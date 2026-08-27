@@ -240,7 +240,10 @@ namespace
           .preprocessDropFlags = MsvcDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
-          .includeDiscovery = IncludeDiscovery::MsvcEnvironment,
+          // Asked for its OWN resource directory, not handed `INCLUDE` and not
+          // modelled off the VC layout: a service inherits no `INCLUDE` either, and
+          // clang-cl lives outside the toolset it borrows. See the enumerator.
+          .includeDiscovery = IncludeDiscovery::ClangResourceLayout,
           .includeProbeFlags = {} },
         { .flavor = Flavor::Gcc,
           .family = DriverFamily::Gnu,

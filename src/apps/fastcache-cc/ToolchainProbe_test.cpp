@@ -406,6 +406,42 @@ void DescribeWindowsMachine(ScriptedToolchainHost& host)
 
     host.SetSearchPath({ std::string { toolset } + "/bin/Hostx64/x64" });
 }
+
+/// A machine with LLVM installed, described the way `DescribeWindowsMachine` is.
+///
+/// Only the half `clang-cl`'s identity is derived from: the resource directory
+/// that ships beside the driver. The driver's own ANSWER is the other half, and it
+/// belongs to the runner rather than to the filesystem -- `ResourceDirRun` below.
+///
+/// The search path is APPENDED rather than set, so composing this with
+/// `DescribeWindowsMachine` leaves `cl` resolvable. A fixture that quietly
+/// unresolved another fixture's compiler would make a case that looks like it
+/// covers both compilers cover one.
+///
+/// @param host The scripted machine to describe.
+/// @param prefix Where LLVM is installed.
+/// @param version The resource directory's version, as clang spells it.
+void DescribeLlvmInstall(ScriptedToolchainHost& host, std::string_view prefix, std::string_view version)
+{
+    host.AddExecutable(std::string { prefix } + "/bin/clang-cl.exe");
+    host.AddDirectory(std::string { prefix } + "/lib/clang/" + std::string { version } + "/include");
+    host.AppendSearchPath(std::string { prefix } + "/bin");
+}
+
+/// What `clang-cl -print-resource-dir` prints on such a machine.
+///
+/// With the trailing newline a real driver emits, on stdout: the parsing that has
+/// to survive it is the reason this is not written as a bare path.
+///
+/// @param prefix Where LLVM is installed.
+/// @param version The resource directory's version.
+/// @return A scripted run for `ScriptedRunner`.
+[[nodiscard]] CompileRun ResourceDirRun(std::string_view prefix, std::string_view version)
+{
+    return CompileRun { .exitCode = 0,
+                        .out = std::string { prefix } + "/lib/clang/" + std::string { version } + "\n",
+                        .err = {} };
+}
 } // namespace
 
 TEST_CASE("An MSVC toolchain's roots come from its own install layout", "[toolchain-probe]")
@@ -567,6 +603,27 @@ TEST_CASE("A machine with no SDK registered reports no kit", "[toolchain-probe]"
     CHECK(WindowsKitIncludeRoots(host).empty());
 }
 
+TEST_CASE("An empty 32-bit KitsRoot10 still reaches the native view", "[toolchain-probe]")
+{
+    // Present and EMPTY is a third answer, and the fallback has to treat it as
+    // absent. `ReadRegistryString` returns a zero-length value as an empty string
+    // rather than as `nullopt` -- which is what a partial or rolled-back SDK
+    // uninstall leaves in `WOW6432Node` -- so a fallback gated on `has_value()`
+    // alone never read the native view, and the machine's `cl` lost the whole SDK
+    // half of its identity while the VC half kept `MsvcLayout` off its `INCLUDE`
+    // fallback too. It then fingerprinted differently from an identically
+    // toolchained peer, with no diagnostic at either end.
+    ScriptedToolchainHost host;
+    constexpr std::string_view roots = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
+    constexpr std::string_view kits = "C:/Program Files (x86)/Windows Kits/10";
+
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", "", RegistryView::ThirtyTwoBit);
+    host.AddRegistryValue(RegistryHive::LocalMachine, roots, "KitsRoot10", std::string { kits } + "/", RegistryView::Native);
+    host.AddDirectory(std::string { kits } + "/Include/10.0.26100.0/ucrt");
+
+    CHECK(WindowsKitIncludeRoots(host) == std::vector<std::string> { std::string { kits } + "/Include/10.0.26100.0/ucrt" });
+}
+
 TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[toolchain-probe]")
 {
     // The defect this whole mechanism exists for. A Windows service inherits no
@@ -685,20 +742,140 @@ TEST_CASE("A toolset with no SDK keeps its VC roots rather than falling back", "
           == std::vector<std::string> { std::string { toolset } + "/include" });
 }
 
-TEST_CASE("clang-cl still reads INCLUDE", "[toolchain-probe]")
+TEST_CASE("clang-cl is asked where its own headers are", "[toolchain-probe]")
 {
-    // Deliberately unchanged: clang-cl's banner is a genuine version string, so a
-    // service run degrades it to a banner-only fingerprint rather than collapsing
-    // every version onto one digest -- and locating the VC headers for a driver
-    // that lives outside the VC layout needs vswhere, a process spawn on the
-    // launcher's per-translation-unit hot path. Issue #145 carries the rest.
-    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
+    ScriptedRunner runner { ResourceDirRun("C:/Program Files/LLVM", "21") };
+    ScriptedToolchainHost host;
+    DescribeLlvmInstall(host, "C:/Program Files/LLVM", "21");
+
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/Program Files/LLVM/bin/clang-cl.exe")
+          == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
+
+    REQUIRE(runner.LastArgv().size() == 2);
+    CHECK(runner.LastArgv().front() == "C:/Program Files/LLVM/bin/clang-cl.exe");
+    CHECK(runner.LastArgv().back() == "-print-resource-dir");
+}
+
+TEST_CASE("The driver's answer wins over anything derivable from its path", "[toolchain-probe]")
+{
+    // The case that made asking non-negotiable, and it is not hypothetical: this is
+    // an ordinary Debian, where `/usr/lib/clang` holds `20`, `20.1.2`, `22` and
+    // `22.1.8` while `/usr/bin/clang-cl-20` is one of two drivers sharing the `/usr`
+    // prefix. Walking up from the driver reaches `/usr` for both of them, and no
+    // rule over those four names picks the right one -- "the newest" hands a clang
+    // 20 driver the headers of clang 22. The driver knows, and answers.
+    ScriptedRunner runner { ResourceDirRun("/usr/lib/llvm-20", "20") };
+    ScriptedToolchainHost host;
+    host.AddExecutable("/usr/bin/clang-cl-20");
+    host.AddDirectory("/usr/lib/llvm-20/lib/clang/20/include");
+    for (auto const& stale: { "20", "20.1.2", "22", "22.1.8" })
+        host.AddDirectory(std::string { "/usr/lib/clang/" } + stale + "/include");
+
+    CHECK(ClangResourceIncludeRoots(runner, host, "/usr/bin/clang-cl-20")
+          == std::vector<std::string> { "/usr/lib/llvm-20/lib/clang/20/include" });
+}
+
+TEST_CASE("A resource directory with no include beneath it is not a root", "[toolchain-probe]")
+{
+    // A partial install must yield NOTHING rather than the directory the driver
+    // named: a root only one of the two ends can see is the disagreement this
+    // mechanism exists to remove.
+    ScriptedRunner runner { ResourceDirRun("C:/LLVM", "21") };
+    ScriptedToolchainHost host;
+    host.AddExecutable("C:/LLVM/bin/clang-cl.exe");
+    host.AddDirectory("C:/LLVM/lib/clang/21");
+
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").empty());
+}
+
+TEST_CASE("A driver that does not understand the flag names no root", "[toolchain-probe]")
+{
+    // A wrapper called `clang-cl.exe` that is not clang. Its diagnostic is not a
+    // path that exists, and that is what rejects it -- the exit code is not
+    // consulted, for the same reason the GNU arm does not consult it.
+    ScriptedRunner runner { CompileRun { .exitCode = 1, .out = "error: unknown argument\n", .err = {} } };
+    ScriptedToolchainHost host;
+    host.AddExecutable("C:/wrappers/clang-cl.exe");
+
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/wrappers/clang-cl.exe").empty());
+}
+
+TEST_CASE("A resource directory answered with CRLF is still a path", "[toolchain-probe]")
+{
+    // Windows is where this driver mostly runs, so a `\r` is the ordinary case
+    // rather than the exotic one. Left on, it becomes part of the path and the
+    // directory test fails -- silently, since a root that does not exist is skipped.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = "C:/LLVM/lib/clang/21\r\n", .err = {} } };
+    ScriptedToolchainHost host;
+    host.AddDirectory("C:/LLVM/lib/clang/21/include");
+
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe")
+          == std::vector<std::string> { "C:/LLVM/lib/clang/21/include" });
+}
+
+TEST_CASE("A clang-cl service and a developer prompt derive the same roots", "[toolchain-probe]")
+{
+    // The defect this mechanism exists for, and the shape #140 fixed for `cl`
+    // reached by a second route. A Windows service inherits no `INCLUDE`, so a
+    // worker started as one fingerprinted `clang-cl` over the banner alone while a
+    // launcher in a developer prompt fingerprinted it over the whole MSVC include
+    // tree. The two never agreed, the scheduler answered `NoWorker`, and nothing at
+    // either end said why.
+    ScriptedRunner serviceRunner { ResourceDirRun("C:/Program Files/LLVM", "21") };
+    ScriptedRunner promptRunner { ResourceDirRun("C:/Program Files/LLVM", "21") };
+
+    ScriptedToolchainHost service;
+    DescribeWindowsMachine(service);
+    DescribeLlvmInstall(service, "C:/Program Files/LLVM", "21");
+    ScriptedToolchainHost developerPrompt;
+    DescribeWindowsMachine(developerPrompt);
+    DescribeLlvmInstall(developerPrompt, "C:/Program Files/LLVM", "21");
+    developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
+
+    auto const underService = DiscoverIncludePaths(serviceRunner, service, "clang-cl", SpecFor(Flavor::ClangCl));
+    auto const underPrompt = DiscoverIncludePaths(promptRunner, developerPrompt, "clang-cl", SpecFor(Flavor::ClangCl));
+
+    CHECK_FALSE(underService.empty());
+    CHECK(underService == underPrompt);
+    CHECK(std::ranges::find(underPrompt, "C:/somewhere/else") == underPrompt.end());
+}
+
+TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[toolchain-probe]")
+{
+    // Where this mechanism deliberately parts company with `MsvcLayout`. That one
+    // falls back to `INCLUDE` because a `cl` outside the VC layout would otherwise
+    // be left with a degenerate identity -- its banner is the constant `cl`, so the
+    // headers are the only identity it has. `clang-cl` announces a genuine version,
+    // so a driver that cannot answer degrades to a banner-only fingerprint, which is
+    // weaker but still tells one clang from another. Reading `INCLUDE` here would
+    // buy that wrapper nothing and reintroduce the very asymmetry this fixes: a
+    // service and a developer prompt disagreeing about a compiler neither can place.
+    ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
     DescribeWindowsMachine(host);
+    host.AddExecutable("C:/wrappers/clang-cl.exe");
     host.SetEnvironment("INCLUDE", "C:/from/the/prompt");
 
-    CHECK(DiscoverIncludePaths(runner, host, "clang-cl.exe", SpecFor(Flavor::ClangCl))
-          == std::vector<std::string> { "C:/from/the/prompt" });
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/clang-cl.exe", SpecFor(Flavor::ClangCl)).empty());
+}
+
+TEST_CASE("An MSVC layout on the machine contributes nothing to clang-cl", "[toolchain-probe]")
+{
+    // clang-cl does not own the VC toolset or the SDK -- it borrows whichever the
+    // machine has -- and the worker compiles text the CLIENT already preprocessed,
+    // so those headers are never read on the far end. Folding them in would add no
+    // discrimination and plenty of mismatch: `WindowsKitIncludeRoots` picks the
+    // newest kit ON THE MACHINE, so two boxes running the same clang-cl with
+    // different SDKs installed would quietly stop matching each other.
+    ScriptedRunner runner { ResourceDirRun("C:/Program Files/LLVM", "21") };
+    ScriptedToolchainHost host;
+    DescribeWindowsMachine(host);
+    DescribeLlvmInstall(host, "C:/Program Files/LLVM", "21");
+
+    REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
+    REQUIRE_FALSE(MsvcToolsetIncludeRoots(host, "cl").empty());
+    CHECK(DiscoverIncludePaths(runner, host, "clang-cl", SpecFor(Flavor::ClangCl))
+          == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
 }
 
 // --- the validity stamp ------------------------------------------------------

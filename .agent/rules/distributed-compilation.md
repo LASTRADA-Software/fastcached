@@ -598,6 +598,41 @@ spawned to learn what the filesystem already said, so `vswhere` runs only when i
 installer directory is present and the Xcode row (which asks once *per compiler
 name*) only when `xcrun` is on the search path.
 
+**A driver's include roots come from what it OWNS, never from the environment**
+([#140](https://github.com/LASTRADA-Software/fastcached/issues/140),
+[#145](https://github.com/LASTRADA-Software/fastcached/issues/145)). `INCLUDE` is set
+per shell by `vcvarsall` and a Windows service inherits none, so any mechanism that
+reads it gives a launcher in a developer prompt and a worker under the SCM two
+different answers for one compiler — and a fingerprint disagreement is invisible from
+both ends, presenting only as a scheduler that answers `NoWorker`. Both MSVC-family
+drivers were on it and both had to come off, by different routes, because *owns*
+means different things to them:
+
+- **`cl` owns the VC toolset it lives inside**, so `MsvcToolsetIncludeRoots` walks up
+  from the driver to `VC\Tools\MSVC\<version>`. It keeps an `INCLUDE` fallback
+  because it must: `cl` answers no `--version`, so a wrapper outside that layout would
+  be left with a digest of the string `cl`, which every MSVC toolset in existence
+  produces.
+- **`clang-cl` owns only its resource directory** —
+  `<prefix>/lib/clang/<version>/include` — and it is **asked** for it
+  (`-print-resource-dir`) rather than having it derived. That is correctness, not
+  taste: `/usr/bin/clang-cl-20` has `/usr` for a prefix, whose `lib/clang` holds `20`,
+  `20.1.2`, `22` and `22.1.8` on an ordinary Debian, and no rule over those four names
+  picks the right one — "the newest" hands a clang 20 driver the headers of clang 22.
+  The layout is modelled for `cl` only because `cl` cannot be asked anything; this
+  driver can, so it is. It reads `INCLUDE` **not at all**, not even as a fallback,
+  which is what makes it symmetric *unconditionally* rather than merely wherever a
+  layout is derivable. It can afford that because its banner is a real version string:
+  a driver that does not answer degrades to a banner-only identity that still tells
+  one clang from another.
+
+The corollary is the part that looks like an omission and is not: **the VC toolset and
+the Windows SDK stay out of `clang-cl`'s identity.** It borrows them rather than owning
+them, a worker compiles text the client already preprocessed and so opens no header
+from either, and the newest-kit-on-the-machine rule that would pick them splits two
+boxes running one clang-cl with different SDKs installed — spending real matches to buy
+no discrimination.
+
 **A cold start fingerprints several toolchains at once, and reports them in table
 order.** A cold walk is seconds per toolchain and a surveyed machine routinely holds
 four or five; sequentially that is a node sitting silent for half a minute before it
@@ -632,9 +667,13 @@ the seam.
   `constexpr` span, and it is only fully correct once a fingerprint can tell one
   toolset's target variants apart -- which today it cannot, since they share an
   include tree and a fallback banner and therefore digest identically.
-- **[#145](https://github.com/LASTRADA-Software/fastcached/issues/145)** — `clang-cl`
-  still takes its include roots from `INCLUDE`, so a launcher in a developer prompt
-  and a worker running as a service compute different fingerprints and never match.
-  Unlike `cl` it degrades to a banner-only identity rather than collapsing every
-  version onto one digest, and moving it needs `vswhere` on the launcher's
-  per-translation-unit hot path — which is a decision, not a detail.
+- **[#154](https://github.com/LASTRADA-Software/fastcached/issues/154)** — taking the
+  VC toolset out of `clang-cl`'s fingerprint (#145) also took out the only thing that
+  was keeping two workers on different MSVC toolsets apart, and
+  `-fms-compatibility-version` is derived from that install and reaches code
+  generation. The window is not
+  new — two service-run workers already shared a banner-only digest — but clang-cl now
+  matches in configurations where it previously matched nothing. The fix is to state
+  the value on the dispatch line rather than to make an identity out of the machine
+  holding it; measure first, since it may not reach codegen for preprocessed input at
+  all.

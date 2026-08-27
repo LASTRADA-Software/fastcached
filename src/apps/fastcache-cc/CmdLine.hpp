@@ -67,18 +67,15 @@ enum class IncludeDiscovery : std::uint8_t
     /// Run the driver verbosely over an empty input and read the search list it
     /// prints between its "search starts here" and "End of search list." markers.
     GnuVerbose = 1,
-    /// Read the `INCLUDE` environment variable, which is where an MSVC toolchain
-    /// puts its search list and the only place `cl` reads it from.
-    MsvcEnvironment = 2,
     /// Derive an MSVC toolchain's search list from the machine's INSTALL LAYOUT --
     /// the compiler's own path for the VC headers, the registry for the Windows
     /// SDK's -- falling back to `INCLUDE` when the layout cannot be determined.
     ///
     /// This exists because `INCLUDE` is set per shell by `vcvarsall`, and a
-    /// **Windows service does not inherit it**. `MsvcEnvironment` therefore
-    /// returns nothing under the SCM, `ProbeToolchainFiles` walks nothing, and --
+    /// **Windows service does not inherit it**. Reading the variable therefore
+    /// yielded nothing under the SCM, `ProbeToolchainFiles` walked nothing, and --
     /// since `cl` has no `--version` and falls back to its normalized basename --
-    /// an MSVC worker started as a service fingerprints as a digest of the string
+    /// an MSVC worker started as a service fingerprinted as a digest of the string
     /// `cl` and nothing else. That is the SAME digest on every MSVC toolset in
     /// existence: the false match `ToolchainFingerprint.hpp` exists to prevent,
     /// and the one that yields a silently wrong object rather than a stale path a
@@ -92,13 +89,40 @@ enum class IncludeDiscovery : std::uint8_t
     /// scheduler that never matches. Layout-first means both derive the same roots
     /// wherever the layout is derivable at all.
     ///
-    /// `Flavor::ClangCl` deliberately does NOT use this. Its banner is a genuine
-    /// version string, so a service run degrades it to a banner-only fingerprint
-    /// rather than collapsing every version onto one digest; and locating the VC
-    /// headers for a driver that does not live inside the VC layout needs
-    /// `vswhere`, which is a process spawn on the launcher's per-translation-unit
-    /// hot path. See https://github.com/LASTRADA-Software/fastcached/issues/145.
-    MsvcLayout = 3,
+    /// The layout is modelled here only because `cl` cannot be ASKED anything --
+    /// it answers no `--version` and prints no search list. `Flavor::ClangCl` can
+    /// be asked, so it is: see `ClangResourceLayout`.
+    MsvcLayout = 2,
+    /// Ask a clang driver for the resource directory that SHIPS WITH IT --
+    /// `<prefix>/lib/clang/<version>/include`, via `-print-resource-dir`.
+    ///
+    /// This exists for `clang-cl`, which read `INCLUDE` like `cl` did and hit the
+    /// same wall from the other side: a developer command prompt has the variable
+    /// and a **Windows service does not**, so a launcher fingerprinted the compiler
+    /// over the whole MSVC include tree while a worker fingerprinted it over the
+    /// banner alone. The two never agreed, the scheduler answered `NoWorker`, and
+    /// nothing at either end said why.
+    ///
+    /// Asked rather than derived, because the resource tree is not recoverable from
+    /// the driver's path: `/usr/bin/clang-cl-20` has `/usr` for a prefix, whose
+    /// `lib/clang` holds `20`, `20.1.2`, `22` and `22.1.8` on an ordinary Debian.
+    /// One spawn, on the same path `GnuVerbose` already spawns on.
+    ///
+    /// Unlike `MsvcLayout` this reads `INCLUDE` **not at all**, not even as a
+    /// fallback, which is what makes a service and a developer prompt agree
+    /// unconditionally rather than merely where a layout is derivable. It can
+    /// afford that because `clang-cl` announces a genuine version: a driver that
+    /// does not answer degrades to a banner-only fingerprint, which still tells one
+    /// clang from another. `cl` cannot -- its banner is the constant `cl` -- which
+    /// is exactly why `MsvcLayout` needs the fallback and this does not.
+    ///
+    /// The VC toolset and the Windows SDK stay OUT of the answer. `clang-cl`
+    /// borrows them rather than owning them, and a worker compiles text the client
+    /// already preprocessed, so it opens no header from either -- while the
+    /// newest-kit rule that picks them would split two machines running one
+    /// clang-cl with different SDKs installed. `ClangResourceIncludeRoots` carries
+    /// the argument in full.
+    ClangResourceLayout = 3,
 };
 
 /// True when two family sets overlap.
