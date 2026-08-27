@@ -306,6 +306,44 @@ namespace
     /// The frontend option whose value is the target triple.
     constexpr std::string_view TripleOption = "-triple";
 
+    /// The header a GNU driver prints its own target on.
+    constexpr std::string_view TargetHeaderPrefix = "Target:";
+
+    /// The first line of @p text that @p extract gets an answer out of.
+    ///
+    /// Shared by the two target readers rather than written out twice, and the
+    /// trailing carriage return is why it earns its keep: a capture taken on Windows,
+    /// or piped through a tool that rewrote the line endings, carries one, and
+    /// stripping it is the step whose omission fails SILENTLY -- the shape check
+    /// rejects an otherwise perfect answer and the probe reports nothing at all.
+    ///
+    /// By value rather than by forwarding reference, and that is a correctness choice
+    /// rather than a style one: @p extract is invoked once per LINE, so forwarding it
+    /// would move from it on the first iteration and leave every later call reading a
+    /// moved-from object. The standard algorithms take a callable by value for the
+    /// same reason.
+    ///
+    /// @param text The driver output to walk.
+    /// @param extract Called per line; returns the answer, or empty to keep looking.
+    /// @return The first non-empty answer, or empty when no line had one.
+    template <typename Extract>
+    [[nodiscard]] std::string FirstLineAnswering(std::string_view text, Extract extract)
+    {
+        for (std::size_t pos = 0; pos <= text.size();)
+        {
+            auto const newline = text.find('\n', pos);
+            auto line = text.substr(pos, newline == std::string_view::npos ? std::string_view::npos : newline - pos);
+            pos = newline == std::string_view::npos ? text.size() + 1 : newline + 1;
+
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+
+            if (auto answer = extract(line); !answer.empty())
+                return answer;
+        }
+        return {};
+    }
+
     /// The longest triple worth believing.
     ///
     /// A real one runs to about thirty characters (`x86_64-pc-windows-msvc19.51.36252`).
@@ -741,47 +779,52 @@ std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, ITool
 
 std::string ParseDriverTargetTriple(std::string_view driverOutput)
 {
-    for (std::size_t pos = 0; pos <= driverOutput.size();)
-    {
-        auto const newline = driverOutput.find('\n', pos);
-        auto line = driverOutput.substr(pos, newline == std::string_view::npos ? std::string_view::npos : newline - pos);
-        pos = newline == std::string_view::npos ? driverOutput.size() + 1 : newline + 1;
-
-        // A capture taken on Windows, or piped through a tool that rewrote the line
-        // endings, carries a trailing carriage return. Left on the last token it would fail the
-        // shape check below and the whole probe would answer nothing.
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
-
+    // No frontend line, or one naming nothing this can trust, yields empty -- the
+    // safe answer, because it leaves the key spelled as it is today and the dispatch
+    // line unpinned. See the header for the one direction in which that is not
+    // enough.
+    return FirstLineAnswering(driverOutput, [](std::string_view line) -> std::string {
         // ONLY the frontend line is read, and that is the point of the marker rather
         // than a tidy-up. The `Target:` header near the top of this same output names
         // a triple too -- `x86_64-pc-windows-msvc` -- but names it WITHOUT the version
-        // suffix that carries `-fms-compatibility-version`. A parser that took
+        // suffix that carries `-fms-compatibility-version`. A reader that took
         // whichever triple came first would pin the architecture, drop the code
         // generation contract, and look entirely correct doing it.
-        // A substring test before tokenizing, so the four banner lines above the
-        // frontend invocation are skipped without being split apart. It is a FILTER
-        // and not the decision: `-cc1` can appear inside a path, so the exact token
-        // match below is still what decides.
+        //
+        // A substring test before tokenizing, so the banner lines above the frontend
+        // invocation are skipped without being split apart. It is a FILTER and not the
+        // decision: `-cc1` can appear inside a path, so the exact token match below is
+        // still what decides.
         if (!line.contains(FrontendMarker))
-            continue;
+            return {};
 
         auto const tokens = SplitDriverLine(line);
         if (!std::ranges::contains(tokens, FrontendMarker))
-            continue;
+            return {};
 
         auto const option = std::ranges::find(tokens, TripleOption);
         if (option == tokens.end() || std::next(option) == tokens.end())
-            continue;
-        if (auto const value = *std::next(option); LooksLikeTargetTriple(value))
-            return std::string { value };
-    }
+            return {};
 
-    // No frontend line, or one naming nothing this can trust. Empty is the safe
-    // answer: it leaves the key spelled as it is today and the dispatch line
-    // unpinned, which costs a MISS between two machines that disagree about whether
-    // the probe worked -- never a hit on an object built for another target.
-    return {};
+        auto const value = *std::next(option);
+        return LooksLikeTargetTriple(value) ? std::string { value } : std::string {};
+    });
+}
+
+std::string ParseDriverTargetHeader(std::string_view driverOutput)
+{
+    return FirstLineAnswering(driverOutput, [](std::string_view line) -> std::string {
+        auto const trimmed = Trim(line);
+        if (!trimmed.starts_with(TargetHeaderPrefix))
+            return {};
+
+        // Validated by the same rule the frontend reader uses, and for the same
+        // reason: this value becomes a cache key input, so a header naming a path --
+        // which a `Configured with:` line is full of -- must not be taken for an
+        // answer.
+        auto const value = Trim(trimmed.substr(TargetHeaderPrefix.size()));
+        return LooksLikeTargetTriple(value) ? std::string { value } : std::string {};
+    });
 }
 
 std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
@@ -801,6 +844,14 @@ std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& comp
             // include probe gives: the frontend line is printed before anything that
             // could fail, and parsing is what decides whether the output is usable.
             return ParseDriverTargetTriple(run.err);
+        }
+
+        case TargetDiscovery::GnuTargetLine: {
+            // The same spawn and the same stream as above; only which line is
+            // authoritative differs, and that is the table's answer rather than this
+            // function's. GCC writes its header to stderr exactly as clang does.
+            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
+            return ParseDriverTargetHeader(run.err);
         }
     }
     return {};

@@ -1302,38 +1302,17 @@ void RecordManifest(Config const& cfg,
     // compile, where stripping an unrecognised argument would change the generated
     // code and hand back an object nobody asked for.
     //
-    // Asked WITHOUT a target first, because this question is answered on string work
-    // alone and the next one costs a process. See below.
-    auto args = Cc::RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    // The target is stated in the SAME call rather than spliced in afterwards. It is
+    // the caller's, probed once above the cache lookup because the key needs it, so
+    // there is nothing here to defer and no second pass to justify -- and the rule
+    // that the pin goes FIRST, so the build's own `--target=` or `-m32` still wins,
+    // stays inside the function that owns the argument order, where it is tested.
+    auto const args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
     if (!args.has_value())
     {
         Note(std::format("not dispatchable ({}); compiling locally", args.error()));
         return std::nullopt;
     }
-
-    // What target THIS machine's driver would generate for, stated on the line so the
-    // worker cannot substitute its own. For a Microsoft target the triple carries
-    // `-fms-compatibility-version`, which clang-cl derives from whatever MSVC it can
-    // find -- a service finds none and falls back to clang's built-in default -- and
-    // which the toolchain fingerprint does not see at all. Without this the two ends
-    // match and generate differently, and the object comes back wrong with a zero
-    // exit code.
-    //
-    // BELOW the refusal, so a line that was never going to be dispatched does not
-    // fork a compiler to decorate arguments about to be thrown away. The
-    // fingerprint's own probe sits below the same guard for the same reason. A driver
-    // with nothing to state (`cl`) is not spawned at all.
-    //
-    // Rebuilt rather than having the flag spliced in here: the rule that the pin goes
-    // FIRST -- so the build's own `--target=` or `-m32` still wins -- belongs to the
-    // function that owns the argument order, and it is unit-tested there. A second
-    // pass over a short argument list costs nothing worth naming.
-    //
-    // The triple is the CALLER's, already folded into the cache key, so this path
-    // spawns nothing of its own: the value a worker is told to generate for and the
-    // value the key was computed under are one probe's answer, and could not be two.
-    if (!targetTriple.empty())
-        args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
 
     // Preprocessed again, with `#line` markers this time. The key's text has them
     // suppressed so no checkout path reaches the key; a worker needs them, because
@@ -1424,9 +1403,11 @@ void RecordManifest(Config const& cfg,
 /// Try to serve `cmd` from the cache; returns the process exit code if handled
 /// (hit or miss-then-stored), or std::nullopt to signal "fall back to a plain
 /// real compile" (any cache error).
-[[nodiscard]] std::optional<int> RunCached(Config const& cfg,
-                                           Cc::ParsedCommand const& cmd,
-                                           std::span<std::string const> argv)
+/// @param cmd Taken BY VALUE so the driver flavour can be corrected in place once
+///        the banner is known -- see `ClassifyCompilerFromBanner`. A copy of a few
+///        strings, once per invocation, against a correction every consumer below
+///        has to see the same way.
+[[nodiscard]] std::optional<int> RunCached(Config const& cfg, Cc::ParsedCommand cmd, std::span<std::string const> argv)
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
     {
@@ -1471,6 +1452,24 @@ void RecordManifest(Config const& cfg,
         });
     auto const compilerBanner = CompilerId(cmd.compiler);
 
+    // `cc` and `c++` name a policy rather than a product, and on macOS that policy
+    // resolves to Apple clang -- CMake's default C++ compiler there. Classified by
+    // name they landed in the `gcc` row, which since this change is the row deciding
+    // how a target is discovered and whether it can be stated. The banner settles it
+    // and is already in hand, so the correction costs a string test rather than a
+    // spawn. Only the target columns can move: the two rows are otherwise identical,
+    // which `CmdLine_test` pins so that stays true.
+    //
+    // Corrected IN PLACE rather than threaded to the one call that discovers the
+    // target, and the difference is a wrong object. `RemoteCompileArgs` re-derives
+    // its own row from `cmd`, so a correction that stopped at the probe left a clang
+    // invoked as `cc` with its versioned triple in the KEY and no `--target=` on the
+    // dispatched line -- the worker generating for its own target, and the result
+    // stored under the client's key. Everything below this line now reads one
+    // flavour.
+    cmd.flavor = Cc::ClassifyCompilerFromBanner(cmd.flavor, compilerBanner);
+    auto const& driver = Cc::DriverOf(cmd.flavor);
+
     // Asked HERE, above the cache lookup, because the answer is a cache key input and
     // a key is needed on a hit too. That is a second spawn per invocation on a clang
     // driver, beside the `--version` one already paid, and it is the price of the key
@@ -1478,8 +1477,18 @@ void RecordManifest(Config const& cfg,
     // and rejected: that stamp covers the compiler binary and its include roots, none
     // of which move when the MSVC install beside `clang-cl` is upgraded, so a cached
     // triple goes stale in the one direction that yields a WRONG HIT rather than a
-    // miss. A driver with no target to state (`cl`, `gcc`) is not spawned at all.
-    auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, Cc::DriverOf(cmd.flavor));
+    // miss. Only a driver with no target at all (`cl`) is left unspawned; `gcc` pays
+    // it too, because its target is keyed even though it can never be stated.
+    auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, driver);
+
+    // Said out loud, because the failing-open story has a hole and this is the only
+    // place it is visible. An empty answer on ONE end is a miss -- the two sides key
+    // differently and simply stop sharing. An empty answer on BOTH ends is the
+    // ORIGINAL defect, silently: both fall back to the banner alone and two code
+    // generators share a key again. Nothing downstream can tell the two cases apart,
+    // so a driver that has a way to name its target and did not is worth a line.
+    if (targetTriple.empty() && driver.targetDiscovery != Cc::TargetDiscovery::None)
+        Note("the compiler did not report a target; keying on its banner alone");
 
     // The banner and the target, joined once. Everything that decides which OBJECT
     // may be served keys on this; the fingerprint, which decides which WORKER may

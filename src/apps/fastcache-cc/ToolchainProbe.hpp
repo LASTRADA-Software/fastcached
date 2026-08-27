@@ -219,15 +219,34 @@ namespace FastCache::Cc
 /// @return The triple, or empty when the output names none it can trust.
 [[nodiscard]] std::string ParseDriverTargetTriple(std::string_view driverOutput);
 
+/// Extract the target from the `Target:` header a GNU driver prints under `-###`.
+///
+/// The companion to `ParseDriverTargetTriple`, and deliberately a separate function
+/// rather than a fallback inside it, because the two disagree about the same line.
+/// For `gcc` this header is the ANSWER: it prints no `-cc1` invocation and its
+/// frontend takes no `-triple`, so there is nothing more precise to read. For a
+/// clang driver the very same header is the WRONG answer -- unversioned, dropping
+/// the `-fms-compatibility-version` that the whole probe exists to carry. Which one
+/// is authoritative is a property of the driver, so it is decided by the table and
+/// not by whichever line a parser happened to find first.
+///
+/// @param driverOutput The driver's `-###` output (it writes to STDERR).
+/// @return The triple, or empty when the output names none it can trust.
+[[nodiscard]] std::string ParseDriverTargetHeader(std::string_view driverOutput);
+
 /// Ask a driver which target it will generate for.
 ///
 /// Dispatches on `spec.targetDiscovery` with no `default:`, so a mechanism added to
 /// the table is a compile error here rather than a silent empty result.
 ///
 /// Fails open, exactly as `DiscoverIncludePaths` does, and the error direction is
-/// what makes that safe. An empty answer leaves the cache key spelled as it is today
-/// and the dispatch line unpinned -- a MISS between two machines that disagree about
-/// whether the probe worked, never a hit on an object built for another target.
+/// safe as far as it goes -- but only that far, so it is worth stating exactly. An
+/// empty answer on ONE end leaves that end keying as it did before, so the two
+/// machines key differently and stop sharing: a MISS. An empty answer on BOTH ends
+/// is the original defect returning in silence, since both fall back to the banner
+/// alone. Failing open therefore never turns a working match into a wrong one, and
+/// never repairs a pair that was already wrong. The caller says so when a driver
+/// that has a mechanism declines to use it.
 ///
 /// One spawn, and it is a real cost: this runs per launcher invocation rather than
 /// per machine, because the value it returns is a cache key input and a cache key is

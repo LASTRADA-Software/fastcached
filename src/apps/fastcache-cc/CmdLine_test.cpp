@@ -463,6 +463,89 @@ TEST_CASE("RemoteCompileArgs keeps the flags that change generated code")
     }
 }
 
+TEST_CASE("cc and c++ are classified by what the driver says, not by what it is called")
+{
+    // `cc` and `c++` name a policy, not a product. On macOS `/usr/bin/c++` is Apple
+    // clang and is CMake's default C++ compiler, so the spelling a build system uses
+    // most is the one that says least -- and by name it landed in the gcc row, which
+    // is now the row deciding how a target is found and whether it can be stated.
+    CHECK(ClassifyCompiler("c++") == Flavor::Gcc);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "Apple clang version 17.0.0 (clang-1700.0.13.3)") == Flavor::Clang);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)") == Flavor::Clang);
+
+    // A real GCC keeps its row.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "g++ (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0") == Flavor::Gcc);
+}
+
+TEST_CASE("An unrecognised banner leaves the name-based guess standing")
+{
+    // The correction runs in ONE direction, on positive evidence only. Seeing
+    // `clang version` is proof; not seeing it is not proof of the opposite, because
+    // a driver that could not be RUN falls back to its own basename. Demoting on
+    // absence would put a real clang++ whose --version failed into the gcc row --
+    // unversioned target, no pin, on a driver whose name said exactly what it was.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Clang, "clang++") == Flavor::Clang);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Gcc, "cc") == Flavor::Gcc);
+
+    // GCC has no marker as reliable as clang's -- vanilla prints `(GCC)`, Ubuntu
+    // prints `(Ubuntu 14.2.0-...)` -- so nothing here tries to prove it.
+    CHECK(ClassifyCompilerFromBanner(Flavor::Clang, "g++ (GCC) 14.2.0") == Flavor::Clang);
+}
+
+TEST_CASE("A banner cannot reclassify clang-cl, because it does not distinguish it")
+{
+    // `clang-cl --version` prints `clang version ...`, byte for byte what plain
+    // clang prints. The NAME is the only thing separating the two drivers, so a
+    // banner test here would collapse clang-cl into clang and take its `/`-spelled
+    // command line, its `/EP` preprocess and its MSVC-preprocessed-input flags with
+    // it.
+    CHECK(ClassifyCompilerFromBanner(Flavor::ClangCl, "clang version 22.1.3") == Flavor::ClangCl);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Cl, "clang version 22.1.3") == Flavor::Cl);
+    CHECK(ClassifyCompilerFromBanner(Flavor::Unknown, "clang version 22.1.3") == Flavor::Unknown);
+}
+
+TEST_CASE("The gcc and clang rows differ in nothing but how a target is discovered")
+{
+    // What makes correcting the flavour AFTER the command line was parsed safe: the
+    // parse read this row, and every column it read is the same in both. Only the
+    // target columns may move. If this ever fails, the correction in main.cpp has to
+    // move above ParseCommand instead of beside the banner.
+    auto const& gcc = DriverOf(Flavor::Gcc);
+    auto const& clang = DriverOf(Flavor::Clang);
+
+    CHECK(gcc.family == clang.family);
+    CHECK(gcc.preprocessFlags.data() == clang.preprocessFlags.data());
+    CHECK(gcc.dispatchPreprocessFlags.data() == clang.dispatchPreprocessFlags.data());
+    CHECK(gcc.preprocessedInput.data() == clang.preprocessedInput.data());
+    CHECK(gcc.preprocessDropFlags.data() == clang.preprocessDropFlags.data());
+    CHECK(gcc.dependencyProbeFlags.data() == clang.dependencyProbeFlags.data());
+    CHECK(gcc.usesDepfile == clang.usesDepfile);
+    CHECK(gcc.includeDiscovery == clang.includeDiscovery);
+    CHECK(gcc.includeProbeFlags.data() == clang.includeProbeFlags.data());
+    CHECK(gcc.targetProbeFlags.data() == clang.targetProbeFlags.data());
+
+    // The one column that is allowed to differ, and does.
+    CHECK(gcc.targetDiscovery != clang.targetDiscovery);
+}
+
+TEST_CASE("gcc is identified but never pinned, because it has no --target")
+{
+    // Discovering and stating are separate questions. gcc's target belongs in the
+    // cache key -- one g++ version string covers x86_64 and aarch64 alike -- and
+    // must never reach a dispatched command line, where the driver would reject the
+    // flag and fail the compile outright.
+    CHECK(TargetPinPrefixFor(TargetDiscovery::GnuTargetLine).empty());
+    CHECK(TargetPinPrefixFor(TargetDiscovery::ClangDriverLine) == "--target=");
+    CHECK(TargetPinPrefixFor(TargetDiscovery::None).empty());
+
+    std::vector<std::string> const argv { "g++", "-c", "-O2", "a.cpp", "-o", "a.o" };
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, "x86_64-linux-gnu");
+
+    REQUIRE(parsed.has_value());
+    CHECK(std::ranges::none_of(*parsed, [](std::string const& a) { return a.starts_with("--target"); }));
+}
+
 TEST_CASE("RemoteCompileArgs states the client's target so the worker cannot pick its own")
 {
     std::vector<std::string> const argv { "clang-cl", "/c", "/O2", "a.cpp", "/Foa.obj" };

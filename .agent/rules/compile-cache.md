@@ -84,6 +84,10 @@ Measured on clang-cl 22.1.3, one binary:
 A `noexcept` function type mangles `P6AXXZ` below 19.12 and `P6AXX_E` from 19.12 on,
 so this reaches defined **and** undefined symbols.
 
+It is not an MSVC-only shape. Stock `g++` on Ubuntu x86_64 and aarch64 prints one
+`--version` first line, so an architecture-independent translation unit keyed the
+same on both — the same defect with no MSVC anywhere near it.
+
 - **The key folds the target; the fingerprint does not.** They answer different
   questions and one string cannot serve both. A fingerprint decides which **worker**
   may serve a client, so folding the target in would split a developer-prompt
@@ -113,11 +117,33 @@ so this reaches defined **and** undefined symbols.
   positionally — the argument after `-triple` — so an option carrying none leaves
   the next FLAG in its place, and `-emit-obj` satisfies every other test for a
   triple. It would reach both a cache key and a `--target=` argument.
-- **An empty triple means UNCHANGED, not an empty field.** `cl` and `gcc` have no
-  target to state (`cl`'s is decided by which `cl.exe` runs; `gcc` is fixed-target
-  and has no `--target`), so `CacheCompilerId` returns the banner byte for byte and
-  their entries stay reachable. Appending an empty field would re-key every cache in
-  the fleet to buy nothing.
+- **Discovering a target and stating one are different questions.** `gcc` can be
+  asked and cannot be told: it is a fixed-target driver with no `--target=`, so its
+  target belongs in the **key**, which decides which object may be served, and must
+  never reach a **dispatched line**, where the driver would reject the flag and fail
+  the compile. `TargetPinPrefixFor` is the seam, and an empty prefix means exactly
+  that — identified, not pinned. Only `cl` is neither: which code generator runs is
+  decided by *which* `cl.exe` is invoked, and no command line can restate that.
+- **Which line is authoritative is the driver's property, not the parser's.** `gcc`
+  prints no `-cc1` invocation — its frontend is `cc1plus` and takes no `-triple` —
+  so its `Target:` header is the whole answer. On a clang driver that same header is
+  the unversioned half-answer. Two mechanisms, chosen by the table; one reader
+  trying both lines would silently downgrade every clang driver whose frontend line
+  it happened to miss.
+- **An empty triple means UNCHANGED, not an empty field.** `CacheCompilerId` returns
+  the banner byte for byte, so a driver that states nothing keeps every entry it has
+  written. Appending an empty field would re-key every cache in the fleet to buy
+  nothing.
+- **`cc` and `c++` name a policy, not a product, so the banner decides.** On macOS
+  `/usr/bin/c++` is Apple clang and is CMake's default; by name it lands in the
+  `gcc` row. That was harmless while the two rows were identical and stopped being
+  harmless when that row began deciding how a target is found. The correction is a
+  string test over the banner already in hand, never a second spawn — and it must
+  not touch `clang-cl`, whose banner is `clang version ...` byte for byte as plain
+  clang's, so the NAME is the only thing separating those two drivers. Correcting
+  the flavour *after* the line is parsed is safe only because the `gcc` and `clang`
+  rows agree on every column the parse reads; a test asserts that, and if it ever
+  fails the correction has to move above `ParseCommand`.
 - **The two halves are framed, not concatenated.** `("ab", "c")` and `("a", "bc")`
   would otherwise key alike. A newline separates them because a banner is one line
   by construction and a triple is `[A-Za-z0-9._-]`, so neither half can contain it.
@@ -125,6 +151,20 @@ so this reaches defined **and** undefined symbols.
   changes with the compatibility version but need not survive preprocessing: a TU
   including `<cstdio>` preprocesses to **byte-identical** text at 19.29 and 19.51.
   The hazard is not confined to include-free translation units.
+- **The triple is folded verbatim, and over-specification is the deliberate half.**
+  Clang's Microsoft ABI gates on major.minor, so two MSVC builds differing only in
+  patch generate identically and key apart — a lost match on every Visual Studio
+  point release. It is not truncated because the same field means something else
+  elsewhere: on Apple targets it is the **deployment target**, which does change code
+  generation. One rule cannot serve both, and a per-platform rule would be guessing
+  about triples this code has never seen. Over-specifying costs a recompile;
+  under-specifying serves an object built by a different code generator.
+- **Failing open is safe in ONE direction only.** A probe that answers nothing on
+  one end leaves that end keying as it did before, so the two machines key apart and
+  stop sharing — a miss. Answering nothing on **both** ends puts both back on the
+  banner alone, which is the original defect, in silence. It never turns a working
+  match into a wrong one and never repairs a pair that was already wrong, so a
+  driver that has a mechanism and declined to use it is reported.
 - **The probe is not cached, and the reason is the direction of the error.** The
   fingerprint's stamp covers the compiler binary and its include roots, none of
   which move when the MSVC install beside `clang-cl` is upgraded — so a triple

@@ -217,9 +217,18 @@ namespace
     /// rather than in a comment at the call site.
     ///
     /// `/c` and `-c` keep it to a compile step: without them the driver also prints a
-    /// link line, which carries no `-triple` and only makes the output longer.
+    /// link line, which carries no `-triple` and only makes the output longer -- and
+    /// on a driver read through the `Target:` header, a link line is all there is.
     constexpr std::array<std::string_view, 3> MsvcTargetProbe { "-###", "/TP", "/c" };
     constexpr std::array<std::string_view, 4> GnuTargetProbe { "-###", "-x", "c++", "-c" };
+
+    /// What every clang vendor's version line carries and no GCC's does.
+    ///
+    /// The marker, not a prefix match: a distribution puts its own name first
+    /// (`Ubuntu clang version 20.1.2`, `Apple clang version 17.0.0`), which is the
+    /// same vendor-prefixing that makes a banner comparison across two distributions
+    /// fail. Here only the presence of the product name matters.
+    constexpr std::string_view ClangBannerMarker = "clang version";
 
     constexpr std::array<DriverSpec, 5> Drivers { {
         { .flavor = Flavor::Unknown,
@@ -283,11 +292,16 @@ namespace
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true,
           .includeDiscovery = IncludeDiscovery::GnuVerbose,
-          // GCC accepts `-###` but has no `--target`: it is a fixed-target driver, so
-          // there is no ambient value a command line could pin.
-          .targetDiscovery = TargetDiscovery::None,
+          // Asked, but never told. GCC prints no `-cc1` line -- its frontend takes no
+          // `-triple` -- so the `Target:` header is all there is, and for this driver
+          // that header is the whole answer rather than the unversioned half one.
+          // It cannot be pinned (no `--target=`), so it identifies the code generator
+          // for the KEY and states nothing on a dispatched line. Without it one g++
+          // version string covers x86_64 and aarch64 alike, and an arch-independent
+          // translation unit keys the same on both.
+          .targetDiscovery = TargetDiscovery::GnuTargetLine,
           .includeProbeFlags = GnuIncludeProbe,
-          .targetProbeFlags = {} },
+          .targetProbeFlags = GnuTargetProbe },
         { .flavor = Flavor::Clang,
           .family = DriverFamily::Gnu,
           .preprocessFlags = GnuPreprocess,
@@ -648,6 +662,11 @@ std::string_view TargetPinPrefixFor(TargetDiscovery discovery) noexcept
             return {};
         case TargetDiscovery::ClangDriverLine:
             return "--target=";
+        case TargetDiscovery::GnuTargetLine:
+            // Identified, never stated. `gcc` is a fixed-target driver: it has no
+            // `--target=`, so putting one on a dispatched line would fail the compile
+            // rather than direct it. Its target still belongs in the cache key.
+            return {};
     }
     return {};
 }
@@ -733,6 +752,29 @@ std::string NormalizedCompilerName(std::string_view compiler)
 Flavor ClassifyCompiler(std::string_view compiler)
 {
     return ClassifyCompilerImpl(compiler);
+}
+
+Flavor ClassifyCompilerFromBanner(Flavor named, std::string_view banner) noexcept
+{
+    // The GNU-driver pair only. `clang-cl` prints `clang version ...` exactly as
+    // plain clang does, so the name is the only thing separating those two drivers
+    // and a banner test here would collapse them into one.
+    if (named != Flavor::Gcc && named != Flavor::Clang)
+        return named;
+
+    // ONE direction, on POSITIVE evidence only. Every vendor's spelling carries the
+    // marker -- `clang version 22.1.3`, `Apple clang version 17.0.0`,
+    // `Ubuntu clang version 20.1.2` -- so seeing it is proof. Not seeing it is not
+    // proof of the opposite: GCC has no equally reliable marker of its own (vanilla
+    // prints `(GCC)`, Ubuntu prints `(Ubuntu 14.2.0-...)`), and more to the point a
+    // driver that could not be RUN falls back to its own basename, so `clang++`
+    // whose `--version` failed would arrive here carrying the string `clang++` and
+    // be demoted into the gcc row -- unversioned target, no pin, on a driver whose
+    // name said exactly what it was.
+    //
+    // So an unrecognised banner leaves the name-based guess standing, which is both
+    // the safe direction and what this did before there was a correction at all.
+    return banner.contains(ClangBannerMarker) ? Flavor::Clang : named;
 }
 
 DriverSpec const& DriverOf(Flavor flavor)

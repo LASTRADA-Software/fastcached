@@ -155,6 +155,20 @@ enum class TargetDiscovery : std::uint8_t
     /// type mangles as `P6AXXZ` below 19.12 and `P6AXX_E` from 19.12 on). Pinning the
     /// unversioned spelling would look exactly like a fix and change nothing.
     ClangDriverLine = 1,
+    /// Read the `Target:` header a GNU driver prints under `-###`.
+    ///
+    /// For `gcc` this header IS the answer: it prints no `-cc1` line and its
+    /// frontend takes no `-triple`, so there is nothing more precise to read. That
+    /// is the opposite of `ClangDriverLine`, where the very same header is the trap
+    /// -- unversioned, and three lines closer to the top than the real answer. Two
+    /// mechanisms rather than one that tries both, so which line is authoritative is
+    /// a property of the driver in the table rather than a guess at parse time.
+    ///
+    /// It DISCOVERS without pinning. `gcc` is a fixed-target driver and has no
+    /// `--target=`, so this identifies the code generator for the cache key and
+    /// states nothing on a dispatched line -- see `TargetPinPrefixFor`, which is
+    /// where those two questions are kept apart.
+    GnuTargetLine = 2,
 };
 
 /// True when two family sets overlap.
@@ -258,6 +272,13 @@ struct PathValueMatch
 /// cannot drift: a mechanism added to `TargetDiscovery` is a compile error here,
 /// which is exactly where somebody has to decide whether `--target=` is still the
 /// right way to say it.
+///
+/// **Discovering and stating are separate questions and this is the seam.** `gcc`
+/// can be asked what it generates for and cannot be told -- it is a fixed-target
+/// driver with no `--target=` -- so its target belongs in the cache key, which
+/// decides which object may be served, and nowhere near a dispatched command line,
+/// which would fail the compile outright. An empty prefix means exactly that:
+/// identified, not pinned.
 ///
 /// The value is meant to be FUSED onto the triple, for the reason
 /// `ObjectOutputPrefixFor`'s is: `--target x` is rejected by clang-cl while
@@ -438,8 +459,15 @@ struct DriverSpec
     /// spelling: `/dev/null` is not a path on Windows, and reading from stdin
     /// needs the caller to close it.
     std::span<std::string_view const> includeProbeFlags;
-    /// Flags that make the driver print its frontend invocation without running it,
-    /// for `TargetDiscovery::ClangDriverLine`. Empty for every other mechanism.
+    /// Flags that make the driver print what it WOULD run without running it, for
+    /// every `TargetDiscovery` mechanism that asks the driver a question -- both
+    /// `ClangDriverLine` and `GnuTargetLine` read this. Empty only for
+    /// `TargetDiscovery::None`.
+    ///
+    /// The two mechanisms differ in which LINE of that output is authoritative, not
+    /// in how the driver is asked, so emptying this for one of them would not
+    /// disable it -- it would spawn `g++ /dev/null`, a link step with no target on
+    /// it, and drop the target from every GCC key in silence.
     ///
     /// Deliberately NOT the compile's own command line, which would make the answer a
     /// property of one translation unit rather than of the machine. It does not need
@@ -486,6 +514,37 @@ struct ParsedCommand
 /// @param compiler argv[0] as invoked.
 /// @return The matching flavor, or `Flavor::Unknown`.
 [[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
+
+/// Correct a name-based classification against what the driver calls itself.
+///
+/// `cc` and `c++` name a POLICY -- "the system C compiler" -- rather than a
+/// product. On most Linuxes they are GCC; on macOS `/usr/bin/c++` is Apple clang,
+/// and it is CMake's default C++ compiler there, so the spelling a build system
+/// uses most is precisely the one that says least. Classifying it by name put an
+/// Apple clang in the `gcc` row, and once that row became the one that decides how
+/// a target is discovered, a name-based guess started deciding whether two machines
+/// share a cache entry.
+///
+/// The banner settles it and costs nothing: it is already in hand for the key, so
+/// this is a string test rather than a second spawn.
+///
+/// Only the GNU-driver pair is refined, and only on POSITIVE evidence. A banner
+/// carrying `clang version` is proof; a banner without it is not proof of the
+/// opposite, because a driver that could not be RUN falls back to its own basename
+/// -- so a real `clang++` whose `--version` failed would otherwise be demoted into
+/// the gcc row, losing both the versioned target and the pin on a driver whose name
+/// said exactly what it was. An unrecognised banner therefore leaves @p named alone.
+///
+/// `clang-cl` is deliberately untouchable here, because its banner is
+/// `clang version ...` -- identical to plain clang's -- so the NAME is the only
+/// thing that distinguishes the two drivers, and a banner test would collapse them.
+/// `cl` is left alone for the same reason in reverse: its banner is a fallback, and
+/// there is nothing to read.
+///
+/// @param named What the compiler's name said it was.
+/// @param banner Its version line, as `CompilerBanner` returns it.
+/// @return The corrected flavor; @p named unchanged for every driver but the pair.
+[[nodiscard]] Flavor ClassifyCompilerFromBanner(Flavor named, std::string_view banner) noexcept;
 
 /// A compiler's basename, lowered and stripped of `.exe`.
 ///

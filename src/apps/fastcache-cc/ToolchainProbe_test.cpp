@@ -1317,6 +1317,65 @@ TEST_CASE("CRLF in a captured driver line does not hide the triple", "[toolchain
     CHECK(ParseDriverTargetTriple(" \"clang\" \"-cc1\" \"-triple\" \"x86_64-pc-linux-gnu\"\r\n") == "x86_64-pc-linux-gnu");
 }
 
+namespace
+{
+/// Real `g++ -### -x c++ -c /dev/null` stderr from an Ubuntu GCC 14.
+///
+/// GCC prints no `-cc1` invocation at all -- its frontend is `cc1plus` and takes no
+/// `-triple` -- so the `Target:` header is not a lesser answer here, it is the only
+/// one. That is the exact opposite of a clang driver, where the same header is the
+/// unversioned half-answer, and it is why the two mechanisms are separate rather
+/// than one parser trying both lines.
+constexpr std::string_view GnuGccDriverLine =
+    R"(Using built-in specs.
+COLLECT_GCC=g++
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 14.2.0-4ubuntu2~24.04.1'
+Thread model: posix
+gcc version 14.2.0 (Ubuntu 14.2.0-4ubuntu2~24.04.1)
+)";
+} // namespace
+
+TEST_CASE("A GNU driver names its target on a header, and that is all it names", "[toolchain-probe]")
+{
+    CHECK(ParseDriverTargetHeader(GnuGccDriverLine) == "x86_64-linux-gnu");
+
+    // And the frontend reader finds nothing in it, which is the whole reason this
+    // driver needs a mechanism of its own rather than a fallback inside that one.
+    CHECK(ParseDriverTargetTriple(GnuGccDriverLine).empty());
+}
+
+TEST_CASE("The two target mechanisms disagree about a clang driver, deliberately", "[toolchain-probe]")
+{
+    // Both readers answer on the same clang output, and they answer DIFFERENTLY.
+    // The header drops the version suffix that carries `-fms-compatibility-version`;
+    // the frontend line keeps it. Which one is right is a property of the driver, so
+    // it is settled by the table rather than by whichever line a parser reaches
+    // first -- and pointing a clang driver at the header reader would be a silent
+    // downgrade that still looked like an answer.
+    CHECK(ParseDriverTargetHeader(ClangClDriverLineDeveloperPrompt) == "x86_64-pc-windows-msvc");
+    CHECK(ParseDriverTargetTriple(ClangClDriverLineDeveloperPrompt) == "x86_64-pc-windows-msvc19.51.36252");
+}
+
+TEST_CASE("A GNU target header that names nothing usable yields nothing", "[toolchain-probe]")
+{
+    CHECK(ParseDriverTargetHeader("Target:\n").empty());
+    CHECK(ParseDriverTargetHeader("Using built-in specs.\nThread model: posix\n").empty());
+    // A path is a parse that went wrong, and it would reach a cache key.
+    CHECK(ParseDriverTargetHeader("Target: /usr/lib/gcc/x86_64-linux-gnu\n").empty());
+    // Tolerated, for the reason the other reader tolerates it.
+    CHECK(ParseDriverTargetHeader("Target: x86_64-linux-gnu\r\n") == "x86_64-linux-gnu");
+}
+
+TEST_CASE("gcc is asked for its target and never told one", "[toolchain-probe]")
+{
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { GnuGccDriverLine } } };
+
+    CHECK(DiscoverTargetTriple(runner, "/usr/bin/g++", SpecFor(Flavor::Gcc)) == "x86_64-linux-gnu");
+    CHECK(runner.Calls() == 1);
+}
+
 TEST_CASE("A driver with no target to state is not spawned at all", "[toolchain-probe]")
 {
     // `cl` has no `-###` and no `--target`: which code generator runs is decided by
@@ -1325,7 +1384,6 @@ TEST_CASE("A driver with no target to state is not spawned at all", "[toolchain-
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { GnuClangDriverLine } } };
 
     CHECK(DiscoverTargetTriple(runner, "cl.exe", SpecFor(Flavor::Cl)).empty());
-    CHECK(DiscoverTargetTriple(runner, "gcc", SpecFor(Flavor::Gcc)).empty());
     CHECK(DiscoverTargetTriple(runner, "mystery", SpecFor(Flavor::Unknown)).empty());
     CHECK(runner.Calls() == 0);
 }
