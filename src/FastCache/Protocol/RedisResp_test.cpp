@@ -2302,9 +2302,9 @@ class FailingPeekStorage final: public FastCache::IStorage
     {
         _inner.FlushWithGeneration(effectiveAt);
     }
-    std::size_t PurgeExpired(FastCache::TimePoint now) override
+    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint now, FastCache::PurgeBudget budget) override
     {
-        return _inner.PurgeExpired(now);
+        return _inner.PurgeExpired(now, budget);
     }
     void Resize(std::size_t newMaxBytes) override
     {

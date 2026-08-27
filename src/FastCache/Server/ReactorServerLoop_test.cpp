@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/NotifyingStorage.hpp>
+#include <FastCache/Cache/ReclaimLog.hpp>
+#include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -8,8 +12,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <string_view>
+#include <vector>
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
           "[server][reactor-loop][tls-null-guard]")
@@ -143,4 +150,119 @@ TEST_CASE("Detail::VerifyTlsContextForTlsBinds accepts mixed plaintext+TLS binds
     auto const exitCode = FastCache::Detail::VerifyTlsContextForTlsBinds(options, logger);
     REQUIRE(exitCode == EXIT_SUCCESS);
     REQUIRE(logger.Snapshot().empty());
+}
+
+namespace
+{
+
+/// Keeps the events a keyspace subscriber would have seen, so a case can assert
+/// on the notification rather than only on the item count going down. Half of
+/// what issue #162 cost was that nobody was told.
+class ExpireRecorder final: public FastCache::IStorageMutationObserver
+{
+  public:
+    void OnMutation(FastCache::MutationKind kind, std::string_view key) noexcept override
+    {
+        if (kind == FastCache::MutationKind::Expire)
+            expired.emplace_back(key);
+    }
+
+    [[nodiscard]] bool HasObservers() const noexcept override
+    {
+        return true;
+    }
+
+    std::vector<std::string> expired;
+};
+
+/// The daemon's storage chain, as `main.cpp` builds it: the tiers record what
+/// they reclaim into a log, and the notifying decorator on top drains that once
+/// their call has returned. `StartExpiryCycle` is handed `engine.Storage()`, so
+/// this is what decides whether a swept key is published or merely freed.
+struct DaemonChain
+{
+    // `InMemoryLruStorage` first, for the reason `ExpiryReaper_test`'s fixture
+    // spells out: it aligns its read counters to a cache line, and a 64-aligned
+    // member anywhere but the front pads the whole struct past what
+    // clang-tidy's padding budget allows. Construction order still holds.
+    FastCache::InMemoryLruStorage lru;
+    FastCache::NullLogger logger;
+    ExpireRecorder observer;
+    FastCache::NotifyingStorage storage { lru, &observer };
+    FastCache::ManualClock clock;
+    FastCache::ReclaimLog log { &observer };
+    FastCache::TestReactor reactor { clock };
+    FastCache::CacheEngine engine { storage, clock };
+
+    DaemonChain()
+    {
+        storage.SetReclaimLog(&log);
+    }
+};
+
+} // namespace
+
+TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the engine's chain",
+          "[server][reactor-loop][expiry]")
+{
+    // Issue #162 at the layer that had the bug. `ExpiryReaper` is tested on its
+    // own; what is asserted here is the wiring -- that the loop starts a cycle
+    // at all, and that it is pointed at `engine.Storage()` (the notifying
+    // decorator) rather than at some tier below it. Sweeping the inner chain
+    // would free the bytes and publish nothing, which is half the issue left in
+    // place and invisible to every storage-level test.
+    using namespace std::chrono_literals;
+    DaemonChain chain;
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+    chain.observer.expired.clear();
+
+    FastCache::ReactorServerOptions options;
+    options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms };
+
+    auto const cycle = FastCache::Detail::StartExpiryCycle(chain.reactor, chain.engine, chain.logger, options, nullptr);
+    REQUIRE(cycle != nullptr);
+    chain.reactor.Drain();
+    CHECK(chain.engine.Storage().Snapshot().itemCount == 1U); // Nothing has lapsed yet.
+
+    // Nothing touches the key. Before the cycle existed this is where it stayed
+    // resident and unreported for the life of the process.
+    chain.clock.Advance(2s);
+    chain.reactor.Drain();
+
+    CHECK(chain.engine.Storage().Snapshot().itemCount == 0U);
+    CHECK(chain.observer.expired == std::vector<std::string> { "gone" });
+}
+
+TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing", "[server][reactor-loop][expiry]")
+{
+    // `--expiry-interval=0` is how an operator asks for the pre-#162 behaviour.
+    // "Off" has to mean a coroutine that ended: one parked forever on a
+    // deadline nothing will move is a frame the reactor has to outlive.
+    using namespace std::chrono_literals;
+    DaemonChain chain;
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+
+    FastCache::ReactorServerOptions options;
+    options.expiry = FastCache::ExpiryReaperOptions { .interval = FastCache::Duration::zero() };
+
+    auto const cycle = FastCache::Detail::StartExpiryCycle(chain.reactor, chain.engine, chain.logger, options, nullptr);
+    REQUIRE(cycle != nullptr);
+    chain.reactor.Drain();
+    chain.clock.Advance(1h);
+    chain.reactor.Drain();
+
+    CHECK(cycle->Cycles() == 0U);
+    CHECK(chain.reactor.PendingTimers() == 0);
+    CHECK(chain.engine.Storage().Snapshot().itemCount == 1U); // Expiry stays access-driven.
+}
+
+TEST_CASE("ReactorServerOptions defaults the expiry cycle on", "[server][reactor-loop][expiry]")
+{
+    // The default has to be a cycle that runs: a `ReactorServerOptions` built
+    // by a caller that does not mention expiry -- which is every test fixture
+    // and every future embedder -- must not silently reproduce #162.
+    FastCache::ReactorServerOptions const options;
+    CHECK(options.expiry.interval > FastCache::Duration::zero());
+    CHECK(options.expiry.scanBudget != 0U);
+    CHECK(options.expiry.purgeBudget != 0U);
 }

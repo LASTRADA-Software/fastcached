@@ -586,12 +586,65 @@ And one that is about the cache rather than the wire:
   notification. An *expiry* is total — both tiers hold the same TTL — so
   `LayeredStorage` forwards expiries to L2 and swallows its evictions.
 
-## Open work
+## The active expiry cycle
 
-- **[#162](https://github.com/LASTRADA-Software/fastcached/issues/162)** —
-  nothing calls `PurgeExpired`, so expiry is entirely access-driven: with the
-  default `Approximate` LRU a read does not reclaim, and a key that lapses and is
-  never touched again is neither reclaimed nor reported. Both a memory cost and
-  the reason a subscriber to `__keyevent@0__:expired` can hear nothing about a
-  key that has certainly expired. `docs/operations/known-limitations.md` records
-  the timing so an operator is not surprised by it meanwhile.
+`ExpiryReaper` is the only thing that calls `IStorage::PurgeExpired` in
+production, and for a long time nothing did — which made every rule below a
+consequence rather than a precaution.
+
+- **A reclaimer that nothing constructs is the bug it was written to fix.**
+  `PurgeExpired` existed, was correct, was tested, and had no production caller,
+  so expiry was entirely access-driven: with the default `Approximate` LRU a read
+  does not reclaim either, and a key that lapsed and was never touched again kept
+  its bytes and its byte-budget contribution until eviction happened to reach it,
+  publishing no `expired` event for exactly the case a subscriber subscribes for.
+  Assert the wiring, not only the mechanism — `Detail::StartExpiryCycle` is
+  exposed for no other reason.
+- **Sweep the chain the engine writes through, not a tier below it.** The reaper
+  is handed `engine.Storage()`, which is the `NotifyingStorage`. Pointed one layer
+  down it would free the bytes and publish nothing — half the bug left in place,
+  and invisible to every storage-level test, because the tiers *do* record into
+  the reclaim log either way. Nothing drains it.
+- **One cycle per daemon, not one per reactor.** The sweep takes each shard's
+  exclusive lock in turn, so a second cycle contends with the first for no gain.
+  It runs on reactor 0, and its owner is declared after the reactors and before
+  the acceptor threads: destroyed while the timer wheel it parked on still exists,
+  and after every thread that could resume it has been joined.
+- **The reclaim ceiling lives below `ReclaimLog::DefaultCapacity`, and is
+  `static_assert`ed against it.** A sweep permitted to reclaim more keys at once
+  than the log holds discards the `expired` events it runs to produce, and counts
+  them in `fastcached_keyspace_reclaim_events_dropped_total`. The failure would be
+  a metric nobody reads, not a symptom.
+- **A bounded sweep must resume, not restart.** Each tier keeps a cursor and
+  `ShardedStorage` rotates its starting shard, because a budget smaller than the
+  shard count is spent before the loop reaches the far ones. Without both, a cache
+  larger than one budget never expires anything past its own prefix. The cursor
+  outlives the call that produced it, which makes **every** erase a place it can
+  dangle: one erase point per tier (`EraseAt`, `EraseNode`) is what keeps that
+  fix-up in one place, and without it MSVC's debug iterators abort the process.
+- **`completedPass` is what separates "nothing left" from "out of budget",** and
+  only the first may back off. A pass that stopped early has entries it has not
+  looked at yet.
+- **Zero means opposite things in the two knobs, and both are load-bearing.**
+  `--expiry-interval=0` disables the cycle, which is a real thing to ask for, and
+  a disabled cycle is a coroutine that *ends* rather than one parked forever on a
+  deadline nothing will move. `--expiry-scan=0` is what `PurgeBudget` spells as
+  *no ceiling* — sweep the whole keyspace under the shard lock — so it is refused.
+- **The reaper's options are baked in at construction, so they are immutable
+  across a reload.** Accepting a SIGHUP that changes them would leave
+  `reloader.Current()` reporting an interval the daemon is not sweeping at.
+
+## Reclaiming on the disk tier
+
+- **A read may not reclaim; a write must.** `CowTreeStorage::Get` and `Peek`
+  reject a lapsed record without erasing it, because a read can be holding nothing
+  but a shared lock and opening a write transaction there would break CowTree's
+  single-writer contract. Every write verb holds the exclusive lock, so the rule
+  never applied to them — and for as long as they were lumped in with the reads,
+  the same client sequence produced a different event stream depending on
+  `--storage`, and the dead bytes stayed on disk until a sweep or a `DELETE`
+  reached them. `AcceptLiveRecord` is the one spelling of that question, so the
+  reclaim cannot be remembered at four sites and forgotten at a fifth.
+- **Reporting without erasing would have been worse than neither.** The record
+  stays, so the next `APPEND`/`INCR`/CAS on the same lapsed key fires `expired`
+  again. The erase is what makes the event true exactly once.

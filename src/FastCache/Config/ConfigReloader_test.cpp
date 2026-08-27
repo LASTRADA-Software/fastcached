@@ -157,6 +157,53 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[conf
     REQUIRE(result.error().field == "storage-durability");
 }
 
+TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "[config][reload][regression]")
+{
+    // `ExpiryReaper` is built once, with the pacing and the ceilings it will
+    // use for the life of the process, on the reactor whose loop drives it.
+    // Nothing hands it new ones -- so a SIGHUP accepted here would leave
+    // `reloader.Current()` reporting a sweep interval the daemon is not
+    // sweeping at, which is exactly the split-brain the storage and listener
+    // fields above reject.
+    auto const path = WriteYaml("expiry-immutable",
+                                "bind: 127.0.0.1\n"
+                                "port: 11740\n"
+                                "max_memory: 1024\n"
+                                "active_expiry_interval_ms: 1000\n");
+    FastCache::Config initial {
+        .maxMemoryBytes = 1024,
+        .bindAddress = "127.0.0.1",
+        .configPath = path.string(),
+        .port = 11740,
+    };
+    FastCache::ConfigReloader reloader { initial, path };
+
+    // Turning the cycle off at runtime is the change an operator would most
+    // plausibly try, and the one that would look most like it had worked.
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "bind: 127.0.0.1\nport: 11740\nmax_memory: 1024\nactive_expiry_interval_ms: 0\n";
+    }
+
+    auto const result = reloader.Reload();
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+    REQUIRE(result.error().field == "expiry-interval");
+    REQUIRE(reloader.Current()->activeExpiryIntervalMs == FastCache::DefaultActiveExpiryIntervalMs);
+
+    // The scan budget is its own field and its own rejection, so a change to it
+    // cannot ride in unnoticed behind an unchanged interval.
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "bind: 127.0.0.1\nport: 11740\nmax_memory: 1024\nactive_expiry_scan: 64\n";
+    }
+
+    auto const scanResult = reloader.Reload();
+    REQUIRE_FALSE(scanResult.has_value());
+    REQUIRE(scanResult.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+    REQUIRE(scanResult.error().field == "expiry-scan");
+}
+
 TEST_CASE("ConfigReloader::Reload rejects changes to listeners (binds vector)", "[config][reload][regression]")
 {
     // Finding #7: pre-fix, ValidateImmutable did not check the new

@@ -126,6 +126,8 @@ namespace
         for (auto& s: servers)
             runAccept(s.get());
 
+        auto const expiry = Detail::StartExpiryCycle(reactor, engine, logger, options, metrics);
+
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
             for (auto& s: servers)
@@ -327,6 +329,8 @@ namespace
         };
         auto watchdog = MakeWatchdog(watchdogQuit, stopAll);
 
+        auto const expiry = Detail::StartExpiryCycle(*reactors[0], engine, logger, options, metrics);
+
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
@@ -447,6 +451,8 @@ namespace
             reactors[index]->Run();
         };
 
+        auto const expiry = Detail::StartExpiryCycle(*reactors[0], engine, logger, options, metrics);
+
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
@@ -496,6 +502,14 @@ int RunReactorServer(ReactorServerOptions const& options,
 
 namespace Detail
 {
+
+    std::unique_ptr<ExpiryReaper> StartExpiryCycle(
+        IReactor& reactor, CacheEngine& engine, ILogger& logger, ReactorServerOptions const& options, IMetricsSink* metrics)
+    {
+        auto reaper = std::make_unique<ExpiryReaper>(engine.Storage(), logger, options.expiry, metrics);
+        reaper->Start(reactor);
+        return reaper;
+    }
 
     int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger)
     {

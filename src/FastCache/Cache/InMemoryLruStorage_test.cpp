@@ -6,8 +6,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <tuple>
@@ -350,11 +353,105 @@ TEST_CASE("InMemoryLruStorage counts expired_unfetched only for never-read victi
     REQUIRE(storage.Get("k1", clock.Now())->found); // k1 fetched before it expires
 
     clock.Advance(2s);
-    auto const purged = storage.PurgeExpired(clock.Now());
+    auto const purged = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 2U);
 
     auto const stats = storage.Snapshot();
     REQUIRE(stats.expiredUnfetched == 1U); // only the unread k2
+}
+
+TEST_CASE("InMemoryLruStorage: a bounded sweep resumes instead of restarting", "[cache][purge]")
+{
+    // Live entries at the FRONT of the LRU (written last), lapsed ones behind
+    // them. A sweep that restarted at the front every cycle would spend its
+    // whole budget on the live entries and never reach the lapsed ones -- which
+    // on any cache bigger than one budget means the far end never expires at
+    // all. That is the bug the cursor exists to prevent, so the fixture is
+    // built to fail without it rather than merely to pass with it.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+
+    constexpr std::size_t Lapsed = 3;
+    constexpr std::size_t Live = 4;
+    for (auto const i: std::views::iota(std::size_t { 0 }, Lapsed))
+        REQUIRE(storage.Set(std::format("lapsed-{}", i), MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    for (auto const i: std::views::iota(std::size_t { 0 }, Live))
+        REQUIRE(storage.Set(std::format("live-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    clock.Advance(2s);
+
+    auto const first = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = Live });
+    CHECK(first.scanned == Live);
+    CHECK(first.purged == 0U); // Every entry in reach is still alive.
+    CHECK_FALSE(first.completedPass);
+
+    auto const second = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = Lapsed });
+    CHECK(second.purged == Lapsed); // Reached only because the cursor persisted.
+    CHECK(storage.Snapshot().itemCount == Live);
+}
+
+TEST_CASE("InMemoryLruStorage: completing a pass is reported apart from the counts", "[cache][purge]")
+{
+    // "Nothing left to expire" and "I ran out of budget" both purge zero, and a
+    // caller that pauses on the first must not pause on the second.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    for (auto const i: std::views::iota(0, 4))
+        REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+
+    CHECK(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).completedPass);
+    CHECK_FALSE(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 2 }).completedPass);
+
+    // An empty tier completes trivially rather than reporting itself unfinished.
+    FastCache::InMemoryLruStorage const empty;
+    CHECK(FastCache::InMemoryLruStorage {}
+              .PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 8 })
+              .completedPass);
+}
+
+TEST_CASE("InMemoryLruStorage: the reclaim ceiling leaves the victim for the next sweep", "[cache][purge]")
+{
+    // The reclaim ceiling is what keeps a sweep from reclaiming more keys than
+    // the notification buffer can hold. Stopping has to LEAVE the entry it
+    // stopped on: counting it as scanned would let a later pass report itself
+    // complete having walked past a key it never dealt with.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    for (auto const i: std::views::iota(0, 3))
+        REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    clock.Advance(2s);
+
+    auto const first = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxPurged = 1 });
+    CHECK(first.purged == 1U);
+    CHECK(first.scanned == 1U);
+    CHECK_FALSE(first.completedPass);
+    CHECK(storage.Snapshot().itemCount == 2U);
+
+    CHECK(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxPurged = 1 }).purged == 1U);
+    CHECK(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    CHECK(storage.Snapshot().itemCount == 0U);
+}
+
+TEST_CASE("InMemoryLruStorage: erasing the entry the sweep is parked on does not dangle it", "[cache][purge]")
+{
+    // The cursor outlives the call that produced it, so an erase arriving from
+    // anywhere else -- a client DELETE, an eviction, a lazy read-time purge --
+    // can be an erase of the exact node it holds. `EraseAt` is the one place
+    // that can happen and the one place that fixes it up; this is the case that
+    // is a use-after-free without it, which a sanitizer build reports directly
+    // and this assertion catches either way.
+    FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
+    for (auto const i: std::views::iota(0, 6))
+        REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+
+    // Park the cursor: one scanned entry, nothing purged (all still alive). The
+    // LRU is newest-first, so the cursor now sits on `k-4`.
+    CHECK(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 }).purged == 0U);
+    REQUIRE(storage.Delete("k-4", clock.Now()).has_value());
+
+    clock.Advance(2s);
+    CHECK(storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 5U);
+    CHECK(storage.Snapshot().itemCount == 0U);
 }
 
 TEST_CASE("InMemoryLruStorage Peek is non-mutating", "[cache][peek]")

@@ -308,7 +308,7 @@ class CowTreeStorage final: public IStorage
                                                                      TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Report this tier's reclaims — TTLs found lapsed during a sweep, and the
     /// LRU tail dropped to stay under the on-disk budget — to `log`.
@@ -379,6 +379,52 @@ class CowTreeStorage final: public IStorage
 
     /// Erase the entry from the tree.
     [[nodiscard]] std::expected<void, StorageError> EraseEntry(std::string_view key);
+
+    /// Reclaim a record a write path has just found dead, and report it.
+    ///
+    /// The disk tier's answer to what `InMemoryLruStorage::FindAlive` does for
+    /// the in-memory one. Every write verb here loads the record, finds its TTL
+    /// lapsed or its generation stale, and reports a miss -- and used to leave
+    /// the record exactly where it was. Two things followed, and both were
+    /// visible to a client: the dead bytes stayed on disk until a sweep or a
+    /// `DELETE` reached them, and the same client sequence produced a different
+    /// event stream depending on `--storage`, because the in-memory tier
+    /// reclaims and reports from every lookup.
+    ///
+    /// Only a write path may call this. A read (`Get`, `Peek`) may hold nothing
+    /// but a shared lock, and opening a write transaction there would break
+    /// CowTree's single-writer contract -- which is why those two still leave a
+    /// dead record for the sweep, and why the asymmetry is now one of timing
+    /// rather than of whether it happens at all.
+    ///
+    /// A stale generation is reclaimed silently: FLUSHDB fired its own event,
+    /// and naming the key `expired` on top of that reports a TTL that never
+    /// passed.
+    /// @param key   The record's key. Must not alias the LRU node's own string.
+    /// @param entry The record as loaded, already known to be dead.
+    /// @param now   Current clock value; decides lapsed from merely flushed.
+    void ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, TimePoint now);
+
+    /// Decide a write path's existence check, reclaiming whatever it finds dead.
+    ///
+    /// The one spelling of "is there a record here I may act on?" for every
+    /// verb that loads before it writes, so the reclaim above cannot be
+    /// remembered at four sites and forgotten at a fifth. `Add` asks the same
+    /// question and acts on the opposite answer.
+    /// Returns the record itself rather than a yes/no, so a caller reaches it
+    /// without a second `*loaded` dereference the guard no longer covers --
+    /// which is both what the caller wanted and what keeps
+    /// `bugprone-unchecked-optional-access` satisfied that the optional was
+    /// checked.
+    /// @param key    The record's key.
+    /// @param loaded What `LoadEntry` returned for it; borrowed, and the
+    ///        returned pointer names storage inside it.
+    /// @param now    Current clock value.
+    /// @return The record this verb may operate on, or nullptr when there is
+    ///         none -- absent, TTL lapsed, or voided by a flush. In the latter
+    ///         two a dead record has already been erased, and reported when its
+    ///         TTL was what killed it.
+    [[nodiscard]] CacheEntry* AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry>& loaded, TimePoint now);
 
     /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
     /// record for `key`, rewriting ONLY the leaf record and REUSING any existing
@@ -590,7 +636,27 @@ class CowTreeStorage final: public IStorage
     using LruList = std::list<LruNode>;
     using Iterator = LruList::iterator;
 
+    /// Drop the mirror node `it` names: byte accounting, index, list.
+    ///
+    /// The single erase point for the mirror, which `_sweepCursor` requires:
+    /// it is the one iterator that outlives the call which produced it, so a
+    /// second place that erased a node would be a second place that could
+    /// leave the cursor dangling -- and the one to forget the fix-up would be
+    /// whichever is written next.
+    /// @param it Mirror node to drop. Must be dereferenceable.
+    void EraseNode(Iterator it);
+
     LruList _lru;
+
+    /// Where the next bounded `PurgeExpired` resumes. See the identically
+    /// named member on `InMemoryLruStorage` for why a sweep needs one; this
+    /// tier additionally pays a disk read per entry examined, so the budget
+    /// that cursor serves matters more here, not less.
+    ///
+    /// Declared after `_lru` so the default member initialiser below reads an
+    /// already-constructed list.
+    Iterator _sweepCursor { _lru.end() };
+
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
 
     std::size_t _bytesUsed { 0 };

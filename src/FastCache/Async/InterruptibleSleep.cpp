@@ -2,8 +2,6 @@
 #include <FastCache/Async/InterruptibleSleep.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
 
-#include <algorithm>
-
 namespace FastCache
 {
 
@@ -27,11 +25,7 @@ Task<WakeReason> InterruptibleSleepUntil(IReactor* reactor, CancellationToken to
         if (now >= deadline)
             co_return WakeReason::Deadline;
 
-        // A non-positive bound means "do not poll", not "spin": a zero-length
-        // step resolves as already-ready and would turn this loop into a busy
-        // reactor thread.
-        auto const step = wakeBound > Duration::zero() ? std::min(deadline, now + wakeBound) : deadline;
-        co_await SleepUntil { .reactor = reactor, .deadline = step };
+        co_await SleepUntil { .reactor = reactor, .deadline = NextWakeStep(now, deadline, wakeBound) };
 
         if (token.IsCancelled())
             co_return WakeReason::Cancelled;

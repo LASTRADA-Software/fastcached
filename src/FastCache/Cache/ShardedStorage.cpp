@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <shared_mutex>
 #include <stdexcept>
 #include <utility>
@@ -368,14 +369,41 @@ void ShardedStorage::FlushWithGeneration(TimePoint effectiveAt)
     }
 }
 
-std::size_t ShardedStorage::PurgeExpired(TimePoint now)
+PurgeOutcome ShardedStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    std::size_t total = 0;
-    for (auto& shard: _shards)
+    PurgeOutcome total {};
+    auto const shardCount = _shards.size();
+    auto const start = _sweepShard.load(std::memory_order_relaxed);
+
+    // The budget is spent across shards in order rather than divided among
+    // them: dividing would floor to zero the moment the budget is smaller than
+    // the shard count, and a sweep that examines nothing at all is worse than
+    // one that examines a few shards properly and rotates.
+    std::size_t visited = 0;
+    for (auto const step: std::views::iota(std::size_t { 0 }, shardCount))
     {
+        if (budget.ScanExhausted(total.scanned) || budget.PurgeExhausted(total.purged))
+        {
+            // Out of budget with shards still unvisited. Their entries have not
+            // been examined, so this pass did not cover the keyspace.
+            total.completedPass = false;
+            break;
+        }
+
+        auto& shard = _shards[(start + step) % shardCount];
         std::unique_lock const lock { shard->mu };
-        total += shard->storage->PurgeExpired(now);
+        auto const outcome = shard->storage->PurgeExpired(now, budget.Remaining(total.scanned, total.purged));
+        total.scanned += outcome.scanned;
+        total.purged += outcome.purged;
+        total.completedPass = total.completedPass && outcome.completedPass;
+        ++visited;
     }
+
+    // Advanced past everything visited, so the next sweep begins where this one
+    // ran out. A shard left mid-pass keeps its own cursor, so nothing is lost
+    // by moving on -- it resumes exactly where it stopped one rotation later.
+    if (shardCount != 0)
+        _sweepShard.store((start + visited) % shardCount, std::memory_order_relaxed);
     return total;
 }
 

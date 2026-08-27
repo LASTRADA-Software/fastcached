@@ -101,6 +101,11 @@ CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, Ti
 
 void InMemoryLruStorage::EraseAt(Iterator it)
 {
+    // Advanced rather than reset: dropping the sweep back to begin() on every
+    // eviction would restart the pass on a cache under memory pressure, which
+    // is exactly the workload where it matters that the pass finishes.
+    if (_sweepCursor == it)
+        ++_sweepCursor;
     _bytesUsed -= it->entry.ValueSize();
     _index.erase(it->key);
     _lru.erase(it);
@@ -548,28 +553,61 @@ void InMemoryLruStorage::FlushWithGeneration(TimePoint effectiveAt)
     ++_stats.cmdFlush;
 }
 
-std::size_t InMemoryLruStorage::PurgeExpired(TimePoint now)
+PurgeOutcome InMemoryLruStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    std::size_t purged = 0;
-    auto it = _lru.begin();
-    while (it != _lru.end())
+    FC_ZONE_SCOPED_N("LruStorage::PurgeExpired");
+
+    // A full pass is `startSize` steps from wherever the last one stopped,
+    // wrapping once at the end -- which examines every entry that was here when
+    // the call began, whether or not the cursor happened to start at the front.
+    // Sizing the pass up front rather than testing against `_lru.end()` in the
+    // loop is what makes "did I see everything?" answerable at all: the loop
+    // erases as it goes, so the end keeps moving.
+    auto const startSize = _lru.size();
+    auto const scanLimit = budget.ScanLimitOver(startSize);
+    PurgeOutcome outcome { .completedPass = scanLimit >= startSize };
+
+    while (outcome.scanned < scanLimit)
     {
-        auto const next = std::next(it);
-        if (!IsAlive(it->entry, _liveGeneration, now))
+        if (_sweepCursor == _lru.end())
         {
-            // Conditioned on the TTL, not on liveness: see FindAlive above.
-            if (it->entry.expiry <= now)
-            {
-                if (!it->entry.fetched)
-                    ++_stats.expiredUnfetched;
-                RecordReclaim(_reclaim, MutationKind::Expire, it->key);
-            }
-            EraseAt(it);
-            ++purged;
+            _sweepCursor = _lru.begin();
+            if (_sweepCursor == _lru.end())
+                break; // The sweep emptied the list.
         }
-        it = next;
+
+        // Advanced BEFORE the erase below, so this loop never dangles its own
+        // cursor and `EraseAt`'s fix-up is left to handle only the erases that
+        // arrive from somewhere else.
+        auto const victim = _sweepCursor++;
+        if (IsAlive(victim->entry, _liveGeneration, now))
+        {
+            ++outcome.scanned;
+            continue;
+        }
+
+        if (budget.PurgeExhausted(outcome.purged))
+        {
+            // Out of reclaim budget holding a victim. Rewind onto it and leave
+            // it where it is: counting it as scanned would let the pass report
+            // completion having walked past an entry it never dealt with.
+            _sweepCursor = victim;
+            outcome.completedPass = false;
+            return outcome;
+        }
+
+        // Conditioned on the TTL, not on liveness: see FindAlive above.
+        if (victim->entry.expiry <= now)
+        {
+            if (!victim->entry.fetched)
+                ++_stats.expiredUnfetched;
+            RecordReclaim(_reclaim, MutationKind::Expire, victim->key);
+        }
+        EraseAt(victim);
+        ++outcome.scanned;
+        ++outcome.purged;
     }
-    return purged;
+    return outcome;
 }
 
 void InMemoryLruStorage::SetReclaimLog(IReclaimLog* log)

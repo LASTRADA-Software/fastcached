@@ -15,7 +15,7 @@
 # the daemon REJECT the whole reload and keep its previous configuration
 # (the reason is logged to the journal). Use `systemctl restart` instead:
 # bind, port, listeners, storage_path, storage_shards, storage_durability,
-# storage_max_value, threads.
+# storage_max_value, threads, active_expiry_interval_ms, active_expiry_scan.
 #
 # Command-line flags override this file. Add them with a drop-in:
 #   systemctl edit fastcached
@@ -72,6 +72,20 @@
 #   approximate  reads run concurrently, eviction is approximately LRU (faster)
 #   strict       exact LRU order, but same-shard reads serialise
 #lru_mode: approximate
+
+# --- Expiry -----------------------------------------------------------------
+
+# How often the active expiry cycle sweeps for entries whose TTL has lapsed,
+# in milliseconds. redis's `hz` is the analogue. 0 disables the cycle, leaving
+# expiry entirely access-driven: an untouched key that lapses then keeps its
+# memory until eviction reaches it and publishes no `expired` keyspace event.
+# The cycle backs off towards 30s while it finds nothing to reclaim.
+#active_expiry_interval_ms: 1000
+
+# Entries one sweep examines per shard before it stops and resumes next time.
+# This is the bound on how long a sweep holds a shard's exclusive lock, so the
+# cost of a cycle is fixed rather than proportional to how much is cached.
+#active_expiry_scan: 512
 
 # --- Concurrency ------------------------------------------------------------
 

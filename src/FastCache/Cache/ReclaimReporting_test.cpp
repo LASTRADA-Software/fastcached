@@ -15,11 +15,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -60,6 +62,53 @@ class AlwaysListening final: public IStorageMutationObserver
 {
     return std::vector<std::byte>(bytes);
 }
+
+/// A verb that loads a record before it writes, and the name a failure reports.
+struct ReclaimingVerb
+{
+    std::string_view name;                                               ///< For the failure message.
+    void (*invoke)(IStorage& tier, std::string_view key, TimePoint now); ///< Runs it, outcome ignored.
+};
+
+/// Every such verb. Each must reclaim a record it finds lapsed and say so, on
+/// whichever backend an operator configured -- so the table is the list, and a
+/// verb added without a reclaim fails here rather than in the field.
+auto const ReclaimingVerbs = std::to_array<ReclaimingVerb>({
+    { .name = "delete",
+      .invoke = [](IStorage& tier, std::string_view key, TimePoint now) { std::ignore = tier.Delete(key, now); } },
+    { .name = "add",
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   TimePoint now) { std::ignore = tier.Add(key, Value(8), 0, TimePoint::max(), now); } },
+    { .name = "replace",
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   TimePoint now) { std::ignore = tier.Replace(key, Value(8), 0, TimePoint::max(), now); } },
+    { .name = "append",
+      .invoke =
+          [](IStorage& tier, std::string_view key, TimePoint now) {
+              auto const suffix = Value(4);
+              std::ignore = tier.Append(key, suffix, 0, now);
+          } },
+    { .name = "prepend",
+      .invoke =
+          [](IStorage& tier, std::string_view key, TimePoint now) {
+              auto const prefix = Value(4);
+              std::ignore = tier.Prepend(key, prefix, 0, now);
+          } },
+    { .name = "cas",
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   TimePoint now) { std::ignore = tier.CompareAndSwap(key, 1, Value(8), 0, TimePoint::max(), now); } },
+    { .name = "incr",
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   TimePoint now) { std::ignore = tier.IncrementOrInitialize(key, 1, false, now); } },
+    { .name = "touch",
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   TimePoint now) { std::ignore = tier.Touch(key, TimePoint::max(), now); } },
+});
 
 } // namespace
 
@@ -123,7 +172,7 @@ TEST_CASE("A generation flush is not reported as an expiry", "[cache][reclaim-re
 
     REQUIRE(lru.Set("kept", Value(8), 0, TimePoint::max()).has_value());
     lru.FlushWithGeneration(TimePoint {});
-    REQUIRE(lru.PurgeExpired(TimePoint {}) == 1);
+    REQUIRE(lru.PurgeExpired(TimePoint {}, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log).empty());
 }
 
@@ -139,7 +188,7 @@ TEST_CASE("A sweep reports the entries whose TTL had passed", "[cache][reclaim-r
     REQUIRE(lru.Set("gone", Value(8), 0, expiry).has_value());
     REQUIRE(lru.Set("stays", Value(8), 0, TimePoint::max()).has_value());
 
-    REQUIRE(lru.PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE(lru.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
 
@@ -177,40 +226,53 @@ TEST_CASE("ShardedStorage routes the log to every shard", "[cache][reclaim-repor
     REQUIRE(std::ranges::all_of(names, [](auto const& n) { return n.starts_with("evict:"); }));
 }
 
-TEST_CASE("Deleting a key whose TTL had passed reports the expiry, on both backends", "[cache][reclaim-reporting]")
+TEST_CASE("Every write verb reclaims the lapsed record it finds, on both backends", "[cache][reclaim-reporting]")
 {
     // The same client sequence must not produce different events depending on
-    // which backend is configured.
+    // which backend is configured -- so the two tiers are asserted against each
+    // other rather than against a hand-written expectation per verb.
+    //
+    // The disk tier used to reject a lapsed record on every one of these paths
+    // and leave it exactly where it was, because the rule was written for the
+    // READ paths, where only a shared lock is held and opening a write
+    // transaction would break CowTree's single-writer contract. These verbs all
+    // hold the exclusive lock, so the rule never applied to them: the cost was
+    // dead bytes on disk until a sweep or a DELETE reached them, and an
+    // `expired` event a subscriber got in memory and not on disk.
+    FastCache::Testing::ScratchDirectory const dir { "reclaim-write-paths" };
     auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
     auto const later = expiry + std::chrono::seconds { 1 };
 
-    SECTION("in memory")
+    for (auto const& verb: ReclaimingVerbs)
     {
+        INFO("verb: " << verb.name);
         AlwaysListening obs;
-        ReclaimLog log { &obs };
+
+        ReclaimLog memoryLog { &obs };
         InMemoryLruStorage lru;
-        lru.SetReclaimLog(&log);
-
+        lru.SetReclaimLog(&memoryLog);
         REQUIRE(lru.Set("doomed", Value(8), 0, expiry).has_value());
-        REQUIRE_FALSE(lru.Delete("doomed", later).has_value());
-        REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:doomed" });
-    }
+        REQUIRE(DrainNames(memoryLog).empty());
+        verb.invoke(lru, "doomed", later);
+        CHECK(DrainNames(memoryLog) == std::vector<std::string> { "expire:doomed" });
 
-    SECTION("on disk")
-    {
-        FastCache::Testing::ScratchDirectory const dir { "reclaim-cow-delete" };
         CowTreeStorage::Options opts;
-        opts.path = dir / "tier.cow";
+        opts.path = dir / (std::string { verb.name } + ".cow");
         auto tier = CowTreeStorage::Open(opts);
         REQUIRE(tier.has_value());
-
-        AlwaysListening obs;
-        ReclaimLog log { &obs };
-        (*tier)->SetReclaimLog(&log);
-
+        ReclaimLog diskLog { &obs };
+        (*tier)->SetReclaimLog(&diskLog);
         REQUIRE((*tier)->Set("doomed", Value(8), 0, expiry).has_value());
-        REQUIRE_FALSE((*tier)->Delete("doomed", later).has_value());
-        REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:doomed" });
+        REQUIRE(DrainNames(diskLog).empty());
+        verb.invoke(**tier, "doomed", later);
+        CHECK(DrainNames(diskLog) == std::vector<std::string> { "expire:doomed" });
+
+        // Reported is only half of it: a record left behind would fire
+        // `expired` again on the next verb that reached it, which is why
+        // reporting without erasing would have been worse than neither. The
+        // in-memory tier's count is the reference -- `add` leaves the new
+        // record it just wrote, everything else leaves nothing.
+        CHECK((*tier)->Snapshot().itemCount == lru.Snapshot().itemCount);
     }
 }
 
@@ -305,7 +367,7 @@ TEST_CASE("A LayeredStorage still reports an L2 expiry", "[cache][reclaim-report
 
     auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(layered.Set("gone", Value(8), 0, expiry).has_value());
-    REQUIRE(layered.PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE(layered.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
 
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
@@ -348,7 +410,7 @@ TEST_CASE("The disk tier's sweep reports only the entries whose TTL had passed",
     REQUIRE((*tier)->Set("gone", Value(8), 0, expiry).has_value());
     REQUIRE((*tier)->Set("stays", Value(8), 0, TimePoint::max()).has_value());
 
-    REQUIRE((*tier)->PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE((*tier)->PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
 

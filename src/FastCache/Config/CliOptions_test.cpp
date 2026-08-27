@@ -69,6 +69,8 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--threads", .value = "4" },
     { .flag = "--listen-backlog", .value = "128" },
     { .flag = "--storage-shards", .value = "2" },
+    { .flag = "--expiry-interval", .value = "250" },
+    { .flag = "--expiry-scan", .value = "64" },
     { .flag = "--daemon", .value = "" },
     { .flag = "--install-service", .value = "" },
     { .flag = "--uninstall-service", .value = "" },

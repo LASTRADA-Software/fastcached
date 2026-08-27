@@ -4,6 +4,7 @@
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <coroutine>
 
@@ -51,6 +52,33 @@ struct SleepUntil
 
     void await_resume() const noexcept {}
 };
+
+/// The next instant a bounded wait should sleep to on its way to `deadline`.
+///
+/// The one place the polling rule is written down. `IReactor::Schedule` cannot
+/// be cancelled, so a wait that must ALSO be woken by something else sleeps in
+/// steps no longer than `wakeBound` and re-reads its own condition at each one
+/// -- which is what makes the sleeping frame *be* the wait, leaving nothing
+/// parked behind it when the reactor stops.
+///
+/// Three waits do this (`InterruptibleSleepUntil`, `DeadlineTimer`,
+/// `ExpiryReaper`) and each has to inline its own loop rather than delegate it,
+/// because awaiting a nested `Task` parks the INNER coroutine's handle and the
+/// handle a teardown has to name would then not be the caller's own. The
+/// arithmetic is the part they can share, and it had drifted into three copies.
+///
+/// A non-positive `wakeBound` means "do not poll", not "spin": a zero-length
+/// step resolves as already-ready and would turn the loop into a busy reactor
+/// thread, so it sleeps straight through to the deadline instead.
+/// @param now       Current clock value.
+/// @param deadline  Absolute instant the wait ends at.
+/// @param wakeBound Longest single uninterruptible sleep; non-positive for one
+///                  sleep straight through.
+/// @return The instant to sleep to next; never past `deadline`.
+[[nodiscard]] constexpr TimePoint NextWakeStep(TimePoint now, TimePoint deadline, Duration wakeBound) noexcept
+{
+    return wakeBound > Duration::zero() ? std::min(deadline, now + wakeBound) : deadline;
+}
 
 /// Build a `SleepUntil` for a relative delay measured from the reactor's
 /// current clock value — the ergonomic form for callers that think in

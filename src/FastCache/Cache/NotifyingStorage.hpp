@@ -42,11 +42,12 @@ namespace FastCache
 ///      (`IReclaimLog`), this decorator drains that once their call has
 ///      returned, and `RedisMutationObserver` publishes it.
 ///
-///      What reclamation does NOT do is run on a timer: nothing calls
-///      `PurgeExpired` periodically, and with the default `Approximate`
-///      LRU a read does not erase either. So a key that lapses and is
-///      never touched again is reported when something touches it, and an
-///      untouched key is not reported at all.
+///      Reclamation also runs on a timer, so a key that lapses and is
+///      never touched again is still reported: `ExpiryReaper` drives a
+///      bounded `PurgeExpired` from the reactor. Without it expiry was
+///      entirely access-driven — and with the default `Approximate` LRU a
+///      read does not erase either, so an untouched key was never reported
+///      at all.
 ///
 ///   3. `FLUSHDB` / `flush_all` wiped the entire keyspace without
 ///      firing the canonical `__keyevent@0__:flushdb` event or
@@ -141,7 +142,7 @@ class NotifyingStorage final: public IStorage
         TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Keep `log` **and** forward it to the inner storage.
     ///

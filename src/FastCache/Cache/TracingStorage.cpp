@@ -351,9 +351,9 @@ void TracingStorage::FlushWithGeneration(TimePoint effectiveAt)
     }
 }
 
-std::size_t TracingStorage::PurgeExpired(TimePoint now)
+PurgeOutcome TracingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    return _inner.PurgeExpired(now);
+    return _inner.PurgeExpired(now, budget);
 }
 
 void TracingStorage::SetReclaimLog(IReclaimLog* log)

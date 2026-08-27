@@ -709,7 +709,7 @@ TEST_CASE("CowTreeStorage Touch preserves the fetched bit (a touch is not a read
     REQUIRE((*storage)->Touch("k", clock.Now() + 1s, clock.Now()).has_value()); // must keep fetched
 
     clock.Advance(2s);
-    REQUIRE((*storage)->PurgeExpired(clock.Now()) == 1U);
+    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
     REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
 }
 
@@ -728,7 +728,7 @@ TEST_CASE("CowTreeStorage MarkStale preserves the fetched bit", "[cowstorage][st
     REQUIRE((*storage)->MarkStale("k", std::nullopt, clock.Now()).has_value()); // must keep fetched
 
     clock.Advance(2s);
-    REQUIRE((*storage)->PurgeExpired(clock.Now()) == 1U);
+    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
     REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
 }
 
@@ -878,7 +878,7 @@ TEST_CASE("Get on an expired entry does NOT mutate the tree (no BeginWrite from 
     }
 
     // PurgeExpired should now report 1 victim and remove it.
-    auto const purged = (*storage)->PurgeExpired(clock.Now());
+    auto const purged = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 1U);
 
     auto after = (*storage)->Get("k", clock.Now());
@@ -901,7 +901,7 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
         REQUIRE((*storage)->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     clock.Advance(10ms);
-    auto const purged = (*storage)->PurgeExpired(clock.Now());
+    auto const purged = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 6U);
 
     for (int i = 0; i < 4; ++i)
@@ -910,6 +910,43 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
+}
+
+TEST_CASE("PurgeExpired on the disk tier is bounded and resumes", "[cowstorage][purge]")
+{
+    // Every step here additionally costs a `LoadEntry`, so an unbounded sweep
+    // over a large store is a disk read per key while the tier's lock is held.
+    // The ceiling makes that a fixed cost per cycle, and the cursor is what
+    // stops a fixed cost per cycle from meaning "only ever the same keys".
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts { .path = tmp.path };
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    // Written first, so the newest-first mirror leaves them BEHIND the live
+    // ones -- out of reach of a sweep that restarted at the front each cycle.
+    for (auto const i: std::views::iota(0, 3))
+        REQUIRE((*storage)->Set(std::format("expire-{}", i), MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+    for (auto const i: std::views::iota(0, 4))
+        REQUIRE((*storage)->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    clock.Advance(10ms);
+
+    auto const first = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 4 });
+    CHECK(first.scanned == 4U);
+    CHECK(first.purged == 0U);
+    CHECK_FALSE(first.completedPass);
+
+    auto const second = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 3 });
+    CHECK(second.purged == 3U);
+
+    for (auto const i: std::views::iota(0, 4))
+    {
+        auto const got = (*storage)->Get(std::format("keep-{}", i), clock.Now());
+        REQUIRE(got.has_value());
+        CHECK(got->found);
+    }
+    CHECK((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).completedPass);
 }
 
 // ============================================================================

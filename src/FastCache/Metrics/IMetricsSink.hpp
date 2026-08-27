@@ -198,6 +198,23 @@ class IMetricsSink
         /// on a large cache.
         KeyspaceReclaimEventsDropped,
 
+        /// Sweeps the active expiry cycle has run.
+        ///
+        /// The denominator for the line below, and on its own the answer to "is
+        /// the cycle running at all" -- which is otherwise indistinguishable
+        /// from "nothing has expired", since both publish no events and reclaim
+        /// nothing. A flat count here on a daemon serving traffic means the
+        /// cycle is disabled or wedged.
+        ExpiryCycles,
+        /// Entries the active expiry cycle reclaimed.
+        ///
+        /// Keys that lapsed and that no client would ever have touched again,
+        /// so nothing else would have reclaimed them. Rising here alongside a
+        /// rising `KeyspaceReclaimEventsDropped` means the sweep is finding
+        /// more per cycle than the notification buffer can carry, and the
+        /// `expired` events for the excess are being lost.
+        ExpiryKeysReclaimed,
+
         Last,
     };
 

@@ -120,9 +120,9 @@ class StubStorage final: public FastCache::IStorage
         return FastCache::CasToken { 1 };
     }
     void FlushWithGeneration(FastCache::TimePoint /*effectiveAt*/) override {}
-    std::size_t PurgeExpired(FastCache::TimePoint /*now*/) override
+    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint /*now*/, FastCache::PurgeBudget /*budget*/) override
     {
-        return 0;
+        return {};
     }
     void Resize(std::size_t /*newMaxBytes*/) override {}
     [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override

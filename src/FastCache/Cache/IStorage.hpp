@@ -7,6 +7,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -184,6 +185,91 @@ constexpr void AddInto(TieredStorageStats& total, TieredStorageStats const& adde
         AddInto(*into, *from);
     }
 }
+
+/// How much work one `IStorage::PurgeExpired` call may do.
+///
+/// A sweep with no ceiling walks the whole keyspace holding the tier's
+/// exclusive lock, so running one periodically -- which is the only way an
+/// untouched key that lapses is ever reclaimed -- would be a periodic latency
+/// spike proportional to how much is cached. Both numbers are ceilings rather
+/// than targets: a sweep stops at whichever it reaches first, says so, and the
+/// next sweep resumes from where it stopped instead of starting over.
+struct PurgeBudget
+{
+    /// Entries this sweep may examine. 0 means no ceiling.
+    std::size_t maxScanned { 0 };
+
+    /// Entries this sweep may reclaim. 0 means no ceiling.
+    ///
+    /// Bounded separately from `maxScanned` because the two protect different
+    /// things. Scanning is the lock hold; reclaiming is the notification
+    /// buffer: a tier names every key it reclaims in its `IReclaimLog`, and
+    /// `ReclaimLog` drops past its capacity and counts the drops. A sweep
+    /// allowed to reclaim more than that buffer holds would discard the very
+    /// `expired` events it runs to produce.
+    std::size_t maxPurged { 0 };
+
+    /// No ceiling on either count -- the whole keyspace, in one call.
+    ///
+    /// Spelled out at the call site rather than reached by a default argument,
+    /// because a default argument on a virtual is taken from the STATIC type:
+    /// the same call would mean different things through a base reference and
+    /// through the concrete tier.
+    /// @return An unbounded budget.
+    [[nodiscard]] static constexpr PurgeBudget Unbounded() noexcept
+    {
+        return PurgeBudget {};
+    }
+
+    /// @param scanned Entries examined so far.
+    /// @return True when no further entry may be examined.
+    [[nodiscard]] constexpr bool ScanExhausted(std::size_t scanned) const noexcept
+    {
+        return maxScanned != 0 && scanned >= maxScanned;
+    }
+
+    /// @param purged Entries reclaimed so far.
+    /// @return True when no further entry may be reclaimed.
+    [[nodiscard]] constexpr bool PurgeExhausted(std::size_t purged) const noexcept
+    {
+        return maxPurged != 0 && purged >= maxPurged;
+    }
+
+    /// How many entries a pass over `available` of them may actually examine.
+    /// @param available Entries the tier holds.
+    /// @return `available` when unbounded, else the smaller of the two.
+    [[nodiscard]] constexpr std::size_t ScanLimitOver(std::size_t available) const noexcept
+    {
+        return maxScanned == 0 ? available : std::min(maxScanned, available);
+    }
+
+    /// What is left of this budget once the given counts have been spent, in
+    /// the same spelling -- so a remainder can be handed straight to a nested
+    /// tier without the sentinel having to be re-derived there.
+    /// @param scanned Entries examined so far.
+    /// @param purged  Entries reclaimed so far.
+    /// @return A budget for the rest of the call.
+    [[nodiscard]] constexpr PurgeBudget Remaining(std::size_t scanned, std::size_t purged) const noexcept
+    {
+        return PurgeBudget { .maxScanned = maxScanned == 0 ? 0 : maxScanned - scanned,
+                             .maxPurged = maxPurged == 0 ? 0 : maxPurged - purged };
+    }
+};
+
+/// What one `IStorage::PurgeExpired` call did.
+struct PurgeOutcome
+{
+    std::size_t scanned { 0 }; ///< Entries examined.
+    std::size_t purged { 0 };  ///< Entries reclaimed.
+
+    /// Every entry the tier held when the call began was examined.
+    ///
+    /// This is what separates "there is nothing left to expire" from "I ran out
+    /// of budget", which is the difference between a caller backing off and a
+    /// caller coming straight back. A tier with nothing in it completes
+    /// trivially.
+    bool completedPass { true };
+};
 
 /// Declared rather than included: only `SetReclaimLog` mentions it, by pointer,
 /// and `Cache/IReclaimLog.hpp` pulls in the mutation-observer vocabulary that
@@ -492,8 +578,22 @@ class IStorage
     /// before effectiveAt are dropped lazily once `now >= effectiveAt`.
     virtual void FlushWithGeneration(TimePoint effectiveAt) = 0;
 
-    /// Purge any entries whose expiry has passed. Returns the number purged.
-    virtual std::size_t PurgeExpired(TimePoint now) = 0;
+    /// Purge entries whose expiry has passed, doing at most `budget` worth of work.
+    ///
+    /// **Resumable.** An implementation that stops on a ceiling remembers where
+    /// it stopped, and the next call continues from there rather than
+    /// re-examining what it has already cleared. Without that, a bounded sweep
+    /// on a large cache would examine the same prefix forever and never reach
+    /// the entries that actually lapsed.
+    ///
+    /// Reclaimed keys are named in the `IReclaimLog` set by `SetReclaimLog`, so
+    /// a caller that wants to know *which* keys went away reads them from
+    /// there; the counts here say how many.
+    /// @param now    Current clock value.
+    /// @param budget Ceilings for this call; `PurgeBudget::Unbounded()` for none.
+    /// @return What this call examined and reclaimed, and whether it got all
+    ///         the way round.
+    virtual PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) = 0;
 
     /// Reconfigure the byte budget at runtime (e.g. on SIGHUP reload).
     /// Budget-owning backends evict to fit; forwarding decorators pass it

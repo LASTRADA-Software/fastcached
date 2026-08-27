@@ -277,14 +277,14 @@ void NotifyingStorage::FlushWithGeneration(TimePoint effectiveAt)
     Notify(MutationKind::FlushDb, std::string_view {});
 }
 
-std::size_t NotifyingStorage::PurgeExpired(TimePoint now)
+PurgeOutcome NotifyingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
     ReclaimDrain const drain { *this };
-    // The count this returns is still opaque — it says how many, not which —
+    // The counts this returns are still opaque — they say how many, not which —
     // but the tier no longer has to answer that question through the return
     // value. It names each key in the reclaim log as it sweeps, and the guard
     // above turns those into Expire events when this returns.
-    return _inner.PurgeExpired(now);
+    return _inner.PurgeExpired(now, budget);
 }
 
 void NotifyingStorage::SetReclaimLog(IReclaimLog* log)

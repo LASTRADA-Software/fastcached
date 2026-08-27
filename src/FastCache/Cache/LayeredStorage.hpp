@@ -42,7 +42,7 @@ namespace FastCache
 /// | `Append`/`Prepend`/`CompareAndSwap`/`IncrementOrInitialize` | Same — L2 enforces semantics; mirror outcome to L1. |
 /// | `Delete`         | L2.Delete; always drop from L1 (best effort). |
 /// | `FlushWithGeneration` | Forward to both (each maintains its own gen). |
-/// | `PurgeExpired`   | Forward to both; return L2's count (canonical). |
+/// | `PurgeExpired`   | Forward the same budget to both; L2's counts are canonical. |
 /// | `Snapshot`       | itemCount/bytesUsed/bytesLimit from L2; LayeredStorage tracks its own
 /// cmdGet/cmdSet/getHits/getMisses. |
 ///
@@ -153,7 +153,7 @@ class LayeredStorage final: public IStorage
         TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Route reclaim reporting to **L2 only, and only its expiries**.
     ///
