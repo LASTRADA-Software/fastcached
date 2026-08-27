@@ -839,6 +839,71 @@ namespace
     };
     using LocalPtr = std::unique_ptr<void, LocalDeleter>;
 
+    /// Where the Application event log records a provider by this name.
+    /// @param serviceName The service, which is also its event source.
+    /// @return The registry path, relative to `HKEY_LOCAL_MACHINE`.
+    [[nodiscard]] std::string EventSourceKeyPath(std::string const& serviceName)
+    {
+        return std::format(R"(SYSTEM\CurrentControlSet\Services\EventLog\Application\{})", serviceName);
+    }
+
+    /// Register @p serviceName as an event source, so its records render as text.
+    ///
+    /// Without this the events are still written and still readable, but each one
+    /// arrives wrapped in "The description for Event ID 1 ... cannot be found",
+    /// because the log resolves message ids against a resource this project does not
+    /// ship. Pointing at `EventCreate.exe` borrows the one Windows already has whose
+    /// first message is the passthrough `%1` -- the same resource `eventcreate.exe`
+    /// itself relies on -- so the single insertion string renders verbatim and no
+    /// message DLL has to be built, signed and installed to say `%1`.
+    ///
+    /// @param serviceName The service, which is also its event source.
+    /// @return An explanatory message on failure, else nullopt.
+    [[nodiscard]] std::optional<std::string> RegisterEventSourceForService(std::string const& serviceName)
+    {
+        auto const path = EventSourceKeyPath(serviceName);
+        HKEY key = nullptr;
+        if (auto const rc = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                                            path.c_str(),
+                                            0,
+                                            nullptr,
+                                            REG_OPTION_NON_VOLATILE,
+                                            KEY_SET_VALUE,
+                                            nullptr,
+                                            &key,
+                                            nullptr);
+            rc != ERROR_SUCCESS)
+            return std::format("could not register the event source (error {}); this service's log lines will be "
+                               "written but shown without their text",
+                               rc);
+
+        // REG_EXPAND_SZ: the value carries `%SystemRoot%` and the log expands it.
+        constexpr std::string_view MessageFile = R"(%SystemRoot%\System32\EventCreate.exe)";
+        auto rc = RegSetValueExA(key,
+                                 "EventMessageFile",
+                                 0,
+                                 REG_EXPAND_SZ,
+                                 reinterpret_cast<BYTE const*>(MessageFile.data()),
+                                 static_cast<DWORD>(MessageFile.size() + 1));
+
+        // Error | Warning | Information -- the three `EventTypeFor` maps onto.
+        constexpr DWORD TypesSupported = EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE;
+        if (rc == ERROR_SUCCESS)
+            rc = RegSetValueExA(key,
+                                "TypesSupported",
+                                0,
+                                REG_DWORD,
+                                reinterpret_cast<BYTE const*>(&TypesSupported),
+                                static_cast<DWORD>(sizeof(TypesSupported)));
+        RegCloseKey(key);
+
+        if (rc != ERROR_SUCCESS)
+            return std::format("could not describe the event source (error {}); this service's log lines will be "
+                               "written but shown without their text",
+                               rc);
+        return std::nullopt;
+    }
+
     /// Give @p account full control of @p target, creating it as a directory if
     /// absent.
     ///
@@ -993,6 +1058,58 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
     SERVICE_DESCRIPTIONA descriptor { .lpDescription = description.data() };
     ChangeServiceConfig2A(service, SERVICE_CONFIG_DESCRIPTION, &descriptor);
 
+    // What the other two supervisors already say, said here. Without it a node that
+    // crashes stays stopped until somebody notices, on a machine whose entire point
+    // is being always-on -- `sc qfailure` reported an empty policy on every
+    // registration this project has ever made.
+    //
+    // The numbers are the other two's, not new ones: systemd's units carry
+    // `Restart=on-failure` with `RestartSec=1`, and the launchd job this file
+    // generates carries `KeepAlive` with `ThrottleInterval=30`. So the first two
+    // attempts are immediate-ish and the third backs off to thirty seconds -- and
+    // the third repeats, because Windows applies the LAST action to every failure
+    // past the end of the array. An hour of health resets the count, which is the
+    // start-limit window the systemd units rely on, spelled the way this API spells
+    // it.
+    //
+    // NOT a `ServiceSpec` field, though the two binaries do express it once: a field
+    // there would imply the other two supervisors read it, and they cannot -- theirs
+    // live in a checked-in unit file and in the scope table above. One place per
+    // supervisor, with each naming the others, is the honest arrangement.
+    constexpr DWORD RestartDelayMs = 1'000;
+    constexpr DWORD BackoffDelayMs = 30'000;
+    constexpr DWORD FailureCountResetSeconds = 3'600;
+
+    std::array<SC_ACTION, 3> actions { SC_ACTION { .Type = SC_ACTION_RESTART, .Delay = RestartDelayMs },
+                                       SC_ACTION { .Type = SC_ACTION_RESTART, .Delay = RestartDelayMs },
+                                       SC_ACTION { .Type = SC_ACTION_RESTART, .Delay = BackoffDelayMs } };
+    SERVICE_FAILURE_ACTIONSA failureActions { .dwResetPeriod = FailureCountResetSeconds,
+                                              .lpRebootMsg = nullptr,
+                                              .lpCommand = nullptr,
+                                              .cActions = static_cast<DWORD>(actions.size()),
+                                              .lpsaActions = actions.data() };
+    // Checked, not discarded. A policy that was refused and is inert, under an
+    // `--install-service` that answered "installed", is the same shape of lie as a
+    // service logging to a handle nobody holds -- and `sc qfailure` would show the
+    // empty policy while the installer had already said otherwise.
+    std::string policyWarnings;
+    if (ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions) == 0)
+        policyWarnings += std::format("\nwarning: the restart policy could not be set (error {}); this service will "
+                                      "stay stopped after it fails",
+                                      GetLastError());
+
+    // And they must fire on an ORDINARY non-zero exit, not only on a crash. That is
+    // the default this API ships with, and it is the wrong one here: every way this
+    // daemon gives up -- a port it cannot bind, a store of the wrong vintage -- is a
+    // clean return with a non-zero code, which is precisely the failure worth
+    // restarting from. Without this the policy above is configured and inert.
+    // Not const: `ChangeServiceConfig2A` takes an untyped mutable pointer.
+    SERVICE_FAILURE_ACTIONS_FLAG onNonCrash { .fFailureActionsOnNonCrashFailures = TRUE };
+    if (ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &onNonCrash) == 0)
+        policyWarnings += std::format("\nwarning: the restart policy could not be applied to ordinary failures (error "
+                                      "{}); it will act on a crash only",
+                                      GetLastError());
+
     CloseServiceHandle(service);
     CloseServiceHandle(manager);
 
@@ -1004,7 +1121,15 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
     // operator with `icacls`; one that was rolled back because of it leaves them
     // nothing to repair. This mirrors the launchd path, where a chown that fails
     // is `(void)`-discarded -- except that this says so.
-    std::string warnings;
+    std::string warnings { std::move(policyWarnings) };
+
+    // A service with no console reports through the event log (#179), and this is
+    // what makes those records legible. Reported rather than fatal for the reason the
+    // grant below is: the events are written either way, and a registration an
+    // operator can repair beats an install rolled back over presentation.
+    if (auto const denial = RegisterEventSourceForService(spec.serviceName))
+        warnings += std::format("\nwarning: {}", *denial);
+
     if (logonName)
         for (auto const& owned: spec.ownedPaths)
             if (auto const denial = GrantPathAccess(owned, *logonName))
@@ -1062,6 +1187,17 @@ ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope /*sc
 
     if (!deleted)
         return { .exitCode = 1, .message = std::format("DeleteService failed (error {})", deleteErr) };
+
+    // AFTER the deletion succeeded, never before it. A service that is still
+    // installed and has lost its provider registration writes records that render as
+    // "the description ... cannot be found" -- and nothing short of a reinstall puts
+    // it back, so a failed uninstall would leave the service worse than it found it.
+    //
+    // Best-effort from here, like the stop above: an orphaned registry key is not
+    // something an operator can act on, and reporting the uninstall as failed over
+    // one would describe a service that is genuinely gone as still present.
+    RegDeleteKeyA(HKEY_LOCAL_MACHINE, EventSourceKeyPath(spec.serviceName).c_str());
+
     return { .exitCode = 0, .message = std::format("uninstalled service '{}'", spec.serviceName) };
 }
 
