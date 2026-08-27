@@ -469,6 +469,12 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
 
     while (true)
     {
+        // Between commands, not after one: `Compact()` releases nothing, so the buffer
+        // a 256 MiB STORE grew into would be held for the rest of a connection that no
+        // longer ends after one operation. `--max-connections` times that is a ceiling
+        // nobody chose. Whatever a pipelined peer has already sent is kept.
+        reader.ReleaseSpareCapacity();
+
         auto const headerBytes = co_await reader.ReadExactly(Wire::RequestHeaderSize);
         if (!headerBytes.has_value())
         {

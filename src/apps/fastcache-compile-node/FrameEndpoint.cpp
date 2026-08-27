@@ -301,6 +301,13 @@ namespace
 
             while (!state->shuttingDown.load(std::memory_order_acquire))
             {
+                // Between requests, not after one: the buffer a 256 MiB object grew
+                // into is kept by the vector, and a reader that now lives as long as
+                // the connection would hold it for as long as the peer stays attached
+                // -- uncounted by the in-flight budget, because nothing is in flight.
+                // Whatever a pipelined peer has already sent is kept.
+                reader.ReleaseSpareCapacity();
+
                 state->Rearm(socket.get(), deadlineFor());
 
                 auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
