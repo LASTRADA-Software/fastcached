@@ -18,6 +18,7 @@
 #   html/index.html   the browsable report
 #   coverage.lcov     lcov-format export, for Codecov and anything else
 #   summary.json      llvm-cov's own per-file summary
+#   report.txt        the per-file table, as printed
 #   percent.txt       the line-coverage percentage, alone on one line
 
 set -euo pipefail
@@ -187,7 +188,9 @@ print(f'{totals["lines"]["percent"]:.2f}')
 PY
 
 echo
-"$llvm_cov" report "${report_args[@]}"
+# Kept as a file as well as printed, so CI can quote the totals row into its job
+# summary without re-running llvm-cov or parsing the JSON a second time.
+"$llvm_cov" report "${report_args[@]}" "$first_party" | tee "$coverage_dir/report.txt"
 echo
 echo "Line coverage: $(cat "$coverage_dir/percent.txt")%"
 echo "HTML report:   $coverage_dir/html/index.html"
