@@ -30,14 +30,17 @@ Full reference: [fastcache-cc](fastcache-cc.md).
 ## `fastcache-compile-node` — the compile worker
 
 Takes translation units that missed the cache and compiles them, so a build is
-not limited to the cores of the machine running it. Workers register with a
-`fastcached` acting as scheduler, and clients are handed one on a miss.
+not limited to the cores of the machine running it. Workers register with **one
+of their own** — a node started with `--listen-scheduler`, never `fastcached` —
+and clients are handed one on a miss.
 
-It is not a cache and not a scheduler: it holds no keys, stores nothing, and is
-given no cache credentials — the object goes back to the client, which stores
-it. A job names a *toolchain fingerprint*, never a program, and the worker maps
-that to a compiler from its own configuration; that is what keeps a build
-accelerator from being a remote shell.
+It is the fleet's only binary and wears several hats: every node compiles, holds
+a cache tier of its own by default, and may additionally schedule, run consensus
+and serve the fleet dashboard. What it never does is write to the shared cache —
+it is given no credentials for it, and the object goes back to the client, which
+stores it. A job names a *toolchain fingerprint*, never a program, and the worker
+maps that to a compiler it discovered on its own machine; that is what keeps a
+build accelerator from being a remote shell.
 
 Every refusal — no matching toolchain, no free slot, an unreachable worker —
 falls back to a local compile, so distribution cannot fail a build.

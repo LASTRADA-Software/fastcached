@@ -27,20 +27,38 @@ src/FastCache/
                 CompileValue (object-blob + tagged-text-region framing),
                 PrefetchGroupManifest — the compile cache's domain logic
   Distributed/  WorkerRegistry (the compile-worker fleet: exact-fingerprint
-                grouping, least-outstanding pick, heartbeat expiry over IClock)
-                and LeaseTable (lease issue/expiry/release plus the in-flight
-                key map that suppresses duplicate work). Both pure with respect
-                to I/O, so every capacity and expiry rule is a ManualClock unit
+                grouping, most-free-slots pick, heartbeat expiry over IClock),
+                LeaseTable (lease issue/expiry/release plus the in-flight key
+                map that suppresses duplicate work), SchedulerService (the one
+                Gate() every verb passes, with leadership and membership as
+                first-class inputs) + SchedulerProtocol, NodePolicy (slot
+                ceilings and node classes), MembershipOracle, and FleetView /
+                FleetChart / FleetHistory / FleetText — what a leader can see,
+                as a page, as JSON and as SVG. All pure with respect to I/O, so
+                every capacity, expiry and rendering rule is a ManualClock unit
                 test rather than a sleep.
+  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
+                challenge), PeerDirectory, ClusterState + ClusterStateMachine,
+                MembershipPolicy — who is a member, WHERE they answer, and the
+                settings every member must agree on
+  Consensus/    Raft, split into a pure state machine (RaftNode) and a coroutine
+                driver, behind IRaftStorage / IRaftTransport / IRaftStateMachine;
+                plus RaftLog, RaftWire, RaftPeerTransport/RaftPeerServer,
+                RaftMembership, and RaftClusterHarness (a whole cluster in one
+                process, against scripted partitions, loss and restarts)
+  Cli/          UsageDoc (usage text as data) and Options (the one parse loop),
+                dependency-free so fastcache-cc compiles it in rather than
+                linking the library
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
                 RedisResp (RESP2/RESP3: strings, keys, pub/sub, streams,
                 MULTI/EXEC), PubSubRegistry, StreamWaiterRegistry,
-                KeyspaceNotifier, CompileCacheHandler (the 0xFC compile cache
-                and the scheduling verbs), CompileCacheWire (header-only,
-                dependency-free: shared verbatim by the daemon, fastcache-cc
-                and fastcache-compile-node)
+                KeyspaceNotifier, CompileCacheHandler (the daemon's 0xFC cache
+                executor; it REFUSES the scheduling verbs, which moved to
+                fastcache-compile-node, and names where they went),
+                CompileCacheWire (header-only, dependency-free: shared verbatim
+                by the daemon, fastcache-cc and fastcache-compile-node)
   Server/       Connection (per-client coroutine), Server (accept loop),
                 ReactorServerLoop (the server driver), AdminHttpServer
   Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),

@@ -16,39 +16,49 @@ have happened anyway.
 
 ## Architecture
 
-Three roles. Two of them are programs you already have.
+Three roles across two programs, with the shared cache behind them.
+**Scheduler and worker are the same binary** — `fastcache-compile-node` —
+because being the one that hands out capacity is a *role* a node takes, not a
+different program.
 
 | Role | Program | What it does |
 |------|---------|--------------|
 | **Client** | `fastcache-cc` | Fronts each compile. Checks the cache, and on a miss asks for a worker. |
-| **Scheduler** | `fastcached` | The cache daemon, with a second listener. Tracks workers and hands one out. |
-| **Worker** | `fastcache-compile-node` | Compiles what it is sent. Holds no cache. |
+| **Scheduler** | `fastcache-compile-node --listen-scheduler` | Tracks the fleet's workers and hands one out. Exactly one node at a time. |
+| **Worker** | `fastcache-compile-node` | Compiles what it is sent. Also holds a cache tier of its own, unless you turn it off. |
+| **Shared cache** | `fastcached` | Optional, and *not* the scheduler. Where objects end up so other machines get them. |
 
 ```
-   ┌──────────────┐                     ┌──────────────────────┐
-   │ fastcache-cc │                     │ fastcached           │
-   │  (client)    │                     │  (cache + scheduler) │
-   └──────┬───────┘                     └───────┬──────────────┘
-          │                                     │
-          │  1. FETCH ─────────────────────────►│ :6674  cache
-          │     ◄──────────── hit: done         │
-          │                                     │
-          │  2. miss: "give me a worker" ──────►│ :6675  dispatch
-          │     ◄──────── endpoint + lease      │
-          │                                     ▲
-          │                                     │ register + heartbeat
-          │                        ┌────────────┴─────────┐
-          │  3. compile this ─────►│ fastcache-compile-node│ :6676
-          │     ◄──── object       │      (worker)         │
-          │                        └───────────────────────┘
+   ┌──────────────┐          ┌───────────────────────────────┐
+   │ fastcache-cc │          │ fastcache-compile-node        │
+   │  (client)    │          │  (this one leads: scheduler)  │
+   └──────┬───────┘          └───────────────┬───────────────┘
+          │                                  │
+          │  1. FETCH ──────────────────────►│ :6674  its cache tier,
+          │     ◄──────────── hit: done      │        reading through to
+          │                                  │        fastcached upstream
+          │  2. miss: "give me a worker" ───►│ :6675  scheduler
+          │     ◄──────── endpoint + lease   │
+          │                                  ▲
+          │                                  │ register + heartbeat
+          │                   ┌──────────────┴─────────┐
+          │  3. compile this ►│ fastcache-compile-node │ :6676
+          │     ◄──── object  │      (a worker)        │
+          │                   └────────────────────────┘
           │
-          └─ 4. STORE the object ─►  :6674   ← the CLIENT stores, not the worker
+          └─ 4. STORE the object ─► :6674  ← the CLIENT stores, not the worker
 ```
 
-### Why the scheduler is the cache daemon
+`fastcached` is behind all of it as the fleet-wide store a node's `--upstream`
+points at. It serves the cache verbs and nothing else: a scheduling verb arriving
+at one of its listeners is refused with a typed `dispatch-not-permitted` naming
+where the scheduler went.
 
-Not for convenience. Because it is both, it knows something neither distcc nor
-sccache-dist can know: **which keys are already being compiled right now.**
+### Why the scheduler knows what is already being compiled
+
+A `LEASE` request names the **object key**, not just the toolchain — so the one
+node handing out capacity sees the whole fleet's misses as they arrive, which is
+something neither distcc nor sccache-dist is positioned to know.
 
 When a header changes and sixty parallel clients miss the same key — the
 ordinary shape of a miss on a shared cache, not an exotic one — the scheduler
@@ -82,15 +92,21 @@ if it were.
 
 The request names a **toolchain fingerprint** and the object key. The scheduler
 matches the fingerprint **byte-identically** and picks the matching worker with
-the fewest jobs outstanding.
+the most **free slots** — ties broken by utilization, so between two machines
+with four slots free the one with proportionally more of itself left takes the
+job.
 
-Least-outstanding rather than round-robin, because compile times within one
-build vary by an order of magnitude: distributing *arrivals* rather than *load*
-queues a forty-second translation unit behind another one while a worker idles.
+Free slots rather than fewest running jobs, because absolute counts treat every
+machine as an identical box: a 64-slot server running 8 jobs looks busier than a
+4-slot laptop running 2, when the server has 56 slots free and the laptop has
+none. Across a fleet of mixed machines — the ordinary case — counting jobs sends
+work to the smallest machines first and leaves the big ones idle.
 
 The scheduler refuses rather than queues — `no-worker`, `no-capacity`,
-`already-in-flight` — because the client is holding the source and can simply
-compile it. Queueing would buy latency and nothing else.
+`withdrawn`, `already-in-flight` — because the client is holding the source and
+can simply compile it. Queueing would buy latency and nothing else. Each names a
+different operator problem, which is why they are counted apart; see
+[the sizing notes](#sizing-and-operations).
 
 ### 3. The client sends preprocessed text, not files
 
@@ -145,7 +161,12 @@ The scheduler is a **compile node**, not the cache. Pick one machine and give it
 `--listen-scheduler`:
 
 ```sh
-fastcache-compile-node     --listen-scheduler=0.0.0.0:6675     --fleet-member=worker-01.internal     --fleet-member=worker-02.internal     --scheduler=127.0.0.1:6675     --advertise=scheduler.internal:6676     --toolchain=/usr/bin/g++
+fastcache-compile-node \
+    --listen-scheduler=0.0.0.0:6675 \
+    --fleet-member=worker-01.internal \
+    --fleet-member=worker-02.internal \
+    --scheduler=127.0.0.1:6675 \
+    --advertise=scheduler.internal:6676
 ```
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
@@ -158,10 +179,24 @@ A scheduling verb arriving at a `fastcached` listener is refused with a typed
 error naming where the scheduler went, so a client configured for the old layout
 tells you what to fix instead of failing mysteriously.
 
-Note that the scheduler also registers as a worker. Every node is a peer; being
-the one that schedules is a role, not a different program. If you do not want it
-taking work, pass `--no-toolchain-discovery` together with a `--toolchain`
-nothing in your fleet compiles with.
+No `--toolchain` is needed: the node surveys the machine at startup and serves
+what it finds. Note that the scheduler therefore also registers as a worker —
+every node is a peer, and being the one that schedules is a role rather than a
+different program. There is no configuration that offers **zero** slots
+([#206](https://github.com/LASTRADA-Software/fastcached/issues/206)); if you want
+this machine kept out of the work, give it an identity nothing dispatches to:
+
+```sh
+--no-toolchain-discovery --toolchain=scheduler-only=/nonexistent
+```
+
+An operator-pinned `<fingerprint>=<compiler>` is deliberately not probed, so that
+registers a toolchain no client can match. One machine leading a fleet of many is
+the only shape this is worth doing for.
+
+Once several nodes run, exactly one of them must schedule at a time, which is
+what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`. See
+[a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
 
@@ -175,8 +210,12 @@ refuses every caller, which is the right default and not a working configuration
 so it is refused at startup rather than left to be discovered as a fleet that
 silently distributes nothing.
 
-Non-members are refused the *fleet*, never the *cache*: they read and write cached
-objects exactly as before. What membership pays for is CPU time.
+Membership gates **all three** of a node's surfaces — its scheduler, its compile
+port, and its own cache tier — and this machine is always a member of its own
+fleet whatever the list says. What it does not gate is the shared `fastcached`: a
+non-member reads and writes objects there exactly as before, because that is
+infrastructure somebody operates while a node's tier is a developer's own build
+output. What membership pays for on a node is CPU time.
 
 ### The workers
 
@@ -201,8 +240,18 @@ Add `--toolchain=<compiler>` to serve a **narrower** set — a build farm pinned
 a curated toolchain — or `--no-toolchain-discovery` to stop the survey entirely.
 Naming any `--toolchain` pins the worker to exactly those.
 
+A node started this way is **also a cache**, which is the part that surprises
+people: `--listen-cache` defaults to `127.0.0.1:6674` and `--cache-memory` to a
+quarter of host RAM within `[512m, 8g]`, so the machine gets a local tier without
+asking for one. Point it at the shared cache with `--upstream` and a local rebuild
+stops reaching the wire at all. `--cache-memory=0` with no `--cache-dir` turns the
+tier off, which is what a machine that only compiles for others wants. The whole
+of it is on
+[the node's own page](../tools/fastcache-compile-node.md#a-cache-of-its-own).
+
 On Linux the package ships a socket-activated unit; put the arguments in
-`/etc/fastcached/compile-node.env` and enable the **socket**:
+`FASTCACHE_NODE_ARGS` in `/etc/fastcached/compile-node.env` and enable the
+**socket**:
 
 ```sh
 sudo systemctl enable --now fastcache-compile-node.socket
@@ -219,12 +268,31 @@ sudo systemctl enable --now fastcache-compile-node.socket
 
 ```sh
 export FASTCACHE_ADDR=build-cache.internal:6674
-export FASTCACHE_SCHEDULER=build-cache.internal:6675
+export FASTCACHE_SCHEDULER=scheduler.internal:6675
 cmake -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc ...
 ```
 
-Unset `FASTCACHE_SCHEDULER` and every miss compiles locally again — the
-behaviour without this feature, and the way to turn it off for one build.
+`FASTCACHE_ADDR` is the **cache** — a `fastcached`, or the local node's own
+`--listen-cache`. It defaults to `127.0.0.1:6674` when unset, which is where a
+node on this machine already answers, so a developer running a node needs only
+the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out.
+
+`FASTCACHE_SCHEDULER` is the **scheduler**, which is some node's
+`--listen-scheduler`, never the cache port. Unset it and every miss compiles
+locally again — the behaviour without this feature, and the way to turn it off
+for one build.
+
+!!! danger "Do not set `FASTCACHE_TOKEN` on a client that dispatches"
+
+    A node's scheduler, compile and cache ports serve no `AUTH` verb, so a
+    credential presented to them is refused `dispatch-not-permitted` — and the
+    launcher surfaces that in place of the answer to the request it actually sent.
+    Every `LEASE` is then declined and every compile happens locally, with a green
+    build and nothing but a `FASTCACHE_VERBOSE` line to say so. The same applies
+    to `--requirepass` on a worker: its `REGISTER` is refused and it never joins
+    the fleet. Tracked as
+    [#198](https://github.com/LASTRADA-Software/fastcached/issues/198); see
+    [Security](#security) for what does protect a fleet today.
 
 ---
 
@@ -234,12 +302,13 @@ With `FASTCACHE_VERBOSE=1` the launcher says what happened to each translation
 unit:
 
 ```
-fastcache-cc: HIT key=…                                    served from cache
-fastcache-cc: DISPATCHED to worker-01.internal:6676 key=…  compiled remotely
-fastcache-cc: not dispatched (rejected (no-worker): …)      compiled locally
+fastcache-cc: HIT key=…                                          served from cache
+fastcache-cc: DISPATCHED to worker-01.internal:6676 key=…        compiled remotely
+fastcache-cc: not dispatched (rejected (no-worker)); compiling locally
 ```
 
-On the scheduler, the `/metrics` endpoint counts the outcomes:
+The scheduler is a compile node, so its `/metrics` endpoint is the node's:
+start it with `--admin-listen` and these count the outcomes.
 
 | Counter | Rising means |
 |---------|--------------|
@@ -281,20 +350,52 @@ The worker also reports what the machine **is** — `fastcache_node_logical_core
 `fastcache_node_slots_busy`. Those are gauges: "is this node pulling its weight"
 is not answerable without knowing how big it is.
 
-And what its **cache** is holding — `fastcached_items`, `fastcached_bytes_used`
-and `fastcached_bytes_limit` for the tier as a whole, plus a
+And what its **cache tier** is doing — `fastcache_node_cache_hits_total` and
+`..._misses_total` for the tier itself, `..._upstream_hits_total` for what the
+shared cache answered after a local miss, and `..._fill_failures_total`,
+`..._store_failures_total`, `..._upstream_stores_total` and
+`..._upstream_store_failures_total` for the writes. A high upstream-hit rate
+against a low local one means the tier is too small for this machine's working
+set, which is a different problem from a fleet that is missing a lot.
+
+Beside them, what it is **holding** — `fastcached_items`, `fastcached_bytes_used`
+and `fastcached_bytes_limit` for the cache as a whole, plus a
 `fastcached_tier_*{tier="memory"|"disk"}` set for the split. A node whose cache is
 effectively empty sends every rebuild to the wire; one whose evictions climb while
 its hit rate falls has a budget too small for the tree it builds. Both are
 invisible from the scheduler's own counters, which only see the work that reached
 it. See [the node's own page](../tools/fastcache-compile-node.md#reading-it) for
-why these must not be summed across tiers.
+why these must not be summed across tiers, and why a node running no tier reports
+the series as **absent** rather than as zero.
 
 The same figures reach the **leader**, on each node's REGISTER and HEARTBEAT, so
 they are readable from one place rather than by scraping every machine. Note that
 a node started with two `--toolchain` flags is two registry entries against one
 machine and one cache: both carry the same figures, and anything summing them
 counts that cache twice.
+
+### The whole fleet on one page
+
+`--dashboard`, on a leader that already has `--admin-listen` and
+`--listen-scheduler`, serves `/fleet` and `/fleet.json` — every member's
+hostname, endpoint, software version, capacity and cache, plus charts of the last
+24 hours or 7 days:
+
+```sh
+fastcache-compile-node ... \
+    --listen-scheduler=6675 --fleet-member=10.0.0.2 \
+    --admin-listen=6677 \
+    --dashboard --dashboard-token-file=/etc/fastcached/dashboard.token
+```
+
+Only the **leader** answers it in full; anyone else replies `503` naming the
+leader, because a follower's registry holds whatever registered against it rather
+than the fleet. The credential is required off loopback and is deliberately its
+own file rather than `--requirepass`. `/metrics` and `/healthz` stay outside it,
+so a scraper or a probe is unaffected — and `/metrics` remains the source of truth
+for anything you alert on. The full account, including what each column means and
+why a value nobody reported renders as `–` rather than `0`, is under
+[looking at the whole fleet](../tools/fastcache-compile-node.md#looking-at-the-whole-fleet).
 
 ### "No worker matches this toolchain"
 
@@ -325,6 +426,41 @@ match. Neither derives its answer
 from `INCLUDE`, which is set per developer command prompt and never inherited by
 a service — so a worker installed as a service matches the launchers that talk
 to it.
+
+### The fingerprint and the cache key are not the same string
+
+They answer different questions, so one of them carries the compiler's **target**
+and the other deliberately does not:
+
+| | Decides | Carries the target? |
+|---|---|---|
+| **Toolchain fingerprint** | which *worker* may serve a client | no |
+| **Object cache key** | which *object* may be served | yes |
+
+A driver's code generation is not a function of the driver alone. `clang-cl`
+detects the MSVC installation beside it and sets `-fms-compatibility-version` from
+that, and clang's Microsoft C++ ABI gates version-specific code generation on the
+value — so the same `clang-cl.exe` in a developer prompt and under a service
+generates differently. Stock `g++` on x86_64 and aarch64 is the same shape with no
+MSVC anywhere near it: one `--version` banner, two code generators.
+
+The **key** therefore folds the target in, so those cases stop sharing entries.
+The **fingerprint** must not, or a developer-prompt launcher would stop matching a
+service-run worker — the mismatch that keeps a fleet answering `no-worker` for
+reasons nobody can see. Dispatch closes the gap on the line instead: a dispatched
+compile states `--target=<triple>` **ahead** of the build's own arguments, so the
+worker generates for the client's target rather than re-deriving one from its own
+machine, while a `--target=` or `-m32` the build states itself still wins.
+
+Only a driver that can be *told* a target is pinned this way. `gcc` is
+fixed-target and rejects the flag, so its target is identified for the key and
+never stated on a dispatched line; `cl` is neither, because which code generator
+runs is decided by which `cl.exe` you invoked and no command line can restate it.
+
+The practical consequence is a hit-rate one: after this change two machines whose
+compilers report one banner but generate for different targets no longer share
+cache entries. That is a correction — they were sharing objects they should not
+have — but it looks like a cold cache the first time a fleet upgrades past it.
 
 ---
 
@@ -359,28 +495,54 @@ to it.
   `fastcached_dispatch_leases_*_total`, because the fixes are different and
   folding `withdrawn` into `no-capacity` sends an operator to buy hardware they
   already own.
-- **Workers can come and go.** A worker that stops heartbeating is dropped after
-  90 s; a client that leases one in the gap finds it unreachable and compiles
-  locally.
+- **A node's own cache tier is subtracted from what it can compile.** Capacity is
+  one job per gigabyte of RAM, and a resident cache is memory that will not yield —
+  so a 64-thread host with 32 GiB holding 8 GiB of cache offers 24 slots, not 32.
+  What is subtracted is what the tier **actually holds**: a node with
+  `--cache-memory=0` and no `--cache-dir` reserves nothing and offers the whole
+  machine, and so does one whose cache never started.
+- **Workers can come and go.** A worker heartbeats every 20 s and is dropped after
+  90 s without one; a client that leases one in the gap finds it unreachable and
+  compiles locally.
 
 ## Security
 
-Start the scheduler with `--requirepass` and give the same secret to workers
-(`--requirepass`) and clients (`FASTCACHE_TOKEN`).
+**Membership is what protects a fleet today, and it is the only thing that does.**
+A node is closed by default: its compile port, its scheduler and its own cache tier
+all admit **this machine and `--fleet-member` peers only** (or every caller, once
+you say `--fleet-open`). Once a cluster exists, the agreed member set replaces that
+list and all three surfaces follow it. That matters most for the compile port,
+which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
+would otherwise have your machine run their compiler on source they chose.
 
-Even without it, a node is closed by default: its compile port, its scheduler and
-its own cache tier all admit **this machine and `--fleet-member` peers only**. That
-matters most for the compile port, which binds `0.0.0.0` because peers have to dial
-it — anybody who could route to it would otherwise have your machine run their
-compiler on source they chose. `--requirepass` is still worth setting: membership is
-about who you are and a credential is about what you know, and a build LAN where
-addresses can be spoofed wants both.
+A node has **no inbound credential**. Its three framed surfaces serve no `AUTH`
+verb, so `--requirepass` on a node is only the secret it *presents* when it dials
+somebody else — and it works in exactly one direction: against a `fastcached`
+`--upstream`, which does serve `AUTH`. Presented to another node it is refused
+`dispatch-not-permitted`, and because the launcher reports that in place of the
+answer to the request it actually sent, the effect is silent:
 
-Keep `--listen-scheduler` off any network you would not run a compiler for, and
-put mTLS in front of both ports for anything beyond a trusted build network.
-`--fleet-member` is a policy about contribution rather than a credential: it stops
-a machine that is not part of your fleet from spending its capacity, and it is not
-a substitute for `--requirepass`.
+| You set | What breaks |
+|---|---|
+| `--requirepass` on a worker | `REGISTER` is refused; the worker never joins the fleet. |
+| `FASTCACHE_TOKEN` on a client with `FASTCACHE_SCHEDULER` set | Every `LEASE` is declined; every compile happens locally, and the build goes green. |
+| `--requirepass` with `--cluster-status` and friends | Refused, naming a verb the operator never typed. |
+
+That is [#198](https://github.com/LASTRADA-Software/fastcached/issues/198), and it
+is a gap rather than a design: what an inbound credential should be spelled, and
+what `AUTH` means against a node that has none configured, are the questions it is
+open on. Until it closes, treat the fleet's boundary as **network reachability
+plus membership**, and size the network accordingly.
+
+So: keep `--listen-scheduler` off any network you would not run a compiler for,
+and put mTLS in front of every port for anything beyond a trusted build network.
+The two remaining credentials in this system are real and unaffected —
+`--dashboard-token-file` guards the fleet page, and `fastcached`'s own
+`--requirepass` guards the shared cache.
+
+Also worth knowing: the node's inter-node gate matches on the peer's **source
+address** alone ([#180](https://github.com/LASTRADA-Software/fastcached/issues/180)),
+so a build LAN where addresses can be spoofed is not a boundary this can hold.
 
 ## Limits worth knowing before you adopt it
 
@@ -390,8 +552,12 @@ a substitute for `--requirepass`.
 - **Diagnostics from a failed remote compile are not shown.** A worker reporting
   a non-zero exit is retried locally and the local result is what you see —
   which also regenerates the diagnostics with correct line numbers.
-- **`--install-service` exists on Linux only.** macOS and Windows workers run in
-  the foreground or under a supervisor you provide.
+- **`--install-service` is Windows and macOS.** It registers an SCM service or a
+  launchd job. On Linux the packages ship a socket-activated systemd unit instead,
+  so there is nothing for the flag to do and it reports as much. A worker that
+  needs `--requirepass` cannot be registered on any platform — a supervisor records
+  launch arguments where every local account can read them — so on Linux that token
+  goes in `FASTCACHE_NODE_ARGS`, and elsewhere such a worker runs in the foreground.
 - **On Windows a dispatched object is not byte-identical to a local one — the code
   in it is.** Every MSVC-family driver stamps the clock into the COFF header, and
   `cl` also records the absolute path of the object file (in `.debug$S`) and a hash
@@ -407,7 +573,16 @@ a substitute for `--requirepass`.
   preprocessed text it sends and would otherwise silently override yours. Run with
   `FASTCACHE_VERBOSE=1` to see which of these applied.
 
+- **A node's `--requirepass` cannot reach another node** (see
+  [Security](#security)). Until
+  [#198](https://github.com/LASTRADA-Software/fastcached/issues/198) closes, the
+  fleet's own traffic is unauthenticated and setting a token on it is worse than
+  leaving it unset.
+
 ## Reference
 
-- [fastcache-compile-node](../tools/fastcache-compile-node.md) — every flag.
+- [fastcache-compile-node](../tools/fastcache-compile-node.md) — every flag, the
+  node's cache tier, the cluster, and the fleet dashboard.
+- [Cluster discovery](cluster-discovery.md) — how nodes find each other, and the
+  pre-shared key that admits them.
 - [Compile cache protocol](../protocols/compile-cache.md) — the wire format.

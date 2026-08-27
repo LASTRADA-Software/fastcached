@@ -103,7 +103,8 @@ src/FastCache/
                 refusing is no longer an option; `Validate` is where a change can be
                 refused, and it runs on the proposer.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
-                least-outstanding pick, heartbeat expiry over IClock) and
+                most-free-slots pick tie-broken by utilization, heartbeat
+                expiry over IClock) and
                 LeaseTable (lease issue/expiry/release plus the in-flight key
                 map that suppresses duplicate work). Both pure with respect to
                 I/O, which is what lets every capacity and expiry rule be a
@@ -200,9 +201,10 @@ src/apps/
                             node's own `--toolchain` table, which is what keeps a
                             build accelerator from being a remote shell. Links
                             `FastCache` (unlike the launcher), because it needs
-                            the reactor and the wire, and holds no cache stack of
-                            its own — `AdminHttpServer`, not `Server`, is the
-                            shape it follows.
+                            the reactor and the wire. It runs no `Server`: its
+                            framed surfaces are `FrameEndpoint`s over one shared
+                            `NodeIoLoop`, and its HTTP surface is
+                            `AdminHttpServer`.
   compile-cache-testclient/ low-level `0xFC` protocol probe + cross-depth
                             validation (FASTCACHED_BUILD_TESTCLIENT, default
                             OFF — test infrastructure, never installed, but

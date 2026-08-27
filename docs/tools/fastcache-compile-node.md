@@ -3,24 +3,38 @@
 A compile worker. It takes translation units that missed the cache and compiles
 them, so a build is not limited to the cores of the machine running it.
 
-It is **not** a cache and **not** a scheduler: it holds no keys, stores nothing,
-and is given no cache credentials. The object it produces goes back to the client
-that asked for it, and the *client* stores it.
+It is the fleet's one binary, and it wears several hats. Compiling is the only one
+it always wears; the rest are surfaces you switch on, and every section below is
+about one of them:
+
+| Surface | Flag | Default |
+|---|---|---|
+| Compile worker | `--port` | on, `6676` |
+| [A cache tier of its own](#a-cache-of-its-own) | `--listen-cache` | on, `127.0.0.1:6674` |
+| [Fleet scheduler](#a-cluster-and-who-leads-it) | `--listen-scheduler` | **off** |
+| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id` | **off** — a lone node leads itself |
+| [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
+
+What it never does is **write to the shared cache**. A worker is given no
+credentials for it: the object it produces goes back to the client that asked for
+it, and the *client* stores it, so a rogue worker can poison only its own key
+space.
 
 ## How the pieces fit
 
 ```
- fastcache-cc                 fastcached                  fastcache-compile-node
- ────────────                 ──────────                  ──────────────────────
-                          :6674 cache                          :6676
-                          :6675 dispatch  ◄──── register + heartbeat ────┘
+ fastcache-cc          fastcache-compile-node          fastcache-compile-node
+ ────────────           (this one leads)                     (a worker)
+                     :6675 scheduler                           :6676
+                     :6676 compile     ◄── register + heartbeat ──┘
+                     :6674 cache tier ──► fastcached  (--upstream)
 
  preprocess ─► key ─► FETCH ──hit──► done
         │
        miss
         ▼
    ask for a worker  ──────────►  match the toolchain exactly
-   ◄── endpoint + lease token     pick the least-loaded one
+   ◄── endpoint + lease token     pick the one with the most free slots
         │                          (or refuse: compile locally)
         ├── send the preprocessed TU ──────────────────────────►
         ◄────────── object + diagnostics ───────────────────────
@@ -388,11 +402,18 @@ when nobody sets `FASTCACHE_ADDR`, and the one `cmake/portable/CompileCache.cmak
 passes. So the whole thing works with no configuration: start a node, build, and
 the launcher finds it.
 
-That port is also `fastcached`'s. On a machine running both, one of them loses the
-bind and the node refuses to start saying so — which is the right outcome, because
-they are two ways to serve one port and a node silently losing the race would leave
-your builds talking to the daemon while its own tier sat unused. Give one of them a
-different port, or run one.
+That port is also `fastcached`'s, and what happens when both want it depends on
+whether **you typed the address**:
+
+| `--listen-cache` | Port already held |
+|---|---|
+| defaulted | Warned, and the node starts **with no local tier**. Your builds reach the daemon on that port instead, so nothing breaks — it just does less than a node with a tier would. |
+| named by you | Fatal. The node refuses to start and says so. |
+
+The asymmetry is the point: a node sharing a machine with `fastcached` should not
+refuse to start over a convenience nobody requested, while an address an operator
+typed is a promise and a broken promise is fatal. Neither is silent. Give one of
+them a port of its own if you want the node's tier as well.
 
 ### Who may use it
 
@@ -434,7 +455,11 @@ developer's private tier. The two are different things that happen to speak one
 protocol.
 
 On a shared multi-user machine, "local" means every account on it. That is the same
-trust level the daemon assumes; use `--requirepass` if it is not the one you want.
+trust level the daemon assumes, and there is currently no way to narrow it: a node
+serves no `AUTH` verb, so it has no inbound credential to require
+([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). If that is
+not the trust level you want, do not serve the tier — `--listen-cache=` turns it
+off.
 
 ## A cluster, and who leads it
 
@@ -447,7 +472,14 @@ not a degraded fleet, it is the one thing the architecture says only one node ma
 do. So a fleet gives each node an identity and tells it who its peers are:
 
 ```sh
-fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --fleet-open     --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
+fastcache-compile-node \
+    --node-id=n1 --listen-raft=6680 \
+    --raft-peer=n1=10.0.0.1:6680 \
+    --raft-peer=n2=10.0.0.2:6680 \
+    --raft-peer=n3=10.0.0.3:6680 \
+    --listen-scheduler=6675 --fleet-open \
+    --advertise=10.0.0.1:6676 \
+    --toolchain=/usr/bin/g++
 ```
 
 Each peer is an **identity and an address in one token**, because they are one
@@ -963,16 +995,16 @@ free the one with proportionally more of itself left takes the job.
 
 `--admin-listen` serves `/metrics` and `/healthz`, and is **off unless you ask
 for it**: a scrape surface reachable from the network is a decision, not a
-default. A bare port binds loopback, so `--admin-listen 6675` is reachable from
-the machine and nowhere else; write `--admin-listen 0.0.0.0:6675` when you mean
+default. A bare port binds loopback, so `--admin-listen 6677` is reachable from
+the machine and nowhere else; write `--admin-listen 0.0.0.0:6677` when you mean
 the network.
 
 ```sh
-fastcache-compile-node --scheduler cache.internal:6674 \
-                       --toolchain /usr/bin/c++ \
-                       --admin-listen 6675
-curl -s localhost:6675/healthz     # 200 while the worker is answering
-curl -s localhost:6675/metrics     # Prometheus exposition
+fastcache-compile-node --scheduler scheduler.internal:6675 \
+                       --advertise worker-01.internal:6676 \
+                       --admin-listen 6677
+curl -s localhost:6677/healthz     # 200 while the worker is answering
+curl -s localhost:6677/metrics     # Prometheus exposition
 ```
 
 It is the same endpoint and the same renderer the daemon serves. A node that
@@ -992,8 +1024,8 @@ a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 numbers those images are drawn from.
 
 ```sh
-fastcache-compile-node --scheduler cache.internal:6674 \
-                       --toolchain /usr/bin/c++ \
+fastcache-compile-node --scheduler 127.0.0.1:6675 \
+                       --advertise 10.0.0.1:6676 \
                        --listen-scheduler 6675 --fleet-member 10.0.0.2 \
                        --admin-listen 6677 \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
@@ -1212,9 +1244,28 @@ What the counters mean is tabulated under
 
 ## Security
 
-The `0xFC` surface is authenticated: start the scheduler with `--requirepass` and
-give workers and clients the same secret (`--requirepass` on the worker,
-`FASTCACHE_TOKEN` on the client).
+!!! danger "A node has no inbound credential, and setting one breaks it"
+
+    None of this node's three framed surfaces — scheduler, compile port, cache
+    tier — serves the `AUTH` verb, so there is nothing for a credential to
+    authenticate against. `--requirepass` here is only the secret this node
+    **presents** when it dials somebody else, and it works in exactly one
+    direction: against a `fastcached` named by `--upstream`, which does serve
+    `AUTH`. Presented to another *node* it is refused `dispatch-not-permitted`,
+    and the caller reports that in place of the answer to the request it actually
+    sent:
+
+    | You set | What breaks |
+    |---|---|
+    | `--requirepass` on a worker | `REGISTER` is refused; the worker never joins the fleet. |
+    | `FASTCACHE_TOKEN` on a client with `FASTCACHE_SCHEDULER` set | Every `LEASE` is declined and every compile happens locally, behind a green build. |
+    | `--requirepass` with `--cluster-status` and friends | Refused, naming a verb you never typed. |
+
+    That is [#198](https://github.com/LASTRADA-Software/fastcached/issues/198).
+    Until it closes, a fleet's boundary is **network reachability plus
+    membership**, and a token on it is worse than no token. The credentials that
+    *are* real: `--dashboard-token-file` for the fleet page, and `fastcached`'s own
+    `--requirepass` for the shared cache.
 
 Keep `--listen-scheduler` off any network you would not run a compiler for. That
 is why it is a separate process from the cache: the cache may reasonably be
@@ -1232,8 +1283,11 @@ Note where this differs from `fastcached`. There, membership is a policy about
 *contribution* and a non-member still reads and writes the shared cache — that
 cache is shared infrastructure somebody operates. A node's tier is a developer's
 own build output, and its compile port is its own CPU, so both are closed by
-default. Membership still complements `--requirepass` rather than replacing it: one
-is about who you are, the other about what you know.
+default. On a node, membership does not merely complement a credential — it is the
+whole of the policy, because there is no credential to complement (#198). Its
+gate is also the peer's **source address** alone
+([#180](https://github.com/LASTRADA-Software/fastcached/issues/180)), so a network
+where addresses can be spoofed is not a boundary this can hold.
 
 For anything beyond a trusted build network, put mTLS in front of every port.
 
