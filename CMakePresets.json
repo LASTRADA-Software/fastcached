@@ -105,13 +105,14 @@
 
         {
             "name": "clang-coverage",
-            "displayName": "Clang Coverage (LCOV/llvm-cov)",
+            "displayName": "Clang Coverage (llvm-cov source-based; needs llvm-profdata/llvm-cov)",
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
-                "ENABLE_COVERAGE": "ON"
+                "ENABLE_COVERAGE": "ON",
+                "USE_COMPILER_CACHE": "OFF"
             },
             "condition": {
                 "type": "notEquals",

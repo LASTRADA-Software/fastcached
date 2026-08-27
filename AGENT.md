@@ -319,6 +319,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
   A length anchored on an enumerator by name is a guard that fires only when
   nothing is wrong.
+- Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000
+  processes, and gcov's shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp`
+  sits next to the implementation, so a report that counts it measures the tests
+  testing themselves. A compiler cache and coverage cannot be combined — a
+  replayed object's embedded mapping names the tree it was built in.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
@@ -478,9 +483,12 @@ ctest --preset clang-debug
 # Linux — GCC Debug
 cmake --preset gcc-debug && cmake --build --preset gcc-debug
 
-# Linux — Coverage (HTML in out/build/clang-coverage/)
+# Linux — Coverage. Needs llvm-profdata/llvm-cov at the SAME major version as
+# clang; the `coverage` target runs the whole suite under instrumentation and
+# writes out/build/clang-coverage/coverage/{html,coverage.lcov,percent.txt}
 cmake --preset clang-coverage
 cmake --build --preset clang-coverage
+cmake --build --preset clang-coverage --target coverage
 
 # Linux — sanitizer-only presets
 cmake --preset clang-asan-ubsan

@@ -263,6 +263,149 @@ jobs:
       - name: "Test"
         run: ctest --preset clang-debug
 
+  # Coverage, measured once, on Linux, with Clang. One configuration and not a
+  # matrix, because coverage answers "which lines did the tests reach", and that
+  # does not vary by compiler or platform — where they genuinely differ is
+  # whether the code builds and passes at all, which is what the `linux`,
+  # `macos` and `windows` jobs above and below are for. A second instrumented
+  # build would double the cost to re-answer a question already answered.
+  #
+  # This job does not gate on a percentage and must not be given one. Its whole
+  # purpose right now is to establish a baseline and publish it; the long-term
+  # target is >90%, and getting there is separate work on separate pull
+  # requests. A threshold added here would block merges on a number nobody has
+  # had a chance to move yet — see issue #149.
+  coverage:
+    name: "Code coverage"
+    runs-on: ubuntu-24.04
+    # Read here rather than in each step's `if`, because the `secrets` context is
+    # not available in a step-level condition while `env` is. Empty on a pull
+    # request from a fork, where GitHub withholds secrets — which is exactly the
+    # behaviour wanted: the upload is skipped and the job still passes.
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      # Where scripts/coverage.sh leaves everything the steps below publish.
+      # Spelled once: three steps read out of it, and a preset rename that moved
+      # the directory would otherwise leave two of them silently finding nothing.
+      COVERAGE_DIR: out/build/clang-coverage/coverage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-clang-coverage-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-coverage-
+
+      # No ccache step here, unlike the two jobs above, and that is not an
+      # oversight to correct. The clang-coverage preset sets
+      # USE_COMPILER_CACHE=OFF and cmake/Coverage.cmake refuses to configure at
+      # all if a compiler-cache launcher is set, because coverage mapping data
+      # is embedded in the object file and names its sources by absolute path —
+      # a replayed object describes the tree it was built in. So a cache step
+      # could never front this compile; it would only write an entry nothing
+      # reads, against the repository's Actions cache quota.
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
+
+      # llvm-${CLANG_TOOLS_VERSION} on top of clang, and the version has to be
+      # the same one: llvm-profdata and llvm-cov live in that package, and the
+      # raw profile format is versioned, so a mismatched pair rejects the file.
+      # cmake/Coverage.cmake refuses to configure rather than let that surface
+      # later as a complaint about the profile.
+      - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }} and its LLVM tools"
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} llvm-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+
+      # TLS on, to match the surface the `linux` job tests. Benchmarks and the
+      # test client deliberately off, unlike that job: it builds them so they
+      # cannot rot, but no ctest test runs either binary, so instrumenting them
+      # would report 0% for code the suite was never meant to reach and pull the
+      # figure down while looking like rigour.
+      - name: "Configure"
+        run: cmake --preset clang-coverage -DFASTCACHED_ENABLE_TLS=ON
+
+      - name: "Build"
+        run: cmake --build --preset clang-coverage
+
+      # Runs the whole suite under instrumentation and renders the report — the
+      # same target, and the same scripts/coverage.sh, a developer runs locally.
+      # A failing test fails this step: the script renders the report anyway, to
+      # read while debugging, and then re-raises, so the steps that publish a
+      # number never run for a red build.
+      - name: "Measure coverage"
+        run: cmake --build --preset clang-coverage --target coverage
+
+      # always(), so a red suite still says what it measured — the report is
+      # rendered either way, and the figure is the first thing anyone asks for.
+      # Guarded on the file existing because a build that never linked has no
+      # report at all.
+      - name: "Summarize"
+        if: always()
+        run: |
+          report="$COVERAGE_DIR"
+          if [[ ! -f "$report/percent.txt" ]]; then
+            echo "No coverage report was produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Code coverage"
+            echo
+            echo "**$(cat "$report/percent.txt")%** of lines covered."
+            # Tested separately from percent.txt rather than assumed from it:
+            # the script writes this one later, so a failure in between would
+            # otherwise render a percentage above an empty code fence.
+            if [[ -f "$report/report.txt" ]]; then
+              echo
+              echo '```'
+              # The header row and the totals row: region, function, line and
+              # branch figures with their column names, rather than a blind tail
+              # that picks up whichever file llvm-cov happened to print last.
+              grep -E '^(Filename|TOTAL)' "$report/report.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Upload the HTML report"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: ${{ env.COVERAGE_DIR }}/html
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Skipped, and the job still green, until a maintainer enables the
+      # repository at codecov.io and adds CODECOV_TOKEN — so this lands working
+      # rather than red. Deliberately NOT `if: always()`: a red suite must not
+      # publish a number.
+      - name: "Upload to Codecov"
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: ${{ env.COVERAGE_DIR }}/coverage.lcov
+          # The lcov export already carries only first-party non-test sources,
+          # so there is nothing else in the directory worth finding.
+          disable_search: true
+          # False, and deliberately. This job is a row in release.needs, so a
+          # Codecov outage or rate-limit with fail_ci_if_error would fail a tag
+          # build whose every other job was green and leave no draft release —
+          # a third party's availability deciding whether this project can ship.
+          # The measurement is what gates; publishing it is not.
+          fail_ci_if_error: false
+
   macos:
     name: "macOS-clang-release"
     runs-on: macos-14
@@ -1574,6 +1717,7 @@ jobs:
       - check-release-gate
       - linux
       - clang-tidy
+      - coverage
       - macos
       - docker
       - sccache-smoke-memcached-text

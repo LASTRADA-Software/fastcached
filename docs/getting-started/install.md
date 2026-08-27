@@ -253,7 +253,10 @@ only makes sense inside a package.
 The repository includes presets for:
 
 - `gcc-debug` — GCC debug build on Linux.
-- `clang-coverage` — Linux coverage build with an HTML report.
+- `clang-coverage` — Linux coverage build. Building its `coverage` target runs the
+  whole test suite under instrumentation and writes an HTML report, an lcov export
+  and the percentage to `out/build/clang-coverage/coverage/`. Needs `llvm-profdata`
+  and `llvm-cov` at the same major version as the `clang` building it.
 - `clang-asan-ubsan` — sanitizers without clang-tidy.
 - `clang-tsan` — thread sanitizer.
 - `clangcl-debug` — clang-cl on Windows.

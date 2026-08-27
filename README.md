@@ -1,5 +1,8 @@
 # fastcached
 
+[![Build](https://github.com/LASTRADA-Software/fastcached/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/LASTRADA-Software/fastcached/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/LASTRADA-Software/fastcached/branch/master/graph/badge.svg)](https://codecov.io/gh/LASTRADA-Software/fastcached)
+
 Three things ship from this repository:
 
 - **`fastcached`** — a fast in-memory cache daemon that speaks the memcached

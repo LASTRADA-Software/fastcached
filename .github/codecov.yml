@@ -1,0 +1,47 @@
+# Codecov configuration. Read by codecov.io, not by any workflow here; the
+# upload itself is the last step of the `coverage` job in workflows/build.yml,
+# and it is skipped until a maintainer enables this repository at codecov.io and
+# adds CODECOV_TOKEN to the repository secrets.
+
+coverage:
+  # Both statuses are informational, and that is the point of the current
+  # arrangement rather than a temporary loosening. Coverage was wired up to
+  # establish a baseline and make the number visible; the long-term target is
+  # >90%, and moving it there is separate work on separate pull requests. A
+  # blocking status now would fail merges over a figure nobody has yet had the
+  # chance to raise, which teaches everyone to ignore it. Tightening this is a
+  # deliberate later decision, once the number stops moving.
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  behavior: default
+  # Comment on every pull request, not only ones that move the number. Seeing
+  # "no change" is itself the useful signal while the baseline is being built.
+  require_changes: false
+
+# Belt and braces. scripts/coverage.sh already restricts the lcov it uploads to
+# src/ and drops the test files, so nothing else should ever reach Codecov;
+# these are named again only so Codecov's own view cannot silently disagree with
+# the report a developer reads locally.
+#
+# Everything third-party is excluded by that allow-list rather than by a rule
+# here: the standard library, the build tree and CPM's dependency sources are
+# all outside src/, wherever CPM_SOURCE_CACHE happens to put them. Which is the
+# point — a deny-list naming `_deps/` is correct locally and silently wrong in
+# CI, where that variable moves those trees somewhere else entirely.
+#
+# So the only rules left are the ones inside src/: the shared harness, and the
+# ~150 *_test.cpp files that live next to the implementation they test and
+# compile straight into the test binaries. Counting those measures the tests
+# testing themselves.
+ignore:
+  - "src/tests/**"
+  - "**/*_test.cpp"
+  - "**/test_main.cpp"

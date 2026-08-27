@@ -352,3 +352,56 @@ so with either launcher active the module scan and precompiled headers are
 turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
 PDB is a second artefact no hit can reproduce).
+
+## Code coverage
+
+`cmake --preset clang-coverage`, build, then `--target coverage`. That target runs the
+**whole** CTest suite under instrumentation and writes
+`out/build/clang-coverage/coverage/`: `html/index.html` to browse, `coverage.lcov` for
+Codecov, `report.txt` and `percent.txt`. CI runs that same target, so there is one code
+path (`scripts/coverage.sh`) rather than two that drift.
+
+**Clang source-based, never gcov — because of how many processes this suite is.**
+`catch_discover_tests` gives each of ~2000 `TEST_CASE`s its own process, and the
+script-driven tests spawn daemons and launchers besides. gcov merges counters into a
+shared `.gcda` per object file as each process exits, so concurrent writers race; that
+race is what every `lcov --ignore-errors mismatch,inconsistent` on the internet is
+suppressing, and a suppressed error there is under-counted coverage reported as a clean
+run. LLVM keys each raw profile on the binary's own module signature and merges into it
+under a lock, so no suppression and no serialization is needed.
+
+**`%8m`, never `%p`.** Measured on this tree, 2228 test processes produce **55** raw
+profiles totalling 20 MB. `%p` would have written one multi-megabyte file *per process*.
+
+**A compiler cache and coverage cannot be combined.** Coverage mapping data is embedded
+in the object file and names its sources by **absolute path**, while `fastcache-cc`
+exists precisely so an object built under one checkout root can serve a compile under
+another. A hit replays a perfectly valid object carrying the *producer's* paths, and
+llvm-cov then reports files that do not exist here — a report about somebody else's
+tree, with nothing failing to say so. The preset sets `USE_COMPILER_CACHE=OFF`, and
+`cmake/Coverage.cmake` refuses to configure if a launcher is set anyway, since
+`-DCMAKE_CXX_COMPILER_LAUNCHER=` bypasses that option.
+
+**`*_test.cpp` is excluded from the report, and that is load-bearing.** Tests here live
+*next to* the implementation, so ~150 `*_test.cpp` files compile straight into the test
+binaries. Counting them measures the tests testing themselves — thousands of near-100%
+lines that move the total a long way and mean nothing. The one `ignore_regex` in
+`scripts/coverage.sh` is the single source of truth for what is measured; `.github/codecov.yml`
+restates it only so Codecov's view cannot silently disagree.
+
+**Every misconfiguration is a `FATAL_ERROR`, not a warning that disables itself.** A
+non-Clang compiler, Windows, an enabled sanitizer, no test suite, a missing `python3`, a
+compiler-cache launcher, or an `llvm-profdata` whose major version differs from the
+compiler's — the raw profile format is versioned, and a mismatch otherwise surfaces as a
+complaint about the *file* rather than about the tool. A coverage build that quietly
+instruments nothing still compiles, still runs the suite and still writes a report, so
+every signal an author would check says it worked. Same reasoning as the sanitizer entry
+above, which had already been found in exactly that state.
+
+**The CI job publishes and gates on nothing.** `coverage` in `build.yml` reports the
+figure to the job summary, uploads the HTML, and pushes lcov to Codecov once
+`CODECOV_TOKEN` exists; both Codecov statuses are `informational`. The long-term target
+is >90% and raising it is separate work — a threshold added before anyone has had the
+chance to move the number only teaches everyone to ignore the signal. A failing suite
+still gets its report rendered, to read while debugging, and then re-raises so no number
+measured from a red build is published.
