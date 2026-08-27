@@ -253,6 +253,29 @@ namespace
     /// The VC include directories relative to a toolset root, in `INCLUDE` order.
     constexpr std::array<std::string_view, 2> MsvcToolsetIncludeSubdirectories { "include", "atlmfc/include" };
 
+    /// What a clang driver is asked for the directory its own headers live in.
+    ///
+    /// Asking beats deriving here, and the difference is not style. The resource
+    /// tree is `<prefix>/lib/clang/<version>/`, and neither half is reliably
+    /// recoverable from the driver's path: `/usr/bin/clang-cl-20` has `/usr` as its
+    /// prefix, whose `lib/clang` on an ordinary Debian holds `20`, `20.1.2`, `22`
+    /// and `22.1.8` -- four candidates, of which "the newest" is the wrong one.
+    /// The driver knows, and says so on stdout, exactly once.
+    ///
+    /// Accepted in cl-driver mode as well as GNU mode, which is what makes one
+    /// spelling serve `clang-cl`: measured against clang-cl 20 and 22, both
+    /// answering their own `/usr/lib/llvm-<v>/lib/clang/<v>`.
+    constexpr std::string_view ClangResourceDirFlag = "-print-resource-dir";
+
+    /// The header directory inside a resource tree.
+    ///
+    /// The tree also holds `lib` and `share`, which a compile links against rather
+    /// than includes -- folding those in would put a machine's link-time artefacts
+    /// into an identity that answers "what will this compile like". Its presence is
+    /// also what tells a real answer from a driver that did not understand the
+    /// question.
+    constexpr std::string_view ClangResourceIncludeSubdirectory = "include";
+
     /// Where the shared VS headers live, relative to the Visual Studio root.
     ///
     /// Present in a developer prompt's `INCLUDE` and easy to miss: leaving it out
@@ -577,6 +600,38 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
     return roots;
 }
 
+std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, IToolchainHost& host, std::string const& compiler)
+{
+    std::array<std::string, 2> const argv { compiler, std::string { ClangResourceDirFlag } };
+
+    // Split rather than combined, so a driver that prints a warning first cannot
+    // put it where a path is expected. `-print-resource-dir` writes one line to
+    // stdout and nothing else.
+    auto const run = runner.RunCaptureSplit(argv);
+
+    // The exit code is not consulted, for the reason the GNU arm below states: a
+    // driver can exit non-zero for reasons that leave its answer perfectly good.
+    // What decides is whether the answer NAMES A DIRECTORY -- which is also what
+    // rejects a wrapper that did not understand the flag, since its diagnostic is
+    // not a path that exists.
+    auto line = std::string_view { run.out }.substr(0, run.out.find('\n'));
+
+    // A `\r` left on the end becomes part of the path, and every directory test
+    // against it then fails silently -- a path that does not exist is skipped
+    // rather than reported. `ParseGnuIncludeSearchPaths` strips it for the same
+    // reason, and this output is read on the platform that produces it.
+    if (!line.empty() && line.back() == '\r')
+        line.remove_suffix(1);
+
+    auto const resourceDir = Trim(line);
+    if (resourceDir.empty())
+        return {};
+
+    std::vector<std::string> roots;
+    AppendIfDirectory(host, roots, resourceDir, ClangResourceIncludeSubdirectory);
+    return roots;
+}
+
 std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
                                               IToolchainHost& host,
                                               std::string const& compiler,
@@ -609,9 +664,6 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
             return ParseGnuIncludeSearchPaths(run.err);
         }
 
-        case IncludeDiscovery::MsvcEnvironment:
-            return IncludeEnvironmentRoots(host);
-
         case IncludeDiscovery::MsvcLayout: {
             auto roots = MsvcToolsetIncludeRoots(host, compiler);
 
@@ -635,6 +687,16 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
             roots.insert(roots.end(), std::make_move_iterator(kits.begin()), std::make_move_iterator(kits.end()));
             return roots;
         }
+
+        case IncludeDiscovery::ClangResourceLayout:
+            // No `INCLUDE` fallback, deliberately, and it is the difference that
+            // makes this mechanism symmetric where `MsvcLayout` can only be
+            // symmetric where a layout is derivable. A driver that does not answer
+            // gets a banner-only fingerprint -- weaker, but `clang-cl` announces a
+            // real version, so it still tells one clang from another. Reaching for
+            // the variable would buy such a driver nothing and hand a service and a
+            // developer prompt two different answers again.
+            return ClangResourceIncludeRoots(runner, host, compiler);
     }
     return {};
 }

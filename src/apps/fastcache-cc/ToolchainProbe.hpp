@@ -159,6 +159,42 @@ namespace FastCache::Cc
 ///         is installed, and always empty off Windows.
 [[nodiscard]] std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host);
 
+/// A clang driver's own resource directory: the headers that ship WITH it.
+///
+/// `<prefix>/lib/clang/<version>/include` -- `stddef.h`, `stdarg.h`, the intrinsics
+/// headers -- which belong to this exact clang build rather than to whatever else
+/// the machine has installed. **The driver is asked** (`-print-resource-dir`)
+/// rather than having it derived from its path, and the difference is correctness
+/// rather than taste: `/usr/bin/clang-cl-20` has `/usr` for a prefix, whose
+/// `lib/clang` holds `20`, `20.1.2`, `22` and `22.1.8` on an ordinary Debian, and
+/// no rule over those names picks the right one. `cl` is modelled from its layout
+/// only because `cl` cannot be asked anything; this driver can.
+///
+/// Nothing ambient reaches the answer, which is the point. `clang-cl` took its
+/// search list from `INCLUDE`, which `vcvarsall` sets per shell and a Windows
+/// service never inherits, so a launcher in a developer prompt and a worker under
+/// the SCM fingerprinted one compiler two ways and the scheduler matched nothing.
+/// A resource directory is a property of the binary, so both ends reach it.
+///
+/// **What is deliberately NOT here is the VC toolset and the Windows SDK.**
+/// `MsvcToolsetIncludeRoots` folds them into `cl`'s identity because `cl` LIVES
+/// inside the toolset and because its banner is the constant `cl`, so those headers
+/// are the only identity it has. Neither holds for `clang-cl`: it announces a
+/// genuine version, and it borrows whichever MSVC the machine happens to have.
+/// Folding a borrowed tree in would buy no discrimination -- a worker compiles text
+/// the client already preprocessed, so it opens no MSVC header -- while costing
+/// real matches, since the newest-kit rule would split two boxes running one
+/// clang-cl with different SDKs installed.
+///
+/// @param runner Process-spawning seam.
+/// @param host The machine's filesystem.
+/// @param compiler The compiler being identified, bare name or path.
+/// @return Its resource include root, or empty when the driver did not name one
+///         that exists.
+[[nodiscard]] std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner,
+                                                                 IToolchainHost& host,
+                                                                 std::string const& compiler);
+
 /// Ask a driver where it searches for system headers.
 ///
 /// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added

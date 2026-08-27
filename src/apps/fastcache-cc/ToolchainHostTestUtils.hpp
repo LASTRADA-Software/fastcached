@@ -120,6 +120,21 @@ class ScriptedToolchainHost final: public IToolchainHost
         return *this;
     }
 
+    /// Append one directory to the search path, keeping what is already there.
+    ///
+    /// Two fixtures describing one machine is the ordinary case -- a Visual Studio
+    /// install and an LLVM install sit side by side on real Windows boxes -- and
+    /// with `SetSearchPath` alone the second silently unresolves the first's
+    /// compiler. A case that then looks like it covers both covers one.
+    ///
+    /// @param directory The directory to append.
+    /// @return This host, for chaining.
+    ScriptedToolchainHost& AppendSearchPath(std::string directory)
+    {
+        _searchPath.push_back(std::move(directory));
+        return *this;
+    }
+
     bool DirectoryExists(std::string_view path) override
     {
         return _directories.contains(Normalize(path));

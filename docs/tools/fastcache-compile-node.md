@@ -151,6 +151,23 @@ under a key other machines fetch.
 Computing it walks the include tree, which takes a few seconds the first time a
 machine sees a toolchain and is cached afterwards.
 
+**Which tree, per driver.** GCC and Clang are asked directly (`-E -v`), and so is
+`clang-cl` (`-print-resource-dir`). `cl` is the one that cannot be asked — it
+answers no `--version` and prints no search list — so it is read off its install
+layout instead: the `VC\Tools\MSVC\<version>` toolset it lives inside, plus the
+newest Windows SDK the registry names. `clang-cl` covers only its own resource
+directory, `<prefix>\lib\clang\<version>\include`: it borrows the VC toolset and
+the SDK rather than owning them, and a worker compiles text the client already
+preprocessed, so it opens no header from either.
+
+Neither takes its answer from `INCLUDE`, which a developer command prompt sets
+and a Windows service never inherits — that is why a service-run worker and a
+developer-prompt launcher agree. `cl` still falls back to it for a driver
+outside any `VC\Tools\MSVC` layout, because a `cl` that answers no `--version`
+would otherwise be left with an identity every MSVC install on earth shares;
+`clang-cl` never does, since its version banner already tells one clang from
+another.
+
 ### When no worker matches
 
 The launcher reports `not dispatched (rejected (no-worker): ...)`. Ask both ends

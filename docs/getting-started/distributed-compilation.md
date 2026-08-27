@@ -309,12 +309,22 @@ journalctl -u fastcache-compile-node | grep serving        # on a worker
 If they differ, the machines really do have different toolchains — different
 patch releases, different SDKs, a vendored header that is not the same.
 
-The fingerprint is a digest of the compiler's version banner **and its whole
-include tree**. That is what lets two machines with the same toolchain at
-different install prefixes match, while two machines whose headers differ do
-not. It cannot be loosened: an over-strict match costs one local compile, an
-over-loose one produces a silently wrong object that is then stored under a key
-every other machine fetches.
+The fingerprint is a digest of the compiler's version banner **and the include
+tree that belongs to it**. That is what lets two machines with the same
+toolchain at different install prefixes match, while two machines whose headers
+differ do not. It cannot be loosened: an over-strict match costs one local
+compile, an over-loose one produces a silently wrong object that is then stored
+under a key every other machine fetches.
+
+*Belongs to it* is the operative phrase on Windows. `cl` carries the
+`VC\Tools\MSVC\<version>` toolset it lives inside and the newest Windows SDK;
+`clang-cl` carries only the resource directory it names when asked
+(`-print-resource-dir`), because it borrows the VC toolset and the SDK rather
+than owning them — so two clang-cl machines with different SDKs installed still
+match. Neither derives its answer
+from `INCLUDE`, which is set per developer command prompt and never inherited by
+a service — so a worker installed as a service matches the launchers that talk
+to it.
 
 ---
 
