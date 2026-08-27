@@ -738,17 +738,19 @@ int main(int argc, char** argv)
     // the same cheap-and-fallible-first ordering the socket-activation check follows.
     //
     // The command line is registered as typed. Every other flag alongside
-    // --install-service is baked in and reused at every start, which is why the
-    // rejections below are install-time rules rather than startup ones: a
-    // registration that cannot work must fail here, where an operator is watching,
-    // rather than at every boot where nobody is.
+    // --install-service is baked in and reused at every start, so a registration
+    // that cannot work must fail here, where an operator is watching, rather than
+    // at every boot where nobody is. That is why the gate is
+    // `NodeInstallRejection` and not `NodeServiceRejection`: an install has to
+    // satisfy the STARTUP rules as well, since this returns before they are ever
+    // reached and every one of them is decided by the command line being baked in.
     if (cfg.installService || cfg.uninstallService)
     {
         // Only an install has to be viable; an uninstall merely names a
         // registration to remove, and refusing to remove one because it was
         // misconfigured is how a bad registration becomes permanent.
         if (cfg.installService)
-            if (auto const rejection = NodeServiceRejection(cfg))
+            if (auto const rejection = NodeInstallRejection(cfg))
             {
                 logger.Logf(LogLevel::Error, "{}", *rejection);
                 return ExitUsage;

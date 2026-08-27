@@ -293,6 +293,77 @@ TEST_CASE("NodeConfig: a discovery-off registration comes back with it still off
     CHECK_FALSE(std::ranges::contains(plain.arguments, "--no-toolchain-discovery"));
 }
 
+TEST_CASE("NodeConfig: an install is judged by the startup rules too", "[node][service][policy]")
+{
+    // The defect: `--install-service` consulted `NodeServiceRejection` and returned
+    // before `StartupPolicyRejection` ever ran, while `MakeNodeServiceSpec` baked
+    // the very flags those rules govern into the registration. A command line that
+    // cannot start therefore installed cleanly and then failed at EVERY boot, into
+    // a log nobody reads -- the exact inversion of the rule the install path states
+    // for itself: refuse where an operator is watching, not where nobody is.
+    auto certWithoutKey = Installable();
+    certWithoutKey.adminListen = "0.0.0.0:6680";
+    certWithoutKey.tlsCertFile = "/etc/fastcache/server.pem";
+
+    // Passes the install table, which knows nothing about TLS.
+    REQUIRE_FALSE(NodeServiceRejection(certWithoutKey).has_value());
+    // And is refused at startup, every time, for a reason decided the moment it was
+    // typed.
+    REQUIRE(StartupPolicyRejection(certWithoutKey).has_value());
+
+    auto const refusal = NodeInstallRejection(certWithoutKey);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--tls-key"));
+}
+
+TEST_CASE("NodeConfig: an install reports the rule that names the install", "[node][service][policy]")
+{
+    // Both tables object; the install-time one is reported, because its wording
+    // names the action the operator is taking. Ordering is the only thing the
+    // composition decides, so it is the only thing worth pinning.
+    auto broken = Installable();
+    broken.advertise.clear(); // an install rule
+    broken.raftJoin = true;   // and a startup rule, with no --node-id
+    broken.nodeId.clear();
+
+    REQUIRE(NodeServiceRejection(broken).has_value());
+    REQUIRE(StartupPolicyRejection(broken).has_value());
+
+    auto const refusal = NodeInstallRejection(broken);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--advertise"));
+}
+
+TEST_CASE("NodeConfig: a second startup rule is refused at install too", "[node][service][policy]")
+{
+    // A structurally different rule from the TLS one, so this pins the composition
+    // rather than one lucky row: nothing about `--dashboard` resembles a cert/key
+    // pair, and both must reach the install path.
+    auto dashboardNowhere = Installable();
+    dashboardNowhere.dashboard = true; // with no --admin-listen to serve it on
+
+    REQUIRE_FALSE(NodeServiceRejection(dashboardNowhere).has_value());
+
+    auto const refusal = NodeInstallRejection(dashboardNowhere);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--admin-listen"));
+}
+
+TEST_CASE("NodeConfig: a registration that can work is still accepted", "[node][service][policy]")
+{
+    // The other direction, and the one a union gets wrong: a worker that would
+    // start must still install. Over-refusing here would make the package
+    // uninstallable on a perfectly ordinary machine.
+    CHECK_FALSE(NodeInstallRejection(Installable()).has_value());
+
+    // Including with the surfaces the startup table governs actually configured.
+    auto full = Installable();
+    full.adminListen = "0.0.0.0:6680";
+    full.tlsCertFile = "/etc/fastcache/server.pem";
+    full.tlsKeyFile = "/etc/fastcache/server.key";
+    CHECK_FALSE(NodeInstallRejection(full).has_value());
+}
+
 TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][service]")
 {
     // Each of these produces a service that registers cleanly and then cannot do

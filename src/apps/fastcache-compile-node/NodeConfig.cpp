@@ -972,6 +972,28 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     return std::nullopt;
 }
 
+std::optional<std::string> NodeInstallRejection(NodeConfig const& cfg)
+{
+    // Composed rather than merged, so each table keeps the contract its own callers
+    // rely on: this is the only place that says an install must satisfy both, and a
+    // new row in either reaches the install path without anybody remembering to add
+    // it here.
+    //
+    // The install-time table is asked first because its messages name the action --
+    // "is required to install a service" reads as an answer to `--install-service`
+    // in a way a startup rule does not, and only one refusal is ever printed.
+    if (auto rejection = NodeServiceRejection(cfg))
+        return rejection;
+
+    // Every startup rule is a pure invariant of the parsed configuration -- no
+    // clock, no filesystem, no port -- so each is decided the moment the command
+    // line is typed. `--install-service` bakes that command line in and replays it
+    // at every boot, which makes a startup rule strictly MORE worth refusing here
+    // than at a start: a start refuses once, in front of the operator who typed it,
+    // while a registration refuses forever into a log nobody reads.
+    return StartupPolicyRejection(cfg);
+}
+
 std::string HelpText(UsageColor color)
 {
     UsageRows optionRows;
