@@ -877,10 +877,18 @@ namespace
                                    "'{}' access to the directory that will hold it once it is there",
                                    target.string(),
                                    account);
-            std::filesystem::create_directories(target, ec);
+            // Its own error_code, because the probe below CLEARS one: a
+            // successful "no, it is not there" is a successful status query, so
+            // reusing `ec` overwrote the reason with a success and the operator
+            // was told "could not create <path>: The operation completed
+            // successfully" for an access-denied create.
+            std::error_code createEc;
+            std::filesystem::create_directories(target, createEc);
+            if (std::error_code probeEc; !std::filesystem::exists(target, probeEc))
+                return std::format("could not create {}: {}",
+                                   target.string(),
+                                   createEc ? createEc.message() : std::string { "it is still not there" });
         }
-        if (!std::filesystem::exists(target, ec))
-            return std::format("could not create {}: {}", target.string(), ec.message());
 
         auto path = target.string();
 
@@ -1412,17 +1420,44 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // made a DIRECTORY the daemon then read as a directory of shards, and once the
     // file existed it failed and skipped the chown — on exactly the upgrade this
     // handover is here for.
+    std::string warnings;
     if (scope == ServiceScope::System && !effective.serviceAccount.empty())
         if (auto const* const pw = ::getpwnam(effective.serviceAccount.c_str()); pw != nullptr)
         {
             std::vector<std::filesystem::path> owned { logDirectory };
             for (auto const& target: effective.ownedPaths)
             {
-                std::error_code ownedEc;
-                if (!std::filesystem::exists(target, ownedEc) && !PathNamesAFile(target))
-                    std::filesystem::create_directories(target, ownedEc);
-                if (std::filesystem::exists(target, ownedEc))
+                std::error_code probeEc;
+                auto const namesAFile = PathNamesAFile(target);
+                std::error_code createEc;
+                if (!std::filesystem::exists(target, probeEc) && !namesAFile)
+                    std::filesystem::create_directories(target, createEc);
+                if (std::filesystem::exists(target, probeEc))
+                {
                     owned.emplace_back(target);
+                    continue;
+                }
+
+                // SAID, not skipped -- and the two ways of getting here are
+                // different facts, so they get different sentences. A path that
+                // NAMES A FILE is correctly not created (making a directory of it
+                // is the failure the comment above records) but is then never
+                // chowned either, and the service account cannot create it inside a
+                // root-owned parent. A path that was meant to be a directory and is
+                // still absent failed to be created, and `createEc` is the reason.
+                //
+                // Left silent, either one let `--install-service` report success
+                // while launchd respawned the job forever. The Windows sibling has
+                // warned since it was written; this path told an operator nothing.
+                warnings += namesAFile
+                                ? std::format("\nwarning: {} does not exist yet and names a file, so it was not "
+                                              "created; grant '{}' access to the directory that will hold it",
+                                              target.string(),
+                                              effective.serviceAccount)
+                                : std::format("\nwarning: could not create {} for '{}': {}",
+                                              target.string(),
+                                              effective.serviceAccount,
+                                              createEc ? createEc.message() : std::string { "it is still not there" });
             }
             for (auto const& path: owned)
                 (void) ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
@@ -1468,10 +1503,11 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
                                         LaunchctlStatusText(rc)) };
 
     return { .exitCode = 0,
-             .message = std::format("installed and started launchd job '{}' ({} scope, {})",
+             .message = std::format("installed and started launchd job '{}' ({} scope, {}){}",
                                     label,
                                     ServiceScopeName(scope),
-                                    plistPath.string()) };
+                                    plistPath.string(),
+                                    warnings) };
 }
 
 ServiceControlResult UninstallService(ServiceSpec const& spec, ServiceScope scope)
