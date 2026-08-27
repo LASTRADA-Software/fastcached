@@ -102,13 +102,21 @@ class DatagramBus
     /// One socket's queue.
     struct Inbox
     {
-        DatagramAddress endpoint;           ///< What this socket bound; never changes.
-        std::deque<ReceivedDatagram> queue; ///< Datagrams awaiting a receive.
-        std::size_t dropsRemaining { 0 };   ///< Scripted losses still to apply.
-        bool closed { false };              ///< Whether its socket has been closed.
+        DatagramAddress endpoint;              ///< What this socket bound; never changes.
+        std::deque<ReceivedDatagram> queue {}; ///< Datagrams awaiting a receive.
+        std::size_t dropsRemaining { 0 };      ///< Scripted losses still to apply.
+        bool closed { false };                 ///< Whether its socket has been closed.
     };
 
     /// What `Attach` hands a socket to work through.
+    ///
+    /// The reference outlives every use of it, because only the socket's own
+    /// destructor detaches -- so a socket destroyed while another thread is
+    /// parked in its `Receive` is a use-after-free rather than the stuck wait it
+    /// would have been when an address was a key. That is the lifetime rule every
+    /// socket in this tree already has (`DiscoveryTier` joins its loop before the
+    /// socket goes), stated here because this is where breaking it stopped being
+    /// survivable.
     struct Attachment
     {
         std::size_t id; ///< What `Detach` takes back.

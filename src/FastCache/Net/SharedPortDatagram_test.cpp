@@ -15,32 +15,18 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/CoHostedDatagram.hpp>
 #include <tests/DatagramPayload.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
+using FastCache::Testing::CoHostedDatagramSocket;
 using FastCache::Testing::DatagramBytes;
 using FastCache::Testing::DatagramText;
+using FastCache::Testing::TestBeaconPort;
 
 namespace
 {
-/// The port every node in these cases listens for broadcasts on.
-///
-/// Named rather than repeated, because every case here turns on the difference
-/// between "the port everybody bound" and "the address only I hold", and a
-/// literal at each call site is how those two come to be the same number.
-constexpr std::uint16_t BeaconPort = 6681;
-
-/// One node's pair: the shared beacon port, and an address of its own.
-/// @param bus The segment.
-/// @param host The machine this node runs on; two co-hosted nodes share it.
-/// @param ownPort The port only this node holds.
-/// @return The pair, as one socket.
-[[nodiscard]] std::unique_ptr<IDatagramSocket> NodeSocket(DatagramBus& bus, std::string_view host, std::uint16_t ownPort)
-{
-    return AnswerFromOwnAddress(bus.Open(DatagramAddress { .host = std::string { host }, .port = BeaconPort }),
-                                bus.Open(DatagramAddress { .host = std::string { host }, .port = ownPort }));
-}
 } // namespace
 
 TEST_CASE("A shared-port socket sends from the address only it holds", "[net][datagram][sharedport]")
@@ -49,8 +35,8 @@ TEST_CASE("A shared-port socket sends from the address only it holds", "[net][da
     // address, so a datagram that went out of the shared socket would have it
     // answered at a port a co-hosted node may hold too.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
     REQUIRE(node->Send(DatagramBytes("beacon"), peer->BoundAddress()).has_value());
 
@@ -67,10 +53,10 @@ TEST_CASE("A shared-port socket receives on both of its halves", "[net][datagram
     // the caller above sees one stream. Sent before either is read, so the case
     // does not depend on which half is polled first -- that alternates.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(BeaconPort)).has_value());
+    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
     REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
 
     std::vector<std::string> heard;
@@ -91,10 +77,10 @@ TEST_CASE("A broadcast reaches the shared half and not the private one", "[net][
     // see every beacon twice, challenge every peer twice per beacon, and reject
     // the first proof back as an answer to a nonce it had already replaced.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(BeaconPort)).has_value());
+    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
 
     auto const once = node->Receive(10ms);
     REQUIRE(once.has_value());
@@ -109,11 +95,11 @@ TEST_CASE("Two co-hosted shared-port sockets each get their own answers", "[net]
     // the other does not hold -- which is what a single shared socket could not
     // give them, because a unicast to the port they share reaches only one.
     DatagramBus bus;
-    auto first = NodeSocket(bus, "10.0.0.1", 40001);
-    auto second = NodeSocket(bus, "10.0.0.1", 40002);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto first = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto second = CoHostedDatagramSocket(bus, "10.0.0.1", 40002);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(BeaconPort)).has_value());
+    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
 
     for (auto* const node: { first.get(), second.get() })
     {
@@ -141,7 +127,7 @@ TEST_CASE("Closing a shared-port socket stops its receive loop", "[net][datagram
     // polled first, so it is asserted twice -- and the order alternates, so two
     // calls cover both.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
 
     node->Close();
 
@@ -156,7 +142,7 @@ TEST_CASE("Closing a shared-port socket stops its receive loop", "[net][datagram
 TEST_CASE("An idle shared-port socket times out rather than blocking", "[net][datagram][sharedport]")
 {
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
 
     auto const result = node->Receive(10ms);
     REQUIRE_FALSE(result.has_value());
@@ -175,7 +161,7 @@ TEST_CASE("A half that could not be bound yields no pair at all", "[net][datagra
     };
 
     CHECK(AnswerFromOwnAddress(nullptr, at(40001)) == nullptr);
-    CHECK(AnswerFromOwnAddress(at(BeaconPort), nullptr) == nullptr);
+    CHECK(AnswerFromOwnAddress(at(TestBeaconPort), nullptr) == nullptr);
     CHECK(AnswerFromOwnAddress(nullptr, nullptr) == nullptr);
 }
 
@@ -191,9 +177,15 @@ TEST_CASE("A shared-port socket drains a backlog as fast as it is asked", "[net]
     // Asserted as elapsed time rather than by reading the implementation, and
     // against a generous ceiling, because what is being ruled out is seconds.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
+    // A large caller timeout, so the two implementations are orders of magnitude
+    // apart rather than a factor of two. Half-the-timeout would spend a full
+    // SECOND on the idle half every other call; a glance spends whatever the
+    // platform's shortest real wait is, which on Windows is a ~15ms timer tick
+    // rather than the 1ms asked for. Eight of each gives 8s against 0.13s, and
+    // the ceiling sits between them with room for a loaded runner on both sides.
     constexpr auto Backlog = 16;
     for (auto sent = 0; sent < Backlog; ++sent)
         REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
@@ -201,17 +193,13 @@ TEST_CASE("A shared-port socket drains a backlog as fast as it is asked", "[net]
     auto const startedAt = std::chrono::steady_clock::now();
     for (auto drained = 0; drained < Backlog; ++drained)
     {
-        auto const received = node->Receive(250ms);
+        auto const received = node->Receive(2s);
         REQUIRE(received.has_value());
         CHECK(DatagramText(*received) == "proof");
     }
     auto const elapsed = std::chrono::steady_clock::now() - startedAt;
 
-    // Half-the-timeout would have spent 125ms on the idle half every other
-    // call -- Backlog/2 * 125ms, a full second. This costs about a
-    // millisecond a datagram, so the ceiling is loose enough for a busy
-    // runner and still three times under what it is ruling out.
-    CHECK(elapsed < 300ms);
+    CHECK(elapsed < 1s);
 }
 
 TEST_CASE("A shared-port socket polls each half however small the timeout", "[net][datagram][sharedport]")
@@ -220,10 +208,10 @@ TEST_CASE("A shared-port socket polls each half however small the timeout", "[ne
     // not wait" to a real socket -- `SO_RCVTIMEO` of zero means block forever --
     // so the half is floored at a millisecond, and both halves are still read.
     DatagramBus bus;
-    auto node = NodeSocket(bus, "10.0.0.1", 40001);
-    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = BeaconPort });
+    auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
+    auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(BeaconPort)).has_value());
+    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
     REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
 
     std::vector<std::string> heard;

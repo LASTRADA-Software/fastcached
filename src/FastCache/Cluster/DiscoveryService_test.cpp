@@ -16,10 +16,13 @@
 #include <string>
 #include <vector>
 
+#include <tests/CoHostedDatagram.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
+using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::TestBeaconPort;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
 
@@ -115,13 +118,15 @@ struct Node
          IClock& clock,
          IRandomSource& random,
          ILogger& logger,
-         std::string id,
-         std::string endpoint,
-         std::string cluster,
+         std::string const& id,
+         std::string const& endpoint,
+         std::string const& cluster,
          std::string const& key):
-        // Copied rather than moved into the delegation: `AtEndpoint(endpoint)`
-        // is evaluated in the same argument list, and the order of the two is
-        // unspecified.
+        // By reference here and by value one frame down, deliberately.
+        // `AtEndpoint(endpoint)` is evaluated in the same argument list as the
+        // forwarded `endpoint` and the order of the two is unspecified, so there
+        // is nothing here that could be moved from anyway; the copies happen
+        // where they can be moved out of.
         Node(bus.Open(AtEndpoint(endpoint)),
              DatagramBus::BroadcastAddress(),
              clock,
@@ -138,25 +143,6 @@ struct Node
     PeerDirectory directory;
     DiscoveryService service;
 };
-
-/// The port every node on a segment listens for beacons on.
-constexpr std::uint16_t BeaconPort = 6681;
-
-/// A socket for a node co-hosted with others, listening where they all do.
-///
-/// Two halves, and that is the point: the shared one hears the broadcast every
-/// node on the segment is listening for, and the private one is what this node
-/// sends from -- so the address a peer replies to names this node rather than
-/// the machine it happens to share. See `Net/SharedPortDatagram`.
-/// @param bus The segment.
-/// @param host The machine; co-hosted nodes pass the same one.
-/// @param ownPort The port only this node holds.
-/// @return The pair, as one socket.
-[[nodiscard]] std::unique_ptr<IDatagramSocket> CoHostedSocket(DatagramBus& bus, std::string_view host, std::uint16_t ownPort)
-{
-    return AnswerFromOwnAddress(bus.Open(DatagramAddress { .host = std::string { host }, .port = BeaconPort }),
-                                bus.Open(DatagramAddress { .host = std::string { host }, .port = ownPort }));
-}
 
 /// Drain everything waiting for @p node, so a test can settle the segment.
 /// @param node Whose inbox to drain.
@@ -189,14 +175,26 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
     ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
     NullLogger logger;
 
-    auto const beacon = DatagramBus::BroadcastAddressOn(BeaconPort);
+    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
 
-    Node first {
-        CoHostedSocket(bus, "10.0.0.1", 40001), beacon, clock, random, logger, "first", "10.0.0.1:7000", "prod", "secret"
-    };
-    Node second {
-        CoHostedSocket(bus, "10.0.0.1", 40002), beacon, clock, random, logger, "second", "10.0.0.1:7001", "prod", "secret"
-    };
+    Node first { CoHostedDatagramSocket(bus, "10.0.0.1", 40001),
+                 beacon,
+                 clock,
+                 random,
+                 logger,
+                 "first",
+                 "10.0.0.1:7000",
+                 "prod",
+                 "secret" };
+    Node second { CoHostedDatagramSocket(bus, "10.0.0.1", 40002),
+                  beacon,
+                  clock,
+                  random,
+                  logger,
+                  "second",
+                  "10.0.0.1:7001",
+                  "prod",
+                  "secret" };
 
     REQUIRE(first.service.SendBeacon());
     REQUIRE(second.service.SendBeacon());

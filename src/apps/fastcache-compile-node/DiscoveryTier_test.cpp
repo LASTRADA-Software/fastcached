@@ -2,7 +2,6 @@
 #include "DiscoveryTier.hpp"
 
 #include <FastCache/Net/InMemoryDatagram.hpp>
-#include <FastCache/Net/SharedPortDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,11 +13,14 @@
 #include <string>
 #include <vector>
 
+#include <tests/CoHostedDatagram.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::TestBeaconPort;
 
 namespace
 {
@@ -31,9 +33,6 @@ namespace
     auto bytes = std::views::iota(0, 32) | std::views::transform([](int value) { return static_cast<std::byte>(value); });
     return std::vector<std::byte> { bytes.begin(), bytes.end() };
 }
-
-/// The port every node on a segment listens for beacons on.
-constexpr std::uint16_t BeaconPort = 6677;
 
 /// What one node announces about itself.
 /// @param nodeId Its identity.
@@ -68,7 +67,7 @@ struct Peer
     /// @param nodeId This node's identity.
     /// @param key The cluster key it holds.
     Peer(DatagramBus& bus, std::string const& nodeId, std::vector<std::byte> key):
-        Peer(bus.Open(DatagramAddress { .host = nodeId, .port = BeaconPort }),
+        Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
              DatagramBus::BroadcastAddress(),
              nodeId,
              std::move(key))
@@ -92,23 +91,6 @@ struct Peer
     {
     }
 };
-
-/// A node sharing a host, and therefore a beacon port, with another.
-///
-/// Listens where every node on the segment does and answers from an address of
-/// its own -- what `DiscoveryTier::Start` builds over real sockets, and the whole
-/// of issue #126. See `Net/SharedPortDatagram`.
-/// @param bus The segment.
-/// @param host The machine; co-hosted nodes pass the same one.
-/// @param ownPort The port only this node holds.
-/// @return The pair, as one socket.
-[[nodiscard]] std::unique_ptr<IDatagramSocket> CoHostedSocket(DatagramBus& bus,
-                                                              std::string const& host,
-                                                              std::uint16_t ownPort)
-{
-    return AnswerFromOwnAddress(bus.Open(DatagramAddress { .host = host, .port = BeaconPort }),
-                                bus.Open(DatagramAddress { .host = host, .port = ownPort }));
-}
 
 /// A step short enough that a whole handshake costs milliseconds.
 ///
@@ -194,10 +176,10 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     // Driven step by step rather than by a settle loop, because each step here is
     // one leg of the handshake and a failure should name the leg.
     DatagramBus bus;
-    auto const beacon = DatagramBus::BroadcastAddressOn(BeaconPort);
+    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
 
-    Peer first { CoHostedSocket(bus, "host", 40001), beacon, "n1", TestKey() };
-    Peer second { CoHostedSocket(bus, "host", 40002), beacon, "n2", TestKey() };
+    Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", TestKey() };
+    Peer second { CoHostedDatagramSocket(bus, "host", 40002), beacon, "n2", TestKey() };
 
     // Each announces itself, then reads the other's beacon and challenges it, then
     // answers the challenge it was given, then checks the proof it was sent. The
@@ -235,7 +217,7 @@ TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
     auto otherConfig = ConfigFor("n2", TestKey(), DatagramBus::BroadcastAddress());
     otherConfig.clusterId = "somebody-elses";
     auto const theirs = DiscoveryTier::Over(
-        bus.Open(DatagramAddress { .host = "n2", .port = BeaconPort }), std::move(otherConfig), {}, otherLogger);
+        bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }), std::move(otherConfig), {}, otherLogger);
 
     for (auto round = 0; round < 6; ++round)
     {

@@ -126,11 +126,14 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // and every wrong pairing still starts and still passes a test suite.
     auto socket = OpenSharedPortUdpSocket("0.0.0.0", *port, cfg.discoveryReplyPort);
     if (socket == nullptr)
-        return std::unexpected { std::format("cannot bind UDP 0.0.0.0:{} for discovery{}",
-                                             *port,
-                                             cfg.discoveryReplyPort != 0
-                                                 ? std::format(" or 0.0.0.0:{} to answer it on", cfg.discoveryReplyPort)
-                                                 : std::string {}) };
+        // Both are named, because either can be the one that failed and this
+        // cannot tell which. A message that blamed the beacon port alone would
+        // send an operator to look at a port that bound perfectly.
+        return std::unexpected { std::format(
+            "cannot bind the UDP sockets discovery needs: 0.0.0.0:{} to listen on, and {} to answer on",
+            *port,
+            cfg.discoveryReplyPort != 0 ? std::format("0.0.0.0:{}", cfg.discoveryReplyPort)
+                                        : std::string { "a port of this node's own" }) };
 
     // The port the operator configured, which is NOT the one the pair reports:
     // that is where this node is answered. Both go in the startup line.

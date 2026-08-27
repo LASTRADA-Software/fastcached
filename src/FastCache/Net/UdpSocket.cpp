@@ -275,11 +275,34 @@ std::unique_ptr<IDatagramSocket> OpenUdpSocket(std::string_view bindAddress,
             ::setsockopt(handle, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char const*>(&reuse), sizeof(reuse));
 #endif
         }
-        // Exclusive asks for nothing, which is every platform's default for a
-        // datagram socket. There is no SO_EXCLUSIVEADDRUSE counterpart to reach
-        // for here the way `Detail::BindAndListen` does: that guards a *named*
-        // port a squatter may already hold shareably, and the sockets that take
-        // this branch ask the kernel to choose one.
+        // Exclusive is the default on POSIX and has to be asked for on Windows,
+        // which is the same asymmetry `Detail::BindAndListen` records for the
+        // stream side: there, SO_REUSEADDR on a *later* bind takes an address a
+        // live socket already holds, and SO_EXCLUSIVEADDRUSE is the documented
+        // way to refuse that.
+        //
+        // It is not hypothetical here just because most of these sockets ask the
+        // kernel to choose a port. `--discovery-reply-port` binds a NAMED one
+        // through this branch, and a socket answering discovery is precisely the
+        // one whose datagrams must not be handed to a second process: that is
+        // issue #126 again, arrived at from the other side.
+        //
+        // So it fails the candidate rather than being ignored the way
+        // TCP_NODELAY is. A `setsockopt` carrying a security property is not
+        // best-effort -- the rule this repository already paid for once.
+#if defined(_WIN32)
+        if (sharing == PortSharing::Exclusive)
+        {
+            int const exclusive = 1;
+            if (::setsockopt(
+                    handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char const*>(&exclusive), sizeof(exclusive))
+                != 0)
+            {
+                Detail::CloseNativeSocket(handle);
+                continue;
+            }
+        }
+#endif
 
         if (broadcast == BroadcastMode::On)
         {
