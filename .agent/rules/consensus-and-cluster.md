@@ -372,10 +372,12 @@ Every rule below has already been a bug.
     true at that instant is that a majority endorsed this node for this term, and
     buying the difference back would mean making `_votesGranted` a map to correct a
     skew bounded by one round trip that the first heartbeat corrects anyway.
-  - **The window is `electionTimeoutMin` and the comparison is strict, matching the
-    follower side exactly.** "Is there a live leader" is a fact about the cluster,
-    and a leader answering it on a window of its own is how two nodes come to
-    disagree about it at the same instant.
+  - **The window is `electionTimeoutMin` and the comparison is strict.** It is the
+    soonest any peer could start campaigning, so it is the shortest silence that
+    could mean this leader is about to be challenged. This bullet used to end
+    "matching the follower side exactly", on the reasoning that a leader answering
+    on a window of its own is how two nodes disagree at the same instant — **and
+    that reasoning was exactly backwards.** See the entry below.
   - **This is not leader step-down, deliberately.** CheckQuorum elsewhere also
     *deposes* a leader that has lost its majority. That is a separate mechanism
     with its own safety argument, and it is not needed for the hole above: an
@@ -404,6 +406,54 @@ Every rule below has already been a bug.
     also the answer to why the defect survived being written down as a residual —
     the harness that found five other consensus defects could not have found this
     one.
+- **Two nodes asked about the same leader can share a window and still disagree,
+  because they measure from different instants (issue #117).** `NoteFollowerContact`
+  stamps when a **response** arrives; `NoteLeaderContact` stamps when the
+  **request** does. On one link the leader's stamp is therefore always the later of
+  the two by half a round trip, so comparing both against one `electionTimeoutMin`
+  leaves a band — half a round trip wide — in which a leader still counts a
+  follower toward its quorum while that follower has already told a challenger
+  there is nobody in charge. The entry above claimed a shared window bought a
+  shared answer; it never could.
+  - **In a three-node cluster that band is decisive, not marginal.** A challenger
+    needs ONE grant, so the ignorant follower's grant is a quorum with the
+    challenger's own vote and the leader's refusal buys nothing. The fix from
+    issue #103 — teaching the leader to refuse — was necessary and, on its own,
+    inert against this.
+  - **So a non-leader answers from its own belief, not from a clock it shares with
+    nobody**: `_knownLeader.has_value() && now < _electionDeadline`. A node
+    authorizes a challenger exactly when it has given up on its own leader, which
+    is the instant it would stand itself. That is coherence with its own behaviour
+    rather than agreement with the leader's clock — and the latter is not
+    available at any price, because the two sides measure one link from opposite
+    ends.
+  - **The conjunct is what keeps this from being the version #103 replaced.** That
+    one read `_electionDeadline` ALONE, and the deadline is re-armed when a node
+    begins its own pre-vote round — so a node that had just started campaigning
+    refused every peer timing out alongside it, at a cost of some forty election
+    rounds for a five-node cluster. `StartPreVote` also clears `_knownLeader`, so
+    a campaigning node answers "no" and that livelock stays fixed. A candidate
+    therefore *always* answers no, which is the point: standing for election is
+    the act of declaring there is no live leader.
+  - **It costs failover time, deliberately.** A follower used to grant after a flat
+    `electionTimeoutMin`; it now grants after its own draw from [min, max], so a
+    genuinely dead leader is replaced once the SECOND smallest draw among the peers
+    expires. Bounded by `electionTimeoutMax`, which the design already accepts for
+    one election round, and paid to stop a HEALTHY cluster re-electing — an
+    unnecessary election costs a term and a leaderless window too, and happens far
+    more often than a leader actually dies.
+  - **`_lastLeaderContact` is gone, and its absence is the rule.** Nothing read it
+    afterwards. A written-but-unread record of "when did a leader last speak" is
+    worse than none: the next person needing that question answered reaches for it
+    without noticing it no longer decides anything.
+  - **No cluster case can pin this either**, for the reason the entry above gives:
+    the harness delivers every heartbeat on time, so a follower whose leader is
+    punctual never reaches the rule at all. What made the real cluster re-elect was
+    a runner slow enough to age out a timestamp. Three `ManualClock` cases on
+    `RaftNode` pin it exactly — including one asserting a follower that has
+    genuinely given up **still grants**, which passes before the fix as well as
+    after and is the guard against over-correcting into a leader that vetoes its
+    own replacement forever.
 - **A cluster that has ELECTED is not a cluster that has FORMED, and only the
   second one is stable (issue #117).** While a member's process is still
   connecting, the remaining two carry the whole quorum — so a leader's
@@ -545,6 +595,19 @@ Every rule below has already been a bug.
     could rewrite the cluster's configuration on a node, with a term above its own as
     the only thing to supply — while the identical attempt over `AppendEntries` was
     refused. A guard a second entry point does not apply is not a guard.
+
+    **The same path was missing the role change too**, and for the same reason: a
+    candidate that hears from a leader of its own term has lost the election, and
+    `OnAppendEntries` demotes it while `OnInstallSnapshot` — which publishes
+    `_knownLeader`, clears the tally and arms the election timer from the very same
+    message — did not. It was survivable while `HasLiveLeader` read a timestamp, and
+    stopped being survivable the moment a non-leader started answering pre-votes from
+    `_knownLeader`: a node left a candidate there denies the pre-votes a candidate is
+    documented to always grant, which is #103's livelock on one entry point. **Both
+    halves of what a message means have to be applied wherever that message is
+    handled** — the two handlers for "a leader spoke" are `OnAppendEntries` and
+    `OnInstallSnapshot`, and a rule stated in only one of them is a rule the cluster
+    does not have.
 
 ## Open work
 

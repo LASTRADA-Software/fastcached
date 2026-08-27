@@ -263,6 +263,43 @@ TEST_CASE("A follower adopts a snapshot it cannot replay to", "[consensus][raft]
     CHECK(replies[0].matchIndex == LogIndex { .value = 9 });
 }
 
+TEST_CASE("A snapshot from the leader of this term ends the election", "[consensus][raft][snapshot][prevote]")
+{
+    // The same rule `OnAppendEntries` applies, on the entry point that did not
+    // apply it: a candidate that hears from a leader OF ITS OWN TERM has lost the
+    // election -- somebody else reached a quorum first -- and must stop competing.
+    // A snapshot is a leader speaking exactly as a heartbeat is, and this node
+    // already treats it as one everywhere else: it publishes `_knownLeader` from it
+    // and arms its election timer on it.
+    //
+    // Left a candidate it goes on campaigning against a leader it is itself being
+    // caught up by, and -- since `HasLiveLeader` now answers from `_knownLeader`
+    // rather than from a timestamp -- it does so while denying its peers the
+    // pre-votes a candidate is documented to always grant. The split vote is
+    // resolved and then immediately re-run, which is the defect the AppendEntries
+    // path carries a comment about.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+
+    // A split vote n2 lost: it stood in term 1, and n1 took the term with n3.
+    (void) node.Tick(At(ElectionMin.count()));
+    (void) node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n3" },
+                        At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::Candidate);
+    REQUIRE(node.CurrentTerm() == Term { .value = 1 });
+
+    (void) node.Receive(InstallSnapshotRequest { .term = Term { .value = 1 },
+                                                 .leaderId = "n1",
+                                                 .lastIncludedIndex = LogIndex { .value = 4 },
+                                                 .lastIncludedTerm = Term { .value = 1 },
+                                                 .members = { "n1", "n2", "n3" },
+                                                 .state = BytesFromString("caught-up") },
+                        At(ElectionMin.count() + 10));
+
+    CHECK(node.CurrentRole() == Role::Follower);
+    CHECK(node.KnownLeader() == std::optional<NodeId> { "n1" });
+}
+
 TEST_CASE("A snapshot from outside the configuration is refused", "[consensus][raft][snapshot]")
 {
     // Everything `OnInstallSnapshot` goes on to do is destructive: it publishes a

@@ -115,10 +115,17 @@ fail() { echo "compile-cache E2E FAILED: $*" >&2; exit 1; }
 #
 # A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT,
 # and the daemon that follows would then be the one that cannot have it.
+#
+# The range stops below the kernel's ephemeral port range: a port can be an
+# outbound connection's local endpoint with nothing listening on it, so this probe
+# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
+# reasoning, and the CI failure that found it, are above `free_port` in
+# dist-compile-e2e.sh.
 free_port() {
     local candidate
+    local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
-        candidate=$(( 20000 + RANDOM % 20000 ))
+        candidate=$(( floor + RANDOM % (ceiling - floor) ))
         if ! (exec 3<>"/dev/tcp/127.0.0.1/${candidate}") 2>/dev/null; then
             echo "$candidate"
             return 0

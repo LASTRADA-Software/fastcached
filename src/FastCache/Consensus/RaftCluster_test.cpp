@@ -509,3 +509,45 @@ TEST_CASE("A cluster formed on a bare quorum keeps its leader when the last memb
 
     RequireNoViolations(cluster);
 }
+
+TEST_CASE("A healthy cluster never changes term", "[consensus][raft][cluster][prevote]")
+{
+    // The property issue #117 is about, stated at the cluster level: with every
+    // node reachable and nothing else wrong, leadership is decided once. A term
+    // that moves here is a node campaigning against a leader it can hear, which is
+    // exactly what the pre-vote round exists to prevent and what the follower side
+    // of `HasLiveLeader` got wrong twice.
+    //
+    // A guard rather than a regression test, and worth saying which: it passes
+    // against the defect too, because the harness delivers every heartbeat on time
+    // and a follower whose leader is punctual never reaches either version of the
+    // rule. What made the real cluster re-elect was a runner slow enough to age
+    // out a timestamp, and reproducing *that* here would mean racing a grant
+    // against the next heartbeat -- arithmetic over the step size and the
+    // per-message delay, which this rulebook already records paying for as a case
+    // that reports future regressions as flakes. The exact form of the rule is
+    // pinned by the `ManualClock` cases on `RaftNode`; this is the end-to-end
+    // statement that nothing perturbs a cluster nobody is perturbing.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(cluster));
+
+    REQUIRE(cluster.Leader().has_value());
+    REQUIRE(cluster.TermOfLeader().has_value());
+    auto const leader = Unwrap(cluster.Leader());
+    auto const term = Unwrap(cluster.TermOfLeader());
+
+    // Six simulated seconds -- twenty to forty election timeouts, so every node's
+    // randomized draw comes round many times over.
+    cluster.Run(600);
+
+    CHECK(cluster.Leader() == std::optional<NodeId> { leader });
+    CHECK(cluster.TermOfLeader() == std::optional<Term> { term });
+    CHECK(cluster.Leaders().size() == 1);
+
+    // Every node, not just the leader: a follower that campaigned and lost would
+    // carry a raised term while the leader's stayed put.
+    for (auto const& id: { "n1", "n2", "n3" })
+        CHECK(cluster.At(id).driver->Node().CurrentTerm() == term);
+
+    RequireNoViolations(cluster);
+}

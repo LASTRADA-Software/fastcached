@@ -370,12 +370,22 @@ class RaftNode
     /// Win the election and start heartbeating.
     void BecomeLeader(TimePoint now, RaftOutput& output);
 
-    /// Record that a leader was heard from, and arm the election timer.
+    /// Record that a leader was heard from, by arming the election timer.
     ///
-    /// The two together, and only where a leader actually spoke — an accepted
-    /// AppendEntries or InstallSnapshot. Arming *alone* is what this node does
-    /// when it stands for election or grants a vote, and neither of those is
-    /// contact from a leader.
+    /// Called only where a leader actually spoke — an AppendEntries or an
+    /// InstallSnapshot, whether or not the log accepts it: §5.2 resets the timer on
+    /// hearing from the current leader, and a leader whose entries do not match this
+    /// node's log yet was still heard from.
+    ///
+    /// Since issue #117 the armed deadline *is* the record: a node answers a
+    /// challenger's pre-vote from the deadline it would campaign on, so pushing that
+    /// out is what "a leader spoke to me" means, and the separate timestamp this used
+    /// to keep beside it had no reader left.
+    ///
+    /// Still its own function rather than `ArmElectionTimer` at the call sites,
+    /// because §5.2 resets the timer on exactly two events — hearing from a
+    /// current leader, and *granting a vote* — and only one of them is contact
+    /// from a leader. Which one a call site means is worth saying in its name.
     /// @param now Current time.
     void NoteLeaderContact(TimePoint now);
 
@@ -403,10 +413,16 @@ class RaftNode
     /// Whether some leader is live, as far as this node can tell.
     ///
     /// The whole of pre-vote's disruption check, and the two roles answer it from
-    /// different evidence. A follower or candidate knows a leader is live because
-    /// one spoke to it; a leader knows because a majority answers it. Asking a
-    /// leader the follower's question is what left the node best placed to refuse
-    /// a challenger as the only one that never did.
+    /// different evidence. A leader knows because a majority still answers it;
+    /// every other role knows because it still names a leader and has not yet
+    /// reached the deadline at which it would stand against one. Asking a leader
+    /// the follower's question is what left the node best placed to refuse a
+    /// challenger as the only one that never did (issue #103).
+    ///
+    /// A candidate or pre-candidate therefore always answers **no**, and that is
+    /// the point rather than a gap: standing for election is precisely the act of
+    /// declaring there is no live leader, and a node that said otherwise while
+    /// campaigning refused every peer timing out alongside it.
     /// @param now Current time.
     /// @return True while a leader is demonstrably live.
     [[nodiscard]] bool HasLiveLeader(TimePoint now) const;
@@ -514,16 +530,14 @@ class RaftNode
     std::optional<NodeId> _knownLeader;
     RaftLog _log;
 
-    /// When a leader was last heard from; absent until one is.
+    /// When this node would stand for election, and — since issue #117 — also
+    /// what it answers a challenger's pre-vote from, together with `_knownLeader`.
     ///
-    /// Deliberately **not** `_electionDeadline`, which is the obvious place to
-    /// look and answers a different question. That deadline is re-armed when this
-    /// node starts its own pre-vote round, so a node using it to answer "have I
-    /// heard from a leader recently?" answers *yes* for a full timeout after it
-    /// began campaigning — and that question is the whole of pre-vote's
-    /// disruption check. Nodes racing then refused each other almost every round.
-    std::optional<TimePoint> _lastLeaderContact;
-
+    /// It replaced a separate `_lastLeaderContact` timestamp, which after that
+    /// change nothing read. Keeping a written-but-unread record of "when did a
+    /// leader last speak" would be worse than not having one: the next person to
+    /// need that question answered would reach for it without noticing it no
+    /// longer decides anything.
     TimePoint _electionDeadline {};
     TimePoint _heartbeatDeadline {};
 
@@ -543,10 +557,14 @@ class RaftNode
 
     /// Per-peer: when it last answered this leader. Empty for anyone else.
     ///
-    /// The leader's counterpart to `_lastLeaderContact`, and it exists for the
-    /// same reason that one does not answer here: a leader never hears from a
-    /// leader, so the field every other role reads is permanently stale on the
-    /// one node whose own quorum proves the cluster is healthy.
+    /// A leader's own evidence that the cluster is healthy, and it exists because
+    /// nothing else on a leader is: a leader never hears from a leader, so what
+    /// every other role answers from is permanently stale on the one node best
+    /// placed to refuse a challenger.
+    ///
+    /// Stamped when a RESPONSE arrives, where a follower stamps when the REQUEST
+    /// does — half a round trip earlier. That difference is why the follower side
+    /// no longer answers from a timestamp at all; see `HasLiveLeader`.
     ///
     /// Absence is what a peer that has not answered *since this leadership began*
     /// looks like, so it must not be seeded with anything but real contact --

@@ -191,6 +191,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A cluster that has elected is not one that has formed. Until every member
   attaches, pre-vote refuses nothing and any stall re-elects — assert leadership
   stability only after formation, and log the term or nothing explains it.
+- A leader and a follower stamp the same link half a round trip apart, so a shared
+  window never bought a shared answer. A non-leader decides a pre-vote from its own
+  `_knownLeader` and election deadline, never from a timestamp.
+- "A leader spoke" arrives at two handlers, and every rule about it belongs in
+  both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
+  candidate demotion included.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
@@ -330,7 +336,9 @@ and what they may assume.
 - Every wait is bounded and says what it waited for.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
-- Tests allocate their ports per run rather than fixing them.
+- Tests allocate their ports per run rather than fixing them — from **below** the
+  kernel's ephemeral range, and remembered, because a connect probe cannot see a
+  port already held as an outbound connection's local endpoint.
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so

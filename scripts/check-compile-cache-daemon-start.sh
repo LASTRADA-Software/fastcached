@@ -113,10 +113,17 @@ fail() { echo "compile-cache daemon-start FAILED: $*" >&2; exit 1; }
 # Find a port nothing is listening on. Same technique and same reasoning as
 # dist-compile-e2e.sh's free_port(): a connect probe, racy in principle,
 # acceptable because this test is RUN_SERIAL and the range is wide.
+#
+# The range stops below the kernel's ephemeral port range: a port can be an
+# outbound connection's local endpoint with nothing listening on it, so this probe
+# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
+# reasoning, and the CI failure that found it, are above `free_port` in
+# dist-compile-e2e.sh.
 free_port() {
     local port
+    local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
-        port=$(( 20000 + RANDOM % 20000 ))
+        port=$(( floor + RANDOM % (ceiling - floor) ))
         if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
             echo "$port"
             return 0
