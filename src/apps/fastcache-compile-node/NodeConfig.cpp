@@ -7,6 +7,7 @@
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -212,6 +214,28 @@ namespace
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
+    }
+
+    /// One cluster member, from the `<id>=<host>:<port>` an operator typed.
+    ///
+    /// Through `Cluster::ParseMemberSpec`, which is the grammar `--cluster-admit`
+    /// already takes: the documentation tells an operator to copy the same token
+    /// between the two flags, so a second implementation would be two flags
+    /// accepting different token sets for one concept -- with only one of them being
+    /// what the transport actually dials.
+    ///
+    /// Here rather than in the tier that consumes it, because the parser is the one
+    /// place on every path and the only one that can name the offending token --
+    /// see `NodeConfig::raftPeers` for what that cost while it was not (#168).
+    /// @param sv Text to parse.
+    /// @return The member, or why the token is not one.
+    [[nodiscard]] std::expected<Cluster::ClusterMember, ConfigError> ParseRaftPeer(std::string_view sv)
+    {
+        auto member = Cluster::ParseMemberSpec(sv);
+        if (!member.has_value())
+            return std::unexpected(
+                ArgvError(ConfigErrorCode::ParseError, "raft-peer", std::format("not <id>=<host>:<port>: {}", sv)));
+        return *std::move(member);
     }
 
     /// A filesystem path, taken as written.
@@ -417,7 +441,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--raft-peer",
           .arity = Arity::Value,
           .operand = "=<id>=<host>:<port>",
-          .apply = AppendFrom<&NodeConfig::raftPeers, ParseText>(),
+          .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
           .description = "a cluster member and where it answers; repeatable.\n"
                          "Both halves in one token because a member id with\n"
                          "no address is a node counted towards quorum and\n"
@@ -787,9 +811,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
     // it was installed with would present as a cluster that stopped forming quorum,
-    // not as a packaging bug.
+    // not as a packaging bug. Re-rendered rather than echoed, because the list is
+    // stored parsed; it is the same token either way, since `ParseMemberSpec` splits
+    // at the FIRST `=` and keeps the endpoint verbatim.
     for (auto const& peer: cfg.raftPeers)
-        argv.push_back(std::format("--raft-peer={}", peer));
+        argv.push_back(std::format("--raft-peer={}={}", peer.id, peer.raftEndpoint));
     emitIfSet("upstream", cfg.upstream, defaults.upstream);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.raftJoin)
@@ -873,6 +899,12 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
+Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
+{
+    auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
+    return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
+}
+
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 {
     // A table, so a new rule is a new row rather than another `if` in main().
@@ -949,6 +981,36 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--raft-join needs --raft-peer: at least this node's own address, which is the half only it "
                      "knows, and normally the cluster's as well. A joiner cannot answer the leader that admits it "
                      "without one, and it cannot learn any address until it has answered." },
+        // After the two `--raft-join` rows, which say the same thing about a joiner
+        // more precisely: first match wins, so putting this one ahead of them would
+        // answer in their place and leave both stating a rule nothing reaches.
+        // `ConsensusTier::Start` decided this from inside the tier, which the install
+        // path returns long before reaching -- so a registration naming no reachable
+        // self was written happily and then died at every boot (#168).
+        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && ClusterSelfMember(c) == nullptr; },
+          .message = NodeIdNamesNoPeerRefusal },
+        // The third refusal `ConsensusTier::Start` made and no table did.
+        // `ParseEndpoint` is asked here rather than `raftListen.empty()` because it
+        // answers nullopt for an unusable port as readily as for a missing one, and
+        // the tier decides on that same answer -- the way the `--dashboard` row
+        // below judges the address `AdminEndpoint` will actually take rather than
+        // the text an operator typed.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, RaftListenDefaultHost).has_value();
+              },
+          .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
+                     "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
+                     "the node refuses to start rather than join a cluster that cannot see it." },
+        // The other half of the same flag group: consensus configured with the
+        // switch that turns it on left off. `--cluster-dir` is deliberately NOT
+        // here -- `FleetHistoryPath` reads it for the dashboard's history file, so
+        // a node running no consensus still has a use for it.
+        { .refuses = [](NodeConfig const& c) { return c.nodeId.empty() && (!c.raftListen.empty() || !c.raftPeers.empty()); },
+          .message = "--listen-raft and --raft-peer configure consensus, and --node-id is what turns consensus ON: "
+                     "without one this node runs none, so the port is never bound and the peers are never dialled. "
+                     "Nothing would say so, which is the silent no-op this list exists to refuse. Give --node-id, "
+                     "or drop them." },
         { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
           .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
                      "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "

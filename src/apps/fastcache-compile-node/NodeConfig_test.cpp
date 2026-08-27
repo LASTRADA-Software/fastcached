@@ -4,6 +4,7 @@
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -18,6 +19,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -37,6 +39,26 @@ namespace
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;
+}
+
+/// The member a `--raft-peer` token names, for a config built without a parser.
+///
+/// `raftPeers` holds members rather than tokens, so a fixture that assigns it has to
+/// go through the same grammar the option table does -- which is the point: a test
+/// spelling a member some other way would be testing a shape no command line can
+/// produce.
+/// @param spec The token as an operator would write it.
+/// @return The member it names.
+[[nodiscard]] Cluster::ClusterMember Peer(std::string_view spec)
+{
+    auto const member = Cluster::ParseMemberSpec(spec);
+    // `Unwrap` hands back a default-constructed member for an empty optional, and
+    // relies on a preceding `REQUIRE` to have failed the test first. Without one a
+    // fixture with a typo'd spec would quietly become a member with no id and no
+    // endpoint -- which is exactly the shape these cases exist to refuse.
+    INFO("peer spec: " << spec);
+    REQUIRE(member.has_value());
+    return Unwrap(member);
 }
 
 /// Parse an argv fragment into a `NodeConfig`, the way `main` does.
@@ -212,7 +234,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.upstream = "cache.internal:6674";
     cfg.nodeId = "n1";
     cfg.raftListen = "0.0.0.0:6680";
-    cfg.raftPeers = { "n1=10.0.0.4:6680", "n2=10.0.0.5:6680" };
+    cfg.raftPeers = { Peer("n1=10.0.0.4:6680"), Peer("n2=10.0.0.5:6680") };
     // Every field differs from its default, so every emitter fires -- which is the
     // narrow question this case asks. Alongside two peers is a legitimate joiner:
     // under `--raft-join` that list is who this node can REACH rather than who it
@@ -560,6 +582,216 @@ TEST_CASE("NodeConfig: consensus state may not default to a relative path in a s
     CHECK(!NodeServiceRejection(plain).has_value());
 }
 
+TEST_CASE("NodeConfig: a --raft-peer that names no member is refused where it was typed", "[node][consensus][policy]")
+{
+    // The grammar is enforced by the parser, so a token that is not a member is
+    // refused on EVERY path -- a hand start, `--install-service`, and the cluster
+    // verbs alike. It used to be checked inside `ConsensusTier::Start`, which the
+    // install path returns long before reaching: a registration carrying
+    // `--raft-peer=garbage` was written happily and then died at every boot (#168).
+    //
+    // Every way a token can fail to name a member, through the one grammar.
+    for (auto const* const token: {
+             "garbage",          // neither half
+             "n1=",              // an id and nothing to dial
+             "=10.0.0.1:6680",   // an endpoint and nobody it belongs to
+             "n1=10.0.0.1",      // a host with no port
+             "n1=10.0.0.1:0",    // a port nobody can connect to
+             "n1=10.0.0.1:http", // a port that is not a number
+         })
+    {
+        INFO("token: " << token);
+        auto const flag = std::format("--raft-peer={}", token);
+        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", flag.c_str() });
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().field == "raft-peer");
+        // The offending token is named, which is the half a policy row could not do:
+        // its messages are static prose and an operator may have typed five peers.
+        CHECK(parsed.error().context.contains(token));
+    }
+
+    // And the shapes that ARE members, including the bracketed v6 one every
+    // `SplitHostPort` caller has to keep intact.
+    auto const parsed = ParseNodeArgv({ "--scheduler=s:1",
+                                        "--toolchain=/usr/bin/cc",
+                                        "--raft-peer=n1=10.0.0.1:6680",
+                                        "--raft-peer=n2=[2001:db8::1]:6680" });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->raftPeers.size() == 2);
+    CHECK(parsed->raftPeers[0].id == "n1");
+    CHECK(parsed->raftPeers[0].raftEndpoint == "10.0.0.1:6680");
+    CHECK(parsed->raftPeers[1].id == "n2");
+    CHECK(parsed->raftPeers[1].raftEndpoint == "[2001:db8::1]:6680");
+}
+
+TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[node][consensus][service]")
+{
+    // A registration replays its command line forever, so the peers have to survive
+    // this project's own parser -- and they are now stored parsed, which means the
+    // installer RE-RENDERS each token rather than echoing it. A member that came
+    // back spelled differently is a node the cluster counts and cannot reach.
+    auto cfg = Installable();
+    cfg.nodeId = "n1";
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    cfg.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=[2001:db8::1]:6680") };
+
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", cfg);
+
+    std::vector<char const*> argv;
+    argv.reserve(spec.arguments.size());
+    for (auto const& argument: spec.arguments)
+        argv.push_back(argument.c_str());
+
+    auto const reparsed = ParseNodeArgv(argv);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->raftPeers == cfg.raftPeers);
+}
+
+TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before it is installed", "[node][consensus][policy]")
+{
+    // #168. `ConsensusTier::Start` refuses this, and the install path returns long
+    // before any tier is built -- so the registration was written, reported
+    // installed, and then exited `ExitUsage` at every boot with nobody watching.
+    // It is a pure function of the command line, like every startup rule, so it is
+    // one now.
+    auto const shapes = std::to_array<std::pair<char const*, NodeConfig>>({
+        { "no --raft-peer at all",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n1";
+              return cfg;
+          }() },
+        { "peers that name somebody else",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n1";
+              cfg.raftPeers = { Peer("n2=10.0.0.2:6680"), Peer("n3=10.0.0.3:6680") };
+              return cfg;
+          }() },
+        { "a joiner that named the cluster and not itself",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n4";
+              cfg.raftJoin = true;
+              cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+              return cfg;
+          }() },
+    });
+
+    for (auto const& [what, cfg]: shapes)
+    {
+        INFO(what);
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--raft-peer"));
+
+        // And through the install path, which is the half #166 closed everywhere
+        // else and this one reached around.
+        auto const install = NodeInstallRejection(cfg);
+        REQUIRE(install.has_value());
+        CHECK(Unwrap(install).contains("--raft-peer"));
+    }
+
+    // The tier says the same thing in the same words, because it asks the same
+    // predicate. A `NodeConfig` built by hand reaches it without a parser or a
+    // policy table in between, and must not hear a second opinion.
+    CHECK(Unwrap(StartupPolicyRejection(shapes[0].second)) == NodeIdNamesNoPeerRefusal);
+
+    // And it names its own flag, which is what lets `main.cpp` print a tier's
+    // refusal without prefixing one -- it used to, and rendered this message as
+    // "--node-id --node-id names no --raft-peer".
+    CHECK(NodeIdNamesNoPeerRefusal.starts_with("--node-id"));
+
+    // A node that names itself is accepted, bootstrapping or joining.
+    auto bootstrapping = Installable();
+    bootstrapping.nodeId = "n1";
+    bootstrapping.raftListen = "6680";
+    bootstrapping.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+    CHECK_FALSE(StartupPolicyRejection(bootstrapping).has_value());
+}
+
+TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before it is installed",
+          "[node][consensus][policy]")
+{
+    // The third refusal `ConsensusTier::Start` made and neither table did:
+    // `ParseEndpoint` answers nullopt for an empty `--listen-raft` exactly as it
+    // does for a malformed one, so a node with an id, a peer list naming itself
+    // and no port installed cleanly and then exited at every boot. The rule asks
+    // the tier's own question, the way the `--dashboard` row asks
+    // `AdminEndpoint`'s.
+    for (auto const* const listen: { "", "nope", "0", "10.0.0.1" })
+    {
+        INFO("--listen-raft=" << listen);
+        auto cfg = Installable();
+        cfg.nodeId = "n1";
+        cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+        cfg.raftListen = listen;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--listen-raft"));
+        CHECK(NodeInstallRejection(cfg).has_value());
+    }
+
+    // A bare port is enough, and binds the wildcard -- peers are on other machines
+    // by definition.
+    auto bare = Installable();
+    bare.nodeId = "n1";
+    bare.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    bare.raftListen = "6680";
+    bare.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK_FALSE(StartupPolicyRejection(bare).has_value());
+    CHECK_FALSE(NodeInstallRejection(bare).has_value());
+
+    // And a worker with no consensus at all is not asked for a port it has no use
+    // for, which is by far the common deployment.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
+TEST_CASE("NodeConfig: the --raft-join rules keep the more specific answer", "[node][consensus][policy]")
+{
+    // The new row must not make either of them dead: both describe a joiner more
+    // precisely than "names no --raft-peer" does, and both come first.
+    NodeConfig noIdentity;
+    noIdentity.raftJoin = true;
+    noIdentity.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(noIdentity)).contains("--raft-join needs --node-id"));
+
+    NodeConfig noPeers;
+    noPeers.raftJoin = true;
+    noPeers.nodeId = "n4";
+    CHECK(Unwrap(StartupPolicyRejection(noPeers)).contains("--raft-join needs --raft-peer"));
+}
+
+TEST_CASE("NodeConfig: consensus flags with no --node-id are refused rather than ignored", "[node][consensus][policy]")
+{
+    // `StartConsensusOrExplain` returns a null tier when `--node-id` is empty, so
+    // these flags are read by nobody: nothing binds, nothing dials, and nothing
+    // anywhere says the operator's cluster was not configured. That is the silent
+    // no-op this table already refuses for `--cluster-key-file` without
+    // `--discovery` and `--dashboard-token-file` without `--dashboard`.
+    auto listening = Installable();
+    listening.raftListen = "6680";
+    listening.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK(Unwrap(StartupPolicyRejection(listening)).contains("--node-id"));
+    CHECK(NodeInstallRejection(listening).has_value());
+
+    auto peered = Installable();
+    peered.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(peered)).contains("--node-id"));
+
+    // `--cluster-dir` is deliberately NOT one of them: `FleetHistoryPath` reads it
+    // for the dashboard's history file, so a node with no consensus at all still
+    // has a use for it. Refusing it here would refuse a working configuration.
+    auto history = Installable();
+    history.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK_FALSE(StartupPolicyRejection(history).has_value());
+
+    // And the ordinary single-machine worker, which configures none of this.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
 TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
 {
     // A system-scope worker runs as an unprivileged account and root created these
@@ -652,7 +884,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // to be admitted without one would listen forever and could never be named.
         NodeConfig cfg;
         cfg.raftJoin = true;
-        cfg.raftPeers = { "n1=10.0.0.4:6680" };
+        cfg.raftPeers = { Peer("n1=10.0.0.4:6680") };
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
@@ -691,7 +923,8 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig joiner;
         joiner.raftJoin = true;
         joiner.nodeId = "n4";
-        joiner.raftPeers = { "n4=10.0.0.4:6680", "n1=10.0.0.1:6680", "n2=10.0.0.2:6680" };
+        joiner.raftListen = "6680";
+        joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
         // And a worker running no scheduler at all -- by far the common case -- is
@@ -766,9 +999,15 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     // handed a unicast. Kernel-chosen by default -- the value nobody has to pick
     // -- and pinned only where a host firewall opens named ports and would
     // otherwise drop every challenge and proof.
+    // It names itself in `--raft-peer`, which every node with a `--node-id` does --
+    // discovery finds the OTHERS, and this node's own address is the half only it
+    // knows. Without it the startup table refuses the whole command line before
+    // reaching anything this case is about.
     auto const base = std::vector<char const*> { "--scheduler=s:1",
                                                  "--toolchain=/usr/bin/cc",
                                                  "--node-id=n1",
+                                                 "--listen-raft=6680",
+                                                 "--raft-peer=n1=10.0.0.1:6680",
                                                  "--cluster-key-file=cluster.key",
                                                  "--discovery=255.255.255.255:6681" };
 

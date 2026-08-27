@@ -455,9 +455,26 @@ fact. A member id with no address is a node the cluster counts towards every quo
 and cannot reach: the fleet is then one node short of forming one, and nothing says
 why.
 
-A node must name itself among its own peers, and it is refused at startup if it
-does not — such a node could never win a vote and could never be voted for, so it
-would stand for election forever against a cluster that has never heard of it.
+A node must name itself among its own peers, and it is refused if it does not —
+such a node could never win a vote and could never be voted for, so it would stand
+for election forever against a cluster that has never heard of it.
+
+Giving `--node-id` is what turns consensus on, and three things then have to hold.
+Each is decided by the command line alone, so each is refused at startup **and** at
+`--install-service`, where you are watching, rather than at every boot into a log
+nobody reads:
+
+| What has to hold | Why |
+|---|---|
+| every `--raft-peer` is `<id>=<host>:<port>` | A token that names no member is refused by the parser, which is the only place that can tell you *which* token. `--cluster-admit` takes the same one. |
+| one of them is this node | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
+| `--listen-raft` names a usable port | That is where every peer dials it. Without one nothing binds and no vote could arrive. |
+
+The reverse holds too: `--listen-raft` or `--raft-peer` **without** `--node-id` is
+refused rather than ignored. This node would run no consensus at all, so neither
+flag is read by anybody and nothing would say so. (`--cluster-dir` is not one of
+them — the dashboard keeps its history file there, so a node with no consensus
+still has a use for it.)
 
 ### Two ports, and why a member records both
 
@@ -692,8 +709,10 @@ where they answer; the *leader* proposes, and only the leader, because admitting
 node is a Raft decision. Every node on the segment sees the same peers and all but
 one of them do nothing about it.
 
-**A node joining a discovered fleet still needs `--raft-join`**, and needs nothing
-else: discovery supplies the addresses that a typed join has to list by hand. One
+**A node joining a discovered fleet still needs `--raft-join`**, and nothing else
+about the *cluster*: discovery supplies the addresses a typed join has to list by
+hand. It still names itself — `--node-id`, `--listen-raft` and its own
+`--raft-peer` entry — as every node with an identity does. One
 node bootstraps the cluster and the rest join it — and exactly one, because two
 nodes that each bootstrapped a cluster of themselves cannot be merged. A membership
 change proposed against such a node never commits, and the leader says so once the

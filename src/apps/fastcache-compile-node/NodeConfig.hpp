@@ -3,6 +3,7 @@
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
@@ -259,18 +260,25 @@ struct NodeConfig
     /// default would be one that silently cannot work.
     std::string raftListen;
 
-    /// The cluster's members as `id=host:port`; repeatable.
+    /// The cluster's members, from `--raft-peer=<id>=<host>:<port>`; repeatable.
     ///
     /// Both halves in one token because they are one fact. A member id without an
     /// address is a node the cluster counts towards quorum and cannot reach -- the
     /// residual `RaftMembership` recorded, and the reason `Cluster::ClusterMember`
     /// pairs them.
     ///
+    /// Stored PARSED rather than as the tokens an operator typed, which is what makes
+    /// a malformed one unrepresentable: the grammar is `Cluster::ParseMemberSpec` and
+    /// it runs in the option table, so a token that names no member is refused where
+    /// it was typed. It used to be refused inside `ConsensusTier::Start` instead -- a
+    /// layer `--install-service` returns long before reaching, so a registration
+    /// carrying one was written happily and then died at every boot (#168).
+    ///
     /// This is the BOOTSTRAP set only. Once the cluster is running, membership is a
     /// replicated log entry and this list is not consulted again -- which is what
     /// makes a node that was admitted at runtime survive a restart without anybody
     /// editing a config file on every other machine.
-    std::vector<std::string> raftPeers;
+    std::vector<Cluster::ClusterMember> raftPeers;
 
     /// Where consensus keeps its durable state, empty for a default beside the cache.
     ///
@@ -527,6 +535,45 @@ struct NodeConfig
 /// @param cfg Configuration about to be baked into a registration.
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
+
+/// What a bare `--listen-raft` binds.
+///
+/// The wildcard, like `--listen-scheduler` and unlike `--listen-cache`: peers are on
+/// other machines by definition, so a loopback default would be one that silently
+/// cannot work. Named because two places have to agree on it -- the policy row that
+/// refuses an unusable `--listen-raft` and the tier that binds it -- and a default
+/// they disagreed about is a row accepting what the tier then refuses.
+inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
+
+/// Why a `--node-id` that names no `--raft-peer` cannot work.
+///
+/// A named constant rather than prose written into the policy row it fills, because
+/// `ConsensusTier::Start` answers with **this** string. The invariant is decided by
+/// the startup table -- which is what makes an operator hear it while they are
+/// watching -- and the tier is that same answer arriving at the boot of a
+/// `NodeConfig` nobody parsed from an argv. Two spellings of one rule is what this
+/// codebase's table idiom exists to prevent.
+///
+/// It ends without a full stop, alone among the rows: `main.cpp` prints a tier's
+/// refusal as `"{}; refusing to start"`, and the tier's other messages are written
+/// as fragments for exactly that. One message serving two callers has to suit the
+/// one that appends.
+inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
+    "--node-id names no --raft-peer: this node must name the endpoint its peers dial, whether it bootstraps a "
+    "cluster or joins one, and consensus cannot start without one";
+
+/// The `--raft-peer` entry `--node-id` names, if the list names it at all.
+///
+/// The predicate behind `NodeIdNamesNoPeerRefusal`, shared for the reason that
+/// constant is: the startup table asks it for a verdict and `ConsensusTier::Start`
+/// asks it for the member itself, and a rule asked two ways is one that drifts.
+///
+/// Answers for the list as typed, so a node with no `--node-id` at all names no
+/// member -- which is not a refusal on its own: an empty id means this node runs no
+/// consensus, and the table's own row is what decides whether that is a mistake.
+/// @param cfg The parsed configuration.
+/// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
+[[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
 
 /// Why this worker's configuration cannot work, if it cannot.
 ///

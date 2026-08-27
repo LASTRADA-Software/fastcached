@@ -204,20 +204,18 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // member could never win a vote and could never be voted for -- it would stand
     // for election forever against a cluster that has never heard of it, which from
     // the outside is a node that simply never becomes ready.
-    std::vector<Cluster::ClusterMember> members;
-    for (auto const& spec: cfg.raftPeers)
-    {
-        auto parsed = Cluster::ParseMemberSpec(spec);
-        if (!parsed.has_value())
-            return std::unexpected { std::format("--raft-peer={} is not <id>=<host>:<port>", spec) };
-        members.push_back(*std::move(parsed));
-    }
+    //
+    // Neither half is decided here any more. The grammar belongs to the option
+    // table, so `cfg.raftPeers` holds members or the command line was refused where
+    // it was typed; and the rule below is `StartupPolicyRejection`'s, asked through
+    // its predicate and answered in its words. That table is what makes an operator
+    // hear it while they are watching -- an install consults it too -- and this is
+    // the same answer arriving for a `NodeConfig` nobody parsed from an argv (#168).
+    auto const& members = cfg.raftPeers;
 
-    auto const self = std::ranges::find(members, cfg.nodeId, &Cluster::ClusterMember::id);
-    if (self == members.end())
-        return std::unexpected { std::format("--node-id={} names no --raft-peer; this node must name the endpoint its "
-                                             "peers dial, whether it bootstraps a cluster or joins one",
-                                             cfg.nodeId) };
+    auto const* const self = ClusterSelfMember(cfg);
+    if (self == nullptr)
+        return std::unexpected { std::string { NodeIdNamesNoPeerRefusal } };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the
@@ -237,7 +235,12 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
     // that silently cannot work.
-    auto const endpoint = ParseEndpoint(cfg.raftListen, "0.0.0.0");
+    //
+    // `StartupPolicyRejection` asks this same question, so an operator meets it at
+    // the command line -- an install included -- rather than here. What survives is
+    // the message that names the text they typed, which a row of static prose
+    // cannot, and the answer for a `NodeConfig` no argv produced (#168).
+    auto const endpoint = ParseEndpoint(cfg.raftListen, RaftListenDefaultHost);
     if (!endpoint.has_value())
         return std::unexpected { std::format("--listen-raft={} names no usable port", cfg.raftListen) };
 

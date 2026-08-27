@@ -184,6 +184,37 @@ readable and silently ignored. Every rule below has already been one of them.
   install time, because the worker derives that at startup through the identical
   code its clients use and a digest computed once would pin the registration to a
   toolchain an update then changes underneath it.
+- **A rule that is fatal at every boot belongs in a table, not in the tier that
+  needs it.** `ConsensusTier::Start` made three refusals that were pure functions of
+  the parsed configuration -- a malformed `--raft-peer`, a `--node-id` naming no
+  peer, and an unusable `--listen-raft` -- and the install path returns long before
+  any tier is built. So `--install-service --node-id=n1` with no peer passed both
+  rejection tables, was reported installed, and exited `ExitUsage` at every boot
+  ([#168](https://github.com/LASTRADA-Software/fastcached/issues/168)). The rule
+  above closed that shape for the rules in the tables; this is what keeps a rule
+  from living outside them in the first place. Being *reachable only through a
+  tier* is not a reason for a check to live there: the question is whether the
+  answer depends on anything but the parsed configuration, and if it does not, the
+  table is where it goes.
+
+  Where it goes depends on what the answer needs to say. A **grammar** goes in the
+  option table -- `--raft-peer` holds `Cluster::ClusterMember`, parsed by the row
+  that accepts it, which refuses a bad token on every path and *names the token*.
+  A **cross-flag invariant** goes in `StartupPolicyRejection`, whose messages are
+  static prose and so can name flags but no values. When both a row and a tier must
+  assert one rule, they share a predicate and a message constant -- `ClusterSelfMember`
+  and `NodeIdNamesNoPeerRefusal` -- because a rule asked two ways is one that drifts,
+  which is the whole reason for a table. And a new row goes **after** any narrower
+  rule about the same flags: first match wins, so `--raft-join needs --raft-peer`
+  would otherwise be answered in its place and become a rule nothing reaches.
+
+  Two things that look like members of the group and are not. `--cluster-dir` is
+  read by `FleetHistoryPath` for the dashboard's history file, so it is *not*
+  refused alongside `--listen-raft` when there is no `--node-id` -- a node running
+  no consensus still has a use for it. And a row asks `ParseEndpoint` rather than
+  `raftListen.empty()`, so an unusable port is refused with the missing one, the
+  way the `--dashboard` row judges the address `AdminEndpoint` will actually take
+  rather than the text an operator typed.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing
@@ -341,6 +372,18 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## Open work
 
+- **[#186](https://github.com/LASTRADA-Software/fastcached/issues/186)** — the rule
+  above holds for the consensus tier and for nothing else yet. `--listen-scheduler`,
+  `--admin-listen` and `--discovery` are `ParseText` rows whose grammar is checked
+  inside `SchedulerTier::Start`, `AdminEndpoint::Start` and
+  `StartDiscoveryOrExplain`, each fatal and each reached long after
+  `--install-service` has returned — so `--install-service --listen-scheduler=nope`
+  registers cleanly and exits `ExitUsage` forever. What makes it a ticket rather
+  than three more rows: unlike `--listen-raft` under a `--node-id`, all three have a
+  legitimate *absence* (no scheduler surface, no admin surface), so the predicate is
+  "parses when given" rather than "parses", and `ParseEndpoint`'s default host
+  differs per flag.
+
 - **[#155](https://github.com/LASTRADA-Software/fastcached/issues/155)** — `argv`
   on Windows carries the ANSI code page, and nothing in this tree converts it to
   UTF-8. It did not matter while every string a peer sent was passed through
@@ -350,13 +393,3 @@ readable and silently ignored. Every rule below has already been one of them.
   seam belongs in `Platform/Environment`, which is already the one place the
   environment is read — but `fastcache-cc` does not link `FastCache`, so what
   that seam may depend on is part of the question.
-
-- **[#168](https://github.com/LASTRADA-Software/fastcached/issues/168)** — the
-  consensus tier refuses a malformed `--raft-peer`, and a `--node-id` that names no
-  peer, from inside `ConsensusTier::Start`. Both are pure functions of the parsed
-  configuration, like every row of `StartupPolicyRejection`, but they live in
-  neither table — so `--install-service --node-id=n1` with no `--raft-peer` still
-  registers cleanly and dies at every boot, which is the shape
-  [#166](https://github.com/LASTRADA-Software/fastcached/issues/166) closed
-  everywhere else. Moving them needs one spelling of the rule, not two:
-  `Cluster::ParseMemberSpec` is what both would share.

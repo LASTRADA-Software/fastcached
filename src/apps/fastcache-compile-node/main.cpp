@@ -392,7 +392,13 @@ constexpr int ExitOk = 0;
     auto consensusOrRefusal = Node::StartConsensusOrExplain(cfg, schedulerTier, membership, logger);
     if (!consensusOrRefusal.has_value())
     {
-        logger.Logf(LogLevel::Error, "--node-id {}; refusing to start", consensusOrRefusal.error());
+        // No flag prefix here, for the reason the cache tier's line below has none:
+        // consensus fails over --node-id, --raft-peer, --listen-raft or
+        // --cluster-dir, and only the tier knows which, so its message names the
+        // flag. It used to prefix `--node-id `, which rendered the peer refusal as
+        // "--node-id --node-id=n1 names no --raft-peer" -- and that message is now
+        // `StartupPolicyRejection`'s own row, which names the flag by construction.
+        logger.Logf(LogLevel::Error, "{}; refusing to start", consensusOrRefusal.error());
         return ExitUsage;
     }
     // May legitimately be null: no `--node-id` means this node leads alone.
