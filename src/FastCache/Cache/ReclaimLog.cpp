@@ -7,10 +7,18 @@
 namespace FastCache
 {
 
-ReclaimLog::ReclaimLog(IStorageMutationObserver* observer, std::size_t capacity) noexcept:
+ReclaimLog::ReclaimLog(IStorageMutationObserver* observer, IMetricsSink* metrics, std::size_t capacity) noexcept:
     _observer { observer },
+    _metrics { metrics },
     _capacity { capacity }
 {
+}
+
+void ReclaimLog::CountDrop() noexcept
+{
+    _dropped.fetch_add(1, std::memory_order_relaxed);
+    if (_metrics != nullptr)
+        _metrics->Increment(IMetricsSink::Counter::KeyspaceReclaimEventsDropped);
 }
 
 bool ReclaimLog::IsRecording() const noexcept
@@ -37,7 +45,7 @@ void ReclaimLog::Record(MutationKind kind, std::string_view key) noexcept
     // behind this one for the whole sweep.
     if (_pendingCount.load(std::memory_order_relaxed) >= _capacity)
     {
-        _dropped.fetch_add(1, std::memory_order_relaxed);
+        CountDrop();
         return;
     }
 
@@ -46,7 +54,7 @@ void ReclaimLog::Record(MutationKind kind, std::string_view key) noexcept
     // entries when several shards record at once. The bound stays exact.
     if (_pending.size() >= _capacity)
     {
-        _dropped.fetch_add(1, std::memory_order_relaxed);
+        CountDrop();
         return;
     }
     // The one allocation on this path, and the reason `IsRecording()` gates the
@@ -59,7 +67,7 @@ void ReclaimLog::Record(MutationKind kind, std::string_view key) noexcept
     }
     catch (...)
     {
-        _dropped.fetch_add(1, std::memory_order_relaxed);
+        CountDrop();
         return;
     }
     _pendingCount.store(_pending.size(), std::memory_order_relaxed);

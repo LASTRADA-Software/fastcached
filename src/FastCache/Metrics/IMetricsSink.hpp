@@ -187,6 +187,17 @@ class IMetricsSink
         NodeCacheUpstreamStores,
         NodeCacheUpstreamStoreFailures,
 
+        /// Reclaim reports the buffer between the storage tiers and the keyspace
+        /// notifier could not hold, so the `expired` / `evicted` events for those
+        /// keys were never published.
+        ///
+        /// Exported because absent is not zero here either: without it a
+        /// subscriber seeing no `expired` frame cannot tell "nothing expired"
+        /// from "the buffer overflowed". It rises when one call reclaims more
+        /// than the bound at once, which in practice means a `maxmemory` shrink
+        /// on a large cache.
+        KeyspaceReclaimEventsDropped,
+
         Last,
     };
 

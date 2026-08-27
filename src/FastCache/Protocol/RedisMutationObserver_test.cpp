@@ -3,6 +3,10 @@
 // What the storage-layer observer publishes, and — just as load-bearing — what
 // it deliberately does not. Publishing for a kind the Redis handlers already
 // cover would double every subscriber's event stream.
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/NotifyingStorage.hpp>
+#include <FastCache/Cache/ReclaimLog.hpp>
+#include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisMutationObserver.hpp>
@@ -10,6 +14,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -188,4 +194,44 @@ TEST_CASE("A class enabled with neither K nor E does not make the tiers record",
 
     REQUIRE_FALSE(observer.HasObservers());
     static_cast<void>(sub);
+}
+
+TEST_CASE("The whole chain delivers expired and evicted to a subscriber", "[protocol][keyspace][mutation-observer]")
+{
+    // The production shape, minus the sockets: sharded storage under the
+    // notifying decorator, the observer wired to a real notifier and registry.
+    // Every earlier test in this file exercises one link; this is the one that
+    // would have caught "the tier names its victims" being necessary but not
+    // sufficient, which is exactly how these two events came to be declared and
+    // never emitted.
+    PubSubRegistry registry;
+    auto const expiredSub = Subscribe(registry, "__keyevent@0__:expired");
+    auto const evictedSub = Subscribe(registry, "__keyevent@0__:evicted");
+
+    KeyspaceNotifier notifier { &registry, KeyspaceEvents::Keyevent | KeyspaceEvents::All };
+    RedisMutationObserver observer { nullptr, &notifier };
+    ReclaimLog reclaimLog { &observer };
+
+    std::vector<std::unique_ptr<IStorage>> shards;
+    // One shard, so which key lands where is not part of the assertion.
+    shards.push_back(std::make_unique<InMemoryLruStorage>(200, 0, LruMode::Strict));
+    ShardedStorage sharded { std::move(shards) };
+
+    NotifyingStorage notifying { sharded, &observer };
+    notifying.SetReclaimLog(&reclaimLog);
+
+    // Eviction: a 200-byte budget and three 150-byte values.
+    for (auto const& key: { "a", "b", "c" })
+        REQUIRE(notifying.Set(key, std::vector<std::byte>(150), 0, TimePoint::max()).has_value());
+    REQUIRE_FALSE(evictedSub->messages.empty());
+
+    // Expiry: reclaimed by the lookup, published by the observer.
+    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
+    auto const got = notifying.Get("doomed", expiry + std::chrono::seconds { 1 });
+    REQUIRE(got.has_value());
+    REQUIRE_FALSE(got->found);
+
+    REQUIRE(expiredSub->messages.size() == 1);
+    REQUIRE(expiredSub->messages[0].payload == "doomed");
 }

@@ -3,6 +3,7 @@
 
 #include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/IStorageMutationObserver.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -39,9 +40,14 @@ class ReclaimLog final: public IReclaimLog
 
     /// Construct over the observer whose interest gates recording.
     /// @param observer Decides `IsRecording()`; nullptr records nothing.
+    /// @param metrics  Where drops are reported as
+    ///                 `fastcached_keyspace_reclaim_events_dropped_total`;
+    ///                 nullptr keeps the count readable only via `Dropped()`.
     /// @param capacity Maximum pending entries; beyond it, records are dropped
-    ///                 and counted by `Dropped()`.
-    explicit ReclaimLog(IStorageMutationObserver* observer, std::size_t capacity = DefaultCapacity) noexcept;
+    ///                 and counted.
+    explicit ReclaimLog(IStorageMutationObserver* observer,
+                        IMetricsSink* metrics = nullptr,
+                        std::size_t capacity = DefaultCapacity) noexcept;
 
     void Record(MutationKind kind, std::string_view key) noexcept override;
     void Drain(std::vector<ReclaimedKey>& out) noexcept override;
@@ -50,11 +56,16 @@ class ReclaimLog final: public IReclaimLog
 
     /// Entries the log refused because it was full, or could not allocate for.
     /// Monotonic for the life of the log, so "no events fired" stays
-    /// distinguishable from "events fired and were dropped".
+    /// distinguishable from "events fired and were dropped". Also exported as
+    /// `fastcached_keyspace_reclaim_events_dropped_total` when a metrics sink
+    /// was supplied — a count only this class can read is one no operator can.
     /// @return The cumulative dropped count.
     [[nodiscard]] std::size_t Dropped() const noexcept;
 
   private:
+    /// Record one dropped entry, on both the local tally and the metrics sink.
+    void CountDrop() noexcept;
+
     mutable std::mutex _mu;
     std::vector<ReclaimedKey> _pending;
     /// Mirrors `_pending.size()`, so both fast probes — is there anything to
@@ -65,6 +76,7 @@ class ReclaimLog final: public IReclaimLog
     std::atomic<std::size_t> _pendingCount { 0 };
     std::atomic<std::size_t> _dropped { 0 };
     IStorageMutationObserver* _observer;
+    IMetricsSink* _metrics;
     std::size_t _capacity;
 };
 

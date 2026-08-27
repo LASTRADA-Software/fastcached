@@ -123,7 +123,7 @@ TEST_CASE("ReclaimLog drops past its capacity rather than growing", "[cache][rec
     // publish events would spike memory exactly when the operator asked for
     // less of it.
     ProbeObserver obs;
-    FastCache::ReclaimLog log { &obs, 3 };
+    FastCache::ReclaimLog log { &obs, nullptr, 3 };
 
     for (auto const index: std::views::iota(0, 10))
         log.Record(FastCache::MutationKind::Evict, std::format("k{}", index));
@@ -143,4 +143,20 @@ TEST_CASE("ReclaimLog drops past its capacity rather than growing", "[cache][rec
     log.Drain(drained);
     REQUIRE(drained.size() == 1);
     REQUIRE(drained[0].key == "after");
+}
+
+TEST_CASE("ReclaimLog reports its drops to the metrics sink", "[cache][reclaim-log]")
+{
+    // A count only this class can read is one no operator can. The bounded loss
+    // is defensible precisely because it is accountable.
+    ProbeObserver obs;
+    FastCache::AtomicMetricsSink metrics;
+    FastCache::ReclaimLog log { &obs, &metrics, 1 };
+
+    log.Record(FastCache::MutationKind::Evict, "kept");
+    log.Record(FastCache::MutationKind::Evict, "lost");
+    log.Record(FastCache::MutationKind::Evict, "also-lost");
+
+    REQUIRE(log.Dropped() == 2);
+    REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::KeyspaceReclaimEventsDropped) == 2);
 }
