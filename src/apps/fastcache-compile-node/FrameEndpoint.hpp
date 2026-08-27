@@ -70,18 +70,21 @@ class IFrameResponder
     /// peer a way to make the scheduler allocate megabytes.
     [[nodiscard]] virtual std::size_t MaxRequestBytes() const noexcept = 0;
 
-    /// How many requests this surface will serve at once.
+    /// How many connections this surface will hold open at once.
     ///
-    /// A cap the serialized loop used to provide by accident. Serving one connection
-    /// at a time bounded peak memory to a single `MaxRequestBytes()` frame; serving
-    /// them concurrently -- which is the whole point of moving onto a reactor --
-    /// turns that into N of them. So the bound has to become explicit at the same
-    /// moment the serialization goes, or the fix opens a memory-exhaustion hole.
+    /// This counts CONNECTIONS, not requests, and the distinction became load-bearing
+    /// when the endpoint learned to serve a connection until the peer stops (#176).
+    /// While each connection was one request, the two were the same number and the
+    /// cap read as a request cap; once a connection is long-lived, a slot held for
+    /// its lifetime is held across the peer's idle time as well. Naming it for
+    /// requests and sizing it for requests -- eight, on the cache surface -- would
+    /// have let eight attached peers lock out every other client while barely
+    /// sending anything.
     ///
-    /// Per-responder for the same reason `MaxRequestBytes` is, and the spread is
-    /// wider here rather than narrower: a scheduler verb is kilobytes and can afford
-    /// hundreds at once, while a cache STORE is megabytes and cannot.
-    [[nodiscard]] virtual std::size_t MaxConcurrentRequests() const noexcept = 0;
+    /// So what it bounds is descriptors and coroutine frames, and it is sized for
+    /// those. Memory is NOT what this bounds; `MaxInFlightBytes()` below is, which is
+    /// why this can afford to be generous.
+    [[nodiscard]] virtual std::size_t MaxOpenConnections() const noexcept = 0;
 
     /// How many declared payload bytes may be in flight across all connections.
     ///
@@ -89,23 +92,37 @@ class IFrameResponder
     /// declaring `MaxRequestBytes()` is still N times that. This is what actually
     /// bounds it, and it is checkable at exactly the right moment: the header
     /// declares its length before a single payload byte is read.
+    ///
+    /// It is therefore also the throttle on concurrent WORK, which is the job the
+    /// connection cap above stopped being able to do: a surface serving megabyte
+    /// objects limits how many move at once by choosing a budget worth about one of
+    /// them, and does not need a second count to say the same thing less precisely.
+    /// A refusal here is a reply on a kept connection, so a peer that arrives during
+    /// a busy moment is told to come back rather than made to reconnect.
     [[nodiscard]] virtual std::size_t MaxInFlightBytes() const noexcept = 0;
 };
 
-/// Accepts connections and answers each with one framed request.
+/// Accepts connections and answers framed requests on each until the peer stops.
 ///
 /// Shaped after `WorkerServer` rather than `Server`, and for the reason that governs
 /// the whole node: `Connection` is built around a `CacheEngine`, and a scheduler has
 /// no cache. Taking an `IListener&` and running its own loop keeps the node clear of
 /// the cache stack while still reusing the reactor and the socket abstraction.
 ///
-/// ## One request per connection
+/// ## Many requests per connection
 ///
-/// The same shape every other client of this wire already uses -- the launcher opens
-/// a fresh connection per cache operation, and a worker per heartbeat. There is no
-/// command loop because there is no per-connection state to justify one: every verb
-/// here is answered from the scheduler's own tables, so a second request on the same
-/// socket would buy nothing but a way for one client to hold a descriptor open.
+/// A connection is served until the peer stops sending, which is what the daemon
+/// serving this same wire has always done (`Protocol/CompileCacheHandler`). This
+/// endpoint answered exactly one request and closed, and that was issue #176 rather
+/// than a simpler design: a worker dials once per heartbeat ROUND and then registers
+/// every toolchain it found over that one connection, so a machine with two
+/// toolchains registered one of them, every round, forever -- reported as a transport
+/// failure, which named neither the cause nor the toolchain that lost.
+///
+/// There is still no per-connection state and no handshake; a loop is not a session.
+/// What it buys is that a peer with two things to say may say both, which is a
+/// property of the wire (a credential is a frame, so presenting one is two frames)
+/// rather than an optimisation.
 ///
 /// ## The payload cap is small on purpose
 ///
@@ -126,6 +143,11 @@ class FrameServer
     /// reads suspend rather than block -- so without a replacement a client that
     /// connects and sends half a header holds a descriptor and a coroutine frame
     /// until the process dies. A slow-loris on the node's cache port, free.
+    ///
+    /// Re-armed before each read rather than once per connection, so a conversation
+    /// is not swept mid-flight -- and so the gap BETWEEN two requests is bounded by
+    /// it too, which is what keeps the slow-loris property once a connection is
+    /// long-lived.
     static constexpr std::chrono::milliseconds RequestTimeout { 5'000 };
 
     /// How often the sweeper looks for connections past their deadline.
@@ -176,7 +198,7 @@ class FrameServer
     void NoteLoopThrew() noexcept;
 
     /// @return How many connections are being served right now. For tests.
-    [[nodiscard]] std::size_t InFlight() const noexcept;
+    [[nodiscard]] std::size_t OpenConnections() const noexcept;
 
     /// @return How many declared payload bytes are in flight. For tests.
     [[nodiscard]] std::size_t InFlightBytes() const noexcept;

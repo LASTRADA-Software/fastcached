@@ -131,6 +131,31 @@ inline constexpr std::size_t ReplyHeaderSize = 5;
 /// values at `--storage-max-value` (256 MiB by default), far below this.
 inline constexpr std::uint64_t MaxFramePayload = WireFields::MaxPayload;
 
+/// How far past a surface's own request cap an oversize declaration is still read
+/// and discarded, so the refusal can be a reply rather than a close.
+///
+/// A frame declares its own length, so a server that refuses one can step over the
+/// body and stay in sync -- and it must, or the peer never sees the typed refusal it
+/// was answered with. Refusing without draining is what made an over-cap STORE break
+/// builds: the client is mid-send when the server stops reading, so it sees its own
+/// write fail (and, before issue #68, died of SIGPIPE doing so) instead of the one
+/// message that would have told an operator to raise `--storage-max-value`. Draining
+/// costs bandwidth the peer was going to spend anyway rather than footprint, since
+/// the body is discarded in chunks and never materialised.
+///
+/// Expressed as a multiple of the cap rather than a byte count of its own: the cap is
+/// already the operator's statement of the largest thing a surface will handle, so
+/// being willing to discard a few times that much needs no second knob and scales
+/// when they retune the first one. Past the bound the connection ends -- a peer
+/// declaring gigabytes it was never going to be allowed to send has stopped being one
+/// worth resynchronizing with.
+///
+/// It lives HERE rather than beside either implementation because both the daemon's
+/// handler and the node's frame endpoint serve this same wire, and a peer must not
+/// have to know which one it reached to know how a refusal behaves. Two copies of a
+/// policy comment claiming to be one policy is how they drift.
+inline constexpr std::uint64_t OversizeDrainFactor = 4;
+
 /// Wire opcodes. One byte, third in the request header.
 enum class Op : std::uint8_t
 {
