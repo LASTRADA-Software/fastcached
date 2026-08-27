@@ -30,8 +30,6 @@
 # Declaring the code page instead makes ONE convention true process-wide, with no
 # conversion, no wide entry point, no dependency, and no call site to remember.
 #
-include(ProjectTargets)
-
 # ## The floor, and what happens below it
 #
 # `activeCodePage` is honoured from Windows 10 1903 / Server 2022. An older host
@@ -39,6 +37,33 @@ include(ProjectTargets)
 # allowed to be -- so `FastCache::NarrowTextIsUtf8()` reports the outcome rather
 # than the intent, and a Catch2 case asserts it. See
 # src/FastCache/Platform/NarrowText.hpp.
+#
+# ## What the COMPILER thinks a narrow literal is
+#
+# The same question, asked of the other end. Without `/utf-8`, MSVC reads a source
+# file in the host's ANSI code page and re-encodes its narrow literals into that
+# same page -- so a string literal holding an em dash round-trips byte-identically
+# on a CP-1252 or CP-65001 host and comes out as different bytes anywhere else.
+# This tree has such literals (a Redis error reply, the Windows service
+# description, an SVG chart caption), and the SVG one is the sharp end: an XML
+# parser refuses a document whose encoding does not hold, so a build on a host
+# with a third code page would emit a chart no browser draws.
+#
+# Not a consequence of the manifest above -- `cl.exe` has a code page of its own
+# and this changes nothing about it -- and not a hazard on any host CI or this
+# project's developers use. It is here because it is the same rule: a `char` in
+# this tree is UTF-8, at run time and at compile time, and a build that decides
+# otherwise per host is one nothing checks.
+#
+# Directory-scoped and included after every CPM dependency has been added, exactly
+# as PedanticCompiler and Sanitizers are, so a third-party source with a byte this
+# would refuse is never handed the flag.
+
+include(ProjectTargets)
+
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+endif()
 
 # Attach the manifest to every executable this project defines.
 #
