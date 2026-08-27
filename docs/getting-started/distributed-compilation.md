@@ -12,6 +12,11 @@ It is **opt-in at both ends** and cannot break a build: every refusal, every
 unreachable worker, every mismatch falls back to the local compile that would
 have happened anyway.
 
+This page is how to set it up and run it. If you want the model first — what the
+pieces are and how one compile flows through them — read
+[How it works](../how-it-works.md), which is a shorter read and makes everything
+below easier to place.
+
 ---
 
 ## Architecture

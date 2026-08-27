@@ -20,6 +20,10 @@ credentials for it: the object it produces goes back to the client that asked fo
 it, and the *client* stores it, so a rogue worker can poison only its own key
 space.
 
+This page is the reference. For why a node is shaped this way — who leads, what a
+joining node does in order, and what decides whether a worker matches a client at
+all — read [How it works](../how-it-works.md#who-leads-and-what-happens-when-that-changes).
+
 ## How the pieces fit
 
 ```

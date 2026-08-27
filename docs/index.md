@@ -42,6 +42,9 @@ list.
 
 ## Where to start
 
+- Want to understand what this actually does before configuring it? Read
+  [How it works](how-it-works.md) — the pieces, one compile followed end to end,
+  and what decides whether two machines can share anything.
 - New to the project? Read [Quickstart](getting-started/quickstart.md).
 - Wondering whether your client will work? Check the
   [Coverage matrix](protocols/coverage-matrix.md).
