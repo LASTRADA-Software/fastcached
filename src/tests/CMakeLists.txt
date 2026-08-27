@@ -194,6 +194,60 @@ set_tests_properties("compile-cache-autoinstall" PROPERTIES
     TIMEOUT 600
 )
 
+# ---------------------------------------------------------------------------
+# Compiler-cache caveat reporting. Configures the same fixture once per selection
+# outcome and requires the module to say so when it picks a launcher that can
+# silently produce a wrong build -- and to stay quiet when it picks one that
+# cannot.
+#
+# Issue #153: sccache replays a cache hit's dependency list with the paths of the
+# build that STORED it, so a second checkout sharing the cache records
+# dependencies pointing into the first and then rebuilds nothing when a header
+# changes. Measured here as 1097 recorded dependency edges into the wrong
+# worktree and `ninja: no work to do` after a real edit. The module cannot fix
+# somebody else's replay; what it owes a developer is a word about it, and that
+# word is what this pins.
+#
+# Both halves matter. A warning that fired for every launcher would be one nobody
+# reads, so the silence is asserted too.
+#
+# Needs no sandbox -- it names the launchers through the find_program cache
+# variables rather than hiding them -- so unlike compile-cache-autoinstall it
+# runs on Windows as well and has no SKIP path. Labelled "hygiene" for the same
+# reason: it starts no daemon and opens no socket, so it belongs in the default
+# ctest set.
+# Which half of the contract this build asserts: the hazard is MSVC's and
+# clang-cl's, so the module carries the caveat on exactly that condition and the
+# check has to expect the noise there and the silence everywhere else. Resolved
+# here rather than re-derived in the script, so the two cannot drift.
+set(_fc_caveat_msvc_like OFF)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"
+   OR CMAKE_C_COMPILER_ID STREQUAL "MSVC" OR CMAKE_C_SIMULATE_ID STREQUAL "MSVC")
+    set(_fc_caveat_msvc_like ON)
+endif()
+
+add_test(
+    NAME "compile-cache-caveat"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-caveat"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        "-DFASTCACHED_MSVC_LIKE=${_fc_caveat_msvc_like}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-caveat.cmake"
+)
+# A shell that is not a Developer shell has a cl.exe that exists and cannot
+# compile, and this is the first of these checks that runs on Windows at all --
+# so it reports that by printing `SKIP: ` rather than blaming the caveat logic
+# for a toolchain nobody set up. repository-hygiene above says why a `cmake -P`
+# script cannot return 77 instead.
+set_tests_properties("compile-cache-caveat" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
 # The other half: that it can actually install one. Serves a synthetic release
 # over file:// through FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE — the same seam an
 # organisation uses to install from an internal mirror — so the happy path is

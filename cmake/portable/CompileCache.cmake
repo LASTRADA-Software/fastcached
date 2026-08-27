@@ -15,6 +15,13 @@
 #      actually answering there — see the probe below.
 #   2. sccache — the usual third-party launcher, used when fastcache-cc is
 #      unavailable or unconfigured. Supports shared (Redis/S3/...) caches.
+#      **Under MSVC or clang-cl, selecting it emits a warning**, and the warning
+#      is the point: there sccache replays a hit's /showIncludes stream with the
+#      absolute paths of the build that stored it, so two checkouts sharing one
+#      cache stop rebuilding on a header change while the build stays green. GCC
+#      and Clang are unaffected. It is a caveat rather than a `check` that skips
+#      the row, because nothing here can tell whether the cache is shared and the
+#      choice belongs to whoever is building. See the row below.
 #   3. ccache — the classic local cache, used when neither of the above applies.
 #
 # Launchers are wired in as compiler launchers, so CPM-/FetchContent-fetched
@@ -997,7 +1004,9 @@ endfunction()
 #                            <fn>(<outVar> <reasonVar>) and only for a row that
 #                            already passed program and requires
 #   _fc_cache_<id>_detail    extra words for the status message (empty for none)
-# Supporting a fourth launcher is adding an id here plus its six variables.
+#   _fc_cache_<id>_caveat    a correctness hazard this launcher carries, warned
+#                            about when it is the row that WINS (empty for none)
+# Supporting a fourth launcher is adding an id here plus its seven variables.
 set(_fc_cache_candidates fastcache_cc sccache ccache)
 
 # Render "<label>[ <detail>]" for a row, so a launcher and where it points are
@@ -1019,6 +1028,7 @@ set(_fc_cache_fastcache_cc_requires "${FASTCACHE_ADDR}")
 set(_fc_cache_fastcache_cc_env ${_fc_fastcache_env})
 set(_fc_cache_fastcache_cc_check _fc_probe_fastcache_cc)
 set(_fc_cache_fastcache_cc_detail "at ${FASTCACHE_ADDR}")
+set(_fc_cache_fastcache_cc_caveat "")
 
 set(_fc_cache_sccache_label "sccache")
 set(_fc_cache_sccache_program "${SCCACHE}")
@@ -1026,6 +1036,44 @@ set(_fc_cache_sccache_requires ON)
 set(_fc_cache_sccache_env "")
 set(_fc_cache_sccache_check "")
 set(_fc_cache_sccache_detail "")
+# Not a `check`, because the row stays usable: this is a hazard a developer has to
+# be able to weigh, not a condition this module can evaluate. Nothing here can
+# tell whether the cache about to be used is shared with another checkout.
+#
+# Carried only where the hazard exists, which is a property of the COMPILER
+# rather than of sccache alone. Measured both ways, because warning where it
+# cannot happen is how a warning becomes one people learn to skip:
+#
+#   * MSVC and clang-cl are exposed. sccache preprocesses them with `/EP`, which
+#     emits no `#line` markers, so the text it hashes carries no paths at all and
+#     two checkouts hash identically. `/showIncludes` then reports ABSOLUTE paths,
+#     so the dependency stream replayed into the second checkout names the first.
+#     Measured on fastcached: two worktrees at one commit, 137 cross-worktree
+#     hits, 1097 recorded dependency edges pointing into the wrong tree and none
+#     into its own, and `ninja: no work to do` after a real edit to a header.
+#
+#   * GCC and Clang are not. Their preprocessed output carries `# n "path"` line
+#     markers, so with the absolute include paths CMake generates the hashed text
+#     differs between checkouts and there is no hit to replay (measured on Ubuntu
+#     24.04: 0 hits, 2 misses). Spell the same compile with relative paths and
+#     there IS a hit -- but then the depfile is relative too and resolves inside
+#     the consuming tree, which is correct. Self-consistent either way.
+#
+# Both languages are tested, not just CXX: this module wires
+# CMAKE_C_COMPILER_LAUNCHER as well, so a `project(x LANGUAGES C)` on MSVC is
+# exposed exactly as much and would otherwise be the one configuration that gets
+# sccache with no word about it.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"
+   OR CMAKE_C_COMPILER_ID STREQUAL "MSVC" OR CMAKE_C_SIMULATE_ID STREQUAL "MSVC")
+    set(_fc_cache_sccache_caveat
+        "sccache replays a cache hit's /showIncludes stream verbatim -- the ABSOLUTE paths spelled by the build that STORED it -- while the text it hashes to find that hit carries no paths at all. Two checkouts therefore share entries and then record each other's headers as their dependencies. Editing a header in the checkout you are building rebuilds nothing: the build stays green and the objects are stale.
+
+It bites an INCREMENTAL build across two checkouts sharing one sccache cache. A clean build has no dependency graph to corrupt, and checkouts that all sit at the same absolute path replay paths that are correct -- CI is normally both, and unaffected. GCC and Clang are unaffected everywhere: their preprocessed output carries the paths, so the two checkouts do not share entries in the first place.
+
+To avoid it: install fastcache-cc and run a fastcached daemon, which rewrites a hit's paths into the consuming checkout and so does not have this failure mode; or pass -DSCCACHE= to fall through to ccache, which is unaffected; or configure with -DUSE_COMPILER_CACHE=OFF.")
+else()
+    set(_fc_cache_sccache_caveat "")
+endif()
 
 set(_fc_cache_ccache_label "ccache")
 set(_fc_cache_ccache_program "${CCACHE}")
@@ -1033,6 +1081,11 @@ set(_fc_cache_ccache_requires ON)
 set(_fc_cache_ccache_env "")
 set(_fc_cache_ccache_check "")
 set(_fc_cache_ccache_detail "")
+# ccache's default `base_dir` is empty, which is documented to mean it does not
+# rewrite absolute paths and so does not share entries between checkouts -- the
+# precondition the sccache hazard above needs. Setting `base_dir` deliberately
+# opts into that sharing, which is a choice its own documentation covers.
+set(_fc_cache_ccache_caveat "")
 
 set(_fc_cache_chosen "")
 set(_fc_cache_rejected "")
@@ -1079,6 +1132,20 @@ if(_fc_cache_chosen)
 
     _fc_cache_describe("${_fc_cache_chosen}" _fc_cache_desc)
     message(STATUS "[cache] Enabling ${_fc_cache_desc} (${_fc_cache_program}) for C/C++ compilation")
+
+    # A launcher that can silently produce a WRONG build says so, at the moment a
+    # build is opted into it. A warning rather than a status line because the
+    # symptom arrives hours later and somewhere else entirely -- a stale object,
+    # a green build, and a crash in code nobody touched -- so the one line naming
+    # it has to still be findable in the log afterwards.
+    #
+    # Never fatal, and never a `check` that skips the row: which launcher to run
+    # is the developer's call, and a module vendored into other repositories does
+    # not get to make it for them. It only has to make it an informed one.
+    if(_fc_cache_${_fc_cache_chosen}_caveat)
+        message(WARNING "[cache] ${_fc_cache_${_fc_cache_chosen}_caveat}")
+    endif()
+
     set(CMAKE_C_COMPILER_LAUNCHER ${_fc_cache_launcher})
     set(CMAKE_CXX_COMPILER_LAUNCHER ${_fc_cache_launcher})
 

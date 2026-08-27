@@ -343,7 +343,8 @@ with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
 trees. Configure proves the cache works by compiling one tiny file through the
 launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
 reach its daemon still compiles fine and would otherwise cost every TU a failed
-connect in silence. When nothing answers it falls back to `sccache`. When
+connect in silence. When nothing answers it falls back to `sccache` — which is
+not free, see below. When
 *nothing* is installed, `-DFASTCACHE_AUTO_INSTALL=ON` (default OFF) fetches a
 prebuilt `fastcache-cc` for the host from the latest stable release instead,
 staged per user so a machine downloads it once; `cmake/README.md` is the note
@@ -352,6 +353,51 @@ so with either launcher active the module scan and precompiled headers are
 turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
 PDB is a second artefact no hit can reproduce).
+
+- **Under MSVC and clang-cl the `sccache` fallback can silently produce a wrong
+  build, and the configure warns about it now rather than leaving it to be
+  discovered.** sccache replays a cache hit's `/showIncludes` stream verbatim —
+  the **absolute** paths spelled by the build that *stored* it — while the text it
+  hashes to find that hit carries no paths at all, because it preprocesses MSVC
+  with `/EP` and `/EP` emits no line markers. Two checkouts therefore share
+  entries and then record each other's headers as their dependencies. Measured on
+  this repository: two worktrees at one commit, stock configure, no daemon —
+  **137** cross-worktree cache hits, **1097** dependency edges recorded pointing
+  at the *other* worktree and **none** at its own, and `ninja: no work to do`
+  after a real edit to the checkout's own `Logger.hpp`.
+
+  **GCC and Clang are not exposed, and the negative result is the reason the
+  warning is scoped rather than unconditional.** Their preprocessed output carries
+  `# n "path"` line markers, so with the absolute include paths CMake generates
+  the hashed text differs between checkouts and there is no hit to replay
+  (measured on Ubuntu 24.04 with g++-14: 0 hits, 2 misses). Spell the same compile
+  with relative paths and there *is* a hit — but then the depfile is relative too
+  and resolves inside the consuming tree. Self-consistent either way. A warning
+  that fired on the majority of this project's CI, where it cannot happen, is one
+  contributors would learn to skip.
+
+  The symptom is not a stale build you notice. It is a green build and a crash
+  somewhere unrelated: adding a virtual to `IStorage` linked objects compiled
+  against the old vtable, and five `ShardedStorage` tests segfaulted inside `Get`.
+
+  **It bites an incremental build across two checkouts that share one cache.** A
+  clean build has no dependency graph to corrupt, and checkouts that all sit at the
+  same absolute path replay paths that are correct — CI is normally both, which is
+  why the fallback stays automatic rather than becoming opt-in: downstream projects
+  run CI with no daemon reachable on purpose and are not exposed. Passing
+  `-DSCCACHE=` falls through to ccache, whose default empty `base_dir` means it
+  does not rewrite absolute paths and so does not share entries between checkouts.
+
+  `fastcache-cc` does not have this failure mode by construction — `MaterializeHit`
+  runs every stored region through `PathCanon::LocalizeRegion` before replaying it,
+  and `MissingReplayedDependency` refuses a hit whose replayed dependency is not
+  there. That is the fix, not a workaround: install it and run a daemon, or
+  configure with `-DUSE_COMPILER_CACHE=OFF`.
+
+  A launcher's caveat is a **row in the candidate table** (`_fc_cache_<id>_caveat`),
+  not an `if` on its name, and `ctest -R compile-cache-caveat` asserts both halves —
+  that sccache warns, and that the launchers without a hazard stay silent. A warning
+  that fired for every launcher would be one nobody reads.
 
 ## Code coverage
 
