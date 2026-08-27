@@ -7,6 +7,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -25,7 +26,10 @@
 #include <thread>
 #include <vector>
 
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
 #include <CowTree/Crc32c.hpp>
+#include <CowTree/IPageStore.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
 
 using namespace std::chrono_literals;
@@ -1082,6 +1086,123 @@ TEST_CASE("Open on a path holding random non-CowTree bytes returns Corrupt or Io
     // first; we accept either Corrupt or IoError, both are sane.
     auto const code = storage.error().code;
     REQUIRE((code == FastCache::StorageErrorCode::Corrupt || code == FastCache::StorageErrorCode::IoError));
+}
+
+// ============================================================================
+// On-disk format vintage (issue #131)
+//
+// A store written under another record layout is refused — that part was always
+// right. What these pin down is that the refusal is not spelled `Corrupt`: the
+// code is what monitoring and every programmatic caller sees, and an operator
+// reading "Corrupt" about an intact cache deletes it.
+// ============================================================================
+
+namespace
+{
+
+/// The format-marker key as tree-key bytes.
+///
+/// Taken from `CowTreeStorage::FormatMarkerKey` rather than a second copy of
+/// the magic, so these tests cannot keep passing after the real key moves.
+/// @return A view over the reserved sentinel key.
+[[nodiscard]] CowTree::BytesView FormatMarkerKeyView() noexcept
+{
+    auto const key = FastCache::CowTreeStorage::FormatMarkerKey;
+    return CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() };
+}
+
+/// Commit one key/value into a store, over a raw tree that stamps no marker of
+/// its own — the only way to produce a store this build refuses.
+/// @param store Page store to write into (opened/initialised here).
+/// @param key   Tree key.
+/// @param value Tree value.
+void PutRaw(CowTree::IPageStore& store, CowTree::BytesView key, CowTree::BytesView value)
+{
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    auto txn = tree.BeginWrite();
+    REQUIRE(txn.Put(key, value).has_value());
+    REQUIRE(txn.Commit().has_value());
+}
+
+/// Stamp `version` into a store's format marker.
+///
+/// The four bytes are spelled out least-significant first rather than memcpy'd
+/// from the integer, so the marker this writes is little-endian on a big-endian
+/// host too — the test would otherwise agree with a bug on exactly the hosts the
+/// on-disk format exists to be portable across.
+/// @param store   Page store to write into.
+/// @param version The version to record.
+void StampFormatVersion(CowTree::IPageStore& store, std::uint32_t version)
+{
+    std::array<std::byte, sizeof(std::uint32_t)> const value {
+        static_cast<std::byte>(version & 0xFFU),
+        static_cast<std::byte>((version >> 8) & 0xFFU),
+        static_cast<std::byte>((version >> 16) & 0xFFU),
+        static_cast<std::byte>((version >> 24) & 0xFFU),
+    };
+    PutRaw(store, FormatMarkerKeyView(), CowTree::BytesView { value.data(), value.size() });
+}
+
+} // namespace
+
+TEST_CASE("A store stamped with an unknown format version is refused as a vintage, not as damage",
+          "[cowstorage][open][format]")
+{
+    constexpr auto Future = FastCache::CowTreeStorage::CurrentFormatVersion + 1;
+    CowTree::InMemoryPageStore store;
+    StampFormatVersion(store, Future);
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+
+    // Both versions named, so an operator can tell which way round it is
+    // without going to the source.
+    auto const& context = opened.error().context;
+    REQUIRE(context.contains(std::format("version {}", Future)));
+    // "writes N", not a bare "N": the digit alone would match anywhere in the
+    // sentence, including the store's own version, so it would keep passing
+    // with the two the wrong way round.
+    REQUIRE(context.contains(std::format("writes {}", FastCache::CowTreeStorage::CurrentFormatVersion)));
+    // A newer store is not something this build can convert; say so instead.
+    REQUIRE(context.contains("upgrade"));
+}
+
+TEST_CASE("A non-empty store carrying no format marker is refused as a vintage, not as damage", "[cowstorage][open][format]")
+{
+    // The marker arrived WITH v4, so its absence over a store that already
+    // holds records IS the version stamp: this is a v3 store.
+    CowTree::InMemoryPageStore store;
+    auto const key = std::string_view { "legacy-key" };
+    std::array<std::byte, 4> const record { std::byte { 0 }, std::byte { 1 }, std::byte { 2 }, std::byte { 3 } };
+    PutRaw(store,
+           CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() },
+           CowTree::BytesView { record.data(), record.size() });
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(opened.error().context.contains("version 3"));
+    // The whole point of the code: nothing here tells the operator to delete it.
+    REQUIRE(opened.error().context.contains("does not need to be deleted"));
+}
+
+TEST_CASE("A format marker too short to hold a version is damage, and keeps saying Corrupt", "[cowstorage][open][format]")
+{
+    // The one case in this area that really IS corruption: there is no version
+    // to report and nothing to convert, so the vintage code would be a lie in
+    // the other direction.
+    CowTree::InMemoryPageStore store;
+    std::array<std::byte, 2> const truncated { std::byte { 4 }, std::byte { 0 } };
+    PutRaw(store, FormatMarkerKeyView(), CowTree::BytesView { truncated.data(), truncated.size() });
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::Corrupt);
 }
 
 TEST_CASE("Set above maxValueBytes returns ValueTooLarge", "[cowstorage][boundary]")

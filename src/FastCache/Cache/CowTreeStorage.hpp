@@ -70,11 +70,36 @@ namespace FastCache
 /// (next == 0 marks the last page). The CRC is computed over everything that
 /// follows it — the `next` link, `chunk_len`, and the chunk — so a torn write
 /// to the chain linkage (not just the payload) is detected on read; data pages
-/// otherwise carry no read-time checksum. v4 breaks the older v3 on-disk format
-/// (acceptable pre-release); an old-format store is rejected on Open.
+/// otherwise carry no read-time checksum. v4 breaks the older v3 on-disk
+/// format; a store of any other vintage is rejected on Open with
+/// `StorageErrorCode::UnsupportedFormatVersion` rather than mis-parsed.
 class CowTreeStorage final: public IStorage
 {
   public:
+    /// On-disk record-layout version this build WRITES. Bumped from 3 to 4 when
+    /// the per-entry compression codec + original-length fields were added (see
+    /// the layout above). A store carrying any other version is refused on Open
+    /// rather than mis-parsed under this layout.
+    ///
+    /// Public because it is part of the on-disk contract, not an implementation
+    /// detail: the diagnostics quote it, and anything that has to build or
+    /// inspect a store of a known vintage needs the same number this class
+    /// stamps rather than a second copy of it.
+    static constexpr std::uint32_t CurrentFormatVersion = 4;
+
+    /// Reserved tree key holding the format-version sentinel, whose value is
+    /// `[u32 version]` little-endian.
+    ///
+    /// Chosen to be unreachable by the memcached-family wire protocols: it
+    /// leads with control bytes (NUL + SOH), which those protocols forbid in
+    /// keys. A RESP binary key could in principle collide, but a client would
+    /// have to store this exact magic; even then only the sentinel read is
+    /// affected, never the integrity of other data. Built via an explicit
+    /// length so the embedded NULs are not truncated.
+    static constexpr char FormatMarkerKeyBytes[] = { '\0', '\1', 'f', 'a', 's', 't', 'c', 'a', 'c',
+                                                     'h',  'e',  'd', '.', 'f', 'm', 't', '\0' };
+    static constexpr std::string_view FormatMarkerKey { FormatMarkerKeyBytes, sizeof(FormatMarkerKeyBytes) };
+
     struct Options
     {
         /// Backing file path.
@@ -237,9 +262,16 @@ class CowTreeStorage final: public IStorage
     /// Validate (or, for a fresh store, stamp) the on-disk record-format
     /// version. A store carrying a marker for a different version — or an
     /// older, pre-marker store that already holds data — is rejected with
-    /// StorageErrorCode::Corrupt so its records are never mis-parsed under the
-    /// current layout. An empty store is stamped with the current version.
-    /// @return Empty on success; Corrupt on a version mismatch / legacy store.
+    /// StorageErrorCode::UnsupportedFormatVersion so its records are never
+    /// mis-parsed under the current layout. An empty store is stamped with
+    /// `CurrentFormatVersion`.
+    ///
+    /// The refusal is NOT `Corrupt`: the store is intact, and telling an
+    /// operator otherwise is what makes them delete a cache they could have
+    /// kept. A marker too short to hold a version is the one case that really
+    /// is damage, and that one keeps `Corrupt`.
+    /// @return Empty on success; UnsupportedFormatVersion on a version
+    ///         mismatch or a pre-marker store; Corrupt on a damaged marker.
     [[nodiscard]] std::expected<void, StorageError> EnsureFormatVersion();
 
     /// Result of a tree lookup with the encoded entry materialised.

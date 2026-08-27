@@ -153,22 +153,35 @@ namespace
     constexpr std::uint8_t RecordKindInline = 0;
     constexpr std::uint8_t RecordKindOverflow = 1;
 
-    /// On-disk record-layout version. Bumped from 3 to 4 when the per-entry
-    /// compression codec + original-length fields were added (see the class
-    /// doc). A store written by an older version is rejected on Open rather
-    /// than mis-parsed under the new layout.
-    constexpr std::uint32_t StorageFormatVersion = 4;
+    /// The version a non-empty store carrying no marker at all must be.
+    ///
+    /// The marker arrived WITH v4, so its absence is itself the version stamp:
+    /// a store holding records but no sentinel was written by a build that did
+    /// not stamp one. That is v3 — no release ever shipped v1 or v2 of this
+    /// layout — and it is why the refusal below can name a version the store
+    /// never records.
+    constexpr std::uint32_t PreMarkerFormatVersion = 3;
 
-    /// Reserved tree key holding the format-version sentinel. Chosen to be
-    /// unreachable by the memcached-family wire protocols: it leads with
-    /// control bytes (NUL + SOH), which those protocols forbid in keys. A RESP
-    /// binary key could in principle collide, but a client would have to store
-    /// this exact magic; even then only the sentinel read is affected, never
-    /// the integrity of other data. The value is `[u32 StorageFormatVersion]`.
-    /// Built via an explicit length so the embedded NULs are not truncated.
-    constexpr char FormatMarkerKeyBytes[] = { '\0', '\1', 'f', 'a', 's', 't', 'c', 'a', 'c',
-                                              'h',  'e',  'd', '.', 'f', 'm', 't', '\0' };
-    constexpr std::string_view FormatMarkerKey { FormatMarkerKeyBytes, sizeof(FormatMarkerKeyBytes) };
+    /// Describe a store this build cannot read, and say what can be done about it.
+    ///
+    /// One helper rather than one message per call site: a marker naming another
+    /// version and a pre-marker store whose ABSENT marker is its version are the
+    /// same fact to an operator, and deserve the same sentence. The sentence has
+    /// to carry the advice because the alternative is what an operator reaches
+    /// for unprompted — deleting a store that was never damaged.
+    /// @param onDisk The version the store carries.
+    /// @return The refusal, coded so a programmatic caller can tell it from damage.
+    [[nodiscard]] StorageError UnsupportedFormat(std::uint32_t onDisk)
+    {
+        auto const remedy = onDisk < CowTreeStorage::CurrentFormatVersion
+                                ? "the store is intact and does not need to be deleted"
+                                : "upgrade fastcached to a build that writes this version";
+        return MakeError(StorageErrorCode::UnsupportedFormatVersion,
+                         std::format("on-disk storage format version {} (this build reads and writes {}): {}",
+                                     onDisk,
+                                     CowTreeStorage::CurrentFormatVersion,
+                                     remedy));
+    }
 
     [[nodiscard]] std::expected<std::uint64_t, StorageError> ParseUnsigned(std::span<std::byte const> bytes)
     {
@@ -247,24 +260,26 @@ std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
 
     if (marker->has_value())
     {
-        // A marker exists: it must name exactly the current format version.
+        // A marker exists: it must name exactly the version this build writes.
         CowTree::BytesView cursor { (*marker)->data(), (*marker)->size() };
         std::uint32_t onDisk = 0;
-        if (!ReadLe<std::uint32_t>(cursor, onDisk) || onDisk != StorageFormatVersion)
-            return std::unexpected(MakeError(
-                StorageErrorCode::Corrupt,
-                std::format("unsupported on-disk storage format version {} (expected {})", onDisk, StorageFormatVersion)));
+        // A marker too short to hold its own u32 is damage rather than vintage:
+        // there is no version to report and nothing to convert, so this one
+        // stays Corrupt while the mismatch below does not.
+        if (!ReadLe<std::uint32_t>(cursor, onDisk))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt, "format marker is too short to hold a version"));
+        if (onDisk != CurrentFormatVersion)
+            return std::unexpected(UnsupportedFormat(onDisk));
         return {};
     }
 
     // No marker. A brand-new (empty) store gets stamped; a non-empty store
-    // predates the marker (legacy v3 or earlier) and must not be mis-parsed.
+    // predates the marker and must not be mis-parsed.
     if (_tree->ItemCount() != 0)
-        return std::unexpected(
-            MakeError(StorageErrorCode::Corrupt, "on-disk store predates the versioned record format; refusing to open"));
+        return std::unexpected(UnsupportedFormat(PreMarkerFormatVersion));
 
     std::vector<std::byte> value;
-    AppendLe<std::uint32_t>(value, StorageFormatVersion);
+    AppendLe<std::uint32_t>(value, CurrentFormatVersion);
     auto txn = _tree->BeginWrite();
     if (auto const put = txn.Put(KeyView(FormatMarkerKey), CowTree::BytesView { value.data(), value.size() });
         !put.has_value())
