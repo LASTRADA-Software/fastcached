@@ -1226,6 +1226,17 @@ struct CacheTierUsage
     std::uint64_t itemCount { 0 }; ///< Live entries.
     std::uint64_t bytesUsed { 0 }; ///< Bytes held.
     std::uint64_t evictions { 0 }; ///< Entries dropped to stay within the budget.
+
+    /// Resident bytes the tier spends on its own key index (#175).
+    ///
+    /// Appended LAST, which is what makes it compatible in both directions: this
+    /// record's arity is variable by design -- the decoder below stops at whichever
+    /// of the two sides has fewer fields and leaves the rest at zero -- so an older
+    /// peer sends three and is read as three, while a newer one sends four and an
+    /// older reader ignores the fourth. Inserting it anywhere else would have
+    /// renumbered the fields either side of it and made two builds disagree about
+    /// what `bytesUsed` means.
+    std::uint64_t indexBytes { 0 };
 };
 
 /// A node's cache as it stands right now, travelling inside HEARTBEAT.
@@ -1257,12 +1268,14 @@ struct CacheLoadFields
     tierFields.reserve(cache.tiers.size());
     for (auto const& tier: cache.tiers)
     {
-        owned.push_back(tier.has_value()
-                            ? WireFields::Encode(
-                                  { std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->itemCount) },
-                                    std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->bytesUsed) },
-                                    std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->evictions) } })
-                            : std::vector<std::byte> {});
+        owned.push_back(
+            tier.has_value()
+                ? WireFields::Encode(
+                      { std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->itemCount) },
+                        std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->bytesUsed) },
+                        std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->evictions) },
+                        std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(tier->indexBytes) } })
+                : std::vector<std::byte> {});
         tierFields.emplace_back(owned.back());
     }
     auto const tiers = WireFields::Encode(WireFields::FieldList { tierFields });
@@ -1304,14 +1317,17 @@ struct CacheLoadFields
                 continue;
             }
             auto const values = WireFields::SplitAll(tier);
-            // Three fields expected and fewer tolerated, exactly as the records
-            // above tolerate a short peer: what is absent stays at zero.
+            // Four fields expected and fewer tolerated, exactly as the records above
+            // tolerate a short peer: what is absent stays at zero. That tolerance is
+            // what let `indexBytes` be appended without a version bump -- and it only
+            // holds while new fields go on the END.
             if (!values.has_value())
                 return std::nullopt;
             CacheTierUsage usage {};
             constexpr std::array Members { &CacheTierUsage::itemCount,
                                            &CacheTierUsage::bytesUsed,
-                                           &CacheTierUsage::evictions };
+                                           &CacheTierUsage::evictions,
+                                           &CacheTierUsage::indexBytes };
             for (std::size_t index = 0; index < Members.size() && index < values->size(); ++index)
             {
                 auto const& raw = (*values)[index];

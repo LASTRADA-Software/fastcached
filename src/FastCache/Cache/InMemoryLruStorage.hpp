@@ -189,6 +189,30 @@ class InMemoryLruStorage final: public IStorage
     };
 
     using LruList = std::list<Node>;
+
+    /// What one index entry with a key of @p keyLength bytes costs in resident memory.
+    ///
+    /// The counterpart of `CowTreeStorage::IndexBytesFor`, and it exists here for a
+    /// reason that surprised a review of #175: this tier's budget counts value bytes
+    /// only -- the class comment above says so outright -- so its keys and per-entry
+    /// overhead are just as unaccounted as the disk tier's. The difference is one of
+    /// degree, not of kind: at least this budget is denominated in the same unit.
+    ///
+    /// Reported so the fleet column is TRUE for both tiers. Leaving it at zero here
+    /// would have been an affirmative claim that this tier's index is free, which is
+    /// worse than the silence it replaced.
+    ///
+    /// @param keyLength Length of the key in bytes.
+    /// @return Estimated resident bytes for one entry.
+    [[nodiscard]] static constexpr std::size_t IndexBytesFor(std::size_t keyLength) noexcept
+    {
+        // The list node's two links, then the map node's next pointer, cached hash and
+        // stored iterator, then one bucket slot -- and the map's own copy of the key,
+        // which is a whole `std::string` and not just its characters.
+        constexpr std::size_t Overheads =
+            (2 * sizeof(void*)) + sizeof(void*) + sizeof(std::size_t) + sizeof(void*) + sizeof(void*) + sizeof(std::string);
+        return sizeof(Node) + Overheads + (2 * keyLength);
+    }
     using Iterator = LruList::iterator;
 
     /// Return iterator to the (non-expired, current-generation) entry, or
@@ -275,6 +299,11 @@ class InMemoryLruStorage final: public IStorage
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };
     CasToken _nextCas { 1 };
+
+    /// What the index above costs in RAM, accumulated as it changes. See
+    /// `IndexBytesFor`, and `CowTreeStorage`'s member of the same name for why this
+    /// is accumulated rather than derived from a count.
+    std::size_t _indexBytes { 0 };
 
     LruList _lru;
 

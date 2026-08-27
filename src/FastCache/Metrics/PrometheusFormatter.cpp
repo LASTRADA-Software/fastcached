@@ -88,6 +88,19 @@ namespace
                      .help = "Entries this tier dropped to stay within its budget.",
                      .type = MetricType::Counter,
                      .project = [](StorageStats const& s) noexcept { return s.evictions; } },
+        // The daemon's half of #175. `--storage` carries the same key index as a
+        // node's disk tier and is not scheduled against, so nothing corrects for it
+        // there at all -- this is the only surface on which a `fastcached` operator
+        // can see it, or alert before the machine starts swapping.
+        //
+        // A gauge, and NOT comparable with `bytes_limit` beside it: that budget is
+        // denominated in whatever bounds the tier, which for a disk tier is bytes on
+        // a filesystem, while this is always resident memory.
+        TierMetric { .name = "fastcached_tier_index_bytes",
+                     .help = "Resident memory this tier spends on its key index. Always RAM, even for a disk tier, "
+                             "so it is not comparable with fastcached_tier_bytes_limit.",
+                     .type = MetricType::Gauge,
+                     .project = [](StorageStats const& s) noexcept { return static_cast<std::uint64_t>(s.indexBytes); } },
     };
 
 } // namespace

@@ -194,6 +194,31 @@ TEST_CASE("A cache serving no reads has no hit rate rather than a rate of zero",
     CHECK(RenderFleetJson(snapshot).contains(R"("cache-hit-rate":750)"));
 }
 
+TEST_CASE("A tier's key index is reported as the RAM it is", "[distributed][fleetview][storage-tier]")
+{
+    // #175, and the half the issue exists to produce. A disk tier's budget is bytes
+    // on a filesystem, so a memory ceiling binding on a disk-cache node used to show
+    // `Memory` with nothing anywhere saying the cache's own key index was what
+    // consumed it. The column is the attribution.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes[0].load.cache.tiers[DiskIndex] =
+        CacheTierUsage { .itemCount = 4'000, .bytesUsed = 8ULL << 30, .evictions = 0, .indexBytes = 96ULL << 20 };
+    snapshot.nodes[0].capacity.cache.tierBytesLimit[DiskIndex] = 32ULL << 30;
+    snapshot.tiersPresent[DiskIndex] = true;
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    auto const json = RenderFleetJson(snapshot);
+
+    // One spelling serving as header and JSON key, like every other column.
+    CHECK(html.contains("disk-index-ram"));
+    CHECK(json.contains(R"("disk-index-ram":100663296)"));
+
+    // And it is NOT the budget beside it: 96 MiB of RAM against 32 GiB of disk. A
+    // renderer that folded the two into one figure would be adding two units, which
+    // is the mistake the help text on this column exists to prevent.
+    CHECK(json.contains(R"("disk-budget":34359738368)"));
+}
+
 TEST_CASE("A tier no member runs contributes no column at all", "[distributed][fleetview][storage-tier]")
 {
     // A table cannot omit one cell the way a scrape omits a line, so this is where

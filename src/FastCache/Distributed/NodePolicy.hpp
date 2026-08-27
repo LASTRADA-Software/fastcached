@@ -129,6 +129,18 @@ struct CacheTierUsage
     std::uint64_t itemCount { 0 }; ///< Live entries.
     std::uint64_t bytesUsed { 0 }; ///< Bytes held.
     std::uint64_t evictions { 0 }; ///< Entries dropped to stay within the budget.
+
+    /// Resident bytes this tier spends on its own key index (#175).
+    ///
+    /// Carried apart from `bytesUsed` because it is separately denominated: a disk
+    /// tier's budget is bytes on a filesystem while this is always RAM, so a leader
+    /// that added them would be adding two units. It is what lets a memory ceiling
+    /// binding on a disk-cache node be attributed to the cache at all -- before this,
+    /// `/fleet` said `Memory` and nothing anywhere said why.
+    ///
+    /// Zero for a tier whose index is already inside `bytesUsed`, which is the
+    /// in-memory one: counting it there would count it twice.
+    std::uint64_t indexBytes { 0 };
 };
 
 /// What a node's cache holds right now, as it reports on each heartbeat.

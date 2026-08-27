@@ -599,6 +599,36 @@ class CowTreeStorage final: public IStorage
     /// Drop the entry from the LRU mirror.
     void EraseFromLru(std::string_view key);
 
+    /// What one mirror entry with a key of @p keyLength bytes costs in resident memory.
+    ///
+    /// An estimate, and deliberately a documented one rather than a measured figure
+    /// nobody can obtain: the allocator's own per-block overhead is not visible from
+    /// here, so this counts the parts that ARE knowable and names them.
+    ///
+    /// Per entry the mirror holds one `std::list` node -- the `LruNode` plus two link
+    /// pointers -- and one `unordered_map` node, which is a second copy of the key,
+    /// the iterator, a next pointer and the cached hash; plus roughly one bucket slot,
+    /// since the default maximum load factor is 1.
+    ///
+    /// The key is counted TWICE on purpose, because it is stored twice: once in the
+    /// `LruNode` and once as the map's own key. That is a real cost and a large part
+    /// of this number -- and it is removable independently of measuring it, which is
+    /// a reason to measure it first.
+    ///
+    /// @param keyLength Length of the key in bytes.
+    /// @return Estimated resident bytes for one entry.
+    [[nodiscard]] static constexpr std::size_t IndexBytesFor(std::size_t keyLength) noexcept
+    {
+        // The list node's two links, then the map node's next pointer, cached hash and
+        // stored iterator, then one bucket slot -- and the map's own copy of the key,
+        // which is a whole `std::string` object and not merely its characters. Leaving
+        // that header out undercounted every entry by ~32 bytes, in the direction that
+        // understates the cost this figure exists to expose.
+        constexpr std::size_t Overheads =
+            (2 * sizeof(void*)) + sizeof(void*) + sizeof(std::size_t) + sizeof(void*) + sizeof(void*) + sizeof(std::string);
+        return sizeof(LruNode) + Overheads + (2 * keyLength);
+    }
+
     /// Evict from the LRU tail until bytesUsed <= maxBytes (best effort).
     void EvictToFit();
 
@@ -658,6 +688,21 @@ class CowTreeStorage final: public IStorage
     Iterator _sweepCursor { _lru.end() };
 
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
+
+    /// What the mirror above costs in RAM, accumulated as it changes.
+    ///
+    /// This tier's budget is bytes on a FILESYSTEM, and `StorageTierTraits` says so
+    /// -- but the mirror is resident memory that grows with the object count, and
+    /// until #175 nothing named it at all. A machine could hold a gigabyte of index
+    /// for a disk cache it had been told was costing it no RAM, and the only symptom
+    /// was a scheduler's memory ceiling binding for a reason nothing could attribute.
+    ///
+    /// Accumulated rather than derived from `itemCount` times a constant, because the
+    /// keys are not uniform: a compile cache's are same-length hashes and the
+    /// daemon's are whatever a client sent, so one average would be right for one
+    /// caller and wrong for the other. It is still an ESTIMATE -- allocator overhead
+    /// is not knowable from here -- and `IndexBytesFor` says which parts are counted.
+    std::size_t _indexBytes { 0 };
 
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };

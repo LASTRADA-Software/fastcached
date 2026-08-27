@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -413,14 +414,15 @@ TEST_CASE("A configured-but-unbounded tier is not the same as no tier", "[distri
 
 TEST_CASE("The two halves of the cache-load mapping agree", "[distributed][scheduler][protocol][cache]")
 {
-    // Every value distinct across both tiers and all three fields, for the reason the
-    // capacity case gives: three same-width numbers per tier make a transposition
-    // decode perfectly.
+    // Every value distinct across both tiers and all FOUR fields, for the reason the
+    // capacity case gives: same-width numbers per tier make a transposition decode
+    // perfectly, and the fourth arrived last (#175) precisely where a renumbering
+    // would be invisible.
     NodeCacheLoad original {};
     original.tiers[static_cast<std::size_t>(StorageTier::Memory)] =
-        CacheTierUsage { .itemCount = 11, .bytesUsed = 22, .evictions = 33 };
+        CacheTierUsage { .itemCount = 11, .bytesUsed = 22, .evictions = 33, .indexBytes = 99 };
     original.tiers[static_cast<std::size_t>(StorageTier::Disk)] =
-        CacheTierUsage { .itemCount = 44, .bytesUsed = 55, .evictions = 66 };
+        CacheTierUsage { .itemCount = 44, .bytesUsed = 55, .evictions = 66, .indexBytes = 111 };
     original.hits = 77;
     original.misses = 88;
 
@@ -435,8 +437,51 @@ TEST_CASE("The two halves of the cache-load mapping agree", "[distributed][sched
     CHECK(Unwrap(disk).itemCount == 44);
     CHECK(Unwrap(disk).bytesUsed == 55);
     CHECK(Unwrap(disk).evictions == 66);
+    // #175: the disk tier's key index, which is RAM its disk budget does not describe.
+    CHECK(Unwrap(memory).indexBytes == 99);
+    CHECK(Unwrap(disk).indexBytes == 111);
     CHECK(back.hits == 77);
     CHECK(back.misses == 88);
+}
+
+TEST_CASE("A cache-load record from a peer that predates indexBytes still decodes",
+          "[distributed][scheduler][protocol][cache]")
+{
+    // The compatibility claim `indexBytes` was appended on (#175), asserted rather
+    // than asserted-in-a-comment. This record's arity is variable by design: the
+    // decoder stops at whichever side has fewer fields and leaves the rest at zero.
+    // So a node built before the field sends three, and a leader built after it must
+    // read those three correctly rather than refusing the heartbeat or shifting the
+    // values along by one.
+    //
+    // Built by hand at the wire level, because there is no older binary to ask and a
+    // round trip through this build's own encoder could never produce a short record.
+    std::vector<std::vector<std::byte>> owned;
+    std::vector<std::span<std::byte const>> tierFields;
+    for (auto const& row: StorageTierTable)
+    {
+        static_cast<void>(row);
+        owned.push_back(WireFields::Encode({ std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(7) },
+                                             std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(8) },
+                                             std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(9) } }));
+        tierFields.emplace_back(owned.back());
+    }
+
+    auto const decoded = Wire::DecodeCacheLoad(WireFields::Encode(WireFields::FieldList { {
+        std::span<std::byte const> { WireFields::Encode(WireFields::FieldList { tierFields }) },
+    } }));
+    REQUIRE(decoded.has_value());
+
+    auto const& memory = Unwrap(decoded).tiers[static_cast<std::size_t>(StorageTier::Memory)];
+    REQUIRE(memory.has_value());
+    CHECK(Unwrap(memory).itemCount == 7);
+    CHECK(Unwrap(memory).bytesUsed == 8);
+    CHECK(Unwrap(memory).evictions == 9);
+
+    // Absent stays zero, which is the only honest answer: a node that could not say
+    // what its index costs is not a node whose index costs nothing, but zero is what
+    // the renderer already treats as "nothing to show" for this figure.
+    CHECK(Unwrap(memory).indexBytes == 0);
 }
 
 TEST_CASE("A node that will not state its hit rate is not a node with no hits", "[distributed][scheduler][protocol][cache]")

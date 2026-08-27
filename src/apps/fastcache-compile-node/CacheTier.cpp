@@ -258,7 +258,8 @@ Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const
             continue;
         out.tiers[index] = Distributed::CacheTierUsage { .itemCount = static_cast<std::uint64_t>(stats->itemCount),
                                                          .bytesUsed = static_cast<std::uint64_t>(stats->bytesUsed),
-                                                         .evictions = stats->evictions };
+                                                         .evictions = stats->evictions,
+                                                         .indexBytes = static_cast<std::uint64_t>(stats->indexBytes) };
     }
     out.hits = metrics.Read(IMetricsSink::Counter::NodeCacheHits);
     out.misses = metrics.Read(IMetricsSink::Counter::NodeCacheMisses);
