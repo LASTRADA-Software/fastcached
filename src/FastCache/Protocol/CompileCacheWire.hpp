@@ -1416,6 +1416,31 @@ struct CapacityFields
     /// on its own cache would over-commit exactly the machines that report it.
     /// Zero from a peer too old to say, which is the arithmetic this had before.
     std::uint64_t reservedMemoryBytes { 0 };
+
+    /// What a person calls the toolchain this registration is for, e.g.
+    /// `cl 19.44.35207`. Empty means "did not say".
+    ///
+    /// The one field of this record that is NOT node-wide, and it rides here anyway
+    /// for the reason everything else does: `SplitFields` is exact at REGISTER's top
+    /// level, so an addition there makes two builds unable to speak, while this
+    /// record tolerates a short peer. A machine with two toolsets sends two
+    /// registrations describing one machine and two different compilers, so the
+    /// per-registration copy is the whole point rather than a wart (#194).
+    ///
+    /// **Display only, and never an identity.** The fingerprint decides every match;
+    /// nothing keys on, compares or routes by this. Both are reported because they
+    /// answer different questions -- and a worker that derived its identity from a
+    /// second string would register cleanly and never be matched, with nothing
+    /// anywhere reporting why.
+    ///
+    /// Empty for an operator's `<fingerprint>=<compiler>` override, which is never
+    /// probed. Absent renders as absent, never as a blank or as "unknown", for the
+    /// reason `version` above gives at length.
+    ///
+    /// **Owned, not a view**, and for exactly the reason `version` documents: this
+    /// struct is returned by value, so a `string_view` here would dangle the moment
+    /// the encoded temporary died.
+    std::string toolchainLabel {};
 };
 
 /// Frame a capacity record as one nested field list.
@@ -1450,7 +1475,8 @@ struct CapacityFields
                                 reserve,
                                 std::span<std::byte const> { cache },
                                 AsBytes(capacity.version),
-                                std::span<std::byte const> { reservedMemory } });
+                                std::span<std::byte const> { reservedMemory },
+                                AsBytes(capacity.toolchainLabel) });
 }
 
 /// Read a capacity record back.
@@ -1524,6 +1550,13 @@ struct CapacityFields
             return std::nullopt;
         out.reservedMemoryBytes = *value;
     }
+    // Free-form and unvalidated here for the reason `version` is: it is a string an
+    // operator reads rather than one this code branches on. It is not unchecked,
+    // though -- `SchedulerService::Register` refuses text that is not UTF-8, where it
+    // enters, because one bad byte makes `/fleet.json` unparseable for the whole
+    // fleet. A build predating the field has no eighth index, which `at` answers as
+    // empty.
+    out.toolchainLabel = std::string { AsStringView(at(7)) };
     return out;
 }
 

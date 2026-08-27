@@ -1521,3 +1521,52 @@ TEST_CASE("A driver that exits non-zero can still have named its target", "[tool
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { GnuClangDriverLine } } };
     CHECK(DiscoverTargetTriple(runner, "clang", SpecFor(Flavor::Clang)) == "x86_64-pc-linux-gnu");
 }
+
+TEST_CASE("A toolchain label says what the compiler is, where a fingerprint cannot", "[cc][toolchain][label]")
+{
+    using FastCache::Cc::ToolchainLabel;
+
+    // #194. Two MSVC toolsets on one machine are two opaque hashes on `/fleet`, and
+    // an ordinary Visual Studio update leaves exactly that. The label is what tells
+    // them apart for a person.
+    CHECK(ToolchainLabel("cl.exe", "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for x64")
+          == "cl 19.44.35207");
+    CHECK(ToolchainLabel("cl.exe", "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36231 for x64")
+          == "cl 19.51.36231");
+
+    // The distribution's own revision carries letters, so it is passed over for the
+    // upstream version -- which is the number an operator matches against a compiler
+    // they have elsewhere.
+    CHECK(ToolchainLabel("/usr/bin/g++", "g++ (Ubuntu 14.2.0-4ubuntu2) 14.2.0") == "g++ 14.2.0");
+
+    // A GNU driver prints its own NAME first, and a version-suffixed one is a
+    // first-class discovered case. Anchoring on a token that merely contains digits
+    // took `g++-13` for `13` and labelled it `g++-13 13` -- so two nodes on 13.2.0 and
+    // 13.3.0 rendered identically, which is precisely the confusion this exists to
+    // remove.
+    CHECK(ToolchainLabel("/usr/bin/g++-13", "g++-13 (Ubuntu 13.3.0-6ubuntu2) 13.3.0") == "g++-13 13.3.0");
+
+    // And a target triple is full of digits that are not versions.
+    CHECK(ToolchainLabel("/opt/cross/bin/aarch64-none-elf-gcc", "aarch64-none-elf-gcc (GCC) 12.2.0")
+          == "aarch64-none-elf-gcc 12.2.0");
+
+    // A dot is required, so a stray number is not mistaken for a version. The tool's
+    // name alone is still true, which is the safe direction -- a wrong number is worse
+    // than none.
+    CHECK(ToolchainLabel("g++", "g++ built in 2024") == "g++");
+
+    // A parenthesised version is still a version: punctuation is trimmed from both
+    // ends before the predicate is asked, or a banner that brackets its number would
+    // be silently unlabelled.
+    CHECK(ToolchainLabel("clang++", "Debian clang version 17.0.6 (3)") == "clang++ 17.0.6");
+
+    // No version is not a failure. A translated banner, a wrapper that prints its own
+    // name, and the basename `CompilerBanner` falls back to when a compiler cannot be
+    // run all land here -- and the tool alone still separates two different
+    // compilers, which the fingerprint alone did not do for a reader.
+    CHECK(ToolchainLabel("/opt/toolchain/g++", "some wrapper with nothing numeric") == "g++");
+    CHECK(ToolchainLabel("clang++", "") == "clang++");
+
+    // Empty only when there is no compiler to name.
+    CHECK(ToolchainLabel("", "Version 1.2.3").empty());
+}

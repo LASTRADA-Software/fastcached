@@ -484,6 +484,38 @@ TEST_CASE("A cache-load record from a peer that predates indexBytes still decode
     CHECK(Unwrap(memory).indexBytes == 0);
 }
 
+TEST_CASE("A capacity record carries the toolchain label, and tolerates one that predates it",
+          "[distributed][scheduler][protocol]")
+{
+    // #194. The label rides the NESTED capacity record rather than REGISTER's top
+    // level, because that level's arity is exact and an addition there makes two
+    // builds unable to speak. This record tolerates a short peer, which is what makes
+    // the field addable at all -- so both halves are asserted: that it survives a
+    // round trip, and that a record written before it existed still decodes.
+    Wire::CapacityFields wire {};
+    wire.logicalCores = 8;
+    wire.version = "0.2.0";
+    wire.toolchainLabel = "cl 19.44.35207";
+
+    auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).toolchainLabel == "cl 19.44.35207");
+    // Not confused with the field beside it: both are free-form strings in one
+    // record, and a transposition would decode perfectly.
+    CHECK(Unwrap(back).version == "0.2.0");
+
+    // Absent is the honest answer for an operator's pinned `<fingerprint>=<compiler>`
+    // override, which is never probed and so has no banner to read a label out of --
+    // and for any node built before the field. Both arrive as empty, and empty is
+    // rendered as absent rather than as a blank.
+    Wire::CapacityFields quiet {};
+    quiet.logicalCores = 4;
+    auto const quietBack = Wire::DecodeCapacity(Wire::EncodeCapacity(quiet));
+    REQUIRE(quietBack.has_value());
+    CHECK(Unwrap(quietBack).toolchainLabel.empty());
+    CHECK(Unwrap(quietBack).logicalCores == 4);
+}
+
 TEST_CASE("A node that will not state its hit rate is not a node with no hits", "[distributed][scheduler][protocol][cache]")
 {
     NodeCacheLoad quiet {};

@@ -117,6 +117,40 @@ namespace FastCache::Cc
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
+/// A short, readable name for a compiler: what it is, and which version.
+///
+/// The fingerprint is the right IDENTITY and the wrong label. It stopped being
+/// something a person can derive -- `NodeToolchains`' own comment records that it used
+/// to be the `--version` line an operator could read -- so `/fleet` showed two opaque
+/// hashes for the two MSVC toolsets an ordinary Visual Studio update leaves on a
+/// machine, with no way to tell which was which (#194).
+///
+/// Derived ONCE, here, rather than formatted per surface. A renderer that shortened a
+/// banner would be a second place the value is decided, and this string travels to a
+/// leader that renders it in two formats -- so the page and the JSON would then be two
+/// spellings of one fact.
+///
+/// **Display only, and never an identity.** Nothing matches on it, keys on it, or
+/// compares it: the fingerprint decides a match, and both are shown side by side
+/// because they answer different questions. `ToolchainDiscovery`'s warning is the
+/// reason -- a worker that derived its identity differently from its clients would
+/// register successfully, heartbeat happily, and never be matched, with nothing
+/// anywhere reporting why.
+///
+/// The version is the banner's first token that is only digits and dots, found with
+/// the same `LooksLikeVersion` predicate that decides which SDK subdirectory is a kit
+/// version and which `gcc-` suffix is a version -- a third question that must answer
+/// alike, rather than a fourth set of rules. That is what makes this need no
+/// per-driver table: `Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for
+/// x64` yields `19.44.35207`, and `g++ (Ubuntu 14.2.0-4ubuntu2) 14.2.0` yields
+/// `14.2.0`, because the Ubuntu revision carries letters and is passed over.
+///
+/// @param compiler The compiler as invoked; names the tool half.
+/// @param banner What `CompilerBanner` returned for it.
+/// @return e.g. `cl 19.44.35207`, or just the tool when the banner states no version.
+///         Empty only when the compiler is.
+[[nodiscard]] std::string ToolchainLabel(std::string_view compiler, std::string_view banner);
+
 /// Whether a name is made only of digits and dots, with at least one digit.
 ///
 /// One predicate for two questions that must answer alike: which subdirectory of a

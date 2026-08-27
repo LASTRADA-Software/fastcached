@@ -141,7 +141,7 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
     }
-    for (auto const& name: { "slots", "in-flight", "available", "limited-by", "toolchain", "heartbeat-age" })
+    for (auto const& name: { "slots", "in-flight", "available", "limited-by", "toolchain", "compiler", "heartbeat-age" })
     {
         INFO("worker column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
@@ -826,6 +826,54 @@ TEST_CASE("A machine too old to report a version renders an absence, not a blank
     CHECK(html.contains("&ndash;"));
     CHECK_FALSE(html.contains("<td></td>"));
     CHECK(RenderFleetJson(snapshot).contains(R"("version":null)"));
+}
+
+TEST_CASE("A worker row names its compiler beside the fingerprint", "[distributed][fleetview][toolchain]")
+{
+    // #194. The fingerprint is the right identity and the wrong label: it stopped
+    // being something a person can derive, so a machine with two MSVC toolsets -- what
+    // an ordinary Visual Studio update leaves behind -- showed two opaque hashes and
+    // no way to tell which was which.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
+                                                             .fingerprint = "bb1558fddcdf8b604cacc58e3f175adc",
+                                                             .endpoint = "10.0.0.2:7100",
+                                                             .toolchainLabel = "cl 19.44.35207",
+                                                             .slots = 8,
+                                                             .capacity = snapshot.nodes[0].capacity,
+                                                             .codecs = {} },
+                                        .heartbeatAge = std::chrono::milliseconds { 30 } } };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    auto const json = RenderFleetJson(snapshot);
+
+    CHECK(html.contains("cl 19.44.35207"));
+    CHECK(json.contains(R"("compiler":"cl 19.44.35207")"));
+
+    // BESIDE, never instead of. The digest is what a launcher compares and what
+    // decides every match, so removing it in favour of a prettier column would take
+    // away the only thing an operator can check a mismatch against.
+    CHECK(json.contains(R"("toolchain":)"));
+    CHECK(html.contains(snapshot.workers[0].info.fingerprint));
+}
+
+TEST_CASE("A worker that did not say what its compiler is renders absent", "[distributed][fleetview][toolchain]")
+{
+    // An operator's `<fingerprint>=<compiler>` override is never probed, so there is
+    // no banner to read a label out of -- and a node built before the field cannot
+    // report one either. Both are rows somebody is looking for, so neither may render
+    // as the emptiest-looking cell in the table.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
+                                                             .fingerprint = "bb1558fddcdf8b604cacc58e3f175adc",
+                                                             .endpoint = "10.0.0.2:7100",
+                                                             .slots = 8,
+                                                             .capacity = snapshot.nodes[0].capacity,
+                                                             .codecs = {} },
+                                        .heartbeatAge = std::chrono::milliseconds { 30 } } };
+
+    CHECK(RenderFleetJson(snapshot).contains(R"("compiler":null)"));
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("&ndash;"));
 }
 
 TEST_CASE("A hostile version string is escaped rather than interpolated", "[distributed][fleetview][version]")

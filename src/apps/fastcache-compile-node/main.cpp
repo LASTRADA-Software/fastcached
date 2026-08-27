@@ -296,7 +296,13 @@ constexpr int ExitOk = 0;
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
-    Cc::CompileJobRunner jobs { *runner, scratch, toolchains };
+    // Projected to what the runner needs: it dispatches on the fingerprint and spawns
+    // the compiler, and has no business with a display label. Taken by value there, so
+    // building it here dangles nothing.
+    std::map<std::string, std::string> compilers;
+    for (auto const& [fingerprint, served]: toolchains)
+        compilers.emplace(fingerprint, served.compiler);
+    Cc::CompileJobRunner jobs { *runner, scratch, std::move(compilers) };
 
     // Every lease is accepted, and that is stated rather than hidden. The boundary
     // today is reachability of this port plus the shared credential -- the same
@@ -556,8 +562,15 @@ constexpr int ExitOk = 0;
 
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.reserve(toolchains.size());
-    for (auto const& [fingerprint, compiler]: toolchains)
-        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, advertisedWire);
+    for (auto const& [fingerprint, served]: toolchains)
+    {
+        // A copy per registrar, because the label is the one field of this record that
+        // is NOT node-wide: a machine with two toolsets sends two registrations
+        // describing one machine and two different compilers (#194).
+        auto perToolchain = advertisedWire;
+        perToolchain.toolchainLabel = served.label;
+        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, perToolchain);
+    }
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would

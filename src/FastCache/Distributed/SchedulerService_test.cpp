@@ -400,6 +400,17 @@ TEST_CASE("A worker that cannot name itself in UTF-8 is refused", "[distributed]
         registration.version = "1.2.3-\xE2\x82"; // a three-byte sequence, two bytes long
         refused(registration, "version");
     }
+
+    SECTION("the label a person reads the toolchain by")
+    {
+        // The likeliest of the four to arrive as something that is not text, because
+        // it is the only one this project did not compose: it is read out of a
+        // compiler's own `--version` banner, which a machine in a non-UTF-8 locale
+        // prints in whatever its code page happens to be (#194).
+        auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
+        registration.toolchainLabel = "cl 19.44\xC3"; // a lead byte with nothing after it
+        refused(registration, "toolchain label");
+    }
 }
 
 TEST_CASE("A toolchain named in multi-byte UTF-8 registers like any other", "[distributed][scheduler]")

@@ -232,7 +232,7 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
-    CHECK(Unwrap(resolved).begin()->second == "/opt/gcc=13/bin/gcc");
+    CHECK(Unwrap(resolved).begin()->second.compiler == "/opt/gcc=13/bin/gcc");
     CHECK(Unwrap(resolved).begin()->first != "/opt/gcc");
 }
 
@@ -271,7 +271,7 @@ TEST_CASE("NodeToolchains: a discovered compiler that cannot be spawned is dropp
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
-    CHECK(Unwrap(resolved).begin()->second == "/usr/bin/gcc");
+    CHECK(Unwrap(resolved).begin()->second.compiler == "/usr/bin/gcc");
 
     // Named, with the layout that found it: an operator surprised by a missing
     // toolchain needs to know it was found and rejected, not merely absent.
@@ -297,7 +297,7 @@ TEST_CASE("NodeToolchains: an operator-named compiler is never spawn-probed", "[
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->first == "deadbeef");
-    CHECK(Unwrap(resolved).begin()->second == "/opt/cross/bin/aarch64-none-elf-gcc");
+    CHECK(Unwrap(resolved).begin()->second.compiler == "/opt/cross/bin/aarch64-none-elf-gcc");
 }
 
 TEST_CASE("NodeToolchains: the operator's list wins whole", "[node][toolchains]")
@@ -420,8 +420,8 @@ TEST_CASE("NodeToolchains: many toolchains are all identified, and reported in o
     for (auto const& candidate: candidates)
     {
         INFO("compiler: " << candidate.compiler);
-        CHECK(
-            std::ranges::any_of(Unwrap(resolved), [&](auto const& served) { return served.second == candidate.compiler; }));
+        CHECK(std::ranges::any_of(Unwrap(resolved),
+                                  [&](auto const& served) { return served.second.compiler == candidate.compiler; }));
     }
 
     // And the "serving" lines come out in table order however the work was
@@ -516,7 +516,7 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
     auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
-    CHECK(Unwrap(resolved).begin()->second == MsvcCompiler);
+    CHECK(Unwrap(resolved).begin()->second.compiler == MsvcCompiler);
 }
 
 TEST_CASE("NodeToolchains: an operator's pinned identity is never second-guessed", "[node][toolchains]")
