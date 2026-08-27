@@ -54,6 +54,43 @@ injection into everybody's build.
 valid or not, and an unsolicited proof is refused *even when it carries the real
 key* — it answers a nonce nobody here chose.
 
+## Two sockets, not one
+
+A node listens for beacons where every other node on the segment does — the port
+`--discovery` names, bound on the wildcard and **shared**, because a beacon is a
+broadcast and a node listening anywhere else would send perfectly and hear
+nothing.
+
+It does not *answer* there. Two sockets on one UDP port both receive what is
+broadcast to it, and only **one** receives what is unicast to it — measured,
+Windows 11 hands a unicast to the first-bound socket and Linux to the last, so
+there is no behaviour to rely on. Since the challenge and the proof are both
+unicast back to wherever the previous datagram came from, a node answering out of
+the shared socket would be answering for its whole *machine*. Two nodes on one
+host therefore saw each other's beacons and never finished proving the key, with
+nothing logged, because every rejection along the way is one the protocol is
+supposed to make ([#126](https://github.com/LASTRADA-Software/fastcached/issues/126)).
+
+So every node holds two:
+
+| socket | binds | role |
+|---|---|---|
+| listener | the `--discovery` port, shared | hears beacons; never sends |
+| answering | a port only this node holds | sends everything; receives challenges and proofs |
+
+Every datagram then leaves from an address exactly one node holds, so the sender
+a peer replies to names a node rather than a host. Nothing on the wire changed,
+so a node running this and one running an older build still complete a handshake
+in either direction, and a fleet upgrades one machine at a time.
+
+**What this means for a firewall.** Challenges and proofs arrive on the answering
+port, not on the `--discovery` port. A rule scoped to the program covers it; a
+rule scoped to `udp/<discovery-port>` alone does not, and the symptom is peers
+that are discovered and never admitted. The answering port is kernel-chosen by
+default; `--discovery-reply-port` pins it where a site needs to name it — one port
+per node on the machine, since two nodes cannot share it. The startup line reports
+both addresses.
+
 ## Why the key never travels
 
 The pre-shared key authenticates a handshake rather than appearing in beacons.
@@ -112,6 +149,7 @@ worth an operator's attention.
 | Who is known, who is proved | `Cluster/PeerDirectory` | Pure; time via `IClock` |
 | The exchange | `Cluster/DiscoveryService` | Drives the above over `IDatagramSocket` |
 | Datagram I/O | `Net/UdpSocket`, `Net/InMemoryDatagram` | Real socket, and a whole segment in one process |
+| The socket pair | `Net/SharedPortDatagram` | Listens shared, answers private; one `IDatagramSocket` |
 | HMAC-SHA256 | `Core/Sha256` | FIPS 180-4 / RFC 4231 vectors |
 
 SHA-256 is implemented rather than taken from OpenSSL because OpenSSL is
