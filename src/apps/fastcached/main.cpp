@@ -15,6 +15,7 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
+#include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Cache/WriteErrorReportingStorage.hpp>
@@ -472,6 +473,42 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // it, so the wrapper would be pure overhead.
     auto const useShardingWrapper = physicalShards > 1 || usingPersistent || reactorCount > 1 || effective.metricsEnabled;
 
+    // Daemon-lifetime sinks: WATCH registry, pubsub, and keyspace notifier.
+    //
+    // Two ordering constraints meet here. They are created BEFORE
+    // `reloaderThread` (declared further below) so LIFO stack unwind destroys
+    // the thread before any object its subscribers capture by reference. And
+    // they are created before the STORAGE CHAIN, because the reclaim log below
+    // is wired into the tiers inside it — a log declared after the backend
+    // would be destroyed while those tiers still held a pointer to it.
+    FastCache::PubSubRegistry pubsub;
+    FastCache::StreamWaiterRegistry streamWaiters;
+    FastCache::WatchRegistry watches;
+    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
+    if (!eventsMask.has_value())
+    {
+        logger.Logf(FastCache::LogLevel::Fatal,
+                    "fastcached: invalid --notify-keyspace-events '{}': {}",
+                    effective.notifyKeyspaceEvents,
+                    eventsMask.error().context);
+        return EXIT_FAILURE;
+    }
+    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
+
+    // Connection-level metrics sink, shared by the server loop and the admin
+    // HTTP endpoint. Wiring it into RunReactorServer is what actually collects
+    // the connection counters; command/capacity stats come from the engine.
+    // Declared here rather than beside the engine because the reclaim log below
+    // reports its dropped notifications into it, and the log has to outlive the
+    // storage chain.
+    FastCache::AtomicMetricsSink metrics;
+
+    // The observer every storage mutation reaches, and the log the tiers report
+    // their own reclaims into. Both sit above the storage chain in declaration
+    // order and therefore outlive it.
+    FastCache::RedisMutationObserver mutationObserver { &watches, &keyspaceNotifier };
+    FastCache::ReclaimLog reclaimLog { &mutationObserver, &metrics };
+
     auto bundle = BuildStorageBackend(effective, usingPersistent, useShardingWrapper, physicalShards);
     if (!bundle.has_value())
     {
@@ -479,7 +516,6 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
         return EXIT_FAILURE;
     }
     auto backend = std::move(bundle->backend);
-    auto* const backendPtr = backend.get();
 
     // Always surface value-write failures. A write that cannot be persisted
     // (full disk / I/O error / corruption / read-only) is otherwise invisible
@@ -499,46 +535,27 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
         storagePtr = tracer.get();
     }
 
-    // Daemon-lifetime sinks: WATCH registry, pubsub, and keyspace
-    // notifier are created BEFORE `reloaderThread` (declared further
-    // below) so LIFO stack unwind destroys the thread before any
-    // object its subscribers capture by reference.
-    FastCache::PubSubRegistry pubsub;
-    FastCache::StreamWaiterRegistry streamWaiters;
-    FastCache::WatchRegistry watches;
-    auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents);
-    if (!eventsMask.has_value())
-    {
-        logger.Logf(FastCache::LogLevel::Fatal,
-                    "fastcached: invalid --notify-keyspace-events '{}': {}",
-                    effective.notifyKeyspaceEvents,
-                    eventsMask.error().context);
-        return EXIT_FAILURE;
-    }
-    FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
-
-    // Storage-layer WATCH fan-out: NotifyingStorage wraps the inner
-    // chain with a RedisMutationObserver that fires
-    // WatchRegistry::Touched on every successful mutation. This closes
-    // two cross-protocol bugs:
+    // Storage-layer fan-out: NotifyingStorage wraps the inner chain with the
+    // RedisMutationObserver declared above, which fires WatchRegistry::Touched
+    // on every successful mutation. This closes two cross-protocol bugs:
     //   * memcached writes never called Touched, so a Redis WATCH on a
     //     key mutated by a memcached client silently passed EXEC;
     //   * FLUSHDB had no per-key fan-out, leaving every WATCH'd key
     //     undirty after a database wipe.
-    // The decorator is intentionally narrow: WATCH dirty signalling
-    // ONLY. Per-verb keyspace events stay where they are (Redis
-    // handlers fire them with verb-specific names), and double-firing
-    // WATCH dirties is harmless because MarkDirty is idempotent.
-    FastCache::RedisMutationObserver mutationObserver { &watches };
+    // Double-firing WATCH dirties is harmless because MarkDirty is idempotent,
+    // so the per-verb Touched calls in the Redis handlers can coexist with it.
+    //
+    // Per-verb keyspace events also stay where they are — the observer
+    // publishes only `expired` and `evicted`, which no handler is in a
+    // position to fire because no verb is executing when they happen.
     FastCache::NotifyingStorage notifyingStorage { *storagePtr, &mutationObserver };
+    // One call wires both halves of the reclaim path: the tiers below record
+    // into the log, this decorator drains it once their call has returned and
+    // every storage lock is released.
+    notifyingStorage.SetReclaimLog(&reclaimLog);
     storagePtr = &notifyingStorage;
 
     FastCache::CacheEngine engine { *storagePtr, clock };
-
-    // Connection-level metrics sink, shared by the server loop and the admin
-    // HTTP endpoint. Wiring it into RunReactorServer is what actually collects
-    // the connection counters; command/capacity stats come from the engine.
-    FastCache::AtomicMetricsSink metrics;
 
     auto const durabilityName = [&] {
         switch (effective.storageDurability)
@@ -564,9 +581,15 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     };
     FastCache::SharedAuthSource authSource { makePolicy(effective) };
 
-    reloader.Subscribe([&logger, backendPtr, &authSource, &makePolicy](auto const& /*prev*/, auto const& next) {
+    reloader.Subscribe([&logger, &notifyingStorage, &authSource, &makePolicy](auto const& /*prev*/, auto const& next) {
         logger.SetMinLevel(next->logLevel);
-        backendPtr->Resize(next->maxMemoryBytes);
+        // Through the top of the chain, not straight at the backend. Shrinking
+        // the budget evicts until it fits, which on a large cache is a great
+        // many keys at once; entering below NotifyingStorage would leave every
+        // one of them recorded in the reclaim log with nothing to drain it,
+        // dropping all but the first bound-many and holding the rest until
+        // some later client call — never, on an idle daemon.
+        notifyingStorage.Resize(next->maxMemoryBytes);
         // Rotate the shared secret: building a fresh AuthPolicy and atomically
         // swapping it in lets a SIGHUP'd operator update requirepass without
         // restarting the daemon. In-flight verifies finish against the policy
@@ -706,10 +729,10 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // Carried on the session bundle that every connection's handlers receive.
     serverOpts.session.logEverything = effective.logEverything;
     serverOpts.session.authSource = &authSource;
-    // pubsub / watches / keyspaceNotifier are declared further up
-    // (immediately before the engine) so the NotifyingStorage decorator
-    // can wire them into the storage chain. Just publish the pointers
-    // into the session here.
+    // pubsub / watches / keyspaceNotifier are declared further up, above the
+    // storage chain, so the NotifyingStorage decorator can wire them into it
+    // and so the reclaim log outlives the tiers that hold a pointer to it.
+    // Just publish the pointers into the session here.
     serverOpts.session.pubsub = &pubsub;
     serverOpts.session.streamWaiters = &streamWaiters;
     serverOpts.session.watches = &watches;

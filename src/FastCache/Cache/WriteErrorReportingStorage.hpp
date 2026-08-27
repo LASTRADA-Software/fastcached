@@ -136,6 +136,11 @@ class WriteErrorReportingStorage final: public IStorage
     std::size_t PurgeExpired(TimePoint now) override;
     void Resize(std::size_t newMaxBytes) override;
 
+    /// Forward to the inner storage: this decorator counts write errors, it
+    /// never reclaims.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     /// @return The inner storage's snapshot with `writeErrors` set to the count
     ///         of persistence-class write failures observed by this decorator.
     [[nodiscard]] StorageStats Snapshot() const noexcept override;

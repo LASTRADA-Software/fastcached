@@ -16,6 +16,7 @@ target_sources(FastCache
         Cache/InMemoryLruStorage.cpp
         Cache/LayeredStorage.cpp
         Cache/NotifyingStorage.cpp
+        Cache/ReclaimLog.cpp
         Cache/ShardedStorage.cpp
         Cache/TracingStorage.cpp
         Cache/WriteErrorReportingStorage.cpp

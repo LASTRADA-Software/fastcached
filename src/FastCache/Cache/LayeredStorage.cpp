@@ -339,6 +339,39 @@ std::size_t LayeredStorage::PurgeExpired(TimePoint now)
     return l2Count;
 }
 
+void LayeredStorage::ExpiriesOnlyLog::Record(MutationKind kind, std::string_view key) noexcept
+{
+    if (_inner != nullptr && kind == MutationKind::Expire)
+        _inner->Record(kind, key);
+}
+
+void LayeredStorage::ExpiriesOnlyLog::Drain(std::vector<ReclaimedKey>& out) noexcept
+{
+    // Nothing is ever buffered here: Record forwards or discards. Draining the
+    // filter would otherwise look like a way to reach the real log's contents.
+    out.clear();
+}
+
+bool LayeredStorage::ExpiriesOnlyLog::HasPending() const noexcept
+{
+    return false;
+}
+
+bool LayeredStorage::ExpiriesOnlyLog::IsRecording() const noexcept
+{
+    return _inner != nullptr && _inner->IsRecording();
+}
+
+void LayeredStorage::SetReclaimLog(IReclaimLog* log)
+{
+    // L1 is never handed one, so the opportunistic purge just above and every
+    // L1 eviction stay silent; L2 is handed the filter, so its expiries reach
+    // the real log and its evictions do not. See the header for why neither
+    // tier's eviction is total in a layered cache.
+    _l2Log.SetInner(log);
+    _l2->SetReclaimLog(log == nullptr ? nullptr : &_l2Log);
+}
+
 StorageStats LayeredStorage::Snapshot() const noexcept
 {
     // Canonical state (itemCount, bytesUsed, bytesLimit) comes from L2.

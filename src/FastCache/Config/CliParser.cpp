@@ -367,8 +367,7 @@ namespace
           .explicitBit = &CliResult::notifyKeyspaceEventsExplicit,
           .description = "redis-style keyspace-event flag string; empty = off (default).\n"
                          "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
-                         "$=string (set/incr*), A=alias for g$\n"
-                         "(x=expired is not yet wired — rejected pending storage callback)" },
+                         "$=string (set/incr*), x=expired, e=evicted, A=alias for g$xe" },
         { .primary = "--log-timestamps",
           .apply = SetTrue<&Config::logTimestamps>(),
           .explicitBit = &CliResult::logTimestampsExplicit,

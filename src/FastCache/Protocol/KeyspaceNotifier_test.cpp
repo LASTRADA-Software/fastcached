@@ -56,30 +56,35 @@ TEST_CASE("ParseKeyspaceEvents: AKE expands and ORs to the all-events mask", "[p
     REQUIRE((*mask & KeyspaceEvents::Keyevent) != 0);
     REQUIRE((*mask & KeyspaceEvents::Generic) != 0);
     REQUIRE((*mask & KeyspaceEvents::String) != 0);
-    // Expired is NOT part of `A` until the storage-layer expiry callback
-    // lands (see TODO.md NotifyingStorage entry). Including it here would
-    // promise an event the daemon never fires.
-    REQUIRE((*mask & KeyspaceEvents::Expired) == 0);
+    // Expired and Evicted are part of `A`, as they are in redis. They were
+    // held out of it while nothing could publish them; the storage tiers now
+    // name their reclaims and RedisMutationObserver publishes both.
+    REQUIRE((*mask & KeyspaceEvents::Expired) != 0);
+    REQUIRE((*mask & KeyspaceEvents::Evicted) != 0);
 }
 
-TEST_CASE("ParseKeyspaceEvents: KEg$ mirrors A explicitly", "[protocol][keyspace]")
+TEST_CASE("ParseKeyspaceEvents: KEg$xe mirrors A explicitly", "[protocol][keyspace]")
 {
     auto const a = ParseKeyspaceEvents("AKE");
-    auto const explicitly = ParseKeyspaceEvents("KEg$");
+    auto const explicitly = ParseKeyspaceEvents("KEg$xe");
     REQUIRE(a.has_value());
     REQUIRE(explicitly.has_value());
     REQUIRE(*a == *explicitly);
 }
 
-TEST_CASE("ParseKeyspaceEvents: 'x' is rejected pending the storage-layer expiry hook", "[protocol][keyspace]")
+TEST_CASE("ParseKeyspaceEvents: 'x' and 'e' are accepted now that both events fire", "[protocol][keyspace]")
 {
-    // Original branch silently accepted `x` (and `A` set the Expired bit)
-    // but the daemon had no code path that ever published an `expired`
-    // event. Rejecting `x` at startup is preferable to advertising the
-    // capability and silently dropping every event.
-    auto const mask = ParseKeyspaceEvents("Ex");
-    REQUIRE_FALSE(mask.has_value());
-    REQUIRE(mask.error().field == "notify-keyspace-events");
+    // `x` was rejected outright while no code path could publish an `expired`
+    // event — better a startup error than an advertised capability that
+    // silently does nothing. The consequence was that a redis configuration
+    // an operator copied across did not start. `AKEx` now does.
+    auto const expired = ParseKeyspaceEvents("Ex");
+    REQUIRE(expired.has_value());
+    REQUIRE((*expired & KeyspaceEvents::Expired) != 0);
+
+    auto const evicted = ParseKeyspaceEvents("Ee");
+    REQUIRE(evicted.has_value());
+    REQUIRE((*evicted & KeyspaceEvents::Evicted) != 0);
 }
 
 TEST_CASE("ParseKeyspaceEvents: unknown letter is a ConfigError", "[protocol][keyspace]")

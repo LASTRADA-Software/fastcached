@@ -185,6 +185,11 @@ constexpr void AddInto(TieredStorageStats& total, TieredStorageStats const& adde
     }
 }
 
+/// Declared rather than included: only `SetReclaimLog` mentions it, by pointer,
+/// and `Cache/IReclaimLog.hpp` pulls in the mutation-observer vocabulary that
+/// every backend would otherwise inherit for a method most of them never define.
+class IReclaimLog;
+
 /// Storage backend abstraction. The cache engine routes every command
 /// through these primitives. Implementations are responsible for honouring
 /// the atomicity contract — each call is the atomicity boundary for the
@@ -584,6 +589,27 @@ class IStorage
     {
         static_cast<void>(key);
         static_cast<void>(now);
+    }
+
+    /// Route this backend's reclaim reports to `log` — the entries it drops on
+    /// its own initiative, by TTL expiry or by LRU eviction, which no caller
+    /// asked for and so nothing above the backend can name.
+    ///
+    /// One method rather than a victim list threaded through twenty signatures:
+    /// the reporting is orthogonal to every operation that can trigger it, and a
+    /// backend that reclaims nothing wants nothing to do with it. The default is
+    /// therefore right for every backend that does not reclaim, and for every
+    /// test double.
+    ///
+    /// Routing decorators forward to their inner storage. **`LayeredStorage`
+    /// forwards to L2 only**: dropping an entry from the L1 mirror is a
+    /// demotion, not a reclaim — the key is still in L2 and still served — and
+    /// reporting it would publish an `evicted` event for a key that never left
+    /// the cache.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    virtual void SetReclaimLog(IReclaimLog* log)
+    {
+        static_cast<void>(log);
     }
 };
 

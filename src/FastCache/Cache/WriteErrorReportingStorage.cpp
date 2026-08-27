@@ -220,6 +220,11 @@ std::size_t WriteErrorReportingStorage::PurgeExpired(TimePoint now)
     return _inner.PurgeExpired(now);
 }
 
+void WriteErrorReportingStorage::SetReclaimLog(IReclaimLog* log)
+{
+    _inner.SetReclaimLog(log);
+}
+
 void WriteErrorReportingStorage::Resize(std::size_t newMaxBytes)
 {
     _inner.Resize(newMaxBytes);

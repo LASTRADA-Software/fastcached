@@ -540,3 +540,58 @@ Every rule below has already been a bug.
   - **The regression test decodes from a temporary on purpose**, and a second one
     scopes the buffer and reads every field after it is gone. A rule this shape
     cannot be left to a case that happens to exercise it.
+
+## Keyspace events for what nobody asked for
+
+`expired` and `evicted` are the two keyspace events no verb handler can fire,
+because no verb is executing when they happen. The path that produces them —
+tier records, `NotifyingStorage` drains, `RedisMutationObserver` publishes —
+has four constraints, and every one of them was a defect first.
+
+- **Naming the victim at the tier is necessary and not sufficient.** For as long
+  as `MutationKind::Expire` and `::Evict` existed, the obvious reading was that
+  the storage layer's silence was the whole problem. It was not:
+  `RedisMutationObserver::DescriptorFor` was a stub returning an empty
+  descriptor for *every* kind and the observer held no notifier, so a named
+  victim would still have published nothing. Whenever an event is missing, check
+  both ends before changing either.
+- **Publish only for the kinds no handler covers.** `RedisResp.cpp` already fires
+  verb-specific events for everything a client asked for. A second publish at the
+  storage layer puts two `__keyevent@0__:*` frames on the wire per write, which
+  every existing subscriber sees as a behaviour change. That is why most rows of
+  `EventTable` are deliberately empty — and it is a table, so the next kind is a
+  row rather than a condition somebody has to remember to add.
+- **A reclaim is reported BEFORE the call that caused it, because they can name
+  the same key.** `ADD k` on a lapsed TTL reclaims `k` inside the lookup and then
+  re-creates it. Drained at scope exit, that reads as `set k` then `expired k`,
+  and a subscriber concludes a live key is gone. `Notify` drains first; the scope
+  guard is only the backstop for calls that report nothing (a failed `DEL` on an
+  expired key, a strict-LRU `Get`).
+- **The recording gate and the publishing gate must agree.** The tiers copy a
+  victim's key only when `IStorageMutationObserver::HasObservers()` says somebody
+  is listening, so an observer that answered for WATCHers alone would leave a
+  daemon with subscribers and no WATCHers publishing nothing — nothing would ever
+  have been recorded to publish. `WouldPublish` likewise has to test `K`/`E` and
+  not just the class bit: `notify-keyspace-events: A` names every class and no
+  channel, and publishes nothing at all.
+
+And one that is about the cache rather than the wire:
+
+- **In a layered cache no single tier's eviction is total, so none is reported.**
+  L1 dropping an entry is a demotion — the key is still in L2 and the next read
+  serves it. L2 dropping one leaves the key in the L1 mirror, which `Get` answers
+  without ever consulting L2, and L1 is exactly where it will be, because L1
+  absorbing the hits is what left L2's recency stale enough to evict it. Erasing
+  from L1 to make the event true would throw a hot key out of RAM to justify a
+  notification. An *expiry* is total — both tiers hold the same TTL — so
+  `LayeredStorage` forwards expiries to L2 and swallows its evictions.
+
+## Open work
+
+- **[#162](https://github.com/LASTRADA-Software/fastcached/issues/162)** —
+  nothing calls `PurgeExpired`, so expiry is entirely access-driven: with the
+  default `Approximate` LRU a read does not reclaim, and a key that lapses and is
+  never touched again is neither reclaimed nor reported. Both a memory cost and
+  the reason a subscriber to `__keyevent@0__:expired` can hear nothing about a
+  key that has certainly expired. `docs/operations/known-limitations.md` records
+  the timing so an operator is not surprised by it meanwhile.

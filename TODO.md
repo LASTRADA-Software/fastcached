@@ -27,22 +27,6 @@ What are the pros and cons of each algorithm in terms of compression ratio, spee
       coverage test that asserts every `CliResult::*Explicit` bit is
       referenced by exactly one descriptor — that guard fails fast the next
       time someone adds a field without wiring it into Merge.
-- [ ] **`NotifyingStorage` IStorage decorator (review follow-up — Group D #13).**
-      Keyspace notifications are currently scattered across each Redis verb
-      handler in `RedisResp.cpp` (~12 `NotifyKeyspace` call sites). This
-      bolts notifications to the Redis protocol only — Memcached writes
-      silently miss keyspace events, and lazy-expiry has no callback to fire
-      `expired` at all (which is why the `x` flag and `Expired` event class
-      had to be removed from the parser in #3). The right altitude is an
-      `IStorage` decorator (`NotifyingStorage` wrapping the inner storage),
-      matching the existing `LayeredStorage` / `ShardedStorage` /
-      `TracingStorage` decorator chain pattern. Every mutation funnels
-      through `IStorage::Set/Delete/CompareAndSwap/Update/Remove`, so one
-      decorator publishes for every protocol *and* every backend. Once
-      this lands, restore the `x` flag and `Expired` class in
-      `KeyspaceNotifier`, and the per-protocol `NotifyKeyspace` scatter
-      in `RedisResp.cpp` collapses to a no-op (the decorator publishes
-      first, the protocol handler only handles the reply).
 - [ ] **Startup-failure log on partial bind (review follow-up — Group D #14).**
       `RunMultiReactorPosix` in `src/FastCache/Server/ReactorServerLoop.cpp`
       binds `reactorCount × binds` listeners. When one bind fails mid-loop,

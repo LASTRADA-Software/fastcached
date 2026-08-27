@@ -205,6 +205,15 @@ class CowTreeStorage final: public IStorage
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
+
+    /// Report this tier's reclaims — TTLs found lapsed during a sweep, and the
+    /// LRU tail dropped to stay under the on-disk budget — to `log`.
+    ///
+    /// This is the authoritative tier of a `LayeredStorage`, so it is the one
+    /// that gets the log: when it drops a key, the key is gone.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
     /// This tier's statistics, reported as the DISK tier.
@@ -368,6 +377,9 @@ class CowTreeStorage final: public IStorage
     /// Evict from the LRU tail until bytesUsed <= maxBytes (best effort).
     void EvictToFit();
 
+    /// Where reclaims are reported, or nullptr when nobody routed a log here.
+    IReclaimLog* _reclaim { nullptr };
+
     Options _options;
     /// Holds the page store when this object owns it (FilePageStore in
     /// production, or an injected store); null when the store is borrowed.
@@ -385,6 +397,11 @@ class CowTreeStorage final: public IStorage
         /// expired_unfetched counters and resets on restart along with the
         /// rest of the LRU mirror.
         bool fetched { false };
+        /// The tier's live generation when this node was stamped. Lets the
+        /// eviction path tell "memory pressure took a live key" from "a flush
+        /// already made this invisible and eviction is just the bookkeeping",
+        /// without a disk read to fetch the stored entry's own generation.
+        std::uint64_t generation { 0 };
     };
     using LruList = std::list<LruNode>;
     using Iterator = LruList::iterator;

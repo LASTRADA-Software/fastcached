@@ -379,6 +379,15 @@ std::size_t ShardedStorage::PurgeExpired(TimePoint now)
     return total;
 }
 
+void ShardedStorage::SetReclaimLog(IReclaimLog* log)
+{
+    for (auto& shard: _shards)
+    {
+        std::unique_lock const lock { shard->mu };
+        shard->storage->SetReclaimLog(log);
+    }
+}
+
 StorageStats ShardedStorage::Snapshot() const noexcept
 {
     // CowTreeStorage::Snapshot writes its `mutable _stats` member, so

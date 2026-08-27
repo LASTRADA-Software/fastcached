@@ -30,6 +30,57 @@ place.
 - **`SELECT db` (Redis)**: accepted as a no-op for any index — the
   reply is always `+OK`, but fastcached is a single flat keyspace, so
   the index is ignored rather than selecting a distinct database.
+- **Keyspace notifications for memcached writes**: not fired. A memcached
+  `set`/`delete`/`incr` dirties a Redis `WATCH` (the storage layer does
+  that for every protocol), but publishes no `__keyevent@0__:*` frame.
+  Memcached has no convention for keyspace events, and the event names
+  belong to the Redis verbs that own them.
+
+## Keyspace notification timing
+
+`notify-keyspace-events` accepts the full redis flag set, `x` (expired) and
+`e` (evicted) included, and both events are published — but **when** an
+`expired` event fires differs from redis, and a subscriber depending on it
+should know how.
+
+**The rule: `expired` fires when the entry is *reclaimed*, not when its TTL
+lapses.** Everything below follows from that, and the two backends reclaim
+at different moments.
+
+- **There is no active expiry cycle.** redis samples keys on a timer and
+  expires them in the background. Nothing here sweeps periodically, so a
+  lapsed entry sits until something reaches it.
+- **A plain `SET` over a lapsed key does not fire `expired`.** It overwrites
+  the record without looking up the old one, so nothing is reclaimed — you
+  get `set` and nothing else. The verbs that *do* reclaim are the ones that
+  must find the key first: `DEL`, `EXPIRE`/`PERSIST`, `APPEND`,
+  `INCR`/`DECR`, `REPLACE`, `GETSET`, and a CAS.
+- **With the default `Approximate` LRU recency, a read does not reclaim
+  either.** The in-memory read path is deliberately non-mutating so reads on
+  one shard run concurrently, so a `GET` of a lapsed key returns a miss and
+  leaves the entry in place. `--lru-recency strict` reclaims on reads too, at
+  the cost of serialising them per shard.
+- **The persistent backend (`--storage`) reclaims later still.** Its read and
+  write paths reject a lapsed record without erasing it — a read holds only a
+  shared lock, and mutating the tree there would break the single-writer
+  contract — so on disk only `DEL` and the (uncalled) sweep reclaim. Expect
+  `expired` to be rarer under `--storage` than in memory for the same
+  workload.
+- **The practical consequence:** a key that lapses and is never touched again
+  is never reported. If you subscribe to `__keyevent@0__:expired` to learn
+  that a key is gone, poll it; do not read silence as "still alive".
+- **`evicted` is immediate in memory and absent on disk.** In-memory eviction
+  happens during the write that caused the memory pressure, so the event goes
+  out with it. Under `--storage` no `evicted` event is emitted at all: that
+  configuration is an in-memory tier mirroring a disk tier, and neither tier's
+  eviction removes the key on its own — an L1 drop leaves it on disk, and a
+  disk drop leaves it in the mirror, which serves reads without consulting
+  disk. An event for a key the next `GET` returns would be worse than none.
+- When one call reclaims more keys at once than the notification buffer
+  holds — a `maxmemory` shrink on a large cache is the realistic case —
+  the surplus events are dropped and counted in
+  `fastcached_keyspace_reclaim_events_dropped_total`. A non-zero value
+  there is the difference between "nothing expired" and "you were not told".
 
 ## Storage model differences from memcached
 
@@ -44,7 +95,9 @@ place.
 
 - No data-structure commands (lists, sets, hashes, sorted sets,
   streams, bitfields). fastcached's engine is key-value only.
-- No pub/sub, scripting (EVAL), or transactions (MULTI/EXEC).
+- No scripting (EVAL). Pub/sub (`SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH`,
+  and the `__keyspace@0__` / `__keyevent@0__` channels) and transactions
+  (`MULTI` / `EXEC` / `WATCH` / `DISCARD`) are implemented.
 - No replication or cluster commands.
 
 ## Operational gaps

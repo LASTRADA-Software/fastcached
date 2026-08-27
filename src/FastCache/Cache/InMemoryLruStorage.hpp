@@ -141,6 +141,16 @@ class InMemoryLruStorage final: public IStorage
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
 
+    /// Report this tier's reclaims — a lapsed TTL noticed during a lookup or a
+    /// sweep, and the LRU tail dropped to stay under budget — to `log`.
+    ///
+    /// Off unless something routes a log here, which is what keeps a tier
+    /// nobody subscribes to free of the per-victim key copy. Note that an
+    /// instance used as a `LayeredStorage` L1 mirror must NOT be given one: its
+    /// evictions are demotions, and the key is still in L2.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
     /// Reconfigure the byte budget at runtime. Used by ConfigReloader on
@@ -248,6 +258,9 @@ class InMemoryLruStorage final: public IStorage
     {
         return _maxValueBytes != 0 && size > _maxValueBytes;
     }
+
+    /// Where reclaims are reported, or nullptr when nobody routed a log here.
+    IReclaimLog* _reclaim { nullptr };
 
     std::size_t _maxBytes;
     std::size_t _maxValueBytes;

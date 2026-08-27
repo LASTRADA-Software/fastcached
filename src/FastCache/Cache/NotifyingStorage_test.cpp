@@ -2,11 +2,13 @@
 #include <FastCache/Cache/IStorageMutationObserver.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
+#include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -200,4 +202,121 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
     REQUIRE(deleted.has_value());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Delete);
+}
+
+TEST_CASE("NotifyingStorage fires Expire for a TTL the tier consumed", "[cache][notifying-storage]")
+{
+    // The event nothing in this daemon has ever fired. The tier names the key
+    // while it still has it; the decorator turns that into the mutation the
+    // observer sees, at a point where publishing is safe.
+    FastCache::InMemoryLruStorage inner { 0, 0, FastCache::LruMode::Strict };
+    RecordingObserver obs;
+    FastCache::NotifyingStorage notifying { inner, &obs };
+    FastCache::ReclaimLog log { &obs };
+    notifying.SetReclaimLog(&log);
+
+    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
+    obs.records.clear();
+
+    auto const got = notifying.Get("doomed", expiry + std::chrono::seconds { 1 });
+    REQUIRE(got.has_value());
+    REQUIRE_FALSE(got->found);
+    REQUIRE(obs.records.size() == 1);
+    REQUIRE(obs.records[0].kind == FastCache::MutationKind::Expire);
+    REQUIRE(obs.records[0].key == "doomed");
+}
+
+TEST_CASE("NotifyingStorage fires Evict for the tail memory pressure took", "[cache][notifying-storage]")
+{
+    FastCache::InMemoryLruStorage inner { 100 };
+    RecordingObserver obs;
+    FastCache::NotifyingStorage notifying { inner, &obs };
+    FastCache::ReclaimLog log { &obs };
+    notifying.SetReclaimLog(&log);
+
+    REQUIRE(notifying.Set("a", std::vector<std::byte>(80), 0, FastCache::TimePoint::max()).has_value());
+    obs.records.clear();
+    REQUIRE(notifying.Set("b", std::vector<std::byte>(80), 0, FastCache::TimePoint::max()).has_value());
+
+    // Two events, and the eviction comes first: it happened first, and redis
+    // orders them the same way.
+    REQUIRE(obs.records.size() == 2);
+    REQUIRE(obs.records[0].kind == FastCache::MutationKind::Evict);
+    REQUIRE(obs.records[0].key == "a");
+    REQUIRE(obs.records[1].kind == FastCache::MutationKind::Set);
+    REQUIRE(obs.records[1].key == "b");
+}
+
+TEST_CASE("A reclaim is reported before the call that caused it, on the same key", "[cache][notifying-storage]")
+{
+    // `ADD k` on a lapsed TTL reclaims k inside the lookup and then re-creates
+    // it. Reported the other way round, a subscriber sees `set k` followed by
+    // `expired k` and concludes a key that is very much alive has gone.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage inner;
+    RecordingObserver obs;
+    FastCache::NotifyingStorage notifying { inner, &obs };
+    FastCache::ReclaimLog log { &obs };
+    notifying.SetReclaimLog(&log);
+
+    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, expiry).has_value());
+    obs.records.clear();
+
+    auto const later = expiry + std::chrono::seconds { 1 };
+    REQUIRE(notifying.Add("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max(), later).has_value());
+
+    REQUIRE(obs.records.size() == 2);
+    REQUIRE(obs.records[0].kind == FastCache::MutationKind::Expire);
+    REQUIRE(obs.records[0].key == "k");
+    REQUIRE(obs.records[1].kind == FastCache::MutationKind::Set);
+    REQUIRE(obs.records[1].key == "k");
+}
+
+TEST_CASE("NotifyingStorage fires Expire even when the call it rode in on failed", "[cache][notifying-storage]")
+{
+    // A Delete of a key whose TTL has passed reclaims the entry and then
+    // reports KeyNotFound. Nothing is notified for the Delete, so a drain
+    // hung off the success path would lose the expiry entirely.
+    FastCache::InMemoryLruStorage inner;
+    RecordingObserver obs;
+    FastCache::NotifyingStorage notifying { inner, &obs };
+    FastCache::ReclaimLog log { &obs };
+    notifying.SetReclaimLog(&log);
+
+    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
+    obs.records.clear();
+
+    REQUIRE_FALSE(notifying.Delete("doomed", expiry + std::chrono::seconds { 1 }).has_value());
+    REQUIRE(obs.records.size() == 1);
+    REQUIRE(obs.records[0].kind == FastCache::MutationKind::Expire);
+    REQUIRE(obs.records[0].key == "doomed");
+}
+
+TEST_CASE("A key that expires under a WATCH now dirties the handle", "[cache][notifying-storage]")
+{
+    // What NotifyingStorage.hpp has claimed since it landed, and what has not
+    // been true until now: a watched key that vanishes under TTL pressure must
+    // abort the EXEC that follows. Without an Expire reaching the observer, the
+    // WATCH registry is never told and the transaction commits over a key that
+    // is gone.
+    FastCache::InMemoryLruStorage inner { 0, 0, FastCache::LruMode::Strict };
+    RecordingObserver obs;
+    FastCache::NotifyingStorage notifying { inner, &obs };
+    FastCache::ReclaimLog log { &obs };
+    notifying.SetReclaimLog(&log);
+
+    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    REQUIRE(notifying.Set("watched", std::vector<std::byte>(8), 0, expiry).has_value());
+    obs.records.clear();
+
+    // The client WATCHes, the TTL lapses, and something touches the key.
+    static_cast<void>(notifying.Get("watched", expiry + std::chrono::seconds { 1 }));
+
+    // One record naming the watched key is exactly what WatchRegistry::Touched
+    // is driven from, so the EXEC that follows aborts.
+    REQUIRE(obs.records.size() == 1);
+    REQUIRE(obs.records[0].key == "watched");
 }

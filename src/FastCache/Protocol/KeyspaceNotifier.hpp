@@ -22,16 +22,12 @@ namespace KeyspaceEvents
     constexpr std::uint32_t Keyevent = 1U << 1; ///< `E` — publish to __keyevent@N__:event
     constexpr std::uint32_t Generic = 1U << 2;  ///< `g` — del / expire / persist
     constexpr std::uint32_t String = 1U << 3;   ///< `$` — set
-    /// `x` — expired (lazy-expiry). The flag bit is reserved but unwired: the
-    /// daemon currently has no expiry callback at the storage layer, so no
-    /// code path can publish an `expired` event. Once the
-    /// `NotifyingStorage` decorator lands (see TODO.md), restore `x` to
-    /// `FlagTable` in KeyspaceNotifier.cpp and include `Expired` in `All`.
-    constexpr std::uint32_t Expired = 1U << 4;
+    constexpr std::uint32_t Expired = 1U << 4;  ///< `x` — a TTL lapsed and the entry was reclaimed.
+    constexpr std::uint32_t Evicted = 1U << 5;  ///< `e` — the entry was reclaimed under memory pressure.
 
-    /// `A` is shorthand for every class type the daemon currently emits.
-    /// `Expired` is intentionally absent — see the note on `Expired` above.
-    constexpr std::uint32_t All = Generic | String;
+    /// `A` is shorthand for every class type the daemon emits, which is what
+    /// redis means by it too.
+    constexpr std::uint32_t All = Generic | String | Expired | Evicted;
 } // namespace KeyspaceEvents
 
 /// Parse a redis-style keyspace-event flag string into a bitmask. Each
@@ -88,13 +84,18 @@ class KeyspaceNotifier
     /// @param classes New bitmask (KeyspaceEvents::None disables).
     void SetClasses(std::uint32_t classes) noexcept;
 
-    /// Lock-free fast-path probe: would a `OnEvent` of `classFlag` plausibly
-    /// publish something? True iff this notifier is enabled, the class is
-    /// in the active bitmask, and the pub/sub registry has at least one
-    /// subscriber. Callers in per-key loops (MSET / MSETNX / DEL) probe
+    /// Lock-free fast-path probe: would an `OnEvent` of `classFlag` publish
+    /// something? True iff the class is in the active bitmask, at least one of
+    /// `K`/`E` is set to publish it on, and the pub/sub registry has at least
+    /// one subscriber. Callers in per-key loops (MSET / MSETNX / DEL) probe
     /// this ONCE per command and skip the per-key OnEvent entirely when
     /// false — replacing N atomic loads with 1 on the hot write path.
-    /// @param classFlag One of `KeyspaceEvents::Generic` / `String` / `Expired`.
+    ///
+    /// The channel half matters as much as the class half: `OnEvent` tests K
+    /// and E separately and does nothing when neither is set, so a probe that
+    /// ignored them would answer yes for a configuration that publishes
+    /// nothing at all.
+    /// @param classFlag One of the `KeyspaceEvents::*` class bits.
     [[nodiscard]] bool WouldPublish(std::uint32_t classFlag) const noexcept;
 
   private:

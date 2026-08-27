@@ -16,22 +16,19 @@ namespace
     /// letters fall through to a hard ConfigError so a typo in a YAML
     /// `notify-keyspace-events: AKE` doesn't silently disable notifications.
     ///
-    /// `x` (Expired) is intentionally absent: the daemon has no expiry
-    /// callback at the storage layer yet, so accepting `x` would advertise
-    /// a capability we don't deliver. The bit itself stays defined in
-    /// KeyspaceEvents so the follow-up `NotifyingStorage` decorator (see
-    /// TODO.md) can add it back in one edit.
     struct FlagBit
     {
         char letter;
         std::uint32_t mask;
     };
 
-    constexpr std::array<FlagBit, 5> FlagTable { {
+    constexpr std::array<FlagBit, 7> FlagTable { {
         { .letter = 'K', .mask = KeyspaceEvents::Keyspace },
         { .letter = 'E', .mask = KeyspaceEvents::Keyevent },
         { .letter = 'g', .mask = KeyspaceEvents::Generic },
         { .letter = '$', .mask = KeyspaceEvents::String },
+        { .letter = 'x', .mask = KeyspaceEvents::Expired },
+        { .letter = 'e', .mask = KeyspaceEvents::Evicted },
         { .letter = 'A', .mask = KeyspaceEvents::All },
     } };
 
@@ -77,7 +74,7 @@ bool KeyspaceNotifier::IsEnabled() const noexcept
     // At least one class AND at least one publishing channel must be set; if
     // K and E are both off, the class flags are unreachable.
     auto constexpr ChannelMask = KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent;
-    auto constexpr ClassMask = KeyspaceEvents::Generic | KeyspaceEvents::String | KeyspaceEvents::Expired;
+    auto constexpr ClassMask = KeyspaceEvents::All;
     auto const classes = _classes.load(std::memory_order_relaxed);
     return (classes & ChannelMask) != 0 && (classes & ClassMask) != 0;
 }
@@ -96,7 +93,16 @@ bool KeyspaceNotifier::WouldPublish(std::uint32_t classFlag) const noexcept
 {
     if (_pubsub == nullptr)
         return false;
-    if ((_classes.load(std::memory_order_relaxed) & classFlag) == 0)
+    auto const classes = _classes.load(std::memory_order_relaxed);
+    if ((classes & classFlag) == 0)
+        return false;
+    // A class with neither channel enabled publishes nothing: `OnEvent` tests
+    // K and E separately and falls out having done nothing. Without this,
+    // `notify-keyspace-events: A` — no K, no E — reports "yes, this would
+    // publish" for every class, and the storage tiers pay a key copy per
+    // reclaimed entry, inside their lock, for frames that never go out.
+    auto constexpr ChannelMask = KeyspaceEvents::Keyspace | KeyspaceEvents::Keyevent;
+    if ((classes & ChannelMask) == 0)
         return false;
     return _pubsub->HasAnySubscribers();
 }

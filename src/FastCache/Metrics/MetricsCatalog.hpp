@@ -207,6 +207,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "write already succeeded -- so this says the FLEET is unreachable, not that "
               "this node is broken.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
+      .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
+      .help = "Reclaimed keys whose expired/evicted keyspace event was never published, because "
+              "one call reclaimed more at once than the notification buffer holds. Without this, "
+              "a subscriber seeing no event cannot tell that from nothing having expired.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
