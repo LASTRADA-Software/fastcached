@@ -241,6 +241,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A service to register is a `ServiceSpec`; what it runs as is part of it, and an
   empty `serviceAccount` means **root**.
 - `--install-service` registers the *command-line* config, never the merged one.
+- An install is judged by the **startup** rules as well as the install-time ones:
+  a registration replays its command line forever, so refuse it while somebody is
+  watching.
 - Whatever reaches a supervisor must survive this project's own parser round trip
   — including the flags the *installer itself* adds, which are the daemon's only
   when the spec names an application.

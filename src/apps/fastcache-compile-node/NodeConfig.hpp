@@ -521,6 +521,27 @@ struct NodeConfig
 /// @return The refusal and its remedy, or nullopt when the configuration can work.
 [[nodiscard]] std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg);
 
+/// Why this configuration cannot be REGISTERED, if it cannot.
+///
+/// Both tables, because an install is judged more strictly than a start rather than
+/// differently. `--install-service` bakes the command line in and replays it at
+/// every boot, so a startup rule -- every one of which is a pure invariant of that
+/// command line -- is just as fatal to a registration as an install-time rule is,
+/// and far more expensive: a start refuses once in front of the operator who typed
+/// it, while a registration refuses forever into a log nobody reads.
+///
+/// The two tables stay separate on purpose and this only composes them.
+/// `StartupPolicyRejection` must keep running at startup as well, or a hand-started
+/// worker makes the identical mistake with nothing saying so; and
+/// `NodeServiceRejection` is asked first, because its rules name the action being
+/// taken and so read better against `--install-service` than a startup rule does.
+///
+/// Lives here rather than in `main()` because `main()` is in no test target, which
+/// is precisely how the gap this closes survived (#166).
+/// @param cfg Configuration about to be baked into a registration.
+/// @return An explanatory message when the install must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> NodeInstallRejection(NodeConfig const& cfg);
+
 /// Render the usage text from the same rows the parser matches.
 /// @param color Whether to emit ANSI colour.
 /// @return The complete help text.

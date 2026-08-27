@@ -405,7 +405,7 @@ not a degraded fleet, it is the one thing the architecture says only one node ma
 do. So a fleet gives each node an identity and tells it who its peers are:
 
 ```sh
-fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
+fastcache-compile-node     --node-id=n1 --listen-raft=6680     --raft-peer=n1=10.0.0.1:6680     --raft-peer=n2=10.0.0.2:6680     --raft-peer=n3=10.0.0.3:6680     --listen-scheduler=6675 --fleet-open     --advertise=10.0.0.1:6676     --toolchain=/usr/bin/g++
 ```
 
 Each peer is an **identity and an address in one token**, because they are one
@@ -593,7 +593,7 @@ fastcache-compile-node \
     --discovery=255.255.255.255:6681 \
     --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
-    --listen-scheduler=6675 --toolchain=/usr/bin/g++
+    --listen-scheduler=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
 Every node still names **itself** in `--raft-peer`, because that is the address its
@@ -708,14 +708,26 @@ No `--toolchain` is needed: the registered service surveys the machine at every
 start, which is also why a toolchain *upgrade* no longer means re-registering.
 
 Every other flag on that command line is **baked into the registration** and
-reused at every start, so this is also where a wrong one is expensive. Three
-things are therefore refused at install time rather than at the next boot:
+reused at every start, so this is also where a wrong one is expensive. An install
+is therefore judged by *every* rule a start is judged by, plus the ones below that
+only a registration can break — a command line that would be refused at startup
+is refused here instead, where you are watching, rather than at every boot into a
+log nobody reads.
+
+These are specific to registering:
 
 | Missing | Why it is refused here |
 |---|---|
 | `--advertise` | Without it the registration bakes in `{--bind}:{--port}`, and the default `0.0.0.0` is not an address a client can dial. Such a worker registers, heartbeats, is leased out, and is never reached — with no error at either end. |
 | `--scheduler` | The service would start and exit at every boot. |
 | `--toolchain` *(only with `--no-toolchain-discovery`)* | With both, the worker has nothing to serve: it would register and then refuse every job sent to it. Without the flag the machine answers at boot, so a registration needs no toolchain at all. |
+| `--cluster-dir` *(only with `--listen-raft`)* | Consensus state would otherwise land in `fastcache-cluster/<node-id>` relative to the working directory, and a service does not inherit the installing shell's — it resolves under `C:\Windows\System32` for the SCM and under `/` for launchd, writable only by the privileges a worker is deliberately not given. |
+
+Everything else the worker refuses at startup — `--tls-cert` without `--tls-key`,
+`--listen-scheduler` without `--fleet-member` or `--fleet-open`, `--dashboard`
+without `--admin-listen`, and the rest — is refused here too. Each is decided by
+the command line alone, and a registration replays that command line forever, so
+there is nothing to gain by waiting for the first boot to say so.
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a

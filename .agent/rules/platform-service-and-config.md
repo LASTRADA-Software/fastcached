@@ -148,6 +148,26 @@ readable and silently ignored. Every rule below has already been one of them.
   reached. `--scheduler` gets the same treatment because it would start and exit at
   every boot.
 
+- **An install is judged by the STARTUP rules as well, through
+  `NodeInstallRejection` -- never by `NodeServiceRejection` alone.** The install
+  branch returns before `StartupPolicyRejection` is ever reached, so for a while it
+  applied four rules where seventeen were fatal: `--install-service` with
+  `--tls-cert` and no `--tls-key` registered cleanly and exited `ExitUsage` at every
+  boot, and so did `--dashboard` with no `--admin-listen` and a dozen more
+  ([#166](https://github.com/LASTRADA-Software/fastcached/issues/166)). Every
+  startup rule is a **pure invariant of the parsed configuration** -- no clock, no
+  filesystem, no port -- so each is decided the moment the command line is typed,
+  and `--install-service` bakes that command line in. That makes a startup rule
+  strictly *more* worth refusing at install than at a start: a start refuses once,
+  in front of the person who typed it.
+
+  The two tables stay separate and `NodeInstallRejection` only composes them, so a
+  new row in either reaches the install path without anyone remembering to add it
+  twice. `StartupPolicyRejection` must keep running at startup as well, or a
+  hand-started worker makes the identical mistake in silence. And the composition
+  lives in `NodeConfig.cpp` rather than `main()`, because `main()` is in no test
+  target -- which is exactly how a gap between two well-tested tables survived.
+
   `--toolchain` used to, and **no longer does** -- the reversal is the whole of
   [#139](https://github.com/LASTRADA-Software/fastcached/issues/139). Registering a
   worker before anybody knows what a machine holds is precisely what makes
@@ -319,7 +339,6 @@ readable and silently ignored. Every rule below has already been one of them.
   `space.free`: the difference is the root-reserved portion, which an unprivileged
   worker cannot write and must not offer to a scheduler as room it has.
 
-
 ## Open work
 
 - **[#155](https://github.com/LASTRADA-Software/fastcached/issues/155)** — `argv`
@@ -331,3 +350,13 @@ readable and silently ignored. Every rule below has already been one of them.
   seam belongs in `Platform/Environment`, which is already the one place the
   environment is read — but `fastcache-cc` does not link `FastCache`, so what
   that seam may depend on is part of the question.
+
+- **[#168](https://github.com/LASTRADA-Software/fastcached/issues/168)** — the
+  consensus tier refuses a malformed `--raft-peer`, and a `--node-id` that names no
+  peer, from inside `ConsensusTier::Start`. Both are pure functions of the parsed
+  configuration, like every row of `StartupPolicyRejection`, but they live in
+  neither table — so `--install-service --node-id=n1` with no `--raft-peer` still
+  registers cleanly and dies at every boot, which is the shape
+  [#166](https://github.com/LASTRADA-Software/fastcached/issues/166) closed
+  everywhere else. Moving them needs one spelling of the rule, not two:
+  `Cluster::ParseMemberSpec` is what both would share.
