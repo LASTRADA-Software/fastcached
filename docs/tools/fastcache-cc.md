@@ -307,7 +307,7 @@ for every path that did not reach the key:
 
 | Reason | What it means |
 |--------|---------------|
-| `toolchain` | Under neither root, or inside a vendored tree. The ordinary bulk of any compile: the compiler identity in the key already covers this content collectively. |
+| `toolchain` | Under neither root, or inside a vendored tree. The ordinary bulk of any compile: the compiler identity in the key already covers this content collectively. That identity is the compiler's own **version banner** — `Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64`, `clang version 22.1.3 (…)` — so two MSVC toolsets, or the x86 and x64 driver of one, key apart even though their headers are the same files. |
 | `drive-relative` | A Windows `C:foo` path under neither root. It resolves against that drive's own current directory — per-process state on the producing machine that no cache entry can record. One under a drive-relative *root* is keyed like any other, or counted `toolchain` if it is vendored content. |
 | `unanchored` | Relative, with no working directory to resolve it against. |
 | `no canonical form` | Under a root by character prefix but not by path segment: a root spelled almost right, such as `/x/build-other` against `/x/build`. |
@@ -415,11 +415,11 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   existence check, by design: they are the producing machine's spelling, the
   compiler identity in the key already covers them, and including them would
   make two machines with different system include prefixes share nothing. So a
-  cache shared between machines whose compilers print the *same* `--version`
-  banner *and target the same triple*, from *different* prefixes, can still
-  replay a dependency record naming a path the consumer lacks. Project headers —
-  the ones that actually move — are covered by the key, so this is now confined
-  to the toolchain.
+  cache shared between machines whose compilers print the *same* version banner
+  *and target the same triple*, from *different* prefixes, can still replay a
+  dependency record naming a path the consumer lacks. Project headers — the ones
+  that actually move — are covered by the key, so this is now confined to the
+  toolchain.
 - The cache key normalization is deliberately young (`objkey-v5`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.

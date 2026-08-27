@@ -303,6 +303,29 @@ TEST_CASE("DriverOf reports how each driver reports its dependencies")
     CHECK(DriverOf(Flavor::Unknown).flavor == Flavor::Unknown);
 }
 
+TEST_CASE("DriverOf asks MSVC for its version the only way MSVC answers")
+{
+    // `cl` has no `--version`. Handed one it prints its banner, warns D9002,
+    // errors D8003 and exits 2 -- and CompilerBanner requires a zero exit, so
+    // every MSVC compiler fell through to the string `cl` and one toolset's object
+    // was served to another toolset's compile (issue #195). An EMPTY row is what
+    // fixes it: bare `cl` prints the same banner and exits 0.
+    //
+    // Asserted as `.empty()` rather than by comparing spans, because the fact under
+    // test is that MSVC is asked with NO flags at all -- a row that grew a flag
+    // would put every `cl` back on the fallback, silently.
+    CHECK(DriverOf(Flavor::Cl).versionFlags.empty());
+
+    // Every other driver, `clang-cl` included: it is clang's own option, not a
+    // GNU-family one, and clang-cl exits 0 from it.
+    for (auto const flavor: { Flavor::ClangCl, Flavor::Gcc, Flavor::Clang, Flavor::Unknown })
+    {
+        auto const flags = DriverOf(flavor).versionFlags;
+        REQUIRE(flags.size() == 1);
+        CHECK(flags.front() == "--version");
+    }
+}
+
 TEST_CASE("PreprocessCommand asks each driver for its dependencies in one spelling")
 {
     // The cache key must be a function of BOTH artefacts a hit reproduces. The

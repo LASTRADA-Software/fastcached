@@ -73,13 +73,14 @@ enum class IncludeDiscovery : std::uint8_t
     ///
     /// This exists because `INCLUDE` is set per shell by `vcvarsall`, and a
     /// **Windows service does not inherit it**. Reading the variable therefore
-    /// yielded nothing under the SCM, `ProbeToolchainFiles` walked nothing, and --
-    /// since `cl` has no `--version` and falls back to its normalized basename --
-    /// an MSVC worker started as a service fingerprinted as a digest of the string
-    /// `cl` and nothing else. That is the SAME digest on every MSVC toolset in
-    /// existence: the false match `ToolchainFingerprint.hpp` exists to prevent,
-    /// and the one that yields a silently wrong object rather than a stale path a
-    /// replay guard can probe.
+    /// yielded nothing under the SCM, `ProbeToolchainFiles` walked nothing, and an
+    /// MSVC worker started as a service fingerprinted as its banner and nothing
+    /// else. That banner was `cl` for every MSVC toolset in existence until issue
+    /// #195, so the digest was too: the false match `ToolchainFingerprint.hpp`
+    /// exists to prevent, and the one that yields a silently wrong object rather
+    /// than a stale path a replay guard can probe. The banner now names the toolset
+    /// and the target, which does not retire this: a fingerprint carrying no
+    /// toolchain CONTENT still cannot see a patched header.
     ///
     /// The layout is tried FIRST and the environment only as a fallback, which is
     /// the whole of why this is not merely "read INCLUDE, then guess". Preferring
@@ -89,9 +90,10 @@ enum class IncludeDiscovery : std::uint8_t
     /// scheduler that never matches. Layout-first means both derive the same roots
     /// wherever the layout is derivable at all.
     ///
-    /// The layout is modelled here only because `cl` cannot be ASKED anything --
-    /// it answers no `--version` and prints no search list. `Flavor::ClangCl` can
-    /// be asked, so it is: see `ClangResourceLayout`.
+    /// The layout is modelled here because `cl` cannot be asked WHERE IT LOOKS --
+    /// it prints no search list at any verbosity. What it can be asked is who it
+    /// is, and it is (`DriverSpec::versionFlags`). `Flavor::ClangCl` answers both,
+    /// so both are asked: see `ClangResourceLayout`.
     MsvcLayout = 2,
     /// Ask a clang driver for the resource directory that SHIPS WITH IT --
     /// `<prefix>/lib/clang/<version>/include`, via `-print-resource-dir`.
@@ -113,8 +115,10 @@ enum class IncludeDiscovery : std::uint8_t
     /// unconditionally rather than merely where a layout is derivable. It can
     /// afford that because `clang-cl` announces a genuine version: a driver that
     /// does not answer degrades to a banner-only fingerprint, which still tells one
-    /// clang from another. `cl` cannot -- its banner is the constant `cl` -- which
-    /// is exactly why `MsvcLayout` needs the fallback and this does not.
+    /// clang from another. `cl` announces one too now (issue #195), but only after
+    /// being asked the one way it answers -- and a banner alone still cannot see a
+    /// patched header, which is why `MsvcLayout` keeps its fallback and this does
+    /// not need one.
     ///
     /// The VC toolset and the Windows SDK stay OUT of the answer. `clang-cl`
     /// borrows them rather than owning them, and a worker compiles text the client
@@ -478,6 +482,24 @@ struct DriverSpec
     /// The input path is appended by the caller, for the reason `includeProbeFlags`
     /// gives: "a file that is empty and always exists" has no portable spelling.
     std::span<std::string_view const> targetProbeFlags;
+    /// Flags that make the driver print its version banner as the FIRST line of
+    /// its output, and exit ZERO having done so.
+    ///
+    /// Both halves are load-bearing, and MSVC is why this is a table row rather
+    /// than one spelling for everybody. `cl` has no `--version`: handed it, it
+    /// prints its banner (it always does), then warns D9002, then errors D8003 and
+    /// exits 2. `CompilerBanner` requires a zero exit — deliberately, so that a
+    /// driver which cannot answer falls back to a normalized name rather than
+    /// fingerprinting on an error message — so `cl` took that fallback, and every
+    /// MSVC compiler ever installed identified as the string `cl`. That string is
+    /// the cache key's compiler identity, so one toolset's object was served to
+    /// another toolset's compile under a zero exit code (issue #195).
+    ///
+    /// MSVC's row is therefore EMPTY, which is not "no probe" but "no flags
+    /// needed": `cl` invoked with nothing at all prints the same banner, reads no
+    /// stdin, writes no file, and exits 0. The gate stays as it was; the probe is
+    /// what was wrong.
+    std::span<std::string_view const> versionFlags;
 };
 
 /// The pieces of a compile command line the launcher needs to key, cache, and

@@ -609,29 +609,59 @@ namespace
     }
 } // namespace
 
+std::vector<std::string> VersionProbeCommand(std::string const& compiler)
+{
+    // The flags come from the driver table, because "how is this driver asked its
+    // version" is a per-driver fact and `cl` has no `--version` at all. Classified
+    // HERE rather than taken as a parameter: the launcher and the compile node both
+    // reach this, and a spec passed in is a second chance for the two to disagree
+    // about one compiler -- which is invisible from both ends, as a scheduler that
+    // simply never matches. See `DriverSpec::versionFlags`.
+    auto const& driver = DriverOf(ClassifyCompiler(compiler));
+    std::vector<std::string> probe;
+    probe.reserve(1 + driver.versionFlags.size());
+    probe.emplace_back(compiler);
+    for (auto const flag: driver.versionFlags)
+        probe.emplace_back(flag);
+    return probe;
+}
+
 std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
 {
+    auto const probe = VersionProbeCommand(compiler);
+
     // Combined capture, because the drivers disagree about which stream this goes
-    // to: clang and gcc print it on stdout, while `cl` with no input prints its
-    // banner on stderr. Asking for both is what makes one call cover every driver
-    // instead of a per-family rule that would need its own table row.
-    std::array<std::string, 2> const probe { compiler, "--version" };
+    // to: clang and gcc print it on stdout, while `cl` prints its banner on stderr.
+    // Asking for both is what makes one call cover every driver instead of a
+    // per-family rule that would need its own table row.
     auto const run = runner.RunCaptureCombined(probe);
     if (run.exitCode == 0 && !run.out.empty())
-        return run.out.substr(0, run.out.find('\n'));
+    {
+        auto line = run.out.substr(0, run.out.find('\n'));
+        // A Windows child writes CRLF, and this line becomes a cache key input and
+        // a fingerprint input. Left on, the identity would carry a byte describing
+        // the HOST's line-ending convention rather than the compiler -- the same
+        // reason `ReadCache` below trims one. Measured: `cl` ends its banner with
+        // CRLF, `clang-cl` with LF, so this separates two things that are the same
+        // and nothing else.
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        return line;
+    }
 
     // NORMALIZED, not the basename as spelled -- and that is the whole point of
     // this branch rather than a tidy-up of it.
     //
-    // Only MSVC reaches here: `cl` has no `--version`, so it errors and every
-    // MSVC fingerprint is built on this fallback. Returning the spelling meant the
-    // digest depended on HOW the compiler was named rather than on which compiler
-    // it is -- `cl` gave one identity and `C:\...\cl.exe` another. A worker is
-    // configured with a path and a build system may invoke the bare name, so the
-    // two computed different fingerprints and the scheduler matched nothing:
-    // "rejected (no-worker): no worker matches this toolchain", on a fleet where
-    // both ends were pointed at the same compiler. Measured in CI, and reproduced
-    // here with a compiler that refuses `--version` under two spellings.
+    // Reached now only by a driver that cannot be run at all, or answers nothing:
+    // the table gives every driver a probe it exits ZERO from, which is what took
+    // MSVC off this branch (issue #195 -- every `cl` identified as the string `cl`,
+    // so one toolset's object was served to another's compile). Returning the
+    // spelling meant the digest depended on HOW the compiler was named rather than
+    // on which compiler it is -- `cl` gave one identity and `C:\...\cl.exe`
+    // another. A worker is configured with a path and a build system may invoke the
+    // bare name, so the two computed different fingerprints and the scheduler
+    // matched nothing: "rejected (no-worker): no worker matches this toolchain", on
+    // a fleet where both ends were pointed at the same compiler.
     //
     // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
     // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.

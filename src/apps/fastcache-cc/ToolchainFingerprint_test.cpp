@@ -80,7 +80,12 @@ TEST_CASE("Adding or removing a header changes the fingerprint", "[toolchain][fi
 TEST_CASE("A different compiler banner over the same headers is a different toolchain", "[toolchain][fingerprint]")
 {
     // Headers alone are too weak in this direction: two compilers can share a
-    // header tree and generate different code from it.
+    // header tree and generate different code from it. The x86 and x64 `cl.exe` of
+    // one MSVC toolset are that case exactly -- their include roots are the same
+    // files -- so the banner is the ONLY thing here that can tell them apart, and
+    // it does only because it names the target ("... for x64"). That is why a
+    // banner all MSVC compilers shared was a fingerprint defect as well as a cache
+    // key one; see issue #195.
     CHECK(ComputeToolchainFingerprint("gcc 13.2.0", SampleTree())
           != ComputeToolchainFingerprint("gcc 14.1.0", SampleTree()));
 }

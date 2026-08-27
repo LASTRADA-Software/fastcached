@@ -73,7 +73,24 @@ namespace FastCache::Cc
 /// @return One entry per readable file, unsorted (the digest sorts).
 [[nodiscard]] std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> roots);
 
-/// The compiler's own version banner: its first `--version` line.
+/// How this compiler is invoked to learn what it is.
+///
+/// `argv[0]` plus its driver's `DriverSpec::versionFlags`, which for MSVC is
+/// nothing at all -- `cl` has no version option and prints its banner regardless.
+///
+/// Exposed because TWO questions are asked with this one command and they must be
+/// asked identically: what the compiler calls itself (`CompilerBanner`), and
+/// whether it can be spawned at all (`NodeToolchains`' `CanSpawn`, which reads only
+/// the "could not spawn" answer). Built here once, so the day a driver's row moves
+/// it moves for both -- a second spelling would make a node judge spawnability from
+/// an invocation it then never uses.
+///
+/// @param compiler argv[0] as invoked.
+/// @return The full argv for the probe.
+[[nodiscard]] std::vector<std::string> VersionProbeCommand(std::string const& compiler);
+
+/// The compiler's own version banner: the first line it prints when asked the way
+/// `DriverSpec::versionFlags` says to ask it.
 ///
 /// Shared rather than private to the launcher because the compile node needs the
 /// identical string. The node derives its own fingerprint from the compiler it
@@ -81,6 +98,14 @@ namespace FastCache::Cc
 /// things -- so two spellings of "what does this compiler call itself" would put
 /// a worker and its clients permanently out of agreement, with no error anywhere,
 /// just a scheduler that never finds a match.
+///
+/// It is also the cache key's compiler identity -- `main.cpp`'s `toolchainStamp`,
+/// which reaches `ComputeKey`, `ComputeManifestKey` and `ValidateManifest` -- and
+/// that is the harsher of the two contracts. A banner that fails to tell two
+/// compilers apart is not a fleet that matches nothing; it is one compiler's
+/// object replayed for another compiler's compile, under a zero exit code. Which
+/// is why every driver's probe is one it answers with a zero exit rather than one
+/// spelling assumed to work everywhere (issue #195).
 ///
 /// Falls back to `NormalizedCompilerName` (in `CmdLine.hpp`) when the compiler
 /// cannot be run or says nothing. A weak identity beats an empty one: an empty
@@ -324,10 +349,16 @@ struct ToolchainIdentity
     ///
     /// Together they are not a weak identity but no identity:
     /// `KeyDigest("toolchain-v1").Field("cl")` is a value this repository could
-    /// print with no compiler installed, and every MSVC toolset in existence
-    /// produces it. The "weaker but still correct" argument above for a
-    /// banner-only fingerprint has an unstated precondition -- that the banner is a
-    /// real version string -- and this is that precondition, checked.
+    /// print with no compiler installed. The "weaker but still correct" argument
+    /// above for a banner-only fingerprint has an unstated precondition -- that the
+    /// banner is a real version string -- and this is that precondition, checked.
+    ///
+    /// `cl` used to fail it on every machine, which is what made a digest of the
+    /// string `cl` the identity of every MSVC toolset in existence (issue #195). It
+    /// answers now, so an MSVC toolchain whose layout could not be derived is served
+    /// on a banner-only fingerprint rather than refused -- correctly, and on the same
+    /// argument `ClangResourceLayout` already rests on: a worker compiles text the
+    /// client preprocessed, so it opens no header from the roots that are missing.
     bool degenerate { false };
 };
 

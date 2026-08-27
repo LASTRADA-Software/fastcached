@@ -142,9 +142,9 @@ compilers a machine holds is a fact the worker can establish.
 A compiler that is found but **cannot be executed** is dropped at startup, named,
 with the layout that found it — rather than registering and failing every job it
 is sent. So is one whose fingerprint would say nothing about which compiler it
-is: a driver that answers no `--version` *and* whose include tree could not be
-located digests to its own basename, which every install of that compiler on
-earth would also produce. Pin such a toolchain with
+is: a driver this build cannot ask for a version *and* whose include tree could
+not be located digests to its own basename, which every install of that compiler
+on earth would also produce. Pin such a toolchain with
 `--toolchain=<fingerprint>=<compiler>` if you want it served anyway. A worker
 that ends up with nothing to serve refuses to start and prints where it looked.
 
@@ -161,7 +161,10 @@ that ends up with nothing to serve refuses to start and prints where it looked.
 
 The fingerprint is a digest of the compiler's version banner **and its whole
 include tree**, so two machines with the same compiler at different install
-prefixes match, while two machines whose headers differ do not. Matching is
+prefixes match, while two machines whose headers differ do not. The banner names
+the target as well as the version — `... Version 19.51.36252 for x64` — which is
+what tells the x86 and x64 `cl.exe` of one toolset apart, since those two share an
+include tree exactly. Matching is
 byte-identical and cannot be loosened: an over-strict match costs a local
 compile, an over-loose one produces a silently wrong object that is then stored
 under a key other machines fetch.
@@ -170,21 +173,20 @@ Computing it walks the include tree, which takes a few seconds the first time a
 machine sees a toolchain and is cached afterwards.
 
 **Which tree, per driver.** GCC and Clang are asked directly (`-E -v`), and so is
-`clang-cl` (`-print-resource-dir`). `cl` is the one that cannot be asked — it
-answers no `--version` and prints no search list — so it is read off its install
-layout instead: the `VC\Tools\MSVC\<version>` toolset it lives inside, plus the
-newest Windows SDK the registry names. `clang-cl` covers only its own resource
+`clang-cl` (`-print-resource-dir`). `cl` prints no search list at any verbosity, so
+its tree is read off its install layout instead: the `VC\Tools\MSVC\<version>`
+toolset it lives inside, plus the newest Windows SDK the registry names. (Its
+*version* it does state — on every invocation, which is why it is asked for it with
+no options at all.) `clang-cl` covers only its own resource
 directory, `<prefix>\lib\clang\<version>\include`: it borrows the VC toolset and
 the SDK rather than owning them, and a worker compiles text the client already
 preprocessed, so it opens no header from either.
 
 Neither takes its answer from `INCLUDE`, which a developer command prompt sets
 and a Windows service never inherits — that is why a service-run worker and a
-developer-prompt launcher agree. `cl` still falls back to it for a driver
-outside any `VC\Tools\MSVC` layout, because a `cl` that answers no `--version`
-would otherwise be left with an identity every MSVC install on earth shares;
-`clang-cl` never does, since its version banner already tells one clang from
-another.
+developer-prompt launcher agree. `cl` still falls back to it for a driver outside
+any `VC\Tools\MSVC` layout, because a banner alone cannot see a patched header;
+`clang-cl` never does, since it owns a resource directory it can be asked for.
 
 ### When no worker matches
 
