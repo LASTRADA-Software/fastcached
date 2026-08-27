@@ -253,6 +253,24 @@ The commonest way to produce one is a `--toolchain=<fingerprint>=...` label
 typed in a shell whose encoding is not UTF-8. A computed fingerprint is hex and
 cannot hit this.
 
+### A change the leader will not record
+
+The flags above are refused by the binary an operator typed them into. The
+scheduler refuses the same values again when they arrive as a request, whoever
+sent them — a client built before that check existed, or a peer — because a
+cluster change is committed through consensus and an entry is applied *after* it
+commits, with nobody left to refuse it:
+
+```
+$ fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-admit='...'
+a member id is not valid UTF-8
+```
+
+**`--cluster-forget` is deliberately exempt, at both ends.** Its operand *is* the
+offending id, so a check covering it would make a member that reached replicated
+state through an older peer impossible to remove — and it would count towards
+quorum forever.
+
 ## A cache of its own
 
 A node can hold a cache tier in front of the shared `fastcached`, and point the
