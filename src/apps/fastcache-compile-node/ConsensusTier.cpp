@@ -204,14 +204,11 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // member could never win a vote and could never be voted for -- it would stand
     // for election forever against a cluster that has never heard of it, which from
     // the outside is a node that simply never becomes ready.
-    std::vector<Cluster::ClusterMember> members;
-    for (auto const& spec: cfg.raftPeers)
-    {
-        auto parsed = Cluster::ParseMemberSpec(spec);
-        if (!parsed.has_value())
-            return std::unexpected { std::format("--raft-peer={} is not <id>=<host>:<port>", spec) };
-        members.push_back(*std::move(parsed));
-    }
+    //
+    // The grammar is not re-checked here: `--raft-peer` is parsed by the option
+    // table, so `cfg.raftPeers` holds members or the command line was refused
+    // where it was typed (#168).
+    auto const& members = cfg.raftPeers;
 
     auto const self = std::ranges::find(members, cfg.nodeId, &Cluster::ClusterMember::id);
     if (self == members.end())

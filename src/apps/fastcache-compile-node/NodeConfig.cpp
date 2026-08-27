@@ -214,6 +214,30 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// One cluster member, from the `<id>=<host>:<port>` an operator typed.
+    ///
+    /// Through `Cluster::ParseMemberSpec`, which is the grammar `--cluster-admit`
+    /// already takes: the documentation tells an operator to copy the same token
+    /// between the two flags, so a second implementation would be two flags
+    /// accepting different token sets for one concept -- with only one of them being
+    /// what the transport actually dials.
+    ///
+    /// Here rather than in the tier that consumes it, and that is the fix for #168:
+    /// a refusal inside `ConsensusTier::Start` is one `--install-service` returns
+    /// long before reaching, so a registration carrying a malformed peer was written
+    /// happily and then failed at every boot, into a log nobody reads. The parser is
+    /// the one place on every path, and the only one that can name the token.
+    /// @param sv Text to parse.
+    /// @return The member, or why the token is not one.
+    [[nodiscard]] std::expected<Cluster::ClusterMember, ConfigError> ParseRaftPeer(std::string_view sv)
+    {
+        auto member = Cluster::ParseMemberSpec(sv);
+        if (!member.has_value())
+            return std::unexpected(
+                ArgvError(ConfigErrorCode::ParseError, "raft-peer", std::format("not <id>=<host>:<port>: {}", sv)));
+        return *std::move(member);
+    }
+
     /// A filesystem path, taken as written.
     /// @param sv Text to parse.
     /// @return The path.
@@ -417,7 +441,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { .primary = "--raft-peer",
           .arity = Arity::Value,
           .operand = "=<id>=<host>:<port>",
-          .apply = AppendFrom<&NodeConfig::raftPeers, ParseText>(),
+          .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
           .description = "a cluster member and where it answers; repeatable.\n"
                          "Both halves in one token because a member id with\n"
                          "no address is a node counted towards quorum and\n"
@@ -787,9 +811,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
     // it was installed with would present as a cluster that stopped forming quorum,
-    // not as a packaging bug.
+    // not as a packaging bug. Re-rendered rather than echoed, because the list is
+    // stored parsed; it is the same token either way, since `ParseMemberSpec` splits
+    // at the FIRST `=` and keeps the endpoint verbatim.
     for (auto const& peer: cfg.raftPeers)
-        argv.push_back(std::format("--raft-peer={}", peer));
+        argv.push_back(std::format("--raft-peer={}={}", peer.id, peer.raftEndpoint));
     emitIfSet("upstream", cfg.upstream, defaults.upstream);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.raftJoin)

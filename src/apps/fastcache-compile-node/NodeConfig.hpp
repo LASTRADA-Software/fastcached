@@ -3,6 +3,7 @@
 
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
@@ -259,18 +260,25 @@ struct NodeConfig
     /// default would be one that silently cannot work.
     std::string raftListen;
 
-    /// The cluster's members as `id=host:port`; repeatable.
+    /// The cluster's members, from `--raft-peer=<id>=<host>:<port>`; repeatable.
     ///
     /// Both halves in one token because they are one fact. A member id without an
     /// address is a node the cluster counts towards quorum and cannot reach -- the
     /// residual `RaftMembership` recorded, and the reason `Cluster::ClusterMember`
     /// pairs them.
     ///
+    /// Stored PARSED rather than as the tokens an operator typed, which is what makes
+    /// a malformed one unrepresentable: the grammar is `Cluster::ParseMemberSpec` and
+    /// it runs in the option table, so a token that names no member is refused where
+    /// it was typed. It used to be refused inside `ConsensusTier::Start` instead -- a
+    /// layer `--install-service` returns long before reaching, so a registration
+    /// carrying one was written happily and then died at every boot (#168).
+    ///
     /// This is the BOOTSTRAP set only. Once the cluster is running, membership is a
     /// replicated log entry and this list is not consulted again -- which is what
     /// makes a node that was admitted at runtime survive a restart without anybody
     /// editing a config file on every other machine.
-    std::vector<std::string> raftPeers;
+    std::vector<Cluster::ClusterMember> raftPeers;
 
     /// Where consensus keeps its durable state, empty for a default beside the cache.
     ///

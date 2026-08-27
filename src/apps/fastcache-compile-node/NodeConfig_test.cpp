@@ -4,6 +4,7 @@
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -37,6 +38,26 @@ namespace
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;
+}
+
+/// The member a `--raft-peer` token names, for a config built without a parser.
+///
+/// `raftPeers` holds members rather than tokens, so a fixture that assigns it has to
+/// go through the same grammar the option table does -- which is the point: a test
+/// spelling a member some other way would be testing a shape no command line can
+/// produce.
+/// @param spec The token as an operator would write it.
+/// @return The member it names.
+[[nodiscard]] Cluster::ClusterMember Peer(std::string_view spec)
+{
+    auto const member = Cluster::ParseMemberSpec(spec);
+    // `Unwrap` hands back a default-constructed member for an empty optional, and
+    // relies on a preceding `REQUIRE` to have failed the test first. Without one a
+    // fixture with a typo'd spec would quietly become a member with no id and no
+    // endpoint -- which is exactly the shape these cases exist to refuse.
+    INFO("peer spec: " << spec);
+    REQUIRE(member.has_value());
+    return Unwrap(member);
 }
 
 /// Parse an argv fragment into a `NodeConfig`, the way `main` does.
@@ -212,7 +233,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.upstream = "cache.internal:6674";
     cfg.nodeId = "n1";
     cfg.raftListen = "0.0.0.0:6680";
-    cfg.raftPeers = { "n1=10.0.0.4:6680", "n2=10.0.0.5:6680" };
+    cfg.raftPeers = { Peer("n1=10.0.0.4:6680"), Peer("n2=10.0.0.5:6680") };
     // Every field differs from its default, so every emitter fires -- which is the
     // narrow question this case asks. Alongside two peers is a legitimate joiner:
     // under `--raft-join` that list is who this node can REACH rather than who it
@@ -560,6 +581,71 @@ TEST_CASE("NodeConfig: consensus state may not default to a relative path in a s
     CHECK(!NodeServiceRejection(plain).has_value());
 }
 
+TEST_CASE("NodeConfig: a --raft-peer that names no member is refused where it was typed", "[node][consensus][policy]")
+{
+    // The grammar is enforced by the parser, so a token that is not a member is
+    // refused on EVERY path -- a hand start, `--install-service`, and the cluster
+    // verbs alike. It used to be checked inside `ConsensusTier::Start`, which the
+    // install path returns long before reaching: a registration carrying
+    // `--raft-peer=garbage` was written happily and then died at every boot (#168).
+    // Every way a token can fail to name a member, through the one grammar.
+    for (auto const* const token: {
+             "garbage",          // neither half
+             "n1=",              // an id and nothing to dial
+             "=10.0.0.1:6680",   // an endpoint and nobody it belongs to
+             "n1=10.0.0.1",      // a host with no port
+             "n1=10.0.0.1:0",    // a port nobody can connect to
+             "n1=10.0.0.1:http", // a port that is not a number
+         })
+    {
+        INFO("token: " << token);
+        auto const flag = std::format("--raft-peer={}", token);
+        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", flag.c_str() });
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().field == "raft-peer");
+        // The offending token is named, which is the half a policy row could not do:
+        // its messages are static prose and an operator may have typed five peers.
+        CHECK(parsed.error().context.contains(token));
+    }
+
+    // And the shapes that ARE members, including the bracketed v6 one every
+    // `SplitHostPort` caller has to keep intact.
+    auto const parsed = ParseNodeArgv({ "--scheduler=s:1",
+                                        "--toolchain=/usr/bin/cc",
+                                        "--raft-peer=n1=10.0.0.1:6680",
+                                        "--raft-peer=n2=[2001:db8::1]:6680" });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->raftPeers.size() == 2);
+    CHECK(parsed->raftPeers[0].id == "n1");
+    CHECK(parsed->raftPeers[0].raftEndpoint == "10.0.0.1:6680");
+    CHECK(parsed->raftPeers[1].id == "n2");
+    CHECK(parsed->raftPeers[1].raftEndpoint == "[2001:db8::1]:6680");
+}
+
+TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[node][consensus][service]")
+{
+    // A registration replays its command line forever, so the peers have to survive
+    // this project's own parser -- and they are now stored parsed, which means the
+    // installer RE-RENDERS each token rather than echoing it. A member that came
+    // back spelled differently is a node the cluster counts and cannot reach.
+    auto cfg = Installable();
+    cfg.nodeId = "n1";
+    cfg.raftListen = "0.0.0.0:6680";
+    cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    cfg.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=[2001:db8::1]:6680") };
+
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", cfg);
+
+    std::vector<char const*> argv;
+    argv.reserve(spec.arguments.size());
+    for (auto const& argument: spec.arguments)
+        argv.push_back(argument.c_str());
+
+    auto const reparsed = ParseNodeArgv(argv);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->raftPeers == cfg.raftPeers);
+}
+
 TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
 {
     // A system-scope worker runs as an unprivileged account and root created these
@@ -652,7 +738,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // to be admitted without one would listen forever and could never be named.
         NodeConfig cfg;
         cfg.raftJoin = true;
-        cfg.raftPeers = { "n1=10.0.0.4:6680" };
+        cfg.raftPeers = { Peer("n1=10.0.0.4:6680") };
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
@@ -691,7 +777,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig joiner;
         joiner.raftJoin = true;
         joiner.nodeId = "n4";
-        joiner.raftPeers = { "n4=10.0.0.4:6680", "n1=10.0.0.1:6680", "n2=10.0.0.2:6680" };
+        joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
         // And a worker running no scheduler at all -- by far the common case -- is
