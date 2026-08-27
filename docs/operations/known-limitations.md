@@ -95,7 +95,9 @@ at different moments.
 
 - No data-structure commands (lists, sets, hashes, sorted sets,
   streams, bitfields). fastcached's engine is key-value only.
-- No pub/sub, scripting (EVAL), or transactions (MULTI/EXEC).
+- No scripting (EVAL). Pub/sub (`SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH`,
+  and the `__keyspace@0__` / `__keyevent@0__` channels) and transactions
+  (`MULTI` / `EXEC` / `WATCH` / `DISCARD`) are implemented.
 - No replication or cluster commands.
 
 ## Operational gaps
