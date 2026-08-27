@@ -39,6 +39,7 @@
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisMutationObserver.hpp>
@@ -628,7 +629,16 @@ struct StorageBackendBundle
 /// service).
 int DaemonBody(FastCache::Config const& effective, std::span<FastCache::RejectedCandidate const> rejected)
 {
-    FastCache::ConsoleLogger logger { std::cerr, effective.logLevel, effective.logTimestamps };
+    // A service gets the event log, everything else gets stderr. The factory answers
+    // nullptr wherever there is no event log, which is how this stays one expression
+    // rather than a platform branch — and `effective.daemon` rather than "am I on
+    // Windows", so a foreground run keeps its terminal output on a machine that has
+    // one (#179).
+    FastCache::ConsoleLogger consoleLogger { std::cerr, effective.logLevel, effective.logTimestamps };
+    auto const eventLogger =
+        effective.daemon ? FastCache::MakeWindowsEventLogger(effective.serviceName, effective.logLevel) : nullptr;
+    FastCache::ILogger& logger =
+        eventLogger ? static_cast<FastCache::ILogger&>(*eventLogger) : static_cast<FastCache::ILogger&>(consoleLogger);
 
     // Through the logger, not just the stderr line main() already printed: a
     // service started by the SCM has no console for that to land on, and this
