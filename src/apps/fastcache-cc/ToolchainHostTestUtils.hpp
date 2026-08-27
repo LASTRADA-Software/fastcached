@@ -171,12 +171,12 @@ class ScriptedToolchainHost final: public IToolchainHost
     {
         if (name.empty())
             return std::nullopt;
-        if (name.find('/') != std::string_view::npos || name.find('\\') != std::string_view::npos)
+        if (name.contains('/') || name.contains('\\'))
             return std::string { name };
 
         for (auto const& directory: _searchPath)
         {
-            auto const candidate = Normalize(directory) + "/" + std::string { name };
+            auto candidate = Normalize(directory) + "/" + std::string { name };
 
             // `.exe` is tried first and is NOT conditioned on the host running the
             // test. This fake describes the machine a *case* wrote down, and the
@@ -275,7 +275,7 @@ class ScriptedToolchainHost final: public IToolchainHost
             if (!path.starts_with(prefix))
                 continue;
             auto const remainder = std::string_view { path }.substr(prefix.size());
-            if (remainder.empty() || remainder.find('/') != std::string_view::npos)
+            if (remainder.empty() || remainder.contains('/'))
                 continue;
             names.emplace_back(remainder);
         }

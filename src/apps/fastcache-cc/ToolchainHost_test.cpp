@@ -214,7 +214,8 @@ TEST_CASE("The real host resolves this process's own executable on PATH", "[tool
 {
     FastCache::Testing::ScratchDirectory tree { "fc-tch-search" };
 #if defined(_WIN32)
-    auto const executable = tree.Write("bin/fc-probe.exe", "not really a program");
+    tree.Write("bin/fc-probe.exe", "not really a program");
+    auto const executable = tree / "bin/fc-probe.exe";
     constexpr std::string_view bareName = "fc-probe";
     // A wrapper with no extension, beside the real thing -- ordinary in an MSYS2
     // or Cygwin bindir. Written FIRST so a search preferring the bare spelling
@@ -223,7 +224,8 @@ TEST_CASE("The real host resolves this process's own executable on PATH", "[tool
     // PATHEXT and never runs this one.
     tree.Write("bin/fc-probe", "#!/bin/sh\n");
 #else
-    auto const executable = tree.Write("bin/fc-probe", "#!/bin/sh\n");
+    tree.Write("bin/fc-probe", "#!/bin/sh\n");
+    auto const executable = tree / "bin/fc-probe";
     constexpr std::string_view bareName = "fc-probe";
     std::filesystem::permissions(executable, std::filesystem::perms::owner_all, std::filesystem::perm_options::add);
 #endif

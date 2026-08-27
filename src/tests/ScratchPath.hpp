@@ -128,10 +128,15 @@ class ScratchDirectory
     /// discarded its `error_code` would be that fixture. Catch2 reports the throw
     /// as a failure of the case that made it, which is where it belongs.
     ///
+    /// Returns nothing, and `operator/` is how a case names what it just wrote.
+    /// Const, because writing into a directory does not change which directory this
+    /// object stands for -- and a const method handing back a value it computed
+    /// would then owe a `[[nodiscard]]`, which most callers here would have to cast
+    /// away. The path is one `operator/` away for the few that want it.
+    ///
     /// @param relative Path relative to this directory.
     /// @param contents What to write; an empty string still creates the file.
-    /// @return The path written, so a case can name it in an assertion.
-    std::filesystem::path Write(std::string_view relative, std::string_view contents = {})
+    void Write(std::string_view relative, std::string_view contents = {}) const
     {
         auto const target = *this / relative;
         auto error = std::error_code {};
@@ -147,7 +152,6 @@ class ScratchDirectory
         out.close();
         if (!out)
             throw std::runtime_error { std::format("scratch: cannot write {}", target.string()) };
-        return target;
     }
 
   private:
