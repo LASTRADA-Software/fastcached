@@ -1081,7 +1081,7 @@ What it shows, and why each part is split the way it is:
 | Section | What it answers |
 |---|---|
 | The readouts | Six figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, and the **oldest** heartbeat in the fleet. The oldest and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. |
-| Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. |
+| Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. A fleet that has never been dispatched to says *that* instead, because the same three numbers mean something else there — see below. |
 | Machines | One row **per machine**, not per toolchain: the software version it is running, cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
 | Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
 | Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
@@ -1107,6 +1107,25 @@ Three of those distinctions cost real debugging time when they are collapsed:
 A value nobody reported renders as `–` on the page and `null` in the JSON, never
 as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
 from "this node never told us".
+
+### An unused fleet is not an idle one
+
+**Dispatch is opt-in.** A client asks for a lease only when `FASTCACHE_SCHEDULER`
+names a scheduler; `FASTCACHE_ADDR` alone points the launcher at a *cache*. A node
+deployed the common way — as a shared cache for a build that compiles locally —
+therefore registers its slots, is never asked for a lease, and reports **0
+compiling** for as long as it runs.
+
+That zero is honest and it is not idleness, so the capacity panel says which it is
+rather than leaving the three numbers to be read the wrong way. It matters because
+the reading underneath is otherwise actively misleading: `withheld` is derived from
+the host's CPU, memory and scratch *minus* the jobs this fleet handed out, so on a
+node that was handed none, **every** core your own build is using is attributed to
+somebody else. The panel would tell you your machines were busy with a third
+party's work while the third party was you.
+
+Once one lease has been granted, the ordinary readings return — from then on, host
+load this fleet cannot account for genuinely is somebody else's.
 
 ### Which build each machine is running
 

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -511,6 +512,31 @@ namespace
         return index < snapshot.leases.size() ? snapshot.leases[index] : 0;
     }
 
+    /// Whether a snapshot carries lease figures at all.
+    ///
+    /// Separate from `CountAt` because the two questions have different right
+    /// answers. Rendering the outcome list wants a zero for a count nobody
+    /// supplied — a row has to print something. Deciding whether this fleet has
+    /// ever been dispatched to must not read that same absence as a zero, or a
+    /// caller who said nothing gets told something. One predicate, so the two
+    /// policies are a visible choice rather than two bounds checks that drifted.
+    /// @param snapshot What to read.
+    /// @return True when every `LeaseOutcomeTable` row has a count.
+    [[nodiscard]] bool HasLeaseFigures(FleetSnapshot const& snapshot) noexcept
+    {
+        return snapshot.leases.size() == LeaseOutcomeTable.size();
+    }
+
+    /// Where `DispatchLeasesGranted` sits in `LeaseOutcomeTable`.
+    ///
+    /// Derived from the table by enumerator rather than written as `0`.
+    /// `FleetSnapshot::leases` is indexed by that position, so a literal would be a
+    /// second place the row order is recorded — and it would reorder in silence.
+    constexpr std::size_t GrantedLeaseIndex = static_cast<std::size_t>(std::ranges::distance(
+        LeaseOutcomeTable.begin(),
+        std::ranges::find(LeaseOutcomeTable, IMetricsSink::Counter::DispatchLeasesGranted, &LeaseOutcomeRow::counter)));
+    static_assert(GrantedLeaseIndex < LeaseOutcomeTable.size(), "a grant must be a row of LeaseOutcomeTable");
+
     /// How the page and the JSON both name a role.
     [[nodiscard]] std::string_view RoleName(SchedulerRole role) noexcept
     {
@@ -544,12 +570,14 @@ FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept
         // implementations of what a machine may take is how a worker comes to
         // accept more jobs than the scheduler believes it has, which is the
         // reason that function exists at all.
-        // `NodeLoad::inFlight` on a report is the CONTRIBUTING ENTRY's job count,
-        // as `NodeReport` says in as many words -- its machine-wide fields are what
-        // this grain is for, and that one is not among them. A machine serving two
-        // toolchains with four jobs each reports 4 there and 8 in
-        // `fleetJobsInFlight`, so a ceiling built from the former and a subtraction
-        // using the latter would mix two grains in one subtraction.
+        // `NodeLoad::inFlight` on a report is whatever the CONTRIBUTING ENTRY last
+        // carried, while `fleetJobsInFlight` is folded across every entry of the
+        // machine. Both are machine-wide quantities -- a node samples one
+        // `WorkerServer::InFlight()` for all its toolchains -- so this is not two
+        // grains being reconciled; it is one figure taken from the whole machine
+        // rather than from whichever entry happened to contribute the rest of the
+        // load. A ceiling built from one entry's copy and a subtraction using the
+        // fold would still disagree the moment a sibling registered mid-flight.
         auto machineLoad = node.load;
         machineLoad.inFlight = node.fleetJobsInFlight;
 
@@ -1069,6 +1097,40 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         std::string sub;   ///< The line under it.
     };
 
+    /// Whether this fleet has been asked to compile nothing at all.
+    ///
+    /// Dispatch is opt-in — a client asks for a lease only when
+    /// `FASTCACHE_SCHEDULER` names a scheduler — so a node deployed as a shared
+    /// *cache*, which is the common case, sits in this state permanently while the
+    /// machine around it compiles at full tilt. The page has to say which of the
+    /// two it is looking at, because the numbers are identical and the operator's
+    /// reading of them is not.
+    ///
+    /// **Three conditions, not one, because the grant counter is process-local.**
+    /// `DispatchLeasesGranted` counts what THIS process granted since it started,
+    /// and leadership moves: a scheduler that has just taken over from a failed
+    /// leader has granted nothing while heartbeats have already repopulated
+    /// `inFlight`. Asking the counter alone would put "no compile has been handed
+    /// to any of them" on a page whose own bar shows twelve running, and displace
+    /// the withheld reading the operator needs. So live work in either spelling —
+    /// jobs in flight, or a lease outstanding — disqualifies the claim, and the
+    /// note itself is careful to say *since this scheduler took over* rather than
+    /// *ever*.
+    ///
+    /// **Absent is not zero.** A snapshot carrying no lease figures is making no
+    /// claim about dispatch, and reading that as a zero would put the strongest
+    /// sentence on this page in front of a caller who never said so.
+    /// @param snapshot The snapshot.
+    /// @param totals Its capacity split.
+    /// @return True when machines are registered and none of them has been given
+    ///         work this scheduler can account for.
+    [[nodiscard]] bool NeverDispatched(FleetSnapshot const& snapshot, FleetTotals const& totals)
+    {
+        if (totals.registered == 0 || !HasLeaseFigures(snapshot))
+            return false;
+        return CountAt(snapshot, GrantedLeaseIndex) == 0 && totals.inFlight == 0 && snapshot.liveLeases == 0;
+    }
+
     /// A figure or the dash, at one decimal place with a unit.
     [[nodiscard]] std::string FigureOr(std::optional<double> value, int decimals)
     {
@@ -1087,9 +1149,12 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     KpiReadout KpiCompilingNow(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
         auto const totals = TotalsFor(snapshot);
+        // The sub-line names WHICH zero this is. "This fleet's own work" over a 0
+        // reads as an idle fleet, and on a node nothing dispatches to it is the
+        // tile an operator stares at while their build saturates the machine.
         return KpiReadout { .value = std::to_string(totals.inFlight),
                             .unit = std::format("/ {} slots", totals.registered),
-                            .sub = "this fleet's own work" };
+                            .sub = NeverDispatched(snapshot, totals) ? "nothing dispatched yet" : "this fleet's own work" };
     }
 
     KpiReadout KpiHitRate(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
@@ -1235,6 +1300,83 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                            FleetSeriesPath);
     }
 
+    /// One reading of the capacity bar, and the sentence it needs beside it.
+    ///
+    /// A table rather than an `if`/`else` ladder, for the reason `KpiTable` is one:
+    /// the note is the part of this panel that grows a state, and a state added as
+    /// another arm is one whose *precedence* is written nowhere. Order is the
+    /// contract here — the first row that applies wins — because the readings are
+    /// not exclusive: a fleet nothing was ever dispatched to also has slots
+    /// withheld, and saying so second would bury the fact that explains it.
+    struct CapacityNoteRow
+    {
+        /// Whether this reading applies. Evaluated in table order.
+        bool (*applies)(FleetSnapshot const&, FleetTotals const&);
+        /// The note, already escaped-safe: every one is a literal plus numbers.
+        ///
+        /// Same parameters as `applies`, deliberately. A row whose two halves take
+        /// different arguments is one that cannot grow a note needing what its
+        /// predicate already had, and `KpiRow` sets the precedent.
+        std::string (*render)(FleetSnapshot const&, FleetTotals const&);
+    };
+
+    /// The note for a fleet that has registered machines and been given no work.
+    /// @param totals Its capacity split.
+    /// @return The paragraph.
+    [[nodiscard]] std::string NoteNeverDispatched(FleetSnapshot const& /*snapshot*/, FleetTotals const& totals)
+    {
+        // The sentence this panel was missing. Without it the reading below runs,
+        // and it attributes the operator's OWN compiles to a third party: the host
+        // CPU is busy, none of it is work this fleet was handed, so every slot the
+        // ceiling withdraws is reported as somebody else's. An operator watching
+        // their build saturate this machine reads "0 compiling" and a bar that says
+        // the load is not theirs.
+        return std::format(R"(<p class="note"><strong>Nothing has been dispatched to this fleet.</strong> )"
+                           R"({} slots are registered, no compile has been handed to any of them since this )"
+                           R"(scheduler took over, and none is running now &mdash; so what is drawn below is an )"
+                           R"(<em>unused</em> fleet rather than an idle one. A client asks for a lease only when )"
+                           R"(<code>FASTCACHE_SCHEDULER</code> names this scheduler; without it every compile )"
+                           R"(runs locally, this machine's own build is what loads it, and <em>compiling</em> )"
+                           R"(can only ever read zero. Until then, read the numbers below as capacity nobody )"
+                           R"(has asked for.</p>)",
+                           totals.registered);
+    }
+
+    /// The note for a fleet whose ceilings are holding slots back.
+    /// @param totals Its capacity split.
+    /// @return The paragraph.
+    [[nodiscard]] std::string NoteWithheld(FleetSnapshot const& /*snapshot*/, FleetTotals const& totals)
+    {
+        // The sentence the split exists for. Which of the two shortages a fleet
+        // has decides what an operator buys, and a single "utilisation" number
+        // answers neither.
+        return std::format(R"(<p class="note"><strong>Read the hatching first.</strong> {} of the {} slots )"
+                           R"(these machines registered are not offerable right now, and that is not this )"
+                           R"(fleet being busy: a ceiling withdrew them, because the host CPU is doing )"
+                           R"(somebody else's work or the scratch filesystem is nearly full. Buying machines )"
+                           R"(fixes a full blue bar. It does not fix this one.</p>)",
+                           totals.withheld,
+                           totals.registered);
+    }
+
+    /// The note for a fleet offering everything it registered.
+    /// @return The paragraph.
+    [[nodiscard]] std::string NoteNothingWithheld(FleetSnapshot const& /*snapshot*/, FleetTotals const& /*totals*/)
+    {
+        return R"(<p class="note">Nothing is being withheld: every registered slot is offerable, so what is )"
+               R"(not blue is genuinely idle. A fleet that refuses work in this state needs more machines, )"
+               R"(not quieter ones.</p>)";
+    }
+
+    /// Every reading, in precedence order. The last row applies unconditionally.
+    constexpr std::array<CapacityNoteRow, 3> CapacityNoteTable {
+        CapacityNoteRow { .applies = NeverDispatched, .render = NoteNeverDispatched },
+        CapacityNoteRow { .applies = [](FleetSnapshot const&, FleetTotals const& totals) { return totals.withheld > 0; },
+                          .render = NoteWithheld },
+        CapacityNoteRow { .applies = [](FleetSnapshot const&, FleetTotals const&) { return true; },
+                          .render = NoteNothingWithheld },
+    };
+
 } // namespace
 
 std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
@@ -1349,21 +1491,15 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
                            totals.inFlight,
                            totals.free,
                            totals.withheld);
-        // The sentence the split exists for. Which of the two shortages a fleet
-        // has decides what an operator buys, and a single "utilisation" number
-        // answers neither.
-        if (totals.withheld > 0)
-            out += std::format(R"(<p class="note"><strong>Read the hatching first.</strong> {} of the {} slots )"
-                               R"(these machines registered are not offerable right now, and that is not this )"
-                               R"(fleet being busy: a ceiling withdrew them, because the host CPU is doing )"
-                               R"(somebody else's work or the scratch filesystem is nearly full. Buying machines )"
-                               R"(fixes a full blue bar. It does not fix this one.</p>)",
-                               totals.withheld,
-                               totals.registered);
-        else
-            out += R"(<p class="note">Nothing is being withheld: every registered slot is offerable, so what is )"
-                   R"(not blue is genuinely idle. A fleet that refuses work in this state needs more machines, )"
-                   R"(not quieter ones.</p>)";
+        // The first reading that applies, from `CapacityNoteTable`. Its last row is
+        // unconditional, so this always appends exactly one paragraph.
+        for (auto const& row: CapacityNoteTable)
+        {
+            if (!row.applies(snapshot, totals))
+                continue;
+            out += row.render(snapshot, totals);
+            break;
+        }
     }
     out += "</div></section>";
 
