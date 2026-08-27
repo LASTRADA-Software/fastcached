@@ -271,6 +271,27 @@ struct StorageBackendBundle
     if (directory.empty())
         return {};
 
+    // A directory that is not there produces the same failed `ofstream` as one
+    // this account cannot write, and the two need opposite answers. Saying
+    // "grant NT SERVICE\... access" for a path nobody created sends the operator
+    // to an `icacls` command that fails on its own terms.
+    if (std::error_code dirEc; !std::filesystem::is_directory(directory, dirEc))
+    {
+        // "is not a directory" rather than "does not exist": the guard tests the
+        // former, and the two need different answers. A `--storage` whose parent is
+        // a regular FILE would otherwise be answered with "create it", against a
+        // path that is already there.
+        std::error_code existsEc;
+        return std::filesystem::exists(directory, existsEc)
+                   ? std::format("\nThe storage path {} cannot be used: {} exists but is not a directory.",
+                                 storagePath.string(),
+                                 directory.string())
+                   : std::format("\nThe storage path {} has no directory to live in: {} does not exist. "
+                                 "Create it, then grant the service account access to it.",
+                                 storagePath.string(),
+                                 directory.string());
+    }
+
     auto const probe = directory / ".fastcached-access-probe";
     {
         std::ofstream out { probe };

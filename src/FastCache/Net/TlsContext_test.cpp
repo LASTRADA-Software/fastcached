@@ -104,6 +104,27 @@ TEST_CASE("A self-signed certificate with no name at all is refused", "[net][tls
     CHECK_FALSE(FastCache::TlsContext::CreateSelfSigned(empty).has_value());
 }
 
+TEST_CASE("A subject name carrying the list separator is refused", "[net][tls][self-signed]")
+{
+    // The names are pasted into OpenSSL's `subjectAltName` config grammar, which
+    // is a COMMA-SEPARATED list of `TYPE:value`. A comma inside one name therefore
+    // ends it and starts another, so a certificate silently comes out valid for a
+    // name nobody asked for. The names are operator-supplied -- a hostname and the
+    // `--admin-listen` bind host -- so this is a typo away rather than an attack,
+    // and a certificate valid for the wrong name is the failure this whole
+    // function exists to prevent.
+    std::vector<std::string> const injected { "localhost", "a,DNS:internal.example.com" };
+    auto const refused = FastCache::TlsContext::CreateSelfSigned(injected);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().context.contains("subject name"));
+
+    // A colon is NOT refused: OpenSSL splits the type from the value at the first
+    // one, so everything after it is the value -- which is what makes an IPv6
+    // literal a legal SAN and why `::1` is in the fixture above.
+    std::vector<std::string> const ipv6 { "::1" };
+    CHECK(FastCache::TlsContext::CreateSelfSigned(ipv6).has_value());
+}
+
 TEST_CASE("A generated certificate reports a fingerprint, and a fresh one each time", "[net][tls][self-signed]")
 {
     // The fingerprint is the ONLY thing that authenticates a self-signed

@@ -687,6 +687,15 @@ the seam.
   disk tier resident is NOT the fix — its budget is disk, so summing it into a
   memory total is wrong by the ratio between the two rather than by the index's
   size. The fix needs a figure that does not exist yet.
+- **[#174](https://github.com/LASTRADA-Software/fastcached/issues/174)** — the two
+  POSIX rows of `ToolchainLayouts()` are walked on Windows, where `/usr` is
+  drive-relative, so an MSYS2 or Cygwin install rooted at `C:\` re-admits through
+  `/usr/bin` the MSYS-runtime `gcc` the `msys2` row deliberately excludes -- and
+  records it under a spelling `PathIdentity` will not collapse against the `C:/...`
+  one, so a machine registers twice. Fixing it needs a platform column on the row,
+  which has to be honoured by the walk WITHOUT being honoured by the tests, or the
+  Windows rows stop being reachable from a Linux runner and the reason the table
+  carries no `#if` is lost.
 - **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
   discovered compiler is spawned twice at startup with the same argv, once to learn
   it can be spawned and once for its banner, and the first is in a serial loop in

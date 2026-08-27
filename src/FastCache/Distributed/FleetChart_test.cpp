@@ -28,6 +28,10 @@ constexpr std::int64_t DaySeconds = 300;
 {
     FleetBucket bucket {};
     bucket.startMillis = millis;
+    // A window sampled right at its start: `Buckets()` would produce this for a
+    // bucket whose only reading landed in its first sub-slot. Cases about a
+    // PARTLY-filled window set `sampleMillis` themselves.
+    bucket.sampleMillis = millis;
     bucket.present = true;
     for (auto const& [metric, value]: slots)
         bucket.values[static_cast<std::size_t>(metric)] = value;
@@ -96,6 +100,30 @@ TEST_CASE("A rate is the delta between adjacent buckets, per minute", "[distribu
     CHECK_FALSE(values[0].has_value());
     REQUIRE(values[1].has_value());
     CHECK(Unwrap(values[1]) == 6.0); // 30 compiles over five minutes.
+}
+
+TEST_CASE("A partly-filled newest bucket is a rate over the span actually seen", "[distributed][fleetchart]")
+{
+    // The newest bucket is ALWAYS still open, and `Buckets()` stamps the window's
+    // start on whatever it folded, so the delta and the divisor come from
+    // different clocks. A 7-day view a minute past the hour holds the sample from
+    // h:01 and the one from (h-1):59 -- two minutes of work -- and dividing that
+    // by the nominal sixty reports a thirtieth of the rate, on the point labelled
+    // "now" and on the `HeadlineOf` figure beside the chart.
+    //
+    // Here in miniature: five-minute windows, but the two readings are one minute
+    // apart, so 30 compiles is 30 per minute rather than 6.
+    auto prior = At(0, { { FleetMetric::DispatchGranted, 100 } });
+    auto latest = At(300'000, { { FleetMetric::DispatchGranted, 130 } });
+    prior.sampleMillis = 240'000;  // sampled near the end of its window
+    latest.sampleMillis = 300'000; // sampled at the start of its own: one minute later
+
+    std::vector<FleetBucket> const buckets { prior, latest };
+
+    auto const values = ValuesFor(SeriesByKey("dispatched"), buckets, DaySeconds);
+    REQUIRE(values.size() == 2);
+    REQUIRE(values[1].has_value());
+    CHECK(Unwrap(values[1]) == 30.0);
 }
 
 TEST_CASE("A counter that goes backwards is a restart, and renders as a gap", "[distributed][fleetchart]")

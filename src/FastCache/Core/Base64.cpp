@@ -78,6 +78,16 @@ std::optional<std::string> Base64Decode(std::string_view text)
             group = (group << 6) | value;
         }
 
+        // The bits a padded group cannot carry must be zero, or one value has
+        // several spellings. Two symbols carry twelve bits and one byte consumes
+        // eight; three carry eighteen and two consume sixteen -- so the spare
+        // count is twice the padding, sitting directly below the bytes emitted
+        // below. Dropping them unchecked is the traditional shape of this
+        // function, and it is what turns `QQ==` and `QR==` into one secret.
+        auto const spareBits = 2 * groupPadding;
+        if (spareBits != 0 && ((group >> (6 * groupPadding)) & ((std::uint32_t { 1 } << spareBits) - 1)) != 0)
+            return std::nullopt;
+
         out.push_back(static_cast<char>((group >> 16) & 0xFF));
         if (groupPadding < 2)
             out.push_back(static_cast<char>((group >> 8) & 0xFF));

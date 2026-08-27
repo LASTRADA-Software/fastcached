@@ -61,3 +61,26 @@ TEST_CASE("Base64 decodes bytes that are not text", "[core][base64]")
     CHECK(decoded[0] == '\0');
     CHECK(static_cast<unsigned char>(decoded[4]) == 0xFF);
 }
+
+TEST_CASE("Base64 refuses a non-canonical final group", "[core][base64]")
+{
+    // The bits a padded group cannot carry must be ZERO, and a decoder that drops
+    // them instead accepts several spellings of one value -- which is the failure
+    // `Base64.hpp` names: "turns two different inputs into one secret". This one
+    // decodes a credential, so that is not a theoretical tidiness argument.
+    //
+    // Two symbols carry twelve bits and one byte consumes eight, so four are
+    // spare: `Q` is 010000 and `R` is 010001, and both left `0x41` behind.
+    CHECK(Unwrap(Base64Decode("QQ==")) == "A");
+    CHECK_FALSE(Base64Decode("QR==").has_value());
+
+    // Three symbols carry eighteen bits and two bytes consume sixteen, so two are
+    // spare. `QUE` is the canonical spelling of "AA"; `QUF` differs only in a bit
+    // no byte of the output can hold.
+    CHECK(Unwrap(Base64Decode("QUE=")) == "AA");
+    CHECK_FALSE(Base64Decode("QUF=").has_value());
+
+    // An unpadded group has no spare bits, so nothing here narrows what was
+    // already accepted.
+    CHECK(Unwrap(Base64Decode("QUJD")) == "ABC");
+}
