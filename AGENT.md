@@ -148,6 +148,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
 - A compile that writes a second artefact (a module BMI, a PCH) is refused, not cached.
+- The compiler identity is the driver AND the target it generates for: `clang-cl`
+  takes `-fms-compatibility-version` from whatever MSVC it finds, and that is code
+  generation. The **key** folds the target, the **fingerprint** must not.
+- Read the `-cc1` line's `-triple`; the `Target:` header three lines above it is
+  unversioned, and pinning it changes nothing while looking like a fix.
+- An empty triple means the identity is UNCHANGED, so `cl` and `gcc` keep their keys.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,

@@ -66,6 +66,72 @@ cold cache, so `scripts/compile-cache-e2e.sh` (POSIX) and
 `run-launcher-e2e.ps1` (Windows) assert them end-to-end in CI on both
 platforms.
 
+## The compiler identity is the driver AND the target it generates for
+
+A banner identifies the **driver**. A driver's code generation is not a function of
+the driver alone, and for `clang-cl` it is not even close: clang detects the MSVC
+installation it will be compatible with and sets `-fms-compatibility-version` from
+it, and clang's Microsoft C++ ABI gates version-specific code generation on that
+value. Same `clang-cl.exe`, different MSVC beside it, different object.
+
+Measured on clang-cl 22.1.3, one binary:
+
+| where it runs | effective `-fms-compatibility-version` |
+| --- | --- |
+| a developer command prompt | `19.51.36252`, from the MSVC install |
+| a Windows **service** (no `INCLUDE`, no prompt) | `19.33`, clang's built-in default |
+
+A `noexcept` function type mangles `P6AXXZ` below 19.12 and `P6AXX_E` from 19.12 on,
+so this reaches defined **and** undefined symbols.
+
+- **The key folds the target; the fingerprint does not.** They answer different
+  questions and one string cannot serve both. A fingerprint decides which **worker**
+  may serve a client, so folding the target in would split a developer-prompt
+  launcher from a service-run worker — the mismatch #145 removed, reintroduced for a
+  fact the dispatch line now states outright. A key decides which **object** may be
+  served, and there the target is load-bearing. `CacheCompilerId` builds the first;
+  `CompilerBanner` alone still feeds `CachedToolchainFingerprint`, and the compile
+  node must keep computing it the same way or the two ends stop matching in silence.
+- **A dispatched compile states the target on the line, first.** A worker otherwise
+  re-derives it from its own machine. `--target=<triple>` goes **ahead** of the
+  build's own arguments, so a `--target=` or `-m32` the build states still wins, as
+  it does locally — which is also why probing the ambient default is sufficient and
+  the compile's own command line is not needed. Appending it would override the
+  build, and compiling for a target the build did not ask for is a wrong object
+  rather than a failed one.
+- **One flag closes both halves.** The cc1 triple EMBEDS the compatibility version:
+  `--target=x86_64-pc-windows-msvc19.11.0` produces an object byte-identical to
+  `-fms-compatibility-version=19.11`. It therefore also closes the case where a
+  `clang-cl` on a POSIX worker — which after #145 had nothing Windows-specific left
+  in its digest — could return an ELF object to a client expecting COFF.
+- **Read the `-cc1` line's `-triple`, never the `Target:` header.** Both name a
+  triple and the header comes first, but the header is UNVERSIONED
+  (`x86_64-pc-windows-msvc`). A parser that took whichever it found first would pin
+  the architecture, drop the code-generation contract, and look entirely correct
+  doing it.
+- **Validate what comes back, and reject a leading dash.** The value is read
+  positionally — the argument after `-triple` — so an option carrying none leaves
+  the next FLAG in its place, and `-emit-obj` satisfies every other test for a
+  triple. It would reach both a cache key and a `--target=` argument.
+- **An empty triple means UNCHANGED, not an empty field.** `cl` and `gcc` have no
+  target to state (`cl`'s is decided by which `cl.exe` runs; `gcc` is fixed-target
+  and has no `--target`), so `CacheCompilerId` returns the banner byte for byte and
+  their entries stay reachable. Appending an empty field would re-key every cache in
+  the fleet to buy nothing.
+- **The two halves are framed, not concatenated.** `("ab", "c")` and `("a", "bc")`
+  would otherwise key alike. A newline separates them because a banner is one line
+  by construction and a triple is `[A-Za-z0-9._-]`, so neither half can contain it.
+- **The preprocessed text does not discriminate, so do not lean on it.** `_MSC_VER`
+  changes with the compatibility version but need not survive preprocessing: a TU
+  including `<cstdio>` preprocesses to **byte-identical** text at 19.29 and 19.51.
+  The hazard is not confined to include-free translation units.
+- **The probe is not cached, and the reason is the direction of the error.** The
+  fingerprint's stamp covers the compiler binary and its include roots, none of
+  which move when the MSVC install beside `clang-cl` is upgraded — so a triple
+  memoized against it goes stale in the one direction that yields a *wrong hit*
+  rather than a miss. It costs a second driver spawn per invocation on a clang
+  driver, beside the `--version` one already paid there.
+
 ## What the key is a function of
 
 - **A key determines two artefacts, so it must be a function of both.** Preprocessing
@@ -888,6 +954,12 @@ without reopening the argument:
 
 ## Open work
 
+- **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
+  target-triple probe costs a driver spawn per translation unit on clang and
+  clang-cl, hits included, because its answer is a cache key input. Memoizing it
+  under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
+  install the answer depends on, so a stale value would be a wrong hit rather than
+  a miss.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the

@@ -797,12 +797,17 @@ struct SourceProbe
     return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
 }
 
-/// This compiler's identity for keying: its version banner.
+/// This compiler's version banner.
 ///
 /// A thin call through to `Cc::CompilerBanner`, which the compile node also uses.
 /// One definition, because the node derives a fingerprint from this exact string
 /// and two spellings would put a worker permanently out of agreement with its
 /// clients -- silently, as a scheduler that simply never matches.
+///
+/// This is the FINGERPRINT's input and only half of the cache key's: what a key is
+/// built on is this banner plus the target the driver generates for, joined by
+/// `Cc::CacheCompilerId`. Passing this string where a key is expected would key two
+/// materially different code generators alike.
 /// @param compiler The compiler being fronted.
 /// @return The banner line, or the compiler's basename.
 [[nodiscard]] std::string CompilerId(std::string const& compiler)
@@ -1279,14 +1284,17 @@ void RecordManifest(Config const& cfg,
 /// @param cmd The parsed compile command.
 /// @param argv The original full invocation.
 /// @param key The object key, for duplicate suppression at the scheduler.
-/// @param toolchainStamp The compiler's version banner, as the cache key uses it.
+/// @param compilerBanner The compiler's version line ALONE -- the fingerprint's
+///        input, and deliberately not the cache key's, which also folds the target.
+/// @param targetTriple The target this client generates for, stated on the wire.
 /// @param dependencyPaths What the key's probe reported this TU depends on.
 /// @return A run to continue with, or nullopt to compile locally.
 [[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(Config const& cfg,
                                                              Cc::ParsedCommand const& cmd,
                                                              std::span<std::string const> argv,
                                                              std::string_view key,
-                                                             std::string_view toolchainStamp,
+                                                             std::string_view compilerBanner,
+                                                             std::string_view targetTriple,
                                                              std::vector<std::string> const& dependencyPaths)
 {
     // Refused before anything is sent when the command line carries something this
@@ -1319,9 +1327,12 @@ void RecordManifest(Config const& cfg,
     // Rebuilt rather than having the flag spliced in here: the rule that the pin goes
     // FIRST -- so the build's own `--target=` or `-m32` still wins -- belongs to the
     // function that owns the argument order, and it is unit-tested there. A second
-    // pass over a short argument list is string work against a process spawn.
-    if (auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, Cc::DriverOf(cmd.flavor));
-        !targetTriple.empty())
+    // pass over a short argument list costs nothing worth naming.
+    //
+    // The triple is the CALLER's, already folded into the cache key, so this path
+    // spawns nothing of its own: the value a worker is told to generate for and the
+    // value the key was computed under are one probe's answer, and could not be two.
+    if (!targetTriple.empty())
         args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
 
     // Preprocessed again, with `#line` markers this time. The key's text has them
@@ -1336,20 +1347,28 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
-    // The DISPATCH identity, which is not the cache key's. The key folds in the
-    // compiler's `--version` banner, which is enough for a cache -- a wrong answer
-    // there is a miss the replay guard can still backstop. Distribution has no such
-    // backstop: two machines can print an identical banner while resolving
-    // different libstdc++ headers, and the object that comes back would be wrong
-    // rather than merely unhelpful. So a worker is matched on a digest of the whole
-    // include tree instead.
+    // The DISPATCH identity, which is not the cache key's -- and it is built on the
+    // BANNER ALONE, deliberately, where the key also folds the target.
+    //
+    // The two answer different questions and the same string cannot serve both. A
+    // fingerprint decides which WORKER may serve this client: folding the target in
+    // would split a developer-prompt launcher from a service-run worker, which is
+    // the mismatch #145 removed, reintroduced for a fact the dispatch line now
+    // states outright. A key decides which OBJECT may be served, and there the
+    // target is load-bearing -- two machines with one clang-cl and two MSVC installs
+    // print the same banner and need different objects.
+    //
+    // What the banner alone still cannot do is stand in for the include tree: two
+    // machines can print an identical version line while resolving different
+    // libstdc++ headers, and for distribution that is a wrong object rather than a
+    // miss. So a worker is matched on a digest of the whole tree.
     //
     // Computed HERE rather than beside the stamp, so it stays on the miss-and-
     // dispatch-configured path only: it is a cache read in the steady state, but
     // several seconds the first time a machine sees a toolchain, and a build that
     // never dispatches must not pay that at all.
     auto const fingerprint = Cc::CachedToolchainFingerprint(
-                                 ProcessRunner(), ToolchainHost(), cmd.compiler, toolchainStamp, Cc::DriverOf(cmd.flavor))
+                                 ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor))
                                  .fingerprint;
 
     auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
@@ -1450,7 +1469,22 @@ void RecordManifest(Config const& cfg,
         Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree, [&reconciler](std::string_view path) {
             return reconciler.Directory(path);
         });
-    auto const toolchainStamp = CompilerId(cmd.compiler);
+    auto const compilerBanner = CompilerId(cmd.compiler);
+
+    // Asked HERE, above the cache lookup, because the answer is a cache key input and
+    // a key is needed on a hit too. That is a second spawn per invocation on a clang
+    // driver, beside the `--version` one already paid, and it is the price of the key
+    // meaning what it says. Caching it under the fingerprint's stamp was considered
+    // and rejected: that stamp covers the compiler binary and its include roots, none
+    // of which move when the MSVC install beside `clang-cl` is upgraded, so a cached
+    // triple goes stale in the one direction that yields a WRONG HIT rather than a
+    // miss. A driver with no target to state (`cl`, `gcc`) is not spawned at all.
+    auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, Cc::DriverOf(cmd.flavor));
+
+    // The banner and the target, joined once. Everything that decides which OBJECT
+    // may be served keys on this; the fingerprint, which decides which WORKER may
+    // serve, keeps the banner alone. See CacheCompilerId.
+    auto const toolchainStamp = Cc::CacheCompilerId(compilerBanner, targetTriple);
 
     // Read once here rather than wherever a relative path needs placing. Three
     // consumers need exactly this value — the replay guard, the manifest's own
@@ -1678,7 +1712,7 @@ void RecordManifest(Config const& cfg,
     // everything below this point is unchanged and cannot tell the difference. That
     // is deliberate: the STORE, the manifest and the statistics all have one path,
     // and a second one would be a second place for them to diverge.
-    auto run = dispatchConfigured ? TryRemoteCompile(cfg, cmd, argv, key, toolchainStamp, dispatchDependencies)
+    auto run = dispatchConfigured ? TryRemoteCompile(cfg, cmd, argv, key, compilerBanner, targetTriple, dispatchDependencies)
                                   : std::optional<Cc::CompileRun> {};
     if (!run.has_value())
         run = RunCaptureSplit(argv);
