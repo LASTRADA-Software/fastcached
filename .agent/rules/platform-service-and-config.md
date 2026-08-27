@@ -372,6 +372,18 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## Open work
 
+- **[#186](https://github.com/LASTRADA-Software/fastcached/issues/186)** — the rule
+  above holds for the consensus tier and for nothing else yet. `--listen-scheduler`,
+  `--admin-listen` and `--discovery` are `ParseText` rows whose grammar is checked
+  inside `SchedulerTier::Start`, `AdminEndpoint::Start` and
+  `StartDiscoveryOrExplain`, each fatal and each reached long after
+  `--install-service` has returned — so `--install-service --listen-scheduler=nope`
+  registers cleanly and exits `ExitUsage` forever. What makes it a ticket rather
+  than three more rows: unlike `--listen-raft` under a `--node-id`, all three have a
+  legitimate *absence* (no scheduler surface, no admin surface), so the predicate is
+  "parses when given" rather than "parses", and `ParseEndpoint`'s default host
+  differs per flag.
+
 - **[#155](https://github.com/LASTRADA-Software/fastcached/issues/155)** — `argv`
   on Windows carries the ANSI code page, and nothing in this tree converts it to
   UTF-8. It did not matter while every string a peer sent was passed through
