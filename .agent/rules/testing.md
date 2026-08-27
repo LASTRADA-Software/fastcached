@@ -143,6 +143,24 @@ than as a stranger answering. It also re-checks that the daemon still running is
 the one it started, because a port that was free at `bind` time says nothing about
 who holds it a second later.
 
+**A drawn port is drawn from below the kernel's ephemeral range, and remembered.**
+Both halves have now been a red CI run. The ledger came first: nothing is listening
+on a port issued a moment ago whose server has not bound yet, and a fixture that
+draws every port it needs before binding any of them can hand the same number out
+twice. The range came second, and is the half a connect probe *cannot* answer at
+all — a port may be the local endpoint of an **outbound** connection, ESTABLISHED
+or TIME_WAIT, with nothing listening on it, so the probe says "free" and the
+`bind()` still fails with `EADDRINUSE`. A draw of 20000–39999 overlapped Linux's
+default `ip_local_port_range` of 32768–60999 by better than one number in three,
+and `dist-compile-e2e` duly died at `bind(127.0.0.1:33174) failed: 98` in the case
+that runs after five cases' worth of connections. Every fixture now draws
+20000–31999, below that floor and below macOS's 49152.
+
+A fixture that reports "free" from a probe is answering *"is anything answering
+here"*, which is not the same question as *"can I bind here"* — and the gap between
+the two is exactly where a smoke test fails for a reason that has nothing to do
+with what it tests.
+
 ## What `cluster-e2e` covers
 
 `cluster-e2e` is the consensus counterpart, and what it covers is deliberately

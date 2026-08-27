@@ -84,10 +84,17 @@ fail() {
 # Ports are allocated per run rather than fixed: four more fixed ports are four
 # more ways to collide with whatever else a CI runner is doing, and the failure
 # reads as "the dashboard is broken" when it means "something else was listening".
+#
+# The range stops below the kernel's ephemeral port range: a port can be an
+# outbound connection's local endpoint with nothing listening on it, so this probe
+# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
+# reasoning, and the CI failure that found it, are above `free_port` in
+# dist-compile-e2e.sh.
 free_port() {
     local port
+    local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
-        port=$(( 20000 + RANDOM % 20000 ))
+        port=$(( floor + RANDOM % (ceiling - floor) ))
         if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
             echo "$port"
             return 0

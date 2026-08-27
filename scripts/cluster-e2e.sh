@@ -127,10 +127,17 @@ export XDG_STATE_HOME="${workdir}/state"
 # substitution, and a subshell's assignment is gone the moment it exits -- which
 # is how a first attempt at this fixed nothing at all. It lives under `workdir`,
 # so the existing cleanup takes it away.
+#
+# The range stops below the kernel's ephemeral port range: a port can be an
+# outbound connection's local endpoint with nothing listening on it, so this probe
+# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
+# reasoning, and the CI failure that found it, are above `free_port` in
+# dist-compile-e2e.sh.
 free_port() {
     local port ledger="${workdir}/.issued-ports"
+    local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
-        port=$(( 20000 + RANDOM % 20000 ))
+        port=$(( floor + RANDOM % (ceiling - floor) ))
         if grep -qx "$port" "$ledger" 2>/dev/null; then
             continue
         fi

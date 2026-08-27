@@ -145,10 +145,28 @@ export FASTCACHE_VERBOSE=1
 # substitution, and a subshell's assignment is gone the moment it exits -- which
 # is how a first attempt at this fixed nothing at all. It lives under `workdir`,
 # so the existing cleanup takes it away.
+#
+# The range stops BELOW the kernel's ephemeral port range, which is the half a
+# connect probe cannot cover. A port can be the local endpoint of an OUTBOUND
+# connection -- ESTABLISHED or TIME_WAIT -- with nothing listening on it, so the
+# probe says "free" and the `bind()` that follows still fails with EADDRINUSE.
+# The ledger does not help either: that port was never issued by this fixture.
+#
+# CI caught exactly that: `bind(127.0.0.1:33174) failed: 98` for case 6's daemon,
+# started after five cases' worth of launcher and probe connections had consumed
+# ephemeral ports. 33174 is inside Linux's default `ip_local_port_range` of
+# 32768-60999, which the old draw of 20000-39999 overlapped by its top 7232
+# numbers -- worse than one draw in three.
+#
+# 20000-31999 is below that floor and below macOS's 49152, and 12000 numbers is
+# ample for a fixture that draws a dozen. A machine that lowered the sysctl below
+# 32000 would need this to move with it, and
+# `cat /proc/sys/net/ipv4/ip_local_port_range` is the check.
 free_port() {
     local port ledger="${workdir}/.issued-ports"
+    local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
-        port=$(( 20000 + RANDOM % 20000 ))
+        port=$(( floor + RANDOM % (ceiling - floor) ))
         if grep -qx "$port" "$ledger" 2>/dev/null; then
             continue
         fi

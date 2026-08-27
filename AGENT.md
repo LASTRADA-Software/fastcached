@@ -336,7 +336,9 @@ and what they may assume.
 - Every wait is bounded and says what it waited for.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
-- Tests allocate their ports per run rather than fixing them.
+- Tests allocate their ports per run rather than fixing them — from **below** the
+  kernel's ephemeral range, and remembered, because a connect probe cannot see a
+  port already held as an outbound connection's local endpoint.
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
