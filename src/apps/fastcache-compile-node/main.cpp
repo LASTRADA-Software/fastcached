@@ -248,21 +248,6 @@ constexpr int ExitOk = 0;
         return ExitUsage;
     auto const toolchains = *std::move(toolchainsOrNone);
 
-    // Computed HERE and advertised, rather than left for the scheduler to derive.
-    // Both would use the same `OfferableSlots`, so the numbers would agree -- but
-    // this worker has to enforce a limit before it has a scheduler to ask, and a
-    // worker running to one number while the scheduler leases against another is
-    // exactly the "fuller and slower than the scheduler believes" failure `--slots`
-    // documents. One call, one answer, used for both.
-    // The machine arrives through a seam rather than through `hardware_concurrency()`
-    // and `QueryHostTotalMemoryBytes()` directly: `NodeCapacityOf` is what decides
-    // which facts come from the operator and which from the hardware, and that rule
-    // is only checkable if a test can present a two-core laptop and a 128-thread
-    // server in one run. It also lives in `NodeConfig.cpp` rather than here, because
-    // this file is in no test target.
-    auto const host = MakeSystemHostFacts();
-    auto const capacity = Node::NodeCapacityOf(cfg, *host);
-    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
     // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
@@ -342,13 +327,13 @@ constexpr int ExitOk = 0;
         jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
     };
 
-    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger };
-
-    // The admin endpoint used to be built here, and moving it down is the fix
-    // rather than tidying. Its snapshot lambda has to report the node's cache, and
-    // the cache tier is started further down -- so a lambda captured at this point
-    // could only ever say `.storage = std::nullopt`, which is exactly what it said,
-    // comment and all, for as long as this program has had a cache.
+    // The worker server and the admin endpoint are both built BELOW the cache tier,
+    // and in both cases moving them down was the fix rather than tidying: one takes
+    // a slot count that is not knowable until the tier has been built or not been
+    // (#167), and the other's snapshot lambda has to report the node's cache -- so
+    // captured up here it could only ever say `.storage = std::nullopt`, which is
+    // exactly what it said, comment and all, for as long as this program has had a
+    // cache.
 
     // The fleet scheduler, when this node is the one running it. Off unless asked
     // for: handing out other machines' CPU time is an operator's decision, not
@@ -444,6 +429,29 @@ constexpr int ExitOk = 0;
     // carry on without a tier rather than as failures. Both have been logged.
     auto const cacheTier = std::move(*cacheTierOrRefusal);
 
+    // Computed HERE and advertised, rather than left for the scheduler to derive.
+    // Both would use the same `OfferableSlots`, so the numbers would agree -- but
+    // this worker has to enforce a limit before it has a scheduler to ask, and a
+    // worker running to one number while the scheduler leases against another is
+    // exactly the "fuller and slower than the scheduler believes" failure `--slots`
+    // documents. One call, one answer, used for both.
+    // The machine arrives through a seam rather than through `hardware_concurrency()`
+    // and `QueryHostTotalMemoryBytes()` directly: `NodeCapacityOf` is what decides
+    // which facts come from the operator and which from the hardware, and that rule
+    // is only checkable if a test can present a two-core laptop and a 128-thread
+    // server in one run. It also lives in `NodeConfig.cpp` rather than here, because
+    // this file is in no test target.
+    //
+    // And it is computed BELOW the cache tier, which is the whole of #167: what a
+    // compile cannot have is what the tier actually HOLDS, which is what the
+    // configuration asked for only sometimes. `NodeCapacityOf`'s contract carries the
+    // three ways those differ; this is the ordering that lets it be honoured.
+    auto const host = MakeSystemHostFacts();
+    auto const capacity = Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()));
+    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
+
+    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger };
+
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a
     // decision, not a default.
@@ -525,17 +533,11 @@ constexpr int ExitOk = 0;
     // of them. The pool behaves as one because the number it reports describes
     // the machine rather than the entry.
     //
-    // The capacity they announce is the machine facts PLUS what the cache tier
-    // actually became, and the second half is read off the tier rather than off
-    // the configuration that asked for it. `--listen-cache` may have been taken and
-    // `--cache-memory 0` may have turned the memory half off, so a node announcing
-    // the budget it was configured with would have the leader reporting a cache
-    // that is not there. It cannot be folded into `capacity` above either: that one
-    // is what `slots` was derived from, and the tier does not exist at that point.
-    auto advertised = capacity;
-    advertised.cache = Node::CacheCapacityOf(cacheTier.get());
-
-    auto advertisedWire = Distributed::CapacityToWire(advertised);
+    // `capacity` already carries the tier's record, so there is nothing to assemble
+    // here. It used to be a patched copy -- the tier did not exist where `capacity`
+    // was derived -- and since #167 it does, which is what makes the number this
+    // worker enforces and the cache the leader renders one call rather than two.
+    auto advertisedWire = Distributed::CapacityToWire(capacity);
     // Compiled in, never configurable. The point of the column this feeds is to tell
     // an operator which binary is actually running on each machine -- most often
     // part-way through a rolling upgrade -- and a version a node could be *told* to

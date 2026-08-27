@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
@@ -8,8 +9,11 @@
 
 #include <array>
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -255,6 +259,57 @@ namespace
         // `--service-scope=user` from the daemon must not find the worker accepting a
         // different vocabulary.
         return ParseServiceScope(sv);
+    }
+
+    /// Memory this node's cache tiers hold, and so cannot lend to a compile.
+    ///
+    /// A fold over `StorageTierTable`'s `budgetIsResidentMemory` column rather than a
+    /// look at the memory tier by name: the taxonomy is open and enumerators are
+    /// appended, so a resident tier added later reaches this arithmetic by being a
+    /// row. Naming `StorageTier::Memory` here would ignore it, and under-counting is
+    /// the direction that over-commits the machine.
+    ///
+    /// Only budgets that are *denominated in* RAM are summed, which is what that
+    /// column says. A disk tier's own in-memory key index is real and is not covered
+    /// here (#175) -- but adding its DISK budget to a memory total would be wrong by
+    /// the ratio between the two, not right by accident.
+    ///
+    /// Total over the vocabulary rather than correct by distant assumption, which is
+    /// the difference between the two spellings of "nothing to add":
+    ///
+    ///   - **Absent** is a tier this node does not run, and contributes nothing.
+    ///   - **Present and zero** is a tier with no ceiling -- the same UNBOUNDED that
+    ///     `--cache-memory 0` once meant to `InMemoryLruStorage` -- so a resident one
+    ///     may take the whole machine and is reserved as such. `BuildStorage` does
+    ///     not build the memory half that way today, but reading it as "reserve
+    ///     nothing" would be the exact inverse of what it says, and that number's two
+    ///     meanings have bitten this codebase before.
+    /// @param cache What this node's tiers actually hold.
+    /// @param totalMemoryBytes The machine's RAM, which an unbounded tier may take all of.
+    /// @return Bytes held back from compiles.
+    [[nodiscard]] std::uint64_t ResidentCacheBytes(Distributed::NodeCacheCapacity const& cache,
+                                                   std::uint64_t totalMemoryBytes) noexcept
+    {
+        std::uint64_t reserved = 0;
+        for (auto const& row: StorageTierTable)
+        {
+            if (!row.budgetIsResidentMemory)
+                continue;
+
+            auto const& budget = cache.tierBytesLimit[static_cast<std::size_t>(row.tier)];
+            if (!budget.has_value())
+                continue;
+            if (*budget == 0)
+                return totalMemoryBytes;
+
+            // Saturating rather than wrapping, for the reason `OfferableSlots`'s core
+            // reserve is: budgets that summed past 64 bits would otherwise come back
+            // as a SMALL reservation, which is the over-commit direction again.
+            if (*budget > std::numeric_limits<std::uint64_t>::max() - reserved)
+                return std::numeric_limits<std::uint64_t>::max();
+            reserved += *budget;
+        }
+        return reserved;
     }
 } // namespace
 
@@ -637,16 +692,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     return options;
 }
 
-Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource const& host)
+Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
+                                         IHostFactsSource const& host,
+                                         Distributed::NodeCacheCapacity const& cache)
 {
     return Distributed::NodeCapacity { .logicalCores = host.LogicalCores(),
                                        .totalMemoryBytes = host.TotalMemoryBytes(),
-                                       // What this node's own cache tier will take,
-                                       // and therefore what a compile cannot have.
-                                       // `cfg.cacheMemoryBytes` is exactly what
-                                       // `CacheTier` builds the memory half with, and
-                                       // zero is both "no tier" and "nothing held".
-                                       .reservedMemoryBytes = cfg.cacheMemoryBytes,
+                                       .reservedMemoryBytes = ResidentCacheBytes(cache, host.TotalMemoryBytes()),
                                        .nodeClass = cfg.nodeClass,
                                        // Absent is not zero, and this is the one line
                                        // where the two are told apart: a reserve the
@@ -657,7 +709,12 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg, IHostFactsSource
                                        // desktop unusable in one direction and wastes
                                        // a build server in the other.
                                        .reservedCores = cfg.reservedCores.value_or(0),
-                                       .reserveIsExplicit = cfg.reservedCores.has_value() };
+                                       .reserveIsExplicit = cfg.reservedCores.has_value(),
+                                       // The same record the reservation was derived
+                                       // from, carried on to the leader -- so what
+                                       // this node holds back and what the fleet is
+                                       // shown cannot drift apart at this end.
+                                       .cache = cache };
 }
 
 ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg)

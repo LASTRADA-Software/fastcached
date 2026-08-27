@@ -162,6 +162,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `NoCapacity` for a key it is already building.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.
+- What a node holds back from compiles is what its tier **built**, never what a flag
+  asked for — so capacity is derived *below* the tier startup. Which tiers cost RAM
+  is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same

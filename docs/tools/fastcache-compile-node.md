@@ -288,6 +288,17 @@ now offers 24. The figure travels with the registration, so a node that asks the
 scheduler to size it (`--slots 0`) gets the same answer at the other end, and a
 peer too old to report it is sized exactly as it always was.
 
+**What is subtracted is what the tier actually holds, not what you asked for.** A
+node that ends up with no tier subtracts nothing and offers the whole machine. Two
+ways of ending up there leave `--cache-memory` reading as though it still meant
+something: `--listen-cache=` turns the cache off outright, and a *default*
+`--listen-cache` that something else already holds — a `fastcached` on the same
+box, usually — is a warning the node carries on past. Both used to reserve the
+configured budget regardless, so on a 32 GiB machine such a node held back the
+default 8 GiB it was not using and offered 24 slots where it could serve 32. A
+disk-only cache (`--cache-memory=0 --cache-dir=…`) is resident nowhere and so
+subtracts nothing either, which is the one case that was always right.
+
 The default follows the machine because the machines this runs on vary by more
 than an order of magnitude, and one object file is routinely megabytes: a cache
 sized for a laptop is close to useless on a 96 GB workstation, and a flat number
