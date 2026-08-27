@@ -89,6 +89,7 @@ target_sources(FastCache
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
         Platform/Terminal.cpp
+        Platform/WindowsEventLogger.cpp
         Platform/WindowsServiceHost.cpp
         Net/InMemoryTransport.cpp
         Protocol/Framing/LineReader.cpp

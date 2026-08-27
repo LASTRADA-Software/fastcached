@@ -44,6 +44,7 @@
 #include <FastCache/Platform/InheritedListener.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 #include <FastCache/Platform/Terminal.hpp>
+#include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -757,7 +758,12 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    ConsoleLogger logger { std::cerr, cfg.logLevel };
+    // The admin verbs below answer an operator at a terminal, so they report to one
+    // -- even under `--daemon`, which the registered command line carries and which
+    // is therefore exactly what somebody copies out of `sc qc` to try by hand. Their
+    // refusals going to the event log while the terminal showed only an exit code
+    // would be the same defect this file is fixing, pointed the other way.
+    ConsoleLogger consoleLogger { std::cerr, cfg.logLevel };
 
     // Service registration, before anything that costs time. A misconfiguration is
     // decided in microseconds while a toolchain fingerprint takes seconds, which is
@@ -778,7 +784,7 @@ int main(int argc, char** argv)
         if (cfg.installService)
             if (auto const rejection = NodeInstallRejection(cfg))
             {
-                logger.Logf(LogLevel::Error, "{}", *rejection);
+                consoleLogger.Logf(LogLevel::Error, "{}", *rejection);
                 return ExitUsage;
             }
 
@@ -803,7 +809,7 @@ int main(int argc, char** argv)
         auto const outcome = MigrateDiskTier(cfg);
         if (!outcome.has_value())
         {
-            logger.Logf(LogLevel::Error, "{}", outcome.error());
+            consoleLogger.Logf(LogLevel::Error, "{}", outcome.error());
             return ExitUsage;
         }
         std::cout << "fastcache-compile-node: " << *outcome << '\n';
@@ -825,6 +831,18 @@ int main(int argc, char** argv)
         std::cout << *answer;
         return ExitOk;
     }
+
+    // NOW the sink is chosen. Everything from here is what a RUNNING service reports
+    // -- every startup refusal below, the toolchain survey, and the loop itself --
+    // and a service has no console for any of it to land on (#179). Everything above
+    // was an operator at a terminal, and stays there.
+    //
+    // The factory answers nullptr wherever there is no event log, which is what keeps
+    // this one expression rather than a platform branch, and `cfg.daemon` rather than
+    // "am I on Windows" is what keeps a foreground run pointed at its terminal on a
+    // machine that has one.
+    auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
+    ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(consoleLogger);
 
     // Both are refused at startup rather than at the first job. A worker missing
     // either would register (or fail to) and then refuse everything, which presents
