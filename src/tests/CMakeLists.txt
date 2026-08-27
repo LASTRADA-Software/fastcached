@@ -123,6 +123,52 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The sccache-backend caveat. Fails when a file recommends pointing sccache at
+# fastcached -- which is what naming either of the two `SCCACHE_*` backend
+# variables is -- without saying, within 40 lines, what that costs under MSVC and
+# clang-cl.
+# scripts/check-sccache-backend-caveat.cmake carries the tables and prints them
+# on failure.
+#
+# compile-cache-caveat, below, pins the warning the vendored CMake module emits
+# when IT falls back to sccache. This is issue #170: the people README.md pitches
+# the backend to never configure that module -- they have their own build system
+# and set the variable themselves -- so that warning cannot reach them, and the
+# configuration they are being sold is by definition ONE cache shared across
+# every checkout and machine, which is the maximal form of the same hazard. Four
+# surfaces said it with no caveat and README.md said the opposite of it.
+#
+# A rule about prose, enforced rather than remembered, for the reason net-boundary
+# is: the next page pitching this arrives from an author who never saw the caveat
+# on the others, and nothing about that fails, warns, or shows up in review.
+#
+# It searches every source root and JUDGES only markdown. A non-prose file that
+# names a variable is neither judged nor waved through: it has to appear in the
+# script's exemption table saying what owns it instead. `--help` is the live case
+# -- its caveat is prose inside a C++ string literal, which a source scan finds
+# just as happily in a comment beside it, so the `--help qualifies its sccache
+# examples with the MSVC caveat` case in CliParser_test.cpp owns it and asserts
+# against the RENDERED usage string.
+#
+# Not labelled "smoke", for the reason the three above are not: it reads source
+# files and reports, so it belongs in the default `ctest` set and must survive
+# `ctest -LE smoke`. It has no skip path -- the source tree is present in an
+# exported tarball exactly as it is in a checkout. Slower than its siblings
+# (~0.2-0.5 s against their ~0.1-0.2 s) because it reads every candidate file to
+# find the few that name a variable, which is what makes it a discovery rather
+# than a list of places to look; still far inside the timeout.
+add_test(
+    NAME "sccache-backend-caveat"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-sccache-backend-caveat.cmake"
+)
+set_tests_properties("sccache-backend-caveat" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Service accounts. Fails when the account a binary compiles into its ServiceSpec
 # is not the one the macOS package creates, or is created by no postinstall, or is
 # never removed by the uninstaller.

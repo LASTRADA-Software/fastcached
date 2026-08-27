@@ -506,6 +506,45 @@ TEST_CASE("CliParser: --help names every location the daemon would read a config
         REQUIRE(usage.contains(FastCache::ExpandApplicationName(candidate.display, FastCache::DaemonApplicationName)));
 }
 
+TEST_CASE("CliParser: --help qualifies its sccache examples with the MSVC caveat", "[config][cli][help]")
+{
+    auto const usage = FastCache::CliUsage();
+
+    // The examples above this recommend pointing sccache at a fastcached daemon
+    // -- on Windows with an MSVC compile line, which is exactly the exposed
+    // configuration. sccache hashes /EP output, which carries no paths, and
+    // replays a hit's /showIncludes with the absolute paths of the checkout that
+    // stored it, so two checkouts at different paths sharing one cache record
+    // each other's headers and an edited header then rebuilds nothing.
+    //
+    // `ctest -R sccache-backend-caveat` requires the same three facts -- which
+    // compilers, the mechanism, the remedy -- of every prose surface naming one
+    // of the SCCACHE_* variables, and exempts this one by name in favour of this
+    // case. Deliberately: that check reads C++ SOURCE, where a mention in the
+    // Doxygen comment beside the literal would satisfy it just as happily as the
+    // help text itself. What follows asserts the RENDERED string, which is the
+    // thing a user actually reads.
+    //
+    // Every one of them on every platform, not only where _WIN32 splits the
+    // examples: what is exposed is the COMPILER. A Windows host building with
+    // MinGW g++ is not exposed and a POSIX host cross-compiling with clang-cl
+    // is, and a daemon printing its own help knows neither -- so it names the
+    // condition rather than guessing it. This case running on the POSIX builds
+    // is what holds that.
+    REQUIRE(usage.contains("MSVC"));
+    REQUIRE(usage.contains("clang-cl"));
+    REQUIRE(usage.contains("fastcache-cc"));
+
+    // And the caveat reads after what it qualifies, not before it. Both
+    // positions are checked: with `caveat` at npos, `caveat > recommendation`
+    // would be trivially true and this would assert nothing.
+    auto const recommendation = usage.find("SCCACHE_");
+    auto const caveat = usage.find("/showIncludes");
+    REQUIRE(recommendation != std::string::npos);
+    REQUIRE(caveat != std::string::npos);
+    REQUIRE(caveat > recommendation);
+}
+
 TEST_CASE("CliParser: --seed-config parses and selects the seeding action", "[config][cli]")
 {
     std::array<char const*, 1> const argv { "--seed-config=/tmp/fastcached.yaml.default" };

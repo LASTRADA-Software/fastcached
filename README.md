@@ -24,7 +24,8 @@ Three things ship from this repository:
 
 Use them together for a shared compile cache, or run `fastcached` on its own as
 a memcached/Redis-compatible cache — including as a plain
-[sccache backend](#using-fastcached-as-an-sccache-backend).
+[sccache backend](#using-fastcached-as-an-sccache-backend), which comes with a
+caveat on MSVC and clang-cl.
 
 It is not a general-purpose replacement for memcached or Redis: it implements
 only the slice of each protocol a cache backend needs. It is in production use
@@ -203,8 +204,35 @@ talks **binary**. Both work, because the listener detects the wire format from
 the first bytes the client sends. `SCCACHE_REDIS` works the same way. CI
 exercises all three protocols on every build.
 
-Note that sccache keys on absolute paths, so its entries are **not** portable
-between checkouts at different paths — that is the reason `fastcache-cc` exists.
+Whether sccache's entries are portable between checkouts at different paths
+depends on the compiler — and on MSVC and clang-cl that is a hazard rather than a
+limitation:
+
+- **GCC and Clang.** The text sccache hashes carries `# n "path"` line markers,
+  so two checkouts hash differently and never share an entry. Nothing goes
+  wrong, and nothing is shared either — which is the reason `fastcache-cc`
+  exists.
+- **MSVC and clang-cl.** sccache preprocesses with `/EP`, which emits no line
+  markers, so the hashed text carries **no paths at all** and the two checkouts
+  *do* share entries — while the `/showIncludes` stream replayed on a hit carries
+  the **absolute** paths of the checkout that stored it. Each build then records
+  the other's headers as its dependencies, editing a header rebuilds nothing, and
+  the objects go stale behind a green build. Measured with sccache 0.14.0 and
+  MSVC 14.51: a second directory took a cache hit from the first, and its
+  `/showIncludes` named the *first* directory's header. The same two compiles
+  under g++ 14 were 0 hits and 2 misses.
+
+What is exposed is narrower than "sharing a cache": an **incremental** build
+across checkouts at **different absolute paths**. A clean build has no dependency
+graph to corrupt, and runners that all check out to the same path replay paths
+that are correct — a CI fleet is normally both, and this is no reason to take the
+cache away from one. But a `fastcached`-backed sccache is *definitionally* one
+cache shared by every checkout and every machine pointed at it, so the developer
+machines behind it are exposed even where CI is not. **On MSVC and clang-cl use
+[`fastcache-cc`](#quick-start-caching-your-compiles) instead** — it rewrites a
+hit's paths into the consuming checkout before replaying them, and refuses a hit
+whose replayed dependency is not there, which is why it does not have this
+failure mode.
 
 ## Production deployment
 

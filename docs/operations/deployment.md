@@ -369,3 +369,5 @@ The original use case still works — point sccache at the cache port:
 export SCCACHE_REDIS=redis://:secret@host:6674   # with auth
 export SCCACHE_MEMCACHED=tcp://host:6674         # binary protocol, no auth
 ```
+
+--8<-- "sccache-backend-caveat.md"

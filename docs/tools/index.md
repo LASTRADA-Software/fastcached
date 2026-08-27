@@ -58,6 +58,11 @@ Reference: [compile-cache-testclient](compile-cache-testclient.md).
 |------|-----|
 | Speed up C/C++ compiles across machines | `fastcache-cc` + a `fastcached` daemon |
 | Compile on other machines too, not just cache | add `fastcache-compile-node` workers |
-| Back an existing sccache setup | `fastcached` alone, via `SCCACHE_MEMCACHED` / `SCCACHE_REDIS` |
+| Back an existing sccache setup, on GCC or Clang | `fastcached` alone, via `SCCACHE_MEMCACHED` / `SCCACHE_REDIS` |
 | A memcached- or Redis-compatible cache | `fastcached` alone |
 | Verify path canonicalization while hacking on the cache | `compile-cache-testclient` |
+
+The sccache row is the one with a condition on it, and the condition is the
+compiler rather than the goal:
+
+--8<-- "sccache-backend-caveat.md"

@@ -54,6 +54,23 @@ cmake_minimum_required(VERSION 3.28)
 # is a test that passes while saying nothing.
 set(FastCachedCaveatMarker "sccache replays a cache hit")
 
+# ...and what the caveat must still SAY, beyond opening with that fragment.
+#
+#   <element>|<accepted spellings, ' / ' separated>
+#
+# The marker above pins how the warning starts, which is not the same as pinning
+# that it remains useful: the text could lose `fastcache-cc` entirely, or stop
+# naming which compilers are exposed, and every assertion here would still pass.
+# The same three elements are required of every prose surface that recommends
+# pointing sccache at fastcached (`ctest -R sccache-backend-caveat`, issue #170),
+# and this is the caveat that reaches a developer at the moment of the mistake
+# rather than hours later, so it is held to them too. Wording is free.
+set(FastCachedCaveatElements
+    "the exposed compilers|MSVC / clang-cl"
+    "the mechanism|/showIncludes / /EP"
+    "the remedy|fastcache-cc"
+)
+
 # One row per selection outcome, pipe-delimited:
 #
 #   <name>|<expected output>|<forbidden output>|<stand-in launcher>|<severity>|<extra -D args>
@@ -241,6 +258,28 @@ foreach(row IN LISTS FastCachedCaveatRows)
         endif()
         if(markerAt EQUAL -1)
             list(APPEND violations "${name}: expected the caveat itself, not merely some warning\n${output}")
+        else()
+            # It is the caveat. Is it still a useful one?
+            foreach(elementRow IN LISTS FastCachedCaveatElements)
+                string(FIND "${elementRow}" "|" elementSeparator)
+                string(SUBSTRING "${elementRow}" 0 ${elementSeparator} elementName)
+                math(EXPR elementSpellingStart "${elementSeparator} + 1")
+                string(SUBSTRING "${elementRow}" ${elementSpellingStart} -1 elementSpellings)
+
+                set(elementPresent FALSE)
+                string(REPLACE " / " ";" spellings "${elementSpellings}")
+                foreach(spelling IN LISTS spellings)
+                    string(FIND "${output}" "${spelling}" spellingAt)
+                    if(NOT spellingAt EQUAL -1)
+                        set(elementPresent TRUE)
+                        break()
+                    endif()
+                endforeach()
+                if(NOT elementPresent)
+                    list(APPEND violations
+                        "${name}: the caveat no longer names ${elementName} (${elementSpellings})\n${output}")
+                endif()
+            endforeach()
         endif()
     elseif(NOT warnedAt EQUAL -1)
         list(APPEND violations "${name}: expected no CMake Warning at all\n${output}")

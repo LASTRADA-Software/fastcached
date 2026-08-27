@@ -595,9 +595,32 @@ namespace
 #endif
     });
 
-    /// Closing note printed after the examples.
-    constexpr std::string_view UsageFooter = "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
-                                             "either works because fastcached auto-detects the wire format.";
+    /// Closing notes printed after the examples, one rendered block each.
+    ///
+    /// A table rather than one longer literal, because they are separate notes to
+    /// a reader -- the first is compatibility, the second a correctness hazard --
+    /// and the renderer already separates blocks with a blank line.
+    ///
+    /// Neither is conditioned on `_WIN32` the way the examples above them are.
+    /// What the second warns about is a property of the COMPILER: a Windows host
+    /// building with MinGW g++ is not exposed, a POSIX host cross-compiling with
+    /// clang-cl is, and a daemon printing its own help knows neither. So it names
+    /// the condition rather than guessing it from the host.
+    ///
+    /// `ctest -R sccache-backend-caveat` requires the same three facts of every
+    /// prose surface naming one of these variables -- which compilers, the
+    /// mechanism, and the remedy. It cannot render help text, so CliParser_test
+    /// pins them here instead.
+    constexpr auto UsageFooters = std::to_array<std::string_view>({
+        "sccache <= 0.7 speaks memcached text; >= 0.8 speaks memcached binary;\n"
+        "either works because fastcached auto-detects the wire format.",
+
+        "With MSVC or clang-cl, prefer fastcache-cc to sccache. sccache hashes /EP output,\n"
+        "which carries no paths, and replays a hit's /showIncludes with the absolute paths\n"
+        "of the checkout that stored it -- so two checkouts at DIFFERENT paths sharing one\n"
+        "cache record each other's headers, and an incremental build then rebuilds nothing\n"
+        "when a header changes. Clean builds, one shared path, GCC and Clang: unaffected.",
+    });
 
 } // namespace
 
@@ -633,18 +656,19 @@ std::string CliUsage(UsageColor color)
         exampleTexts.push_back(std::format("{}\n{}", example.title, example.body));
 
     std::vector<UsageBlock> blocks;
-    blocks.reserve(1 + exampleTexts.size() + 1);
+    blocks.reserve(1 + exampleTexts.size() + UsageFooters.size());
     blocks.push_back({ .entries = optionRows.Rows() });
     for (auto const& text: exampleTexts)
         blocks.push_back({ .text = text, .textIndent = 2 });
-    blocks.push_back({ .text = UsageFooter });
+    for (auto const& note: UsageFooters)
+        blocks.push_back({ .text = note });
 
     std::span<UsageBlock const> const allBlocks { blocks };
     auto const sections = std::to_array<UsageSection>({
         { .title = "usage:", .subject = " fastcached [options]" },
         { .title = "OPTIONS", .blocks = allBlocks.subspan(0, 1) },
         { .title = "EXAMPLES", .blocks = allBlocks.subspan(1, exampleTexts.size()) },
-        { .blocks = allBlocks.subspan(1 + exampleTexts.size(), 1) },
+        { .blocks = allBlocks.subspan(1 + exampleTexts.size(), UsageFooters.size()) },
     });
 
     return RenderUsage({ .sections = sections }, color, substitutions);
