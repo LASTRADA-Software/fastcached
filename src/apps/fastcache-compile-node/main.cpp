@@ -764,6 +764,24 @@ int main(int argc, char** argv)
         return result.exitCode;
     }
 
+    // Converting the store acts on the files and exits. After the service block
+    // for the same reason that one is early -- it costs microseconds to decide --
+    // and before everything below it, because a node whose store is of the wrong
+    // vintage cannot start at all: making the operator satisfy `--scheduler` or a
+    // toolchain probe first would be demanding they fix a running configuration
+    // before being allowed to fix the store that stops it running.
+    if (cfg.migrateCache)
+    {
+        auto const outcome = MigrateDiskTier(cfg);
+        if (!outcome.has_value())
+        {
+            logger.Logf(LogLevel::Error, "{}", outcome.error());
+            return ExitUsage;
+        }
+        std::cout << "fastcache-compile-node: " << *outcome << '\n';
+        return 0;
+    }
+
     // A question asked OF a running cluster, rather than a worker starting up.
     // After the service block, because an installation is about this machine and
     // this is about somebody else's; before the `--scheduler` and `--toolchain`

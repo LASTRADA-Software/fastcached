@@ -25,6 +25,23 @@ enum class StorageErrorCode : std::uint8_t
     NotANumber,      ///< Value is not a valid integer/float for a numeric op (incr/incrbyfloat).
     WrongType,       ///< Operation against a key holding a different value type (redis WRONGTYPE).
     InfiniteOrNaN,   ///< Numeric op would produce a non-finite result (overflow / NaN); cf. redis incrbyfloat.
+
+    /// On-disk store is intact, but carries a record format this build does
+    /// not write.
+    ///
+    /// Deliberately not `Corrupt`, which is how this used to be spelled. The
+    /// two call for opposite responses: `Corrupt` means the bytes are damaged
+    /// and there is nothing to recover, while this means a healthy store of a
+    /// different vintage — data an operator can still convert, and must not be
+    /// told to delete. The code is what monitoring and every programmatic
+    /// caller sees, so which of the two happened cannot live only in the
+    /// message text.
+    ///
+    /// Appended rather than slotted in beside `Corrupt` so that no existing
+    /// enumerator's value moves: `StorageError::ToString` renders the code as a
+    /// number, and an operator alerting on one would otherwise silently start
+    /// matching a different condition after an upgrade.
+    UnsupportedFormatVersion,
 };
 
 /// Structured storage error.
@@ -83,6 +100,8 @@ struct StorageError
             return "WrongType";
         case StorageErrorCode::InfiniteOrNaN:
             return "InfiniteOrNaN";
+        case StorageErrorCode::UnsupportedFormatVersion:
+            return "UnsupportedFormatVersion";
     }
     return "Unknown";
 }

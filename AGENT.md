@@ -250,6 +250,21 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   written it (`Platform/FileTrust`).
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
 
+**[`.agent/rules/storage.md`](.agent/rules/storage.md)** — the on-disk format and
+converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
+- An old store is `UnsupportedFormatVersion`, never `Corrupt` — the code is what
+  monitoring sees, and `Corrupt` is what makes somebody delete a healthy cache.
+- A format is convertible exactly as long as its reader is in `RecordFormats()`.
+  Bumping the version without adding a row is the decision to discard every store.
+- "No marker" is an INFERENCE. Validate every record before writing any of them:
+  a store this build cannot read must come back unmodified.
+- The conversion commits in slices — one transaction inflates the file by a page
+  per record per level, permanently — and each slice must `Flush()`, or the freed
+  pages are not reclaimable and the slicing buys nothing.
+- Each slice records its resume point in its own transaction, so an interrupted
+  run is refused by name and finished by re-running it.
+- A tree walk is bounded by `PageCount()`, and must not overlap a commit.
+
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
 - A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every

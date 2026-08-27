@@ -81,6 +81,14 @@ class InMemoryPageStore final: public IPageStore
     /// @return Total number of SyncData() calls (including failed ones).
     [[nodiscard]] std::size_t SyncDataCount() const noexcept;
 
+    /// Total successful Read() calls since construction.
+    ///
+    /// A page store is where a tree walk's cost is actually visible: whether a
+    /// scan skipped a subtree or read it and threw the entries away is
+    /// invisible in its results and plain here.
+    /// @return The count.
+    [[nodiscard]] std::size_t ReadCount() const noexcept;
+
     // IPageStore -----------------------------------------------------
 
     [[nodiscard]] auto Read(PageId id) const -> std::expected<BytesView, CowTreeError> override;
@@ -98,6 +106,10 @@ class InMemoryPageStore final: public IPageStore
     [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> override;
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
+
+    [[nodiscard]] auto Flush() -> std::expected<void, CowTreeError> override;
+
+    [[nodiscard]] auto PageCount() const noexcept -> std::size_t override;
 
   private:
     std::size_t _pageSize;
@@ -119,6 +131,7 @@ class InMemoryPageStore final: public IPageStore
     std::array<std::vector<std::byte>, 2> _meta;
 
     FaultPlan _plan;
+    mutable std::size_t _readCount { 0 };
     mutable std::size_t _writeCount { 0 };
     mutable std::size_t _syncDataCount { 0 };
     mutable std::size_t _writeMetaCount { 0 };

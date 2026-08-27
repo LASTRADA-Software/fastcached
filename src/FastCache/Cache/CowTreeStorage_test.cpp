@@ -7,6 +7,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -23,10 +26,16 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <CowTree/Bytes.hpp>
+#include <CowTree/CowTree.hpp>
 #include <CowTree/Crc32c.hpp>
+#include <CowTree/FilePageStore.hpp>
+#include <CowTree/IPageStore.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
@@ -1082,6 +1091,827 @@ TEST_CASE("Open on a path holding random non-CowTree bytes returns Corrupt or Io
     // first; we accept either Corrupt or IoError, both are sane.
     auto const code = storage.error().code;
     REQUIRE((code == FastCache::StorageErrorCode::Corrupt || code == FastCache::StorageErrorCode::IoError));
+}
+
+// ============================================================================
+// On-disk format vintage (issue #131)
+//
+// A store written under another record layout is refused — that part was always
+// right. What these pin down is that the refusal is not spelled `Corrupt`: the
+// code is what monitoring and every programmatic caller sees, and an operator
+// reading "Corrupt" about an intact cache deletes it.
+// ============================================================================
+
+namespace
+{
+
+/// The format-marker key as tree-key bytes.
+///
+/// Taken from `CowTreeStorage::FormatMarkerKey` rather than a second copy of
+/// the magic, so these tests cannot keep passing after the real key moves.
+/// @return A view over the reserved sentinel key.
+[[nodiscard]] CowTree::BytesView FormatMarkerKeyView() noexcept
+{
+    auto const key = FastCache::CowTreeStorage::FormatMarkerKey;
+    return CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() };
+}
+
+/// Commit one key/value into a store, over a raw tree that stamps no marker of
+/// its own — the only way to produce a store this build refuses.
+/// @param store Page store to write into (opened/initialised here).
+/// @param key   Tree key.
+/// @param value Tree value.
+void PutRaw(CowTree::IPageStore& store, CowTree::BytesView key, CowTree::BytesView value)
+{
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    auto txn = tree.BeginWrite();
+    REQUIRE(txn.Put(key, value).has_value());
+    REQUIRE(txn.Commit().has_value());
+}
+
+/// Stamp `version` into a store's format marker.
+///
+/// The four bytes are spelled out least-significant first rather than memcpy'd
+/// from the integer, so the marker this writes is little-endian on a big-endian
+/// host too — the test would otherwise agree with a bug on exactly the hosts the
+/// on-disk format exists to be portable across.
+/// @param store   Page store to write into.
+/// @param version The version to record.
+void StampFormatVersion(CowTree::IPageStore& store, std::uint32_t version)
+{
+    std::array<std::byte, sizeof(std::uint32_t)> const value {
+        static_cast<std::byte>(version & 0xFFU),
+        static_cast<std::byte>((version >> 8) & 0xFFU),
+        static_cast<std::byte>((version >> 16) & 0xFFU),
+        static_cast<std::byte>((version >> 24) & 0xFFU),
+    };
+    PutRaw(store, FormatMarkerKeyView(), CowTree::BytesView { value.data(), value.size() });
+}
+
+} // namespace
+
+TEST_CASE("A store stamped with an unknown format version is refused as a vintage, not as damage",
+          "[cowstorage][open][format]")
+{
+    constexpr auto Future = FastCache::CowTreeStorage::CurrentFormatVersion + 1;
+    CowTree::InMemoryPageStore store;
+    StampFormatVersion(store, Future);
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+
+    // Both versions named, so an operator can tell which way round it is
+    // without going to the source.
+    auto const& context = opened.error().context;
+    REQUIRE(context.contains(std::format("version {}", Future)));
+    // "writes N", not a bare "N": the digit alone would match anywhere in the
+    // sentence, including the store's own version, so it would keep passing
+    // with the two the wrong way round.
+    REQUIRE(context.contains(std::format("writes {}", FastCache::CowTreeStorage::CurrentFormatVersion)));
+    // A newer store is not something this build can convert; say so instead.
+    REQUIRE(context.contains("upgrade"));
+}
+
+TEST_CASE("A non-empty store carrying no format marker is refused as a vintage, not as damage", "[cowstorage][open][format]")
+{
+    // The marker arrived WITH v4, so its absence over a store that already
+    // holds records IS the version stamp: this is a v3 store.
+    CowTree::InMemoryPageStore store;
+    auto const key = std::string_view { "legacy-key" };
+    std::array<std::byte, 4> const record { std::byte { 0 }, std::byte { 1 }, std::byte { 2 }, std::byte { 3 } };
+    PutRaw(store,
+           CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() },
+           CowTree::BytesView { record.data(), record.size() });
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(opened.error().context.contains("version 3"));
+    // The whole point of the code: nothing here tells the operator to delete it.
+    REQUIRE(opened.error().context.contains("does not need to be deleted"));
+}
+
+TEST_CASE("A format marker too short to hold a version is damage, and keeps saying Corrupt", "[cowstorage][open][format]")
+{
+    // The one case in this area that really IS corruption: there is no version
+    // to report and nothing to convert, so the vintage code would be a lie in
+    // the other direction.
+    CowTree::InMemoryPageStore store;
+    std::array<std::byte, 2> const truncated { std::byte { 4 }, std::byte { 0 } };
+    PutRaw(store, FormatMarkerKeyView(), CowTree::BytesView { truncated.data(), truncated.size() });
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::Corrupt);
+}
+
+// ============================================================================
+// Converting a store of an older vintage (issue #131)
+// ============================================================================
+
+namespace
+{
+
+/// Read a little-endian integer of `Width` bytes at `offset`.
+/// @param bytes Source.
+/// @param offset Byte offset.
+/// @return The value, host order.
+template <std::size_t Width>
+[[nodiscard]] std::uint64_t LoadLe(CowTree::BytesView bytes, std::size_t offset)
+{
+    std::uint64_t value = 0;
+    for (auto const i: std::views::iota(std::size_t { 0 }, Width))
+        value |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(bytes[offset + i])) << (8U * i);
+    return value;
+}
+
+/// Append a little-endian integer of `Width` bytes.
+/// @param out Destination.
+/// @param value The value, host order.
+template <std::size_t Width>
+void AppendLe(std::vector<std::byte>& out, std::uint64_t value)
+{
+    for (auto const i: std::views::iota(std::size_t { 0 }, Width))
+        out.push_back(static_cast<std::byte>((value >> (8U * i)) & 0xFFU));
+}
+
+/// Bytes of the leaf-record header both v3 and v4 carry, between the kind tag
+/// (plus v4's codec byte) and the length fields: flags, cas, expiry,
+/// generation, lastAccess, stale.
+constexpr std::size_t CommonHeaderBytes = 4 + 8 + 8 + 8 + 8 + 1;
+
+/// Rewrite one current-format leaf record as the v3 layout it would have had.
+///
+/// v3 is v4 minus the codec byte and minus every original-length field. The
+/// test only reverses THAT, and never touches the overflow page format — which
+/// v3 and v4 share — so the chains a downgraded store points at are the ones
+/// the production writer laid down rather than a second implementation of them.
+///
+/// Only meaningful for an uncompressed record, which is why the callers open
+/// with `CompressionCodec::Identity`: v3 had no codec field because it never
+/// compressed anything, so a compressed record has no v3 spelling at all.
+/// @param v4 The record as the current encoder wrote it.
+/// @return The same record under format v3.
+[[nodiscard]] std::vector<std::byte> DowngradeRecordToV3(CowTree::BytesView v4)
+{
+    REQUIRE(v4.size() > 2 + CommonHeaderBytes);
+    auto const kind = std::to_integer<std::uint8_t>(v4[0]);
+    REQUIRE(std::to_integer<std::uint8_t>(v4[1]) == static_cast<std::uint8_t>(FastCache::CompressionCodec::Identity));
+
+    std::vector<std::byte> out;
+    out.push_back(v4[0]);
+    // The common header is copied verbatim: identical fields, identical order.
+    auto const common = v4.subspan(2, CommonHeaderBytes);
+    out.insert(out.end(), common.begin(), common.end());
+
+    auto const tail = 2 + CommonHeaderBytes;
+    if (kind == 0) // inline
+    {
+        auto const storedLen = LoadLe<4>(v4, tail);
+        REQUIRE(LoadLe<4>(v4, tail + 4) == storedLen); // Identity: original == stored
+        AppendLe<4>(out, storedLen);
+        auto const value = v4.subspan(tail + 8, static_cast<std::size_t>(storedLen));
+        out.insert(out.end(), value.begin(), value.end());
+        return out;
+    }
+
+    // overflow: v4 is [u64 stored][u64 original][u64 root], v3 [u64 len][u64 root].
+    auto const storedLen = LoadLe<8>(v4, tail);
+    REQUIRE(LoadLe<8>(v4, tail + 8) == storedLen);
+    AppendLe<8>(out, storedLen);
+    AppendLe<8>(out, LoadLe<8>(v4, tail + 16));
+    return out;
+}
+
+/// Turn a current-format store into a genuine v3 one: every leaf record
+/// rewritten under the old layout, and the version marker removed — which is
+/// exactly the shape a build from before the marker existed left behind.
+/// @param store The store to rewrite in place.
+void DowngradeStoreToV3(CowTree::IPageStore& store,
+                        std::size_t leaveConverted = 0,
+                        std::uint32_t targetVersion = FastCache::CowTreeStorage::CurrentFormatVersion)
+{
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+
+    std::vector<std::vector<std::byte>> keys;
+    std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>> rewritten;
+    {
+        auto const reader = tree.BeginRead();
+        REQUIRE(reader
+                    .ForEach([&](CowTree::BytesView key, CowTree::BytesView value) {
+                        if (std::ranges::equal(key, FormatMarkerKeyView()))
+                            return true;
+                        keys.emplace_back(key.begin(), key.end());
+                        // The first `leaveConverted` keys stay in the current
+                        // layout: together with the progress marker the caller
+                        // plants, that is precisely the shape an interrupted
+                        // conversion leaves behind.
+                        if (keys.size() > leaveConverted)
+                            rewritten.emplace_back(std::vector<std::byte> { key.begin(), key.end() },
+                                                   DowngradeRecordToV3(value));
+                        return true;
+                    })
+                    .has_value());
+    }
+    REQUIRE_FALSE(rewritten.empty());
+
+    auto txn = tree.BeginWrite();
+    for (auto const& [key, record]: rewritten)
+        REQUIRE(txn.Put(CowTree::BytesView { key.data(), key.size() }, CowTree::BytesView { record.data(), record.size() })
+                    .has_value());
+    auto const erased = txn.Erase(FormatMarkerKeyView());
+    REQUIRE(erased.has_value());
+    REQUIRE(*erased);
+    REQUIRE(txn.Commit().has_value());
+
+    if (leaveConverted != 0)
+    {
+        REQUIRE(leaveConverted <= keys.size());
+        std::vector<std::byte> value;
+        AppendLe<4>(value, 3);             // fromVersion
+        AppendLe<4>(value, targetVersion); // toVersion
+        auto const& lastConverted = keys[leaveConverted - 1];
+        value.insert(value.end(), lastConverted.begin(), lastConverted.end());
+
+        auto marker = tree.BeginWrite();
+        auto const key = FastCache::CowTreeStorage::MigrationMarkerKey;
+        REQUIRE(marker
+                    .Put(CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() },
+                         CowTree::BytesView { value.data(), value.size() })
+                    .has_value());
+        REQUIRE(marker.Commit().has_value());
+    }
+}
+
+/// The overflow-chain head the current-format record under `key` names, or
+/// nullopt when that record stores its value inline.
+///
+/// Read straight off the leaf record rather than inferred from page counts,
+/// because "the chain is reused in place" is the specific claim under test and
+/// a page total can be right for the wrong reason — freed leaf pages get
+/// recycled, so a rebuilt chain need not grow the file at all.
+/// @param store The store to read.
+/// @param key   The cache key.
+/// @return The chain head page id, or nullopt for an inline record.
+[[nodiscard]] std::optional<std::uint64_t> OverflowRootOf(CowTree::IPageStore& store, std::string_view key)
+{
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    auto const reader = tree.BeginRead();
+    auto const got = reader.Get(CowTree::AsBytes(key));
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+
+    // Through Unwrap: clang-tidy cannot see the REQUIRE above as a guard, and
+    // the dereference it DOES understand lives in there.
+    auto const& stored = FastCache::Testing::Unwrap(*got);
+    auto const raw = CowTree::BytesView { stored.data(), stored.size() };
+    if (std::to_integer<std::uint8_t>(raw[0]) != 1) // RecordKindOverflow
+        return std::nullopt;
+    return LoadLe<8>(raw, 2 + CommonHeaderBytes + 16);
+}
+
+} // namespace
+
+TEST_CASE("A v3 store converts in place, and every entry survives it", "[cowstorage][format][migrate]")
+{
+    // 4 KiB pages put the inline limit at 1 KiB, so the samples straddle it on
+    // purpose: the small ones exercise the inline record rewrite and the large
+    // ones the overflow descriptor, whose whole claim is that the chain it
+    // names is reused rather than rebuilt.
+    CowTree::InMemoryPageStore store { 4096 };
+
+    struct Sample
+    {
+        std::string key;
+        std::size_t size;
+        std::uint32_t flags;
+    };
+    auto const samples = std::vector<Sample> {
+        { .key = "inline-tiny", .size = 8, .flags = 1 },
+        { .key = "inline-near-limit", .size = 900, .flags = 7 },
+        { .key = "overflow-one-page", .size = 5000, .flags = 3 },
+        { .key = "overflow-many-pages", .size = 40000, .flags = 42 },
+    };
+
+    std::map<std::string, std::vector<std::byte>> written;
+    {
+        FastCache::CowTreeStorage::Options opts;
+        // v3 never compressed anything, so a store that is to be downgraded
+        // must not have.
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        // Indexed by hand rather than with `std::views::enumerate`, which Apple
+        // clang's libc++ does not carry -- and which nothing else in this tree
+        // uses, so the one caller is not worth the portability.
+        for (auto const index: std::views::iota(std::size_t { 0 }, samples.size()))
+        {
+            auto const& sample = samples[index];
+            auto bytes = RandomBytes(sample.size, 0xA5A5ULL + index);
+            REQUIRE((*storage)->Set(sample.key, bytes, sample.flags, FastCache::TimePoint::max()).has_value());
+            written.emplace(sample.key, std::move(bytes));
+        }
+    }
+
+    // Captured before anything is rewritten, so the assertion at the end can
+    // name the very pages the chains started on.
+    std::map<std::string, std::optional<std::uint64_t>> rootsBefore;
+    for (auto const& sample: samples)
+        rootsBefore.emplace(sample.key, OverflowRootOf(store, sample.key));
+    REQUIRE(rootsBefore.at("overflow-many-pages").has_value());
+
+    DowngradeStoreToV3(store);
+
+    // Precondition for the whole test: it really is refused now.
+    {
+        FastCache::CowTreeStorage::Options opts;
+        auto const refused = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE_FALSE(refused.has_value());
+        REQUIRE(refused.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    }
+
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(report.has_value());
+    REQUIRE(report->fromVersion == 3);
+    REQUIRE(report->toVersion == FastCache::CowTreeStorage::CurrentFormatVersion);
+    REQUIRE(report->recordsConverted == samples.size());
+
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+
+    FastCache::ManualClock clock;
+    for (auto const& sample: samples)
+    {
+        auto const got = (*storage)->Get(sample.key, clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(sample.key));
+        REQUIRE(got->entry.flags == sample.flags);
+    }
+
+    // The conversion rewrites leaf records, never value pages. Every chain must
+    // still start on the page it started on — a rebuilt chain would round-trip
+    // the data just as well and quietly cost a second copy of every large
+    // value, which is the difference between converting a 50 GB cache and
+    // needing 100 GB to do it.
+    for (auto const& sample: samples)
+        REQUIRE(OverflowRootOf(store, sample.key) == rootsBefore.at(sample.key));
+}
+
+TEST_CASE("An interrupted conversion is refused by name rather than mis-parsed", "[cowstorage][format][migrate]")
+{
+    // A part-converted store has no single format version: some records are the
+    // new layout and the marker still names the old one. Reading it under
+    // either would be wrong, so it says what actually happened instead.
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, 6))
+            REQUIRE((*storage)->Set(std::format("key-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+    DowngradeStoreToV3(store, 2);
+
+    FastCache::CowTreeStorage::Options opts;
+    auto const refused = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(refused.has_value());
+    REQUIRE(refused.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(refused.error().context.contains("interrupted"));
+    // And it must not read as advice to delete the store, which is the whole
+    // point of the code.
+    REQUIRE(refused.error().context.contains("does not need to be deleted"));
+}
+
+TEST_CASE("A conversion another build started is never picked up", "[cowstorage][format][migrate]")
+{
+    // The failure this marker records a target version to prevent. A newer build
+    // interrupted part-way from 4 to 5 leaves a store whose FORMAT marker still
+    // says 4 -- so an older build reading only the source version would find a
+    // vintage it can read, "resume", re-encode the tail 4-to-4, and stamp the
+    // whole store as 4 over a prefix that is really 5. That is precisely the
+    // silent mis-parse the version marker exists to prevent, reached through the
+    // machinery meant to prevent it.
+    constexpr auto Future = FastCache::CowTreeStorage::CurrentFormatVersion + 1;
+
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, 6))
+            REQUIRE((*storage)->Set(std::format("key-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+    DowngradeStoreToV3(store, 2, Future);
+
+    auto const pagesBefore = store.PageCount();
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE_FALSE(report.has_value());
+    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().context.contains("finish it with the build that started it"));
+    // Refused without writing: the check happens before the first slice opens a
+    // transaction.
+    REQUIRE(store.PageCount() == pagesBefore);
+
+    // And Open says the same thing rather than the resumable-here message.
+    FastCache::CowTreeStorage::Options opts;
+    auto const refused = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE_FALSE(refused.has_value());
+    REQUIRE(refused.error().context.contains("finish it with the build that started it"));
+}
+
+TEST_CASE("Resuming converts only what is left, and never the same record twice", "[cowstorage][format][migrate]")
+{
+    // Converting an already-converted record would read a v4 record with the v3
+    // reader: it would parse (the layouts overlap) and silently produce wrong
+    // flags and a wrong value length. The value assertions below are what catch
+    // that, so this test fails loudly if the resume point is off by one.
+    constexpr int Total = 6;
+    constexpr std::size_t AlreadyDone = 2;
+
+    CowTree::InMemoryPageStore store { 4096 };
+    std::map<std::string, std::vector<std::byte>> written;
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, Total))
+        {
+            auto const key = std::format("key-{}", i);
+            auto bytes = RandomBytes(64 + static_cast<std::size_t>(i), 0xBEEFULL + static_cast<std::uint64_t>(i));
+            REQUIRE((*storage)->Set(key, bytes, static_cast<std::uint32_t>(i) + 1, FastCache::TimePoint::max()).has_value());
+            written.emplace(key, std::move(bytes));
+        }
+    }
+    DowngradeStoreToV3(store, AlreadyDone);
+
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(report.has_value());
+    REQUIRE(report->resumed);
+    REQUIRE(report->fromVersion == 3);
+    REQUIRE(report->recordsConverted == Total - AlreadyDone);
+
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+    for (auto const i: std::views::iota(0, Total))
+    {
+        auto const key = std::format("key-{}", i);
+        auto const got = (*storage)->Get(key, clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+        REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(key));
+        REQUIRE(got->entry.flags == static_cast<std::uint32_t>(i) + 1);
+    }
+}
+
+TEST_CASE("A conversion killed part-way finishes correctly on a re-run", "[cowstorage][format][migrate]")
+{
+    // The end-to-end property the slicing exists to preserve: whatever write
+    // fails and wherever it fails, running the conversion again produces a
+    // store in which every entry is intact. Driven through the page store's
+    // fault injection rather than by hand, so the interrupted state is one the
+    // real code path actually produces.
+    constexpr int Total = 2500; // more than MigrationChunkRecords, so it slices
+
+    for (auto const failAt: { std::size_t { 300 }, std::size_t { 3000 }, std::size_t { 9000 } })
+    {
+        CowTree::InMemoryPageStore store { 4096 };
+        std::map<std::string, std::vector<std::byte>> written;
+        {
+            FastCache::CowTreeStorage::Options opts;
+            opts.compression = FastCache::CompressionCodec::Identity;
+            auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+            REQUIRE(storage.has_value());
+            for (auto const i: std::views::iota(0, Total))
+            {
+                auto const key = std::format("key-{:05d}", i);
+                auto bytes = MakeBytes(std::format("value-{}", i));
+                REQUIRE((*storage)->Set(key, bytes, static_cast<std::uint32_t>(i), FastCache::TimePoint::max()).has_value());
+                written.emplace(key, std::move(bytes));
+            }
+        }
+        DowngradeStoreToV3(store);
+
+        CowTree::InMemoryPageStore::FaultPlan plan;
+        plan.failNthWrite = failAt;
+        store.SetFaultPlan(plan);
+        // It may fail or (if the store needed fewer writes than that) succeed;
+        // either way the store must end up correct after the retry below.
+        std::ignore = FastCache::CowTreeStorage::MigrateStore(store);
+
+        store.SetFaultPlan(CowTree::InMemoryPageStore::FaultPlan {});
+        auto const retry = FastCache::CowTreeStorage::MigrateStore(store);
+        INFO("failAt=" << failAt);
+        REQUIRE(retry.has_value());
+
+        FastCache::CowTreeStorage::Options opts;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        FastCache::ManualClock clock;
+        for (auto const i: std::views::iota(0, Total))
+        {
+            auto const key = std::format("key-{:05d}", i);
+            auto const got = (*storage)->Get(key, clock.Now());
+            REQUIRE(got.has_value());
+            REQUIRE(got->found);
+            REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(key));
+            REQUIRE(std::cmp_equal(got->entry.flags, i));
+        }
+    }
+}
+
+TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the store", "[cowstorage][format][migrate]")
+{
+    // The reason the conversion commits in slices at all. One transaction over
+    // the whole store allocates a page per record per tree level and can reuse
+    // none of them until it commits -- and since `CommitTxn` writes
+    // `freeRoot = PageId::None()`, that growth is not reclaimable by the next
+    // process either. Slicing bounds it: each slice returns its replaced pages
+    // to the free list and the next one allocates out of that.
+    //
+    // Asserted as a SHAPE rather than a number, because that is the actual
+    // claim. Quadrupling the records must not quadruple the growth: whatever
+    // the conversion costs, it costs about a slice, and a slice is a constant.
+    // Measured on real files, opened fresh for the conversion exactly as the
+    // tool does -- an in-memory store carries a warm free list that hides the
+    // whole effect.
+    auto const growthFor = [](int total) {
+        TempFile tmp;
+        FastCache::CowTreeStorage::Options opts;
+        opts.path = tmp.path;
+        opts.pageSize = 512; // small pages keep the fixture's files small
+        opts.compression = FastCache::CompressionCodec::Identity;
+
+        std::map<std::string, std::vector<std::byte>> written;
+        {
+            auto storage = FastCache::CowTreeStorage::Open(opts);
+            REQUIRE(storage.has_value());
+            for (auto const i: std::views::iota(0, total))
+            {
+                auto const key = std::format("key-{:05d}", i);
+                auto bytes = MakeBytes(std::format("value-{}", i));
+                REQUIRE((*storage)->Set(key, bytes, 0, FastCache::TimePoint::max()).has_value());
+                written.emplace(key, std::move(bytes));
+            }
+        }
+        {
+            auto pageStore = CowTree::FilePageStore::Open(CowTree::FilePageStore::Options { .path = tmp.path });
+            REQUIRE(pageStore.has_value());
+            DowngradeStoreToV3(**pageStore);
+        }
+
+        auto const before = std::filesystem::file_size(tmp.path);
+        auto const report = FastCache::CowTreeStorage::Migrate(opts);
+        REQUIRE(report.has_value());
+        REQUIRE(std::cmp_equal(report->recordsConverted, total));
+        auto const after = std::filesystem::file_size(tmp.path);
+        REQUIRE(after >= before);
+
+        // ...and it converted everything, which is the other half of the claim:
+        // a conversion that grew by nothing because it did nothing is not the
+        // property under test.
+        auto storage = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(storage.has_value());
+        FastCache::ManualClock clock;
+        for (auto const& [key, value]: written)
+        {
+            auto const got = (*storage)->Get(key, clock.Now());
+            REQUIRE(got.has_value());
+            REQUIRE(got->found);
+            REQUIRE(FastCache::Testing::ValueOf(got->entry) == value);
+        }
+        return after - before;
+    };
+
+    auto const small = growthFor(2000);
+    auto const large = growthFor(8000);
+
+    // Four times the records. A conversion that allocated per record would
+    // grow four times as much; one bounded by a slice grows about the same.
+    INFO("growth: 2000 records -> " << small << " bytes, 8000 records -> " << large << " bytes");
+    REQUIRE(large < small * 2);
+}
+
+TEST_CASE("A record whose expiry does not fit the clock is decoded, not undefined", "[cowstorage][format]")
+{
+    // The timestamps come off DISK, and the clock counts in nanoseconds, so
+    // building a time point from a microsecond count multiplies by a thousand.
+    // A damaged field near the type's range therefore overflows a signed
+    // integer -- undefined behaviour rather than a wrong timestamp, on a path
+    // any corrupt record can reach. Only a sanitizer sees it, which is why this
+    // pins the value rather than the absence of a crash.
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    // Rewrite the record's expiry field to a microsecond count that is huge but
+    // not the "never expires" sentinel, so the conversion below is a real one.
+    constexpr std::int64_t Overflowing = (std::numeric_limits<std::int64_t>::max() / 16) + 1;
+    {
+        CowTree::CowTree tree { store };
+        REQUIRE(tree.Open().has_value());
+        std::vector<std::byte> record;
+        {
+            auto const reader = tree.BeginRead();
+            auto const got = reader.Get(CowTree::AsBytes("k"));
+            REQUIRE(got.has_value());
+            REQUIRE(got->has_value());
+            record = FastCache::Testing::Unwrap(*got);
+        }
+        // kind(1) + codec(1) + flags(4) + cas(8) puts expiry at offset 14.
+        constexpr std::size_t ExpiryOffset = 1 + 1 + 4 + 8;
+        REQUIRE(record.size() > ExpiryOffset + sizeof(std::int64_t));
+        auto const raw = static_cast<std::uint64_t>(Overflowing);
+        for (auto const i: std::views::iota(std::size_t { 0 }, sizeof(std::uint64_t)))
+            record[ExpiryOffset + i] = static_cast<std::byte>((raw >> (8U * i)) & 0xFFU);
+
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(CowTree::AsBytes("k"), CowTree::BytesView { record.data(), record.size() }).has_value());
+        REQUIRE(txn.Commit().has_value());
+    }
+
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+
+    // Clamped to "never", which is the nearest representable instant, and the
+    // entry is still readable rather than the process being in undefined
+    // behaviour.
+    auto const got = (*storage)->Peek("k", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.expiry == FastCache::TimePoint::max());
+}
+
+TEST_CASE("A store older than any reader is refused, not rewritten in place", "[cowstorage][format][migrate]")
+{
+    // "No marker" is an inference, not a statement: it means v3, because that
+    // is the last layout that did not stamp one -- but a store from before v3
+    // is equally unmarked, and its records begin with a flags field rather than
+    // a kind tag, so a zero-flags record starts with the same byte as an inline
+    // one. Accepting it would be the worst outcome this feature can have: a
+    // store the daemon merely refused to open, destroyed in place by the thing
+    // meant to rescue it.
+    CowTree::InMemoryPageStore store { 4096 };
+
+    // A record in the pre-v3 layout -- no kind byte -- and specifically one
+    // that a LENIENT reader accepts. Every field lands one byte early, so the
+    // four bytes the reader takes for the inline length are the top half of the
+    // real length field followed by the first two value bytes. A value that
+    // begins with two zero bytes therefore reads as length zero, which a reader
+    // that only checks "are there at least that many bytes left" is happy with:
+    // it returns an empty value, and the conversion writes that empty value
+    // over the real one. Requiring the record to end exactly where its value
+    // does is what rejects it.
+    std::vector<std::byte> ancient;
+    AppendLe<4>(ancient, 0);  // flags
+    AppendLe<8>(ancient, 11); // cas
+    AppendLe<8>(ancient, 0);  // expiry
+    AppendLe<8>(ancient, 0);  // generation
+    AppendLe<8>(ancient, 0);  // lastAccess
+    AppendLe<4>(ancient, 8);  // value length
+    for (auto const b: { 0x00, 0x00, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x21 })
+        ancient.push_back(static_cast<std::byte>(b));
+
+    auto const key = std::string_view { "ancient-key" };
+    PutRaw(store,
+           CowTree::BytesView { reinterpret_cast<std::byte const*>(key.data()), key.size() },
+           CowTree::BytesView { ancient.data(), ancient.size() });
+
+    auto const before = store.PageCount();
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE_FALSE(report.has_value());
+    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().context.contains("NOT been modified"));
+
+    // Refused before writing anything: the validation pass runs to completion
+    // before the first slice opens a transaction.
+    REQUIRE(store.PageCount() == before);
+    {
+        CowTree::CowTree tree { store };
+        REQUIRE(tree.Open().has_value());
+        auto const reader = tree.BeginRead();
+        auto const got = reader.Get(CowTree::AsBytes(key));
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        REQUIRE(FastCache::Testing::Unwrap(*got) == ancient);
+    }
+}
+
+TEST_CASE("Converting a store already at the current version changes nothing", "[cowstorage][format][migrate]")
+{
+    CowTree::InMemoryPageStore store;
+    {
+        FastCache::CowTreeStorage::Options opts;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(report.has_value());
+    REQUIRE(report->fromVersion == FastCache::CowTreeStorage::CurrentFormatVersion);
+    REQUIRE(report->toVersion == report->fromVersion);
+    REQUIRE(report->recordsConverted == 0);
+}
+
+TEST_CASE("Converting a store nothing has written yet is a no-op, not a failure", "[cowstorage][format][migrate]")
+{
+    // An operator pointing the conversion at a path the daemon has not created
+    // yet should read "nothing to do", not a diagnostic they have to interpret.
+    CowTree::InMemoryPageStore store;
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(report.has_value());
+    REQUIRE(report->fromVersion == FastCache::CowTreeStorage::CurrentFormatVersion);
+    REQUIRE(report->recordsConverted == 0);
+}
+
+TEST_CASE("A store newer than this build cannot be converted forwards", "[cowstorage][format][migrate]")
+{
+    // There is no reader for a layout that does not exist yet, so the honest
+    // answer is the same refusal Open gives — not a conversion that guesses.
+    CowTree::InMemoryPageStore store;
+    StampFormatVersion(store, FastCache::CowTreeStorage::CurrentFormatVersion + 1);
+
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE_FALSE(report.has_value());
+    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().context.contains("upgrade"));
+}
+
+TEST_CASE("A converted store keeps working as a cache", "[cowstorage][format][migrate]")
+{
+    // Converting must leave a store that is writable, not merely readable: the
+    // marker has to be committed alongside the records, or the next Open stamps
+    // nothing and the LRU accounting starts from a tree it never replayed.
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("old", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    }
+    DowngradeStoreToV3(store);
+    REQUIRE(FastCache::CowTreeStorage::MigrateStore(store).has_value());
+
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+
+    FastCache::ManualClock clock;
+    REQUIRE((*storage)->Set("new", MakeBytes("written-after"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Delete("old", clock.Now()).has_value());
+
+    auto const fresh = (*storage)->Get("new", clock.Now());
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->found);
+    REQUIRE(Decode(fresh->entry.ValueBytes()) == "written-after");
+
+    auto const gone = (*storage)->Get("old", clock.Now());
+    REQUIRE(gone.has_value());
+    REQUIRE_FALSE(gone->found);
+}
+
+TEST_CASE("Converting a second time reports nothing left to do", "[cowstorage][format][migrate]")
+{
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+    DowngradeStoreToV3(store);
+
+    auto const first = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(first.has_value());
+    REQUIRE(first->recordsConverted == 1);
+
+    // Idempotent, which is what makes it safe to put in a start-up script.
+    auto const second = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE(second.has_value());
+    REQUIRE(second->fromVersion == second->toVersion);
+    REQUIRE(second->recordsConverted == 0);
 }
 
 TEST_CASE("Set above maxValueBytes returns ValueTooLarge", "[cowstorage][boundary]")

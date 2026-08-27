@@ -489,6 +489,14 @@ namespace
                          "user (default) = a LaunchAgent in ~/Library/LaunchAgents, started at\n"
                          "login as you; system = a LaunchDaemon in /Library/LaunchDaemons,\n"
                          "started at boot as _fastcached (needs sudo)" },
+        { .primary = "--migrate-storage",
+          .select = SelectOutcome<&CliResult::outcome, CliOutcome::MigrateStorage>(),
+          .description = "convert the store named by --storage to this build's on-disk record\n"
+                         "layout and exit, instead of serving. Takes no path of its own so it\n"
+                         "converts exactly the files the daemon would open -- pass the same\n"
+                         "--storage/--storage-shards/--config the daemon runs with.\n"
+                         "Run it with the daemon STOPPED. Safe to re-run: a store already in\n"
+                         "this layout is left untouched, and a run that is interrupted resumes" },
         { .primary = "--healthcheck",
           .select = SelectOutcome<&CliResult::outcome, CliOutcome::HealthCheck>(),
           .description = "probe http://127.0.0.1:<metrics-port>/healthz and exit 0 (healthy) or 1\n"

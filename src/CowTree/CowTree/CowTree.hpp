@@ -41,6 +41,63 @@ class ReadTxn
     ///         miss; CowTreeError on I/O or corruption.
     [[nodiscard]] auto Get(BytesView key) const -> std::expected<std::optional<std::vector<std::byte>>, CowTreeError>;
 
+    /// Visit every entry in this snapshot, in ascending key order.
+    ///
+    /// An ADMINISTRATIVE scan, not a serving path: it reads every page of the
+    /// tree, so it costs the size of the store rather than its depth — `Get` is
+    /// what a lookup uses. It exists because some jobs are defined over the
+    /// whole keyspace, converting a store written under an older record layout
+    /// being the first, and a B+tree that can only be probed by key cannot
+    /// express one at all.
+    ///
+    /// **The walk must not overlap a commit**, from inside `visit` or from
+    /// another thread. A commit frees the pages it replaced and `Allocate`
+    /// recycles them, so a scan pinned before it either fails with
+    /// `OutOfRange` or — once an index has been handed out again — reads a page
+    /// that now belongs somewhere else and reports keys that are wrong rather
+    /// than merely stale. Collect first, then write. That is a property of the
+    /// page stores rather than of this walk: `Get` on a snapshot pinned across
+    /// a commit fails the same way, which is why the isolation the class
+    /// comment describes stops at the first commit that reclaims a page.
+    ///
+    /// Reading elsewhere in the store from inside `visit` IS safe: each page is
+    /// copied out before the callback runs, so a shared read buffer cannot be
+    /// pulled out from under the views.
+    ///
+    /// @param visit Called once per entry; return false to stop the walk early,
+    ///              which is success rather than an error. Both views alias
+    ///              storage owned by the walk and are invalidated once it
+    ///              returns, so copy anything that must outlive the call.
+    /// @return Empty when the tree was walked or `visit` stopped it;
+    ///         CowTreeError on an I/O or page-decoding failure.
+    [[nodiscard]] auto ForEach(std::function<bool(BytesView key, BytesView value)> const& visit) const
+        -> std::expected<void, CowTreeError>;
+
+    /// `ForEach`, resumed: visits only the entries whose key sorts strictly
+    /// after `startAfter`.
+    ///
+    /// Whole subtrees below `startAfter` are skipped rather than read and
+    /// filtered, which is what makes a job that walks the store in resumable
+    /// slices cost one pass in total rather than one pass per slice.
+    /// @param startAfter Exclusive lower bound; the last key already handled.
+    /// @param visit      As `ForEach`.
+    /// @return As `ForEach`.
+    [[nodiscard]] auto ForEachAfter(BytesView startAfter,
+                                    std::function<bool(BytesView key, BytesView value)> const& visit) const
+        -> std::expected<void, CowTreeError>;
+
+  private:
+    /// Shared implementation of the two `ForEach` overloads.
+    /// @param startAfter Exclusive lower bound, or nullopt to start at the
+    ///                   beginning — which is NOT the same as an empty key,
+    ///                   since an empty key is itself storable.
+    /// @param visit      As `ForEach`.
+    /// @return As `ForEach`.
+    [[nodiscard]] auto Walk(std::optional<BytesView> startAfter,
+                            std::function<bool(BytesView key, BytesView value)> const& visit) const
+        -> std::expected<void, CowTreeError>;
+
+  public:
     /// @return The txnId of the snapshot this transaction observes.
     [[nodiscard]] TxnId Snapshot() const noexcept
     {

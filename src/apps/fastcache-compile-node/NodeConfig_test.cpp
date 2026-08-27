@@ -97,6 +97,20 @@ class FakeHost final: public IHostFactsSource
 
 } // namespace
 
+TEST_CASE("NodeConfig: --migrate-cache is a mode, and never reaches a service registration", "[node][config]")
+{
+    auto const parsed = ParseNodeArgv({ "--migrate-cache", "--cache-dir=/var/cache/fastcache-node" });
+    REQUIRE(parsed.has_value());
+    auto const& cfg = *parsed;
+    REQUIRE(cfg.migrateCache);
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    CHECK(std::ranges::none_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--migrate-cache"); }));
+    // ...while the flag it acts ON is carried, since that one does describe the
+    // running worker. Asserted alongside so this cannot pass by emitting nothing.
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--cache-dir"); }));
+}
+
 TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", "[node][service]")
 {
     // The daemon's equivalent case exists because its table once stopped after
@@ -127,6 +141,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--cluster-set",
         "--cluster-forget",
         "--cluster-admit",
+        // Same rule, applied to the store rather than to the cluster: a worker
+        // that converted its store at every boot would replay one operator's
+        // decision forever, on a store that after the first run has nothing
+        // left to convert.
+        "--migrate-cache",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.

@@ -5,6 +5,7 @@
 #include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -132,6 +133,24 @@ namespace
             return TimePoint::max();
         if (v == std::numeric_limits<std::int64_t>::min())
             return TimePoint::min();
+
+        // Clamped, because this number comes off DISK and the clock counts in
+        // nanoseconds: constructing the time point multiplies by a thousand, and
+        // a microsecond count that does not fit overflows a signed integer --
+        // undefined behaviour rather than a wrong timestamp, on a path any
+        // damaged record can reach. UBSan trips on it, which is how it was
+        // found: the first test to feed the parser arbitrary bytes reached it
+        // immediately.
+        //
+        // The sentinels above are the only values that MEAN anything at the
+        // extremes, so anything else out there is a damaged field, and the
+        // nearest representable instant is a better answer than a trap.
+        constexpr auto MaxMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::max()).count();
+        constexpr auto MinMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::min()).count();
+        if (v >= MaxMicros)
+            return TimePoint::max();
+        if (v <= MinMicros)
+            return TimePoint::min();
         return TimePoint { std::chrono::microseconds { v } };
     }
 
@@ -153,22 +172,107 @@ namespace
     constexpr std::uint8_t RecordKindInline = 0;
     constexpr std::uint8_t RecordKindOverflow = 1;
 
-    /// On-disk record-layout version. Bumped from 3 to 4 when the per-entry
-    /// compression codec + original-length fields were added (see the class
-    /// doc). A store written by an older version is rejected on Open rather
-    /// than mis-parsed under the new layout.
-    constexpr std::uint32_t StorageFormatVersion = 4;
+    /// The version a non-empty store carrying no marker at all must be.
+    ///
+    /// The marker arrived WITH v4, so its absence is itself the version stamp:
+    /// a store holding records but no sentinel was written by a build that did
+    /// not stamp one. That is v3 — no release ever shipped v1 or v2 of this
+    /// layout — and it is why the refusal below can name a version the store
+    /// never records.
+    constexpr std::uint32_t PreMarkerFormatVersion = 3;
 
-    /// Reserved tree key holding the format-version sentinel. Chosen to be
-    /// unreachable by the memcached-family wire protocols: it leads with
-    /// control bytes (NUL + SOH), which those protocols forbid in keys. A RESP
-    /// binary key could in principle collide, but a client would have to store
-    /// this exact magic; even then only the sentinel read is affected, never
-    /// the integrity of other data. The value is `[u32 StorageFormatVersion]`.
-    /// Built via an explicit length so the embedded NULs are not truncated.
-    constexpr char FormatMarkerKeyBytes[] = { '\0', '\1', 'f', 'a', 's', 't', 'c', 'a', 'c',
-                                              'h',  'e',  'd', '.', 'f', 'm', 't', '\0' };
-    constexpr std::string_view FormatMarkerKey { FormatMarkerKeyBytes, sizeof(FormatMarkerKeyBytes) };
+    /// Records converted per transaction.
+    ///
+    /// The conversion cannot be one transaction, however much atomicity would
+    /// like it to be. A CoW commit replaces every page on the root-to-leaf path
+    /// and the replaced ones are only freed AT the commit, so a single
+    /// transaction over the whole store allocates one fresh page per record per
+    /// tree level and can reuse none of them -- measured at 3 pages per record,
+    /// a 20x file inflation on a 2000-record store. Worse, `CommitTxn` writes
+    /// `freeRoot = PageId::None()` ("free list is in-memory only for v1"), so
+    /// that garbage is not reclaimable by the next process either: it is
+    /// permanent growth of the operator's cache file.
+    ///
+    /// Committing in slices bounds it. Each commit returns its replaced pages
+    /// to the free list, and the next slice allocates out of that, so the file
+    /// grows by about one slice rather than by the whole store. The cost of a
+    /// small slice is more commits; the cost of a large one is the peak. A
+    /// thousand records is roughly 48 MiB of headroom at the daemon's 16 KiB
+    /// page size, which is a rounding error against the cache it is converting.
+    constexpr std::uint64_t MigrationChunkRecords = 1000;
+
+    /// Describe a store this build cannot read, and say what can be done about it.
+    ///
+    /// One helper rather than one message per call site: a marker naming another
+    /// version and a pre-marker store whose ABSENT marker is its version are the
+    /// same fact to an operator, and deserve the same sentence. The sentence has
+    /// to carry the advice because the alternative is what an operator reaches
+    /// for unprompted — deleting a store that was never damaged.
+    /// @param onDisk   The version the store carries.
+    /// @param readable  Whether this build still has a reader for it.
+    /// @return The refusal, coded so a programmatic caller can tell it from damage.
+    [[nodiscard]] StorageError UnsupportedFormat(std::uint32_t onDisk, bool readable)
+    {
+        // The advice is the load-bearing half. An operator reading a refusal
+        // with no next step reaches for `rm -rf`, which is the outcome this
+        // whole error code exists to prevent.
+        //
+        // Which advice, though, turns on whether a READER still exists -- not on
+        // which side of the current version the store sits. A version older than
+        // every reader (one whose row was retired, which the table's comment
+        // describes as a supported decision) would otherwise be told to run a
+        // conversion that refuses it with this very sentence.
+        auto const* const remedy = [&] {
+            if (readable)
+                return "the store is intact and does not need to be deleted -- convert it with "
+                       "`fastcached --migrate-storage` (or `fastcache-compile-node --migrate-cache`), "
+                       "passing the same storage options this process was given";
+            if (onDisk > CowTreeStorage::CurrentFormatVersion)
+                return "upgrade to a build that writes this version; the store is intact and does not need to be "
+                       "deleted";
+            return "this build no longer carries a reader for that version, so it cannot be converted; the cache "
+                   "has to be rebuilt";
+        }();
+        return MakeError(StorageErrorCode::UnsupportedFormatVersion,
+                         std::format("on-disk storage format version {} (this build reads and writes {}): {}",
+                                     onDisk,
+                                     CowTreeStorage::CurrentFormatVersion,
+                                     remedy));
+    }
+
+    /// Describe a store a conversion stopped in the middle of.
+    ///
+    /// A distinct sentence from `UnsupportedFormat` because the remedy is
+    /// distinct: this store is neither vintage nor damaged, it is half-way, and
+    /// the one thing that fixes it is running the conversion again.
+    /// @param fromVersion The version the interrupted run was converting from.
+    /// @return The refusal.
+    /// Describe a conversion some OTHER build started and this one must not
+    /// finish.
+    /// @param progressFrom The version that run was converting from.
+    /// @param progressTo   The version it was converting to.
+    /// @return The refusal.
+    [[nodiscard]] StorageError ForeignConversion(std::uint32_t progressFrom, std::uint32_t progressTo)
+    {
+        return MakeError(StorageErrorCode::UnsupportedFormatVersion,
+                         std::format("an interrupted conversion from on-disk storage format version {} to {} is in "
+                                     "progress, and this build writes version {}: finish it with the build that "
+                                     "started it. The store is intact and does not need to be deleted.",
+                                     progressFrom,
+                                     progressTo,
+                                     CowTreeStorage::CurrentFormatVersion));
+    }
+
+    [[nodiscard]] StorageError InterruptedConversion(std::uint32_t fromVersion)
+    {
+        return MakeError(StorageErrorCode::UnsupportedFormatVersion,
+                         std::format("an interrupted conversion left this store part-way from on-disk storage "
+                                     "format version {} to {}: re-run `fastcached --migrate-storage` (or "
+                                     "`fastcache-compile-node --migrate-cache`) to finish it, which resumes where "
+                                     "it stopped. The store is intact and does not need to be deleted.",
+                                     fromVersion,
+                                     CowTreeStorage::CurrentFormatVersion));
+    }
 
     [[nodiscard]] std::expected<std::uint64_t, StorageError> ParseUnsigned(std::span<std::byte const> bytes)
     {
@@ -238,46 +342,405 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
     return {};
 }
 
-std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
+namespace
 {
-    auto reader = _tree->BeginRead();
-    auto marker = reader.Get(KeyView(FormatMarkerKey));
-    if (!marker.has_value())
-        return std::unexpected(TranslateError(marker.error(), "format-marker read"));
 
-    if (marker->has_value())
+    /// Is `key` one of the reserved sentinels rather than a cache entry?
+    ///
+    /// Both of them, in one predicate, because every caller wants the same
+    /// answer: a conversion that parsed either as a record would report the
+    /// store corrupt.
+    /// @param key A tree key.
+    /// @return True when it is reserved.
+    [[nodiscard]] bool IsReservedKey(CowTree::BytesView key) noexcept
     {
-        // A marker exists: it must name exactly the current format version.
+        return std::ranges::equal(key, KeyView(CowTreeStorage::FormatMarkerKey))
+               || std::ranges::equal(key, KeyView(CowTreeStorage::MigrationMarkerKey));
+    }
+
+    /// How far an interrupted conversion had got.
+    struct MigrationProgress
+    {
+        /// The version that run was converting FROM. Recorded rather than
+        /// re-derived, because by the time it is read the store is mixed: some
+        /// records are already the new layout and the old marker still stands,
+        /// so nothing on disk can be asked which reader to use.
+        std::uint32_t fromVersion { 0 };
+
+        /// The version that run was converting TO.
+        ///
+        /// Recorded because "resume it" is only safe when the run being resumed
+        /// was heading where this build writes. A newer build interrupted
+        /// part-way from 4 to 5 leaves a store whose format marker still says 4
+        /// -- so without this, an older build would find a source version it can
+        /// read, "resume", re-encode the v4 tail to v4, and stamp the whole
+        /// store v4 over a v5 prefix. That is the silent mis-parse the version
+        /// marker exists to prevent, arrived at through the machinery meant to
+        /// prevent it.
+        std::uint32_t toVersion { 0 };
+
+        /// The last key that run converted. Everything at or below it is
+        /// already in the new layout.
+        std::vector<std::byte> lastKey;
+    };
+
+    /// Read the in-flight-conversion marker, if there is one.
+    /// @param tree An opened tree.
+    /// @return The progress, or nullopt when no conversion is in flight.
+    [[nodiscard]] std::expected<std::optional<MigrationProgress>, StorageError> ReadMigrationProgress(CowTree::CowTree& tree)
+    {
+        auto reader = tree.BeginRead();
+        auto const marker = reader.Get(KeyView(CowTreeStorage::MigrationMarkerKey));
+        if (!marker.has_value())
+            return std::unexpected(TranslateError(marker.error(), "migration-marker read"));
+        if (!marker->has_value())
+            return std::optional<MigrationProgress> {};
+
         CowTree::BytesView cursor { (*marker)->data(), (*marker)->size() };
-        std::uint32_t onDisk = 0;
-        if (!ReadLe<std::uint32_t>(cursor, onDisk) || onDisk != StorageFormatVersion)
-            return std::unexpected(MakeError(
-                StorageErrorCode::Corrupt,
-                std::format("unsupported on-disk storage format version {} (expected {})", onDisk, StorageFormatVersion)));
+        MigrationProgress progress;
+        if (!ReadLe<std::uint32_t>(cursor, progress.fromVersion) || !ReadLe<std::uint32_t>(cursor, progress.toVersion))
+            return std::unexpected(
+                MakeError(StorageErrorCode::Corrupt, "migration marker is too short to hold its versions"));
+        progress.lastKey.assign(cursor.begin(), cursor.end());
+        return progress;
+    }
+
+    /// Record how far the conversion has got, into `txn`. The caller commits —
+    /// in the SAME transaction as the records it describes, so the marker can
+    /// never claim more progress than was made.
+    /// @param txn         An open write transaction.
+    /// @param fromVersion The version being converted from.
+    /// @param lastKey     The last key converted.
+    /// @return Empty on success.
+    [[nodiscard]] std::expected<void, StorageError> WriteMigrationProgress(CowTree::WriteTxn& txn,
+                                                                           std::uint32_t fromVersion,
+                                                                           std::span<std::byte const> lastKey)
+    {
+        std::vector<std::byte> value;
+        AppendLe<std::uint32_t>(value, fromVersion);
+        AppendLe<std::uint32_t>(value, CowTreeStorage::CurrentFormatVersion);
+        value.insert(value.end(), lastKey.begin(), lastKey.end());
+        if (auto const put =
+                txn.Put(KeyView(CowTreeStorage::MigrationMarkerKey), CowTree::BytesView { value.data(), value.size() });
+            !put.has_value())
+            return std::unexpected(TranslateError(put.error(), "migration-marker write"));
         return {};
     }
 
-    // No marker. A brand-new (empty) store gets stamped; a non-empty store
-    // predates the marker (legacy v3 or earlier) and must not be mis-parsed.
-    if (_tree->ItemCount() != 0)
-        return std::unexpected(
-            MakeError(StorageErrorCode::Corrupt, "on-disk store predates the versioned record format; refusing to open"));
+    /// The record-layout version a store carries.
+    ///
+    /// Three inputs and one place that reads them, so `EnsureFormatVersion` and
+    /// `MigrateStore` cannot reach different conclusions about the same file: a
+    /// marker holding a version answers directly; no marker over a store that
+    /// already holds records is itself the stamp (see `PreMarkerFormatVersion`);
+    /// and no marker over an empty store means nothing has been written yet,
+    /// which is `nullopt` rather than a version, because the two callers do
+    /// opposite things with it -- one stamps, the other has nothing to convert.
+    /// @param tree An opened tree.
+    /// @return The version, or nullopt for a store nothing has stamped; Corrupt
+    ///         when a marker is present but too short to hold one.
+    [[nodiscard]] std::expected<std::optional<std::uint32_t>, StorageError> StoredFormatVersion(CowTree::CowTree& tree)
+    {
+        auto reader = tree.BeginRead();
+        auto const marker = reader.Get(KeyView(CowTreeStorage::FormatMarkerKey));
+        if (!marker.has_value())
+            return std::unexpected(TranslateError(marker.error(), "format-marker read"));
 
-    std::vector<std::byte> value;
-    AppendLe<std::uint32_t>(value, StorageFormatVersion);
+        if (marker->has_value())
+        {
+            CowTree::BytesView cursor { (*marker)->data(), (*marker)->size() };
+            std::uint32_t onDisk = 0;
+            // A marker too short to hold its own u32 is damage rather than
+            // vintage: there is no version to report and nothing to convert, so
+            // this one is Corrupt while a mismatch is not.
+            if (!ReadLe<std::uint32_t>(cursor, onDisk))
+                return std::unexpected(MakeError(StorageErrorCode::Corrupt, "format marker is too short to hold a version"));
+            return onDisk;
+        }
+
+        if (tree.ItemCount() != 0)
+            return PreMarkerFormatVersion;
+        return std::optional<std::uint32_t> {};
+    }
+
+    /// Stamp the current version into `txn`. The caller commits.
+    /// @param txn An open write transaction.
+    /// @return Empty on success.
+    [[nodiscard]] std::expected<void, StorageError> StampFormatVersion(CowTree::WriteTxn& txn)
+    {
+        std::vector<std::byte> value;
+        AppendLe<std::uint32_t>(value, CowTreeStorage::CurrentFormatVersion);
+        if (auto const put =
+                txn.Put(KeyView(CowTreeStorage::FormatMarkerKey), CowTree::BytesView { value.data(), value.size() });
+            !put.has_value())
+            return std::unexpected(TranslateError(put.error(), "format-marker write"));
+        return {};
+    }
+
+} // namespace
+
+std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
+{
+    // Asked BEFORE the version, because a store with a conversion in flight has
+    // no single answer to that question: some of its records are the new layout
+    // and its marker still names the old one.
+    auto const progress = ReadMigrationProgress(*_tree);
+    if (!progress.has_value())
+        return std::unexpected(progress.error());
+    if (progress->has_value())
+    {
+        if ((*progress)->toVersion != CurrentFormatVersion)
+            return std::unexpected(ForeignConversion((*progress)->fromVersion, (*progress)->toVersion));
+        return std::unexpected(InterruptedConversion((*progress)->fromVersion));
+    }
+
+    auto const onDisk = StoredFormatVersion(*_tree);
+    if (!onDisk.has_value())
+        return std::unexpected(onDisk.error());
+
+    if (onDisk->has_value())
+    {
+        if (**onDisk != CurrentFormatVersion)
+            return std::unexpected(UnsupportedFormat(**onDisk, CanRead(**onDisk)));
+        return {};
+    }
+
+    // Nothing stamped and nothing stored: a brand-new store, and this is the
+    // first and only chance to mark it.
     auto txn = _tree->BeginWrite();
-    if (auto const put = txn.Put(KeyView(FormatMarkerKey), CowTree::BytesView { value.data(), value.size() });
-        !put.has_value())
-        return std::unexpected(TranslateError(put.error(), "format-marker write"));
+    if (auto const stamped = StampFormatVersion(txn); !stamped.has_value())
+        return std::unexpected(stamped.error());
     if (auto const c = txn.Commit(); !c.has_value())
         return std::unexpected(TranslateError(c.error(), "format-marker commit"));
     return {};
 }
 
+std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Migrate(Options const& options)
+{
+    // `FilePageStore::Open` creates what it cannot find, which is right for a
+    // daemon starting up and wrong here: it would turn a mistyped path into a
+    // brand-new empty store, report "nothing to convert" over it, and leave the
+    // stray file behind -- while the store the operator meant is still refused
+    // at every start with no hint that they converted something else.
+    auto error = std::error_code {};
+    if (!std::filesystem::exists(options.path, error) || error)
+        return std::unexpected(
+            MakeError(StorageErrorCode::IoError, std::format("no storage file at '{}'", options.path.string())));
+
+    CowTree::FilePageStore::Options pageOpts;
+    pageOpts.path = options.path;
+    pageOpts.pageSize = options.pageSize != 0 ? options.pageSize : DefaultStoragePageSize;
+    // Batched, not Fsync. `Fsync` durability fsyncs on every PAGE write, and a
+    // conversion writes one page per record per tree level -- three fsyncs a
+    // record, which turns a large store into hours. Batched flushes on a
+    // group-commit boundary and again when the store closes, and the progress
+    // marker is what makes the remaining window safe: a crash that loses the
+    // last batch of slices costs those slices, which the next run redoes, not
+    // the store.
+    pageOpts.durability = CowTree::FilePageStore::Durability::Batched;
+
+    auto store = CowTree::FilePageStore::Open(pageOpts);
+    if (!store.has_value())
+        return std::unexpected(
+            TranslateError(store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
+
+    // Opening had to assume a page size in order to know where the second meta
+    // slot even is, and the file gets to overrule that. When it does, the slot
+    // was read at the wrong offset and thrown away -- and since the two slots
+    // alternate, the store may have opened on the OLDER of them. Converting on
+    // top of a rolled-back root would then discard whatever the newer slot
+    // recorded. Reopen with the size the file itself names, now that it is
+    // known.
+    if (auto const actual = (*store)->PageSize(); actual != pageOpts.pageSize)
+    {
+        pageOpts.pageSize = actual;
+        store->reset();
+        store = CowTree::FilePageStore::Open(pageOpts);
+        if (!store.has_value())
+            return std::unexpected(TranslateError(
+                store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
+    }
+    return MigrateStore(**store);
+}
+
+std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::MigrateStore(CowTree::IPageStore& store)
+{
+    CowTree::CowTree tree { store };
+    if (auto const r = tree.Open(); !r.has_value())
+        return std::unexpected(TranslateError(r.error(), "CowTree::Open"));
+
+    auto const progress = ReadMigrationProgress(tree);
+    if (!progress.has_value())
+        return std::unexpected(progress.error());
+
+    MigrationReport report { .fromVersion = CurrentFormatVersion,
+                             .toVersion = CurrentFormatVersion,
+                             .recordsConverted = 0,
+                             .resumed = progress->has_value() };
+
+    // Where to read the source version from. An interrupted run recorded it,
+    // and that recording is the only thing that still knows: the store's own
+    // marker names the version it is converting FROM, but its records are by
+    // now a mixture of both layouts.
+    std::optional<std::uint32_t> sourceVersion;
+    std::optional<std::vector<std::byte>> resume;
+    if (progress->has_value())
+    {
+        // Only a conversion heading where THIS build writes may be resumed.
+        // Picking up one aimed at another version would re-encode its tail into
+        // the wrong layout and then stamp the store as if the whole thing were
+        // in it.
+        if ((*progress)->toVersion != CurrentFormatVersion)
+            return std::unexpected(ForeignConversion((*progress)->fromVersion, (*progress)->toVersion));
+        sourceVersion = (*progress)->fromVersion;
+        resume = (*progress)->lastKey;
+    }
+    else
+    {
+        auto const onDisk = StoredFormatVersion(tree);
+        if (!onDisk.has_value())
+            return std::unexpected(onDisk.error());
+        // An unstamped store holds nothing to convert, and `Open` will stamp
+        // it. Reported as already current rather than as an error, so running
+        // the conversion over a path that turns out to be empty is a no-op an
+        // operator can read rather than a failure they have to interpret.
+        if (!onDisk->has_value() || **onDisk == CurrentFormatVersion)
+            return report;
+        sourceVersion = *onDisk;
+    }
+
+    auto const formats = RecordFormats();
+    auto const row = std::ranges::find(formats, *sourceVersion, &RecordFormat::version);
+    if (row == formats.end())
+        return std::unexpected(UnsupportedFormat(*sourceVersion, CanRead(*sourceVersion)));
+    report.fromVersion = *sourceVersion;
+
+    // Parse everything BEFORE converting anything.
+    //
+    // Which reader to use is an inference -- an unmarked store is assumed to be
+    // v3 -- and the conversion rewrites records in place, so a wrong inference
+    // is not a failed conversion but a destroyed store. One read-only pass
+    // turns that into a refusal: a store whose records do not all parse under
+    // the reader chosen for it is left exactly as it was found. The cost is a
+    // second pass over a job that is already offline and once-per-upgrade.
+    {
+        auto reader = tree.BeginRead();
+        std::optional<StorageError> invalid;
+        auto const check = [&](CowTree::BytesView key, CowTree::BytesView value) {
+            if (IsReservedKey(key))
+                return true;
+            auto const parsed = row->parse(value);
+            if (!parsed.has_value())
+            {
+                invalid = MakeError(StorageErrorCode::UnsupportedFormatVersion,
+                                    std::format("this store does not read as on-disk storage format version {}, so "
+                                                "it cannot be converted to {}. It has NOT been modified.",
+                                                *sourceVersion,
+                                                CurrentFormatVersion));
+                return false;
+            }
+            return true;
+        };
+        auto const scanned = resume.has_value()
+                                 ? reader.ForEachAfter(CowTree::BytesView { resume->data(), resume->size() }, check)
+                                 : reader.ForEach(check);
+        if (!scanned.has_value())
+            return std::unexpected(TranslateError(scanned.error(), "migration validation scan"));
+        if (invalid.has_value())
+            return std::unexpected(*invalid);
+    }
+
+    // Converted in slices rather than in one transaction; see
+    // `MigrationChunkRecords` for why a single transaction is not an option.
+    // Each slice pins its own read snapshot AFTER the previous slice committed,
+    // so no walk ever overlaps a commit -- which is the one thing `ForEach`
+    // does not tolerate.
+    while (true)
+    {
+        auto reader = tree.BeginRead();
+        auto txn = tree.BeginWrite();
+
+        std::vector<std::byte> lastKey;
+        std::uint64_t inChunk = 0;
+        std::optional<StorageError> failure;
+
+        auto const visit = [&](CowTree::BytesView key, CowTree::BytesView value) {
+            if (IsReservedKey(key))
+                return true;
+
+            auto const parsed = row->parse(value);
+            if (!parsed.has_value())
+            {
+                failure = parsed.error();
+                return false;
+            }
+            auto const record = ReEncodeRecord(*parsed, value);
+            if (auto const put = txn.Put(key, CowTree::BytesView { record.data(), record.size() }); !put.has_value())
+            {
+                failure = TranslateError(put.error(), "migration write");
+                return false;
+            }
+            lastKey.assign(key.begin(), key.end());
+            ++inChunk;
+            return inChunk < MigrationChunkRecords;
+        };
+
+        auto const walked = resume.has_value()
+                                ? reader.ForEachAfter(CowTree::BytesView { resume->data(), resume->size() }, visit)
+                                : reader.ForEach(visit);
+        if (!walked.has_value())
+            return std::unexpected(TranslateError(walked.error(), "migration scan"));
+        if (failure.has_value())
+            return std::unexpected(*failure);
+
+        if (inChunk == 0)
+        {
+            txn.Abort();
+            break;
+        }
+
+        if (auto const recorded = WriteMigrationProgress(txn, *sourceVersion, lastKey); !recorded.has_value())
+            return std::unexpected(recorded.error());
+        if (auto const c = txn.Commit(); !c.has_value())
+            return std::unexpected(TranslateError(c.error(), "migration commit"));
+
+        // Committing is not enough to get the slice's replaced pages back. A
+        // batching store holds them until the commit that freed them is
+        // durable, which it would otherwise defer to a fixed commit interval --
+        // so without this the slices allocate fresh pages the whole way and the
+        // file grows per record after all, which is the one thing slicing is
+        // for. Measured: without it, 4x the records cost 5.3x the growth.
+        if (auto const flushed = store.Flush(); !flushed.has_value())
+            return std::unexpected(TranslateError(flushed.error(), "migration flush"));
+
+        report.recordsConverted += inChunk;
+        resume = std::move(lastKey);
+    }
+
+    // The progress marker goes away in the SAME transaction that stamps the new
+    // version, so there is no instant at which the store is both "converting"
+    // and "converted" -- nor one in which it is neither.
+    auto txn = tree.BeginWrite();
+    if (auto const erased = txn.Erase(KeyView(CowTreeStorage::MigrationMarkerKey)); !erased.has_value())
+        return std::unexpected(TranslateError(erased.error(), "migration-marker erase"));
+    if (auto const stamped = StampFormatVersion(txn); !stamped.has_value())
+        return std::unexpected(stamped.error());
+    if (auto const c = txn.Commit(); !c.has_value())
+        return std::unexpected(TranslateError(c.error(), "migration commit"));
+
+    // Checked, unlike the flush the store would do in its destructor: an
+    // operator told a conversion succeeded must not be told it by a path that
+    // discarded the error saying otherwise.
+    if (auto const flushed = store.Flush(); !flushed.has_value())
+        return std::unexpected(TranslateError(flushed.error(), "migration flush"));
+
+    return report;
+}
+
 namespace
 {
-    /// Append the common v3 leaf-record header (everything but the value /
-    /// overflow descriptor).
+    /// Append the leaf-record header every record starts with: the kind tag,
+    /// the codec, and the fields `ReadCommonHeader` reads back.
     void AppendCommonHeader(std::vector<std::byte>& out, std::uint8_t kind, CompressionCodec codec, CacheEntry const& entry)
     {
         AppendLe<std::uint8_t>(out, kind);
@@ -323,11 +786,48 @@ std::vector<std::byte> CowTreeStorage::EncodeOverflowDescriptor(CacheEntry const
     return out;
 }
 
+namespace
+{
+
+    /// Read the fields every record layout has carried since v3, in their
+    /// shared order. Split out so each version's reader is the short list of
+    /// what is DIFFERENT about it, rather than a second copy of the eight
+    /// fields that are not.
+    /// @param cursor Advanced past the common header.
+    /// @param entry  Filled in.
+    /// @return False when the record runs out before the header does.
+    [[nodiscard]] bool ReadCommonHeader(CowTree::BytesView& cursor, CacheEntry& entry) noexcept
+    {
+        if (!ReadLe<std::uint32_t>(cursor, entry.flags))
+            return false;
+        if (!ReadLe<std::uint64_t>(cursor, entry.cas))
+            return false;
+        std::int64_t expiryUs = 0;
+        if (!ReadLe<std::int64_t>(cursor, expiryUs))
+            return false;
+        entry.expiry = MicrosToTimePoint(expiryUs);
+        if (!ReadLe<std::uint64_t>(cursor, entry.generation))
+            return false;
+        std::int64_t lastAccessUs = 0;
+        if (!ReadLe<std::int64_t>(cursor, lastAccessUs))
+            return false;
+        entry.lastAccess = MicrosToTimePoint(lastAccessUs);
+        std::uint8_t staleByte = 0;
+        if (!ReadLe<std::uint8_t>(cursor, staleByte))
+            return false;
+        entry.stale = staleByte != 0;
+        return true;
+    }
+
+} // namespace
+
 std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseRecord(CowTree::BytesView raw)
 {
+    // v4: u8 kind, u8 codec, <common header>, then
+    //     inline   -> u32 stored_len, u32 original_len, [stored bytes]
+    //     overflow -> u64 stored_len, u64 original_len, u64 root_page_id
     auto cursor = raw;
     ParsedRecord parsed;
-    auto& e = parsed.entry;
     std::uint8_t kind = 0;
     if (!ReadLe<std::uint8_t>(cursor, kind))
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
@@ -335,24 +835,8 @@ std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseR
     if (!ReadLe<std::uint8_t>(cursor, codecByte))
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
     parsed.codec = static_cast<CompressionCodec>(codecByte);
-    if (!ReadLe<std::uint32_t>(cursor, e.flags))
+    if (!ReadCommonHeader(cursor, parsed.entry))
         return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    if (!ReadLe<std::uint64_t>(cursor, e.cas))
-        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    std::int64_t expiryUs = 0;
-    if (!ReadLe<std::int64_t>(cursor, expiryUs))
-        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    e.expiry = MicrosToTimePoint(expiryUs);
-    if (!ReadLe<std::uint64_t>(cursor, e.generation))
-        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    std::int64_t lastAccessUs = 0;
-    if (!ReadLe<std::int64_t>(cursor, lastAccessUs))
-        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    e.lastAccess = MicrosToTimePoint(lastAccessUs);
-    std::uint8_t staleByte = 0;
-    if (!ReadLe<std::uint8_t>(cursor, staleByte))
-        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
-    e.stale = staleByte != 0;
 
     if (kind == RecordKindInline)
     {
@@ -381,6 +865,94 @@ std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseR
         return parsed;
     }
     return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+}
+
+std::expected<CowTreeStorage::ParsedRecord, StorageError> CowTreeStorage::ParseRecordV3(CowTree::BytesView raw)
+{
+    // v3: u8 kind, <common header>, then
+    //     inline   -> u32 len, [bytes]
+    //     overflow -> u64 len, u64 root_page_id
+    //
+    // No codec byte and no original length: v3 stored every value verbatim, so
+    // `Identity` and "original == stored" are not defaults standing in for
+    // missing information -- they are what the layout meant.
+    auto cursor = raw;
+    ParsedRecord parsed;
+    parsed.codec = CompressionCodec::Identity;
+    std::uint8_t kind = 0;
+    if (!ReadLe<std::uint8_t>(cursor, kind))
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+    if (!ReadCommonHeader(cursor, parsed.entry))
+        return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+
+    // EXACT lengths, where the current reader only checks there is enough. This
+    // reader is reached by inference rather than by a marker -- a store with no
+    // sentinel is ASSUMED to be v3 -- and the layout before v3 had no kind byte
+    // at all, so its first byte is a flags byte that reads as `RecordKindInline`
+    // whenever flags are zero. Accepting a record with bytes left over is what
+    // would let such a store parse, and a conversion that parses it rewrites it
+    // in place: a store this build used to merely refuse would be destroyed by
+    // the feature meant to rescue it. A v3 record ends exactly where its value
+    // does.
+    if (kind == RecordKindInline)
+    {
+        if (!ReadLe<std::uint32_t>(cursor, parsed.inlineLen))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        parsed.originalLen = parsed.inlineLen;
+        if (cursor.size() != parsed.inlineLen)
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        parsed.inlineOffset = static_cast<std::size_t>(raw.size() - cursor.size());
+        return parsed;
+    }
+    if (kind == RecordKindOverflow)
+    {
+        parsed.overflow = true;
+        if (!ReadLe<std::uint64_t>(cursor, parsed.totalLen))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        parsed.originalLen = parsed.totalLen;
+        std::uint64_t rootValue = 0;
+        if (!ReadLe<std::uint64_t>(cursor, rootValue))
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        if (!cursor.empty())
+            return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+        parsed.root = CowTree::PageId { rootValue };
+        return parsed;
+    }
+    return std::unexpected(MakeError(StorageErrorCode::Corrupt));
+}
+
+std::span<CowTreeStorage::RecordFormat const> CowTreeStorage::RecordFormats() noexcept
+{
+    static constexpr std::array formats {
+        RecordFormat { .version = PreMarkerFormatVersion, .parse = &CowTreeStorage::ParseRecordV3 },
+        RecordFormat { .version = CurrentFormatVersion, .parse = &CowTreeStorage::ParseRecord },
+    };
+
+    // The table ends at the version this build writes, and covers every one
+    // down to its first without a gap. Checked row by row rather than by
+    // arithmetic on the first and last: {3, 5, 5} has the right first version,
+    // the right last version and the right length, and silently cannot read a
+    // v4 store. Anchored on the extent rather than on any row's name, so
+    // adding a reader without bumping the version -- or the reverse -- fails
+    // here rather than at the first store nobody can open.
+    static_assert(formats.back().version == CurrentFormatVersion);
+    static_assert(std::ranges::all_of(std::views::iota(std::size_t { 0 }, formats.size()),
+                                      [](std::size_t i) { return formats[i].version == formats.front().version + i; }));
+
+    return formats;
+}
+
+bool CowTreeStorage::CanRead(std::uint32_t version) noexcept
+{
+    auto const formats = RecordFormats();
+    return std::ranges::find(formats, version, &RecordFormat::version) != formats.end();
+}
+
+std::vector<std::byte> CowTreeStorage::ReEncodeRecord(ParsedRecord const& parsed, CowTree::BytesView raw)
+{
+    if (parsed.overflow)
+        return EncodeOverflowDescriptor(parsed.entry, parsed.codec, parsed.root, parsed.totalLen, parsed.originalLen);
+    return EncodeInline(parsed.entry, parsed.codec, raw.subspan(parsed.inlineOffset, parsed.inlineLen), parsed.originalLen);
 }
 
 std::size_t CowTreeStorage::InlineValueLimit() const noexcept
@@ -1305,6 +1877,27 @@ void CowTreeStorage::Resize(std::size_t newMaxBytes)
     _options.maxBytes = newMaxBytes;
     _stats.bytesLimit = newMaxBytes;
     EvictToFit();
+}
+
+std::string DescribeMigration(std::filesystem::path const& path,
+                              std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome)
+{
+    if (!outcome.has_value())
+        // The code as well as the context: several failure paths carry only the
+        // label of the step that failed, and "CowTree::Open" on its own tells an
+        // operator nothing about which kind of problem to go looking for.
+        return std::format("{}: {}: {}", path.string(), ToStringView(outcome.error().code), outcome.error().context);
+
+    if (outcome->fromVersion == outcome->toVersion)
+        return std::format(
+            "{}: already at on-disk storage format version {}; nothing to do", path.string(), outcome->toVersion);
+
+    return std::format("{}: converted {} record(s) from on-disk storage format version {} to {}{}",
+                       path.string(),
+                       outcome->recordsConverted,
+                       outcome->fromVersion,
+                       outcome->toVersion,
+                       outcome->resumed ? " (resumed an interrupted conversion)" : "");
 }
 
 } // namespace FastCache

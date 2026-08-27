@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -106,6 +107,109 @@ auto ReadTxn::Get(BytesView key) const -> std::expected<std::optional<std::vecto
         cursor = next;
     }
     return std::optional<std::vector<std::byte>> {};
+}
+
+auto ReadTxn::ForEach(std::function<bool(BytesView key, BytesView value)> const& visit) const
+    -> std::expected<void, CowTreeError>
+{
+    return Walk(std::nullopt, visit);
+}
+
+auto ReadTxn::ForEachAfter(BytesView startAfter, std::function<bool(BytesView key, BytesView value)> const& visit) const
+    -> std::expected<void, CowTreeError>
+{
+    return Walk(startAfter, visit);
+}
+
+auto ReadTxn::Walk(std::optional<BytesView> startAfter,
+                   std::function<bool(BytesView key, BytesView value)> const& visit) const
+    -> std::expected<void, CowTreeError>
+{
+    if (_store == nullptr)
+        return std::unexpected(CowTreeError::NotOpen);
+
+    // Explicit stack rather than recursion: the depth is a function of the
+    // stored data, and a tree deep enough to overflow the call stack would take
+    // an administrative scan down with it rather than returning an error.
+    std::vector<PageId> pending;
+    if (_root)
+        pending.push_back(_root);
+
+    // A tree reaches each of its pages exactly once, so a walk that has read
+    // more pages than the store holds is following a cycle: a child pointer
+    // back into an ancestor. Per-page CRCs cannot catch that — every page
+    // around the loop is individually valid — so without a budget the walk
+    // spins until `pending` exhausts memory. O(1) rather than a visited set,
+    // which on a large store would cost more than the scan itself.
+    auto budget = _store->PageCount();
+
+    // Reused across pages so the walk does not allocate once per page. Each page
+    // is copied into it before `visit` runs, which is what lets a callback read
+    // elsewhere in the store without the page store's shared read buffer being
+    // pulled out from under the entry views (see the header).
+    std::vector<std::byte> page;
+
+    while (!pending.empty())
+    {
+        auto const id = pending.back();
+        pending.pop_back();
+
+        if (budget == 0)
+            return std::unexpected(CowTreeError::Corrupt);
+        --budget;
+
+        auto const view = _store->Read(id);
+        if (!view.has_value())
+            return std::unexpected(view.error());
+        page.assign(view->begin(), view->end());
+
+        auto const header = DecodePageHeader(page);
+        if (!header.has_value())
+            return std::unexpected(header.error());
+
+        if (header->type == PageType::Leaf)
+        {
+            auto const entries = DecodeLeafEntries(page, *header);
+            if (!entries.has_value())
+                return std::unexpected(entries.error());
+            for (auto const& e: *entries)
+            {
+                // The subtree pruning below can only skip whole children, so the
+                // leaf holding `startAfter` itself still arrives with its
+                // already-handled entries on it.
+                if (startAfter.has_value() && CompareBytes(e.key, *startAfter) <= 0)
+                    continue;
+                if (!visit(e.key, e.value))
+                    return {};
+            }
+            continue;
+        }
+
+        auto const entries = DecodeInternalEntries(page, *header);
+        if (!entries.has_value())
+            return std::unexpected(entries.error());
+
+        // Child i covers [entries[i].key, entries[i+1].key), and `firstChild`
+        // covers everything below entries[0].key. A child whose whole range
+        // ends at or before `startAfter` cannot hold an unvisited key, so it is
+        // never read — which is what makes resuming a slice cost one pass over
+        // the store in total rather than one pass per slice.
+        auto const reachable = [&](std::size_t upperBound) {
+            if (!startAfter.has_value() || upperBound >= entries->size())
+                return true;
+            return CompareBytes((*entries)[upperBound].key, *startAfter) > 0;
+        };
+
+        // Pushed in reverse so the LIFO stack pops them back in key order, which
+        // is what callers are promised. `firstChild` covers the keys below
+        // entries[0].key, so it goes on last and comes off first.
+        for (auto const i: std::views::iota(std::size_t { 0 }, entries->size()) | std::views::reverse)
+            if ((*entries)[i].child && reachable(i + 1))
+                pending.push_back((*entries)[i].child);
+        if (header->firstChild && reachable(0))
+            pending.push_back(header->firstChild);
+    }
+    return {};
 }
 
 // ============================================================================

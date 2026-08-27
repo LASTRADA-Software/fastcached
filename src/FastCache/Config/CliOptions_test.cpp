@@ -75,6 +75,7 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--service-scope", .value = "system" },
     { .flag = "--healthcheck", .value = "" },
     { .flag = "--seed-config", .value = "template.yaml" },
+    { .flag = "--migrate-storage", .value = "" },
     { .flag = "--pidfile", .value = "fastcached.pid" },
     { .flag = "--service-name", .value = "FastCached" },
     { .flag = "--help", .value = "" },

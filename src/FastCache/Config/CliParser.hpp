@@ -25,6 +25,10 @@ enum class CliOutcome : std::uint8_t
     UninstallService, ///< --uninstall-service was seen; remove the Windows service.
     HealthCheck,      ///< --healthcheck was seen; probe /healthz and exit 0/1.
     SeedConfig,       ///< --seed-config was seen; install the default config file and exit.
+
+    /// --migrate-storage was seen; convert the configured store's on-disk
+    /// record layout to the one this build writes, then exit.
+    MigrateStorage,
 };
 
 struct CliResult

@@ -519,6 +519,20 @@ TEST_CASE("CliParser: --seed-config parses and selects the seeding action", "[co
     REQUIRE(parsed->config.configPath.empty());
 }
 
+TEST_CASE("CliParser: --migrate-storage selects the conversion and keeps parsing", "[config][cli]")
+{
+    // It has to keep parsing. The conversion acts on the storage options that
+    // follow it, so a flag that stopped the parse would convert whatever the
+    // defaults name rather than what the operator typed -- and on a sharded
+    // layout that is a different set of files entirely.
+    std::array<char const*, 3> const argv { "--migrate-storage", "--storage=/var/lib/fastcached", "--storage-shards=4" };
+    auto const parsed = FastCache::ParseCli(std::span<char const* const> { argv });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->outcome == FastCache::CliOutcome::MigrateStorage);
+    REQUIRE(parsed->config.storagePath == "/var/lib/fastcached");
+    REQUIRE(parsed->config.storageShards == 4);
+}
+
 TEST_CASE("CliParser: --help option descriptions share one aligned column", "[config][cli][help]")
 {
     auto const usage = FastCache::CliUsage();
