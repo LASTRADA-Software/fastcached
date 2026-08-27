@@ -238,6 +238,19 @@ the one being refused.
 Renaming the service with `--service-name` renames the account with it, since the
 SCM derives one from the other.
 
+**A storage path belongs to one daemon.** The store is claimed exclusively while
+it is open, so a second daemon started against the same `storage_path` refuses
+rather than sharing it:
+
+```
+failed to open storage 'D:\fastcached\cache': StorageError(code=InUse system=0 context=FilePageStore::Open)
+Another process already has this store open. A storage path belongs to one daemon:
+stop the other one, or give this daemon a path of its own.
+```
+
+Running two daemons on one machine is fine — give each its own path. Nothing is
+written to the store to enforce this, so its files stay readable by any build.
+
 `--install-service` records the flags it was given on the command line into
 the service's command line (values from a `--config` file stay in the file)
 and makes path arguments absolute — a service starts with its

@@ -41,6 +41,7 @@ using namespace std::chrono_literals;
 using FastCache::Testing::Decode;
 using FastCache::Testing::MakeBytes;
 using FastCache::Testing::TempFile;
+using FastCache::Testing::Unwrap;
 using FastCache::Testing::ValueOf;
 
 namespace
@@ -2507,4 +2508,72 @@ TEST_CASE("Compression: a store mixes codecs and reads each by its own tag", "[c
         REQUIRE(b->found);
         REQUIRE(ValueOf(b->entry) == zstdValue);
     });
+}
+
+// ============================================================================
+// The exclusive claim, as the storage layer reports it
+// ============================================================================
+
+TEST_CASE("A second CowTreeStorage on one path reports InUse, not IoError", "[cowstorage][open][lock]")
+{
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto first = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(first.has_value());
+
+    // The distinction IS the fix. `IoError` sends an operator to look at the
+    // disk, the permissions and the file; `InUse` tells them the truth, which
+    // is that a second process is already serving this path.
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE_FALSE(second.has_value());
+    REQUIRE(second.error().code == FastCache::StorageErrorCode::InUse);
+    REQUIRE(FastCache::ToStringView(second.error().code) == "InUse");
+}
+
+TEST_CASE("An opened CowTreeStorage reports holding its file", "[cowstorage][open][lock]")
+{
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+    auto const state = (*storage)->StoreLockState();
+    REQUIRE(state.has_value());
+    REQUIRE(Unwrap(state) == CowTree::FilePageStore::LockState::Held);
+}
+
+TEST_CASE("A CowTreeStorage over a borrowed page store reports no claim at all", "[cowstorage][open][lock]")
+{
+    // Absent is not zero: there is no file here, so "not claimed" would be a
+    // false statement about a store that never had one to take.
+    CowTree::InMemoryPageStore store;
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+    REQUIRE_FALSE((*storage)->StoreLockState().has_value());
+}
+
+TEST_CASE("Closing a CowTreeStorage releases the path for the next one", "[cowstorage][open][lock]")
+{
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        REQUIRE((*first)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    // Every restart goes through here, so the claim must not outlive the object
+    // that took it -- and the data written under it must still be there.
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+    FastCache::ManualClock clock;
+    auto const got = (*second)->Get("k", clock.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
 }

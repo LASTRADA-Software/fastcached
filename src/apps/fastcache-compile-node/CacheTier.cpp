@@ -58,29 +58,45 @@ namespace
     constexpr std::size_t DiskMaxValueBytes = 256ULL * 1024ULL * 1024ULL;
 
     /// Open the on-disk half of the tier under `--cache-dir`.
-    /// @param cfg The parsed configuration; `cacheDir` must not be empty.
+    ///
+    /// ONE process per directory, and the store now enforces it rather than
+    /// asking to be trusted: `CowTreeStorage::Open` claims the file for the life
+    /// of the process, so a second node pointed at one `--cache-dir` is refused
+    /// with `StorageErrorCode::InUse`. That refusal is spelled out here because
+    /// `--cache-dir` is the flag most likely to be copied between two nodes on
+    /// one machine, and a node that will not start is worth one clear sentence.
+    /// @param cfg    The parsed configuration; `cacheDir` must not be empty.
+    /// @param logger Where an unenforceable claim is reported.
     /// @return The store, or why it could not be opened.
-    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> OpenDiskTier(NodeConfig const& cfg)
+    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> OpenDiskTier(NodeConfig const& cfg, ILogger& logger)
     {
         auto error = std::error_code {};
         std::filesystem::create_directories(cfg.cacheDir, error);
         if (error)
             return std::unexpected { std::format("cannot create {}: {}", cfg.cacheDir.string(), error.message()) };
 
-        // ONE process per directory, and nothing here enforces it. The page store
-        // takes no inter-process lock: on Windows it opens with `FILE_SHARE_READ`,
-        // so a second node is refused outright, and on POSIX it does not lock at
-        // all, so two would write the same meta pages and corrupt the tree in
-        // silence. The daemon's `--storage` has exactly this property (issue #135)
-        // and it is stated here because `--cache-dir` is the flag most likely to be
-        // copied between two nodes on one machine.
         CowTreeStorage::Options options;
         options.path = cfg.cacheDir / DiskStoreFileName;
         options.maxBytes = static_cast<std::size_t>(cfg.cacheDiskBytes);
         options.maxValueBytes = DiskMaxValueBytes;
         auto opened = CowTreeStorage::Open(options);
         if (!opened.has_value())
+        {
+            if (opened.error().code == StorageErrorCode::InUse)
+                return std::unexpected { std::format(
+                    "cannot open {}: another process already has this cache open. A --cache-dir belongs to one "
+                    "node; give this one a path of its own.",
+                    options.path.string()) };
             return std::unexpected { std::format("cannot open {}: {}", options.path.string(), opened.error().ToString()) };
+        }
+
+        // Said out loud rather than assumed. A guard that silently does nothing
+        // reads exactly like one that works, and this is the one place an
+        // operator could still end up with two nodes on one store.
+        if ((*opened)->StoreLockState() == CowTree::FilePageStore::LockState::Unavailable)
+            logger.Logf(LogLevel::Warn,
+                        "{} is on a filesystem that cannot lock; nothing stops a second node opening it",
+                        options.path.string());
         return std::move(*opened);
     }
 
@@ -103,14 +119,15 @@ namespace
     /// whatever scrapes `/metrics`, and `Snapshot()` on these backends writes a
     /// `mutable` member. The daemon reaches for the same wrapper for the same
     /// reason, which is why its `useShardingWrapper` includes `metricsEnabled`.
-    /// @param cfg The parsed configuration; at least one half must be configured.
+    /// @param cfg    The parsed configuration; at least one half must be configured.
+    /// @param logger Passed to the on-disk half, which reports an unenforceable claim.
     /// @return The storage, or why the on-disk half could not be opened.
-    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> BuildStorage(NodeConfig const& cfg)
+    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> BuildStorage(NodeConfig const& cfg, ILogger& logger)
     {
         std::unique_ptr<IStorage> storage;
         if (!cfg.cacheDir.empty())
         {
-            auto disk = OpenDiskTier(cfg);
+            auto disk = OpenDiskTier(cfg, logger);
             if (!disk.has_value())
                 return std::unexpected { std::move(disk.error()) };
             storage = std::move(*disk);
@@ -283,7 +300,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     // type, so without this a bad `--cache-dir` reached the operator as
     // "--listen-cache cannot create /var/lib/...: permission denied" -- which
     // sends them to check a port.
-    auto storage = BuildStorage(cfg);
+    auto storage = BuildStorage(cfg, logger);
     if (!storage.has_value())
         return std::unexpected { std::format("--cache-dir {}", storage.error()) };
 

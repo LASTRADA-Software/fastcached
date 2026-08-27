@@ -65,6 +65,9 @@ namespace
             case CowTree::CowTreeError::NotFound:
                 code = StorageErrorCode::KeyNotFound;
                 break;
+            case CowTree::CowTreeError::InUse:
+                code = StorageErrorCode::InUse;
+                break;
             default:
                 code = StorageErrorCode::IoError;
                 break;
@@ -305,7 +308,14 @@ std::expected<std::unique_ptr<CowTreeStorage>, StorageError> CowTreeStorage::Ope
     auto store = CowTree::FilePageStore::Open(pageOpts);
     if (!store.has_value())
         return std::unexpected(TranslateError(store.error(), "FilePageStore::Open"));
-    return OpenWithStore(std::move(options), std::move(*store));
+
+    // Read before the store is moved from: this is the one path that knows a
+    // real file is behind it, so it is the only one that can answer.
+    auto const lockState = (*store)->StoreLockState();
+    auto opened = OpenWithStore(std::move(options), std::move(*store));
+    if (opened.has_value())
+        (*opened)->_storeLockState = lockState;
+    return opened;
 }
 
 std::expected<std::unique_ptr<CowTreeStorage>, StorageError> CowTreeStorage::OpenWithStore(
@@ -1877,6 +1887,11 @@ void CowTreeStorage::Resize(std::size_t newMaxBytes)
     _options.maxBytes = newMaxBytes;
     _stats.bytesLimit = newMaxBytes;
     EvictToFit();
+}
+
+std::optional<CowTree::FilePageStore::LockState> CowTreeStorage::StoreLockState() const noexcept
+{
+    return _storeLockState;
 }
 
 std::string DescribeMigration(std::filesystem::path const& path,

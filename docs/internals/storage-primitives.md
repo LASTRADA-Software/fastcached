@@ -44,7 +44,7 @@ public:
 | Class                | Purpose |
 |----------------------|---------|
 | `InMemoryLruStorage` | In-memory LRU with a soft byte budget. Carries no lock of its own; the caller serialises it (`ShardedStorage` does), except that `LruMode::Approximate` declares `SupportsSharedRead()` so reads may run concurrently under a shared lock. |
-| `CowTreeStorage`     | Persistent copy-on-write B-tree backing with an in-memory LRU mirror for eviction accounting. |
+| `CowTreeStorage`     | Persistent copy-on-write B-tree backing with an in-memory LRU mirror for eviction accounting. Claims its file exclusively while open, so a second process on one path is refused with `StorageErrorCode::InUse` rather than allowed to interleave meta-page writes. |
 | `LayeredStorage`     | Two-tier composition: L1 = `InMemoryLruStorage`, L2 = any `IStorage`. Reads hit L1 first, writes are write-through. |
 | `ShardedStorage`     | Hash-based sharding across N inner storages. Each shard holds a `std::shared_mutex` for concurrency. |
 | `TracingStorage`     | Decorator that emits one Trace log line per call. |

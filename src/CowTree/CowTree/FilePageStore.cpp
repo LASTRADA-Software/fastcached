@@ -52,8 +52,8 @@ namespace
     /// `CreateFileW` refuses a second writer because of the share mode the
     /// first one passed; both spellings of that refusal reach us here.
     constexpr std::array LockErrorRows {
-        LockErrorRow { ERROR_SHARING_VIOLATION, FilePageStore::LockFailure::Contended },
-        LockErrorRow { ERROR_LOCK_VIOLATION, FilePageStore::LockFailure::Contended },
+        LockErrorRow { .systemError = ERROR_SHARING_VIOLATION, .failure = FilePageStore::LockFailure::Contended },
+        LockErrorRow { .systemError = ERROR_LOCK_VIOLATION, .failure = FilePageStore::LockFailure::Contended },
     };
 
     /// The call that failed is the open itself, so anything not named above is
@@ -66,9 +66,9 @@ namespace
     /// on a platform where they split. EBADF is our own bug rather than
     /// anything about the file.
     constexpr std::array LockErrorRows {
-        LockErrorRow { EWOULDBLOCK, FilePageStore::LockFailure::Contended },
-        LockErrorRow { EAGAIN, FilePageStore::LockFailure::Contended },
-        LockErrorRow { EBADF, FilePageStore::LockFailure::Fatal },
+        LockErrorRow { .systemError = EWOULDBLOCK, .failure = FilePageStore::LockFailure::Contended },
+        LockErrorRow { .systemError = EAGAIN, .failure = FilePageStore::LockFailure::Contended },
+        LockErrorRow { .systemError = EBADF, .failure = FilePageStore::LockFailure::Fatal },
     };
 
     /// The file is already open by the time `flock` runs, so an unrecognised
@@ -84,10 +84,15 @@ namespace
 
 auto FilePageStore::ClassifyLockFailure(int systemError) noexcept -> LockFailure
 {
-    // `auto`, never `auto const*`: a std::array iterator is a raw pointer on
-    // libstdc++ and libc++ and a class type on MSVC.
-    auto const row = std::ranges::find(LockErrorRows, systemError, &LockErrorRow::systemError);
-    return row != LockErrorRows.end() ? row->failure : UnnamedLockError;
+    // Walked rather than looked up with `std::ranges::find`, which would hand
+    // back a std::array iterator -- a raw pointer on libstdc++ and libc++ and a
+    // class type on MSVC. Spelling that `auto` trips `readability-qualified-auto`
+    // and spelling it `auto const*` does not compile on MSVC, so there is no
+    // spelling that satisfies both. A range-for over three rows needs neither.
+    for (auto const& row: LockErrorRows)
+        if (row.systemError == systemError)
+            return row.failure;
+    return UnnamedLockError;
 }
 
 FilePageStore::FilePageStore(Options options) noexcept:

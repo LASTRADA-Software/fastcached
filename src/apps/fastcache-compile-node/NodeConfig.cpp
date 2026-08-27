@@ -546,9 +546,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .apply = AssignFrom<&NodeConfig::cacheDir, ParsePathValue>(),
           .description = "back the local cache tier with disk at this path.\n"
                          "Memory-only otherwise: a disk tier is a resource an\n"
-                         "operator should have to name. ONE node per path:\n"
-                         "the store takes no inter-process lock, so two\n"
-                         "nodes sharing it corrupt it." },
+                         "operator should have to name. ONE node per path,\n"
+                         "enforced: the store is claimed exclusively, so a\n"
+                         "second node sharing it refuses to start." },
         { .primary = "--listen-cache",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",

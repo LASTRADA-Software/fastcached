@@ -453,19 +453,19 @@ TEST_CASE("ClassifyLockFailure maps this platform's lock errors", "[filestore][l
     // checks.
 #if defined(_WIN32)
     auto const rows = std::vector<Row> {
-        { ERROR_SHARING_VIOLATION, LockFailure::Contended, "another handle holds the file" },
-        { ERROR_LOCK_VIOLATION, LockFailure::Contended, "a byte-range lock refuses us" },
-        { ERROR_FILE_NOT_FOUND, LockFailure::Fatal, "the open itself failed" },
-        { ERROR_ACCESS_DENIED, LockFailure::Fatal, "no rights to the file" },
+        { .systemError = ERROR_SHARING_VIOLATION, .expected = LockFailure::Contended, .what = "another handle holds the file" },
+        { .systemError = ERROR_LOCK_VIOLATION, .expected = LockFailure::Contended, .what = "a byte-range lock refuses us" },
+        { .systemError = ERROR_FILE_NOT_FOUND, .expected = LockFailure::Fatal, .what = "the open itself failed" },
+        { .systemError = ERROR_ACCESS_DENIED, .expected = LockFailure::Fatal, .what = "no rights to the file" },
     };
 #else
     auto const rows = std::vector<Row> {
-        { EWOULDBLOCK, LockFailure::Contended, "another descriptor holds the file" },
-        { EAGAIN, LockFailure::Contended, "the same condition under its other spelling" },
-        { EBADF, LockFailure::Fatal, "our own bug, not the filesystem's limit" },
-        { ENOLCK, LockFailure::Unsupported, "the kernel has no lock to give" },
-        { EINVAL, LockFailure::Unsupported, "this descriptor cannot be flocked" },
-        { EOPNOTSUPP, LockFailure::Unsupported, "the filesystem does not implement it" },
+        { .systemError = EWOULDBLOCK, .expected = LockFailure::Contended, .what = "another descriptor holds the file" },
+        { .systemError = EAGAIN, .expected = LockFailure::Contended, .what = "the same condition, other spelling" },
+        { .systemError = EBADF, .expected = LockFailure::Fatal, .what = "our own bug, not the filesystem's limit" },
+        { .systemError = ENOLCK, .expected = LockFailure::Unsupported, .what = "the kernel has no lock to give" },
+        { .systemError = EINVAL, .expected = LockFailure::Unsupported, .what = "this descriptor cannot be flocked" },
+        { .systemError = EOPNOTSUPP, .expected = LockFailure::Unsupported, .what = "the filesystem does not implement it" },
     };
 #endif
 
