@@ -195,6 +195,54 @@ namespace FastCache::Cc
                                                                  IToolchainHost& host,
                                                                  std::string const& compiler);
 
+/// Extract the target triple from a clang driver's `-###` output.
+///
+/// Pure, like `ParseGnuIncludeSearchPaths` and for the same reason: the outputs this
+/// has to get right come from drivers that cannot all be installed on whatever
+/// machine runs the tests, so the parsing is exercised against captured text.
+///
+/// Read from the `-cc1` line, and **not** from the `Target:` header three lines
+/// above it. That distinction is the entire value of this function. Both name a
+/// triple, but the header's is unversioned -- `x86_64-pc-windows-msvc` -- while the
+/// frontend is really run with `x86_64-pc-windows-msvc19.51.36252`. The suffix is
+/// where `-fms-compatibility-version` lives, so a parser that read the easier line
+/// would return a triple that looks right, pins the architecture, and silently drops
+/// the very thing it was written to pin.
+///
+/// The answer is validated rather than trusted, because it becomes both a cache key
+/// input and a command-line argument. A triple is letters, digits, dots, underscores
+/// and dashes; anything carrying a separator or a space is a parse that went wrong,
+/// and returning it would poison a key with a path and hand a worker an argument it
+/// must refuse.
+///
+/// @param driverOutput The driver's `-###` output (it writes to STDERR).
+/// @return The triple, or empty when the output names none it can trust.
+[[nodiscard]] std::string ParseDriverTargetTriple(std::string_view driverOutput);
+
+/// Ask a driver which target it will generate for.
+///
+/// Dispatches on `spec.targetDiscovery` with no `default:`, so a mechanism added to
+/// the table is a compile error here rather than a silent empty result.
+///
+/// Fails open, exactly as `DiscoverIncludePaths` does, and the error direction is
+/// what makes that safe. An empty answer leaves the cache key spelled as it is today
+/// and the dispatch line unpinned -- a MISS between two machines that disagree about
+/// whether the probe worked, never a hit on an object built for another target.
+///
+/// One spawn, and it is a real cost: this runs per launcher invocation rather than
+/// per machine, because the value it returns is a cache key input and a cache key is
+/// needed on hits too. Caching it under the fingerprint's stamp was considered and
+/// rejected -- that stamp covers the compiler binary and its include roots, none of
+/// which move when the MSVC install beside `clang-cl` is upgraded, so a cached triple
+/// would go stale in the one direction that produces a WRONG HIT rather than a miss.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler The compiler to interrogate.
+/// @param spec The driver's table row.
+/// @return Its target triple; empty when this driver has none to state or would not
+///         say.
+[[nodiscard]] std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec);
+
 /// Ask a driver where it searches for system headers.
 ///
 /// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added

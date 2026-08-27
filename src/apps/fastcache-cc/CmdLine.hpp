@@ -125,6 +125,38 @@ enum class IncludeDiscovery : std::uint8_t
     ClangResourceLayout = 3,
 };
 
+/// How a driver can be asked which target it will actually generate for.
+///
+/// Separate from `IncludeDiscovery` because it answers a different question about a
+/// different half of the machine. The include roots decide what the compiler READS;
+/// the target decides what it EMITS -- and once `ClangResourceLayout` took the VC
+/// toolset and the Windows SDK out of `clang-cl`'s fingerprint, nothing left in that
+/// digest varies with the target at all. Two machines running one clang-cl therefore
+/// match while generating differently, which is the hole this closes.
+///
+/// A mechanism added here is a new enumerator plus one arm in the single switch that
+/// interprets it, which carries no `default:` -- so adding one is a compile error at
+/// the site that must handle it rather than a silent "no target".
+enum class TargetDiscovery : std::uint8_t
+{
+    /// Not askable, or nothing ambient worth stating. `cl` is both: it has no `-###`
+    /// and no `--target`, because its target is decided by WHICH `cl.exe` is
+    /// invoked -- a fact no command line can restate.
+    None = 0,
+    /// Ask a clang driver to print the frontend invocation it WOULD run (`-###`) and
+    /// read the `-triple` out of it.
+    ///
+    /// The `-triple` from the `-cc1` line, and deliberately not the `Target:` line
+    /// three lines above it. That is the trap this mechanism exists to walk around:
+    /// `Target:` reports `x86_64-pc-windows-msvc`, while the frontend is really run
+    /// with `x86_64-pc-windows-msvc19.51.36252`. The version suffix is the entire
+    /// point -- it is where `-fms-compatibility-version` lives, and clang's Microsoft
+    /// C++ ABI gates version-specific CODE GENERATION on it (a `noexcept` function
+    /// type mangles as `P6AXXZ` below 19.12 and `P6AXX_E` from 19.12 on). Pinning the
+    /// unversioned spelling would look exactly like a fix and change nothing.
+    ClangDriverLine = 1,
+};
+
 /// True when two family sets overlap.
 ///
 /// A membership test when one side is a single family (a driver's), and a
@@ -377,6 +409,12 @@ struct DriverSpec
     bool usesDepfile { false };
     /// How this driver reveals its system include search paths.
     IncludeDiscovery includeDiscovery { IncludeDiscovery::None };
+    /// How this driver reveals the target it will generate for.
+    ///
+    /// Beside `includeDiscovery` rather than below the spans, so every byte-wide
+    /// member stays in one run: one dropped between two 8-aligned members costs
+    /// seven bytes of padding and fails clang-tidy's budget.
+    TargetDiscovery targetDiscovery { TargetDiscovery::None };
     /// Flags that make the driver print its include search list, for
     /// `IncludeDiscovery::GnuVerbose`. Empty for every other mechanism.
     ///
@@ -385,6 +423,18 @@ struct DriverSpec
     /// spelling: `/dev/null` is not a path on Windows, and reading from stdin
     /// needs the caller to close it.
     std::span<std::string_view const> includeProbeFlags;
+    /// Flags that make the driver print its frontend invocation without running it,
+    /// for `TargetDiscovery::ClangDriverLine`. Empty for every other mechanism.
+    ///
+    /// Deliberately NOT the compile's own command line, which would make the answer a
+    /// property of one translation unit rather than of the machine. It does not need
+    /// to be: the pin these produce is placed FIRST among the dispatched arguments,
+    /// so anything the build states for itself -- `--target=`, `-m32` -- comes later
+    /// and still wins, which is precisely what happens locally.
+    ///
+    /// The input path is appended by the caller, for the reason `includeProbeFlags`
+    /// gives: "a file that is empty and always exists" has no portable spelling.
+    std::span<std::string_view const> targetProbeFlags;
 };
 
 /// The pieces of a compile command line the launcher needs to key, cache, and

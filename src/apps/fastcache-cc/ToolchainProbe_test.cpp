@@ -1190,3 +1190,189 @@ TEST_CASE("A working --version wins over the fallback", "[toolchain-probe]")
     ScriptedRunner answers { CompileRun { .exitCode = 0, .out = "g++ (GCC) 14.2.0\nCopyright ...", .err = {} } };
     CHECK(CompilerBanner(answers, "/usr/bin/g++") == "g++ (GCC) 14.2.0");
 }
+
+// --- the target a driver will actually generate for --------------------------
+
+namespace
+{
+/// Real `clang-cl -### /TP /c NUL` stderr from ONE clang-cl binary, run twice.
+///
+/// The PAIR is the defect, which is why both are here rather than one. Same driver,
+/// same `--version` banner, same resource directory -- so the same toolchain
+/// fingerprint, which is exactly what makes the two ends match once the VC toolset
+/// and the Windows SDK left that digest. What differs is the only thing neither the
+/// banner nor the resource tree records: which MSVC clang could see, and therefore
+/// the compatibility version it bakes into code generation.
+///
+/// Captured rather than invented, and trimmed to the shape the parser must cope
+/// with. The trimming deliberately KEEPS the trap: `Target:` on line two names a
+/// triple as well, unversioned, three lines closer to the top than the answer.
+constexpr std::string_view ClangClDriverLineService =
+    R"(clang version 22.1.3 (https://github.com/llvm/llvm-project e9846648fd61)
+Target: x86_64-pc-windows-msvc
+Thread model: posix
+InstalledDir: C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin
+ (in-process)
+ "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\x64\\bin\\clang-cl.exe" "-cc1" "-triple" "x86_64-pc-windows-msvc19.33.0" "-emit-obj" "-fms-compatibility-version=19.33" "-o" "NUL.obj" "-x" "c++" "NUL"
+)";
+
+/// The same binary again, from inside a developer command prompt.
+constexpr std::string_view ClangClDriverLineDeveloperPrompt =
+    R"(clang version 22.1.3 (https://github.com/llvm/llvm-project e9846648fd61)
+Target: x86_64-pc-windows-msvc
+Thread model: posix
+InstalledDir: C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin
+ (in-process)
+ "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\x64\\bin\\clang-cl.exe" "-cc1" "-triple" "x86_64-pc-windows-msvc19.51.36252" "-emit-obj" "-fms-compatibility-version=19.51.36252" "-o" "NUL.obj" "-x" "c++" "NUL"
+)";
+
+/// Real `clang -### -x c++ -c /dev/null` stderr from an Ubuntu clang 20.
+constexpr std::string_view GnuClangDriverLine =
+    R"(Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/lib/llvm-20/bin
+ (in-process)
+ "/usr/lib/llvm-20/bin/clang" "-cc1" "-triple" "x86_64-pc-linux-gnu" "-emit-obj" "-disable-free" "-main-file-name" "null" "-o" "null.o" "-x" "c++" "/dev/null"
+)";
+} // namespace
+
+TEST_CASE("The frontend line's triple is read, never the unversioned Target: header", "[toolchain-probe]")
+{
+    // Both lines name a triple and the header comes first, so a parser that took
+    // whichever it found would take the wrong one -- and would look right doing it,
+    // since the architecture it pins is correct. What the header drops is the
+    // version suffix, which is where -fms-compatibility-version lives and therefore
+    // the only part of the answer this whole probe exists to carry.
+    CHECK(ParseDriverTargetTriple(ClangClDriverLineDeveloperPrompt) == "x86_64-pc-windows-msvc19.51.36252");
+    CHECK(ParseDriverTargetTriple(ClangClDriverLineService) == "x86_64-pc-windows-msvc19.33.0");
+    CHECK(ParseDriverTargetTriple(GnuClangDriverLine) == "x86_64-pc-linux-gnu");
+}
+
+TEST_CASE("One clang-cl reports two targets depending on the MSVC it can see", "[toolchain-probe]")
+{
+    // The regression this exists for. A worker runs as a Windows service and
+    // inherits no developer prompt, so clang finds no MSVC and falls back to its own
+    // built-in default; a launcher in a developer prompt finds the installed one.
+    // Same binary, same banner, same resource directory -- so the same fingerprint,
+    // and the scheduler matches them. The two targets differ, and clang's Microsoft
+    // C++ ABI gates version-specific code generation on exactly that difference.
+    auto const service = ParseDriverTargetTriple(ClangClDriverLineService);
+    auto const developerPrompt = ParseDriverTargetTriple(ClangClDriverLineDeveloperPrompt);
+
+    REQUIRE_FALSE(service.empty());
+    REQUIRE_FALSE(developerPrompt.empty());
+    CHECK(service != developerPrompt);
+}
+
+TEST_CASE("A quoted path with spaces does not shift the triple that follows it", "[toolchain-probe]")
+{
+    // The value is read POSITIONALLY -- the argument after `-triple` -- and clang
+    // prints the driver's own path first, quoted, with spaces in it on every
+    // ordinary Windows install. Splitting on whitespace alone would break that into
+    // two tokens and slide the read along by one, which returns a neighbouring
+    // token rather than failing.
+    CHECK(ParseDriverTargetTriple(ClangClDriverLineService) == "x86_64-pc-windows-msvc19.33.0");
+}
+
+TEST_CASE("A driver line that names no triple this can trust yields nothing", "[toolchain-probe]")
+{
+    // Empty is the safe answer in every one of these: it leaves the cache key
+    // spelled as it is today and the dispatch line unpinned, which costs a MISS
+    // between two machines that disagree about whether the probe worked -- never a
+    // hit on an object built for another target.
+
+    // No frontend line at all: a driver that did not understand the probe.
+    CHECK(ParseDriverTargetTriple("clang: error: no such file or directory: 'NUL'\n").empty());
+
+    // A banner and a Target: header, and nothing else. The header must NOT answer.
+    CHECK(ParseDriverTargetTriple("clang version 22.1.3\nTarget: x86_64-pc-windows-msvc\n").empty());
+
+    // `-triple` as the last token on the line: nothing follows it to read.
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple")").empty());
+
+    // A value carrying a path separator is a parse that went wrong. Returning it
+    // would split the fleet's keys by install location and hand a worker an
+    // argument its own filter has to refuse.
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple" "/usr/lib/llvm-20/bin")").empty());
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple" "C:\\Program Files\\x")").empty());
+
+    // A token with no dash is not a triple.
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple" "x86_64")").empty());
+
+    // `-triple` carrying no value leaves the next FLAG standing where the value
+    // should be, and a flag satisfies every other rule on the list: it is short, it
+    // has a dash in it, and it is made of nothing else. Read positionally, that
+    // returns somebody else's option as the target -- and it would reach both a
+    // cache key and a `--target=` argument.
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple" "-emit-obj" "-o" "a.o")").empty());
+    CHECK(ParseDriverTargetTriple(R"( "clang" "-cc1" "-triple" "--target=x86_64-pc-linux-gnu")").empty());
+}
+
+TEST_CASE("CRLF in a captured driver line does not hide the triple", "[toolchain-probe]")
+{
+    // A capture taken on Windows, or piped through a tool that rewrote the line
+    // endings, carries a trailing carriage return. Left on the final token it would
+    // fail the shape check and the probe would answer nothing at all.
+    CHECK(ParseDriverTargetTriple(" \"clang\" \"-cc1\" \"-triple\" \"x86_64-pc-linux-gnu\"\r\n") == "x86_64-pc-linux-gnu");
+}
+
+TEST_CASE("A driver with no target to state is not spawned at all", "[toolchain-probe]")
+{
+    // `cl` has no `-###` and no `--target`: which code generator runs is decided by
+    // WHICH cl.exe is invoked, and no command line can restate that. Asking anyway
+    // would spend a process per translation unit to learn nothing.
+    ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { GnuClangDriverLine } } };
+
+    CHECK(DiscoverTargetTriple(runner, "cl.exe", SpecFor(Flavor::Cl)).empty());
+    CHECK(DiscoverTargetTriple(runner, "gcc", SpecFor(Flavor::Gcc)).empty());
+    CHECK(DiscoverTargetTriple(runner, "mystery", SpecFor(Flavor::Unknown)).empty());
+    CHECK(runner.Calls() == 0);
+}
+
+TEST_CASE("A clang driver is asked over an empty input, and its stderr is what is read", "[toolchain-probe]")
+{
+    // stdout is deliberately populated with something that would parse, because
+    // `-###` writes every line to STDERR and reading the wrong stream is the defect
+    // this pins: it would silently answer nothing on every machine.
+    ScriptedRunner runner { CompileRun { .exitCode = 0,
+                                         .out = R"( "clang" "-cc1" "-triple" "wrong-stream-triple")",
+                                         .err = std::string { GnuClangDriverLine } } };
+
+    CHECK(DiscoverTargetTriple(runner, "/usr/bin/clang", SpecFor(Flavor::Clang)) == "x86_64-pc-linux-gnu");
+
+    auto const& argv = runner.LastArgv();
+    REQUIRE(argv.size() >= 3);
+    CHECK(argv.front() == "/usr/bin/clang");
+    CHECK(std::ranges::contains(argv, "-###"));
+    // The language is named because the input has no extension to read it from. A
+    // driver that cannot tell what it is being handed prints no frontend line, and
+    // that failure looks exactly like "this driver has no target".
+    CHECK(std::ranges::contains(argv, "-x"));
+    CHECK(std::ranges::contains(argv, "c++"));
+}
+
+TEST_CASE("clang-cl is asked in its own spelling", "[toolchain-probe]")
+{
+    ScriptedRunner runner { CompileRun {
+        .exitCode = 0, .out = {}, .err = std::string { ClangClDriverLineDeveloperPrompt } } };
+
+    CHECK(DiscoverTargetTriple(runner, "clang-cl.exe", SpecFor(Flavor::ClangCl)) == "x86_64-pc-windows-msvc19.51.36252");
+
+    auto const& argv = runner.LastArgv();
+    CHECK(std::ranges::contains(argv, "-###"));
+    // `/TP`, not `-x c++`: the MSVC driver spells the language its own way, and a
+    // GNU spelling here would make clang-cl print a warning instead of a frontend
+    // line.
+    CHECK(std::ranges::contains(argv, "/TP"));
+}
+
+TEST_CASE("A driver that exits non-zero can still have named its target", "[toolchain-probe]")
+{
+    // The exit code is not consulted, for the same reason the include probe does not
+    // consult it: the frontend line is printed before anything that could fail, and
+    // a driver can exit non-zero over the empty input it was handed while its answer
+    // is perfectly good.
+    ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { GnuClangDriverLine } } };
+    CHECK(DiscoverTargetTriple(runner, "clang", SpecFor(Flavor::Clang)) == "x86_64-pc-linux-gnu");
+}
