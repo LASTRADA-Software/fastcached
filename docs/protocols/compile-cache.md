@@ -91,6 +91,10 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x11` | worker-spawn-failed | The worker could not *start* the compiler. Not "the compiler rejected the code" — that is a successful exchange carrying a non-zero exit code. |
 | `0x12` | not-leader | This node does not lead the cluster. The message carries the leader's endpoint when one is known, and is empty during an election. |
 | `0x13` | not-a-member | The caller is not a member of this cluster, so it may not spend the fleet's capacity. It is still served the cache. |
+| `0x14` | withdrawn | Matching workers have slots free on paper and have withdrawn them: their machines are busy with something other than this fleet, or out of scratch space. Distinct from `no-capacity`, which means the fleet is full of this build's own work. |
+| `0x15` | no-cluster | This node runs no cluster, so there is nothing to administer. Distinct from `not-leader`, which names somewhere else to ask. |
+| `0x16` | invalid-cluster-change | The cluster cannot accept that change — a setting nobody has heard of, a member named with no address, a field a verb ignores. The message says which. |
+| `0x17` | endpoint-busy | This endpoint has reached its own concurrent-request cap or in-flight byte budget. A statement about one node's front door, never about the fleet. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
