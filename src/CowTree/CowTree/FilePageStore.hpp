@@ -179,6 +179,10 @@ class FilePageStore final: public IPageStore
     [[nodiscard]] auto TakeExclusiveLock() -> std::expected<void, CowTreeError>;
 #endif
 
+    /// Current length of the backing file, read from the open handle.
+    /// @return Byte length, or CowTreeError::IoError if it cannot be read.
+    [[nodiscard]] auto FileSizeBytes() const -> std::expected<std::uint64_t, CowTreeError>;
+
     /// Compute the file offset of a data page.
     [[nodiscard]] std::uint64_t DataPageOffset(PageId id) const noexcept;
 

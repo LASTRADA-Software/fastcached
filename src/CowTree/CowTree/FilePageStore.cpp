@@ -132,7 +132,7 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
 
     auto store = std::unique_ptr<FilePageStore> { new FilePageStore { std::move(options) } };
 
-    bool const existed = std::filesystem::exists(store->_options.path);
+    bool const existedBeforeOpen = std::filesystem::exists(store->_options.path);
 
 #if defined(_WIN32)
     auto const path = store->_options.path.native();
@@ -180,7 +180,24 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
         return std::unexpected(claimed.error());
 #endif
 
-    if (!existed)
+    // Bootstrapping BLANKS both meta pages, so which branch runs is a
+    // destructive decision — and `existedBeforeOpen` was sampled before the
+    // file was open and before it was ours, which makes acting on it alone a
+    // time-of-check/time-of-use bug the claim above does not close. Another
+    // process can create, populate and close the store inside that window; it
+    // is gone by the time we take the claim, so nothing refuses us, and we
+    // would blank a store somebody had just written.
+    //
+    // Re-checking the length under the claim closes it: content that appeared
+    // in the window means there is a store here to recover, whatever the
+    // earlier observation said. An empty file that already existed is left to
+    // `RecoverExistingFile` exactly as before, so the only case this changes is
+    // the racing one.
+    auto const sizeUnderClaim = store->FileSizeBytes();
+    if (!sizeUnderClaim.has_value())
+        return std::unexpected(sizeUnderClaim.error());
+
+    if (!existedBeforeOpen && *sizeUnderClaim == 0)
     {
         if (auto const r = store->BootstrapNewFile(); !r.has_value())
             return std::unexpected(r.error());
@@ -230,6 +247,21 @@ auto FilePageStore::TakeExclusiveLock() -> std::expected<void, CowTreeError>
     return {};
 }
 #endif
+
+auto FilePageStore::FileSizeBytes() const -> std::expected<std::uint64_t, CowTreeError>
+{
+#if defined(_WIN32)
+    LARGE_INTEGER size;
+    if (::GetFileSizeEx(_handle, &size) == 0)
+        return std::unexpected(CowTreeError::IoError);
+    return static_cast<std::uint64_t>(size.QuadPart);
+#else
+    struct stat st {};
+    if (::fstat(_fd, &st) != 0)
+        return std::unexpected(CowTreeError::IoError);
+    return static_cast<std::uint64_t>(st.st_size);
+#endif
+}
 
 auto FilePageStore::BootstrapNewFile() -> std::expected<void, CowTreeError>
 {
@@ -307,17 +339,10 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     }
 
     // Compute the number of data pages currently sized into the file.
-#if defined(_WIN32)
-    LARGE_INTEGER size;
-    if (::GetFileSizeEx(_handle, &size) == 0)
-        return std::unexpected(CowTreeError::IoError);
-    auto const fileSize = static_cast<std::uint64_t>(size.QuadPart);
-#else
-    struct stat st {};
-    if (::fstat(_fd, &st) != 0)
-        return std::unexpected(CowTreeError::IoError);
-    auto const fileSize = static_cast<std::uint64_t>(st.st_size);
-#endif
+    auto const size = FileSizeBytes();
+    if (!size.has_value())
+        return std::unexpected(size.error());
+    auto const fileSize = *size;
     auto const dataBytes = fileSize >= (2 * _pageSize) ? (fileSize - (2 * _pageSize)) : 0;
     _totalDataPages = static_cast<std::size_t>(dataBytes / _pageSize);
 

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -473,4 +474,25 @@ TEST_CASE("ClassifyLockFailure maps this platform's lock errors", "[filestore][l
         INFO(row.what);
         CHECK(CowTree::FilePageStore::ClassifyLockFailure(row.systemError) == row.expected);
     }
+}
+
+TEST_CASE("An empty file that already existed is not blanked into a fresh store", "[filestore][open]")
+{
+    TempFile tmp;
+    {
+        std::ofstream created { tmp.path, std::ios::binary };
+        REQUIRE(created.good());
+    }
+    REQUIRE(std::filesystem::file_size(tmp.path) == 0U);
+
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    // Whether to bootstrap is decided from the pre-open `exists()` AND the
+    // length read back under the claim, so this pins the conservative half of
+    // that pair: a file the operator put there is never silently initialised
+    // just because it happens to be empty. It is refused, exactly as before.
+    auto const store = CowTree::FilePageStore::Open(opts);
+    REQUIRE_FALSE(store.has_value());
+    REQUIRE(store.error() == CowTree::CowTreeError::CorruptMetas);
 }
