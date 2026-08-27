@@ -89,13 +89,23 @@ fail() {
 # outbound connection's local endpoint with nothing listening on it, so this probe
 # says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
 # reasoning, and the CI failure that found it, are above `free_port` in
-# dist-compile-e2e.sh.
+# dist-compile-e2e.sh -- as is the issued-port ledger below, which this fixture
+# went without for two releases while both siblings had it.
 free_port() {
-    local port
+    local port ledger="${workdir}/.issued-ports"
     local floor=20000 ceiling=32000
     for _ in $(seq 1 200); do
         port=$(( floor + RANDOM % (ceiling - floor) ))
+        # A port handed out but not yet bound still probes as free, and this
+        # fixture draws three in a row before starting anything. Without the
+        # ledger the second draw can repeat the first, and the collision surfaces
+        # as a node dying with `bind(...) failed` -- which reads as an unrelated
+        # flake rather than as this.
+        if grep -qx "$port" "$ledger" 2>/dev/null; then
+            continue
+        fi
         if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+            echo "$port" >> "$ledger"
             echo "$port"
             return 0
         fi
