@@ -60,9 +60,10 @@ struct ExpiryReaperOptions
     /// Longest the cycle may take to notice it has been cancelled.
     ///
     /// The sweep sleeps in steps no longer than this and re-reads the token at
-    /// each one, so a shutdown never waits out a whole `maxInterval` and --
-    /// more importantly -- leaves no coroutine frame parked on a timer wheel
-    /// that is about to stop. See `InterruptibleSleepUntil`.
+    /// each one, so a shutdown never waits out a whole backed-off `maxInterval`.
+    /// A non-positive value means one sleep straight through, which is a
+    /// legitimate thing to ask for and is spelled rather than defaulted -- the
+    /// same rule `InterruptibleSleepUntil` states.
     Duration stopWakeBound { std::chrono::milliseconds { 50 } };
 };
 
@@ -128,10 +129,40 @@ class ExpiryReaper
     /// @param metrics Counter sink, or nullptr.
     ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptions options, IMetricsSink* metrics = nullptr) noexcept;
 
+    ~ExpiryReaper()
+    {
+        Stop();
+    }
+    ExpiryReaper(ExpiryReaper const&) = delete;
+    ExpiryReaper(ExpiryReaper&&) = delete;
+    ExpiryReaper& operator=(ExpiryReaper const&) = delete;
+    ExpiryReaper& operator=(ExpiryReaper&&) = delete;
+
+    /// Start the cycle on `reactor` and keep its task here.
+    ///
+    /// The reaper owns the coroutine frame for its whole life, which is what
+    /// makes `Stop` able to reclaim it. Call once.
+    /// @param reactor Reactor whose clock paces the cycle and whose thread the
+    ///        sweeps run on. Must outlive this reaper.
+    void Start(IReactor& reactor);
+
+    /// Stop the cycle and reclaim its coroutine frame.
+    ///
+    /// Deliberately safe to call **after** `IReactor::Run` has returned, which
+    /// is the case that matters: a loop that has stopped will never resume a
+    /// frame still parked on its timer wheel, and never free it either.
+    /// `CancelPending` is what makes taking it back decidable rather than a
+    /// guess -- true means this call removed it and we are now its only owner.
+    /// Idempotent; the destructor calls it.
+    void Stop() noexcept;
+
     /// Sweep until `token` is cancelled.
     ///
     /// Returns immediately when `options.interval` is zero -- a disabled cycle
     /// is a coroutine that ends, not one that parks forever.
+    ///
+    /// Public so a test can drive the loop against a `TestReactor` without
+    /// going through `Start`; production uses `Start`.
     /// @param reactor Reactor whose clock paces the cycle and whose thread the
     ///        sweeps run on.
     /// @param token  Observed at every wake; cancelling it ends the loop.
@@ -165,6 +196,11 @@ class ExpiryReaper
     ExpiryReaperOptions _options;
     Duration _interval;
     std::uint64_t _cycles { 0 };
+
+    /// Set by `Start`; the reactor `Stop` reclaims the frame from.
+    IReactor* _reactor { nullptr };
+    CancellationSource _source;
+    Task<void> _task;
 };
 
 } // namespace FastCache

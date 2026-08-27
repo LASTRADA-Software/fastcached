@@ -291,6 +291,8 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     emitIfSet("storage-max-value", cfg.storageMaxValueBytes, defaults.storageMaxValueBytes);
     emitIfSet("storage-max-disk", cfg.storageMaxDiskBytes, defaults.storageMaxDiskBytes);
     emitIfSet("storage-shards", cfg.storageShards, defaults.storageShards);
+    emitIfSet("expiry-interval", cfg.activeExpiryIntervalMs, defaults.activeExpiryIntervalMs);
+    emitIfSet("expiry-scan", cfg.activeExpiryScanBudget, defaults.activeExpiryScanBudget);
     emitIfSet("threads", cfg.workerThreads, defaults.workerThreads);
     emitIfSet("cpu-affinity", cfg.cpuAffinity, defaults.cpuAffinity);
     emitIfSet("lru-mode", cfg.lruRecency, defaults.lruRecency);

@@ -69,6 +69,8 @@ struct CliResult
     bool storageMaxDiskBytesExplicit { false };
     bool workerThreadsExplicit { false };
     bool storageShardsExplicit { false };
+    bool activeExpiryIntervalMsExplicit { false };
+    bool activeExpiryScanBudgetExplicit { false };
     bool listenBacklogExplicit { false };
     bool logTimestampsExplicit { false };
     bool logSourceExplicit { false };

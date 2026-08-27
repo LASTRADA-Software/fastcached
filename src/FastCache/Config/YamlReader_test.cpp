@@ -69,6 +69,37 @@ TEST_CASE("YamlReader: malformed storage_max_disk is rejected", "[config][yaml][
     REQUIRE_FALSE(cfg.has_value());
 }
 
+TEST_CASE("YamlReader: the active expiry keys parse, zero included", "[config][yaml][expiry]")
+{
+    auto const path = WriteTempYaml("expiry",
+                                    "active_expiry_interval_ms: 250\n"
+                                    "active_expiry_scan: 64\n");
+    auto const cfg = FastCache::ReadYamlConfig(path);
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->activeExpiryIntervalMs == 250U);
+    REQUIRE(cfg->activeExpiryScanBudget == 64U);
+
+    // Zero disables the cycle, so it has to survive the reader rather than be
+    // rejected as a degenerate count the way the scan budget is.
+    auto const off = FastCache::ReadYamlConfig(WriteTempYaml("expiry-off", "active_expiry_interval_ms: 0\n"));
+    REQUIRE(off.has_value());
+    REQUIRE(off->activeExpiryIntervalMs == 0U);
+}
+
+TEST_CASE("YamlReader: out-of-range active expiry values are rejected", "[config][yaml][expiry]")
+{
+    // Same two ceilings the CLI enforces, because the file is the other way an
+    // operator sets these and a key silently accepted here would be one the
+    // flag refuses.
+    REQUIRE_FALSE(
+        FastCache::ReadYamlConfig(WriteTempYaml("expiry-huge", "active_expiry_interval_ms: 86400001\n")).has_value());
+    REQUIRE_FALSE(
+        FastCache::ReadYamlConfig(WriteTempYaml("expiry-negative", "active_expiry_interval_ms: -1\n")).has_value());
+    // 0 means "no ceiling" to `PurgeBudget`, i.e. sweep everything under the
+    // shard lock -- the opposite of what a scan budget of zero asks for.
+    REQUIRE_FALSE(FastCache::ReadYamlConfig(WriteTempYaml("expiry-scan-zero", "active_expiry_scan: 0\n")).has_value());
+}
+
 TEST_CASE("YamlReader: log_source toggles the connection source prefix", "[config][yaml]")
 {
     auto const on = FastCache::ReadYamlConfig(WriteTempYaml("logsrc-on", "log_source: true\n"));

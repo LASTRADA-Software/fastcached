@@ -702,6 +702,8 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
     cfg.storageMaxValueBytes = 4096;
     cfg.storageMaxDiskBytes = 8192;
     cfg.storageShards = 7;
+    cfg.activeExpiryIntervalMs = 250;
+    cfg.activeExpiryScanBudget = 64;
     cfg.workerThreads = 5;
     cfg.listenBacklog = 64;
     cfg.lruRecency = FastCache::LruRecency::Strict;

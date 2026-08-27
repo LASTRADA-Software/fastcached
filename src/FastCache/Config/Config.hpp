@@ -35,6 +35,17 @@ inline constexpr std::uint16_t DefaultPort { 6674 };
 /// protocols.
 inline constexpr std::uint16_t DefaultMetricsPort { 9259 };
 
+/// Default period of the active expiry sweep, in milliseconds. 0 would disable it.
+///
+/// Spelled here and `static_assert`ed against `ExpiryReaperOptions` where the
+/// two meet, rather than written twice: `Config` must not depend on `Cache/`,
+/// and two independently-maintained copies of a default is how the CLI's
+/// advertised default stops matching what the daemon actually does.
+inline constexpr std::uint32_t DefaultActiveExpiryIntervalMs { 1000 };
+
+/// Default number of entries one expiry sweep examines per shard.
+inline constexpr std::size_t DefaultActiveExpiryScanBudget { 512 };
+
 /// One listener flag, and what an endpoint declared with it serves.
 ///
 /// The single source of truth for the mapping between a `--listen*` spelling and
@@ -191,6 +202,21 @@ struct Config
     /// `shard-NN.cow` files. 0 means "auto" — defaults to a sensible
     /// value at runtime (min(16, hardware_concurrency)).
     std::size_t storageShards { 0 };
+
+    /// How often the active expiry cycle sweeps, in milliseconds. 0 disables it.
+    ///
+    /// Without a sweep, expiry is entirely access-driven: a key whose TTL
+    /// lapses and which nobody touches again keeps its memory and never
+    /// publishes an `expired` keyspace event. redis's `hz` is the analogue.
+    ///
+    /// Milliseconds rather than a `Duration`, because a config field is
+    /// compared, merged, round-tripped through YAML and printed back to an
+    /// operator, and every one of those is simpler on a plain integer.
+    std::uint32_t activeExpiryIntervalMs { DefaultActiveExpiryIntervalMs };
+
+    /// Entries one sweep examines per shard before it stops and resumes next
+    /// time. The bound on how long the cycle holds a shard's exclusive lock.
+    std::size_t activeExpiryScanBudget { DefaultActiveExpiryScanBudget };
 
     /// Bind address: IPv4/IPv6 literal or hostname. Default 127.0.0.1
     /// (IPv4 loopback). An IPv6 wildcard (`::`) binds dual-stack and

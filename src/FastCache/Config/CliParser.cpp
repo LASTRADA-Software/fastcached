@@ -85,6 +85,39 @@ namespace
         return ParsePositiveInt(sv, "storage-shards");
     }
 
+    /// A day, in milliseconds. Not a limit anybody reaches on purpose; it is
+    /// here so a figure typed in the wrong unit is refused rather than silently
+    /// turning the cycle off for the life of the process.
+    constexpr std::size_t ExpiryIntervalCeilingMs = 86'400'000;
+
+    [[nodiscard]] std::expected<std::uint32_t, ConfigError> ParseExpiryInterval(std::string_view sv)
+    {
+        // Zero is meaningful here -- it disables the cycle -- so it is accepted
+        // rather than rejected as a degenerate count.
+        return ParsePositiveInt(sv, "expiry-interval")
+            .and_then([](std::size_t value) -> std::expected<std::uint32_t, ConfigError> {
+                if (value > ExpiryIntervalCeilingMs)
+                    return std::unexpected(
+                        ArgvError(ConfigErrorCode::OutOfRange,
+                                  "expiry-interval",
+                                  std::format("out of range (0..{}): {}", ExpiryIntervalCeilingMs, value)));
+                return static_cast<std::uint32_t>(value);
+            });
+    }
+
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseExpiryScan(std::string_view sv)
+    {
+        return ParsePositiveInt(sv, "expiry-scan")
+            .and_then([](std::size_t value) -> std::expected<std::size_t, ConfigError> {
+                // Zero would mean "no ceiling" to `PurgeBudget`, i.e. sweep the
+                // whole keyspace under the shard lock -- the opposite of what an
+                // operator typing a scan budget of zero is asking for.
+                if (value == 0)
+                    return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange, "expiry-scan", "must be at least 1"));
+                return value;
+            });
+    }
+
     [[nodiscard]] std::expected<int, ConfigError> ParseListenBacklog(std::string_view sv)
     {
         // The kernel clamps to its own SOMAXCONN ceiling, so we only guard
@@ -464,6 +497,22 @@ namespace
                          "default: 1 (single-file mode) when --storage names a regular file,\n"
                          "min(16, hardware_concurrency) otherwise;\n"
                          "when N>1 and --storage is set, --storage must be a directory" },
+        { .primary = "--expiry-interval",
+          .arity = Arity::Value,
+          .operand = "=<ms>",
+          .apply = AssignFrom<&Config::activeExpiryIntervalMs, ParseExpiryInterval>(),
+          .explicitBit = &CliResult::activeExpiryIntervalMsExplicit,
+          .description = "how often to sweep for entries whose TTL has lapsed (default 1000; 0 disables).\n"
+                         "without it expiry is purely access-driven, so a key nobody touches again is\n"
+                         "never reclaimed and fires no `expired` keyspace event.\n"
+                         "backs off while there is nothing to reclaim" },
+        { .primary = "--expiry-scan",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::activeExpiryScanBudget, ParseExpiryScan>(),
+          .explicitBit = &CliResult::activeExpiryScanBudgetExplicit,
+          .description = "entries one expiry sweep examines per shard before resuming next time\n"
+                         "(default 512); the bound on how long a sweep holds a shard's lock" },
         { .primary = "--daemon",
           .apply = SetTrue<&Config::daemon>(),
           .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },

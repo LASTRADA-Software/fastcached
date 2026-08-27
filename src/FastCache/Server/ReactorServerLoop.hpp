@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEngine.hpp>
+#include <FastCache/Cache/ExpiryReaper.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,6 +57,14 @@ struct ReactorServerOptions
     /// TLS context for terminating TLS on accepted connections, or nullptr for
     /// plaintext. Only honoured in TLS-enabled builds; must outlive the run.
     TlsContext* tlsContext { nullptr };
+
+    /// Pacing and ceilings for the active expiry cycle.
+    ///
+    /// A zero `interval` turns the cycle off, leaving expiry entirely
+    /// access-driven -- which is what the daemon did before it had one, and
+    /// which means a key that lapses and is never touched again is neither
+    /// reclaimed nor reported.
+    ExpiryReaperOptions expiry {};
 
     /// Clock the reactors drive and read, or nullptr to let the loop own a
     /// plain `SteadyClock`.
@@ -102,6 +112,33 @@ namespace Detail
     /// @param logger  Logger receiving the diagnostic on failure.
     /// @return EXIT_SUCCESS / EXIT_FAILURE.
     [[nodiscard]] int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger);
+
+    /// Start this daemon's active expiry cycle on `reactor`.
+    ///
+    /// **One per daemon, not one per reactor.** The sweep takes each shard's
+    /// exclusive lock in turn, so a second cycle would contend with the first
+    /// for no gain -- reactor 0 gets it because it is the one whose loop the
+    /// calling thread runs, which bounds the cycle's lifetime by the same
+    /// scope.
+    ///
+    /// The returned owner must be declared AFTER the reactor at every call
+    /// site, so it is destroyed first and takes its coroutine frame back off a
+    /// timer wheel that still exists. `ExpiryReaper::Stop` explains why that
+    /// matters.
+    ///
+    /// Exposed here, like the verifier above, because the thing worth asserting
+    /// is that the daemon starts the cycle **at all**: the whole of issue #162
+    /// was a `PurgeExpired` nothing called, and a reaper nothing constructs is
+    /// that bug again with more code in it.
+    /// @param reactor Reactor to run the cycle on.
+    /// @param engine  Whose storage chain is swept -- the notifying decorator
+    ///                included, or reclaimed keys are never published.
+    /// @param logger  Where the cycle reports itself, at Debug.
+    /// @param options Server options; only `expiry` is read.
+    /// @param metrics Counter sink, or nullptr.
+    /// @return The running cycle. Stops when destroyed.
+    [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(
+        IReactor& reactor, CacheEngine& engine, ILogger& logger, ReactorServerOptions const& options, IMetricsSink* metrics);
 
 } // namespace Detail
 

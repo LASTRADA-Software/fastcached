@@ -137,6 +137,24 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     CHECK(reaper.Cycles() == 0U);
 }
 
+TEST_CASE("Stopping the expiry cycle reclaims a frame still parked on the reactor", "[expiry][reaper]")
+{
+    // The case a graceful shutdown does not cover: the loop stops while the
+    // cycle is asleep between sweeps. Nothing will ever resume that frame, so
+    // unless its owner takes it back off the timer wheel it is leaked -- and a
+    // sanitizer build reports it as exactly that.
+    Fixture f;
+    {
+        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
+        reaper.Start(f.reactor);
+        f.reactor.Drain();
+        REQUIRE(f.reactor.PendingTimers() == 1); // Parked mid-interval.
+    } // ~ExpiryReaper -> Stop() -> CancelPending, then the frame is destroyed.
+
+    CHECK(f.reactor.PendingTimers() == 0);
+    CHECK(f.reactor.PendingSubmissions() == 0);
+}
+
 TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[expiry][reaper]")
 {
     // "Off" has to mean a coroutine that ended. One parked forever on a

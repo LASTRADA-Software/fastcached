@@ -364,6 +364,50 @@ TEST_CASE("CliParser: --listen-backlog rejects out-of-range values", "[config][c
     REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
 }
 
+TEST_CASE("CliParser: --expiry-interval=0 disables the cycle and is not a degenerate count", "[config][cli][expiry]")
+{
+    // Zero is the one spelling that MEANS something here -- it turns the active
+    // expiry cycle off and leaves expiry access-driven, which is what the
+    // daemon did before it had one. Every other count flag in this table
+    // rejects zero, so accepting it has to be asserted rather than assumed.
+    auto const args = std::array<char const*, 1> { "--expiry-interval=0" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.activeExpiryIntervalMs == 0U);
+    REQUIRE(result->activeExpiryIntervalMsExplicit);
+}
+
+TEST_CASE("CliParser: --expiry-interval refuses a figure typed in the wrong unit", "[config][cli][expiry]")
+{
+    auto const ok = std::array<char const*, 1> { "--expiry-interval=250" };
+    auto const parsed = FastCache::ParseCli(std::span<char const* const> { ok });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->config.activeExpiryIntervalMs == 250U);
+
+    // A day is the ceiling. Nobody reaches it on purpose; it is there so
+    // seconds typed where milliseconds were wanted -- or a stray digit -- is
+    // refused rather than silently turning the cycle off for the life of the
+    // process, which looks exactly like the bug this flag exists to fix.
+    auto const tooBig = std::array<char const*, 1> { "--expiry-interval=86400001" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { tooBig }).has_value());
+}
+
+TEST_CASE("CliParser: --expiry-scan rejects zero, which PurgeBudget reads as unbounded", "[config][cli][expiry]")
+{
+    auto const args = std::array<char const*, 1> { "--expiry-scan=64" };
+    auto const result = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(result.has_value());
+    REQUIRE(result->config.activeExpiryScanBudget == 64U);
+    REQUIRE(result->activeExpiryScanBudgetExplicit);
+
+    // `PurgeBudget` spells "no ceiling" as 0, so passing an operator's zero
+    // through would sweep the whole keyspace under the shard's exclusive lock
+    // every cycle -- the exact opposite of what typing a scan budget of zero
+    // asks for.
+    auto const zero = std::array<char const*, 1> { "--expiry-scan=0" };
+    REQUIRE_FALSE(FastCache::ParseCli(std::span<char const* const> { zero }).has_value());
+}
+
 TEST_CASE("CliParser: --storage-durability=batched records the explicit-set flag", "[config][cli][regression]")
 {
     // batched is the field's default; absent an explicit-tracker the

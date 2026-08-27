@@ -603,6 +603,27 @@ namespace
             cfg.storageShards = static_cast<std::size_t>(raw);
             return {};
         }
+        /// `active_expiry_interval_ms`: expiry sweep period; 0 disables the cycle.
+        if (key == "active_expiry_interval_ms")
+        {
+            auto const raw = valueNode.as<long long>();
+            constexpr long long Ceiling = 86'400'000;
+            if (raw < 0 || raw > Ceiling)
+                return std::unexpected(MakeError(
+                    ConfigErrorCode::OutOfRange, path, "active_expiry_interval_ms", "must be in 0..86400000", line));
+            cfg.activeExpiryIntervalMs = static_cast<std::uint32_t>(raw);
+            return {};
+        }
+        /// `active_expiry_scan`: entries one sweep examines per shard.
+        if (key == "active_expiry_scan")
+        {
+            auto const raw = valueNode.as<long long>();
+            if (raw < 1)
+                return std::unexpected(
+                    MakeError(ConfigErrorCode::OutOfRange, path, "active_expiry_scan", "must be >= 1", line));
+            cfg.activeExpiryScanBudget = static_cast<std::size_t>(raw);
+            return {};
+        }
         /// `listen_backlog`: ::listen() backlog depth (1..65535).
         if (key == "listen_backlog")
         {

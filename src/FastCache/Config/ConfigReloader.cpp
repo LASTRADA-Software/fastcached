@@ -100,6 +100,15 @@ std::expected<void, ConfigError> ConfigReloader::ValidateImmutable(Config const&
         return reject("storage-shards", "cannot change shard count at runtime");
     if (previous.storageDurability != candidate.storageDurability)
         return reject("storage-durability", "cannot change durability mode at runtime");
+    // The active expiry cycle is live-wired like everything else here: the
+    // reaper is constructed with its pacing and its ceilings once, on the
+    // reactor it runs on, and nothing hands it new ones. Accepting a changed
+    // value would leave `reloader.Current()` reporting an interval the daemon
+    // is not sweeping at -- the same split-brain the fields above reject.
+    if (previous.activeExpiryIntervalMs != candidate.activeExpiryIntervalMs)
+        return reject("expiry-interval", "cannot change the expiry sweep interval at runtime");
+    if (previous.activeExpiryScanBudget != candidate.activeExpiryScanBudget)
+        return reject("expiry-scan", "cannot change the expiry scan budget at runtime");
     if (previous.storageMaxValueBytes != candidate.storageMaxValueBytes)
         return reject("storage-max-value", "cannot change value-size cap at runtime");
     if (previous.workerThreads != candidate.workerThreads)
