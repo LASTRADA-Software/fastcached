@@ -33,6 +33,11 @@ enum class MutationKind : std::uint8_t
     Expire,    ///< Lazy or scheduled TTL expiry consumed the entry.
     Evict,     ///< LRU eviction reclaimed the entry under memory pressure.
     FlushDb,   ///< FLUSHDB / flush_all — entire database wiped.
+
+    /// Not a kind: the count, so a table over this enum takes its extent from
+    /// the enum rather than from however many rows somebody last wrote. See
+    /// `Core/EnumTable.hpp`.
+    Last,
 };
 
 /// Notification sink consumed by `NotifyingStorage` on every mutation that
