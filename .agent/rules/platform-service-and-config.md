@@ -215,6 +215,47 @@ readable and silently ignored. Every rule below has already been one of them.
   `raftListen.empty()`, so an unusable port is refused with the missing one, the
   way the `--dashboard` row judges the address `AdminEndpoint` will actually take
   rather than the text an operator typed.
+
+  **The line is "pure function of the command line", and it is narrower than "would
+  be fatal".** `--listen-scheduler`, `--admin-listen`, `--listen-cache` and
+  `--discovery` were the same defect one tier along
+  ([#186](https://github.com/LASTRADA-Software/fastcached/issues/186)): each names an
+  address, each grammar was checked where the surface is opened, and a typo therefore
+  registered cleanly and killed the node at every boot. They are one `EndpointFlag`
+  table now, because four rules differing only in a flag name and a grammar are the
+  repetition a table exists to remove -- and `--listen-cache` is in it, which is easy
+  to miss: its failure is fatal only once the address is *named*, and a value that
+  does not parse is named by construction.
+
+  What stayed out needs stating carefully, because the easy reason is the wrong one.
+  `--bind`, `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are
+  addresses on the same command line, and it is tempting to say they are excluded
+  because they fail at `bind()` or `connect()` -- but that is about **reachability**,
+  and their *grammar* is every bit as much a pure function of the command line as a
+  listen flag's. The honest split is narrower: this table covers the surfaces this
+  node OPENS, whose grammar was already being checked in a tier and only in the wrong
+  place. Whether a dialled address is well-formed is a rule nobody has written yet,
+  not a rule deliberately declined
+  ([#208](https://github.com/LASTRADA-Software/fastcached/issues/208)). What genuinely
+  cannot move here is only the resolving: an address that does not exist when a
+  service is installed may exist by the time it boots.
+
+  **A host somebody did not write is not a host they meant.** All four rows refuse an
+  empty one, and it is worth knowing why that is not fussiness: an empty BIND host
+  reaches `getaddrinfo` as nullptr under `AI_PASSIVE` (`SocketAddress.cpp:163`), which
+  is the WILDCARD -- so `--listen-cache=:6674` would quietly serve this node's private
+  cache to the whole network, which is exactly what `CacheListenDefaultHost`'s loopback
+  exists to make a decision rather than a typo. `UdpSocket::Send` refuses an empty
+  destination outright, so `--discovery=:6681` announces to nobody. A **bare** port is
+  a different thing and stays legal for the three bound surfaces: it names no host at
+  all, so it takes that surface's default instead of silently replacing it.
+
+  And a table column must be one an answer can depend on. The endpoint table carries
+  no default host: `ParseEndpoint` uses one only to fill in the host of a bare port,
+  never to decide whether the text parses, so a column for it would have been a value
+  that could be wrong for years with nothing to show it. The default hosts are named
+  (`SchedulerListenDefaultHost` and its siblings) for the rules that *do* turn on
+  them -- `--dashboard`'s loopback test is the one that does.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing
@@ -408,14 +449,11 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## Open work
 
-- **[#186](https://github.com/LASTRADA-Software/fastcached/issues/186)** — the rule
-  above holds for the consensus tier and for nothing else yet. `--listen-scheduler`,
-  `--admin-listen` and `--discovery` are `ParseText` rows whose grammar is checked
-  inside `SchedulerTier::Start`, `AdminEndpoint::Start` and
-  `StartDiscoveryOrExplain`, each fatal and each reached long after
-  `--install-service` has returned — so `--install-service --listen-scheduler=nope`
-  registers cleanly and exits `ExitUsage` forever. What makes it a ticket rather
-  than three more rows: unlike `--listen-raft` under a `--node-id`, all three have a
-  legitimate *absence* (no scheduler surface, no admin surface), so the predicate is
-  "parses when given" rather than "parses", and `ParseEndpoint`'s default host
-  differs per flag.
+- **[#208](https://github.com/LASTRADA-Software/fastcached/issues/208)** — the rule
+  above covers the addresses this node OPENS. The ones it dials — `--advertise`,
+  `--scheduler`, `--upstream`, `--fleet-member` — are never checked for shape at all.
+  `--advertise` is the costly one: nothing parses it, so `--advertise=nope` installs,
+  registers, heartbeats, is leased out and is never reached, which is word for word
+  the failure the emptiness rule beside it was written to prevent. Deciding it needs
+  a grammar per flag (`--bind` is a host alone; `--upstream` may be empty;
+  `--fleet-member` is a list) and words other than "the surface it configures".
