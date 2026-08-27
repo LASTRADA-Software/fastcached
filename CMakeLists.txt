@@ -329,10 +329,17 @@ if(FASTCACHED_ENABLE_COMPRESSION)
 endif()
 
 # ----------------------------------------------------------------------------
-# Toolchain helpers (warning levels, sanitizers, clang-tidy).
+# Toolchain helpers (warning levels, sanitizers, coverage, clang-tidy).
+#
+# Coverage belongs here, next to Sanitizers, and not one line earlier: both add
+# their instrumentation with directory-scoped add_compile_options(), which
+# reaches targets defined AFTER it. Every CPM dependency has been added by this
+# point, so yaml-cpp, Catch2 and Tracy are left uninstrumented rather than
+# instrumented and then filtered back out of the report.
 
 include(PedanticCompiler)
 include(Sanitizers)
+include(Coverage)
 include(ClangTidy)
 
 # ----------------------------------------------------------------------------
@@ -431,4 +438,14 @@ include(Packaging)
 
 if(FASTCACHED_BUILD_TESTS)
     add_subdirectory(src/tests)
+endif()
+
+# ----------------------------------------------------------------------------
+# The `coverage` / `coverage-clean` targets, when ENABLE_COVERAGE is on. Last in
+# the file on purpose: the target hands llvm-cov every executable defined under
+# src/, and it discovers them by walking the build system as it stands, so a
+# subdirectory added after this call is a binary left out of the report.
+
+if(ENABLE_COVERAGE)
+    fastcached_add_coverage_targets()
 endif()
