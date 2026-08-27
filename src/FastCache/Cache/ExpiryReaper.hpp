@@ -163,11 +163,16 @@ class ExpiryReaper
     ///
     /// Public so a test can drive the loop against a `TestReactor` without
     /// going through `Start`; production uses `Start`.
+    ///
+    /// A pointer rather than a reference, and a token rather than a reference
+    /// to one, for the same reason `InterruptibleSleepUntil` spells both that
+    /// way: this is a coroutine, so a reference parameter is bound before the
+    /// first suspension and then outlives the expression that produced it.
     /// @param reactor Reactor whose clock paces the cycle and whose thread the
-    ///        sweeps run on.
+    ///        sweeps run on. Must not be null, and must outlive the task.
     /// @param token  Observed at every wake; cancelling it ends the loop.
     /// @return A task that completes when the cycle stops.
-    [[nodiscard]] Task<void> Run(IReactor& reactor, CancellationToken token);
+    [[nodiscard]] Task<void> Run(IReactor* reactor, CancellationToken token);
 
     /// One sweep, with this reaper's budget. Exposed so the sweep can be
     /// exercised without a reactor.

@@ -5,7 +5,6 @@
 
 #include <format>
 #include <tuple>
-#include <utility>
 
 namespace FastCache
 {
@@ -14,7 +13,7 @@ ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptio
     _storage { storage },
     _logger { logger },
     _metrics { metrics },
-    _options { std::move(options) },
+    _options { options },
     _interval { _options.interval }
 {
 }
@@ -22,7 +21,7 @@ ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptio
 void ExpiryReaper::Start(IReactor& reactor)
 {
     _reactor = &reactor;
-    _task = Run(reactor, _source.Token());
+    _task = Run(&reactor, _source.Token());
     reactor.Submit(_task.Native());
 }
 
@@ -69,7 +68,7 @@ PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
     return outcome;
 }
 
-Task<void> ExpiryReaper::Run(IReactor& reactor, CancellationToken token)
+Task<void> ExpiryReaper::Run(IReactor* reactor, CancellationToken token)
 {
     // A disabled cycle ends rather than parking forever: a coroutine asleep on
     // a deadline nobody will move is a frame the reactor has to outlive.
@@ -100,18 +99,18 @@ Task<void> ExpiryReaper::Run(IReactor& reactor, CancellationToken token)
         // directly makes them the same frame, which is what lets the owner take
         // it back with `CancelPending` instead of leaking it. `DeadlineTimer`
         // inlines its wait for exactly this reason.
-        auto const deadline = reactor.Clock().Now() + _interval;
+        auto const deadline = reactor->Clock().Now() + _interval;
         while (!token.IsCancelled())
         {
-            auto const now = reactor.Clock().Now();
+            auto const now = reactor->Clock().Now();
             if (now >= deadline)
                 break;
-            co_await SleepUntil { .reactor = &reactor, .deadline = NextWakeStep(now, deadline, _options.stopWakeBound) };
+            co_await SleepUntil { .reactor = reactor, .deadline = NextWakeStep(now, deadline, _options.stopWakeBound) };
         }
         if (token.IsCancelled())
             break;
 
-        auto const outcome = SweepOnce(reactor.Clock().Now());
+        auto const outcome = SweepOnce(reactor->Clock().Now());
         if (outcome.purged != 0)
             _logger.Logf(LogLevel::Debug,
                          "expiry: reclaimed {} lapsed entr{} ({} examined)",

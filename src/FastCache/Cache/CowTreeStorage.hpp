@@ -411,14 +411,20 @@ class CowTreeStorage final: public IStorage
     /// verb that loads before it writes, so the reclaim above cannot be
     /// remembered at four sites and forgotten at a fifth. `Add` asks the same
     /// question and acts on the opposite answer.
+    /// Returns the record itself rather than a yes/no, so a caller reaches it
+    /// without a second `*loaded` dereference the guard no longer covers --
+    /// which is both what the caller wanted and what keeps
+    /// `bugprone-unchecked-optional-access` satisfied that the optional was
+    /// checked.
     /// @param key    The record's key.
-    /// @param loaded What `LoadEntry` returned for it.
+    /// @param loaded What `LoadEntry` returned for it; borrowed, and the
+    ///        returned pointer names storage inside it.
     /// @param now    Current clock value.
-    /// @return True when `loaded` holds a record this verb may operate on.
-    ///         False when there is none -- absent, TTL lapsed, or voided by a
-    ///         flush -- in which case a dead record has already been erased,
-    ///         and reported when its TTL was what killed it.
-    [[nodiscard]] bool AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry> const& loaded, TimePoint now);
+    /// @return The record this verb may operate on, or nullptr when there is
+    ///         none -- absent, TTL lapsed, or voided by a flush. In the latter
+    ///         two a dead record has already been erased, and reported when its
+    ///         TTL was what killed it.
+    [[nodiscard]] CacheEntry* AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry>& loaded, TimePoint now);
 
     /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
     /// record for `key`, rewriting ONLY the leaf record and REUSING any existing

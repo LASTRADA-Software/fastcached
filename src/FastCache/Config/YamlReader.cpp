@@ -369,6 +369,55 @@ namespace
         return std::nullopt;
     }
 
+    /// Apply the active-expiry keys, if `key` names one of them.
+    ///
+    /// Extracted from ApplyEntry to keep that function under the
+    /// cognitive-complexity threshold, exactly as the compression keys are --
+    /// adding these two to the ladder is what pushed it over.
+    ///
+    /// Both read as `long long` rather than the `int` the neighbouring keys use,
+    /// so a figure typed in the wrong unit lands in the range check below and is
+    /// refused by name. Read as `int` it would overflow the conversion first and
+    /// come back as "bad conversion", which says nothing about what to type
+    /// instead -- and being told what to type instead is the entire point of a
+    /// ceiling nobody reaches on purpose.
+    /// @param cfg       Config being populated.
+    /// @param key       The key being applied.
+    /// @param valueNode Its value node.
+    /// @param path      Config file path, for diagnostics.
+    /// @param line      Line number, for diagnostics.
+    /// @return nullopt when `key` is not one of these; otherwise the outcome.
+    [[nodiscard]] std::optional<std::expected<void, ConfigError>> ApplyExpiryEntry(
+        Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
+    {
+        /// `active_expiry_interval_ms`: expiry sweep period; 0 disables the cycle.
+        if (key == "active_expiry_interval_ms")
+        {
+            auto const raw = valueNode.as<long long>();
+            constexpr long long Ceiling = 86'400'000;
+            if (raw < 0 || raw > Ceiling)
+                return std::expected<void, ConfigError> {
+                    std::unexpect,
+                    MakeError(ConfigErrorCode::OutOfRange, path, "active_expiry_interval_ms", "must be in 0..86400000", line)
+                };
+            cfg.activeExpiryIntervalMs = static_cast<std::uint32_t>(raw);
+            return std::expected<void, ConfigError> {};
+        }
+        /// `active_expiry_scan`: entries one sweep examines per shard. Zero is
+        /// `PurgeBudget`'s spelling of *no ceiling*, so it is refused here.
+        if (key == "active_expiry_scan")
+        {
+            auto const raw = valueNode.as<long long>();
+            if (raw < 1)
+                return std::expected<void, ConfigError> {
+                    std::unexpect, MakeError(ConfigErrorCode::OutOfRange, path, "active_expiry_scan", "must be >= 1", line)
+                };
+            cfg.activeExpiryScanBudget = static_cast<std::size_t>(raw);
+            return std::expected<void, ConfigError> {};
+        }
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
         Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
     {
@@ -603,27 +652,10 @@ namespace
             cfg.storageShards = static_cast<std::size_t>(raw);
             return {};
         }
-        /// `active_expiry_interval_ms`: expiry sweep period; 0 disables the cycle.
-        if (key == "active_expiry_interval_ms")
-        {
-            auto const raw = valueNode.as<long long>();
-            constexpr long long Ceiling = 86'400'000;
-            if (raw < 0 || raw > Ceiling)
-                return std::unexpected(MakeError(
-                    ConfigErrorCode::OutOfRange, path, "active_expiry_interval_ms", "must be in 0..86400000", line));
-            cfg.activeExpiryIntervalMs = static_cast<std::uint32_t>(raw);
-            return {};
-        }
-        /// `active_expiry_scan`: entries one sweep examines per shard.
-        if (key == "active_expiry_scan")
-        {
-            auto const raw = valueNode.as<long long>();
-            if (raw < 1)
-                return std::unexpected(
-                    MakeError(ConfigErrorCode::OutOfRange, path, "active_expiry_scan", "must be >= 1", line));
-            cfg.activeExpiryScanBudget = static_cast<std::size_t>(raw);
-            return {};
-        }
+        /// The active-expiry keys are handled in a dedicated helper, for the
+        /// same reason the compression ones are.
+        if (auto handled = ApplyExpiryEntry(cfg, key, valueNode, path, line); handled.has_value())
+            return std::move(*handled);
         /// `listen_backlog`: ::listen() backlog depth (1..65535).
         if (key == "listen_backlog")
         {

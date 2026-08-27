@@ -181,13 +181,17 @@ class ExpireRecorder final: public FastCache::IStorageMutationObserver
 /// this is what decides whether a swept key is published or merely freed.
 struct DaemonChain
 {
-    ExpireRecorder observer;
-    FastCache::ReclaimLog log { &observer };
+    // `InMemoryLruStorage` first, for the reason `ExpiryReaper_test`'s fixture
+    // spells out: it aligns its read counters to a cache line, and a 64-aligned
+    // member anywhere but the front pads the whole struct past what
+    // clang-tidy's padding budget allows. Construction order still holds.
     FastCache::InMemoryLruStorage lru;
+    FastCache::NullLogger logger;
+    ExpireRecorder observer;
     FastCache::NotifyingStorage storage { lru, &observer };
     FastCache::ManualClock clock;
+    FastCache::ReclaimLog log { &observer };
     FastCache::TestReactor reactor { clock };
-    FastCache::NullLogger logger;
     FastCache::CacheEngine engine { storage, clock };
 
     DaemonChain()

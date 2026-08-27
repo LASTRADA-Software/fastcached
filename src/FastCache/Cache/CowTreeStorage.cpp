@@ -1365,15 +1365,15 @@ void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& e
     EraseFromLru(key);
 }
 
-bool CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry> const& loaded, TimePoint now)
+CacheEntry* CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry>& loaded, TimePoint now)
 {
     if (!loaded.has_value())
-        return false; // Nothing on disk; nothing to reclaim either.
-    auto const& entry = loaded->entry;
+        return nullptr; // Nothing on disk; nothing to reclaim either.
+    auto& entry = loaded->entry;
     if (entry.expiry > now && entry.generation >= _liveGeneration)
-        return true;
+        return &entry;
     ReclaimDeadRecord(key, entry, now);
-    return false;
+    return nullptr;
 }
 
 void CowTreeStorage::EvictToFit()
@@ -1626,7 +1626,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Add(
     // silently overwrite it. `NotifyingStorage` drains reclaims before it emits
     // a verb's own event, so a subscriber sees `expired k` and then `set k`,
     // which is the order the in-memory tier already produces for this sequence.
-    if (AcceptLiveRecord(key, *loaded, now))
+    if (AcceptLiveRecord(key, *loaded, now) != nullptr)
         return std::unexpected(MakeError(StorageErrorCode::KeyExists));
     return Set(key, std::move(value), flags, expiry);
 }
@@ -1637,7 +1637,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Replace(
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!AcceptLiveRecord(key, *loaded, now))
+    if (AcceptLiveRecord(key, *loaded, now) == nullptr)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     return Set(key, std::move(value), flags, expiry);
 }
@@ -1650,9 +1650,10 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!AcceptLiveRecord(key, *loaded, now))
+    auto* const live = AcceptLiveRecord(key, *loaded, now);
+    if (live == nullptr)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
-    auto& entry = (*loaded)->entry;
+    auto& entry = *live;
     if (expected != 0 && entry.cas != expected)
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
     auto const existing = entry.ValueBytes();
@@ -1682,9 +1683,10 @@ std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view k
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
         return std::unexpected(loaded.error());
-    if (!AcceptLiveRecord(key, *loaded, now))
+    auto* const live = AcceptLiveRecord(key, *loaded, now);
+    if (live == nullptr)
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
-    auto& entry = (*loaded)->entry;
+    auto& entry = *live;
     if (expected != 0 && entry.cas != expected)
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
     auto const existing = entry.ValueBytes();
@@ -1719,12 +1721,13 @@ std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string
         ++_stats.casMisses;
         return std::unexpected(loaded.error());
     }
-    if (!AcceptLiveRecord(key, *loaded, now))
+    auto const* const live = AcceptLiveRecord(key, *loaded, now);
+    if (live == nullptr)
     {
         ++_stats.casMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     }
-    if ((*loaded)->entry.cas != expected)
+    if (live->cas != expected)
     {
         ++_stats.casBadval;
         return std::unexpected(MakeError(StorageErrorCode::CasMismatch));
@@ -1752,7 +1755,8 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     // semantics (binary `initial`/`expiration`, meta `J`/`N`) and re-issues
     // a Set on KeyNotFound. Auto-vivifying here with current=0 would ignore
     // those flags and silently bypass the binary "do not create" sentinel.
-    if (!AcceptLiveRecord(key, *loaded, now))
+    auto* const live = AcceptLiveRecord(key, *loaded, now);
+    if (live == nullptr)
     {
         if (decrement)
             ++_stats.decrMisses;
@@ -1761,7 +1765,7 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     }
 
-    auto& existing = (*loaded)->entry;
+    auto& existing = *live;
     std::uint64_t current = 0;
     {
         auto parsed = ParseUnsigned(existing.ValueBytes());

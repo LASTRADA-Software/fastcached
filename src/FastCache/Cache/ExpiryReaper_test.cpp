@@ -66,14 +66,20 @@ class RecordingObserver final: public IStorageMutationObserver
 /// event rather than just a smaller item count.
 struct Fixture
 {
-    RecordingObserver observer;
-    ReclaimLog log { &observer };
+    // Declared in the order clang-tidy's padding check asks for rather than the
+    // order the wiring reads in: `InMemoryLruStorage` puts its read counters on
+    // separate cache lines, so a 64-aligned member anywhere but the front costs
+    // this fixture 72 bytes of padding and fails the build. The construction
+    // dependencies still hold -- `observer` precedes `log` and `storage`, `lru`
+    // precedes `storage`, `clock` precedes `reactor`.
     InMemoryLruStorage lru;
-    NotifyingStorage storage { lru, &observer };
-    ManualClock clock;
-    TestReactor reactor { clock };
     NullLogger logger;
     CancellationSource source;
+    RecordingObserver observer;
+    NotifyingStorage storage { lru, &observer };
+    ManualClock clock;
+    ReclaimLog log { &observer };
+    TestReactor reactor { clock };
     AtomicMetricsSink metrics;
 
     Fixture()
@@ -96,7 +102,7 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     ExpiryReaper reaper {
         f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms }, &f.metrics
     };
-    auto task = reaper.Run(f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
     CHECK(f.storage.Snapshot().itemCount == 1U); // Still live; nothing to do yet.
@@ -122,7 +128,7 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     // ever resume and nobody will ever free.
     Fixture f;
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
-    auto task = reaper.Run(f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
 
@@ -163,7 +169,7 @@ TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[
     REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
 
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = Duration::zero() } };
-    auto task = reaper.Run(f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
 
@@ -206,7 +212,7 @@ TEST_CASE("The expiry cycle actually backs off on a running reactor", "[expiry][
     ExpiryReaper reaper { f.storage,
                           f.logger,
                           ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms, .stopWakeBound = 100ms } };
-    auto task = reaper.Run(f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
     CHECK(reaper.CurrentInterval() == 100ms);
