@@ -304,6 +304,73 @@ determinism rests on.
     compile naming its own table. A completeness guard that has never been seen
     to fail is exactly the thing this entry is about.
 
+## What a `char` is
+
+- **Every Windows executable declares UTF-8 as its process code page, and the
+  declaration is applied by walking the build system rather than by a line per
+  target.** Windows keeps command lines, environment blocks and paths as UTF-16 and
+  transcodes them for a narrow caller through the process's *active code page*,
+  whose default is the host's legacy one — 1252 on a Western install. That one
+  setting decides `argv`, `getenv`, every `...A` API this tree calls
+  (`CreateProcessA` in the launcher's process runner, `CreateServiceA` and
+  `GetModuleFileNameA` in `ServiceControl`, `RegQueryValueExA` in `Registry`) and
+  `std::filesystem::path`'s narrow conversions in BOTH directions — MSVC's
+  `__std_fs_code_page()` answers `CP_ACP` unless the CRT locale is UTF-8. Since #141
+  the fleet refuses a registration whose fields are not valid UTF-8, so a non-ASCII
+  `--toolchain` or `--advertise` typed on a Windows console was refused for a reason
+  invisible from where it was typed (#155).
+
+  **The obvious fix is the wrong one.** `GetCommandLineW` + `CommandLineToArgvW` +
+  `WideCharToMultiByte` in a seam every `main` calls converts ONE boundary and
+  leaves the rest on the legacy page — which turns a wrong encoding into a *split*
+  one: UTF-8 `argv` handed to `std::filesystem::path` decodes as CP-1252 and names a
+  different file, and handed to `CreateProcessA` spawns the compiler with a mangled
+  command line. Both work today. Closing that gap means policing a second convention
+  across 45 path constructions, 122 `.string()` calls and six `...A` call sites,
+  forever, with no compiler enforcement. `cmake/Utf8CodePage.cmake` carries the
+  measurements.
+
+- **`activeCodePage` is honoured from Windows 10 1903 / Server 2022 and ignored in
+  silence below it**, which is the one thing a build-time setting must not be
+  allowed to be. `FastCache::NarrowTextIsUtf8()` reports the OUTCOME rather than the
+  intent, a Catch2 case asserts it — red at code page 1252, green at 65001 — and the
+  node names the active code page in a parse refusal when it is not UTF-8, which on
+  such a host is the whole answer and no other surface would ever give it.
+
+- **`utf8-argv-*` is the only end-to-end proof there can be.** The defect is in what
+  the OS hands a process, so nothing *inside* a process can observe it: a Catch2 case
+  can assert the code page a test binary ended up with, and only running a real
+  executable says what an argument BECAME on the way in. Each binary with an option
+  table is run with an unrecognised flag spelled with U+00FC and must echo those
+  exact bytes; the argument is built with `string(ASCII 103 114 195 188 110 …)`, raw
+  byte values, so no file's own encoding is what is under test.
+
+- **`std::filesystem::path`'s narrow constructor THROWS once the active code page is
+  UTF-8** and the bytes are not — `MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+  …)` refuses them — and it throws *before* any `std::error_code` overload downstream
+  is reached, so a call site that carefully takes an `error_code` for every operation
+  is still not protected. `Platform::PathFromNarrowText` is the one `catch` in this
+  project's own code, and one rather than none because the standard library states
+  this failure by throwing and offers no `error_code` overload of the constructor to
+  ask instead. It is a guard, not a decision: where readability *decides* something,
+  the caller asks `Utf8FromNarrowText` and says what it does about the answer.
+
+- **A CHILD process has a code page of its own, and `cl.exe` does not use even that
+  for output.** It writes the paths in `/showIncludes` in the CONSOLE OUTPUT code
+  page — measured on this tree's toolchain at `C3 BC` for U+00FC under CP 65001 and
+  `81` under CP 850. See `.agent/rules/compile-cache.md` for what the launcher does
+  about it.
+
+- **`/utf-8` is on for MSVC, so the compiler agrees with the runtime about what a
+  narrow literal is.** Without it MSVC reads a source file in the host's ANSI code
+  page and re-encodes its narrow literals into that same page: byte-identical on a
+  CP-1252 or CP-65001 host, different bytes anywhere else. This tree has such
+  literals (a Redis error reply, the Windows service description, an SVG chart
+  caption), and the SVG one is the sharp end — an XML parser refuses a whole
+  document whose encoding does not hold. Directory-scoped and applied after every
+  CPM dependency has been added, exactly as `PedanticCompiler` and `Sanitizers` are,
+  so a third-party source carrying a byte it would refuse never sees the flag.
+
 ## Line endings
 
 Line endings are LF everywhere, and that is a `.gitattributes` rule

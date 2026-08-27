@@ -57,7 +57,9 @@ src/FastCache/
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,
                 InheritedListener (systemd socket activation),
-                Environment (the one place the environment is read), FileTrust
+                Environment (the one place the environment is read), FileTrust,
+                NarrowText (what a `char` is on this host, and reading text
+                something else wrote)
   Config/       Config, CliParser + CliOptions (the one flag table), ByteSize,
                 YamlReader, ConfigReloader, EnvExpand, DefaultConfigPath
   Metrics/      IMetricsSink + AtomicMetricsSink, MetricsCatalog (the counter
@@ -163,6 +165,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - `cc` and `c++` name a policy, not a product — on macOS that is Apple clang — so
   the banner corrects the name. It must never reclassify `clang-cl`, whose banner
   is plain clang's.
+- A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
+  the console output code page. Decoded at `RootReconciler::Path`, or the compile is
+  not cached.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,
@@ -292,6 +297,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A machine-wide config is obeyed only when only an administrator could have
   written it (`Platform/FileTrust`).
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
+- Which flags carry text *other machines* will read is a column of that table
+  (`ParseUtf8Text`). `--cluster-forget` is deliberately out of it, or a bad member
+  becomes unremovable; so is every path-valued flag, and the compiler half of
+  `--toolchain`.
+- A value parser cannot know which flag it was reached through, so it names none and
+  `ApplyOneOption` stamps the row's own spelling.
 
 **[`.agent/rules/storage.md`](.agent/rules/storage.md)** — the on-disk format and
 converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
@@ -371,6 +382,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- A `char` is UTF-8 here, at run time and at compile time: every Windows executable
+  declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
+  boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy
+  page.
+- `std::filesystem::path`'s narrow constructor THROWS on such a host for bytes that
+  are not UTF-8 — before any `error_code` overload runs. `PathFromNarrowText` is the
+  one `catch` in this tree.
 - Where `clang-debug` will not build, get ASan from GCC (`-fsanitize=address` alone —
   UBSan breaks the option tables' constexpr checks) and run the **whole** suite: a
   freed block nothing disturbs reports nothing.
