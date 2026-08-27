@@ -4,6 +4,13 @@ fastcached is a layered C++23 server. Each layer reaches its
 collaborators through a narrow interface, which keeps the whole
 thing testable end-to-end against an in-memory transport.
 
+!!! info "Looking for the behaviour rather than the code?"
+
+    This page is a map of the **source tree**, written for people changing it. If
+    you want to know what the programs do, how a compile flows through them, and
+    what decides whether two machines share a cache, read
+    [How it works](../how-it-works.md) instead.
+
 ## Module map
 
 ```

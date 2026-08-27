@@ -74,6 +74,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - How it works: how-it-works.md
   - Getting started:
     - Install: getting-started/install.md
     - Quickstart: getting-started/quickstart.md

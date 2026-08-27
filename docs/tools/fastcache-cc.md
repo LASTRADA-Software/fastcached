@@ -9,6 +9,11 @@ canonicalized result. On **any** cache error it falls back to a plain real
 compile. Caching is an optimization — an unreachable or broken cache slows a
 build down, it never breaks one.
 
+This page is the reference: every flag, every environment variable, every
+fall-back reason by name. For the story of what happens between your build system
+and your compiler — direct mode, the key, the lookup, the dispatch — read
+[How it works](../how-it-works.md#one-compile-start-to-finish).
+
 ## Why not just ccache or sccache?
 
 Cache entries are **portable across checkout paths**. Before the key is
