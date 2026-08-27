@@ -991,6 +991,17 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // self was written happily and then died at every boot (#168).
         { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && ClusterSelfMember(c) == nullptr; },
           .message = NodeIdNamesNoPeerRefusal },
+        // The third refusal `ConsensusTier::Start` made and no table did.
+        // `ParseEndpoint` is asked here rather than `raftListen.empty()` because it
+        // answers nullopt for an unusable port as readily as for a missing one, and
+        // the tier decides on that same answer -- the way the `--dashboard` row
+        // below judges the address `AdminEndpoint` will actually take rather than
+        // the text an operator typed.
+        { .refuses =
+              [](NodeConfig const& c) { return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, "0.0.0.0").has_value(); },
+          .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
+                     "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
+                     "the node refuses to start rather than join a cluster that cannot see it." },
         // The other half of the same flag group: consensus configured with the
         // switch that turns it on left off. `--cluster-dir` is deliberately NOT
         // here -- `FleetHistoryPath` reads it for the dashboard's history file, so

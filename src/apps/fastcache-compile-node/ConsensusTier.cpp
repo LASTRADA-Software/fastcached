@@ -235,6 +235,11 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
     // that silently cannot work.
+    //
+    // `StartupPolicyRejection` asks this same question, so an operator meets it at
+    // the command line -- an install included -- rather than here. What survives is
+    // the message that names the text they typed, which a row of static prose
+    // cannot, and the answer for a `NodeConfig` no argv produced (#168).
     auto const endpoint = ParseEndpoint(cfg.raftListen, "0.0.0.0");
     if (!endpoint.has_value())
         return std::unexpected { std::format("--listen-raft={} names no usable port", cfg.raftListen) };

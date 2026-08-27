@@ -700,8 +700,47 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
     // A node that names itself is accepted, bootstrapping or joining.
     auto bootstrapping = Installable();
     bootstrapping.nodeId = "n1";
+    bootstrapping.raftListen = "6680";
     bootstrapping.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
     CHECK_FALSE(StartupPolicyRejection(bootstrapping).has_value());
+}
+
+TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before it is installed",
+          "[node][consensus][policy]")
+{
+    // The third refusal `ConsensusTier::Start` made and neither table did:
+    // `ParseEndpoint` answers nullopt for an empty `--listen-raft` exactly as it
+    // does for a malformed one, so a node with an id, a peer list naming itself
+    // and no port installed cleanly and then exited at every boot. The rule asks
+    // the tier's own question, the way the `--dashboard` row asks
+    // `AdminEndpoint`'s.
+    for (auto const* const listen: { "", "nope", "0", "10.0.0.1" })
+    {
+        INFO("--listen-raft=" << listen);
+        auto cfg = Installable();
+        cfg.nodeId = "n1";
+        cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+        cfg.raftListen = listen;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--listen-raft"));
+        CHECK(NodeInstallRejection(cfg).has_value());
+    }
+
+    // A bare port is enough, and binds the wildcard -- peers are on other machines
+    // by definition.
+    auto bare = Installable();
+    bare.nodeId = "n1";
+    bare.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    bare.raftListen = "6680";
+    bare.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK_FALSE(StartupPolicyRejection(bare).has_value());
+    CHECK_FALSE(NodeInstallRejection(bare).has_value());
+
+    // And a worker with no consensus at all is not asked for a port it has no use
+    // for, which is by far the common deployment.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
 TEST_CASE("NodeConfig: the --raft-join rules keep the more specific answer", "[node][consensus][policy]")
@@ -878,6 +917,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig joiner;
         joiner.raftJoin = true;
         joiner.nodeId = "n4";
+        joiner.raftListen = "6680";
         joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
@@ -960,6 +1000,7 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     auto const base = std::vector<char const*> { "--scheduler=s:1",
                                                  "--toolchain=/usr/bin/cc",
                                                  "--node-id=n1",
+                                                 "--listen-raft=6680",
                                                  "--raft-peer=n1=10.0.0.1:6680",
                                                  "--cluster-key-file=cluster.key",
                                                  "--discovery=255.255.255.255:6681" };
