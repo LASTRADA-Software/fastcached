@@ -352,12 +352,17 @@ rather than "no deadline" — every write landed and was unreadable, a cache tha
 silently stores nothing while reporting success on every write. `CacheEngine` already
 spelled it the same way, which is what makes this a drift rather than a discovery.
 
-- **`FASTCACHE_ADDR` is deliberately NOT defaulted to the local node.** Unset means the
-  cache is off, and it stays that way: defaulting to localhost would make every build
-  on a machine without a node pay a failed connect per translation unit, in silence —
-  the exact cost `USE_COMPILER_CACHE` probes at configure time to avoid. Pointing it at
-  the node is one line of configuration, and it is better written by an operator than
-  assumed by a tool.
+- **`FASTCACHE_ADDR` defaults to LOOPBACK, and set-but-empty is the opt-out.** Unset
+  resolves to `Cc::DefaultAddr` (`127.0.0.1:6674`), which is where `--listen-cache`
+  answers, so the launcher caches against a node on this machine with no
+  configuration at all. Three-valued on purpose, and `EnvOr` — which collapses
+  set-but-empty into unset — must not be used to read it, or the documented opt-out
+  `cmake/portable/CompileCache.cmake` exports becomes the default. A *remote*
+  default would be indefensible: every TU on a machine with nothing listening would
+  pay a connect timeout in silence, the exact cost `USE_COMPILER_CACHE` probes at
+  configure time to avoid. Loopback is not that — a closed port refuses immediately,
+  with no timeout and no round trip — which is the whole argument for this address
+  and why it could not be another one.
 - **A cache answer that dials must not be serialized behind the accept loop.**
   `FrameEndpoint` owned a thread and served its connections ONE AT A TIME, and
   `RemoteUpstream` dials the shared cache from inside a cache answer -- so a single
@@ -708,13 +713,3 @@ the seam.
   `constexpr` span, and it is only fully correct once a fingerprint can tell one
   toolset's target variants apart -- which today it cannot, since they share an
   include tree and a fallback banner and therefore digest identically.
-- **[#154](https://github.com/LASTRADA-Software/fastcached/issues/154)** — taking the
-  VC toolset out of `clang-cl`'s fingerprint (#145) also took out the only thing that
-  was keeping two workers on different MSVC toolsets apart, and
-  `-fms-compatibility-version` is derived from that install and reaches code
-  generation. The window is not
-  new — two service-run workers already shared a banner-only digest — but clang-cl now
-  matches in configurations where it previously matched nothing. The fix is to state
-  the value on the dispatch line rather than to make an identity out of the machine
-  holding it; measure first, since it may not reach codegen for preprocessed input at
-  all.

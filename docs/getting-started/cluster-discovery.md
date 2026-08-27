@@ -1,12 +1,14 @@
 # Cluster discovery
 
-How the nodes of a `fastcached` peer cluster find each other on a LAN, and how one
-proves it belongs before the cluster admits it.
+How the nodes of a `fastcache-compile-node` cluster find each other on a LAN, and
+how one proves it belongs before the cluster admits it.
 
-> **Status.** The discovery layer is implemented and unit-tested; wiring it into
-> the node binary and the Raft membership change it feeds are the remaining
-> pieces of the peer-to-peer work tracked in
-> [#81](https://github.com/LASTRADA-Software/fastcached/issues/81).
+It is off unless you ask for it. Turn it on with `--discovery`, which needs
+`--node-id` and `--cluster-key-file` and is refused without them; without it a
+cluster is exactly the `--raft-peer` list an operator typed, which works and is
+the right answer for a fleet that does not change. The flags, and what a
+deployment looks like end to end, are under
+[finding peers instead of typing them](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them).
 
 ## What problem it solves
 

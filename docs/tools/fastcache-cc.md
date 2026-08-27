@@ -62,10 +62,18 @@ to an object file. Link steps, compile-and-link steps, preprocess-only runs
 ```
 fastcache-cc <compiler> <args...>                       Front a compile (as CMAKE_<LANG>_COMPILER_LAUNCHER)
 fastcache-cc --show-stats | -s [--prefetch-group <id>]  Report cache statistics for this machine
+fastcache-cc --html-stats [--prefetch-group <id>]
+                          [--out <path>]                Render those statistics as a self-contained HTML dashboard
 fastcache-cc --zero-stats | -z                          Discard the statistics log
+fastcache-cc --print-toolchain-fingerprint <compiler>   Print the fingerprint a dispatched compile would use
 fastcache-cc --help | -h | /?                           Flags and environment reference
 fastcache-cc --version                                  Launcher version
 ```
+
+`--print-toolchain-fingerprint` is the diagnostic for a fleet whose scheduler
+answers `no-worker`: run it on a client and compare with what the worker logs as
+`serving`. It recomputes rather than reading the cache, so it also repairs a stale
+entry on its way past.
 
 `--help` is generated from the same table the launcher dispatches on, so it
 always lists exactly what the binary accepts.
@@ -172,15 +180,18 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `FASTCACHE_ADDR` | `host:port` of the daemon. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. | unset — **no caching** |
+| `FASTCACHE_ADDR` | `host:port` of the cache — a `fastcached`, or a `fastcache-compile-node`'s `--listen-cache`. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. Set but **empty** is the opt-out and means no caching. | `127.0.0.1:6674` |
 | `FASTCACHE_SOURCE_DIR` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
 | `FASTCACHE_BINARY_DIR` | Build output root. | unset — **no caching** |
 | `FASTCACHE_PREFETCH_GROUP` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
 | `FASTCACHE_VERBOSE` | Print `HIT`/`MISS` and fall-back diagnostics to stderr. | unset (quiet) |
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
+| `FASTCACHE_CONNECT_TIMEOUT_MS` | Deadline, in milliseconds, for *opening* a connection — name resolution included. `0` leaves the platform's own, which runs to minutes. Short on purpose: a cache that has not accepted within a second is one the build is better off without, and a wedged resolver would otherwise stall every translation unit. | `1000` |
 | `FASTCACHE_TIMEOUT_MS` | Per-call deadline, in milliseconds, for every send/recv to the daemon. `0` disables it. A daemon that accepts and then stalls mid-reply would otherwise block the compile forever. Bounds each call, not the whole invocation — see below. | `10000` |
-| `FASTCACHE_TOKEN` | Shared secret presented to a daemon started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe to set against a daemon that requires no credential: such a daemon accepts it and ignores it. | unset — **no credential sent** |
+| `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
+| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — some `fastcache-compile-node`'s `--listen-scheduler` port, never a cache port. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
+| `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 
 The statistics log is located from the usual per-user state variables rather than
@@ -195,11 +206,20 @@ one of the launcher's own. These are read but never written:
 With no usable state directory there is nowhere to append to, so statistics are
 silently disabled. Caching itself is unaffected.
 
-`ADDR`, `SOURCE_DIR` and `BINARY_DIR` must **all** be set. If any is missing
-every compile runs uncached — the build still succeeds, which is exactly why
-this is worth checking before concluding the cache does not help. With
+`ADDR`, `SOURCE_DIR` and `BINARY_DIR` must **all** be non-empty to cache. `ADDR`
+has a default and the other two do not, so in practice it is the roots that are
+missing when nothing caches — the build still succeeds, which is exactly why this
+is worth checking before concluding the cache does not help. With
 `FASTCACHE_VERBOSE` set, that case reports
 `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR`.
+
+`FASTCACHE_ADDR` defaults to `127.0.0.1:6674` rather than to nothing, so the
+launcher caches with no configuration at all against whichever of `fastcached` or
+`fastcache-compile-node` is running on this machine — the node's `--listen-cache`
+defaults to the same address for exactly that reason. A *remote* default would be
+indefensible, since every translation unit on a machine with nothing listening
+would pay a connect timeout in silence; a closed loopback port refuses
+immediately, so a machine running neither pays microseconds per compile.
 
 ## How it works
 
@@ -210,7 +230,16 @@ this is worth checking before concluding the cache does not help. With
    and hash `(compiler id + preprocessed text + relativized args + dependency
    paths)` into a 128-bit key — MurmurHash3 x64_128, which is 128 bits of
    *strength* and not merely 128 bits wide; see the note in `.agent/rules/compile-cache.md` on why
-   the four-CRC construction it replaced was not. The dependency set comes from
+   the four-CRC construction it replaced was not. **Compiler id is the driver's
+   banner *and* the target it generates for**, where the driver can be asked: a
+   banner alone identifies the driver, and a driver's code generation is not a
+   function of the driver alone — `clang-cl` takes `-fms-compatibility-version`
+   from the MSVC install beside it, and one stock `g++` banner covers x86_64 and
+   aarch64. A driver that states no target keeps its entries unchanged. Note this
+   is the *key*, not the toolchain fingerprint a dispatched compile matches
+   workers on, which deliberately omits the target — see
+   [Distributed compilation](../getting-started/distributed-compilation.md#the-fingerprint-and-the-cache-key-are-not-the-same-string).
+   The dependency set comes from
    that same preprocess run — `-MD` into a scratch depfile for GNU drivers,
    `/showIncludes` for MSVC ones — which costs about 1.5% of it, because the
    compiler has already opened every one of those files.
@@ -382,9 +411,10 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   compiler identity in the key already covers them, and including them would
   make two machines with different system include prefixes share nothing. So a
   cache shared between machines whose compilers print the *same* `--version`
-  banner from *different* prefixes can still replay a dependency record naming a
-  path the consumer lacks. Project headers — the ones that actually move — are
-  covered by the key, so this is now confined to the toolchain.
+  banner *and target the same triple*, from *different* prefixes, can still
+  replay a dependency record naming a path the consumer lacks. Project headers —
+  the ones that actually move — are covered by the key, so this is now confined
+  to the toolchain.
 - The cache key normalization is deliberately young (`objkey-v5`). Tune it
   against real developer↔CI hit rates before relying on it broadly. Bumping the
   schema re-keys the cache: existing entries miss once and are rewritten.

@@ -314,6 +314,16 @@ Two further ports, both **off unless you ask for them**:
 | **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --listen-scheduler`. Not served by `fastcached` |
 | **6676** | A compile worker's own port | the worker's `--port` |
 
+A compile node also serves a **cache tier of its own**, and its `--listen-cache`
+defaults to `127.0.0.1:6674` — the same address as the daemon's, deliberately,
+because that is where `fastcache-cc` already looks. On a machine running both, the
+node loses the bind, warns, and carries on with no local tier — the launcher
+reaches the daemon on that port instead. Give one of them a port of its own if you
+want the node's tier as well.
+A node running consensus additionally binds `--listen-raft` and, with discovery
+on, a UDP `--discovery` port plus a per-node answering port; none has a
+conventional number, and all are off unless configured.
+
 The dispatch endpoint is separate from the cache **on purpose**. The cache may
 reasonably be reachable across a build LAN; the surface that causes a compiler to
 *run* on another machine should be something you switch on and firewall

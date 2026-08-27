@@ -151,28 +151,47 @@ registers once per toolchain. The scheduler keys a worker on
 heartbeats the same machine-wide in-flight count, so the entries fill up together
 and the pool behaves as one rather than advertising N times the machine.
 
-`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler; `COMPILE` goes to a
-worker on its own port, and is the only verb a worker answers at all —
-everything else, the scheduler's verbs included, is refused with
-`dispatch-not-permitted`, so a client that sent the wrong verb to the wrong port
-learns which rather than seeing a dropped connection it cannot tell from a dead
-host.
+`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler, along with the four
+cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
+`CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
+only to a member. `COMPILE` goes to a worker on its own port and is the only verb
+a worker answers at all — everything else, the scheduler's verbs included, is
+refused with `dispatch-not-permitted`, so a client that sent the wrong verb to the
+wrong port learns which rather than seeing a dropped connection it cannot tell
+from a dead host.
 
 ```
-REGISTER   [fingerprint][endpoint][slots][codecs]       -> [workerId]
-HEARTBEAT  [workerId][inFlight]                          -> Ok
-LEASE      [fingerprint][objectKey][codecs]              -> [endpoint][leaseToken][workerCodecs]
-COMPILE    [leaseToken][fingerprint][args][source][codecs] -> [exitCode][object][stdout][stderr]
+REGISTER   [fingerprint][endpoint][slots][codecs][capacity] -> [workerId]
+HEARTBEAT  [workerId][inFlight][load]                       -> Ok
+LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs]
+COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
+                                                            -> [exitCode][object][stdout][stderr]
 ```
+
+`capacity` and `load` are **nested** records rather than fields of their own, and
+that is a compatibility property rather than tidiness: the top-level field count
+of each verb is exact and fixed forever, so a fact added there would make two
+builds of one fleet unable to speak at all. The nested records are read with the
+variable-arity split, so a node built before a field existed simply reports
+nothing for it and a newer node registering with an older leader has it skipped.
+`capacity` is what the machine *is* — cores, memory, node class, reserve, the
+software version and the cache budgets; `load` is what it is *doing* — CPU busy,
+available memory, free scratch and what its cache holds. `inFlight` stays outside
+the nested record, because it is the one number a worker can never fail to have.
+
+`sourceName` is the **base name** of the client's translation unit, so the worker
+can name its scratch file the same way: a compiler records the name of the file it
+was handed, and an object built under an invented name is gratuitously different
+from a locally built one. It is sanitized before it becomes a path, and it never
+decides the language — the client states that explicitly.
 
 Two rules carry the weight and neither is configurable. A job goes only to a
 worker whose fingerprint is **byte-identical**: an over-strict match costs a
 local compile, an over-loose one produces a silently wrong object stored under a
 key other machines fetch, and those errors are not symmetric. And the scheduler
-picks the **least-outstanding** worker rather than round-robining, because
-compile times vary by an order of magnitude within one build, so distributing
-arrivals rather than load queues a long translation unit behind another while a
-worker idles.
+picks the worker with the most **free slots**, ties broken by utilization —
+not the one running the fewest jobs, which treats every machine as an identical
+box and sends work to the smallest ones first.
 
 The scheduler also suppresses duplicate work: when many clients miss the same key
 at once — the ordinary shape of a miss after a header change — only the first is
