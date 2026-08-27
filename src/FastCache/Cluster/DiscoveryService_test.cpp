@@ -282,6 +282,39 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     CHECK(reported() == 2);
 }
 
+TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster][discovery][service]")
+{
+    // The mismatch line names the endpoint a PROOF claimed, and a proof is
+    // unauthenticated until its tag checks out -- so without this, anything on the
+    // segment could write arbitrary bytes into a node's log by sending one beacon
+    // and then one lie, holding no key at all.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    CapturingLogger logger;
+
+    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
+    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", "secret" };
+
+    // Announced properly, so it is recorded and challenged -- which is what makes a
+    // proof carrying its id something this node looks at rather than discards.
+    REQUIRE(peer.service.SendBeacon());
+    REQUIRE(listener.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
+
+    // And then answers for an endpoint that is not text. The tag is not even filled
+    // in: this is refused long before anything is verified.
+    REQUIRE(peer.socket
+                ->Send(DiscoveryWire::EncodeProof(
+                           DiscoveryWire::Proof { .nodeId = "peer", .raftEndpoint = "10.0.0.2:7000\xFF", .tag = {} }),
+                       AtEndpoint("10.0.0.1:7000"))
+                .has_value());
+    CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
+
+    CHECK(std::ranges::none_of(logger.Snapshot(),
+                               [](CapturingLogger::Record const& record) { return record.message.contains('\xFF'); }));
+    CHECK(listener.directory.AuthenticatedPeers().empty());
+}
+
 TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discovery][service]")
 {
     // The whole feature, end to end, in one process: beacon, challenge, proof,

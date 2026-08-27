@@ -2,6 +2,7 @@
 #include <FastCache/Cluster/DiscoveryService.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
 #include <ranges>
@@ -143,6 +144,19 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
             auto const proof = DiscoveryWire::DecodeProof(received->payload);
             if (!proof.has_value())
                 return DiscoveryEvent::Ignored;
+
+            // Refused before it is COMPARED, and the ordering is the whole of it:
+            // the mismatch below names what the proof claimed, and a proof is
+            // unauthenticated until its tag checks out -- so anything on the
+            // segment could otherwise put arbitrary bytes into this node's log
+            // without ever holding the key.
+            //
+            // It could never have matched anyway. The endpoint it would have to
+            // equal is one `PeerDirectory::NoteBeacon` recorded, and that refuses
+            // an endpoint which is not text. The node id needs no such check: it
+            // has to be a key of `_pending`, and those come from the same door.
+            if (!IsValidUtf8(proof->raftEndpoint))
+                return DiscoveryEvent::ProofRejected;
 
             // A proof is only ever an answer to a challenge THIS node issued. An
             // unsolicited one carries a nonce nobody here chose, so there is
