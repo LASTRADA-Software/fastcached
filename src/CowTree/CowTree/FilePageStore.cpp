@@ -511,6 +511,12 @@ std::size_t FilePageStore::PageSize() const noexcept
     return _pageSize;
 }
 
+std::size_t FilePageStore::PageCount() const noexcept
+{
+    std::scoped_lock const lock { _ioMutex };
+    return _totalDataPages;
+}
+
 FilePageStore::Durability FilePageStore::DurabilityMode() const noexcept
 {
     return _options.durability;

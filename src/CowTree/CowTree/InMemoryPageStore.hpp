@@ -99,6 +99,8 @@ class InMemoryPageStore final: public IPageStore
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 
+    [[nodiscard]] auto PageCount() const noexcept -> std::size_t override;
+
   private:
     std::size_t _pageSize;
 

@@ -178,4 +178,9 @@ std::size_t InMemoryPageStore::PageSize() const noexcept
     return _pageSize;
 }
 
+std::size_t InMemoryPageStore::PageCount() const noexcept
+{
+    return _pages.size();
+}
+
 } // namespace CowTree

@@ -87,6 +87,17 @@ class IPageStore
     /// @return The configured data-page size in bytes. Constant for the
     ///         lifetime of the page store.
     [[nodiscard]] virtual auto PageSize() const noexcept -> std::size_t = 0;
+
+    /// Total data pages this store currently holds, live and free alike.
+    ///
+    /// Grows as pages are allocated and never shrinks, so it is an upper bound
+    /// on how many DISTINCT pages any structure inside the store can span. That
+    /// is what it exists for: a tree walk reaches each of its pages once, so a
+    /// walk that has read more pages than this is following a cycle — and a
+    /// cycle is precisely what a per-page CRC cannot catch, since every page
+    /// around the loop is individually valid.
+    /// @return The page count; zero for a store nothing has allocated in yet.
+    [[nodiscard]] virtual auto PageCount() const noexcept -> std::size_t = 0;
 };
 
 } // namespace CowTree

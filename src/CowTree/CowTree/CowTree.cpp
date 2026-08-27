@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -106,6 +107,78 @@ auto ReadTxn::Get(BytesView key) const -> std::expected<std::optional<std::vecto
         cursor = next;
     }
     return std::optional<std::vector<std::byte>> {};
+}
+
+auto ReadTxn::ForEach(std::function<bool(BytesView key, BytesView value)> const& visit) const
+    -> std::expected<void, CowTreeError>
+{
+    if (_store == nullptr)
+        return std::unexpected(CowTreeError::NotOpen);
+
+    // Explicit stack rather than recursion: the depth is a function of the
+    // stored data, and a tree deep enough to overflow the call stack would take
+    // an administrative scan down with it rather than returning an error.
+    std::vector<PageId> pending;
+    if (_root)
+        pending.push_back(_root);
+
+    // A tree reaches each of its pages exactly once, so a walk that has read
+    // more pages than the store holds is following a cycle: a child pointer
+    // back into an ancestor. Per-page CRCs cannot catch that — every page
+    // around the loop is individually valid — so without a budget the walk
+    // spins until `pending` exhausts memory. O(1) rather than a visited set,
+    // which on a large store would cost more than the scan itself.
+    auto budget = _store->PageCount();
+
+    // Reused across pages so the walk does not allocate once per page. Each page
+    // is copied into it before `visit` runs, which is what lets a callback read
+    // elsewhere in the store without the page store's shared read buffer being
+    // pulled out from under the entry views (see the header).
+    std::vector<std::byte> page;
+
+    while (!pending.empty())
+    {
+        auto const id = pending.back();
+        pending.pop_back();
+
+        if (budget == 0)
+            return std::unexpected(CowTreeError::Corrupt);
+        --budget;
+
+        auto const view = _store->Read(id);
+        if (!view.has_value())
+            return std::unexpected(view.error());
+        page.assign(view->begin(), view->end());
+
+        auto const header = DecodePageHeader(page);
+        if (!header.has_value())
+            return std::unexpected(header.error());
+
+        if (header->type == PageType::Leaf)
+        {
+            auto const entries = DecodeLeafEntries(page, *header);
+            if (!entries.has_value())
+                return std::unexpected(entries.error());
+            for (auto const& e: *entries)
+                if (!visit(e.key, e.value))
+                    return {};
+            continue;
+        }
+
+        auto const entries = DecodeInternalEntries(page, *header);
+        if (!entries.has_value())
+            return std::unexpected(entries.error());
+
+        // Pushed in reverse so the LIFO stack pops them back in key order, which
+        // is what callers are promised. `firstChild` covers the keys below
+        // entries[0].key, so it goes on last and comes off first.
+        for (auto const& e: *entries | std::views::reverse)
+            if (e.child)
+                pending.push_back(e.child);
+        if (header->firstChild)
+            pending.push_back(header->firstChild);
+    }
+    return {};
 }
 
 // ============================================================================
