@@ -43,6 +43,24 @@ End of search list.
 # 1 "/dev/null"
 )";
 
+/// Real `cl --version` combined output, which is a REFUSAL that still names the
+/// compiler.
+///
+/// Captured rather than invented, and the distinction is the whole point of this
+/// fixture. `RunCaptureCombined` merges both streams into `out` and leaves `err`
+/// empty, so scripting `cl` with an empty `out` models a driver that prints
+/// NOTHING -- and the premise every MSVC identity rests on, that `cl` tells us
+/// nothing, would then be asserted by the fixture rather than tested. `cl` in fact
+/// prints its version line first and only then complains, so the banner IS in the
+/// buffer; what discards it is the exit code, which is what the test below pins.
+constexpr std::string_view ClVersionRefusal =
+    R"(Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for x64
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+cl : Command line warning D9002 : ignoring unknown option '--version'
+cl : Command line error D8003 : missing source filename
+)";
+
 [[nodiscard]] bool HasPath(std::vector<ToolchainFile> const& files, std::string_view relative)
 {
     return std::ranges::any_of(files, [&](ToolchainFile const& f) { return f.relativePath == relative; });
@@ -577,6 +595,58 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     CHECK(std::ranges::find(underPrompt, "C:/somewhere/else") == underPrompt.end());
 }
 
+TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]")
+{
+    // The other half of the guarantee, and the half nothing asserted. The case
+    // above pins that one toolchain reaches ONE digest however it was reached;
+    // this pins that two toolchains reach TWO -- "never two different ones",
+    // which is precisely what a banner-only MSVC fingerprint dropped and what the
+    // layout exists to restore. It was evidenced only by a measurement on one
+    // machine, so nothing would have caught its regression.
+    //
+    // Driven through the layout walk rather than the launcher's whole path, which
+    // the case above already covers. Each link here is tested on its own too --
+    // the walk yields per-toolset roots, the digest is content-sensitive -- so a
+    // reader had to compose them to believe the property the fleet depends on.
+    // Asserting it in one place is the point, not extra coverage of the links.
+    FastCache::Testing::ScratchDirectory machine { "fc-tcp-two-toolsets" };
+    ScriptedToolchainHost host;
+
+    // Real files, because `ProbeToolchainFiles` walks the filesystem rather than
+    // the scripted machine -- the scripted half only has to agree with it.
+    auto const describe = [&](std::string_view version, std::string_view stlUpdate) {
+        auto const toolset = "vs/VC/Tools/MSVC/" + std::string { version };
+        machine.Write(toolset + "/include/yvals_core.h", stlUpdate);
+        machine.Write(toolset + "/include/vector", "template <class T> struct vector {};");
+
+        auto const compiler = (machine / (toolset + "/bin/Hostx64/x64/cl.exe")).generic_string();
+        host.AddExecutable(compiler);
+        host.AddDirectory((machine / (toolset + "/include")).generic_string());
+        return compiler;
+    };
+
+    // Two toolsets differ in what their headers SAY -- `yvals_core.h` carries
+    // `_MSVC_STL_UPDATE` -- and that is what has to separate them, not the version
+    // in the path: `ProbeToolchainFiles` records every file relative to its own
+    // root, so that one toolchain at two install prefixes still matches.
+    auto const older = describe("14.29.30133", "#define _MSVC_STL_UPDATE 202008L\n");
+    auto const newer = describe("14.51.36231", "#define _MSVC_STL_UPDATE 202506L\n");
+
+    auto const digestOf = [&](std::string const& compiler) {
+        auto const roots = MsvcToolsetIncludeRoots(host, compiler);
+        REQUIRE_FALSE(roots.empty());
+        auto const files = ProbeToolchainFiles(roots);
+        // Not vacuous: two empty walks would digest equal and the check below would
+        // pass having compared nothing.
+        REQUIRE(files.size() == 2);
+        // "cl" for both, which is what the banner fallback gives every MSVC
+        // toolchain -- so the roots are the only thing that can tell these apart.
+        return ComputeToolchainFingerprint("cl", files);
+    };
+
+    CHECK(digestOf(older) != digestOf(newer));
+}
+
 TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[toolchain-probe]")
 {
     // A wrapper named cl.exe outside any VC layout -- ON A MACHINE THAT HAS AN SDK,
@@ -913,7 +983,14 @@ TEST_CASE("A banner falls back to a normalized name, not the spelling", "[toolch
     // computed different fingerprints, and the scheduler matched neither to the
     // other -- "no worker matches this toolchain", on a fleet where both ends were
     // pointed at the same compiler.
-    ScriptedRunner refuses { CompileRun { .exitCode = 2, .out = {}, .err = "unknown option" } };
+    // The refusal carries `cl`'s real version line, in `out`, where a combined
+    // capture puts it -- so this asserts the fallback is taken DESPITE a usable
+    // banner sitting in the buffer, rather than for want of one. That is the
+    // behaviour, and it is the reason relaxing the exit-code gate would be a
+    // change of policy rather than a tidy-up: it would re-key every MSVC
+    // fingerprint in a fleet, and a localized version line differs between two
+    // machines holding the same toolset.
+    ScriptedRunner refuses { CompileRun { .exitCode = 2, .out = std::string { ClVersionRefusal }, .err = {} } };
 
     auto const bare = CompilerBanner(refuses, "cl");
     auto const full = CompilerBanner(refuses, R"(C:\Program Files\MSVC\bin\cl.exe)");
