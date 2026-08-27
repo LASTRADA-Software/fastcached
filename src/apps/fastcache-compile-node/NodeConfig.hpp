@@ -427,6 +427,15 @@ struct NodeConfig
     bool daemon { false };           ///< Fork into the background / run under the SCM.
     bool installService { false };   ///< Register with the platform's supervisor and exit.
     bool uninstallService { false }; ///< Remove that registration and exit.
+
+    /// Convert the `--cache-dir` store to this build's on-disk record layout
+    /// and exit, instead of serving.
+    ///
+    /// Like `--install-service`, a mode rather than a serving option -- and,
+    /// like it, deliberately absent from `BuildServiceArgv`: a worker that
+    /// converted its store at every boot would replay one operator's decision
+    /// forever, on a store that after the first run has nothing left to convert.
+    bool migrateCache { false };
     bool help { false };
     bool version { false };
 

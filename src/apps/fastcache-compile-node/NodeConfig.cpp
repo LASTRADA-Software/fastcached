@@ -599,6 +599,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::uninstallService>(),
           .description = "remove that registration and exit" },
+        { .primary = "--migrate-cache",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::migrateCache>(),
+          .description = "convert the --cache-dir store to this build's on-disk\n"
+                         "record layout and exit, instead of serving. Run it\n"
+                         "with the worker STOPPED. Safe to re-run: a store\n"
+                         "already in this layout is left untouched, and a run\n"
+                         "that is interrupted resumes where it stopped" },
         { .primary = "--service-name",
           .arity = Arity::Value,
           .operand = "=<name>",

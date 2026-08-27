@@ -663,14 +663,18 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
         "--install-service",   // a service must never re-install itself
         "--uninstall-service", //
         "--service-scope",     // install-time only
-        "--seed-config",       // an installer step, not daemon state
-        "--daemon",            // emitted unconditionally, not from Config
-        "--healthcheck",       //
-        "--help",              //
-        "--version",           //
-        "--config",            // the operator's own assertion; see main.cpp
-        "--service-name",      // emitted unconditionally, above the table
-        "--pidfile",           // POSIX daemon-mode only, never registered
+        "--seed-config",
+        // Converting the store is a one-shot act, not state a daemon runs with.
+        // A registration carrying it would re-run the conversion at every boot,
+        // on a store that after the first run has nothing left to convert.
+        "--migrate-storage", // an installer step, not daemon state
+        "--daemon",          // emitted unconditionally, not from Config
+        "--healthcheck",     //
+        "--help",            //
+        "--version",         //
+        "--config",          // the operator's own assertion; see main.cpp
+        "--service-name",    // emitted unconditionally, above the table
+        "--pidfile",         // POSIX daemon-mode only, never registered
         // The one Config field with no safe representation in launch arguments:
         // a supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists

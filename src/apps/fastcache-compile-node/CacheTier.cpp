@@ -309,4 +309,22 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     return std::unique_ptr<CacheTier> {};
 }
 
+std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)
+{
+    if (cfg.cacheDir.empty())
+        return std::unexpected { std::string {
+            "--migrate-cache needs --cache-dir: a memory-only node has no on-disk store to convert" } };
+
+    auto const path = cfg.cacheDir / DiskStoreFileName;
+    CowTreeStorage::Options options;
+    options.path = path;
+    options.maxValueBytes = DiskMaxValueBytes;
+
+    auto const report = CowTreeStorage::Migrate(options);
+    auto line = DescribeMigration(path, report);
+    if (!report.has_value())
+        return std::unexpected { std::move(line) };
+    return line;
+}
+
 } // namespace FastCache::Node

@@ -107,6 +107,10 @@ max_memory: 4g
 storage_path: /var/lib/fastcached/cache
 ```
 
+A release that changes the on-disk record layout refuses an older store at
+startup rather than mis-reading it. It is not damaged, and it does not have to be
+thrown away — see [Upgrading a store](../operations/upgrading-a-store.md).
+
 Path-valued settings (`storage_path`, `tls_cert`, `tls_key`) understand `$VAR`
 and `${VAR}` environment references; write `$$` for a literal dollar. A
 reference to a variable that is not set is an error rather than an empty

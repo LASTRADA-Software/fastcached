@@ -323,6 +323,32 @@ struct StorageBackendBundle
     return std::make_unique<FastCache::LayeredStorage>(std::move(l1), std::move(*opened));
 }
 
+/// The store files a persistent configuration names, in shard order.
+///
+/// The one place that knows the layout, so nothing derives `shard-NN.cow` for
+/// itself.
+/// @param storagePath    The configured `--storage` path.
+/// @param physicalShards How many shards the configuration resolves to.
+/// @return One path per shard: the path itself when unsharded, else
+///         `shard-NN.cow` beneath it.
+[[nodiscard]] std::vector<std::filesystem::path> StorageShardPaths(std::string const& storagePath,
+                                                                   std::size_t physicalShards)
+{
+    if (physicalShards <= 1)
+        return { std::filesystem::path { storagePath } };
+
+    // Built by hand rather than with `std::ranges::to`, which clang 22 over
+    // libstdc++ 14 rejects here ("deduced return type cannot be used before it
+    // is defined") -- and which nothing else in this tree uses, so the one
+    // caller is not worth the portability.
+    std::filesystem::path const dir { storagePath };
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(physicalShards);
+    for (auto const i: std::views::iota(std::size_t { 0 }, physicalShards))
+        paths.push_back(dir / std::format("shard-{:02d}.cow", i));
+    return paths;
+}
+
 /// Construct the multi-shard inner storages for a ShardedStorage
 /// wrapper. Handles three shapes: in-memory fan-out, single-file
 /// persistent, and multi-file persistent (directory of shard-NN.cow).
@@ -362,9 +388,8 @@ struct StorageBackendBundle
                                            ec.message(),
                                            StorageAccessHint(effective)));
 
-    for (std::size_t i = 0; i < physicalShards; ++i)
+    for (auto const& path: StorageShardPaths(effective.storagePath, physicalShards))
     {
-        auto const path = dir / std::format("shard-{:02d}.cow", i);
         auto layered = BuildLayeredShard(path, effective, perShardBytes, perShardDiskBytes);
         if (!layered.has_value())
             return std::unexpected(std::format(
@@ -422,6 +447,109 @@ struct StorageBackendBundle
             "failed to open storage '{}': {}{}", effective.storagePath, layered.error(), StorageAccessHint(effective)));
     bundle.backend = std::move(*layered);
     return bundle;
+}
+
+/// The store files that actually exist under a configured `--storage` path.
+///
+/// Deliberately an enumeration rather than `StorageShardPaths`: that one answers
+/// "which files will this configuration open", which depends on a shard count
+/// the daemon derives from the CPU count when the operator did not name one. A
+/// conversion has to cover every file the daemon could open on ANY future start,
+/// and the set on disk is exactly that.
+/// @param storagePath The configured `--storage` path.
+/// @return The store files, or why there are none to convert.
+[[nodiscard]] std::expected<std::vector<std::filesystem::path>, std::string> ExistingStorePaths(
+    std::string const& storagePath)
+{
+    std::filesystem::path const configured { storagePath };
+    std::error_code ec;
+
+    if (std::filesystem::is_regular_file(configured, ec))
+        return std::vector<std::filesystem::path> { configured };
+    if (!std::filesystem::is_directory(configured, ec))
+        return std::unexpected(
+            std::format("no store at '{}': it is neither a store file nor a directory of shards", configured.string()));
+
+    // Incremented explicitly with an error_code. A range-for over
+    // `directory_iterator` advances through the THROWING `operator++`, so an
+    // entry vanishing mid-scan or a subdirectory that cannot be read would
+    // terminate the process instead of reporting "cannot list".
+    std::vector<std::filesystem::path> shards;
+    auto entry = std::filesystem::directory_iterator { configured, ec };
+    auto const end = std::filesystem::directory_iterator {};
+    for (; !ec && entry != end; entry.increment(ec))
+    {
+        auto const name = entry->path().filename().string();
+        if (name.starts_with("shard-") && name.ends_with(".cow"))
+            shards.push_back(entry->path());
+    }
+    if (ec)
+        return std::unexpected(std::format("cannot list '{}': {}", configured.string(), ec.message()));
+    if (shards.empty())
+        return std::unexpected(std::format("no shard-NN.cow files under '{}'", configured.string()));
+
+    // Sorted so the report reads in shard order rather than in whatever order
+    // the filesystem hands them back.
+    std::ranges::sort(shards);
+    return shards;
+}
+
+/// Convert every store the configuration names to this build's record layout.
+///
+/// Acts on the EFFECTIVE configuration rather than on a path of its own, so it
+/// converts exactly the files `BuildShardedInners` would open -- including the
+/// directory-of-shards shape, which a `--migrate-storage=<path>` taking one
+/// path could not express without the operator knowing the naming scheme.
+///
+/// Reports per shard rather than in total. An operator whose fleet has one bad
+/// shard needs to know which one, and a summary line saying "4 stores, 0
+/// converted" hides the case where three were converted and the fourth was
+/// refused.
+/// @param effective The merged configuration.
+/// @return Process exit code.
+[[nodiscard]] int MigrateConfiguredStorage(FastCache::Config const& effective)
+{
+    if (effective.storagePath.empty())
+    {
+        std::println(std::cerr,
+                     "fastcached: --migrate-storage needs --storage: there is no on-disk store to convert "
+                     "in a memory-only configuration");
+        return EXIT_FAILURE;
+    }
+
+    // What is ON DISK, not what the shard formula predicts. With no explicit
+    // --storage-shards the daemon derives the count from the CPU count, so a
+    // conversion run inside a CPU-limited container -- or after the machine was
+    // resized -- would walk a different set than the daemon opens, exit zero,
+    // and leave the daemon still refusing to start on the shard it missed. That
+    // is precisely the failure this command exists to end, so it enumerates
+    // rather than predicts: every `shard-NN.cow` present is converted, whatever
+    // count the daemon resolves to next time.
+    auto const paths = ExistingStorePaths(effective.storagePath);
+    if (!paths.has_value())
+    {
+        std::println(std::cerr, "fastcached: {}", paths.error());
+        return EXIT_FAILURE;
+    }
+
+    auto failures = 0;
+    for (auto const& path: *paths)
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.path = path;
+        opts.maxValueBytes = effective.storageMaxValueBytes;
+
+        auto const report = FastCache::CowTreeStorage::Migrate(opts);
+        auto const line = FastCache::DescribeMigration(path, report);
+        if (!report.has_value())
+        {
+            std::println(std::cerr, "fastcached: {}", line);
+            ++failures;
+            continue;
+        }
+        std::println("fastcached: {}", line);
+    }
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
@@ -899,6 +1027,7 @@ int main(int argc, char const* const* argv)
         case FastCache::CliOutcome::InstallService:
         case FastCache::CliOutcome::UninstallService:
         case FastCache::CliOutcome::HealthCheck:
+        case FastCache::CliOutcome::MigrateStorage:
             // These all need the effective config assembled below; they branch
             // apart afterwards.
             break;
@@ -944,7 +1073,12 @@ int main(int argc, char const* const* argv)
             // recovery the operator reached for, and fails a container health
             // check whose daemon was started with explicit flags and is serving
             // perfectly well.
-            if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run)
+            // ...and for the conversion, which acts on the merged `storage_path`:
+            // proceeding on a config this run could not read would convert a
+            // different set of files than the daemon opens, or none at all, and
+            // report success either way.
+            if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run
+                || parsed->outcome == FastCache::CliOutcome::MigrateStorage)
             {
                 std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
                 return EXIT_FAILURE;
@@ -978,6 +1112,16 @@ int main(int argc, char const* const* argv)
     if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
         if (auto const envPort = MetricsPortFromEnv())
             effective.metricsPort = *envPort;
+
+    // Converting the store acts on the files and exits; it never runs the daemon
+    // body. BEFORE the serving-shape checks below, and after the merge because it
+    // is the MERGED --storage it acts on: a store of the wrong vintage is what
+    // stops the daemon starting, so demanding the operator first fix an unrelated
+    // `--listen`/`--notify-keyspace-events` typo would be refusing to let them
+    // repair the thing that is actually broken. The node's `--migrate-cache`
+    // sits early for the same reason.
+    if (parsed->outcome == FastCache::CliOutcome::MigrateStorage)
+        return MigrateConfiguredStorage(effective);
 
     // Reject shapes that would silently drop user-typed values: combining the
     // legacy single-bind triplet (`--bind / --port / --tls` OR YAML

@@ -579,4 +579,21 @@ class CowTreeStorage final: public IStorage
     mutable StorageStats _stats;
 };
 
+/// One line telling an operator what a conversion did to one store.
+///
+/// Both binaries that expose the conversion print the same sentence, so it is
+/// written once. Two copies of an operator-facing string diverge the first time
+/// either is improved, and an operator running `fastcache-compile-node
+/// --migrate-cache` after `fastcached --migrate-storage` should not have to work
+/// out whether two differently-worded lines mean the same thing.
+///
+/// Takes the whole outcome rather than a report, because the failure line is
+/// half of what has to be said and the callers differ only in which stream they
+/// send it to.
+/// @param path    The store the conversion acted on.
+/// @param outcome What `CowTreeStorage::Migrate` returned for it.
+/// @return The line, without a trailing newline and without a program prefix.
+[[nodiscard]] std::string DescribeMigration(std::filesystem::path const& path,
+                                            std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome);
+
 } // namespace FastCache

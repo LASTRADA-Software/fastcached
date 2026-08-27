@@ -554,3 +554,36 @@ if(SCCACHE)
 else()
     message(STATUS "sccache not found — skipping sccache smoke tests")
 endif()
+
+# ---------------------------------------------------------------------------
+# migrate-storage-e2e: `fastcached --migrate-storage` over both storage shapes.
+#
+# What it covers that the unit tests cannot: `MigrateConfiguredStorage` and
+# `StorageShardPaths` live in `main.cpp`, which is in no test target -- and the
+# property that actually decides whether the feature works for an operator is
+# that the flag enumerates the SAME files the daemon opens. A conversion walking
+# a different set would exit zero and leave the daemon still refusing to start on
+# the store it missed.
+if(NOT TARGET fastcached)
+    message(STATUS "migrate-storage-e2e: daemon not built — skipping")
+elseif(WIN32)
+    # POSIX-only fixture, the way `fleet-dashboard-e2e` records for itself: it is
+    # bash and `mktemp`, and a PowerShell twin would be a translation rather than
+    # new coverage. The paths under test are covered on Windows by the manual
+    # check recorded in the pull request.
+    message(STATUS "migrate-storage-e2e: POSIX-only fixture — skipping on Windows")
+else()
+    add_test(
+        NAME "migrate-storage-e2e"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/migrate-storage-e2e.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+    )
+    # Starts a real daemon to create the stores, so it must not race the other
+    # server-starting smoke tests.
+    set_tests_properties("migrate-storage-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+    )
+endif()

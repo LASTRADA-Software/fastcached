@@ -246,6 +246,11 @@ B+tree:
 | `--cache-memory=0 --cache-dir=…` | Disk only. |
 | `--cache-memory=0` and no `--cache-dir` | **No tier at all**, which is what a node that only compiles for others wants. |
 
+A release that changes the on-disk record layout refuses an older `--cache-dir`
+store at startup rather than mis-reading it. Convert it with
+`fastcache-compile-node --migrate-cache --cache-dir=…`, with the worker stopped;
+see [Upgrading a store](../operations/upgrading-a-store.md).
+
 `--cache-memory` takes bytes (`k`/`m`/`g` = KiB/MiB/GiB, or a bare count with an
 optional `B`) or a share of host RAM (`N%`) — the vocabulary its own default is
 stated in, so "a quarter, but half of that" is `--cache-memory=12%` rather than

@@ -249,8 +249,9 @@ namespace
     {
         return MakeError(StorageErrorCode::UnsupportedFormatVersion,
                          std::format("an interrupted conversion left this store part-way from on-disk storage "
-                                     "format version {} to {}: re-run the conversion to finish it, which resumes "
-                                     "where it stopped. The store is intact and does not need to be deleted.",
+                                     "format version {} to {}: re-run `fastcached --migrate-storage` (or "
+                                     "`fastcache-compile-node --migrate-cache`) to finish it, which resumes where "
+                                     "it stopped. The store is intact and does not need to be deleted.",
                                      fromVersion,
                                      CowTreeStorage::CurrentFormatVersion));
     }
@@ -522,7 +523,8 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
 
     auto store = CowTree::FilePageStore::Open(pageOpts);
     if (!store.has_value())
-        return std::unexpected(TranslateError(store.error(), "FilePageStore::Open"));
+        return std::unexpected(
+            TranslateError(store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
 
     // Opening had to assume a page size in order to know where the second meta
     // slot even is, and the file gets to overrule that. When it does, the slot
@@ -537,7 +539,8 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         store->reset();
         store = CowTree::FilePageStore::Open(pageOpts);
         if (!store.has_value())
-            return std::unexpected(TranslateError(store.error(), "FilePageStore::Open"));
+            return std::unexpected(TranslateError(
+                store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error()))));
     }
     return MigrateStore(**store);
 }
@@ -1856,6 +1859,27 @@ void CowTreeStorage::Resize(std::size_t newMaxBytes)
     _options.maxBytes = newMaxBytes;
     _stats.bytesLimit = newMaxBytes;
     EvictToFit();
+}
+
+std::string DescribeMigration(std::filesystem::path const& path,
+                              std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome)
+{
+    if (!outcome.has_value())
+        // The code as well as the context: several failure paths carry only the
+        // label of the step that failed, and "CowTree::Open" on its own tells an
+        // operator nothing about which kind of problem to go looking for.
+        return std::format("{}: {}: {}", path.string(), ToStringView(outcome.error().code), outcome.error().context);
+
+    if (outcome->fromVersion == outcome->toVersion)
+        return std::format(
+            "{}: already at on-disk storage format version {}; nothing to do", path.string(), outcome->toVersion);
+
+    return std::format("{}: converted {} record(s) from on-disk storage format version {} to {}{}",
+                       path.string(),
+                       outcome->recordsConverted,
+                       outcome->fromVersion,
+                       outcome->toVersion,
+                       outcome->resumed ? " (resumed an interrupted conversion)" : "");
 }
 
 } // namespace FastCache

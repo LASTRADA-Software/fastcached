@@ -182,4 +182,16 @@ class CacheTier
     IMetricsSink& metrics,
     ILogger& logger);
 
+/// Convert the on-disk half of the tier to this build's record layout, and say
+/// what happened.
+///
+/// Lives here rather than in `main.cpp` because WHERE the store is, is this
+/// file's knowledge: the tier decides that `--cache-dir` names a directory and
+/// the store is one file inside it. A conversion that reconstructed that path
+/// for itself would be a second place to change it, and would convert nothing
+/// on the day the first one moved.
+/// @param cfg The parsed configuration; `cacheDir` must not be empty.
+/// @return A line to print on success, or the reason it could not be done.
+[[nodiscard]] std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg);
+
 } // namespace FastCache::Node
