@@ -44,31 +44,45 @@ place.
 should know how.
 
 **The rule: `expired` fires when the entry is *reclaimed*, not when its TTL
-lapses.** Everything below follows from that, and the two backends reclaim
-at different moments.
+lapses.** Everything below follows from that.
 
-- **There is no active expiry cycle.** redis samples keys on a timer and
-  expires them in the background. Nothing here sweeps periodically, so a
-  lapsed entry sits until something reaches it.
+- **An active expiry cycle sweeps on a timer**, so a key that lapses and is
+  never touched again is still reclaimed and still reported — redis's `hz` is
+  the analogue. It runs every `active_expiry_interval_ms` milliseconds (`1000`
+  by default), examines `active_expiry_scan` entries per shard per sweep
+  (`512`), and resumes where the last sweep stopped rather than restarting at
+  the front, so its cost per cycle is fixed rather than proportional to how
+  much is cached.
+  It backs off towards 30s while it finds nothing and returns to the base
+  interval the moment it does.
+
+  **The delay is therefore bounded, not zero.** An `expired` event for an
+  untouched key arrives at the next sweep that reaches it, which on a cache
+  larger than one scan budget is several cycles rather than one. Setting
+  `active_expiry_interval_ms: 0` (or `--expiry-interval=0`) turns the cycle
+  off and leaves expiry purely access-driven, which is what the daemon did
+  before it had one.
+
+  `fastcached_expiry_cycles_total` is flat when the cycle is disabled or
+  wedged — which otherwise looks exactly like nothing having expired — and
+  `fastcached_expiry_keys_reclaimed_total` counts what it found.
+
 - **A plain `SET` over a lapsed key does not fire `expired`.** It overwrites
   the record without looking up the old one, so nothing is reclaimed — you
-  get `set` and nothing else. The verbs that *do* reclaim are the ones that
-  must find the key first: `DEL`, `EXPIRE`/`PERSIST`, `APPEND`,
-  `INCR`/`DECR`, `REPLACE`, `GETSET`, and a CAS.
+  get `set` and nothing else. The verbs that *do* reclaim on the spot are the
+  ones that must find the key first: `DEL`, `ADD`, `EXPIRE`/`PERSIST`,
+  `APPEND`, `INCR`/`DECR`, `REPLACE`, `GETSET`, and a CAS.
 - **With the default `Approximate` LRU recency, a read does not reclaim
   either.** The in-memory read path is deliberately non-mutating so reads on
   one shard run concurrently, so a `GET` of a lapsed key returns a miss and
-  leaves the entry in place. `--lru-recency strict` reclaims on reads too, at
-  the cost of serialising them per shard.
-- **The persistent backend (`--storage`) reclaims later still.** Its read and
-  write paths reject a lapsed record without erasing it — a read holds only a
-  shared lock, and mutating the tree there would break the single-writer
-  contract — so on disk only `DEL` and the (uncalled) sweep reclaim. Expect
-  `expired` to be rarer under `--storage` than in memory for the same
-  workload.
-- **The practical consequence:** a key that lapses and is never touched again
-  is never reported. If you subscribe to `__keyevent@0__:expired` to learn
-  that a key is gone, poll it; do not read silence as "still alive".
+  leaves the entry for the sweep. `--lru-recency strict` reclaims on reads
+  too, at the cost of serialising them per shard.
+- **The persistent backend (`--storage`) reclaims on a read later than in
+  memory.** `GET` and a meta no-op probe reject a lapsed record without
+  erasing it: a read holds only a shared lock, and mutating the tree there
+  would break the single-writer contract. Every *write* verb does erase and
+  report, exactly as the in-memory tier does, so the difference is confined to
+  reads and is bounded by one sweep.
 - **`evicted` is immediate in memory and absent on disk.** In-memory eviction
   happens during the write that caused the memory pressure, so the event goes
   out with it. Under `--storage` no `evicted` event is emitted at all: that

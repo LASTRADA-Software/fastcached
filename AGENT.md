@@ -241,6 +241,20 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   names the same key twice, and the wrong order tells a subscriber a live key is gone.
 - In a layered cache no single tier's eviction is total, so none is reported. An
   expiry is, because both tiers hold the same TTL.
+- A reclaimer nothing constructs is the bug it was written to fix: `PurgeExpired`
+  was correct and tested, and had no production caller at all. Assert the wiring.
+- The expiry cycle sweeps `engine.Storage()` — the notifying decorator. One layer
+  down it frees the bytes and publishes nothing, and every tier test still passes.
+- One cycle per daemon, on reactor 0; its reclaim ceiling sits below
+  `ReclaimLog::DefaultCapacity` or the sweep drops the events it runs to produce.
+- A bounded sweep resumes from a cursor and `ShardedStorage` rotates its starting
+  shard, or everything past the first budget never expires. That cursor outlives
+  the call, so a tier gets exactly one erase point.
+- `--expiry-interval=0` disables the cycle (a coroutine that *ends*);
+  `--expiry-scan=0` is `PurgeBudget`'s spelling of *no ceiling* and is refused.
+- On disk a read may not reclaim and a write must: `Get`/`Peek` can hold a shared
+  lock, every write verb holds the exclusive one. Reporting without erasing is
+  worse than neither — the record stays and fires `expired` again.
 
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
