@@ -29,6 +29,8 @@
 # suite needs no suppression and no serialization. It also means no lcov and no
 # genhtml: `llvm-cov show` renders the HTML itself.
 
+include(ProjectTargets)
+
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
 
 if(NOT ENABLE_COVERAGE)
@@ -194,45 +196,13 @@ message(STATUS "[Coverage] Clang ${COVERAGE_CLANG_MAJOR} source-based instrument
 add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
 add_link_options(-fprofile-instr-generate)
 
-# Collect the executables defined under src/, so `llvm-cov` is handed every
-# binary the suite runs. Derived from the build system rather than listed here:
-# a new app under src/apps/ is a new row in that directory's app table and
-# nothing else, and a hand-kept list is how a binary silently stops being
-# measured.
-#
-# The subdirectory walk is filtered to src/ because CPM adds each dependency's
-# source tree as a subdirectory too, and those carry executables (Catch2's own
-# self-tests, for one) that were never instrumented -- llvm-cov fails outright on
-# an object with no coverage mapping. Compared with string(FIND) rather than a
-# regex: a checkout path is arbitrary text, and this repository routinely has
-# worktrees with a `+` in the name.
-function(_fastcached_collect_executables DIR OUT_VAR)
-    set(found "")
-
-    get_property(targets DIRECTORY "${DIR}" PROPERTY BUILDSYSTEM_TARGETS)
-    foreach(target IN LISTS targets)
-        get_target_property(type ${target} TYPE)
-        if(type STREQUAL "EXECUTABLE")
-            list(APPEND found ${target})
-        endif()
-    endforeach()
-
-    get_property(subdirectories DIRECTORY "${DIR}" PROPERTY SUBDIRECTORIES)
-    foreach(subdirectory IN LISTS subdirectories)
-        string(FIND "${subdirectory}" "${CMAKE_SOURCE_DIR}/src" position)
-        if(position EQUAL 0)
-            _fastcached_collect_executables("${subdirectory}" nested)
-            list(APPEND found ${nested})
-        endif()
-    endforeach()
-
-    set(${OUT_VAR} "${found}" PARENT_SCOPE)
-endfunction()
-
-# Call once, after every add_subdirectory() -- the walk above reads the build
-# system as it stands, so a target added later is a target left out.
+# Call once, after every add_subdirectory() -- fastcached_collect_executables()
+# reads the build system as it stands, so a target added later is a target left
+# out of the report. The walk itself lives in cmake/ProjectTargets.cmake, shared
+# with cmake/Utf8CodePage.cmake, which needs the same list for the same reason:
+# both are wrong in silence when it is incomplete.
 function(fastcached_add_coverage_targets)
-    _fastcached_collect_executables("${CMAKE_SOURCE_DIR}" executables)
+    fastcached_collect_executables("${CMAKE_SOURCE_DIR}" executables)
 
     if(NOT executables)
         message(FATAL_ERROR
