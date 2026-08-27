@@ -19,6 +19,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -646,6 +647,106 @@ TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[
     CHECK(reparsed->raftPeers == cfg.raftPeers);
 }
 
+TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before it is installed", "[node][consensus][policy]")
+{
+    // #168. `ConsensusTier::Start` refuses this, and the install path returns long
+    // before any tier is built -- so the registration was written, reported
+    // installed, and then exited `ExitUsage` at every boot with nobody watching.
+    // It is a pure function of the command line, like every startup rule, so it is
+    // one now.
+    auto const shapes = std::to_array<std::pair<char const*, NodeConfig>>({
+        { "no --raft-peer at all",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n1";
+              return cfg;
+          }() },
+        { "peers that name somebody else",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n1";
+              cfg.raftPeers = { Peer("n2=10.0.0.2:6680"), Peer("n3=10.0.0.3:6680") };
+              return cfg;
+          }() },
+        { "a joiner that named the cluster and not itself",
+          [] {
+              auto cfg = Installable();
+              cfg.nodeId = "n4";
+              cfg.raftJoin = true;
+              cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+              return cfg;
+          }() },
+    });
+
+    for (auto const& [what, cfg]: shapes)
+    {
+        INFO(what);
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--raft-peer"));
+
+        // And through the install path, which is the half #166 closed everywhere
+        // else and this one reached around.
+        auto const install = NodeInstallRejection(cfg);
+        REQUIRE(install.has_value());
+        CHECK(Unwrap(install).contains("--raft-peer"));
+    }
+
+    // The tier says the same thing in the same words, because it asks the same
+    // predicate. A `NodeConfig` built by hand reaches it without a parser or a
+    // policy table in between, and must not hear a second opinion.
+    CHECK(Unwrap(StartupPolicyRejection(shapes[0].second)) == NodeIdNamesNoPeerRefusal);
+
+    // A node that names itself is accepted, bootstrapping or joining.
+    auto bootstrapping = Installable();
+    bootstrapping.nodeId = "n1";
+    bootstrapping.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+    CHECK_FALSE(StartupPolicyRejection(bootstrapping).has_value());
+}
+
+TEST_CASE("NodeConfig: the --raft-join rules keep the more specific answer", "[node][consensus][policy]")
+{
+    // The new row must not make either of them dead: both describe a joiner more
+    // precisely than "names no --raft-peer" does, and both come first.
+    NodeConfig noIdentity;
+    noIdentity.raftJoin = true;
+    noIdentity.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(noIdentity)).contains("--raft-join needs --node-id"));
+
+    NodeConfig noPeers;
+    noPeers.raftJoin = true;
+    noPeers.nodeId = "n4";
+    CHECK(Unwrap(StartupPolicyRejection(noPeers)).contains("--raft-join needs --raft-peer"));
+}
+
+TEST_CASE("NodeConfig: consensus flags with no --node-id are refused rather than ignored", "[node][consensus][policy]")
+{
+    // `StartConsensusOrExplain` returns a null tier when `--node-id` is empty, so
+    // these flags are read by nobody: nothing binds, nothing dials, and nothing
+    // anywhere says the operator's cluster was not configured. That is the silent
+    // no-op this table already refuses for `--cluster-key-file` without
+    // `--discovery` and `--dashboard-token-file` without `--dashboard`.
+    auto listening = Installable();
+    listening.raftListen = "6680";
+    listening.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK(Unwrap(StartupPolicyRejection(listening)).contains("--node-id"));
+    CHECK(NodeInstallRejection(listening).has_value());
+
+    auto peered = Installable();
+    peered.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(peered)).contains("--node-id"));
+
+    // `--cluster-dir` is deliberately NOT one of them: `FleetHistoryPath` reads it
+    // for the dashboard's history file, so a node with no consensus at all still
+    // has a use for it. Refusing it here would refuse a working configuration.
+    auto history = Installable();
+    history.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    CHECK_FALSE(StartupPolicyRejection(history).has_value());
+
+    // And the ordinary single-machine worker, which configures none of this.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
 TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[node][service]")
 {
     // A system-scope worker runs as an unprivileged account and root created these
@@ -852,9 +953,14 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     // handed a unicast. Kernel-chosen by default -- the value nobody has to pick
     // -- and pinned only where a host firewall opens named ports and would
     // otherwise drop every challenge and proof.
+    // It names itself in `--raft-peer`, which every node with a `--node-id` does --
+    // discovery finds the OTHERS, and this node's own address is the half only it
+    // knows. Without it the startup table refuses the whole command line before
+    // reaching anything this case is about.
     auto const base = std::vector<char const*> { "--scheduler=s:1",
                                                  "--toolchain=/usr/bin/cc",
                                                  "--node-id=n1",
+                                                 "--raft-peer=n1=10.0.0.1:6680",
                                                  "--cluster-key-file=cluster.key",
                                                  "--discovery=255.255.255.255:6681" };
 

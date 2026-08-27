@@ -205,16 +205,17 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // for election forever against a cluster that has never heard of it, which from
     // the outside is a node that simply never becomes ready.
     //
-    // The grammar is not re-checked here: `--raft-peer` is parsed by the option
-    // table, so `cfg.raftPeers` holds members or the command line was refused
-    // where it was typed (#168).
+    // Neither half is decided here any more. The grammar belongs to the option
+    // table, so `cfg.raftPeers` holds members or the command line was refused where
+    // it was typed; and the rule below is `StartupPolicyRejection`'s, asked through
+    // its predicate and answered in its words. That table is what makes an operator
+    // hear it while they are watching -- an install consults it too -- and this is
+    // the same answer arriving for a `NodeConfig` nobody parsed from an argv (#168).
     auto const& members = cfg.raftPeers;
 
-    auto const self = std::ranges::find(members, cfg.nodeId, &Cluster::ClusterMember::id);
-    if (self == members.end())
-        return std::unexpected { std::format("--node-id={} names no --raft-peer; this node must name the endpoint its "
-                                             "peers dial, whether it bootstraps a cluster or joins one",
-                                             cfg.nodeId) };
+    auto const* const self = ClusterSelfMember(cfg);
+    if (self == nullptr)
+        return std::unexpected { std::string { NodeIdNamesNoPeerRefusal } };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the

@@ -7,6 +7,7 @@
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -899,6 +901,12 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
+Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
+{
+    auto const self = std::ranges::find(cfg.raftPeers, cfg.nodeId, &Cluster::ClusterMember::id);
+    return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
+}
+
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 {
     // A table, so a new rule is a new row rather than another `if` in main().
@@ -975,6 +983,23 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--raft-join needs --raft-peer: at least this node's own address, which is the half only it "
                      "knows, and normally the cluster's as well. A joiner cannot answer the leader that admits it "
                      "without one, and it cannot learn any address until it has answered." },
+        // After the two `--raft-join` rows, which say the same thing about a joiner
+        // more precisely: first match wins, so putting this one ahead of them would
+        // answer in their place and leave both stating a rule nothing reaches.
+        // `ConsensusTier::Start` decided this from inside the tier, which the install
+        // path returns long before reaching -- so a registration naming no reachable
+        // self was written happily and then died at every boot (#168).
+        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && ClusterSelfMember(c) == nullptr; },
+          .message = NodeIdNamesNoPeerRefusal },
+        // The other half of the same flag group: consensus configured with the
+        // switch that turns it on left off. `--cluster-dir` is deliberately NOT
+        // here -- `FleetHistoryPath` reads it for the dashboard's history file, so
+        // a node running no consensus still has a use for it.
+        { .refuses = [](NodeConfig const& c) { return c.nodeId.empty() && (!c.raftListen.empty() || !c.raftPeers.empty()); },
+          .message = "--listen-raft and --raft-peer configure consensus, and --node-id is what turns consensus ON: "
+                     "without one this node runs none, so the port is never bound and the peers are never dialled. "
+                     "Nothing would say so, which is the silent no-op this list exists to refuse. Give --node-id, "
+                     "or drop them." },
         { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
           .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
                      "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "

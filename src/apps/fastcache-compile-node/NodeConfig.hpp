@@ -536,6 +536,31 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
+/// Why a `--node-id` that names no `--raft-peer` cannot work.
+///
+/// A named constant rather than prose written into the policy row it fills, because
+/// `ConsensusTier::Start` answers with **this** string. The invariant is decided by
+/// the startup table -- which is what makes an operator hear it while they are
+/// watching -- and the tier is that same answer arriving at the boot of a
+/// `NodeConfig` nobody parsed from an argv. Two spellings of one rule is what this
+/// codebase's table idiom exists to prevent.
+inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
+    "--node-id names no --raft-peer: this node must name the endpoint its peers dial, whether it bootstraps a "
+    "cluster or joins one. Consensus refuses to start without it, so this worker would exit at every boot.";
+
+/// The `--raft-peer` entry `--node-id` names, if the list names it at all.
+///
+/// The predicate behind `NodeIdNamesNoPeerRefusal`, shared for the reason that
+/// constant is: the startup table asks it for a verdict and `ConsensusTier::Start`
+/// asks it for the member itself, and a rule asked two ways is one that drifts.
+///
+/// Answers for the list as typed, so a node with no `--node-id` at all names no
+/// member -- which is not a refusal on its own: an empty id means this node runs no
+/// consensus, and the table's own row is what decides whether that is a mistake.
+/// @param cfg The parsed configuration.
+/// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
+[[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
+
 /// Why this worker's configuration cannot work, if it cannot.
 ///
 /// A *startup* rule rather than an install-time one, and the split is deliberate:
