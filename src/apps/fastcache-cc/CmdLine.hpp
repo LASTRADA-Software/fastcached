@@ -70,6 +70,35 @@ enum class IncludeDiscovery : std::uint8_t
     /// Read the `INCLUDE` environment variable, which is where an MSVC toolchain
     /// puts its search list and the only place `cl` reads it from.
     MsvcEnvironment = 2,
+    /// Derive an MSVC toolchain's search list from the machine's INSTALL LAYOUT --
+    /// the compiler's own path for the VC headers, the registry for the Windows
+    /// SDK's -- falling back to `INCLUDE` when the layout cannot be determined.
+    ///
+    /// This exists because `INCLUDE` is set per shell by `vcvarsall`, and a
+    /// **Windows service does not inherit it**. `MsvcEnvironment` therefore
+    /// returns nothing under the SCM, `ProbeToolchainFiles` walks nothing, and --
+    /// since `cl` has no `--version` and falls back to its normalized basename --
+    /// an MSVC worker started as a service fingerprints as a digest of the string
+    /// `cl` and nothing else. That is the SAME digest on every MSVC toolset in
+    /// existence: the false match `ToolchainFingerprint.hpp` exists to prevent,
+    /// and the one that yields a silently wrong object rather than a stale path a
+    /// replay guard can probe.
+    ///
+    /// The layout is tried FIRST and the environment only as a fallback, which is
+    /// the whole of why this is not merely "read INCLUDE, then guess". Preferring
+    /// `INCLUDE` where it is set would make a developer prompt and a service
+    /// disagree the moment the two root sets differ by one directory -- and a
+    /// fingerprint disagreement is invisible from both ends, presenting only as a
+    /// scheduler that never matches. Layout-first means both derive the same roots
+    /// wherever the layout is derivable at all.
+    ///
+    /// `Flavor::ClangCl` deliberately does NOT use this. Its banner is a genuine
+    /// version string, so a service run degrades it to a banner-only fingerprint
+    /// rather than collapsing every version onto one digest; and locating the VC
+    /// headers for a driver that does not live inside the VC layout needs
+    /// `vswhere`, which is a process spawn on the launcher's per-translation-unit
+    /// hot path. See https://github.com/LASTRADA-Software/fastcached/issues/145.
+    MsvcLayout = 3,
 };
 
 /// True when two family sets overlap.
@@ -368,6 +397,19 @@ struct ParsedCommand
 /// @param compiler argv[0] as invoked.
 /// @return The matching flavor, or `Flavor::Unknown`.
 [[nodiscard]] Flavor ClassifyCompiler(std::string_view compiler);
+
+/// A compiler's basename, lowered and stripped of `.exe`.
+///
+/// Here rather than beside its callers because THREE questions are answered from
+/// it and they must not disagree: which driver this is (`ClassifyCompiler`),
+/// whether it compiles everything as C++, and -- when a driver answers no
+/// `--version` -- what to call it in a fingerprint. `CL.EXE`, `cl` and
+/// `C:/.../cl.exe` are one compiler, and a second spelling of "what do we call it"
+/// is a second chance for a launcher and a worker to part company silently.
+///
+/// @param compiler argv[0] as invoked, bare name or path.
+/// @return Its normalized basename.
+[[nodiscard]] std::string NormalizedCompilerName(std::string_view compiler);
 
 [[nodiscard]] DriverSpec const& DriverOf(Flavor flavor);
 

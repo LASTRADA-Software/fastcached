@@ -70,7 +70,23 @@ Checks: >-
   -readability-redundant-parentheses
 WarningsAsErrors: "*"
 UseColor: true
-HeaderFilterRegex: '.*/fastcached/src/.*'
+# Which headers findings are reported for. Everything else is discarded as
+# "non-user code" -- SILENTLY, with only a `Suppressed NNN warnings` line to show
+# for it, which is why this pattern being slightly wrong is expensive rather than
+# annoying.
+#
+# It must match a checkout whatever it is CALLED. CI clones to
+# `.../fastcached/fastcached/src/...`, but a git worktree is not named after the
+# repository: `fastcached-wt-139/src/...` and `.../worktrees/<name>/src/...` are
+# both ordinary, and neither matched a pattern anchored on the literal directory
+# name `fastcached`. The result was a local clang-tidy that checked no headers at
+# all and reported clean -- which has now sent two branches to CI with header
+# findings a local run had called clean.
+#
+# It must NOT match dependencies, which carry no `.clang-tidy` of their own and
+# would bury real findings: `_deps/catch2-src/src/...` is the shape to keep out,
+# and it is kept out because `catch2-src` does not begin with `fastcached`.
+HeaderFilterRegex: '.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
 FormatStyle:     none
 CheckOptions:
   # 60 is generous (LLVM default is 25) but matches the natural complexity

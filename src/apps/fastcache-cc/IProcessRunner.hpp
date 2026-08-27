@@ -25,6 +25,13 @@ struct CompileRun
 /// on Windows, fork/exec + pipes on POSIX), so it is reached through this
 /// interface: the launcher's caching logic stays platform-free, and tests
 /// drive it with a scripted fake instead of a real toolchain.
+///
+/// **Implementations must tolerate concurrent calls.** Argv in, `CompileRun` out,
+/// with nothing kept between calls -- which is what both platform implementations
+/// already are, holding no members at all. Requiring it here is what lets a caller
+/// with several things to identify at once (the compile node, fingerprinting every
+/// toolchain on a machine at startup) share the ONE runner it was handed, instead of
+/// quietly manufacturing its own and stepping around the seam its tests depend on.
 class IProcessRunner
 {
   public:

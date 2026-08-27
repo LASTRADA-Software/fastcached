@@ -108,14 +108,21 @@ compile. So the client preprocesses a second time for dispatch.
 ### 4. The worker compiles it — with a compiler *it* chose
 
 The job names a fingerprint, **never a program**. The worker maps that
-fingerprint to a compiler from its own `--toolchain` configuration and refuses
-one it does not have.
+fingerprint to a compiler it serves and refuses one it does not have.
+
+Which compilers those are is a fact the worker establishes for itself: it surveys
+the machine at startup, so a package install is the whole setup. `--toolchain`
+narrows that set rather than supplying it.
 
 This is the difference between a build accelerator and a remote shell, and it is
-why there is deliberately no default compiler. The worker also re-checks the
-argument list, because the client's check protects an honest client from
-dispatching something that would not work, while the worker's protects it from a
-client that is not honest.
+why there is still deliberately no default *compiler*. "No default" and "no
+discovery" are different claims — a default is how a job ends up running
+against something nobody chose, while which compilers a machine holds is simply
+a fact.
+
+The worker also re-checks the argument list, because the client's check protects
+an honest client from dispatching something that would not work, while the
+worker's protects it from a client that is not honest.
 
 ### 5. The client writes the object, reproduces the dependency record, and stores
 
@@ -153,7 +160,8 @@ tells you what to fix instead of failing mysteriously.
 
 Note that the scheduler also registers as a worker. Every node is a peer; being
 the one that schedules is a role, not a different program. If you do not want it
-taking work, give it a `--toolchain` nothing in your fleet compiles with.
+taking work, pass `--no-toolchain-discovery` together with a `--toolchain`
+nothing in your fleet compiles with.
 
 #### Who may use the fleet
 
@@ -177,10 +185,21 @@ On each machine that should take work:
 ```sh
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
-    --advertise=worker-01.internal:6676 \
-    --toolchain=/usr/bin/g++ \
-    --toolchain=/usr/bin/clang++
+    --advertise=worker-01.internal:6676
 ```
+
+That is the whole of it. The worker surveys the machine at startup and serves
+every compiler it finds, naming each one and the layout it came from:
+
+```
+[INFO] found /usr/bin/g++ (usr)
+[INFO] found /usr/bin/clang++ (usr)
+[INFO] discovered 2 toolchain(s) on this machine; pass --toolchain to serve a narrower set
+```
+
+Add `--toolchain=<compiler>` to serve a **narrower** set — a build farm pinned to
+a curated toolchain — or `--no-toolchain-discovery` to stop the survey entirely.
+Naming any `--toolchain` pins the worker to exactly those.
 
 On Linux the package ships a socket-activated unit; put the arguments in
 `/etc/fastcached/compile-node.env` and enable the **socket**:

@@ -3,6 +3,8 @@
 
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -111,6 +113,45 @@ class ScratchDirectory
     [[nodiscard]] std::filesystem::path operator/(std::string_view relative) const
     {
         return _path / std::filesystem::path { relative };
+    }
+
+    /// Create a file inside this directory, parent directories and all.
+    ///
+    /// Here rather than in each test file that wants a tree to walk: the copies
+    /// this replaced each re-derived the same "make the parents, then open" pair,
+    /// and a fixture that silently fails to create a parent produces a test that
+    /// passes by finding nothing.
+    ///
+    /// **Throws on failure**, which is the point rather than an afterthought. A
+    /// fixture that silently fails to create what a case is about to look for
+    /// produces a test that passes by finding nothing -- and a `Write` that
+    /// discarded its `error_code` would be that fixture. Catch2 reports the throw
+    /// as a failure of the case that made it, which is where it belongs.
+    ///
+    /// Returns nothing, and `operator/` is how a case names what it just wrote.
+    /// Const, because writing into a directory does not change which directory this
+    /// object stands for -- and a const method handing back a value it computed
+    /// would then owe a `[[nodiscard]]`, which most callers here would have to cast
+    /// away. The path is one `operator/` away for the few that want it.
+    ///
+    /// @param relative Path relative to this directory.
+    /// @param contents What to write; an empty string still creates the file.
+    void Write(std::string_view relative, std::string_view contents = {}) const
+    {
+        auto const target = *this / relative;
+        auto error = std::error_code {};
+        std::filesystem::create_directories(target.parent_path(), error);
+        if (error)
+            throw std::runtime_error { std::format(
+                "scratch: cannot create {}: {}", target.parent_path().string(), error.message()) };
+
+        std::ofstream out { target, std::ios::binary };
+        out << contents;
+        // Flushed and checked here rather than left to the destructor, whose failure
+        // nothing observes.
+        out.close();
+        if (!out)
+            throw std::runtime_error { std::format("scratch: cannot write {}", target.string()) };
     }
 
   private:

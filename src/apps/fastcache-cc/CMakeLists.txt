@@ -12,7 +12,12 @@
 # Cli/UsageDoc.cpp is what makes `fastcache-cc --help` render and colorize
 # exactly like `fastcached --help`; Platform/Terminal.cpp decides whether to,
 # and Platform/Environment.cpp is the one place the environment is read, so the
-# launcher no longer needs its own copy of that dance.
+# launcher no longer needs its own copy of that dance. Platform/Registry.cpp is
+# there for the same reason one layer over: locating an MSVC toolchain without an
+# inherited `INCLUDE` means reading the Windows SDK's installed roots, and a
+# second copy of the two-call size dance and the WOW64 view is a second chance to
+# get either wrong. It compiles to nothing on POSIX, so it costs that build a
+# translation unit and no dependency.
 #
 # Note what is NOT here: Core/Crc32c.cpp. It was carried for the cache key, and
 # the key no longer uses it -- Core/MurmurHash3.hpp replaced the four salted
@@ -43,6 +48,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ThreadedAddressResolver.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Registry.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
 # The Net rows are the launcher's TCP client -- the blocking pair it dials with,
@@ -126,6 +132,7 @@ set(_fc_cc_sources
     RootReconciler.cpp
     Stats.cpp
     ToolchainFingerprint.cpp
+    ToolchainHost.cpp
     ToolchainProbe.cpp
     ProcessRunner.cpp
     WorkerProtocol.cpp)
@@ -244,7 +251,15 @@ if(FASTCACHED_BUILD_TESTS)
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
         Stats_test.cpp
+        # Discovery is the compile NODE's, not the launcher's -- `fastcache-cc`
+        # never surveys a machine, it is handed a compiler. The source is listed
+        # here for its tests and in `_fc_node_shared` for its one real consumer,
+        # rather than in `_fc_cc_sources`, so the shipped launcher does not carry a
+        # layout table and a vswhere parser it cannot reach.
+        ToolchainDiscovery.cpp
+        ToolchainDiscovery_test.cpp
         ToolchainFingerprint_test.cpp
+        ToolchainHost_test.cpp
         ToolchainProbe_test.cpp
         WorkerProtocol_test.cpp
         ${_fc_cc_core}

@@ -88,15 +88,58 @@ name an address other machines can reach.
 
 ## Toolchains
 
+**A worker surveys this machine at startup and serves what it finds.** Nothing has
+to be typed:
+
 ```sh
---toolchain=/usr/bin/g++          # this node computes the fingerprint
---toolchain=<fingerprint>=/usr/bin/g++   # or pin it explicitly
+fastcache-compile-node --scheduler=... --advertise=...
 ```
 
+```
+[INFO] found /usr/bin/g++ (usr)
+[INFO] found /usr/bin/clang++ (usr)
+[INFO] serving /usr/bin/g++ as 4f2c...
+[INFO] discovered 2 toolchain(s) on this machine; pass --toolchain to serve a narrower set
+```
+
+`--toolchain` is an **override** that narrows that set:
+
+```sh
+--toolchain=/usr/bin/g++                 # this node computes the fingerprint
+--toolchain=<fingerprint>=/usr/bin/g++   # or pin it explicitly
+--no-toolchain-discovery                 # do not survey the machine at all
+```
+
+Naming any `--toolchain` pins the worker to exactly those; naming none means
+"serve what this machine has". The two are never merged, because a merged set
+would quietly re-add a compiler you had deliberately narrowed away.
+
 A job names a **fingerprint, never a program**. The worker maps that fingerprint
-to a compiler from its own configuration and refuses one it does not have — which
-is the difference between a build accelerator and a remote shell, and is why
-there is deliberately no default compiler.
+to a compiler it serves and refuses one it does not have — which is the difference
+between a build accelerator and a remote shell, and is why there is still no
+default *compiler*. "No default" and "no discovery" are different claims: a
+default is how a job ends up running against something nobody chose, while which
+compilers a machine holds is a fact the worker can establish.
+
+A compiler that is found but **cannot be executed** is dropped at startup, named,
+with the layout that found it — rather than registering and failing every job it
+is sent. So is one whose fingerprint would say nothing about which compiler it
+is: a driver that answers no `--version` *and* whose include tree could not be
+located digests to its own basename, which every install of that compiler on
+earth would also produce. Pin such a toolchain with
+`--toolchain=<fingerprint>=<compiler>` if you want it served anyway. A worker
+that ends up with nothing to serve refuses to start and prints where it looked.
+
+### Where it looks
+
+| Layout | Where |
+|---|---|
+| `visual-studio` | `vswhere`, then every toolset under `VC\Tools\MSVC` |
+| `llvm-registry`, `llvm-program-files` | `HKLM\SOFTWARE\LLVM\LLVM`, `%ProgramFiles%\LLVM` |
+| `msys2`, `mingw-w64` | `C:\msys64\{ucrt64,mingw64,clang64}`, `C:\mingw64` |
+| `usr-local`, `usr` | `/usr/local/bin`, `/usr/bin` — version suffixes included (`g++-13`) |
+| `macports`, `homebrew` | `/opt/local/bin`, `/opt/homebrew/bin` |
+| `xcode` | `xcrun --find` |
 
 The fingerprint is a digest of the compiler's version banner **and its whole
 include tree**, so two machines with the same compiler at different install
@@ -581,7 +624,8 @@ The package ships a socket-activated unit. Enable the **socket**, not the
 service:
 
 ```sh
-sudoedit /etc/fastcached/compile-node.env     # scheduler, advertise, toolchains
+sudoedit /etc/fastcached/compile-node.env     # scheduler and advertise; the
+                                              # compilers are discovered
 sudo systemctl enable --now fastcache-compile-node.socket
 ```
 
@@ -604,9 +648,11 @@ replaced on upgrade.
 fastcache-compile-node --install-service \
     --scheduler=cache.internal:6675 \
     --advertise=worker-01.internal:6676 \
-    --toolchain=/usr/bin/c++ \
     --service-scope=user            # macOS: registers a launchd agent for you
 ```
+
+No `--toolchain` is needed: the registered service surveys the machine at every
+start, which is also why a toolchain *upgrade* no longer means re-registering.
 
 Every other flag on that command line is **baked into the registration** and
 reused at every start, so this is also where a wrong one is expensive. Three
@@ -616,7 +662,7 @@ things are therefore refused at install time rather than at the next boot:
 |---|---|
 | `--advertise` | Without it the registration bakes in `{--bind}:{--port}`, and the default `0.0.0.0` is not an address a client can dial. Such a worker registers, heartbeats, is leased out, and is never reached — with no error at either end. |
 | `--scheduler` | The service would start and exit at every boot. |
-| `--toolchain` | The worker would register and then refuse every job sent to it. |
+| `--toolchain` *(only with `--no-toolchain-discovery`)* | With both, the worker has nothing to serve: it would register and then refuse every job sent to it. Without the flag the machine answers at boot, so a registration needs no toolchain at all. |
 
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a
@@ -662,6 +708,19 @@ is granted to that account at install time; the grant is reported if it fails an
 the registration is kept, so you can repair it with `icacls` rather than being
 left with nothing. If you rename the service with `--service-name`, the account
 follows the new name.
+
+The MSI can do that registration for you, given the two things an installer
+cannot guess:
+
+```
+msiexec /i fastcached.msi ^
+    FASTCACHE_NODE_SCHEDULER=build-cache.internal:6675 ^
+    FASTCACHE_NODE_ADVERTISE=worker-01.internal:6676
+```
+
+Both are required together or nothing is registered: a registration naming a
+scheduler and no advertised endpoint bakes in `0.0.0.0`, and that worker is
+leased out and never reached.
 
 Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install

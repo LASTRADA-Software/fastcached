@@ -132,11 +132,28 @@ export FASTCACHE_VERBOSE=1
 # here right now". Racy in principle; the test is RUN_SERIAL and the range is
 # wide, and the alternative — four hard-coded ports — races with every other
 # smoke test in the suite rather than only with itself.
+#
+# Ports already handed out THIS RUN are remembered and skipped. Without that, the
+# only question asked is "is anything listening", and nothing is listening on a
+# port issued a moment ago whose server has not bound yet -- so two calls could
+# return the same number and the second process to start died with
+# `bind(...) failed: 98`. This fixture draws every port it needs before binding
+# any of them, which is exactly the window that makes it reachable: rare enough
+# to read as an unrelated flake, and it did.
+#
+# The ledger is a FILE rather than a variable because every call site is a command
+# substitution, and a subshell's assignment is gone the moment it exits -- which
+# is how a first attempt at this fixed nothing at all. It lives under `workdir`,
+# so the existing cleanup takes it away.
 free_port() {
-    local port
+    local port ledger="${workdir}/.issued-ports"
     for _ in $(seq 1 200); do
         port=$(( 20000 + RANDOM % 20000 ))
+        if grep -qx "$port" "$ledger" 2>/dev/null; then
+            continue
+        fi
         if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+            echo "$port" >> "$ledger"
             echo "$port"
             return 0
         fi

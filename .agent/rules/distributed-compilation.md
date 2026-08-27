@@ -514,3 +514,114 @@ and silent, because the two clocks agree about nothing. Subtracting inside the
 registry means the answer comes from the clock it was injected with; it clamps at
 zero, because a manual clock can legitimately be set backwards and an unsigned
 duration would otherwise read as several hundred million years.
+
+**A worker discovers the machine's compilers; `--toolchain` narrows that, and does
+not supply it.** `--toolchain` was required and had no default, which meant
+`packaging/` shipped a worker that could not start: the Linux unit reads an env file
+whose every line is commented out, so the service starts, refuses and exits, and the
+Windows MSI registered no node at all. The reversal rests on a distinction that is
+easy to lose — **"no default compiler" and "no discovery" are different claims**. A
+default is how a job ends up running against something nobody chose; which compilers
+a machine holds is a *fact*, and it is the half of the configuration that has to be
+redone after every toolchain upgrade. Seven rules under it, each already a defect
+caught in review:
+
+- **Discovery adds CANDIDATES and must not add a second way to identify one.** The
+  flavour comes from `Cc::ClassifyCompiler` and the fingerprint from
+  `CachedToolchainFingerprint`, unchanged — a worker that derived either differently
+  from its clients registers, heartbeats, and is never matched, with nothing anywhere
+  reporting why.
+- **A discovered path never goes back through the operator's grammar.**
+  `SplitToolchain` reserves the first `=`, which is right for something a person
+  typed and wrong for a path this process found itself: `/opt/gcc=13/bin/gcc` would
+  register the fingerprint `/opt/gcc`, and a leading or trailing `=` would abort
+  startup as "malformed --toolchain", naming a flag nobody passed.
+- **The operator's list wins whole; the two are never merged.** A merged set would
+  quietly re-add a compiler an operator had deliberately narrowed away, which is the
+  entire reason a build farm names its toolchains.
+- **A found compiler that cannot be spawned is not a toolchain.** That is the
+  `SpawnFailed` refusal a client otherwise meets at job time, moved to startup where
+  an operator can see it. An operator-NAMED one is not probed — the
+  `<fingerprint>=<compiler>` override exists precisely for a compiler this process
+  cannot execute.
+- **An empty resolved set refuses startup, and the message names where it looked.**
+  Left to run, such a worker registers nothing, heartbeats "0 of 0 toolchain(s)
+  registered" as a complete success, and prints a ready line: a healthy unit, a green
+  fleet, and every build compiling locally with no error at either end. The search
+  list comes off `ToolchainLayouts()` rather than a list written by hand, which is
+  maintained by the same person who forgot to add the row.
+- **One location has one spelling, or one machine registers twice.** A root arrives
+  spelled however its source spells it — the registry writes `C:\Program Files\LLVM`,
+  an environment variable writes `C:\Program Files`, a table row writes `C:/msys64` —
+  so the same `clang.exe` reached through two rows came back as two strings.
+  `WorkerRegistry` keys on `(fingerprint, endpoint)`, so that is the double-counting a
+  fleet view then has to render. Separators are collapsed on every host, case only on
+  Windows; a scripted host cannot catch it, because it normalizes on the way in.
+- **A fingerprint that names no compiler is refused, not registered**
+  ([#140](https://github.com/LASTRADA-Software/fastcached/issues/140)). A driver that
+  answers no `--version` falls back to a digest of its own basename, and discovery of
+  its include tree is best-effort by construction; a toolchain that hits both at once
+  digests to a value this repository could print with nothing installed, and that
+  every MSVC toolset in existence produces. `ToolchainProbe.hpp` permits a
+  banner-only fingerprint on the argument that it "can only cause two
+  genuinely-identical toolchains to be treated as identical" — true, with an unstated
+  precondition that the banner is a real version string. Check the precondition where
+  both halves are known. An operator-pinned identity is never judged this way; it is
+  the escape hatch for exactly the compiler this process cannot interrogate.
+- **`cc` and `gcc` stay two candidates.** Usually one binary under two names, and they
+  fingerprint *differently*, because a GNU driver prints its own `argv[0]` in the
+  banner its clients hash. Collapsing them looks like tidiness and costs the fleet
+  every `cc` build.
+
+**Only the native MSVC target variant is offered, and only what the filesystem
+confirms.** Every target variant of one toolset — x64, x86, arm64 — shares an include
+tree and, because `cl` has no `--version`, a banner of the normalized basename, so
+all of them fingerprint identically: offering them all registers one machine several
+times under one identity. Two neighbouring rules for the same reason: `vswhere` is
+asked without `-requires`, because filtering on `...VC.Tools.x86.x64` is a false
+negative on exactly the ARM64-only host the arm64 bin path exists for — an install
+with no C++ toolset simply has nothing beneath its `versionRoot`; and nothing is
+spawned to learn what the filesystem already said, so `vswhere` runs only when its
+installer directory is present and the Xcode row (which asks once *per compiler
+name*) only when `xcrun` is on the search path.
+
+**A cold start fingerprints several toolchains at once, and reports them in table
+order.** A cold walk is seconds per toolchain and a surveyed machine routinely holds
+four or five; sequentially that is a node sitting silent for half a minute before it
+reaches its scheduler, on the one start where an operator is watching. Bounded rather
+than one thread each, because every one of them is a recursive directory walk hashing
+what it finds. Results are collected positionally — the "serving" lines are where two
+machines' digests get compared, so a log ordered by which thread finished first would
+be a poor place to do it. The pool is joined **explicitly** before the return: locals
+are destroyed after the return value is constructed, so leaving it to scope exit
+copies the results while the workers are still writing into them.
+
+**The workers share the ONE injected runner, and `IProcessRunner` requires that.**
+Making a runner per thread reads like a courtesy to the seam and is the opposite of
+one: a function whose caller passed an `IProcessRunner&` and that calls
+`MakeProcessRunner()` anyway spawns real compilers no test can script, and every case
+that believed it was driving a fake was quietly interrogating whatever the machine it
+ran on happened to have installed — five of them passed for that reason and failed
+the moment the hole was closed. If concurrency needs something of a seam, say so in
+the seam.
+
+## Open work
+
+- **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
+  discovered compiler is spawned twice at startup with the same argv, once to learn
+  it can be spawned and once for its banner, and the first is in a serial loop in
+  front of the pool built to hide exactly that. `CompilerBanner` knows both facts
+  and reports neither, so two callers reconstruct what it discarded.
+- **[#146](https://github.com/LASTRADA-Software/fastcached/issues/146)** — the MSVC
+  bindir a layout row searches is chosen by `#if` on the architecture this binary was
+  COMPILED for, so an x64 build on an ARM64 Windows host never offers that machine's
+  native toolset. Moving the fact onto `IToolchainHost` costs the row its
+  `constexpr` span, and it is only fully correct once a fingerprint can tell one
+  toolset's target variants apart -- which today it cannot, since they share an
+  include tree and a fallback banner and therefore digest identically.
+- **[#145](https://github.com/LASTRADA-Software/fastcached/issues/145)** — `clang-cl`
+  still takes its include roots from `INCLUDE`, so a launcher in a developer prompt
+  and a worker running as a service compute different fingerprints and never match.
+  Unlike `cl` it degrades to a banner-only identity rather than collapsing every
+  version onto one digest, and moving it needs `vswhere` on the launcher's
+  per-translation-unit hot path — which is a decision, not a detail.

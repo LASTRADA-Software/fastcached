@@ -145,13 +145,25 @@ readable and silently ignored. Every rule below has already been one of them.
   is the one worth naming: left empty it bakes in `{--bind}:{--port}`, and `--bind`
   defaults to `0.0.0.0`, which is not an address a client can dial. Such a worker
   registers, heartbeats happily, is leased out by the scheduler, and is never
-  reached. `--scheduler` and `--toolchain` get the same treatment because each
-  would start and exit at every boot. Two related choices: an **uninstall** is not
-  gated the same way -- refusing to remove a registration because it was
-  misconfigured is how a bad one becomes permanent -- and a bare compiler path is
-  **not** resolved to a fingerprint at install time, because the worker derives that
-  at startup through the identical code its clients use and a digest computed once
-  would pin the registration to a toolchain an update then changes underneath it.
+  reached. `--scheduler` gets the same treatment because it would start and exit at
+  every boot.
+
+  `--toolchain` used to, and **no longer does** -- the reversal is the whole of
+  [#139](https://github.com/LASTRADA-Software/fastcached/issues/139). Registering a
+  worker before anybody knows what a machine holds is precisely what makes
+  installing the package the entire setup; the node surveys the machine at boot and
+  answers the question itself. What still cannot work is `--no-toolchain-discovery`
+  with nothing named, and that shape alone is refused. The flag therefore has to
+  survive the round trip into the registration: it changes what the service DOES at
+  every boot, so losing it would leave the worker quietly serving compilers the
+  operator excluded, with nothing saying the registration had changed meaning.
+
+  Two related choices: an **uninstall** is not gated the same way -- refusing to
+  remove a registration because it was misconfigured is how a bad one becomes
+  permanent -- and a bare compiler path is **not** resolved to a fingerprint at
+  install time, because the worker derives that at startup through the identical
+  code its clients use and a digest computed once would pin the registration to a
+  toolchain an update then changes underneath it.
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing

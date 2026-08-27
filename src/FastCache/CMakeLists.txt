@@ -82,6 +82,7 @@ target_sources(FastCache
         Platform/HostMemory.cpp
         Platform/InheritedListener.cpp
         Platform/PosixDaemonHost.cpp
+        Platform/Registry.cpp
         Platform/ServiceControl.cpp
         Platform/Terminal.cpp
         Platform/WindowsServiceHost.cpp

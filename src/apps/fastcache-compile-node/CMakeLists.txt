@@ -28,7 +28,9 @@ set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/EndpointDial.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ProcessRunner.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Stats.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainDiscovery.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainFingerprint.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainHost.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainProbe.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/WorkerProtocol.cpp")
 
@@ -43,6 +45,7 @@ add_executable(fastcache-compile-node
     SchedulerTier.cpp
     LocalCache.cpp
     NodeConfig.cpp
+    NodeToolchains.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
     NodeIoLoop.cpp
@@ -88,6 +91,8 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream.cpp
         NodeConfig.cpp
         NodeConfig_test.cpp
+        NodeToolchains.cpp
+        NodeToolchains_test.cpp
         FrameEndpoint.cpp
         NodeIoLoop.cpp
         FrameEndpoint_test.cpp

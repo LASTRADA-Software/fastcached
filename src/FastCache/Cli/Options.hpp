@@ -226,17 +226,6 @@ template <auto Field, auto Parse>
     };
 }
 
-/// An applier for a valueless switch: sets `Field` to true.
-/// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
-template <auto Field>
-[[nodiscard]] constexpr auto SetTrue() noexcept
-{
-    return [](auto& result, std::string_view) -> std::expected<void, ConfigError> {
-        TargetOf<Field>(result) = true;
-        return {};
-    };
-}
-
 /// An applier that stores a fixed value in `Field` — how a flag selects what
 /// the process will do instead of its default action.
 /// @return The applier, usable as an OptionSpec::select in a `constexpr` table.
@@ -247,6 +236,35 @@ template <auto Field, auto Value>
         TargetOf<Field>(result) = Value;
         return {};
     };
+}
+
+/// An applier for a valueless switch: sets `Field` to true.
+///
+/// Named rather than spelled `SelectOutcome<Field, true>()` at each call site,
+/// because a table of flags reads better when the common case has a name — but it
+/// IS that, rather than a second copy of it. `apply` and `select` are the same type
+/// (`ApplyFlag<Result>`), so there was never a reason for two bodies.
+///
+/// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+template <auto Field>
+[[nodiscard]] constexpr auto SetTrue() noexcept
+{
+    return SelectOutcome<Field, true>();
+}
+
+/// An applier for a valueless switch that turns something OFF: sets `Field` to
+/// false.
+///
+/// The counterpart to `SetTrue`, for the flag whose default is on. Spelling the
+/// field positively and clearing it here is what keeps the double negative out of
+/// the config struct — `toolchainDiscovery = false` reads, `noToolchainDiscovery =
+/// true` has to be decoded at every use.
+///
+/// @return The applier, usable as an OptionSpec::apply in a `constexpr` table.
+template <auto Field>
+[[nodiscard]] constexpr auto SetFalse() noexcept
+{
+    return SelectOutcome<Field, false>();
 }
 
 /// The identity parser, for flags whose value is taken verbatim.

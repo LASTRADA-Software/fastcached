@@ -15,10 +15,13 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <ranges>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -215,6 +218,106 @@ namespace
     /// The environment variable an MSVC toolchain publishes its search list in.
     constexpr std::string_view MsvcIncludeVariable = "INCLUDE";
 
+    /// The registry key recording which Windows SDKs are installed and where.
+    constexpr std::string_view InstalledRootsKey = R"(SOFTWARE\Microsoft\Windows Kits\Installed Roots)";
+
+    /// The value naming the Windows 10/11 SDK's install prefix.
+    constexpr std::string_view KitsRootValue = "KitsRoot10";
+
+    /// The directory name a `VC\Tools\MSVC\<version>` toolset sits directly under.
+    ///
+    /// Matched case-insensitively, and this is what locates the toolset root
+    /// instead of counting directory levels: `bin\Hostx64\x64` is three levels but
+    /// a cross-targeting `bin\Hostx64\arm64` toolset is the same depth today and
+    /// there is nothing promising it stays that way.
+    constexpr std::string_view MsvcToolsetParent = "msvc";
+
+    /// How far above the compiler the toolset root may be.
+    ///
+    /// Four is the real depth (`<ver>/bin/Host<a>/<b>/cl.exe`); six leaves room for
+    /// a layout with one more level without letting the walk escape into
+    /// `C:\Program Files` and match something that merely happens to be called
+    /// MSVC.
+    constexpr int MaxToolsetAncestors = 6;
+
+    /// The include directories a Windows SDK kit is made of, in the order
+    /// `vcvarsall` lists them in `INCLUDE`.
+    ///
+    /// A table so the next one the SDK grows is a row. The order does not reach the
+    /// fingerprint -- that sorts -- but it is what an operator compares against
+    /// their own `INCLUDE` when a fingerprint disagrees.
+    constexpr std::array<std::string_view, 5> WindowsKitIncludeSubdirectories {
+        "ucrt", "um", "shared", "winrt", "cppwinrt"
+    };
+
+    /// The VC include directories relative to a toolset root, in `INCLUDE` order.
+    constexpr std::array<std::string_view, 2> MsvcToolsetIncludeSubdirectories { "include", "atlmfc/include" };
+
+    /// Where the shared VS headers live, relative to the Visual Studio root.
+    ///
+    /// Present in a developer prompt's `INCLUDE` and easy to miss: leaving it out
+    /// would make the layout-derived root set differ from the environment-derived
+    /// one by exactly one directory, and a fingerprint that differs by one
+    /// directory matches nothing while looking entirely reasonable.
+    constexpr std::string_view VisualStudioSharedInclude = "VC/Auxiliary/VS/include";
+
+    /// Order two dotted versions by their numeric components.
+    ///
+    /// Numerically rather than lexicographically, because the SDK's own numbering
+    /// makes the difference load-bearing: `10.0.9` sorts ABOVE `10.0.22621.0` as
+    /// text, so a string compare picks a kit years out of date and derives the
+    /// fingerprint from headers the compiler will not use.
+    ///
+    /// @param left One version.
+    /// @param right The other.
+    /// @return True when @p left is older than @p right.
+    [[nodiscard]] bool VersionLess(std::string_view left, std::string_view right)
+    {
+        auto next = [](std::string_view& text) -> unsigned long long {
+            auto const dot = text.find('.');
+            auto const head = text.substr(0, dot);
+            text = dot == std::string_view::npos ? std::string_view {} : text.substr(dot + 1);
+            unsigned long long value = 0;
+            std::from_chars(head.data(), head.data() + head.size(), value);
+            return value;
+        };
+
+        while (!left.empty() || !right.empty())
+        {
+            auto const leftPart = next(left);
+            auto const rightPart = next(right);
+            if (leftPart != rightPart)
+                return leftPart < rightPart;
+        }
+        return false;
+    }
+
+    /// Append @p relative to @p root when the directory is really there.
+    /// @param host The machine's filesystem.
+    /// @param roots Where to append.
+    /// @param root The prefix.
+    /// @param relative What to hang under it.
+    void AppendIfDirectory(IToolchainHost& host,
+                           std::vector<std::string>& roots,
+                           std::string_view root,
+                           std::string_view relative)
+    {
+        auto joined = JoinPath(root, relative);
+        if (host.DirectoryExists(joined))
+            roots.push_back(std::move(joined));
+    }
+
+    /// The `INCLUDE` variable's search paths, read through the injected host.
+    /// @param host The machine's environment.
+    /// @return The search paths, in order; empty when the variable is unset.
+    [[nodiscard]] std::vector<std::string> IncludeEnvironmentRoots(IToolchainHost& host)
+    {
+        auto const value = host.Environment(MsvcIncludeVariable);
+        if (!value.has_value())
+            return {};
+        return ParseIncludeEnvironment(*value);
+    }
+
     /// Schema tag for the validity stamp.
     ///
     /// Separate from `FingerprintSchema`, because the two version different
@@ -370,15 +473,114 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     //
     // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
     // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.
-    auto const slash = compiler.find_last_of("/\\");
-    auto base = slash == std::string::npos ? compiler : compiler.substr(slash + 1);
-    std::ranges::transform(base, base.begin(), [](char c) { return PathCanon::AsciiLower(c); });
-    if (base.ends_with(".exe"))
-        base.resize(base.size() - 4);
-    return base;
+    return NormalizedCompilerName(compiler);
 }
 
-std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
+bool LooksLikeVersion(std::string_view name) noexcept
+{
+    return !name.empty() && std::ranges::any_of(name, [](char c) { return c >= '0' && c <= '9'; })
+           && std::ranges::all_of(name, [](char c) { return (c >= '0' && c <= '9') || c == '.'; });
+}
+
+std::vector<std::string> MsvcToolsetIncludeRoots(IToolchainHost& host, std::string const& compiler)
+{
+    // Resolved first, so a bare `cl` from a build system and an absolute path from
+    // a worker's configuration reach the same layout -- the rule the whole feature
+    // turns on, since a disagreement here is a fingerprint disagreement and those
+    // are invisible from both ends.
+    auto const resolved = host.ResolveOnSearchPath(compiler);
+    if (!resolved.has_value())
+        return {};
+
+    // Walk up looking for the `MSVC/<version>` pair rather than counting levels;
+    // `directory` starts at the compiler itself so its first parent is the bindir.
+    std::filesystem::path directory { *resolved };
+    std::filesystem::path toolset;
+    for ([[maybe_unused]] auto const level: std::views::iota(0, MaxToolsetAncestors))
+    {
+        auto const parent = directory.parent_path();
+        if (parent.empty() || parent == directory)
+            break;
+        if (PathCanon::AsciiLower(parent.parent_path().filename().string()) == MsvcToolsetParent)
+        {
+            toolset = parent;
+            break;
+        }
+        directory = parent;
+    }
+    if (toolset.empty())
+        return {};
+
+    // `include` is what makes this a toolset rather than a directory that happens
+    // to sit under one called MSVC -- and without it there is nothing to fingerprint
+    // anyway, so falling back to `INCLUDE` is strictly better than half an answer.
+    auto const toolsetRoot = toolset.generic_string();
+    if (!host.DirectoryExists(JoinPath(toolsetRoot, MsvcToolsetIncludeSubdirectories.front())))
+        return {};
+
+    std::vector<std::string> roots;
+    for (auto const& relative: MsvcToolsetIncludeSubdirectories)
+        AppendIfDirectory(host, roots, toolsetRoot, relative);
+
+    // `<vs>/VC/Auxiliary/VS/include` -- four levels above the toolset root, which
+    // is `<vs>/VC/Tools/MSVC/<version>`.
+    auto const visualStudioRoot = toolset.parent_path().parent_path().parent_path().parent_path();
+    if (!visualStudioRoot.empty())
+        AppendIfDirectory(host, roots, visualStudioRoot.generic_string(), VisualStudioSharedInclude);
+
+    return roots;
+}
+
+std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
+{
+    // The 32-bit view first and the native one as a fallback: `Installed Roots` is
+    // written by a 32-bit installer, so it lands in `WOW6432Node` and a native read
+    // from this 64-bit process finds nothing at all -- silently, as a kit the
+    // machine has that discovery never sees.
+    auto kitsRoot =
+        host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::ThirtyTwoBit);
+    if (!kitsRoot.has_value())
+        kitsRoot = host.RegistryString(RegistryHive::LocalMachine, InstalledRootsKey, KitsRootValue, RegistryView::Native);
+    if (!kitsRoot.has_value() || kitsRoot->empty())
+        return {};
+
+    auto const includeRoot = JoinPath(*kitsRoot, "Include");
+
+    // The DIRECTORIES are the source, and the registry's value names are
+    // deliberately not consulted -- which is a correction, not a shortcut.
+    //
+    // They were, on the reasoning that some machines record each kit as a
+    // version-named value while others (this one included) record `KitsRoot10` and
+    // two hundred GUIDs. But a candidate only survives if `<Include>/<version>`
+    // exists as a directory, and `ListDirectories` already returns every such
+    // directory -- so a registry-sourced name could never contribute one the listing
+    // had not. It was two `RegQueryInfoKey` sweeps of ~200 value names each, per
+    // translation unit on the launcher's dispatch path, that could not change the
+    // answer.
+    //
+    // What the registry WOULD be good for is the opposite question -- telling an
+    // installed kit from a directory an uninstall left behind -- and that would mean
+    // treating its names as authoritative when it lists any, not unioning them in.
+    // That changes which kit is chosen on such a machine, and therefore the
+    // fingerprint, so it is not a change to make in passing.
+    std::string best;
+    for (auto const& candidate: host.ListDirectories(includeRoot))
+        if (LooksLikeVersion(candidate) && (best.empty() || VersionLess(best, candidate)))
+            best = candidate;
+    if (best.empty())
+        return {};
+
+    auto const versionRoot = JoinPath(includeRoot, best);
+    std::vector<std::string> roots;
+    for (auto const& subdirectory: WindowsKitIncludeSubdirectories)
+        AppendIfDirectory(host, roots, versionRoot, subdirectory);
+    return roots;
+}
+
+std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
+                                              IToolchainHost& host,
+                                              std::string const& compiler,
+                                              DriverSpec const& spec)
 {
     // No `default:`, so a mechanism added to the table fails to compile here
     // rather than silently returning nothing -- which would present as a
@@ -407,11 +609,31 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner, std::strin
             return ParseGnuIncludeSearchPaths(run.err);
         }
 
-        case IncludeDiscovery::MsvcEnvironment: {
-            auto const value = ReadEnvironmentVariable(std::string { MsvcIncludeVariable });
-            if (!value.has_value())
-                return {};
-            return ParseIncludeEnvironment(*value);
+        case IncludeDiscovery::MsvcEnvironment:
+            return IncludeEnvironmentRoots(host);
+
+        case IncludeDiscovery::MsvcLayout: {
+            auto roots = MsvcToolsetIncludeRoots(host, compiler);
+
+            // The fallback is gated on the TOOLSET half, not on the merged list, and
+            // the difference is a false match rather than a missing root.
+            // `WindowsKitIncludeRoots` answers from the registry alone, so it knows
+            // nothing about which compiler is being identified -- on any machine with
+            // an SDK installed, a `cl.exe` outside the `VC\Tools\MSVC\<version>`
+            // layout (a shim, a wrapper, a VS2015-era `<vs>\VC\bin\cl.exe`) would come
+            // back with SDK roots only, never reach the fallback, and drop the VC
+            // headers from its identity. Two such toolchains then digest IDENTICALLY,
+            // which is exactly the false match this mechanism exists to prevent.
+            if (roots.empty())
+                return IncludeEnvironmentRoots(host);
+
+            // A partial layout answer IS kept rather than topped up from `INCLUDE`:
+            // both ends of a dispatch run this same code and so reach the same partial
+            // answer, whereas mixing in a variable only one of them has is precisely
+            // how the two stop agreeing.
+            auto kits = WindowsKitIncludeRoots(host);
+            roots.insert(roots.end(), std::make_move_iterator(kits.begin()), std::make_move_iterator(kits.end()));
+            return roots;
         }
     }
     return {};
@@ -444,18 +666,42 @@ std::string ComputeToolchainStamp(std::string_view banner, std::string const& co
     return digest.ToHex();
 }
 
-std::string CachedToolchainFingerprint(
-    IProcessRunner& runner, std::string const& compiler, std::string_view banner, DriverSpec const& spec, bool forceRefresh)
+ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
+                                             IToolchainHost& host,
+                                             std::string const& compiler,
+                                             std::string_view banner,
+                                             DriverSpec const& spec,
+                                             bool forceRefresh)
 {
-    auto const roots = DiscoverIncludePaths(runner, compiler, spec);
-    auto const stamp = ComputeToolchainStamp(banner, compiler, roots);
-    auto const cachePath = CacheFilePath(compiler);
+    auto const roots = DiscoverIncludePaths(runner, host, compiler, spec);
+
+    // Decided here, where the banner and the roots are both in hand, rather than
+    // left for a caller to reconstruct -- see `ToolchainIdentity::degenerate` for
+    // why all three conditions are needed and what the value means without them.
+    auto const degenerate =
+        spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler);
+
+    // Resolved for the STAMP and the CACHE FILE, which is what makes the cache work
+    // at all for a compiler invoked by bare name. `ComputeToolchainStamp` stats the
+    // binary, and a bare `cl` or `gcc` cannot be stat'd from an arbitrary working
+    // directory -- so it produced no stamp, nothing was ever cached, and the
+    // multi-second walk of the include tree ran again for every translation unit.
+    // It also gives the two spellings of one compiler ONE cache file, rather than
+    // two entries whose contents are identical and each of which the other misses.
+    //
+    // The banner is deliberately NOT recomputed from the resolved path: it is the
+    // caller's, taken from the compiler as invoked, and a GNU driver prints its own
+    // argv[0] -- so re-deriving it here would make `cc` identify as `gcc` and part
+    // company with the clients that call it `cc`.
+    auto const resolved = host.ResolveOnSearchPath(compiler).value_or(compiler);
+    auto const stamp = ComputeToolchainStamp(banner, resolved, roots);
+    auto const cachePath = CacheFilePath(resolved);
 
     if (!forceRefresh && !stamp.empty() && !cachePath.empty())
     {
         auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
         if (!cachedStamp.empty() && cachedStamp == stamp)
-            return cachedFingerprint;
+            return ToolchainIdentity { .fingerprint = cachedFingerprint, .degenerate = degenerate };
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
@@ -464,7 +710,7 @@ std::string CachedToolchainFingerprint(
     if (!stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
-    return fingerprint;
+    return ToolchainIdentity { .fingerprint = fingerprint, .degenerate = degenerate };
 }
 
 } // namespace FastCache::Cc

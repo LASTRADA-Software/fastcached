@@ -304,9 +304,19 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<compiler>|<fingerprint>=<compiler>",
           .apply = AppendFrom<&NodeConfig::toolchains, ParseText>(),
-          .description = "a toolchain this worker serves; repeatable. Required.\n"
-                         "There is deliberately no default compiler: a default is\n"
-                         "how a job ends up running against something nobody chose." },
+          .description = "a toolchain this worker serves; repeatable. An OVERRIDE:\n"
+                         "naming any pins this worker to exactly that set, and\n"
+                         "naming none means serve whatever this machine has.\n"
+                         "There is still no default COMPILER -- a default is how a\n"
+                         "job ends up running against something nobody chose." },
+        { .primary = "--no-toolchain-discovery",
+          .arity = Arity::None,
+          .apply = SetFalse<&NodeConfig::toolchainDiscovery>(),
+          .description = "do not survey this machine for compilers. Without\n"
+                         "--toolchain this leaves the worker with nothing to\n"
+                         "serve, so it refuses to start -- and refuses to be\n"
+                         "INSTALLED as a service, which is the registration that\n"
+                         "would otherwise fail at every boot with nobody watching." },
         { .primary = "--slots",
           .arity = Arity::Value,
           .operand = "=<n>",
@@ -727,6 +737,14 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     for (auto const& toolchain: cfg.toolchains)
         argv.push_back(std::format("--toolchain={}", toolchain));
 
+    // Carried into the registration, because it changes what the service DOES at
+    // every boot. A node installed with discovery off and no toolchain is refused
+    // below; one installed with it off and a toolchain named must come back with it
+    // still off, or the service quietly starts serving compilers the operator
+    // deliberately excluded.
+    if (!cfg.toolchainDiscovery)
+        argv.emplace_back("--no-toolchain-discovery");
+
     // Directories root will create for an account that is not root. Without the
     // handover the worker's first write fails with EACCES, which launchd surfaces
     // only as a job that exits over and over -- the same reason the daemon hands
@@ -792,9 +810,15 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
         { .refuses = [](NodeConfig const& c) { return c.scheduler.empty(); },
           .message = "--scheduler is required to install a service: a worker nothing knows about serves nobody, "
                      "and the registration would start and immediately exit at every boot." },
-        { .refuses = [](NodeConfig const& c) { return c.toolchains.empty(); },
-          .message = "--toolchain is required to install a service: a worker with none registers and then refuses "
-                     "every job the scheduler sends it." },
+        // Conditional, where it used to be absolute. Registering a service before
+        // anybody knows what the machine holds is the entire point of #139 -- the
+        // node answers that at boot. What still cannot work is discovery turned OFF
+        // with nothing named, and that is refused here, where an operator is
+        // watching, rather than at every boot where nobody is.
+        { .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
+          .message = "--toolchain is required alongside --no-toolchain-discovery: with both, a worker has nothing to "
+                     "serve, so it would register and then refuse every job the scheduler sends it. Drop "
+                     "--no-toolchain-discovery to let the machine answer at boot instead." },
         { .refuses = [](NodeConfig const& c) { return c.advertise.empty(); },
           .message = "--advertise is required to install a service: without it the registration bakes in "
                      "{--bind}:{--port}, and the default 0.0.0.0 is not an address a client can dial. Such a worker "
