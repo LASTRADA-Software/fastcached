@@ -749,6 +749,152 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
+TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused before it is installed", "[node][policy]")
+{
+    // #186. Each of these grammars was checked inside the tier that binds it, and
+    // `--install-service` returns long before any tier is built -- so a typo in any
+    // of them registered cleanly and then exited `ExitUsage` at every boot. They are
+    // pure functions of the command line, so they are decided where it is typed.
+    //
+    // A configuration per flag rather than one carrying all four, because the point
+    // is that EACH is refused on its own: one row covering for another is exactly
+    // what a table of four near-identical rules would hide.
+    auto const shapes = std::to_array<std::pair<char const*, NodeConfig>>({
+        { "--listen-scheduler",
+          [] {
+              auto cfg = Installable();
+              cfg.schedulerListen = "nope";
+              cfg.fleetOpen = true; // else the fleet-membership rule answers first
+              return cfg;
+          }() },
+        { "--admin-listen",
+          [] {
+              auto cfg = Installable();
+              cfg.adminListen = "nope";
+              return cfg;
+          }() },
+        { "--listen-cache",
+          [] {
+              auto cfg = Installable();
+              cfg.cacheListen = "nope";
+              return cfg;
+          }() },
+        { "--discovery",
+          [] {
+              auto cfg = Installable();
+              cfg.discoveryAddress = "nope";
+              cfg.nodeId = "n1";
+              cfg.raftListen = "6680";
+              cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+              cfg.clusterKeyFile = "cluster.key";
+              cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+              return cfg;
+          }() },
+    });
+
+    for (auto const& [flag, cfg]: shapes)
+    {
+        INFO(flag);
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(flag));
+        // The offending text is echoed, which is what a row of static prose could
+        // not do: an operator who mistyped one of four ports has to be told which.
+        CHECK(Unwrap(refusal).contains("nope"));
+
+        // And through the install path, which is the whole point: #166 composed the
+        // tables so a registration is judged by both, and this reached around them.
+        auto const install = NodeInstallRejection(cfg);
+        REQUIRE(install.has_value());
+        CHECK(Unwrap(install).contains(flag));
+    }
+}
+
+TEST_CASE("NodeConfig: a listen flag that is absent, defaulted or valid is accepted", "[node][policy]")
+{
+    // The direction a "must parse" rule gets wrong. Empty means the surface is off
+    // for three of these, and `--listen-cache` carries a non-empty default that
+    // every ordinary node runs with -- so a rule reading "must parse" rather than
+    // "parses when given" would refuse the default deployment outright.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+    CHECK_FALSE(NodeInstallRejection(Installable()).has_value());
+
+    auto off = Installable();
+    off.schedulerListen.clear();
+    off.adminListen.clear();
+    off.cacheListen.clear(); // documented as "no cache tier", not as a mistake
+    off.discoveryAddress.clear();
+    CHECK_FALSE(StartupPolicyRejection(off).has_value());
+
+    // Every surface configured, in each of the spellings the tiers accept: a bare
+    // port, an address and port, and a bracketed v6 literal.
+    auto configured = Installable();
+    configured.schedulerListen = "6678";
+    configured.fleetOpen = true;
+    configured.adminListen = "127.0.0.1:6677";
+    configured.cacheListen = "[::1]:6679";
+    configured.dashboard = true;
+    CHECK_FALSE(StartupPolicyRejection(configured).has_value());
+}
+
+TEST_CASE("NodeConfig: a listen flag with a port and no host is refused, not widened", "[node][policy]")
+{
+    // `:6674` is not "the default host, and this port". An empty bind host reaches
+    // `getaddrinfo` as nullptr under AI_PASSIVE, so it is the WILDCARD -- which for
+    // the cache surface is the whole machine's network rather than the loopback its
+    // default promises, and nothing anywhere would say so.
+    auto cache = Installable();
+    cache.cacheListen = ":6674";
+    auto const widened = StartupPolicyRejection(cache);
+    REQUIRE(widened.has_value());
+    CHECK(Unwrap(widened).contains("--listen-cache"));
+
+    auto admin = Installable();
+    admin.adminListen = ":6677";
+    CHECK(StartupPolicyRejection(admin).has_value());
+
+    // A BARE port is a different thing and stays legal: it names no host at all, so
+    // it takes the surface's own default rather than silently replacing it.
+    auto bare = Installable();
+    bare.cacheListen = "6674";
+    bare.adminListen = "6677";
+    bare.schedulerListen = "6678";
+    bare.fleetOpen = true;
+    CHECK_FALSE(StartupPolicyRejection(bare).has_value());
+}
+
+TEST_CASE("NodeConfig: --discovery takes an address and a port, never a bare port", "[node][policy]")
+{
+    // Its grammar is NOT the one the three listen flags take, and that difference is
+    // the tier's: a beacon is sent TO an address, so there is no host for a bare
+    // port to default to. A shared "is this an endpoint" test would accept `6681`
+    // here and the tier would then refuse it at every boot.
+    auto bare = Installable();
+    bare.nodeId = "n1";
+    bare.raftListen = "6680";
+    bare.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    bare.clusterKeyFile = "cluster.key";
+    bare.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    bare.discoveryAddress = "6681";
+
+    auto const refusal = StartupPolicyRejection(bare);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--discovery"));
+
+    // Nor a port with no address in front of it, which is the shape that splits and
+    // still names nowhere: `UdpSocket::Send` refuses an empty destination outright,
+    // so such a node starts, runs discovery, and announces to nobody. That is decided
+    // by the text alone, which is what makes it this table's to refuse.
+    bare.discoveryAddress = ":6681";
+    auto const headless = StartupPolicyRejection(bare);
+    REQUIRE(headless.has_value());
+    CHECK(Unwrap(headless).contains("--discovery"));
+
+    // And the spelling it does take.
+    bare.discoveryAddress = "255.255.255.255:6681";
+    CHECK_FALSE(StartupPolicyRejection(bare).has_value());
+}
+
 TEST_CASE("NodeConfig: the --raft-join rules keep the more specific answer", "[node][consensus][policy]")
 {
     // The new row must not make either of them dead: both describe a joiner more
