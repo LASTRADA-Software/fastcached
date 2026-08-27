@@ -10,6 +10,9 @@
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <format>
 #include <mutex>
 #include <thread>
@@ -34,6 +37,34 @@ namespace
     {
         auto const written = co_await socket->Write(bytes);
         co_return written.has_value() && *written == bytes.size();
+    }
+
+    /// Read and discard until the peer closes, so OUR close can be graceful.
+    ///
+    /// The counterpart of `WriteAll` on a path that answers and then hangs up: a close
+    /// with unread bytes still queued is a reset, and a reset takes the answer back
+    /// out of the peer's receive buffer. Returning as soon as the peer closes is what
+    /// makes this cheap -- a client that has read its refusal closes at once, so the
+    /// common case is one read and an EOF.
+    ///
+    /// Bounded by what the surface would have read had it accepted the request, so a
+    /// refusal never costs more than serving would have; a peer past that has stopped
+    /// being one worth being polite to and gets the reset. The socket is tracked
+    /// besides, so a peer that goes silent without closing is swept rather than
+    /// waited on.
+    /// @param socket The socket about to be closed.
+    /// @param limit How many bytes may be discarded before giving up on politeness.
+    Task<void> DrainUntilPeerCloses(ISocket* socket, std::size_t limit)
+    {
+        std::array<std::byte, 4096> scratch {};
+        for (std::size_t discarded = 0; discarded < limit;)
+        {
+            auto const read = co_await socket->Read(std::span<std::byte> { scratch });
+            if (!read.has_value() || *read == 0)
+                break;
+            discarded += *read;
+        }
+        co_return;
     }
 
 } // namespace
@@ -62,7 +93,7 @@ struct FrameServer::State
     mutable std::mutex mutex;
     std::vector<std::pair<ISocket*, TimePoint>> open;
 
-    std::atomic<std::size_t> inFlight { 0 };
+    std::atomic<std::size_t> openConnections { 0 };
     std::atomic<std::size_t> inFlightBytes { 0 };
 
     /// How many of this server's own loops -- the accept loop and the sweeper --
@@ -89,6 +120,26 @@ struct FrameServer::State
     {
         std::scoped_lock const guard { mutex };
         open.emplace_back(socket, deadline);
+    }
+
+    /// Move a tracked socket's deadline forward.
+    ///
+    /// A connection serves many requests, so one deadline armed at accept would sweep
+    /// a conversation mid-flight. Armed once per REQUEST instead -- before its header
+    /// read, and not again until the next one -- it means "how long this request has,
+    /// from its first byte to its answer". Deliberately not re-armed after the header:
+    /// that would give a payload a fresh budget of its own and let a slow drip hold a
+    /// connection indefinitely, which is the property `RequestTimeout` exists for. The
+    /// idle gap before a request is inside the same window, so an attached peer that
+    /// stops talking is still swept.
+    /// @param socket The tracked socket.
+    /// @param deadline Its new deadline.
+    void Rearm(ISocket* socket, TimePoint deadline)
+    {
+        std::scoped_lock const guard { mutex };
+        for (auto& entry: open)
+            if (entry.first == socket)
+                entry.second = deadline;
     }
 
     /// Deregister a socket. Must happen before its owner destroys it.
@@ -143,29 +194,31 @@ struct FrameServer::State
 namespace
 {
 
-    /// Holds a connection's slot in the in-flight count for as long as it is served.
+    /// Holds a connection's slot in the open count for as long as it is served.
     ///
     /// RAII rather than a decrement at each of the task's exits: a connection ends
-    /// several ways -- a foreign magic, an oversize declaration, a short read, a
-    /// normal answer -- and the exit that gets forgotten leaks a slot, after which
-    /// the surface refuses everything forever while looking perfectly healthy.
-    class ServedSlot
+    /// several ways -- a foreign magic, an oversize declaration, a short read, a peer
+    /// that simply stops -- and the exit that gets forgotten leaks a slot, after which
+    /// the surface refuses everything forever while looking perfectly healthy. The
+    /// loop added for #176 multiplied those exits, which is exactly when a hand-placed
+    /// decrement would have started being wrong.
+    class OpenConnectionSlot
     {
       public:
-        explicit ServedSlot(FrameServer::State* state) noexcept:
+        explicit OpenConnectionSlot(FrameServer::State* state) noexcept:
             _state { state }
         {
-            _state->inFlight.fetch_add(1, std::memory_order_acq_rel);
+            _state->openConnections.fetch_add(1, std::memory_order_acq_rel);
         }
 
-        ServedSlot(ServedSlot const&) = delete;
-        ServedSlot(ServedSlot&&) = delete;
-        ServedSlot& operator=(ServedSlot const&) = delete;
-        ServedSlot& operator=(ServedSlot&&) = delete;
+        OpenConnectionSlot(OpenConnectionSlot const&) = delete;
+        OpenConnectionSlot(OpenConnectionSlot&&) = delete;
+        OpenConnectionSlot& operator=(OpenConnectionSlot const&) = delete;
+        OpenConnectionSlot& operator=(OpenConnectionSlot&&) = delete;
 
-        ~ServedSlot()
+        ~OpenConnectionSlot()
         {
-            _state->inFlight.fetch_sub(1, std::memory_order_acq_rel);
+            _state->openConnections.fetch_sub(1, std::memory_order_acq_rel);
         }
 
       private:
@@ -198,7 +251,21 @@ namespace
         std::size_t _bytes;
     };
 
-    /// Answer one connection, then close it.
+    /// Answer requests on one connection until the peer stops sending.
+    ///
+    /// A LOOP, and that is issue #176 rather than a refinement. This served exactly
+    /// one request and closed, while two callers in this tree send more than one down
+    /// a connection they opened once: the heartbeat dials per ROUND and then registers
+    /// or heartbeats every toolchain over it (`main.cpp`), and `Cc::Exchange` writes
+    /// AUTH and the command back to back and reads two replies (`CacheProtocol.cpp`).
+    /// The first silently cost a two-toolchain worker half its fleet presence; the
+    /// second made a credential impossible to present at all.
+    ///
+    /// The daemon serving this identical wire has always looped
+    /// (`CompileCacheHandler.cpp`), so what follows is that policy applied here rather
+    /// than a second opinion about one protocol: a refusal is a reply and a
+    /// resynchronization, and only a frame with no recognisable header -- and so no
+    /// length to step over -- ends the connection.
     ///
     /// A free function taking raw pointers rather than a capturing lambda: a
     /// coroutine's closure outlives the expression that created it.
@@ -208,12 +275,16 @@ namespace
     {
         auto* const state = shared.get();
         auto socket = std::move(owned);
-        ServedSlot const slot { state };
+        OpenConnectionSlot const slot { state };
 
         // Registered with its deadline BEFORE the first read, so a client that sends
         // half a header is swept rather than holding a frame until the process dies.
-        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
-        state->Track(socket.get(), deadline);
+        // `Rearm` below moves it forward once per request -- not once per read; see
+        // its note for what the window then covers.
+        auto const deadlineFor = [state] {
+            return state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
+        };
+        state->Track(socket.get(), deadlineFor());
 
         // The firewall: this is a DetachedTask, whose unhandled_exception terminates
         // the process, so one client's answer must not take the node with it.
@@ -222,65 +293,123 @@ namespace
             // The peer's HOST. A connection's source port is ephemeral and is not the
             // peer's endpoint, so for a surface whose policy needs an identity -- the
             // scheduler's -- there is nothing else here that could supply one.
-            auto peer = socket->PeerAddress();
+            auto const peer = socket->PeerAddress();
 
             auto const cap = state->responder.MaxRequestBytes();
+
+            // ONE reader for the connection, as the daemon's loop has: it buffers
+            // internally, so a per-request reader would discard bytes already pulled
+            // off the socket -- which is exactly the pipelined second frame.
             ByteReader reader { *socket, /*maxLineBytes*/ 1, cap };
-            auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
-            if (header.has_value())
+
+            while (!state->shuttingDown.load(std::memory_order_acquire))
             {
+                // Between requests, not after one: the buffer a 256 MiB object grew
+                // into is kept by the vector, and a reader that now lives as long as
+                // the connection would hold it for as long as the peer stays attached
+                // -- uncounted by the in-flight budget, because nothing is in flight.
+                // Whatever a pipelined peer has already sent is kept.
+                reader.ReleaseSpareCapacity();
+
+                state->Rearm(socket.get(), deadlineFor());
+
+                auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
+                if (!header.has_value())
+                    break; // Routine at a request boundary: the peer is done.
+
                 auto const decoded = Wire::DecodeRequestHeader(*header);
                 if (!decoded.has_value())
-                {
-                    // A foreign magic: the peer is not speaking this protocol, and with
-                    // no declared length there is nowhere to resynchronize to. Closing
-                    // is the only thing left, and is what an empty answer means here.
-                }
-                else if (decoded->payloadLength > cap)
+                    break; // A foreign magic: no declared length, so nowhere to
+                           // resynchronize to. Closing is the only thing left.
+
+                if (decoded->payloadLength > cap)
                 {
                     // Refused with a reply naming BOTH numbers, because "too large"
                     // without the ceiling tells an operator nothing about a 64 KiB
                     // limit. The bytes are never taken: the check is on the declared
                     // length, before the read.
-                    (void) co_await WriteAll(
-                        socket.get(),
-                        Wire::EncodeErrorReply(
-                            Wire::ErrorCode::PayloadTooLarge,
-                            std::format("{} exceeds the {} {}-byte request cap", decoded->payloadLength, state->what, cap)));
+                    //
+                    // Answered BEFORE the body is stepped over, which is the one place
+                    // this deliberately does not copy the daemon's order. Draining
+                    // first makes the reply contingent on the peer finishing a write
+                    // it may already have abandoned -- a client that computed the
+                    // frame was too large and sent only the header then waits for an
+                    // answer that arrives when the sweeper closes it, i.e. never
+                    // usefully. Writing first costs nothing and the resynchronization
+                    // is just as good: a peer that sends what it declared is still
+                    // stepped over exactly.
+                    if (!co_await WriteAll(socket.get(),
+                                           Wire::EncodeErrorReply(Wire::ErrorCode::PayloadTooLarge,
+                                                                  std::format("{} exceeds the {} {}-byte request cap",
+                                                                              decoded->payloadLength,
+                                                                              state->what,
+                                                                              cap))))
+                        break;
+
+                    // Then the body is STEPPED OVER so the connection stays usable,
+                    // bounded by the wire's own shared factor rather than a second
+                    // opinion about it. `Skip` discards in chunks and never
+                    // materialises the frame, so the memory the cap protects is still
+                    // never taken.
+                    auto const drainable = static_cast<std::uint64_t>(cap) * Wire::OversizeDrainFactor;
+                    if (decoded->payloadLength > drainable || !(co_await reader.Skip(decoded->payloadLength)).has_value())
+                    {
+                        // Past the bound the connection ends -- but not with the peer's
+                        // bytes still queued, which would reset it and take the refusal
+                        // just written back out of the peer's buffer. Best effort, and
+                        // bounded like every other drain here: a peer that keeps sending
+                        // past that has chosen the reset.
+                        co_await DrainUntilPeerCloses(socket.get(), cap);
+                        break;
+                    }
+                    continue;
                 }
-                else if (auto const budget = state->responder.MaxInFlightBytes();
-                         budget != 0
-                         && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
+
+                if (auto const budget = state->responder.MaxInFlightBytes();
+                    budget != 0 && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
                 {
                     // Checked on the DECLARED length, before a payload byte is read,
                     // so an over-budget request costs no allocation at all. The
                     // connection cap alone would not bound memory: N connections each
                     // declaring the per-request maximum is still N times it.
-                    (void) co_await WriteAll(
-                        socket.get(),
-                        Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
-                                               std::format("{} has {} of {} bytes in flight",
-                                                           state->what,
-                                                           state->inFlightBytes.load(std::memory_order_acquire),
-                                                           budget)));
+                    //
+                    // Drained rather than closed, and it is bounded by `cap` above --
+                    // this branch is only reached for a declaration the surface WOULD
+                    // have accepted, so the peer is told to come back rather than made
+                    // to reconnect over a transient budget. Answered first, for the
+                    // reason the oversize branch is.
+                    if (!co_await WriteAll(
+                            socket.get(),
+                            Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
+                                                   std::format("{} has {} of {} bytes in flight",
+                                                               state->what,
+                                                               state->inFlightBytes.load(std::memory_order_acquire),
+                                                               budget))))
+                        break;
+                    if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
+                        break;
+                    continue;
                 }
-                else
-                {
-                    BudgetedBytes const bytes { state, decoded->payloadLength };
-                    if (auto const payload = co_await reader.ReadExactly(decoded->payloadLength); payload.has_value())
-                    {
-                        std::vector<std::byte> frame { header->begin(), header->end() };
-                        frame.insert(frame.end(), payload->begin(), payload->end());
 
-                        // Awaited: answering may reach the network -- the cache surface
-                        // consults an upstream -- and that suspends rather than
-                        // blocking every other connection on this loop, which is the
-                        // whole reason this task exists separately from the accept
-                        // loop.
-                        if (auto const reply = co_await state->responder.Answer(frame, std::move(peer)); !reply.empty())
-                            (void) co_await WriteAll(socket.get(), reply);
-                    }
-                }
+                BudgetedBytes const bytes { state, decoded->payloadLength };
+                auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
+                if (!payload.has_value())
+                    break;
+
+                std::vector<std::byte> frame { header->begin(), header->end() };
+                frame.insert(frame.end(), payload->begin(), payload->end());
+
+                // Awaited: answering may reach the network -- the cache surface
+                // consults an upstream -- and that suspends rather than blocking
+                // every other connection on this loop, which is the whole reason
+                // this task exists separately from the accept loop.
+                auto const reply = co_await state->responder.Answer(frame, peer);
+                if (reply.empty())
+                    break; // `IFrameResponder::Answer` documents an empty reply as
+                           // "close without answering", which is only ever right
+                           // when the peer is not speaking this protocol at all.
+                if (!co_await WriteAll(socket.get(), reply))
+                    break;
             }
         }
         catch (...)
@@ -298,23 +427,38 @@ namespace
     /// Refuse a connection the surface has no room for, then close it.
     ///
     /// Its own task rather than a write in the accept loop, so refusing never parks
-    /// the loop on a client that is not reading. It takes no served slot and reads
-    /// nothing, so it cannot itself be what keeps the surface at capacity -- but it
-    /// IS registered with the sweeper, so a client that never reads its refusal is
-    /// still let go.
+    /// the loop on a client that is not reading. It takes no open-connection slot, so
+    /// it cannot itself be what keeps the surface at capacity -- but it IS registered
+    /// with the sweeper, so a client that never reads its refusal is still let go.
+    ///
+    /// It reads, and that is not optional. Closing a socket while the peer's bytes sit
+    /// unread in the receive queue is a RESET rather than a graceful close, and a reset
+    /// discards data the peer had already buffered -- including the refusal just
+    /// written to it. Every real client writes its request and then reads, so the
+    /// refusal was never the thing they saw: they saw a connection reset, which names
+    /// neither the surface nor the reason. A client that reads WITHOUT writing did
+    /// receive it, which is how the two cases below tell the halves apart.
     DetachedTask RefuseAtCapacity(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
     {
         auto* const state = shared.get();
         auto socket = std::move(owned);
-        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
+
+        // A SHORTER window than a served request gets. A refused connection has
+        // nothing left to do but be read and hang up, so the drain below should end in
+        // a round trip; giving it the full `RequestTimeout` would let a flood arriving
+        // at capacity park a socket per attempt for five seconds each -- taking no
+        // slot, and so counted by nothing. This is the one place where being polite
+        // has to stay cheap.
+        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
         state->Track(socket.get(), deadline);
         try
         {
-            (void) co_await WriteAll(socket.get(),
-                                     Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
-                                                            std::format("{} is already serving {} requests",
-                                                                        state->what,
-                                                                        state->responder.MaxConcurrentRequests())));
+            if (co_await WriteAll(socket.get(),
+                                  Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
+                                                         std::format("{} is already holding {} connections",
+                                                                     state->what,
+                                                                     state->responder.MaxOpenConnections()))))
+                co_await DrainUntilPeerCloses(socket.get(), state->responder.MaxRequestBytes());
         }
         catch (...)
         {
@@ -362,9 +506,9 @@ void FrameServer::NoteLoopThrew() noexcept
     _state->logger.Logf(LogLevel::Error, "{}: accept loop threw; this surface has stopped accepting", _state->what);
 }
 
-std::size_t FrameServer::InFlight() const noexcept
+std::size_t FrameServer::OpenConnections() const noexcept
 {
-    return _state->inFlight.load(std::memory_order_acquire);
+    return _state->openConnections.load(std::memory_order_acquire);
 }
 
 std::size_t FrameServer::InFlightBytes() const noexcept
@@ -411,8 +555,8 @@ Task<void> FrameServer::Run()
         // Checked before the connection is served rather than inside it: the cap
         // exists to bound how much this surface buffers at once, and a task that had
         // already started reading would be past the point of refusing cheaply.
-        auto const concurrent = state->responder.MaxConcurrentRequests();
-        if (concurrent != 0 && state->inFlight.load(std::memory_order_acquire) >= concurrent)
+        auto const concurrent = state->responder.MaxOpenConnections();
+        if (concurrent != 0 && state->openConnections.load(std::memory_order_acquire) >= concurrent)
             RefuseAtCapacity(state, std::move(socket));
         else
             ServeConnection(state, std::move(socket));

@@ -15,11 +15,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <format>
 #include <future>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -89,6 +91,57 @@ struct Fleet
     return port;
 }
 
+/// Read until @p received holds at least @p count bytes.
+///
+/// A free function taking raw pointers rather than a lambda closing over the
+/// accumulator: a capturing lambda coroutine outlives the expression that created
+/// it, which `cppcoreguidelines-avoid-capturing-lambda-coroutines` rejects outright,
+/// and a reference parameter is the same hazard spelled differently
+/// (`...-avoid-reference-coroutine-parameters`). `ServeConnection` is shaped this way
+/// for the same reason.
+/// @param peer Connected socket.
+/// @param received Accumulator, appended to; must outlive the awaiting caller.
+/// @param count How many bytes must be present before this returns.
+/// @return False when the peer closed before that many arrived.
+[[nodiscard]] Task<bool> ReadAtLeast(ISocket* peer, std::vector<std::byte>* received, std::size_t count)
+{
+    while (received->size() < count)
+    {
+        std::array<std::byte, 4096> chunk {};
+        auto const want = std::min(chunk.size(), count - received->size());
+        auto const read = co_await peer->Read(std::span<std::byte> { chunk.data(), want });
+        if (!read.has_value() || *read == 0)
+            co_return false;
+        received->insert(received->end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+    }
+    co_return true;
+}
+
+/// Read exactly one framed reply: the header, then the payload it declares.
+///
+/// Reading to EOF instead would work only against a server that closes after
+/// answering, which is what this endpoint used to do and no longer does -- against a
+/// connection the server keeps, it would block until the sweeper closed the socket
+/// and add `RequestTimeout` to every case. So this reads what the protocol says is
+/// there, which is also what lets a caller send a second request afterwards.
+/// @param peer Connected socket.
+/// @return Header plus payload, or empty when the peer closed without answering.
+[[nodiscard]] Task<std::vector<std::byte>> ReadOneReply(ISocket* peer)
+{
+    std::vector<std::byte> received;
+
+    if (!co_await ReadAtLeast(peer, &received, Wire::ReplyHeaderSize))
+        co_return std::vector<std::byte> {};
+
+    auto const header = Wire::DecodeReplyHeader(received);
+    if (!header.has_value())
+        co_return received;
+
+    if (!co_await ReadAtLeast(peer, &received, Wire::ReplyHeaderSize + header->payloadLength))
+        co_return std::vector<std::byte> {};
+    co_return received;
+}
+
 /// Send one frame to `port` and read the reply.
 /// @param port Where the endpoint is listening.
 /// @param frame The request, header included.
@@ -105,22 +158,56 @@ struct Fleet
         auto const written = co_await peer->Write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
-
-        std::vector<std::byte> received;
-        std::array<std::byte, 4096> chunk {};
-        while (true)
-        {
-            auto const read = co_await peer->Read(std::span<std::byte> { chunk });
-            if (!read.has_value() || *read == 0)
-                break;
-            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
-        }
-        co_return received;
+        co_return co_await ReadOneReply(peer);
     }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
 
     (*socket)->Close();
     return reply;
 }
+
+/// One connection, held open across several requests.
+///
+/// What `Exchange` cannot express: the heartbeat loop and `Cc::Exchange` both send
+/// more than one frame down a connection they opened once, and that is the property
+/// #176 was about.
+class Conversation
+{
+  public:
+    explicit Conversation(std::uint16_t port)
+    {
+        auto socket = SyncRun(_connector.Connect("127.0.0.1", port, 5s));
+        REQUIRE(socket.has_value());
+        _socket = std::move(*socket);
+    }
+
+    /// Send one frame and read one reply, leaving the connection open.
+    /// @param frame The request, header included.
+    /// @return The reply, or empty when the peer closed without answering.
+    [[nodiscard]] std::vector<std::byte> Send(std::span<std::byte const> frame)
+    {
+        return SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
+            auto const written = co_await peer->Write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
+            co_return co_await ReadOneReply(peer);
+        }(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    }
+
+    ~Conversation()
+    {
+        if (_socket)
+            _socket->Close();
+    }
+
+    Conversation(Conversation const&) = delete;
+    Conversation(Conversation&&) = delete;
+    Conversation& operator=(Conversation const&) = delete;
+    Conversation& operator=(Conversation&&) = delete;
+
+  private:
+    BlockingConnector _connector;
+    std::unique_ptr<ISocket> _socket;
+};
 
 /// The error code of a refusal, or nullopt when the reply is not one.
 [[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
@@ -337,7 +424,7 @@ class HoldableResponder final: public IFrameResponder
         return 64ULL * 1024ULL;
     }
 
-    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return _concurrent;
     }
@@ -430,4 +517,209 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     REQUIRE(second.wait_for(15s) == std::future_status::ready);
     CHECK_FALSE(first.get().empty());
     CHECK_FALSE(second.get().empty());
+}
+
+TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
+{
+    // Issue #176. `ServeConnection` read one frame, answered it and closed, while two
+    // callers in this tree send more than one down a connection they opened once:
+    // the heartbeat loop dials once per round and then registers or heartbeats EVERY
+    // toolchain over it (`main.cpp:577`), and `Cc::Exchange` writes AUTH and the
+    // command back to back and reads two replies (`CacheProtocol.cpp:136`). The first
+    // cost a two-toolchain worker half its fleet presence, permanently and silently;
+    // the second made a credential impossible to present at all.
+    //
+    // The daemon serving the identical wire has always looped
+    // (`CompileCacheHandler.cpp:490`), so this asserts the contract the node was the
+    // only implementation to break.
+    Fleet fleet;
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    auto const first = conversation.Send(Wire::EncodeFetch("first"));
+    REQUIRE_FALSE(first.empty());
+    CHECK(Wire::DecodeReplyHeader(first).has_value());
+
+    // The one that never arrived. Before the fix this is empty, because the server
+    // closed the connection after answering the frame above.
+    auto const second = conversation.Send(Wire::EncodeFetch("second"));
+    REQUIRE_FALSE(second.empty());
+    CHECK(Wire::DecodeReplyHeader(second).has_value());
+}
+
+TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
+{
+    // The framing invariant, from `.agent/rules/wire-and-protocol.md`: a frame
+    // declares its own length, so a rejection is a REPLY and a resynchronization --
+    // never a close. The endpoint wrote the reply and then closed anyway, which meant
+    // the length the header carries bought nothing.
+    Fleet fleet;
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // A COMPLETE oversize frame -- header plus the bytes it declares. Sending the
+    // header alone would be a peer that broke its own framing, and there is nothing
+    // for the endpoint to resynchronize to in that case; the separate scheduler case
+    // covers that shape and asserts only that the refusal still arrives.
+    auto const declared = fleet.responder.MaxRequestBytes() + 1;
+    std::vector<std::byte> oversize(Wire::RequestHeaderSize + declared, std::byte { 0 });
+    WireFrame::PutHeader(std::span<std::byte> { oversize }.first(Wire::RequestHeaderSize),
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Register),
+                         static_cast<std::uint32_t>(declared));
+
+    auto const refusal = conversation.Send(oversize);
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::PayloadTooLarge);
+
+    // And the connection is still usable, which is the half that was missing.
+    auto const after = conversation.Send(Wire::EncodeFetch("after-the-refusal"));
+    REQUIRE_FALSE(after.empty());
+    CHECK(Wire::DecodeReplyHeader(after).has_value());
+}
+
+TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
+{
+    // What the loop for #176 changed about the cap, made explicit so it cannot drift
+    // back. While a connection was one request the two numbers were the same, and the
+    // cache surface picked its value for the expensive thing -- eight object files at
+    // once. Held for a whole connection instead, eight would have been eight ATTACHED
+    // PEERS, so a wide build's ninth launcher, or eight peers sending almost nothing,
+    // would have closed the surface to everyone else.
+    //
+    // Both halves are asserted here: one connection is one slot however many requests
+    // it serves, and the slot is what a second connection is refused for.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // Three requests down the one connection. If the cap counted requests, the second
+    // would be refused; it holds one slot for all three.
+    for (auto const* const attempt: { "first", "second", "third" })
+    {
+        auto const reply = conversation.Send(Wire::EncodeFetch(attempt));
+        REQUIRE_FALSE(reply.empty());
+        CHECK(ErrorOf(reply) != Wire::ErrorCode::EndpointBusy);
+    }
+
+    // And the slot IS taken, so a second connection is refused by name rather than
+    // admitted -- the cap still bounds something.
+    //
+    // Read without writing first, which keeps this case about the CAP: a client that
+    // sends its request before reading exercises whether the refusal survives the
+    // close as well, and that is a separate defect with a case of its own below.
+    BlockingConnector connector;
+    auto second = SyncRun(connector.Connect("127.0.0.1", port, 5s));
+    REQUIRE(second.has_value());
+    auto const refusal = SyncRun(ReadOneReply((*second).get()));
+    (*second)->Close();
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+}
+
+TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame]")
+{
+    // The half the case above deliberately does not cover, and the half every real
+    // client is on: it writes its request and THEN reads. The endpoint wrote the
+    // refusal and closed without reading, so the request sat unread in the receive
+    // queue -- and a close with bytes still queued is a reset, which takes the refusal
+    // back out of the client's own receive buffer before it can be read.
+    //
+    // So the surface at capacity looked to every caller like a connection reset, which
+    // names neither the surface nor the reason, while the reply that did name both had
+    // been written and thrown away. The case above reads without writing and always
+    // saw it, which is what isolated this from "the refusal is never written".
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // One completed round trip before the second client arrives, so the slot is
+    // provably taken rather than probably taken: the accept that takes it is on the
+    // reactor thread and would otherwise be racing this one.
+    Conversation holder { port };
+    REQUIRE_FALSE(holder.Send(Fetch("attached")).empty());
+
+    auto const refusal = Exchange(port, Fetch("while-attached"));
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+}
+
+TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
+{
+    // `MaxInFlightBytes` is what actually bounds this surface's memory, and since the
+    // connection cap stopped being a request cap it is the only thing that bounds
+    // concurrent work either. It had no coverage at all -- every case ran with the
+    // budget disabled -- while being the branch the loop rewrote most.
+    //
+    // The property is that it refuses like every other recoverable refusal: a REPLY
+    // naming the budget, on a connection that is still usable afterwards. A close here
+    // would make a busy moment cost every launcher a reconnect.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+
+    // One byte of budget, so any declared payload exceeds it. Small enough to be
+    // unambiguous: this is the declared length being weighed, not the bytes read.
+    responder.Limit(/*concurrent*/ 0, /*budget*/ 1);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    auto const refusal = conversation.Send(Fetch("over-budget"));
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // Never reached the responder: the budget is weighed on the DECLARED length,
+    // before a payload byte is read, which is the whole reason it can bound anything.
+    CHECK(responder.Entered() == 0);
+
+    // And the connection survives it, so the peer may retry rather than reconnect.
+    CHECK_FALSE(conversation.Send(Fetch("again")).empty());
+}
+
+TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
+{
+    // The one case that must NOT resynchronize: with no recognisable header there is
+    // no declared length, so there is nowhere to skip to and no framing in which a
+    // reply would mean anything. Kept as a case so the loop above cannot quietly turn
+    // this into an infinite one.
+    Fleet fleet;
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    std::array<std::byte, Wire::RequestHeaderSize> foreign {};
+    foreign.fill(std::byte { 0x7F });
+
+    CHECK(conversation.Send(foreign).empty());
 }

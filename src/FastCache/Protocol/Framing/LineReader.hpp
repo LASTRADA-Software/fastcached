@@ -76,6 +76,25 @@ class ByteReader
     /// @param bytes Bytes to prepend.
     void PrimeWith(std::span<std::byte const> bytes);
 
+    /// Give back the buffer's spare capacity, keeping whatever is still unconsumed.
+    ///
+    /// `Compact()` moves the unconsumed tail to the front and `resize()`s down, which
+    /// releases nothing: a `std::vector` keeps the block it grew into. That is right
+    /// while a reader serves one request and is destroyed, and wrong once one serves a
+    /// connection -- a cache connection that carried a single 256 MiB object would
+    /// hold 256 MiB for as long as the peer stayed attached, uncounted by any in-flight
+    /// budget because nothing is in flight. Multiply by a connection cap and the
+    /// ceiling the budget exists to impose is gone.
+    ///
+    /// So a server that loops calls this between requests. It costs an allocation on
+    /// the next read, which is nothing beside the round trip that read is waiting for,
+    /// and it costs nothing at all when the buffer never grew.
+    void ReleaseSpareCapacity()
+    {
+        Compact();
+        _buffer.shrink_to_fit();
+    }
+
     /// @return true if the underlying socket returned EOF and the buffer is drained.
     [[nodiscard]] bool Eof() const noexcept
     {

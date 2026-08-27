@@ -50,14 +50,13 @@ class SchedulerResponder final: public IFrameResponder
         return 64ULL * 1024ULL;
     }
 
-    /// Hundreds, because a scheduler verb is kilobytes.
+    /// Hundreds: a fleet's worth of workers, each attached for a heartbeat round.
     ///
-    /// The spread against the cache surface below is the whole reason this is a
-    /// per-responder column: at 64 KiB a request, 256 at once is 16 MiB, which is
-    /// nothing. Sizing this like the cache's would refuse a busy fleet for no
-    /// reason; sizing the cache's like this would let 256 object files be in flight
-    /// at once.
-    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    /// A worker dials once per round and then speaks for every toolchain it found, so
+    /// a connection here is held for as long as that conversation takes rather than
+    /// for one verb. 256 of them is a large fleet, and at 64 KiB a request the memory
+    /// behind them is bounded below by the byte budget anyway.
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return 256;
     }
@@ -122,25 +121,30 @@ class CacheResponder final: public IFrameResponder
         return 256ULL * 1024ULL * 1024ULL;
     }
 
-    /// Eight, because a cache STORE carries a whole object file.
+    /// Hundreds, and NOT eight, which is what it was while a connection was a request.
     ///
-    /// This surface is the one the concurrency change is FOR -- a slow upstream used
-    /// to stall every local `fastcache-cc` behind it -- so it must serve several at
-    /// once. But it is also the one where "several at once" is expensive, and the
-    /// serialized loop was bounding peak memory to a single request by accident.
-    /// Eight parallel translation units is a wide build; the byte budget below is
-    /// what actually stops it becoming eight times the per-request maximum.
-    [[nodiscard]] std::size_t MaxConcurrentRequests() const noexcept override
+    /// Eight was the right number of object files to have in flight at once and the
+    /// wrong number of connections to allow: a wide build has a launcher per job, and
+    /// once a connection outlives its request (#176), sizing this for the expensive
+    /// thing would have made the ninth `fastcache-cc` on a `-j16` build wait for a
+    /// slot rather than for a byte budget. Worse on an open port -- eight attached
+    /// peers sending almost nothing would have closed the surface to everyone else.
+    ///
+    /// What bounds the expensive thing is `MaxInFlightBytes()` below, which is worth
+    /// about one object file on purpose and refuses with a reply rather than a close.
+    /// So this bounds descriptors, and is sized for descriptors.
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
-        return 8;
+        return 256;
     }
 
     /// 256 MiB across all of them, which is deliberately ONE request's worth.
     ///
-    /// So the common case -- eight ordinary objects of a few megabytes -- runs fully
-    /// in parallel, while a single 256 MiB monster still cannot be joined by seven
-    /// more. That keeps this endpoint's peak footprint where the serialized loop
-    /// used to hold it, without reintroducing the serialization.
+    /// So the common case -- a handful of ordinary objects of a few megabytes -- runs
+    /// fully in parallel, while a single 256 MiB monster cannot be joined at all.
+    /// That keeps this endpoint's peak footprint where the serialized loop used to
+    /// hold it, without reintroducing the serialization -- and since the connection
+    /// cap above stopped being a request cap, this is the only thing that does.
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return 256ULL * 1024ULL * 1024ULL;

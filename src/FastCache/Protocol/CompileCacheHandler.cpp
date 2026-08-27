@@ -110,26 +110,6 @@ namespace
         return RelocatedVerb { .op = op, .code = Wire::ErrorCode::DispatchNotPermitted, .why = {} };
     }
 
-    /// How far past `maxPayloadBytes` an over-cap frame may still be drained so
-    /// that its refusal can be a *reply* rather than a dropped connection.
-    ///
-    /// Refusing without draining is what made an over-cap STORE break builds: the
-    /// client is mid-send when the server stops reading and closes, so it never
-    /// sees the typed `payload-too-large` it was answered with — it sees its own
-    /// write fail (and, before issue #68, died of SIGPIPE doing so). "Declared
-    /// payload N exceeds cap M" is the one message that makes an operator raise
-    /// `--storage-max-value`, and it is worth reading and discarding the frame to
-    /// deliver it.
-    ///
-    /// Bounded, and expressed as a multiple of the operator's own cap rather than
-    /// a byte count of its own: the cap is already their statement of the largest
-    /// thing this server will handle on a connection, so being willing to discard
-    /// a few times that much needs no second knob and scales when they retune the
-    /// first one. Past the bound the server closes as before — a peer declaring
-    /// gigabytes it was never going to be allowed to store has stopped being a
-    /// client worth resynchronizing with.
-    constexpr std::uint64_t OversizeDrainFactor = 4;
-
     /// Interpret a byte span as a UTF-8/ASCII string (copying).
     [[nodiscard]] std::string BytesToString(std::span<std::byte const> bytes)
     {
@@ -489,6 +469,12 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
 
     while (true)
     {
+        // Between commands, not after one: `Compact()` releases nothing, so the buffer
+        // a 256 MiB STORE grew into would be held for the rest of a connection that no
+        // longer ends after one operation. `--max-connections` times that is a ceiling
+        // nobody chose. Whatever a pipelined peer has already sent is kept.
+        reader.ReleaseSpareCapacity();
+
         auto const headerBytes = co_await reader.ReadExactly(Wire::RequestHeaderSize);
         if (!headerBytes.has_value())
         {
@@ -544,7 +530,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // `Skip` discards in chunks and never materialises the frame, so the
             // memory the cap protects is still never taken -- draining costs
             // bandwidth the peer was going to spend anyway, not footprint.
-            auto const drainable = static_cast<std::uint64_t>(session.maxPayloadBytes) * OversizeDrainFactor;
+            auto const drainable = static_cast<std::uint64_t>(session.maxPayloadBytes) * Wire::OversizeDrainFactor;
             bool drained = false;
             if (header->payloadLength <= drainable)
                 drained = (co_await reader.Skip(header->payloadLength)).has_value();
