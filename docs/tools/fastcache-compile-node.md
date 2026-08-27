@@ -166,6 +166,29 @@ different toolchains — different patch releases, different SDKs, a vendored
 header that differs. `--print-toolchain-fingerprint` recomputes rather than
 reading the cache, so it also repairs a stale entry on its way past.
 
+### A node that never appears in the fleet at all
+
+A pinned fingerprint is yours to choose, and it has to be **text** —
+specifically, valid UTF-8. So do `--advertise` and the version the node reports
+about itself. A scheduler refuses a registration that is not, with
+`malformed-registration` naming the offending field, and the node says so once
+per heartbeat:
+
+```
+scheduler scheduler.internal:6675 did not register a1b2c3:
+  rejected (malformed-registration): fingerprint is not valid UTF-8
+```
+
+It is refused rather than cleaned up because a fingerprint is matched byte for
+byte: a worker admitted under a repaired name would match no client's toolchain
+and would sit in the fleet registered and never picked. The leader counts it as
+`fastcached_dispatch_worker_registrations_malformed_total`, which is the only
+trace a peer that never says anything else leaves behind.
+
+The commonest way to produce one is a `--toolchain=<fingerprint>=...` label
+typed in a shell whose encoding is not UTF-8. A computed fingerprint is hex and
+cannot hit this.
+
 ## A cache of its own
 
 A node can hold a cache tier in front of the shared `fastcached`, and point the

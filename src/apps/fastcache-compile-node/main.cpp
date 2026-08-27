@@ -605,11 +605,26 @@ constexpr int ExitOk = 0;
 
                 for (auto& registrar: registrars)
                 {
-                    bool ok = !registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, load, credential);
-                    if (!ok)
-                        ok = registrar.Register(*client, credential);
-                    if (ok)
+                    if (!registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, load, credential))
+                    {
                         ++accepted;
+                        continue;
+                    }
+
+                    // The scheduler's own reason, logged per toolchain. The
+                    // summary below can only say how many did not register, and
+                    // "0 of 1" is exactly as much as an operator knew about a
+                    // node that had silently dropped out of the fleet -- a
+                    // fingerprint the scheduler will not accept, a cluster this
+                    // node is not a member of, a leader that has moved.
+                    if (auto const registered = registrar.Register(*client, credential); registered.has_value())
+                        ++accepted;
+                    else
+                        logger.Logf(LogLevel::Warn,
+                                    "scheduler {} did not register {}: {}",
+                                    cfg.scheduler,
+                                    registrar.Fingerprint(),
+                                    registered.error());
                 }
                 bool const ok = accepted == registrars.size();
                 logger.Logf(ok ? LogLevel::Debug : LogLevel::Warn,

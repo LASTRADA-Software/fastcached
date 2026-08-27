@@ -9,6 +9,7 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <span>
@@ -102,10 +103,19 @@ class WorkerRegistrar
                     CompileCacheWire::CapacityFields capacity = {});
 
     /// Announce this worker over an already-connected scheduler client.
+    ///
+    /// Reports the scheduler's own words rather than a bare false, because the
+    /// reasons differ in what an operator must do about them and only the
+    /// scheduler knows which one applies: a fleet this node is not a member of, a
+    /// leader that has moved, a toolchain fingerprint that is not text. A worker
+    /// that discarded them would disappear from the fleet with nothing anywhere
+    /// saying why -- the node's own log can only report that it did not register.
     /// @param scheduler Connected transport; not owned.
     /// @param credential Credential to present.
-    /// @return True when the scheduler accepted; the assigned id is kept internally.
-    [[nodiscard]] bool Register(ISocket& scheduler, Credential const& credential = {});
+    /// @return Nothing when the scheduler accepted, and the assigned id is kept
+    ///         internally; otherwise a phrase naming the refusal or the transport
+    ///         failure, ready to log.
+    [[nodiscard]] std::expected<void, std::string> Register(ISocket& scheduler, Credential const& credential = {});
 
     /// Report liveness and current load.
     ///
@@ -127,6 +137,13 @@ class WorkerRegistrar
     [[nodiscard]] std::string const& WorkerId() const noexcept
     {
         return _workerId;
+    }
+
+    /// The toolchain this registrar announces, so a diagnostic can name which of
+    /// a node's several registrars it is about.
+    [[nodiscard]] std::string const& Fingerprint() const noexcept
+    {
+        return _fingerprint;
     }
 
   private:

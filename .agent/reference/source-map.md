@@ -16,7 +16,9 @@ src/FastCache/
                 `port` / `host:port` / `[v6]:port`), IRandomSource (the randomness seam,
                 beside Clock and for the same reason), Logger, BufferPool,
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
-                StringHash, Owner, Profiling (Tracy wrappers)
+                StringHash, Owner, Utf8 (one strict RFC 3629 decoder -- overlongs,
+                surrogates and anything above U+10FFFF refused, so what it accepts
+                a strict parser on the far end accepts too), Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil (a bounded wait a stop can interrupt),
                 DeadlineTimer (the same shape with a callback, for a timeout that

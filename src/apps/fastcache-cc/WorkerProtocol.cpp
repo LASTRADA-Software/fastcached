@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <expected>
 #include <ranges>
+#include <string>
 #include <utility>
 
 namespace FastCache::Cc
@@ -212,7 +214,7 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
 {
 }
 
-bool WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
+std::expected<void, std::string> WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
 {
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
@@ -221,10 +223,20 @@ bool WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
                                                                     .capacity = _capacity });
     auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
     if (!outcome.IsHit())
-        return false;
+        // The scheduler's own words, code and message both, which is the whole
+        // reason this is not a bool: "not a member of this cluster" and "fingerprint
+        // is not valid UTF-8" call for opposite actions from an operator, and this
+        // node cannot tell them apart from its own side.
+        return std::unexpected { DescribeOutcome(outcome) };
 
     _workerId = std::string { Wire::AsStringView(outcome.value) };
-    return !_workerId.empty();
+    if (_workerId.empty())
+        // Accepted and unusable: every later heartbeat needs the id, so a worker
+        // that kept going here would heartbeat nothing into a fleet that thinks it
+        // is registered. Reported as a refusal because that is what it costs.
+        return std::unexpected { std::string { "accepted, and assigned no worker id" } };
+
+    return {};
 }
 
 bool WorkerRegistrar::Heartbeat(ISocket& scheduler,
