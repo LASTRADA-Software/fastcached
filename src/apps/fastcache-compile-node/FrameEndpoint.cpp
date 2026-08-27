@@ -10,6 +10,8 @@
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <mutex>
@@ -35,6 +37,34 @@ namespace
     {
         auto const written = co_await socket->Write(bytes);
         co_return written.has_value() && *written == bytes.size();
+    }
+
+    /// Read and discard until the peer closes, so OUR close can be graceful.
+    ///
+    /// The counterpart of `WriteAll` on a path that answers and then hangs up: a close
+    /// with unread bytes still queued is a reset, and a reset takes the answer back
+    /// out of the peer's receive buffer. Returning as soon as the peer closes is what
+    /// makes this cheap -- a client that has read its refusal closes at once, so the
+    /// common case is one read and an EOF.
+    ///
+    /// Bounded by what the surface would have read had it accepted the request, so a
+    /// refusal never costs more than serving would have; a peer past that has stopped
+    /// being one worth being polite to and gets the reset. The socket is tracked
+    /// besides, so a peer that goes silent without closing is swept rather than
+    /// waited on.
+    /// @param socket The socket about to be closed.
+    /// @param limit How many bytes may be discarded before giving up on politeness.
+    Task<void> DrainUntilPeerCloses(ISocket* socket, std::size_t limit)
+    {
+        std::array<std::byte, 4096> scratch {};
+        for (std::size_t discarded = 0; discarded < limit;)
+        {
+            auto const read = co_await socket->Read(std::span<std::byte> { scratch });
+            if (!read.has_value() || *read == 0)
+                break;
+            discarded += *read;
+        }
+        co_return;
     }
 
 } // namespace
@@ -379,10 +409,17 @@ namespace
     /// Refuse a connection the surface has no room for, then close it.
     ///
     /// Its own task rather than a write in the accept loop, so refusing never parks
-    /// the loop on a client that is not reading. It takes no open-connection slot and
-    /// reads nothing, so it cannot itself be what keeps the surface at capacity -- but it
-    /// IS registered with the sweeper, so a client that never reads its refusal is
-    /// still let go.
+    /// the loop on a client that is not reading. It takes no open-connection slot, so
+    /// it cannot itself be what keeps the surface at capacity -- but it IS registered
+    /// with the sweeper, so a client that never reads its refusal is still let go.
+    ///
+    /// It reads, and that is not optional. Closing a socket while the peer's bytes sit
+    /// unread in the receive queue is a RESET rather than a graceful close, and a reset
+    /// discards data the peer had already buffered -- including the refusal just
+    /// written to it. Every real client writes its request and then reads, so the
+    /// refusal was never the thing they saw: they saw a connection reset, which names
+    /// neither the surface nor the reason. A client that reads WITHOUT writing did
+    /// receive it, which is how the two cases below tell the halves apart.
     DetachedTask RefuseAtCapacity(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
     {
         auto* const state = shared.get();
@@ -391,11 +428,12 @@ namespace
         state->Track(socket.get(), deadline);
         try
         {
-            (void) co_await WriteAll(socket.get(),
-                                     Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
-                                                            std::format("{} is already holding {} connections",
-                                                                        state->what,
-                                                                        state->responder.MaxOpenConnections())));
+            if (co_await WriteAll(socket.get(),
+                                  Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
+                                                         std::format("{} is already holding {} connections",
+                                                                     state->what,
+                                                                     state->responder.MaxOpenConnections()))))
+                co_await DrainUntilPeerCloses(socket.get(), state->responder.MaxRequestBytes());
         }
         catch (...)
         {

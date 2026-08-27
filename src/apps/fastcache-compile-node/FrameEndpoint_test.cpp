@@ -634,6 +634,38 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
 }
 
+TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame]")
+{
+    // The half the case above deliberately does not cover, and the half every real
+    // client is on: it writes its request and THEN reads. The endpoint wrote the
+    // refusal and closed without reading, so the request sat unread in the receive
+    // queue -- and a close with bytes still queued is a reset, which takes the refusal
+    // back out of the client's own receive buffer before it can be read.
+    //
+    // So the surface at capacity looked to every caller like a connection reset, which
+    // names neither the surface nor the reason, while the reply that did name both had
+    // been written and thrown away. The case above reads without writing and always
+    // saw it, which is what isolated this from "the refusal is never written".
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // One completed round trip before the second client arrives, so the slot is
+    // provably taken rather than probably taken: the accept that takes it is on the
+    // reactor thread and would otherwise be racing this one.
+    Conversation holder { port };
+    REQUIRE_FALSE(holder.Send(Fetch("attached")).empty());
+
+    auto const refusal = Exchange(port, Fetch("while-attached"));
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+}
+
 TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
 {
     // The one case that must NOT resynchronize: with no recognisable header there is
