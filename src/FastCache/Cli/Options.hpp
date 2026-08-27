@@ -3,11 +3,13 @@
 
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
+#include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <ranges>
 #include <span>
 #include <string>
@@ -275,6 +277,47 @@ template <auto Field>
     return std::string { sv };
 }
 
+/// As ParseText, for a flag whose value OTHER MACHINES will read.
+///
+/// Which flags those are is a column of the option table, the same way the set of
+/// verbs reachable before authentication is: a node's advertised endpoint and its
+/// cluster id travel to peers, are rendered into `/fleet.json` and onto the fleet
+/// page, and #141 made the scheduler refuse a registration carrying a field that
+/// is not valid UTF-8. A path or a local-only setting is deliberately NOT in this
+/// column -- on a host that transcodes nothing, a legacy filename is a perfectly
+/// good filename, and refusing it would break a working build to satisfy a rule
+/// about a different thing.
+///
+/// Refused HERE, where a person typed it, rather than only at the far end. A value
+/// that gets past this is refused by `SchedulerService::Register` on every
+/// heartbeat, forever, with the operator's only recovery being to rename the
+/// thing -- and on Windows the byte they typed was never going to be the byte the
+/// check wanted (issue #155). The offending offset is named because "not valid
+/// UTF-8" about a string a console already re-rendered tells nobody which
+/// character was the problem.
+///
+/// @param sv The value text.
+/// @return `sv` as an owned string, or why it is not text. The error names no
+///         field; `ApplyOneOption` stamps the flag, which this cannot know.
+[[nodiscard]] inline std::expected<std::string, ConfigError> ParseUtf8Text(std::string_view sv)
+{
+    std::size_t offset = 0;
+    while (offset < sv.size())
+    {
+        auto const length = Utf8SequenceLength(sv.substr(offset));
+        if (length == 0)
+            return std::unexpected(ArgvError(
+                ConfigErrorCode::ParseError,
+                {},
+                std::format("value is not valid UTF-8: byte 0x{:02X} at offset {} starts no valid sequence, so this "
+                            "value cannot travel to the rest of the fleet",
+                            static_cast<unsigned>(static_cast<unsigned char>(sv[offset])),
+                            offset)));
+        offset += length;
+    }
+    return std::string { sv };
+}
+
 /// Apply the one option named by `args[i]`.
 ///
 /// @param table The rows to match against.
@@ -305,7 +348,22 @@ template <typename Result>
             value = *taken;
         }
         if (auto const applied = (*match->apply)(result, value); !applied.has_value())
-            return std::unexpected(applied.error());
+        {
+            // The flag stamped here rather than by the value parser, which cannot
+            // know it: a parser is a free function reached through a member pointer
+            // in the table, shared by every row that uses it. A row's own spelling
+            // is the only one that could ever be right, and a hand-written field is
+            // one that drifts when a flag is renamed.
+            //
+            // Only when the parser left it empty, so a parser with something more
+            // specific to say -- the node's log-level parser names `log-level`, and
+            // its cluster appliers name the action they were reached through --
+            // keeps saying it.
+            auto error = applied.error();
+            if (error.field.empty())
+                error.field = std::string { match->primary };
+            return std::unexpected(std::move(error));
+        }
     }
     if (match->select != nullptr)
     {
