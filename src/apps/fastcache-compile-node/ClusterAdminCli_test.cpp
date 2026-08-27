@@ -256,6 +256,39 @@ TEST_CASE("A change reaches the cluster as the command it names", "[node][cluste
     CHECK(cluster.proposed[1] == Cmd(Cluster::CommandKind::RemoveMember, "n3"));
 }
 
+TEST_CASE("The operator's door refuses a member it could not name, and forgets one anyway", "[node][clusteradmin]")
+{
+    // #159 at the door an operator types through, which is the one where a refusal is
+    // safe: `--cluster-admit` and `--cluster-set` are one-shot and somebody is
+    // reading the answer. The reconciler is the door where the same refusal is a
+    // trap, because it would retry the identical command every interval forever.
+    Fixture fixture;
+    FakeCluster cluster;
+    fixture.service.AdministerWith(cluster);
+
+    auto const admit = fixture.Ask(Ask(ClusterAction::Admit, "n\x80", "10.0.0.4:6680"));
+    CHECK(ErrorOf(admit) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK(MessageOf(admit).contains("a member id"));
+
+    // A second verb, because what this case is about is the DOOR: which field of
+    // which command is at fault is `ClusterState_test`'s question, and it asks it
+    // over every field there.
+    auto const set = fixture.Ask(Ask(ClusterAction::Set, "upstream", "cache.internal:6674\xE2\x82"));
+    CHECK(ErrorOf(set) == Wire::ErrorCode::InvalidClusterChange);
+
+    // Refused before the cluster was asked, not by it: the whole point of shutting
+    // this door is that no such entry ever reaches a log the fleet replicates.
+    CHECK(cluster.proposed.empty());
+
+    // And the removal goes through, which is what keeps the refusal from being a
+    // trap. A member that reached replicated state through a peer built before any
+    // of this existed is exactly the one an operator has to be able to name, and its
+    // id is the offending value itself.
+    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Forget, "n\x80"))) == Wire::Status::Ok);
+    REQUIRE(cluster.proposed.size() == 1);
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::RemoveMember, "n\x80"));
+}
+
 TEST_CASE("A node with no cluster says so rather than pretending", "[node][clusteradmin]")
 {
     // The state of a single node started without `--node-id`: it leads itself and

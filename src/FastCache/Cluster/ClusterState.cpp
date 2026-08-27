@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
+#include <array>
 #include <ranges>
+#include <span>
 #include <utility>
 
 namespace FastCache::Cluster
@@ -120,8 +124,13 @@ std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
     // later: a byte this build does not know is a peer speaking a vocabulary it
     // lacks, and applying it as whichever enumerator it happens to alias would
     // change the cluster's state in a way nobody wrote down.
-    auto const kindRaw = static_cast<std::uint8_t>(header[1]);
-    if (kindRaw > static_cast<std::uint8_t>(CommandKind::SetSetting))
+    //
+    // Bounded by the enum's own count rather than by its last enumerator BY NAME.
+    // The two agree today and stop agreeing the moment a verb is appended: the
+    // name-anchored form then refuses the new verb, on a peer that understands it
+    // perfectly, and says nothing about why.
+    auto const kindRaw = static_cast<std::size_t>(header[1]);
+    if (kindRaw >= EnumeratorCount<CommandKind>)
         return std::nullopt;
 
     return Command { .kind = static_cast<CommandKind>(kindRaw),
@@ -222,6 +231,7 @@ void Apply(ClusterState& state, Command const& command)
         case CommandKind::RemoveMember:
             std::erase_if(state.members, [&](auto const& member) { return member.id == command.key; });
             return;
+
         case CommandKind::SetSetting: {
             auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
             if (it != state.settings.end())
@@ -233,13 +243,82 @@ void Apply(ClusterState& state, Command const& command)
             SortByKey(state.settings, &Setting::name);
             return;
         }
+
+        // Not a verb -- it is the enum's own count, which is what sizes the table in
+        // `Validate`. Named rather than swept up by a `default`, because a `default`
+        // is what would let a verb added later reach this switch unhandled and be
+        // applied as nothing at all, silently.
+        case CommandKind::Last:
+            break;
     }
 }
 
+namespace
+{
+    /// What `AddMember` records; all three become a `ClusterMember`.
+    ///
+    /// The rows restate the strings `Apply` copies, which is a residual worth naming:
+    /// the completeness check below proves one row per VERB, not one entry per field,
+    /// so a fourth string added to `Command` and copied by `Apply` would get neither an
+    /// entry here nor a compile error. That is the same residual
+    /// `RegistrationTextFields` records about `WorkerRegistration`, and the reason both
+    /// are tables rather than checks written out.
+    constexpr std::array<TextField<Command>, 3> AddMemberText { {
+        { .name = "a member id", .project = [](Command const& c) -> std::string_view { return c.key; } },
+        { .name = "a member's consensus endpoint", .project = [](Command const& c) -> std::string_view { return c.value; } },
+        { .name = "a member's scheduler endpoint",
+          .project = [](Command const& c) -> std::string_view { return c.schedulerEndpoint; } },
+    } };
+
+    /// What `SetSetting` records that is not already decided by a lookup.
+    ///
+    /// The name is absent because `FindSetting` settles it: a key this build does not
+    /// know is refused whatever its bytes are, so a spelling that is not text cannot
+    /// reach the state through that door either.
+    constexpr std::array<TextField<Command>, 1> SetSettingText { {
+        { .name = "a cluster setting's value", .project = [](Command const& c) -> std::string_view { return c.value; } },
+    } };
+
+    /// Which strings each verb records, in one place.
+    struct CommandTextRow
+    {
+        CommandKind kind;                           ///< The verb this row describes.
+        std::span<TextField<Command> const> fields; ///< What it must be able to name.
+    };
+
+    /// One row per `CommandKind`, in enumerator order.
+    ///
+    /// `RemoveMember`'s row is empty **by name** rather than by an omission somebody
+    /// might tidy up. `Validate` states why; what belongs here is that an empty row
+    /// is a decision and looks like one.
+    constexpr EnumTable<CommandKind, CommandTextRow> CommandTextFields { {
+        { .kind = CommandKind::AddMember, .fields = AddMemberText },
+        { .kind = CommandKind::RemoveMember, .fields = {} },
+        { .kind = CommandKind::SetSetting, .fields = SetSettingText },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(CommandTextFields, &CommandTextRow::kind),
+                  "CommandTextFields must hold one row per CommandKind, in enumerator order");
+
+} // namespace
+
 std::expected<void, ConsensusError> Validate(Command const& command)
 {
+    // The verb first, because nothing else can be judged without it -- and because a
+    // `Command` can be built by a decoder, so indexing the table below is not the way
+    // to find out that this build has no row for it.
+    auto const verb = static_cast<std::size_t>(command.kind);
+    if (verb >= EnumeratorCount<CommandKind>)
+        return std::unexpected(InvalidConfiguration("unknown command"));
+
     if (command.key.empty())
         return std::unexpected(InvalidConfiguration("a cluster command names nothing"));
+
+    // Before the per-verb rules rather than inside them, because the answer is
+    // already per-verb: the table is indexed by the verb, and `RemoveMember`'s row is
+    // deliberately empty.
+    if (auto const field = FirstFieldNotText(command, CommandTextFields[verb].fields); field.has_value())
+        return std::unexpected(InvalidConfiguration(NotTextRefusal(*field)));
 
     switch (command.kind)
     {
@@ -267,6 +346,10 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             if (FindSetting(command.key) == nullptr)
                 return std::unexpected(InvalidConfiguration("no such cluster setting: " + command.key));
             return {};
+
+        // The count rather than a verb; falls out to the refusal below.
+        case CommandKind::Last:
+            break;
     }
 
     return std::unexpected(InvalidConfiguration("unknown command"));
