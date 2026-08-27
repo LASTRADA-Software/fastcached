@@ -252,6 +252,21 @@ struct PathValueMatch
                                                                std::string_view introducers,
                                                                DriverFamily families);
 
+/// How a driver is TOLD which target to generate for.
+///
+/// A function over the DISCOVERY mechanism rather than a constant, so the two
+/// cannot drift: a mechanism added to `TargetDiscovery` is a compile error here,
+/// which is exactly where somebody has to decide whether `--target=` is still the
+/// right way to say it.
+///
+/// The value is meant to be FUSED onto the triple, for the reason
+/// `ObjectOutputPrefixFor`'s is: `--target x` is rejected by clang-cl while
+/// `--target=x` is accepted by both clang drivers, so one spelling covers both.
+///
+/// @param discovery The mechanism that produced the triple.
+/// @return The flag prefix, or empty when this mechanism pins nothing.
+[[nodiscard]] std::string_view TargetPinPrefixFor(TargetDiscovery discovery) noexcept;
+
 /// The option-introducer characters a driver family uses.
 /// @param family The family (or family set) to describe.
 /// @return Its introducers; empty for DriverFamily::None.
@@ -581,14 +596,39 @@ struct ParsedCommand
 /// The worker separately refuses to take its compiler from the client, so this is
 /// the second of two independent barriers rather than the only one.
 ///
+/// ## The target is stated, not left to the worker
+///
+/// `targetTriple` is emitted as `--target=<triple>` **first**, ahead of everything
+/// the build said for itself. A worker otherwise re-derives the target from its own
+/// machine, and for a Microsoft target that re-derivation includes
+/// `-fms-compatibility-version`: clang-cl reads it from whatever MSVC it can find,
+/// a Windows service can find none and falls back to clang's built-in default, and
+/// the toolchain fingerprint sees neither. So two ends match and generate
+/// differently, which is a wrong object with a zero exit code.
+///
+/// FIRST and not last, which is the opposite of the language flags below and for the
+/// opposite reason. What this states is the DEFAULT the client's own driver would
+/// have used, so anything the build names explicitly -- `--target=`, `-m32` -- comes
+/// later on the line and still wins, exactly as it does locally. Appending it would
+/// override the build instead, and compiling for a target the build did not ask for
+/// is a wrong object rather than a failed one.
+///
+/// Passing it is not optional, and there is deliberately no default: a second
+/// dispatch path that forgot it would silently go back to letting the worker choose.
+/// Empty is the honest answer for a driver with no target to state (`cl`) or one
+/// that would not say, and it leaves the line exactly as it was.
+///
 /// @param cmd The parsed compile command.
 /// @param argv The original full invocation.
+/// @param targetTriple The target the CLIENT's driver would generate for; empty to
+///        state none.
 /// @return The arguments to send (without the compiler and without the source), or
 ///         the reason this command line must not be dispatched. The reason travels
 ///         because every refusal here ends in a local compile, and "distribution
 ///         stopped helping" is otherwise a whole investigation.
 [[nodiscard]] std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
-                                                                                     std::span<std::string const> argv);
+                                                                                     std::span<std::string const> argv,
+                                                                                     std::string_view targetTriple);
 
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,

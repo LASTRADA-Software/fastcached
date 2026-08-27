@@ -637,6 +637,21 @@ std::span<PathValueFlag const> PathValueFlags()
     return PathValues;
 }
 
+std::string_view TargetPinPrefixFor(TargetDiscovery discovery) noexcept
+{
+    // No `default:`, so a mechanism added to the table fails to compile here rather
+    // than silently pinning nothing -- which would present as a worker quietly going
+    // back to choosing its own target.
+    switch (discovery)
+    {
+        case TargetDiscovery::None:
+            return {};
+        case TargetDiscovery::ClangDriverLine:
+            return "--target=";
+    }
+    return {};
+}
+
 std::string_view IntroducersOf(DriverFamily family) noexcept
 {
     for (auto const& [candidate, introducers]: FamilyIntroducers)
@@ -923,7 +938,8 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
 }
 
 std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCommand const& cmd,
-                                                                       std::span<std::string const> argv)
+                                                                       std::span<std::string const> argv,
+                                                                       std::string_view targetTriple)
 {
     auto const& driver = DriverOf(cmd.flavor);
 
@@ -950,7 +966,16 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
             std::format("this driver has no way to be handed preprocessed {}", DescribeLanguage(*language)));
 
     std::vector<std::string> out;
-    out.reserve(argv.size());
+    out.reserve(argv.size() + 1);
+
+    // FIRST, before a single one of the build's own arguments. This states the
+    // default the client's driver would have used; the build's own `--target=` or
+    // `-m32` comes later and still wins, which is what happens locally and is why
+    // probing the ambient default is enough. The prefix comes from the mechanism
+    // that produced the triple, so a driver with nothing to state pins nothing even
+    // if a caller hands it a value.
+    if (auto const prefix = TargetPinPrefixFor(driver.targetDiscovery); !prefix.empty() && !targetTriple.empty())
+        out.emplace_back(std::format("{}{}", prefix, targetTriple));
 
     std::size_t skipUntil = 1; // argv[0] is the compiler; the worker picks its own
     for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))

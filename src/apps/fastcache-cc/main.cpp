@@ -1293,12 +1293,36 @@ void RecordManifest(Config const& cfg,
     // launcher cannot account for. See RemoteCompileArgs: refusing costs one local
     // compile, where stripping an unrecognised argument would change the generated
     // code and hand back an object nobody asked for.
-    auto const args = Cc::RemoteCompileArgs(cmd, argv);
+    //
+    // Asked WITHOUT a target first, because this question is answered on string work
+    // alone and the next one costs a process. See below.
+    auto args = Cc::RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
     if (!args.has_value())
     {
         Note(std::format("not dispatchable ({}); compiling locally", args.error()));
         return std::nullopt;
     }
+
+    // What target THIS machine's driver would generate for, stated on the line so the
+    // worker cannot substitute its own. For a Microsoft target the triple carries
+    // `-fms-compatibility-version`, which clang-cl derives from whatever MSVC it can
+    // find -- a service finds none and falls back to clang's built-in default -- and
+    // which the toolchain fingerprint does not see at all. Without this the two ends
+    // match and generate differently, and the object comes back wrong with a zero
+    // exit code.
+    //
+    // BELOW the refusal, so a line that was never going to be dispatched does not
+    // fork a compiler to decorate arguments about to be thrown away. The
+    // fingerprint's own probe sits below the same guard for the same reason. A driver
+    // with nothing to state (`cl`) is not spawned at all.
+    //
+    // Rebuilt rather than having the flag spliced in here: the rule that the pin goes
+    // FIRST -- so the build's own `--target=` or `-m32` still wins -- belongs to the
+    // function that owns the argument order, and it is unit-tested there. A second
+    // pass over a short argument list is string work against a process spawn.
+    if (auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, Cc::DriverOf(cmd.flavor));
+        !targetTriple.empty())
+        args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
 
     // Preprocessed again, with `#line` markers this time. The key's text has them
     // suppressed so no checkout path reaches the key; a worker needs them, because

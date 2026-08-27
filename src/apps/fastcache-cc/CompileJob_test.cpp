@@ -308,6 +308,12 @@ TEST_CASE("IsAcceptableJobArgument applies the strictest reading", "[compile-job
     CHECK(IsAcceptableJobArgument("-O2"));
     CHECK(IsAcceptableJobArgument("-std=c++23"));
     CHECK(IsAcceptableJobArgument("/O2"));
+    // The target the CLIENT states so this worker cannot pick its own. The client's
+    // filter protects an honest client; this one protects the worker from a client
+    // that is not. They have to agree about this argument specifically, or every
+    // dispatched clang compile becomes a RejectedArgument the moment the pin lands.
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-windows-msvc19.51.36252"));
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu"));
     CHECK(IsAcceptableJobArgument(""));
 
     CHECK_FALSE(IsAcceptableJobArgument("@rsp"));
