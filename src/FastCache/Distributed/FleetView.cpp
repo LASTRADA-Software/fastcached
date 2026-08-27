@@ -484,10 +484,31 @@ FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept
         // implementations of what a machine may take is how a worker comes to
         // accept more jobs than the scheduler believes it has, which is the
         // reason that function exists at all.
-        auto const ceilings = SlotCeilingsFor(node.capacity, node.registeredSlots, node.load);
+        // `NodeLoad::inFlight` on a report is the CONTRIBUTING ENTRY's job count,
+        // as `NodeReport` says in as many words -- its machine-wide fields are what
+        // this grain is for, and that one is not among them. A machine serving two
+        // toolchains with four jobs each reports 4 there and 8 in
+        // `fleetJobsInFlight`, so a ceiling built from the former and a subtraction
+        // using the latter would mix two grains in one subtraction.
+        auto machineLoad = node.load;
+        machineLoad.inFlight = node.fleetJobsInFlight;
+
+        auto const ceilings = SlotCeilingsFor(node.capacity, node.registeredSlots, machineLoad);
         totals.registered += node.registeredSlots;
         totals.inFlight += node.fleetJobsInFlight;
-        totals.free += ceilings.available;
+
+        // A ceiling is the total a machine supports with its RUNNING jobs
+        // INCLUDED -- `Detail::CeilingFrom` says so in as many words -- so adding
+        // it straight into `free` counts this fleet's own work twice: once as
+        // in-flight and once as room to start more. A full 8-slot machine then
+        // rendered "8 compiling, 8 free" out of 8 registered, and the legend
+        // offered a compile a start on a machine that could take none.
+        //
+        // `WorkerRegistry::FreeSlots` is the definition this has to match, and it
+        // subtracts before calling anything free. Two answers to "what is free"
+        // is how a page comes to disagree with the scheduler it is describing.
+        auto const ceiling = std::min(ceilings.available, node.registeredSlots);
+        totals.free += node.fleetJobsInFlight >= ceiling ? 0U : ceiling - node.fleetJobsInFlight;
     }
 
     // Saturating, not wrapping. These are unsigned and the three parts are read

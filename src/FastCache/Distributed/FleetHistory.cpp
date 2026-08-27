@@ -53,7 +53,13 @@ namespace
         auto const start = number * widthMillis;
         auto& slot = ring[static_cast<std::size_t>(number) % ring.size()];
         auto const opened = !slot.present || slot.startMillis != start;
-        slot = FleetBucket { .startMillis = start, .values = values, .present = true };
+
+        // `nowMillis` for the sample instant, NOT the aligned `start`. Stamping the
+        // alignment here throws the reading's real time away at the moment it is
+        // recorded, and no later fold can recover it -- which made the divisor fix
+        // below a no-op for the Week view, whose bucket IS its sub-bucket, so the
+        // two were always exactly one nominal width apart.
+        slot = FleetBucket { .startMillis = start, .sampleMillis = nowMillis, .values = values, .present = true };
         return opened;
     }
 
@@ -157,11 +163,15 @@ std::vector<FleetBucket> FleetHistory::Buckets(FleetRange range) const
         auto found = NewestWithin(source, subWidth, start, start + width);
         if (found.has_value())
         {
+            // Only `startMillis` is restamped, to the window's start, so the chart
+            // plots evenly. `sampleMillis` is carried through untouched: it is the
+            // instant `PlaceInto` recorded, and deriving it from the sub-bucket's
+            // alignment here would throw away exactly what it exists to keep.
             found->startMillis = start;
             out.push_back(*found);
         }
         else
-            out.push_back(FleetBucket { .startMillis = start, .values = {}, .present = false });
+            out.push_back(FleetBucket { .startMillis = start, .sampleMillis = start, .values = {}, .present = false });
     }
     return out;
 }
@@ -299,6 +309,7 @@ bool FleetHistory::Load(std::filesystem::path const& path)
             if (!take(start) || !take(present))
                 return false;
             bucket.startMillis = static_cast<std::int64_t>(start);
+            bucket.sampleMillis = bucket.startMillis;
             bucket.present = present != 0;
             for (auto& value: bucket.values)
                 if (!take(value))

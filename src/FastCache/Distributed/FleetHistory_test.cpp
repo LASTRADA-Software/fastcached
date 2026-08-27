@@ -233,3 +233,36 @@ TEST_CASE("A history file that cannot be trusted starts empty rather than throwi
         CHECK(history.Empty());
     }
 }
+
+TEST_CASE("A bucket remembers when it was sampled, not when its window opened", "[distributed][fleethistory]")
+{
+    // The two are the same thing for a reading that lands on a boundary and
+    // different for every other one, and only the second is what a rate may be
+    // divided by. Stamping the alignment at RECORD time throws the instant away
+    // where no later fold can recover it -- which made the Week view, whose bucket
+    // is its own sub-bucket, always report exactly one nominal width between two
+    // adjacent points however far apart they were really taken.
+    PlacedWallClock clock;
+    FleetHistory history { clock };
+
+    // Two readings in consecutive hours, but only ten minutes apart: the first at
+    // the end of its hour, the second at the start of the next.
+    clock.Set(std::chrono::sys_days { std::chrono::January / 1 / 2030 } + std::chrono::hours { 5 }
+              + std::chrono::minutes { 55 });
+    history.Record(Reading(100));
+    clock.Set(std::chrono::sys_days { std::chrono::January / 1 / 2030 } + std::chrono::hours { 6 }
+              + std::chrono::minutes { 5 });
+    history.Record(Reading(130));
+
+    auto const week = history.Buckets(FleetRange::Week);
+    REQUIRE(week.size() >= 2);
+    auto const& last = week.back();
+    auto const& prior = week[week.size() - 2];
+    REQUIRE(last.present);
+    REQUIRE(prior.present);
+
+    // Drawn one hour apart, as the chart needs.
+    CHECK(last.startMillis - prior.startMillis == 3'600'000);
+    // Taken ten minutes apart, as a rate needs.
+    CHECK(last.sampleMillis - prior.sampleMillis == 600'000);
+}

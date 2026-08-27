@@ -311,7 +311,19 @@ FleetSeriesValues ValuesFor(FleetSeriesRow const& series,
 
         if (series.kind == FleetSeriesKind::Rate)
         {
-            out[index] = minutes > 0.0 ? static_cast<double>(numerator) / minutes : 0.0;
+            // The span BETWEEN THE TWO SAMPLES, not the nominal bucket width. The
+            // newest bucket is always still open -- a 7-day view one minute past
+            // the hour holds two readings two minutes apart and would divide them
+            // by sixty, reporting a thirtieth of the rate on the point labelled
+            // "now" and on the headline beside the chart. A window that was only
+            // partly sampled is understated the same way, less dramatically.
+            //
+            // Falls back to the nominal width when the two carry no usable span,
+            // which is what a bucket assembled by hand rather than by `Buckets()`
+            // has.
+            auto const observed = static_cast<double>(here.sampleMillis - prior.sampleMillis) / 60'000.0;
+            auto const divisor = observed > 0.0 ? observed : minutes;
+            out[index] = divisor > 0.0 ? static_cast<double>(numerator) / divisor : 0.0;
             continue;
         }
 

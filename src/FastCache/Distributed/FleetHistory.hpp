@@ -82,6 +82,21 @@ struct FleetBucket
     /// Wall clock and not `TimePoint`: this outlives the process, and a steady
     /// clock's origin is meaningless across a restart.
     std::int64_t startMillis { 0 };
+
+    /// Wall-clock instant the reading in `values` was actually taken.
+    ///
+    /// Separate from `startMillis` because the two answer different questions and
+    /// only one of them can be the bucket's x-position. `Buckets()` folds a window
+    /// down to its newest sample and then stamps the WINDOW's start on it, so the
+    /// chart's points are evenly spaced -- which is right for plotting and wrong
+    /// for dividing by. The newest bucket is always still open, so a rate that
+    /// divided the delta by the nominal width reported a fraction of the truth on
+    /// exactly the point an operator reads first.
+    ///
+    /// Not persisted: the stored ring's own `startMillis` IS the sample instant at
+    /// sub-bucket granularity, so this is derived on the way out and the file
+    /// format is unchanged.
+    std::int64_t sampleMillis { 0 };
     EnumTable<FleetMetric, std::uint64_t> values {}; ///< Raw readings, counters cumulative.
     bool present { false };                          ///< False means nobody sampled this bucket.
 };

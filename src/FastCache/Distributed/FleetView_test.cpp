@@ -468,10 +468,45 @@ TEST_CASE("Fleet capacity is summed per machine and splits busy from withheld", 
 
     CHECK(totals.registered == 24);
     CHECK(totals.inFlight == 4);
-    // The whole point of the split: what is not running is not therefore
-    // available, and the difference is what an operator has to act on.
+
+    // Named rather than left to the identity below, which is the whole reason
+    // this case did not catch a defect it covers. `withheld` is derived by
+    // subtraction, so `inFlight + free + withheld == registered` holds for ANY
+    // `free` the sum produces -- it asserted the arithmetic was self-consistent,
+    // not that it was right.
+    //
+    // The busy machine: 16 registered, 900 permille of 16 cores is 14 busy, less
+    // our own 4 leaves 10 taken by somebody else, so it supports 6 jobs in total
+    // -- 4 of which are already running. Two are free and ten are withheld.
+    // The idle machine reports nothing, so all 8 of its slots are free.
+    CHECK(totals.free == 10);
+    CHECK(totals.withheld == 10);
     CHECK(totals.inFlight + totals.free + totals.withheld == totals.registered);
-    CHECK(totals.withheld > 0);
+}
+
+TEST_CASE("A machine running everything it can offers nothing", "[distributed][fleetview]")
+{
+    // The sharpest form of the same defect, and the one an operator sees first: a
+    // ceiling is the total a machine supports with its RUNNING jobs INCLUDED
+    // (`Detail::CeilingFrom`), so treating it as free counts this fleet's own work
+    // twice. `WorkerRegistry::FreeSlots` subtracts `inFlight` before calling
+    // anything free; this has to agree with it, or the page invites an operator to
+    // start work on a machine the scheduler will not send any to.
+    FleetSnapshot snapshot;
+    snapshot.role = SchedulerRole::Leader;
+    auto full = Machine("10.0.0.1:7100", 8);
+    full.registeredSlots = 8;
+    full.fleetJobsInFlight = 8;
+    full.load = NodeLoad {};
+    full.load.inFlight = 8;
+    snapshot.nodes.push_back(full);
+
+    auto const totals = TotalsFor(snapshot);
+
+    CHECK(totals.registered == 8);
+    CHECK(totals.inFlight == 8);
+    CHECK(totals.free == 0);
+    CHECK(totals.withheld == 0);
 }
 
 TEST_CASE("Fleet capacity saturates rather than wrapping", "[distributed][fleetview]")
