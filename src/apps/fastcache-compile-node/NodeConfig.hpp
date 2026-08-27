@@ -544,9 +544,14 @@ struct NodeConfig
 /// watching -- and the tier is that same answer arriving at the boot of a
 /// `NodeConfig` nobody parsed from an argv. Two spellings of one rule is what this
 /// codebase's table idiom exists to prevent.
+///
+/// It ends without a full stop, alone among the rows: `main.cpp` prints a tier's
+/// refusal as `"{}; refusing to start"`, and the tier's other messages are written
+/// as fragments for exactly that. One message serving two callers has to suit the
+/// one that appends.
 inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
     "--node-id names no --raft-peer: this node must name the endpoint its peers dial, whether it bootstraps a "
-    "cluster or joins one. Consensus refuses to start without it, so this worker would exit at every boot.";
+    "cluster or joins one, and consensus cannot start without one";
 
 /// The `--raft-peer` entry `--node-id` names, if the list names it at all.
 ///

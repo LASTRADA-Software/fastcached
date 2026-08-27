@@ -697,6 +697,11 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
     // policy table in between, and must not hear a second opinion.
     CHECK(Unwrap(StartupPolicyRejection(shapes[0].second)) == NodeIdNamesNoPeerRefusal);
 
+    // And it names its own flag, which is what lets `main.cpp` print a tier's
+    // refusal without prefixing one -- it used to, and rendered this message as
+    // "--node-id --node-id names no --raft-peer".
+    CHECK(NodeIdNamesNoPeerRefusal.starts_with("--node-id"));
+
     // A node that names itself is accepted, bootstrapping or joining.
     auto bootstrapping = Installable();
     bootstrapping.nodeId = "n1";
