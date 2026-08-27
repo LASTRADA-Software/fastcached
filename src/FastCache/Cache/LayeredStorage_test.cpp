@@ -300,7 +300,7 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[laye
         REQUIRE(storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     clock.Advance(10ms);
-    auto const purged = storage->PurgeExpired(clock.Now());
+    auto const purged = storage->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 5U);
 
     // Surviving entries still reachable.

@@ -133,7 +133,7 @@ class WriteErrorReportingStorage final: public IStorage
         TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
     void Resize(std::size_t newMaxBytes) override;
 
     /// Forward to the inner storage: this decorator counts write errors, it

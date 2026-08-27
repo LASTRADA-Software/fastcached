@@ -129,7 +129,7 @@ class ShardedStorage final: public IStorage
         TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Hand `log` to every shard, each under its own exclusive lock.
     ///
@@ -176,6 +176,16 @@ class ShardedStorage final: public IStorage
     };
 
     std::vector<std::unique_ptr<Shard>> _shards;
+
+    /// Which shard the next bounded `PurgeExpired` starts on.
+    ///
+    /// Each shard resumes its own pass from its own cursor, but a budget
+    /// smaller than the number of shards is spent before the loop reaches the
+    /// far ones -- so without a rotating start, shard 0 would be swept every
+    /// cycle and the last shard never. Relaxed because a race between two
+    /// concurrent sweeps costs a repeated shard, not a missed one, and this is
+    /// not worth a lock of its own.
+    std::atomic<std::size_t> _sweepShard { 0 };
 };
 
 } // namespace FastCache

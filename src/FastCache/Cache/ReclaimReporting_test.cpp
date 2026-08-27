@@ -123,7 +123,7 @@ TEST_CASE("A generation flush is not reported as an expiry", "[cache][reclaim-re
 
     REQUIRE(lru.Set("kept", Value(8), 0, TimePoint::max()).has_value());
     lru.FlushWithGeneration(TimePoint {});
-    REQUIRE(lru.PurgeExpired(TimePoint {}) == 1);
+    REQUIRE(lru.PurgeExpired(TimePoint {}, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log).empty());
 }
 
@@ -139,7 +139,7 @@ TEST_CASE("A sweep reports the entries whose TTL had passed", "[cache][reclaim-r
     REQUIRE(lru.Set("gone", Value(8), 0, expiry).has_value());
     REQUIRE(lru.Set("stays", Value(8), 0, TimePoint::max()).has_value());
 
-    REQUIRE(lru.PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE(lru.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
 
@@ -305,7 +305,7 @@ TEST_CASE("A LayeredStorage still reports an L2 expiry", "[cache][reclaim-report
 
     auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(layered.Set("gone", Value(8), 0, expiry).has_value());
-    REQUIRE(layered.PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE(layered.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
 
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
@@ -348,7 +348,7 @@ TEST_CASE("The disk tier's sweep reports only the entries whose TTL had passed",
     REQUIRE((*tier)->Set("gone", Value(8), 0, expiry).has_value());
     REQUIRE((*tier)->Set("stays", Value(8), 0, TimePoint::max()).has_value());
 
-    REQUIRE((*tier)->PurgeExpired(expiry + std::chrono::seconds { 1 }) == 1);
+    REQUIRE((*tier)->PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
 }
 

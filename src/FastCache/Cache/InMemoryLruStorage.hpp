@@ -139,7 +139,7 @@ class InMemoryLruStorage final: public IStorage
                                                                   TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Report this tier's reclaims — a lapsed TTL noticed during a lookup or a
     /// sweep, and the LRU tail dropped to stay under budget — to `log`.
@@ -248,6 +248,11 @@ class InMemoryLruStorage final: public IStorage
     void EvictToFit();
 
     /// Erase the entry pointed at by `it`. Updates accounting and stats.
+    ///
+    /// The single erase point for this tier, and `_sweepCursor` is why that
+    /// matters: it is the one iterator that outlives the call which produced
+    /// it, so this is the only place that can leave it dangling.
+    /// @param it Entry to erase.
     void EraseAt(Iterator it);
 
     /// True if a value of `size` bytes exceeds the configured per-value
@@ -272,6 +277,21 @@ class InMemoryLruStorage final: public IStorage
     CasToken _nextCas { 1 };
 
     LruList _lru;
+
+    /// Where the next bounded `PurgeExpired` resumes.
+    ///
+    /// A sweep that always started at `_lru.begin()` would examine the same
+    /// prefix every cycle and never reach anything past its own budget, which
+    /// on a cache larger than one budget means the entries at the far end
+    /// never expire at all. `std::list` iterators survive every other
+    /// mutation this tier performs -- insertion, and the splice that promotes
+    /// an entry -- so the only thing that can invalidate this is erasing the
+    /// node it points at, which `EraseAt` handles.
+    ///
+    /// Declared after `_lru` so the default member initialiser below reads an
+    /// already-constructed list.
+    Iterator _sweepCursor { _lru.end() };
+
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
 
     mutable StorageStats _stats;

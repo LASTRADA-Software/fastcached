@@ -308,7 +308,7 @@ class CowTreeStorage final: public IStorage
                                                                      TimePoint now) override;
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
-    std::size_t PurgeExpired(TimePoint now) override;
+    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
 
     /// Report this tier's reclaims — TTLs found lapsed during a sweep, and the
     /// LRU tail dropped to stay under the on-disk budget — to `log`.
@@ -590,7 +590,27 @@ class CowTreeStorage final: public IStorage
     using LruList = std::list<LruNode>;
     using Iterator = LruList::iterator;
 
+    /// Drop the mirror node `it` names: byte accounting, index, list.
+    ///
+    /// The single erase point for the mirror, which `_sweepCursor` requires:
+    /// it is the one iterator that outlives the call which produced it, so a
+    /// second place that erased a node would be a second place that could
+    /// leave the cursor dangling -- and the one to forget the fix-up would be
+    /// whichever is written next.
+    /// @param it Mirror node to drop. Must be dereferenceable.
+    void EraseNode(Iterator it);
+
     LruList _lru;
+
+    /// Where the next bounded `PurgeExpired` resumes. See the identically
+    /// named member on `InMemoryLruStorage` for why a sweep needs one; this
+    /// tier additionally pays a disk read per entry examined, so the budget
+    /// that cursor serves matters more here, not less.
+    ///
+    /// Declared after `_lru` so the default member initialiser below reads an
+    /// already-constructed list.
+    Iterator _sweepCursor { _lru.end() };
+
     std::unordered_map<std::string, Iterator, TransparentStringHash, std::equal_to<>> _index;
 
     std::size_t _bytesUsed { 0 };

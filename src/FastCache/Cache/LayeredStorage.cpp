@@ -330,13 +330,20 @@ void LayeredStorage::FlushWithGeneration(TimePoint effectiveAt)
     _l1->FlushWithGeneration(effectiveAt);
 }
 
-std::size_t LayeredStorage::PurgeExpired(TimePoint now)
+PurgeOutcome LayeredStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    // L2 is canonical for the purge count — counts entries actually
-    // removed from the disk file. L1's purge is opportunistic.
-    auto const l2Count = _l2->PurgeExpired(now);
-    static_cast<void>(_l1->PurgeExpired(now));
-    return l2Count;
+    // L2 is canonical for the counts — it holds every key, and it is where an
+    // entry actually stops occupying anything. L1's purge is opportunistic: it
+    // mirrors a subset, so its counts describe a different population and
+    // adding them would double-count the keys in both.
+    auto outcome = _l2->PurgeExpired(now, budget);
+    auto const l1 = _l1->PurgeExpired(now, budget);
+
+    // The exception is completion, which is a statement about the whole tier
+    // rather than a count: a caller that backs off because "there is nothing
+    // left" must not do so while the mirror still has entries to get to.
+    outcome.completedPass = outcome.completedPass && l1.completedPass;
+    return outcome;
 }
 
 void LayeredStorage::ExpiriesOnlyLog::Record(MutationKind kind, std::string_view key) noexcept

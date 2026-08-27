@@ -161,9 +161,19 @@ class ParkableStorage: public FastCache::IStorage
     }
     void FlushWithGeneration(FastCache::TimePoint /*effectiveAt*/) override {}
     void Resize(std::size_t /*newMaxBytes*/) override {}
-    std::size_t PurgeExpired(FastCache::TimePoint /*now*/) override
+    /// How many times this shard has been asked to sweep.
+    ///
+    /// The rotation test reads this: a sweep that spent its budget on whichever
+    /// shard came first would ask shard 0 every cycle and never reach the rest.
+    std::atomic<int> sweeps { 0 };
+
+    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint /*now*/, FastCache::PurgeBudget budget) override
     {
-        return 0;
+        ++sweeps;
+        // Reports the whole scan ceiling as spent, so a caller handing the
+        // budget to shards in turn actually runs out on the first one -- which
+        // is the condition the rotation exists to answer.
+        return FastCache::PurgeOutcome { .scanned = budget.maxScanned, .purged = 0, .completedPass = false };
     }
     [[nodiscard]] FastCache::StorageStats Snapshot() const noexcept override
     {
@@ -200,6 +210,40 @@ bool WaitFor(Pred const& predicate, int timeoutMs = 2000)
 }
 
 } // namespace
+
+TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][purge]")
+{
+    // Each shard resumes its own pass from its own cursor, so nothing is lost
+    // by leaving one mid-pass -- but a budget smaller than the shard count is
+    // spent before the loop reaches the far shards, and without a rotating
+    // start those shards would never be swept at all.
+    constexpr std::size_t ShardCount = 4;
+    std::vector<ParkableStorage*> raw;
+    std::vector<std::unique_ptr<FastCache::IStorage>> shards;
+    shards.reserve(ShardCount);
+    for (std::size_t i = 0; i < ShardCount; ++i)
+    {
+        auto shard = std::make_unique<ParkableStorage>();
+        raw.push_back(shard.get());
+        shards.emplace_back(std::move(shard));
+    }
+    FastCache::ShardedStorage storage { std::move(shards) };
+    FastCache::ManualClock clock;
+
+    // A ceiling of one entry reaches exactly one shard per call.
+    for (std::size_t i = 0; i < ShardCount; ++i)
+    {
+        auto const outcome = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 });
+        CHECK_FALSE(outcome.completedPass); // Shards were left unvisited.
+    }
+    for (auto const* shard: raw)
+        CHECK(shard->sweeps.load() == 1);
+
+    // With no ceiling every shard is swept in the one call.
+    std::ignore = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    for (auto const* shard: raw)
+        CHECK(shard->sweeps.load() == 2);
+}
 
 TEST_CASE("ShardedStorage rejects empty shard list", "[sharded]")
 {

@@ -1334,9 +1334,19 @@ void CowTreeStorage::EraseFromLru(std::string_view key)
     auto it = _index.find(key);
     if (it == _index.end())
         return;
-    _bytesUsed -= it->second->bytes;
-    _lru.erase(it->second);
-    _index.erase(it);
+    EraseNode(it->second);
+}
+
+void CowTreeStorage::EraseNode(Iterator it)
+{
+    // Advanced rather than reset, for the reason spelled out on the in-memory
+    // tier: restarting the sweep whenever eviction runs would leave the pass
+    // permanently unfinished on a cache that is under pressure.
+    if (_sweepCursor == it)
+        ++_sweepCursor;
+    _bytesUsed -= it->bytes;
+    _index.erase(it->key);
+    _lru.erase(it);
 }
 
 void CowTreeStorage::EvictToFit()
@@ -1364,14 +1374,12 @@ void CowTreeStorage::EvictToFit()
         }
         if (!victim->fetched)
             ++_stats.evictedUnfetched;
-        _bytesUsed -= victim->bytes;
         // Not reported when a flush already made this invisible: FLUSHDB fired
         // its own event, and `evicted` on top of it names a second thing that
         // did not happen. Same rule as the in-memory tier's EvictToFit.
         if (victim->generation >= _liveGeneration)
             RecordReclaim(_reclaim, MutationKind::Evict, keyCopy);
-        _index.erase(keyCopy);
-        _lru.erase(victim);
+        EraseNode(victim);
         ++_stats.evictions;
         remainingAttempts = _lru.size();
     }
@@ -1798,15 +1806,17 @@ void CowTreeStorage::FlushWithGeneration(TimePoint effectiveAt)
     ++_stats.cmdFlush;
 }
 
-std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
+PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    // Walk the LRU mirror, collect keys whose stored entry is expired
-    // or stale-generation, then erase them on disk + drop them from
-    // the mirror. Two-phase to avoid iterator invalidation by
-    // EraseFromLru. Bound to keys present in the mirror — entries on
-    // disk that the LRU does not know about (post-restart, with Replay
-    // a no-op) are reachable only via Get, which the reader-side fix
-    // now leaves alone.
+    FC_ZONE_SCOPED_N("CowTreeStorage::PurgeExpired");
+
+    // Walk the LRU mirror from wherever the last sweep stopped, collect keys
+    // whose stored entry is expired or stale-generation, then erase them on
+    // disk + drop them from the mirror. Two-phase to avoid iterator
+    // invalidation by the erase. Bound to keys present in the mirror — entries
+    // on disk that the LRU does not know about (post-restart, with Replay a
+    // no-op) are reachable only via Get, which the reader-side fix now leaves
+    // alone.
     // A victim carries WHY it is one, because only one of the three reasons is
     // an expiry: a stale generation means FLUSHDB already fired its own event,
     // and an orphan means the mirror disagreed with the disk, which is not a
@@ -1816,33 +1826,65 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
         std::string key;
         bool lapsed {}; ///< The stored TTL had passed.
     };
+
+    // See the in-memory tier for why the pass is sized up front and why the
+    // cursor is what makes a bounded sweep reach the far end at all. Here each
+    // step additionally costs a `LoadEntry`, so the budget is the difference
+    // between a sweep and a scan of the whole store.
+    auto const startSize = _lru.size();
+    auto const scanLimit = budget.ScanLimitOver(startSize);
+    PurgeOutcome outcome { .completedPass = scanLimit >= startSize };
+
     std::vector<Victim> victims;
-    victims.reserve(_lru.size());
-    for (auto const& node: _lru)
+    victims.reserve(budget.maxPurged == 0 ? scanLimit : std::min(budget.maxPurged, scanLimit));
+
+    while (outcome.scanned < scanLimit)
     {
-        auto loaded = LoadEntry(node.key);
+        if (_sweepCursor == _lru.end())
+        {
+            _sweepCursor = _lru.begin();
+            if (_sweepCursor == _lru.end())
+                break; // Nothing left in the mirror.
+        }
+
+        // Advanced before anything below can erase, so this loop never dangles
+        // its own cursor; `EraseNode` covers the erases that come from
+        // elsewhere, and the one below where the sweep has wrapped onto a key
+        // it already collected.
+        auto const node = _sweepCursor++;
+        ++outcome.scanned;
+
+        auto loaded = LoadEntry(node->key);
         if (!loaded.has_value())
             continue;
         if (!loaded->has_value())
         {
             // Disk and mirror out of sync — drop the orphan from the
             // mirror; nothing to erase on disk.
-            victims.push_back(Victim { .key = node.key, .lapsed = false });
-            continue;
+            victims.push_back(Victim { .key = node->key, .lapsed = false });
         }
-        auto const& entry = (*loaded)->entry;
-        if (entry.expiry <= now)
+        else if (auto const& entry = (*loaded)->entry; entry.expiry <= now)
         {
-            if (!node.fetched)
+            if (!node->fetched)
                 ++_stats.expiredUnfetched;
-            victims.push_back(Victim { .key = node.key, .lapsed = true });
+            victims.push_back(Victim { .key = node->key, .lapsed = true });
         }
         else if (entry.generation < _liveGeneration)
         {
-            victims.push_back(Victim { .key = node.key, .lapsed = false });
+            victims.push_back(Victim { .key = node->key, .lapsed = false });
+        }
+        else
+        {
+            continue;
+        }
+
+        if (budget.PurgeExhausted(victims.size()))
+        {
+            outcome.completedPass = false;
+            break;
         }
     }
-    std::size_t purged = 0;
+
     for (auto const& victim: victims)
     {
         auto loaded = LoadEntry(victim.key);
@@ -1857,9 +1899,9 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
         // served is worse than no event.
         if (victim.lapsed)
             RecordReclaim(_reclaim, MutationKind::Expire, victim.key);
-        ++purged;
+        ++outcome.purged;
     }
-    return purged;
+    return outcome;
 }
 
 void CowTreeStorage::SetReclaimLog(IReclaimLog* log)

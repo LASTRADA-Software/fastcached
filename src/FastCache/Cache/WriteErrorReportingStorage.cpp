@@ -215,9 +215,9 @@ void WriteErrorReportingStorage::FlushWithGeneration(TimePoint effectiveAt)
     _inner.FlushWithGeneration(effectiveAt);
 }
 
-std::size_t WriteErrorReportingStorage::PurgeExpired(TimePoint now)
+PurgeOutcome WriteErrorReportingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 {
-    return _inner.PurgeExpired(now);
+    return _inner.PurgeExpired(now, budget);
 }
 
 void WriteErrorReportingStorage::SetReclaimLog(IReclaimLog* log)
