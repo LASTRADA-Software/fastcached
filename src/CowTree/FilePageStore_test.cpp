@@ -17,7 +17,11 @@
 #if defined(_WIN32)
     #include <windows.h>
 #else
+    #include <sys/stat.h>
+
     #include <cerrno>
+
+    #include <fcntl.h>
 #endif
 
 namespace
@@ -453,7 +457,9 @@ TEST_CASE("ClassifyLockFailure maps this platform's lock errors", "[filestore][l
     // checks.
 #if defined(_WIN32)
     auto const rows = std::vector<Row> {
-        { .systemError = ERROR_SHARING_VIOLATION, .expected = LockFailure::Contended, .what = "another handle holds the file" },
+        { .systemError = ERROR_SHARING_VIOLATION,
+          .expected = LockFailure::Contended,
+          .what = "another handle holds the file" },
         { .systemError = ERROR_LOCK_VIOLATION, .expected = LockFailure::Contended, .what = "a byte-range lock refuses us" },
         { .systemError = ERROR_FILE_NOT_FOUND, .expected = LockFailure::Fatal, .what = "the open itself failed" },
         { .systemError = ERROR_ACCESS_DENIED, .expected = LockFailure::Fatal, .what = "no rights to the file" },
@@ -463,7 +469,7 @@ TEST_CASE("ClassifyLockFailure maps this platform's lock errors", "[filestore][l
         { .systemError = EWOULDBLOCK, .expected = LockFailure::Contended, .what = "another descriptor holds the file" },
         { .systemError = EAGAIN, .expected = LockFailure::Contended, .what = "the same condition, other spelling" },
         { .systemError = EBADF, .expected = LockFailure::Fatal, .what = "our own bug, not the filesystem's limit" },
-        { .systemError = ENOLCK, .expected = LockFailure::Unsupported, .what = "the kernel has no lock to give" },
+        { .systemError = ENOLCK, .expected = LockFailure::Fatal, .what = "transient, not a capability statement" },
         { .systemError = EINVAL, .expected = LockFailure::Unsupported, .what = "this descriptor cannot be flocked" },
         { .systemError = EOPNOTSUPP, .expected = LockFailure::Unsupported, .what = "the filesystem does not implement it" },
     };
@@ -496,3 +502,40 @@ TEST_CASE("An empty file that already existed is not blanked into a fresh store"
     REQUIRE_FALSE(store.has_value());
     REQUIRE(store.error() == CowTree::CowTreeError::CorruptMetas);
 }
+
+#if !defined(_WIN32)
+TEST_CASE("The store descriptor does not survive an exec", "[filestore][lock]")
+{
+    TempFile tmp;
+    CowTree::FilePageStore::Options opts;
+    opts.path = tmp.path;
+
+    auto const store = CowTree::FilePageStore::Open(opts);
+    REQUIRE(store.has_value());
+
+    struct stat target {};
+    REQUIRE(::stat(tmp.path.c_str(), &target) == 0);
+
+    // A `flock` lives on the open file description and is released only when
+    // the LAST descriptor on it closes, so a copy inherited by a compiler child
+    // would keep the store claimed after this process exits -- and the next
+    // start would blame a second node that does not exist. Found by scanning
+    // rather than by asking the store, because the point is what any inherited
+    // copy would look like, not what the member happens to hold.
+    bool found = false;
+    for (int fd = 0; fd < 256; ++fd)
+    {
+        struct stat here {};
+        if (::fstat(fd, &here) != 0)
+            continue;
+        if (here.st_dev != target.st_dev || here.st_ino != target.st_ino)
+            continue;
+        auto const descriptorFlags = ::fcntl(fd, F_GETFD);
+        REQUIRE(descriptorFlags != -1);
+        CHECK((descriptorFlags & FD_CLOEXEC) != 0);
+        found = true;
+    }
+    // Without this the case passes by finding nothing at all.
+    REQUIRE(found);
+}
+#endif

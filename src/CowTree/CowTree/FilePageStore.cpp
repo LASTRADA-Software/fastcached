@@ -65,18 +65,26 @@ namespace
     /// POSIX; the duplicate row costs a comparison and keeps the table honest
     /// on a platform where they split. EBADF is our own bug rather than
     /// anything about the file.
+    ///
+    /// ENOLCK is named here rather than left to the default because it is not a
+    /// statement about the filesystem's capabilities: it means the kernel's lock
+    /// table is exhausted, or — on NFS — that the lock manager could not be
+    /// reached. Treating that as "cannot lock, carry on" would drop the guard
+    /// exactly where two HOSTS sharing one store path is most plausible, and it
+    /// is transient, so refusing is both safe and recoverable by starting again.
     constexpr std::array LockErrorRows {
         LockErrorRow { .systemError = EWOULDBLOCK, .failure = FilePageStore::LockFailure::Contended },
         LockErrorRow { .systemError = EAGAIN, .failure = FilePageStore::LockFailure::Contended },
         LockErrorRow { .systemError = EBADF, .failure = FilePageStore::LockFailure::Fatal },
+        LockErrorRow { .systemError = ENOLCK, .failure = FilePageStore::LockFailure::Fatal },
     };
 
     /// The file is already open by the time `flock` runs, so an unrecognised
     /// errno means the claim could not be made rather than that the file could
-    /// not be reached. ENOLCK, EOPNOTSUPP and EINVAL all arrive here and there
-    /// is no closed list of them — kernels and network filesystems disagree
-    /// about which they report — so this is the default rather than a fourth
-    /// row somebody has to keep current.
+    /// not be reached — EOPNOTSUPP and EINVAL both arrive here, and kernels and
+    /// network filesystems disagree about which they report, so this stays the
+    /// default rather than a list somebody has to keep current. Only the errnos
+    /// that are NOT capability statements are named above.
     constexpr auto UnnamedLockError = FilePageStore::LockFailure::Unsupported;
 #endif
 
@@ -171,7 +179,15 @@ auto FilePageStore::Open(Options options) -> std::expected<std::unique_ptr<FileP
         store->_lockState = LockState::Unavailable;
     }
 #else
-    auto const flags = O_RDWR | O_CREAT;
+    // O_CLOEXEC is load-bearing now that the descriptor carries the claim. A
+    // `flock` lives on the open file DESCRIPTION and is released only when the
+    // last descriptor referring to it closes — so an inherited copy in a child
+    // keeps the store claimed after this process is gone. Without it, a compile
+    // node that spawns a compiler (`posix_spawnp` closes only its two pipe
+    // ends) and is then restarted mid-build refuses to start, blaming a second
+    // node that does not exist. Before the claim this was a harmless leaked
+    // descriptor, which is exactly why it was not already here.
+    auto const flags = O_RDWR | O_CREAT | O_CLOEXEC;
     auto const fd = ::open(store->_options.path.c_str(), flags, 0644);
     if (fd < 0)
         return std::unexpected(CowTreeError::IoError);
