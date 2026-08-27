@@ -226,3 +226,80 @@ TEST_CASE("An empty root is a prefix of nothing, not of everything")
     CHECK(reconciler.Region("Note: including file: C:\\x\\a.h\r\n", PathCanon::Grammar::ShowIncludes)
           == "Note: including file: C:\\x\\a.h\r\n");
 }
+
+TEST_CASE("Where bytes are bytes, a legacy path is reconciled exactly as any other")
+{
+    // POSIX, and a pre-1903 Windows: nothing is transcoded, so a filename spelled
+    // in a legacy encoding names a file perfectly well. Refusing it here would
+    // break builds that work today, which is why `pathsAreUtf8` is a property of
+    // the HOST rather than a rule the launcher applies everywhere.
+    auto resolver = FakeResolver { {} };
+    RootReconciler reconciler { "/x/src", "/x/build", resolver, FastCache::NarrowTextPolicy {} };
+
+    CHECK(reconciler.Path("/x/src/gr\xFC"
+                          "n/a.h")
+          == "/x/src/gr\xFC"
+             "n/a.h");
+    CHECK(reconciler.UnreadablePaths() == 0);
+}
+
+TEST_CASE("Where a path must be UTF-8, a tool's own code page is what reads it")
+{
+    // The split this closes: the roots come from `argv`, which on a host declaring
+    // the UTF-8 code page is UTF-8, while `cl` writes `/showIncludes` in the console
+    // output code page. Untranslated, the two stop prefix-matching, so a project
+    // header keys as toolchain content -- and a header moved inside it then replays
+    // a stored object under a zero exit code.
+    auto resolver = FakeResolver { {} };
+    RootReconciler reconciler {
+        "/x/src", "/x/build", resolver, FastCache::NarrowTextPolicy { .pathsAreUtf8 = true, .toolCodePage = 1252U }
+    };
+
+    // Already UTF-8: through untouched, on every platform, and the case a modern
+    // console actually produces.
+    CHECK(reconciler.Path("/x/src/gr\xC3\xBC"
+                          "n/a.h")
+          == "/x/src/gr\xC3\xBC"
+             "n/a.h");
+    CHECK(reconciler.UnreadablePaths() == 0);
+
+#if defined(_WIN32)
+    // CP-1252 in, UTF-8 out, so it prefix-matches the root that came from argv.
+    // Windows-only because there is no transcoder anywhere else -- and nowhere else
+    // is a code page ever named, so nothing else can reach this.
+    CHECK(reconciler.Path("/x/src/gr\xFC"
+                          "n/a.h")
+          == "/x/src/gr\xC3\xBC"
+             "n/a.h");
+    CHECK(reconciler.UnreadablePaths() == 0);
+#endif
+}
+
+TEST_CASE("A path this host cannot read as text is returned verbatim and counted")
+{
+    // Verbatim and UNTRANSLATED, because translating means resolving and resolving
+    // means `std::filesystem::path` -- which on a host that reads narrow bytes as
+    // UTF-8 throws on these rather than mis-naming a file. The count is what
+    // main.cpp declines the compile on; nothing here decides that.
+    auto resolver = FakeResolver { {} };
+    RootReconciler reconciler { "/x/src", "/x/build", resolver, FastCache::NarrowTextPolicy { .pathsAreUtf8 = true } };
+
+    CHECK(reconciler.Path("/x/src/gr\xFC"
+                          "n/a.h")
+          == "/x/src/gr\xFC"
+             "n/a.h");
+    CHECK(reconciler.UnreadablePaths() == 1);
+
+    // Counted per occurrence, and reached through `All` and `Region` too: `Path` is
+    // the funnel all three share, which is what lets one count cover the include
+    // notes, the depfile entries and the stored regions alike.
+    std::vector<std::string> paths { "/x/src/gr\xFC"
+                                     "n/a.h",
+                                     "/x/src/plain.h" };
+    reconciler.All(paths);
+    CHECK(reconciler.UnreadablePaths() == 2);
+    CHECK(paths[0]
+          == "/x/src/gr\xFC"
+             "n/a.h");
+    CHECK(paths[1] == "/x/src/plain.h");
+}

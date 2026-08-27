@@ -2,6 +2,7 @@
 #include "ToolchainHost.hpp"
 
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -64,8 +65,16 @@ namespace
     template <typename Predicate>
     [[nodiscard]] std::vector<std::string> EntryNames(std::string_view path, Predicate keep)
     {
+        // Through `PathFromNarrowText`, like every leaf probe in this file: a
+        // directory named by bytes this process cannot read is one it cannot walk,
+        // which is the same answer as "not there" -- and building the path directly
+        // would THROW, before the `error_code` this call takes is ever consulted.
+        auto const directory = PathFromNarrowText(path);
+        if (!directory.has_value())
+            return {};
+
         std::error_code ec;
-        std::filesystem::directory_iterator entry { std::filesystem::path { path },
+        std::filesystem::directory_iterator entry { *directory,
                                                     std::filesystem::directory_options::skip_permission_denied,
                                                     ec };
         if (ec)
@@ -98,13 +107,21 @@ namespace
       public:
         bool DirectoryExists(std::string_view path) override
         {
+            auto const directory = PathFromNarrowText(path);
+            if (!directory.has_value())
+                return false;
+
             std::error_code ec;
-            return std::filesystem::is_directory(std::filesystem::path { path }, ec) && !ec;
+            return std::filesystem::is_directory(*directory, ec) && !ec;
         }
 
         bool ExecutableExists(std::string_view path) override
         {
-            std::filesystem::path const file { path };
+            auto const opened = PathFromNarrowText(path);
+            if (!opened.has_value())
+                return false;
+
+            auto const& file = *opened;
             std::error_code ec;
             if (!std::filesystem::is_regular_file(file, ec) || ec)
                 return false;
@@ -141,7 +158,11 @@ namespace
             // this returns an empty string -- "a version file that says nothing"
             // rather than "there is no version file", which are different answers
             // to a caller deciding whether a layout is present.
-            std::filesystem::path const file { path };
+            auto const opened = PathFromNarrowText(path);
+            if (!opened.has_value())
+                return std::nullopt;
+
+            auto const& file = *opened;
             std::error_code ec;
             if (!std::filesystem::is_regular_file(file, ec) || ec)
                 return std::nullopt;

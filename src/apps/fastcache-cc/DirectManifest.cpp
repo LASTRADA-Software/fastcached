@@ -2,6 +2,8 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
+#include <FastCache/Platform/NarrowText.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -316,7 +318,23 @@ std::string HashFileContents(std::string_view absolutePath)
 
 std::string NormalizePath(std::string_view rawPath)
 {
-    return std::filesystem::path { rawPath }.lexically_normal().make_preferred().string();
+    // Total, and that is a contract rather than defensiveness. `std::filesystem::
+    // path`'s narrow constructor THROWS on a host that decodes narrow bytes as
+    // UTF-8 when the bytes are not -- `MultiByteToWideChar(CP_UTF8,
+    // MB_ERR_INVALID_CHARS, ...)` refuses them -- and this function is on the path
+    // of every dependency a compiler reported. A launcher's one promise is that it
+    // never fails a build the compiler would have completed, so an unreadable
+    // spelling has to come back as itself rather than as std::terminate.
+    //
+    // It is not where that case is DECIDED: `RootReconciler::Path` reads a tool's
+    // path as text before anything else touches it and counts what it could not,
+    // and main.cpp declines to cache the compile. This is the guard that keeps the
+    // road to that decline from ending in a crash -- including for a path that
+    // reached here from a manifest an older launcher stored.
+    auto const path = PathFromNarrowText(rawPath);
+    if (!path.has_value())
+        return std::string { rawPath };
+    return path->lexically_normal().make_preferred().string();
 }
 
 std::string NormalizeForLayout(std::string_view rawPath, PathCanon::Layout const& layout)
@@ -531,15 +549,35 @@ std::string ResolveAgainst(std::string_view rawPath, std::string_view workingDir
 
     // Joined and normalized again: the join is what collapses a leading `..`
     // against the working directory's last component.
-    return NormalizeForLayout((std::filesystem::path { workingDirectory } / std::filesystem::path { normalized }).string(),
-                              layout);
+    //
+    // Both sides through `PathFromNarrowText`, because `NormalizePath` above is
+    // TOTAL: a spelling this host cannot read comes back verbatim, and building a
+    // `path` from it here would only move the throw two lines down. Unanchored is
+    // the honest answer for such a path -- `ClassifyResolved` reads an empty result
+    // as exactly that -- and it is what the caller already handles.
+    auto const base = PathFromNarrowText(workingDirectory);
+    auto const tail = PathFromNarrowText(normalized);
+    if (!base.has_value() || !tail.has_value())
+        return {};
+
+    return NormalizeForLayout((*base / *tail).string(), layout);
 }
 
 std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout const& layout)
 {
     auto normalized = NormalizeForLayout(directory, layout);
+
+    // Same reason as ResolveAgainst's: `NormalizePath` is total, so `normalized`
+    // may still be a spelling this host cannot read, and `weakly_canonical`'s
+    // error_code overload does not help -- the throw is in the `path` constructor
+    // it is handed. Answering with the normalized form is what an unresolvable
+    // directory already gets.
+    auto const directoryPath = PathFromNarrowText(normalized);
+    if (!directoryPath.has_value())
+        return normalized;
+
     std::error_code ec;
-    auto const canonicalDirectory = std::filesystem::weakly_canonical(std::filesystem::path { normalized }, ec);
+    auto const canonicalDirectory = std::filesystem::weakly_canonical(*directoryPath, ec);
     if (ec)
         return normalized;
 
@@ -554,7 +592,10 @@ std::string AnchorWorkingDirectory(std::string_view directory, PathCanon::Layout
     {
         if (root->empty())
             continue;
-        auto const canonicalRoot = std::filesystem::weakly_canonical(std::filesystem::path { *root }, ec);
+        auto const rootPath = PathFromNarrowText(*root);
+        if (!rootPath.has_value())
+            continue;
+        auto const canonicalRoot = std::filesystem::weakly_canonical(*rootPath, ec);
         if (ec)
             continue;
 

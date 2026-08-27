@@ -6,6 +6,7 @@
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -121,9 +122,17 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
 
     for (auto const& root: roots)
     {
+        // A root the DRIVER printed, so its bytes are the driver's encoding and
+        // not necessarily this process's -- and a `std::filesystem::path` built
+        // from bytes this process cannot read THROWS, before the `error_code`
+        // below is ever consulted. A root that cannot be read is one this
+        // fingerprint does not cover, exactly as an absent one is.
+        auto const base = PathFromNarrowText(root);
+        if (!base.has_value())
+            continue;
+
         std::error_code ec;
-        auto const base = std::filesystem::path { root };
-        if (!std::filesystem::is_directory(base, ec) || ec)
+        if (!std::filesystem::is_directory(*base, ec) || ec)
             continue;
 
         // `skip_permission_denied` because a search path the driver lists is not
@@ -133,7 +142,7 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
         // throwing overloads would turn that into an exception on a path whose
         // whole job is to degrade quietly.
         auto options = std::filesystem::directory_options::skip_permission_denied;
-        std::filesystem::recursive_directory_iterator it { base, options, ec };
+        std::filesystem::recursive_directory_iterator it { *base, options, ec };
         if (ec)
             continue;
 
@@ -153,7 +162,7 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
                 continue;
             }
 
-            auto const relative = std::filesystem::relative(it->path(), base, ec);
+            auto const relative = std::filesystem::relative(it->path(), *base, ec);
             if (ec)
             {
                 ec.clear();
@@ -951,9 +960,14 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
 
 std::string ComputeToolchainStamp(std::string_view banner, std::string const& compiler, std::span<std::string const> roots)
 {
-    std::filesystem::path const binary { compiler };
-    auto const size = FileSizeOrZero(binary);
-    auto const mtime = LastWriteTicks(binary);
+    auto const binary = PathFromNarrowText(compiler);
+    if (!binary.has_value())
+        // Bytes this process cannot read name nothing it can stat: the case below,
+        // reached one step earlier.
+        return {};
+
+    auto const size = FileSizeOrZero(*binary);
+    auto const mtime = LastWriteTicks(*binary);
     if (size == 0 && mtime == 0)
         // Not stattable: a bare `cc` resolved through PATH, or a wrapper that is
         // not a file. Refusing to stamp means refusing to cache, which costs a
@@ -970,8 +984,18 @@ std::string ComputeToolchainStamp(std::string_view banner, std::string const& co
         // The root's own mtime changes when an entry is added or removed in it.
         // Both the path and the time are folded, so a root REPLACED by one with
         // the same timestamp still restamps.
+        // A root whose bytes this process cannot read is one this stamp cannot
+        // cover, and `ProbeToolchainFiles` skipped its contents for the same
+        // reason. Folding a constant in would be worse than folding nothing: the
+        // stamp would then be STABLE across every change under that root, which is
+        // a toolchain quietly matching one it is not. Refusing to stamp is refusing
+        // to cache, exactly as the unstattable binary above.
+        auto const rootPath = PathFromNarrowText(root);
+        if (!rootPath.has_value())
+            return {};
+
         digest.Path(root);
-        digest.Field(std::to_string(LastWriteTicks(std::filesystem::path { root })));
+        digest.Field(std::to_string(LastWriteTicks(*rootPath)));
     }
     return digest.ToHex();
 }
