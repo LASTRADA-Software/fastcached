@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -18,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <tests/ScratchPath.hpp>
@@ -42,7 +44,7 @@ struct Fixture
 {
     ManualClock clock;
     AtomicMetricsSink metrics;
-    NullLogger logger;
+    CapturingLogger logger;
     Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
     NodeIoLoop io;
 
@@ -73,6 +75,16 @@ struct Fixture
         return StartCacheTierOrExplain(io, cfg, membership, clock, metrics, logger);
     }
 };
+
+/// Whether any captured line contains @p needle.
+/// @param logger Where the tier reported.
+/// @param needle Text to look for.
+/// @return True when some line contains it.
+[[nodiscard]] bool Logged(CapturingLogger const& logger, std::string_view needle)
+{
+    auto const records = logger.Snapshot();
+    return std::ranges::any_of(records, [needle](CapturingLogger::Record const& r) { return r.message.contains(needle); });
+}
 
 /// One tier's entry, or nullopt when the cache has no such tier.
 ///
@@ -130,6 +142,29 @@ TEST_CASE("A node with no cache port serves no cache tier", "[node][cache-tier]"
     auto const budget = CacheCapacityOf(tier.get());
     CHECK_FALSE(At(budget.tierBytesLimit, StorageTier::Memory).has_value());
     CHECK_FALSE(At(budget.tierBytesLimit, StorageTier::Disk).has_value());
+
+    // And it says so. This was the one route to "no cache tier" that logged
+    // nothing at all, so an operator had no line anywhere telling them this node
+    // was not caching.
+    CHECK(Logged(fixture.logger, "serving no local cache tier"));
+}
+
+TEST_CASE("A cache budget with no port to serve it is called out", "[node][cache-tier]")
+{
+    // `--cache-memory` and `--cache-dir` do nothing at all without a port, and a
+    // flag silently doing nothing is the shape this codebase keeps a list about.
+    // Named only when the operator actually set one -- a default nobody typed is
+    // not something to warn them about.
+    Testing::ScratchDirectory const scratch { "node-cache-no-port" };
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheListen.clear();
+    cfg.cacheDir = scratch.Path();
+
+    auto const started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    CHECK(*started == nullptr);
+    CHECK(Logged(fixture.logger, "--cache-memory/--cache-dir have no effect"));
 }
 
 TEST_CASE("A memory-only node reports its budget and no disk tier", "[node][cache-tier]")

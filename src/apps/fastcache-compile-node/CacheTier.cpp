@@ -275,8 +275,22 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
 {
     // Emptied deliberately. A node that only compiles for others wants no cache port
     // at all, and saying so must not be an error.
+    //
+    // Said out loud, for the reason the branch below already is: this was the one
+    // way to reach "no cache tier" that logged NOTHING, so a node started with
+    // `--listen-cache=` had no line anywhere saying it was not caching -- while
+    // `--cache-memory` and `--cache-dir`, which an operator may well have set
+    // beside it, went on reading as though they meant something. It names them
+    // when they did, because a flag silently doing nothing is the shape this
+    // codebase keeps a list about.
     if (cfg.cacheListen.empty())
+    {
+        auto const configured = cfg.cacheMemoryExplicit || !cfg.cacheDir.empty();
+        logger.Logf(LogLevel::Info,
+                    "--listen-cache is empty; serving no local cache tier{}",
+                    configured ? " (--cache-memory/--cache-dir have no effect without a port)" : "");
         return std::unique_ptr<CacheTier> {};
+    }
 
     // Neither half configured, which is what `--cache-memory 0` means without a
     // `--cache-dir` beside it: there is nothing to keep objects in, so there is no
