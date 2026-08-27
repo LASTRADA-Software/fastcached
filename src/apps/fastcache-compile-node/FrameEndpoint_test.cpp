@@ -613,7 +613,7 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
 
     // Three requests down the one connection. If the cap counted requests, the second
     // would be refused; it holds one slot for all three.
-    for (auto const attempt: { "first", "second", "third" })
+    for (auto const* const attempt: { "first", "second", "third" })
     {
         auto const reply = conversation.Send(Wire::EncodeFetch(attempt));
         REQUIRE_FALSE(reply.empty());
@@ -664,6 +664,43 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     auto const refusal = Exchange(port, Fetch("while-attached"));
     REQUIRE_FALSE(refusal.empty());
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+}
+
+TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
+{
+    // `MaxInFlightBytes` is what actually bounds this surface's memory, and since the
+    // connection cap stopped being a request cap it is the only thing that bounds
+    // concurrent work either. It had no coverage at all -- every case ran with the
+    // budget disabled -- while being the branch the loop rewrote most.
+    //
+    // The property is that it refuses like every other recoverable refusal: a REPLY
+    // naming the budget, on a connection that is still usable afterwards. A close here
+    // would make a busy moment cost every launcher a reconnect.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+
+    // One byte of budget, so any declared payload exceeds it. Small enough to be
+    // unambiguous: this is the declared length being weighed, not the bytes read.
+    responder.Limit(/*concurrent*/ 0, /*budget*/ 1);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    auto const refusal = conversation.Send(Fetch("over-budget"));
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // Never reached the responder: the budget is weighed on the DECLARED length,
+    // before a payload byte is read, which is the whole reason it can bound anything.
+    CHECK(responder.Entered() == 0);
+
+    // And the connection survives it, so the peer may retry rather than reconnect.
+    CHECK_FALSE(conversation.Send(Fetch("again")).empty());
 }
 
 TEST_CASE("A foreign magic still closes the connection", "[node][frame]")

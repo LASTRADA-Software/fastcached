@@ -124,11 +124,14 @@ struct FrameServer::State
 
     /// Move a tracked socket's deadline forward.
     ///
-    /// A connection serves many requests, so one deadline armed at accept would
-    /// sweep a conversation mid-flight. Re-armed before each read, it means "how long
-    /// until the NEXT request completes" -- which bounds the idle gap between
-    /// requests too, so the slow-loris property `RequestTimeout` exists for survives
-    /// the connection becoming long-lived.
+    /// A connection serves many requests, so one deadline armed at accept would sweep
+    /// a conversation mid-flight. Armed once per REQUEST instead -- before its header
+    /// read, and not again until the next one -- it means "how long this request has,
+    /// from its first byte to its answer". Deliberately not re-armed after the header:
+    /// that would give a payload a fresh budget of its own and let a slow drip hold a
+    /// connection indefinitely, which is the property `RequestTimeout` exists for. The
+    /// idle gap before a request is inside the same window, so an attached peer that
+    /// stops talking is still swept.
     /// @param socket The tracked socket.
     /// @param deadline Its new deadline.
     void Rearm(ISocket* socket, TimePoint deadline)
@@ -276,8 +279,8 @@ namespace
 
         // Registered with its deadline BEFORE the first read, so a client that sends
         // half a header is swept rather than holding a frame until the process dies.
-        // `Rearm` below moves it forward per request; see its note for why that still
-        // bounds an idle connection.
+        // `Rearm` below moves it forward once per request -- not once per read; see
+        // its note for what the window then covers.
         auto const deadlineFor = [state] {
             return state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
         };
@@ -350,7 +353,15 @@ namespace
                     // never taken.
                     auto const drainable = static_cast<std::uint64_t>(cap) * Wire::OversizeDrainFactor;
                     if (decoded->payloadLength > drainable || !(co_await reader.Skip(decoded->payloadLength)).has_value())
+                    {
+                        // Past the bound the connection ends -- but not with the peer's
+                        // bytes still queued, which would reset it and take the refusal
+                        // just written back out of the peer's buffer. Best effort, and
+                        // bounded like every other drain here: a peer that keeps sending
+                        // past that has chosen the reset.
+                        co_await DrainUntilPeerCloses(socket.get(), cap);
                         break;
+                    }
                     continue;
                 }
 
@@ -431,7 +442,14 @@ namespace
     {
         auto* const state = shared.get();
         auto socket = std::move(owned);
-        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
+
+        // A SHORTER window than a served request gets. A refused connection has
+        // nothing left to do but be read and hang up, so the drain below should end in
+        // a round trip; giving it the full `RequestTimeout` would let a flood arriving
+        // at capacity park a socket per attempt for five seconds each -- taking no
+        // slot, and so counted by nothing. This is the one place where being polite
+        // has to stay cheap.
+        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
         state->Track(socket.get(), deadline);
         try
         {

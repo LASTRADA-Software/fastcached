@@ -144,9 +144,10 @@ class FrameServer
     /// connects and sends half a header holds a descriptor and a coroutine frame
     /// until the process dies. A slow-loris on the node's cache port, free.
     ///
-    /// Re-armed before each read rather than once per connection, so a conversation
-    /// is not swept mid-flight -- and so the gap BETWEEN two requests is bounded by
-    /// it too, which is what keeps the slow-loris property once a connection is
+    /// Armed once per REQUEST rather than once per connection, so a conversation is
+    /// not swept mid-flight. One window covers a request from its first byte to its
+    /// answer, and the idle gap before it -- so an attached peer that stops talking is
+    /// still swept, which is what keeps the slow-loris property once a connection is
     /// long-lived.
     static constexpr std::chrono::milliseconds RequestTimeout { 5'000 };
 
@@ -158,6 +159,21 @@ class FrameServer
     /// stay on the wheel for the full interval after its connection had already
     /// finished -- the leak `Async/DeadlineTimer` documents at length.
     static constexpr std::chrono::milliseconds SweepInterval { RequestTimeout / 4 };
+
+    /// How long a REFUSED connection is given to read its refusal and hang up.
+    ///
+    /// Shorter than `RequestTimeout` because there is less to wait for: the peer has
+    /// its answer already and has only to close, which is a round trip rather than a
+    /// request. A refusal takes no connection slot, so nothing counts one -- and a
+    /// surface that is refusing is one already at capacity, which is exactly when a
+    /// flood must not be able to park a socket per attempt for as long as a real
+    /// request gets.
+    ///
+    /// One sweep interval, because the sweeper's cadence is the floor on how promptly
+    /// any deadline can be acted on: asking for less would be a number that reads like
+    /// a guarantee and is not one. So a refused socket outlives its answer by at most
+    /// two ticks, against the six a served request may take.
+    static constexpr std::chrono::milliseconds RefusalTimeout { SweepInterval };
 
     /// @param io The loop this server accepts and answers on.
     /// @param listener Bound listener; must outlive the run.
