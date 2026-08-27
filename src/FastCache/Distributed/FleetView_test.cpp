@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -711,11 +712,55 @@ TEST_CASE("A hostile version string is escaped rather than interpolated", "[dist
 {
     auto snapshot = LeadingSnapshot();
     // It came off a wire: whatever a peer sent is what lands here, and the decoder
-    // deliberately does not validate it -- refusing a registration over a
-    // diagnostic field would take a working machine out of the fleet.
+    // deliberately does not validate its SHAPE -- a version is a string an operator
+    // chooses, so one this build does not recognise is a peer to report rather than
+    // a peer to refuse. Being text at all is a separate question, and the scheduler
+    // does refuse that: see `SchedulerService::Register`. A shape nobody anticipated
+    // still has to reach a reader, and reaching one safely is this escape's job.
     snapshot.nodes[0].version = R"(<script>alert(1)</script>)";
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK_FALSE(html.contains("<script>alert(1)</script>"));
     CHECK(html.contains("&lt;script&gt;"));
+}
+
+TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's JSON unparseable",
+          "[distributed][fleetview]")
+{
+    // The reported defect, at the grain it was reported at: one worker's row makes
+    // the WHOLE document something a strict parser may reject, so `/fleet.json`
+    // stops answering for every other machine in the fleet as well.
+    //
+    // `SchedulerService::Register` refuses such a registration now, which is where
+    // the fix belongs -- the page, `--cluster-status` and the logs read the same
+    // strings back out, so repairing them in one renderer would leave the others
+    // carrying the originals. This asserts the other half: that an encoder cannot
+    // emit a document its own format forbids, whatever it is handed. A value can
+    // still arrive through a door this build does not control, and `members[]` is
+    // exactly that door -- a consensus entry is applied AFTER it is committed, so a
+    // peer built before that refusal existed can replicate a member id straight
+    // into it with nobody left to refuse it.
+    auto snapshot = LeadingSnapshot();
+    snapshot.leaderEndpoint = "10.0.0.2:7100\xFF";
+    snapshot.cluster = Cluster::ClusterState { .members = { Cluster::ClusterMember { .id = "n\x80\x80",
+                                                                                     .raftEndpoint = "10.0.0.2:6675\xC3",
+                                                                                     .schedulerEndpoint = "\xE2\x82" } },
+                                               .settings = {} };
+    snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
+                                                             .fingerprint = "gcc-13-ab\x80\x80",
+                                                             .endpoint = "10.0.0.2:7100\xFF",
+                                                             .version = "1.2.3-\xE2\x82",
+                                                             .slots = 8,
+                                                             .inFlight = 1,
+                                                             .capacity = snapshot.nodes[0].capacity,
+                                                             .load = Busy(1),
+                                                             .codecs = {} },
+                                        .heartbeatAge = std::chrono::milliseconds { 30 } } };
+    snapshot.nodes[0].endpoint = "10.0.0.2:7100\xFF";
+    snapshot.nodes[0].version = "1.2.3-\xE2\x82";
+
+    // Both surfaces, because each has an encoding its consumer enforces: JSON must
+    // be UTF-8, and the page is served as UTF-8 and embeds SVG, which is XML.
+    CHECK(IsValidUtf8(RenderFleetJson(snapshot)));
+    CHECK(IsValidUtf8(RenderFleetHtml(snapshot, NoHistory(), 10)));
 }
