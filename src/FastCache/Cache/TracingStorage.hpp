@@ -128,6 +128,11 @@ class TracingStorage final: public IStorage
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
     void Resize(std::size_t newMaxBytes) override;
+
+    /// Forward to the inner storage: this decorator traces, it never reclaims.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
     [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;
 

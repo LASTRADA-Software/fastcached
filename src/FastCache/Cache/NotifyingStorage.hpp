@@ -130,6 +130,12 @@ class NotifyingStorage final: public IStorage
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
+
+    /// Forward to the inner storage, which is where the tiers that reclaim
+    /// live. This decorator is the other end of the same log — it drains what
+    /// they record — but it reclaims nothing itself.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
     void Resize(std::size_t newMaxBytes) override;
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
     [[nodiscard]] TieredStorageStats SnapshotTiers() const noexcept override;

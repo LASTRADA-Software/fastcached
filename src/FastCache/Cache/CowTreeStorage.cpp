@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CowTreeStorage.hpp>
+#include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
@@ -729,13 +730,19 @@ void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize, 
         _bytesUsed -= it->second->bytes;
         it->second->bytes = valueSize;
         it->second->fetched = fetched;
+        // Re-stamped: touching a node is what brings it back into the live
+        // generation, exactly as the stored entry's own generation is rewritten.
+        it->second->generation = _liveGeneration;
         _bytesUsed += valueSize;
         _lru.splice(_lru.begin(), _lru, it->second);
         return;
     }
     // A brand-new mirror node has never been read; only an explicit Read
     // marks it fetched.
-    _lru.push_front(LruNode { .key = std::string { key }, .bytes = valueSize, .fetched = access == AccessKind::Read });
+    _lru.push_front(LruNode { .key = std::string { key },
+                              .bytes = valueSize,
+                              .fetched = access == AccessKind::Read,
+                              .generation = _liveGeneration });
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += valueSize;
 }
@@ -776,6 +783,11 @@ void CowTreeStorage::EvictToFit()
         if (!victim->fetched)
             ++_stats.evictedUnfetched;
         _bytesUsed -= victim->bytes;
+        // Not reported when a flush already made this invisible: FLUSHDB fired
+        // its own event, and `evicted` on top of it names a second thing that
+        // did not happen. Same rule as the in-memory tier's EvictToFit.
+        if (victim->generation >= _liveGeneration)
+            RecordReclaim(_reclaim, MutationKind::Evict, keyCopy);
         _index.erase(keyCopy);
         _lru.erase(victim);
         ++_stats.evictions;
@@ -1181,6 +1193,12 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
         // same as if the key was absent — KeyNotFound.
         std::ignore = EraseEntry(key);
         EraseFromLru(key);
+        // A lapsed TTL noticed here is a reclaim like any other: the in-memory
+        // tier reports one from its own delete path, and the same client
+        // sequence must not produce different events per backend. A stale
+        // generation is excluded, as everywhere else — FLUSHDB already fired.
+        if (entry.expiry <= now)
+            RecordReclaim(_reclaim, MutationKind::Expire, key);
         ++_stats.deleteMisses;
         return std::unexpected(MakeError(StorageErrorCode::KeyNotFound));
     }
@@ -1207,7 +1225,16 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
     // disk that the LRU does not know about (post-restart, with Replay
     // a no-op) are reachable only via Get, which the reader-side fix
     // now leaves alone.
-    std::vector<std::string> victims;
+    // A victim carries WHY it is one, because only one of the three reasons is
+    // an expiry: a stale generation means FLUSHDB already fired its own event,
+    // and an orphan means the mirror disagreed with the disk, which is not a
+    // thing that happened to the key at all.
+    struct Victim
+    {
+        std::string key;
+        bool lapsed {}; ///< The stored TTL had passed.
+    };
+    std::vector<Victim> victims;
     victims.reserve(_lru.size());
     for (auto const& node: _lru)
     {
@@ -1218,7 +1245,7 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
         {
             // Disk and mirror out of sync — drop the orphan from the
             // mirror; nothing to erase on disk.
-            victims.push_back(node.key);
+            victims.push_back(Victim { .key = node.key, .lapsed = false });
             continue;
         }
         auto const& entry = (*loaded)->entry;
@@ -1226,26 +1253,36 @@ std::size_t CowTreeStorage::PurgeExpired(TimePoint now)
         {
             if (!node.fetched)
                 ++_stats.expiredUnfetched;
-            victims.push_back(node.key);
+            victims.push_back(Victim { .key = node.key, .lapsed = true });
         }
         else if (entry.generation < _liveGeneration)
         {
-            victims.push_back(node.key);
+            victims.push_back(Victim { .key = node.key, .lapsed = false });
         }
     }
     std::size_t purged = 0;
-    for (auto const& key: victims)
+    for (auto const& victim: victims)
     {
-        auto loaded = LoadEntry(key);
+        auto loaded = LoadEntry(victim.key);
         if (loaded.has_value() && loaded->has_value())
         {
-            if (auto const r = EraseEntry(key); !r.has_value())
+            if (auto const r = EraseEntry(victim.key); !r.has_value())
                 continue;
         }
-        EraseFromLru(key);
+        EraseFromLru(victim.key);
+        // Reported only once the key is actually gone: a disk delete that
+        // failed above took the `continue`, and an event for a key still being
+        // served is worse than no event.
+        if (victim.lapsed)
+            RecordReclaim(_reclaim, MutationKind::Expire, victim.key);
         ++purged;
     }
     return purged;
+}
+
+void CowTreeStorage::SetReclaimLog(IReclaimLog* log)
+{
+    _reclaim = log;
 }
 
 StorageStats CowTreeStorage::Snapshot() const noexcept

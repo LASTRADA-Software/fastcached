@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
@@ -68,8 +69,16 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
         // Lazy reclaim during lookup. Attribute a never-fetched expiry to
         // the expired_unfetched counter (generation flushes are not
         // "expiry" and are excluded).
-        if (nodeIt->entry.expiry <= now && !nodeIt->entry.fetched)
-            ++_stats.expiredUnfetched;
+        // Both the counter and the event are conditioned on the TTL actually
+        // having lapsed: a generation flush also makes an entry unreachable,
+        // but FLUSHDB already fired its own whole-database event, and naming
+        // every key it swept `expired` reports a TTL that never passed.
+        if (nodeIt->entry.expiry <= now)
+        {
+            if (!nodeIt->entry.fetched)
+                ++_stats.expiredUnfetched;
+            RecordReclaim(_reclaim, MutationKind::Expire, nodeIt->key);
+        }
         EraseAt(nodeIt);
         return _lru.end();
     }
@@ -107,6 +116,16 @@ void InMemoryLruStorage::EvictToFit()
         auto const victim = std::prev(_lru.end());
         if (!victim->entry.fetched)
             ++_stats.evictedUnfetched;
+        // An entry a generation flush already made invisible is being evicted
+        // as bookkeeping, not because memory pressure took a live key: FLUSHDB
+        // fired its own event, and `evicted` on top of that names a second
+        // thing that did not happen to the key. Generation alone settles it, so
+        // this needs no clock -- which is why the check is not `IsAlive`. A
+        // tail entry whose TTL has passed is reported as an eviction, which is
+        // imprecise but not untrue: the key really is gone, and this path has
+        // no `now` to know better.
+        if (victim->entry.generation >= _liveGeneration)
+            RecordReclaim(_reclaim, MutationKind::Evict, victim->key);
         EraseAt(victim);
         ++_stats.evictions;
     }
@@ -538,14 +557,24 @@ std::size_t InMemoryLruStorage::PurgeExpired(TimePoint now)
         auto const next = std::next(it);
         if (!IsAlive(it->entry, _liveGeneration, now))
         {
-            if (it->entry.expiry <= now && !it->entry.fetched)
-                ++_stats.expiredUnfetched;
+            // Conditioned on the TTL, not on liveness: see FindAlive above.
+            if (it->entry.expiry <= now)
+            {
+                if (!it->entry.fetched)
+                    ++_stats.expiredUnfetched;
+                RecordReclaim(_reclaim, MutationKind::Expire, it->key);
+            }
             EraseAt(it);
             ++purged;
         }
         it = next;
     }
     return purged;
+}
+
+void InMemoryLruStorage::SetReclaimLog(IReclaimLog* log)
+{
+    _reclaim = log;
 }
 
 StorageStats InMemoryLruStorage::Snapshot() const noexcept

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/CacheEntry.hpp>
+#include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -153,6 +154,30 @@ class LayeredStorage final: public IStorage
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
+
+    /// Route reclaim reporting to **L2 only, and only its expiries**.
+    ///
+    /// Neither half of that is arbitrary. L1 gets nothing because it is a
+    /// mirror: when it drops an entry the key is still in L2 and the very next
+    /// read serves it, so reporting it would publish `evicted` for a key that
+    /// never left the cache — and dirty every WATCH on it, aborting
+    /// transactions over a demotion no client can observe.
+    ///
+    /// L2's *evictions* are dropped for the mirror image of that reason. `Get`
+    /// serves an L1 hit without ever consulting L2, so a key L2 evicted stays
+    /// retrievable until L1 drops it too — and L1 is exactly where the key will
+    /// still be, because L1 absorbing the hits is what left L2's recency stale
+    /// enough to evict it. The alternative, erasing it from L1 to make the
+    /// event true, would throw a hot key out of RAM to justify a notification.
+    /// So in a layered cache no single tier's eviction is total, and none is
+    /// reported.
+    ///
+    /// L2's expiries **are** reported, because an expiry is total: both tiers
+    /// hold the same TTL, so the entry the mirror still has is one it will
+    /// refuse on the next lookup for the same reason L2 reclaimed it.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
     /// Both tiers' statistics, unmerged.
@@ -201,8 +226,34 @@ class LayeredStorage final: public IStorage
                                                                             CasToken l2Cas,
                                                                             TimePoint now);
 
+    /// The log L2 is actually handed: forwards expiries and swallows evictions.
+    ///
+    /// A filter rather than a flag on the tier, because "is my eviction total"
+    /// is not something a tier can answer about itself — it depends entirely on
+    /// what is layered over it. The same `CowTreeStorage` standing alone is
+    /// authoritative and reports both.
+    class ExpiriesOnlyLog final: public IReclaimLog
+    {
+      public:
+        /// Point the filter at the log to forward to.
+        /// @param inner Destination, or nullptr to discard.
+        void SetInner(IReclaimLog* inner) noexcept
+        {
+            _inner = inner;
+        }
+
+        void Record(MutationKind kind, std::string_view key) noexcept override;
+        void Drain(std::vector<ReclaimedKey>& out) override;
+        [[nodiscard]] bool HasPending() const noexcept override;
+        [[nodiscard]] bool IsRecording() const noexcept override;
+
+      private:
+        IReclaimLog* _inner { nullptr };
+    };
+
     std::unique_ptr<InMemoryLruStorage> _l1;
     std::unique_ptr<IStorage> _l2;
+    ExpiriesOnlyLog _l2Log;
     mutable StorageStats _stats;
 };
 

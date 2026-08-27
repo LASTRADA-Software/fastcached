@@ -247,6 +247,11 @@ std::size_t NotifyingStorage::PurgeExpired(TimePoint now)
     return _inner.PurgeExpired(now);
 }
 
+void NotifyingStorage::SetReclaimLog(IReclaimLog* log)
+{
+    _inner.SetReclaimLog(log);
+}
+
 void NotifyingStorage::Resize(std::size_t newMaxBytes)
 {
     _inner.Resize(newMaxBytes);

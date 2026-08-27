@@ -356,6 +356,11 @@ std::size_t TracingStorage::PurgeExpired(TimePoint now)
     return _inner.PurgeExpired(now);
 }
 
+void TracingStorage::SetReclaimLog(IReclaimLog* log)
+{
+    _inner.SetReclaimLog(log);
+}
+
 void TracingStorage::Resize(std::size_t newMaxBytes)
 {
     _inner.Resize(newMaxBytes);

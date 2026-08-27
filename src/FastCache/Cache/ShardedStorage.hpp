@@ -130,6 +130,14 @@ class ShardedStorage final: public IStorage
 
     void FlushWithGeneration(TimePoint effectiveAt) override;
     std::size_t PurgeExpired(TimePoint now) override;
+
+    /// Hand `log` to every shard, each under its own exclusive lock.
+    ///
+    /// One log serves all of them: it is thread-safe, and which shard evicted a
+    /// key is not something a keyspace event has anywhere to say.
+    /// @param log Sink for reclaimed keys, or nullptr to stop reporting.
+    void SetReclaimLog(IReclaimLog* log) override;
+
     [[nodiscard]] StorageStats Snapshot() const noexcept override;
 
     /// Every shard's tiers, summed tier by tier.

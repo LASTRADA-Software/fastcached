@@ -75,4 +75,19 @@ class IReclaimLog
     [[nodiscard]] virtual bool IsRecording() const noexcept = 0;
 };
 
+/// Report a reclaimed key, if there is a log and anything is listening.
+///
+/// The gate lives here rather than being written out at each of the reclaim
+/// sites, because there are several across two tiers and the cost of one of them
+/// forgetting is a string copy per evicted key on the hot write path — on a cache
+/// running at its budget, that is every write.
+/// @param log  Where to report, or nullptr when nothing routed one here.
+/// @param kind `MutationKind::Expire` or `MutationKind::Evict`.
+/// @param key  The key being reclaimed.
+inline void RecordReclaim(IReclaimLog* log, MutationKind kind, std::string_view key) noexcept
+{
+    if (log != nullptr && log->IsRecording())
+        log->Record(kind, key);
+}
+
 } // namespace FastCache
