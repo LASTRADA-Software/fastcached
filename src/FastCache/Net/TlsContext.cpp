@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/TlsContext.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <format>
 #include <memory>
 #include <string>
 
@@ -183,6 +185,22 @@ std::expected<std::unique_ptr<TlsContext>, NetError> TlsContext::CreateSelfSigne
     // matches nothing, so every client would reject it -- an encrypted surface
     // nobody can reach, which looks like a network fault rather than a
     // misconfiguration.
+    // A comma ENDS one entry and starts another in the config grammar below, so a
+    // name carrying one would silently add a SAN nobody asked for -- and a
+    // certificate valid for the wrong name is exactly what this function's own
+    // argument says must not happen. These names are operator-supplied (a hostname
+    // and the `--admin-listen` bind host), so it is a typo away.
+    //
+    // A colon is deliberately NOT refused: `X509V3_parse_list` splits the type
+    // from the value at the FIRST one, so the rest is the value -- which is what
+    // makes `::1` a legal IPv6 SAN rather than a malformed entry.
+    if (auto const injected = std::ranges::find_if(subjectNames, [](std::string const& name) { return name.contains(','); });
+        injected != subjectNames.end())
+        return std::unexpected(
+            NetError { .code = NetErrorCode::SystemError,
+                       .systemCode = 0,
+                       .context = std::format("a subject name may not contain a comma: '{}'", *injected) });
+
     auto const names = SubjectAltNames(subjectNames);
     if (names.empty())
         // `SystemError` because this taxonomy has no enumerator for "the caller
