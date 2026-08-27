@@ -273,12 +273,13 @@ struct Config
     ///   E  publish on `__keyevent@<db>__:<event>` channels
     ///   g  generic events: del / expire / persist
     ///   $  string events: set
-    ///   A  alias for `g$` — everything we currently emit
-    /// `x` (expiration events) is documented by Redis but not yet
-    /// implemented here — the storage layer has no expiry callback, so
-    /// the parser rejects `x` until the NotifyingStorage decorator lands
-    /// (see TODO.md). Operators who set `x` get a startup error rather
-    /// than the silent miss the original branch shipped with.
+    ///   x  expired: a TTL lapsed and the entry was reclaimed
+    ///   e  evicted: the entry was reclaimed under memory pressure
+    ///   A  alias for `g$xe` — everything we emit, as in redis
+    /// `x` and `e` come from the storage layer rather than a verb handler,
+    /// because no verb is executing when a key expires or is evicted. They
+    /// fire when the tier reclaims the entry, which access drives rather
+    /// than a timer — see `docs/operations/known-limitations.md`.
     /// Each enabled write verb fires `__keyspace@0__:<key> <event>` (with K)
     /// and `__keyevent@0__:<event> <key>` (with E). At least one of K or E
     /// must be set for any event to actually be published.

@@ -27,15 +27,26 @@ namespace FastCache
 ///
 ///   1. Memcached writes (`set`, `add`, `replace`, `delete`, `cas`,
 ///      `incr`/`decr`, `append`/`prepend`, `flush_all`) used to bypass
-///      WATCH dirty signals and keyspace notifications entirely. A
-///      Redis WATCH'd key mutated by a concurrent memcached client
-///      silently committed the watching client's EXEC.
+///      WATCH dirty signals entirely. A Redis WATCH'd key mutated by a
+///      concurrent memcached client silently committed the watching
+///      client's EXEC. (Only the WATCH half: memcached writes still fire
+///      no keyspace events, because memcached has no convention for them
+///      and the Redis handlers own the per-verb names. See
+///      `docs/operations/known-limitations.md`.)
 ///
-///   2. Storage-internal events (TTL expiry inside `Get`/`Peek`/`PurgeExpired`,
-///      LRU eviction inside `Set`/`Add`/...) never fired WATCH dirties
-///      or `__keyevent@0__:expired` / `:evicted` events. Watched keys
-///      that vanished under TTL pressure passed an EXEC the WATCH
-///      should have aborted.
+///   2. Storage-internal events — a TTL found lapsed during a lookup or a
+///      sweep, an LRU tail dropped under memory pressure — never fired
+///      WATCH dirties or `__keyevent@0__:expired` / `:evicted` events, so
+///      watched keys that vanished under TTL pressure passed an EXEC the
+///      WATCH should have aborted. The tiers now name what they reclaim
+///      (`IReclaimLog`), this decorator drains that once their call has
+///      returned, and `RedisMutationObserver` publishes it.
+///
+///      What reclamation does NOT do is run on a timer: nothing calls
+///      `PurgeExpired` periodically, and with the default `Approximate`
+///      LRU a read does not erase either. So a key that lapses and is
+///      never touched again is reported when something touches it, and an
+///      untouched key is not reported at all.
 ///
 ///   3. `FLUSHDB` / `flush_all` wiped the entire keyspace without
 ///      firing the canonical `__keyevent@0__:flushdb` event or

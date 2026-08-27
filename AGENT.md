@@ -228,6 +228,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   member after it completes an awaitable.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
+- A missing keyspace event has two ends — the tier that never named the victim and
+  the observer that never published it. Check both before changing either.
+- A reclaim is reported **before** the call that caused it: `ADD` on a lapsed TTL
+  names the same key twice, and the wrong order tells a subscriber a live key is gone.
+- In a layered cache no single tier's eviction is total, so none is reported. An
+  expiry is, because both tiers hold the same TTL.
 
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
