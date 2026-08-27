@@ -112,6 +112,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Worker registrations accepted. A steady rise means heartbeats are "
               "not arriving.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed,
+      .prometheusName = "fastcached_dispatch_worker_registrations_malformed_total",
+      .help = "Worker registrations refused because the worker did not name its "
+              "toolchain, endpoint or version in UTF-8. Any rise names a peer that "
+              "is not in the fleet and cannot say so itself.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
       .help = "Compiles this worker began. Minus jobs_completed_total, the number "

@@ -272,6 +272,24 @@ enum class ErrorCode : std::uint8_t
     /// question does not apply here at all -- a single node started without
     /// `--node-id` leads itself and has no replicated state to change.
     NoCluster = 0x15,
+
+    /// A worker announced itself in bytes that are not text.
+    ///
+    /// Everything a peer states about itself -- its toolchain fingerprint, the
+    /// endpoint clients are sent to, the version it is running -- is copied into
+    /// the leader's view of the fleet and read back out of it by an operator: a
+    /// page, a JSON document somebody's script parses, `--cluster-status`, the
+    /// logs. RFC 8259 requires UTF-8 of JSON exchanged between systems, so one
+    /// worker registering a byte that belongs to no valid sequence makes the
+    /// whole fleet's answer a document a strict parser may reject -- not merely
+    /// that worker's row in it.
+    ///
+    /// Refused rather than repaired, and that is the asymmetry that decides it: a
+    /// fingerprint is matched BYTE FOR BYTE, so a worker admitted under a
+    /// cleaned-up name would match no client's toolchain and would sit in the
+    /// fleet forever, registered and never picked, with nothing anywhere saying
+    /// why. A refusal is loud; a repair is a worker that quietly does nothing.
+    MalformedRegistration = 0x18,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -488,6 +506,9 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::EndpointBusy,
                       .name = "endpoint-busy",
                       .defaultMessage = "this endpoint is serving all it will serve at once" },
+    ErrorDescriptor { .code = ErrorCode::MalformedRegistration,
+                      .name = "malformed-registration",
+                      .defaultMessage = "a worker must name itself in UTF-8" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.

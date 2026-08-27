@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <format>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 namespace FastCache::Distributed
@@ -39,6 +42,8 @@ namespace
         RefusalDescriptor { .code = Wire::ErrorCode::Withdrawn, .counter = IMetricsSink::Counter::DispatchLeasesWithdrawn },
         RefusalDescriptor { .code = Wire::ErrorCode::AlreadyInFlight,
                             .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
+        RefusalDescriptor { .code = Wire::ErrorCode::MalformedRegistration,
+                            .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed },
     };
 
     /// The refusals this service makes that deliberately move nothing.
@@ -145,6 +150,27 @@ namespace
     {
         return PickErrorTable[static_cast<std::size_t>(error)].reported;
     }
+
+    /// One text field a worker states about itself.
+    struct RegistrationTextField
+    {
+        std::string_view name;                                  ///< What a refusal calls it.
+        std::string_view (*project)(WorkerRegistration const&); ///< Where to read it.
+    };
+
+    /// Every string a REGISTER carries, in one place.
+    ///
+    /// A table rather than three checks written out, because the failure this
+    /// guards against is a FOURTH string being added to `WorkerRegistration` and
+    /// nobody remembering to check it -- which stays invisible until a peer sends
+    /// one that is not text, by which time the bytes are in the leader's view of
+    /// the fleet and in everything rendered from it.
+    constexpr std::array RegistrationTextFields {
+        RegistrationTextField { .name = "fingerprint",
+                                .project = [](WorkerRegistration const& r) { return r.fingerprint; } },
+        RegistrationTextField { .name = "endpoint", .project = [](WorkerRegistration const& r) { return r.endpoint; } },
+        RegistrationTextField { .name = "version", .project = [](WorkerRegistration const& r) { return r.version; } },
+    };
 
     /// The counter a refusal moves, if any.
     /// @param code The refusal.
@@ -291,6 +317,22 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
 
+    // Checked HERE, where the wire becomes fleet state, rather than in whichever
+    // renderer notices first. Everything below copies these strings into the
+    // leader's view of the fleet, and `/fleet.json`, `/fleet`, `--cluster-status`
+    // and the logs all read them back out again -- so a renderer that repaired
+    // them would be a second place the value is decided, and the surfaces that did
+    // not repair would still carry the originals.
+    //
+    // The whole registration goes, not the offending field: the fingerprint is
+    // matched byte for byte, so a worker admitted with a blanked-out one would
+    // match nothing and sit in the fleet never being picked. A refusal reaches the
+    // worker's own log through `DescribeOutcome`; the counter is what an operator
+    // sees when the peer is not one of ours and never says anything at all.
+    for (auto const& field: RegistrationTextFields)
+        if (!IsValidUtf8(field.project(registration)))
+            return Refuse(Wire::ErrorCode::MalformedRegistration, std::format("{} is not valid UTF-8", field.name));
+
     // No zero-slot refusal any more, and its removal is a decision rather than a
     // simplification. A zero used to mean "a worker that will never be picked" and
     // was refused for that reason; since `OfferableSlots` it means "size me from my
@@ -300,6 +342,7 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // against is closed by construction instead: `OfferableSlots` never returns
     // zero, so no registration can produce a worker that matches leases and is
     // never picked.
+
     auto const id = _workers.Register(registration);
     // Counted as an event, not as fleet size. This interface is counter-only, so it
     // cannot express a gauge -- and the event turns out to be the more useful

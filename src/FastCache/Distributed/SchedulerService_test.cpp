@@ -7,8 +7,10 @@
 
 #include <array>
 #include <chrono>
+#include <format>
 #include <ranges>
 #include <string>
+#include <string_view>
 
 #include <tests/Unwrap.hpp>
 
@@ -347,4 +349,73 @@ TEST_CASE("An expired lease stops suppressing its key", "[distributed][scheduler
     }
 
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "abandoned")).status == Wire::Status::Ok);
+}
+
+TEST_CASE("A worker that cannot name itself in UTF-8 is refused", "[distributed][scheduler]")
+{
+    // Everything a peer states about itself is copied into the leader's view of the
+    // fleet and read back out of it by an operator. `/fleet.json` is the surface
+    // that cannot survive it: RFC 8259 requires UTF-8 of JSON exchanged between
+    // systems, so one worker's stray byte makes the whole fleet's answer a document
+    // a strict parser may reject -- not merely that worker's row in it.
+    //
+    // Refused where the wire becomes fleet state, so every surface rendered from
+    // that state is clean, rather than each renderer repairing it and the ones that
+    // forget carrying the originals.
+    Leading fleet;
+
+    auto const refused = [&fleet](WorkerRegistration const& registration, std::string_view field) {
+        auto const reply = fleet.service.Register(Insider, registration);
+        CHECK(reply.status == Wire::Status::Error);
+        CHECK(reply.error == Wire::ErrorCode::MalformedRegistration);
+        // The field is named, because all three arrive over one verb and each sends
+        // an operator somewhere different: a `--toolchain` override, an
+        // `--endpoint`, or a peer running something this fleet did not build.
+        CHECK(reply.message == std::format("{} is not valid UTF-8", field));
+
+        // Refused means refused: nothing reached the registry, so no later snapshot
+        // can carry it and no renderer has to know about this at all.
+        CHECK(fleet.service.Workers().LiveWorkers().empty());
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 0);
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed) == 1);
+    };
+
+    SECTION("the toolchain fingerprint")
+    {
+        refused(OneSlot("gcc-14-a1\x80\x80", "10.0.0.2:7100"), "fingerprint");
+    }
+
+    SECTION("the endpoint clients would be sent to")
+    {
+        refused(OneSlot("gcc-14", "10.0.0.2:7100\xFF"), "endpoint");
+    }
+
+    SECTION("the version it says it is running")
+    {
+        // Free-form on the wire, and free-form is not the same claim as "any bytes":
+        // it is the field an operator reads during a rolling upgrade, and the one a
+        // peer this fleet did not build is likeliest to fill with something
+        // surprising.
+        auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
+        registration.version = "1.2.3-\xE2\x82"; // a three-byte sequence, two bytes long
+        refused(registration, "version");
+    }
+}
+
+TEST_CASE("A toolchain named in multi-byte UTF-8 registers like any other", "[distributed][scheduler]")
+{
+    // The rule is about ENCODING, not about ASCII. A fingerprint is opaque by
+    // design -- the launcher computes it and the scheduler matches it byte for
+    // byte -- so narrowing it to ASCII would be a second, unannounced restriction
+    // on a field the wire deliberately does not constrain.
+    Leading fleet;
+
+    auto registration = OneSlot("gcc-14-\xC3\xA9\xE2\x82\xAC", "10.0.0.2:7100");
+    registration.version = "1.2.3-\xF0\x9F\x92\xA9";
+    REQUIRE(fleet.service.Register(Insider, registration).status == Wire::Status::Ok);
+
+    auto const live = fleet.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    CHECK(live.front().fingerprint == "gcc-14-\xC3\xA9\xE2\x82\xAC");
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed) == 0);
 }

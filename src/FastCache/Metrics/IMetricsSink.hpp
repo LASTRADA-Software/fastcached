@@ -88,6 +88,13 @@ class IMetricsSink
         /// watching -- a fleet that re-registers constantly is a fleet whose
         /// heartbeats are not arriving.
         DispatchWorkerRegistrations,
+        /// Registrations refused because the worker did not announce itself in
+        /// UTF-8. Beside the accepted count rather than beside the lease refusals,
+        /// deliberately: this is not a statement about the fleet's capacity, it is
+        /// a peer that cannot be recorded, and it is the ONLY trace such a peer
+        /// leaves on the leader -- a node whose `--toolchain` override carries a
+        /// stray byte otherwise vanishes from the fleet with nothing saying why.
+        DispatchWorkerRegistrationsMalformed,
 
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this
