@@ -1130,10 +1130,11 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               [](NodeConfig const& c) {
                   if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
                       return false;
-                  // The same default host `AdminEndpoint::Start` binds with, so
-                  // this rule judges the address the endpoint will actually take
-                  // rather than the text an operator typed.
-                  auto const endpoint = ParseEndpoint(c.adminListen, "127.0.0.1");
+                  // The same default host `AdminEndpoint::Start` binds with --
+                  // the constant, not a second copy of the literal -- so this rule
+                  // judges the address the endpoint will actually take rather than
+                  // the text an operator typed.
+                  auto const endpoint = ParseEndpoint(c.adminListen, AdminListenDefaultHost);
                   return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
               },
           .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "

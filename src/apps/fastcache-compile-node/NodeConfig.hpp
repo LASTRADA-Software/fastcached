@@ -545,6 +545,26 @@ struct NodeConfig
 /// they disagreed about is a row accepting what the tier then refuses.
 inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
 
+/// What a bare `--listen-scheduler` binds.
+///
+/// The wildcard, for the reason `--listen-raft` takes one: a scheduler hands out other
+/// machines' work, so the callers are on other machines by definition.
+inline constexpr std::string_view SchedulerListenDefaultHost = "0.0.0.0";
+
+/// What a bare `--listen-cache` binds.
+///
+/// Loopback, the OPPOSITE of the two above and deliberately: this is the surface
+/// `fastcache-cc` on this machine talks to, and a node's private cache reachable from
+/// the network is a decision rather than something an operator gets by typing a port.
+inline constexpr std::string_view CacheListenDefaultHost = "127.0.0.1";
+
+/// What a bare `--admin-listen` binds.
+///
+/// Loopback, and it is what the dashboard's credential rule turns on: reaching loopback
+/// already means being on the machine, so a bare port needs no token while a bind an
+/// operator deliberately exposed does.
+inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
+
 /// Why a `--node-id` that names no `--raft-peer` cannot work.
 ///
 /// A named constant rather than prose written into the policy row it fills, because
