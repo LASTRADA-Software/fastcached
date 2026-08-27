@@ -13,6 +13,7 @@ target_sources(FastCache
         Auth/AuthPolicy.cpp
         Cache/CacheEngine.cpp
         Cache/CowTreeStorage.cpp
+        Cache/ExpiryReaper.cpp
         Cache/InMemoryLruStorage.cpp
         Cache/LayeredStorage.cpp
         Cache/NotifyingStorage.cpp

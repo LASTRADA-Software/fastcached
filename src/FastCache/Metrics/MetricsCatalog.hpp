@@ -213,6 +213,16 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "one call reclaimed more at once than the notification buffer holds. Without this, "
               "a subscriber seeing no event cannot tell that from nothing having expired.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::ExpiryCycles,
+      .prometheusName = "fastcached_expiry_cycles_total",
+      .help = "Sweeps the active expiry cycle has run. Flat on a daemon serving traffic means the "
+              "cycle is disabled or wedged, which otherwise looks exactly like nothing having expired.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::ExpiryKeysReclaimed,
+      .prometheusName = "fastcached_expiry_keys_reclaimed_total",
+      .help = "Entries the active expiry cycle reclaimed -- keys that lapsed and that nothing would "
+              "have touched again, so no other path would ever have freed them.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
