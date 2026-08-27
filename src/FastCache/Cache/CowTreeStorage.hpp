@@ -100,6 +100,18 @@ class CowTreeStorage final: public IStorage
                                                      'h',  'e',  'd', '.', 'f', 'm', 't', '\0' };
     static constexpr std::string_view FormatMarkerKey { FormatMarkerKeyBytes, sizeof(FormatMarkerKeyBytes) };
 
+    /// Reserved tree key recording an in-flight conversion, whose value is
+    /// `[u32 fromVersion][last converted key]`.
+    ///
+    /// Unreachable by the wire protocols for the same reason as
+    /// `FormatMarkerKey`, and separate from it because the two state different
+    /// things: the format marker says what the records ARE, this says what they
+    /// are part-way through becoming. Its presence is what turns an interrupted
+    /// conversion from a store nobody can read into one the next run finishes.
+    static constexpr char MigrationMarkerKeyBytes[] = { '\0', '\1', 'f', 'a', 's', 't', 'c', 'a', 'c',
+                                                        'h',  'e',  'd', '.', 'm', 'i', 'g', '\0' };
+    static constexpr std::string_view MigrationMarkerKey { MigrationMarkerKeyBytes, sizeof(MigrationMarkerKeyBytes) };
+
     struct Options
     {
         /// Backing file path.
@@ -141,9 +153,72 @@ class CowTreeStorage final: public IStorage
         std::size_t compressionMinBytes { 256 };
     };
 
+    /// What a conversion did, so a caller can say it out loud.
+    struct MigrationReport
+    {
+        /// The version the store carried on the way in.
+        std::uint32_t fromVersion { 0 };
+
+        /// The version it carries now — always `CurrentFormatVersion`.
+        std::uint32_t toVersion { 0 };
+
+        /// Leaf records rewritten BY THIS RUN. Zero when the store was already
+        /// current, which `fromVersion == toVersion` is the reliable way to
+        /// test: an empty store of the current version also converts nothing.
+        /// A resumed run counts what it finished, not what the interrupted one
+        /// had already done — nothing on disk records that total.
+        std::uint64_t recordsConverted { 0 };
+
+        /// True when this run picked up an interrupted conversion rather than
+        /// starting one. Worth saying out loud: the operator ran the same
+        /// command and got a different amount of work than they expected.
+        bool resumed { false };
+    };
+
     /// Open or create the storage. Replays existing entries into the
     /// in-memory LRU mirror.
     [[nodiscard]] static std::expected<std::unique_ptr<CowTreeStorage>, StorageError> Open(Options options);
+
+    /// Convert the store at `options.path` to the record layout this build
+    /// writes, in place.
+    ///
+    /// OFFLINE, and deliberately not something `Open` does for itself: the
+    /// conversion rewrites every leaf record in the store, which on a cache
+    /// worth migrating is long enough that a supervisor would time out the
+    /// start it was hiding inside. An operator asks for it, once, and watches
+    /// it finish.
+    ///
+    /// **Interruptible, not atomic** — and that is a decision rather than a
+    /// shortcoming. Converting in one transaction would be atomic and would
+    /// also inflate the file by one page per record per tree level, permanently,
+    /// because a CoW commit frees replaced pages only at the commit and the
+    /// free list is not persisted (see `MigrationChunkRecords`). So the work
+    /// commits in slices, and each slice records how far it got in the same
+    /// transaction as the records it converted.
+    ///
+    /// A run that is interrupted therefore leaves a store that is part-way, and
+    /// says so: `Open` refuses it by name rather than mis-parsing it, and
+    /// running the conversion again RESUMES from the last committed slice.
+    /// Nothing is ever converted twice and nothing is skipped.
+    ///
+    /// Idempotent: a store already at `CurrentFormatVersion` is reported as
+    /// such and not written to at all.
+    ///
+    /// @param options Storage options; `path` and `pageSize` are used.
+    ///                Durability is chosen here rather than taken from the
+    ///                caller — see the implementation.
+    /// @return What was converted; `UnsupportedFormatVersion` when the store is
+    ///         NEWER than this build can read, since there is no converting
+    ///         forwards from a layout nothing here knows; `IoError` when the
+    ///         path names no store at all.
+    [[nodiscard]] static std::expected<MigrationReport, StorageError> Migrate(Options const& options);
+
+    /// `Migrate` over an injected page store, so the conversion can be driven
+    /// against a synthesised store of a known vintage rather than only against
+    /// a file somebody still has.
+    /// @param store Borrowed page store; must outlive the call.
+    /// @return As `Migrate`.
+    [[nodiscard]] static std::expected<MigrationReport, StorageError> MigrateStore(CowTree::IPageStore& store);
 
     /// Test seam: open over an injected page store (e.g. an InMemoryPageStore
     /// with fault injection) instead of a FilePageStore on disk. Used by the
@@ -362,8 +437,64 @@ class CowTreeStorage final: public IStorage
                                                                          std::uint64_t storedLen,
                                                                          std::uint64_t originalLen);
 
-    /// Parse a leaf record's header (everything but the materialised value).
+    /// Parse a leaf record's header (everything but the materialised value)
+    /// under the layout this build writes. The serving path calls this
+    /// directly rather than through `RecordFormats()`, because a store that
+    /// carries any other version never opens (see `EnsureFormatVersion`) and a
+    /// per-read table lookup would buy nothing.
     [[nodiscard]] static std::expected<ParsedRecord, StorageError> ParseRecord(CowTree::BytesView raw);
+
+    /// Parse a leaf record written under format v3 — the layout before the
+    /// per-entry compression codec and original-length fields existed.
+    ///
+    /// It fills `codec = Identity` and `originalLen` from the stored length,
+    /// which is what makes the conversion format-agnostic: whatever reads an
+    /// old record hands back the same `ParsedRecord` the current encoders
+    /// consume, so `Migrate` never learns which version it is converting from.
+    /// @param raw The encoded leaf record.
+    /// @return The parsed record, or Corrupt when it does not decode.
+    [[nodiscard]] static std::expected<ParsedRecord, StorageError> ParseRecordV3(CowTree::BytesView raw);
+
+    /// A reader for one historical on-disk record layout.
+    using RecordParser = std::expected<ParsedRecord, StorageError> (*)(CowTree::BytesView raw);
+
+    /// One layout this build can still READ.
+    struct RecordFormat
+    {
+        std::uint32_t version;
+        RecordParser parse;
+    };
+
+    /// Every layout this build can read, oldest first, ending at the one it
+    /// writes.
+    ///
+    /// This table IS the migration policy: a format is convertible exactly
+    /// when its reader is still here, so bumping `CurrentFormatVersion`
+    /// without adding a row is the decision to throw every existing store
+    /// away — and a decision that has to be made by deleting a line is one
+    /// somebody makes on purpose. `Migrate` walks it and needs no per-version
+    /// code of its own.
+    /// @return A view of the static table; never empty.
+    [[nodiscard]] static std::span<RecordFormat const> RecordFormats() noexcept;
+
+    /// Does this build still carry a reader for `version`?
+    ///
+    /// What a refusal's advice turns on: a store older than every remaining
+    /// reader cannot be converted, and telling its operator to run the
+    /// conversion sends them to a command that refuses them in the same words.
+    /// @param version An on-disk format version.
+    /// @return True when `RecordFormats()` has a row for it.
+    [[nodiscard]] static bool CanRead(std::uint32_t version) noexcept;
+
+    /// Re-encode a parsed record under the current layout.
+    ///
+    /// An overflow record keeps its chain: only the leaf descriptor is
+    /// rewritten, so converting a store never rewrites a value page and never
+    /// needs room for a second copy of the data.
+    /// @param parsed The record, as some version's reader returned it.
+    /// @param raw    The bytes it was parsed from (the inline value lives there).
+    /// @return The record under `CurrentFormatVersion`.
+    [[nodiscard]] static std::vector<std::byte> ReEncodeRecord(ParsedRecord const& parsed, CowTree::BytesView raw);
 
     /// Write `value` as a chain of overflow pages; returns the chain head.
     [[nodiscard]] std::expected<CowTree::PageId, StorageError> WriteOverflowChain(std::span<std::byte const> value);

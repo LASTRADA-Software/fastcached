@@ -55,6 +55,11 @@ std::size_t InMemoryPageStore::WriteCount() const noexcept
     return _writeCount;
 }
 
+std::size_t InMemoryPageStore::ReadCount() const noexcept
+{
+    return _readCount;
+}
+
 std::size_t InMemoryPageStore::SyncDataCount() const noexcept
 {
     return _syncDataCount;
@@ -69,6 +74,7 @@ auto InMemoryPageStore::Read(PageId id) const -> std::expected<BytesView, CowTre
         return std::unexpected(CowTreeError::OutOfRange);
     if (!_live.contains(idx))
         return std::unexpected(CowTreeError::OutOfRange);
+    ++_readCount;
     auto const& page = _pages[idx];
     return BytesView { page.data(), page.size() };
 }
@@ -176,6 +182,13 @@ auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expec
 std::size_t InMemoryPageStore::PageSize() const noexcept
 {
     return _pageSize;
+}
+
+auto InMemoryPageStore::Flush() -> std::expected<void, CowTreeError>
+{
+    // Nothing is deferred: this store recycles a freed page the moment it is
+    // freed, and "durable" is not a thing it has.
+    return {};
 }
 
 std::size_t InMemoryPageStore::PageCount() const noexcept

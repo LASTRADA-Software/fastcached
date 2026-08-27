@@ -88,6 +88,21 @@ class IPageStore
     ///         lifetime of the page store.
     [[nodiscard]] virtual auto PageSize() const noexcept -> std::size_t = 0;
 
+    /// Make everything committed so far durable, now.
+    ///
+    /// A store that batches commits into groups holds a window of writes that
+    /// are not on disk and, with them, a set of freed pages it dare not recycle
+    /// yet — reusing a page whose freeing is not durable would let a crash
+    /// resurrect a tree pointing at overwritten data. That window is normally
+    /// closed on a fixed commit interval, which is right for a server taking
+    /// small writes and wrong for a job that commits in a few large slices and
+    /// wants each one to become both durable and reclaimable before it starts
+    /// the next.
+    ///
+    /// A no-op for a store with nothing deferred.
+    /// @return Empty on success; CowTreeError when the flush itself fails.
+    [[nodiscard]] virtual auto Flush() -> std::expected<void, CowTreeError> = 0;
+
     /// Total data pages this store currently holds, live and free alike.
     ///
     /// Grows as pages are allocated and never shrinks, so it is an upper bound

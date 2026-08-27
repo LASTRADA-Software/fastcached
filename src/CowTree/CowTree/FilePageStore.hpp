@@ -88,6 +88,8 @@ class FilePageStore final: public IPageStore
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 
+    [[nodiscard]] auto Flush() -> std::expected<void, CowTreeError> override;
+
     [[nodiscard]] auto PageCount() const noexcept -> std::size_t override;
 
     /// @return Current durability mode.

@@ -73,6 +73,31 @@ class ReadTxn
     [[nodiscard]] auto ForEach(std::function<bool(BytesView key, BytesView value)> const& visit) const
         -> std::expected<void, CowTreeError>;
 
+    /// `ForEach`, resumed: visits only the entries whose key sorts strictly
+    /// after `startAfter`.
+    ///
+    /// Whole subtrees below `startAfter` are skipped rather than read and
+    /// filtered, which is what makes a job that walks the store in resumable
+    /// slices cost one pass in total rather than one pass per slice.
+    /// @param startAfter Exclusive lower bound; the last key already handled.
+    /// @param visit      As `ForEach`.
+    /// @return As `ForEach`.
+    [[nodiscard]] auto ForEachAfter(BytesView startAfter,
+                                    std::function<bool(BytesView key, BytesView value)> const& visit) const
+        -> std::expected<void, CowTreeError>;
+
+  private:
+    /// Shared implementation of the two `ForEach` overloads.
+    /// @param startAfter Exclusive lower bound, or nullopt to start at the
+    ///                   beginning — which is NOT the same as an empty key,
+    ///                   since an empty key is itself storable.
+    /// @param visit      As `ForEach`.
+    /// @return As `ForEach`.
+    [[nodiscard]] auto Walk(std::optional<BytesView> startAfter,
+                            std::function<bool(BytesView key, BytesView value)> const& visit) const
+        -> std::expected<void, CowTreeError>;
+
+  public:
     /// @return The txnId of the snapshot this transaction observes.
     [[nodiscard]] TxnId Snapshot() const noexcept
     {

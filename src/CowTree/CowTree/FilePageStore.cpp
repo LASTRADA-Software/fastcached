@@ -511,6 +511,16 @@ std::size_t FilePageStore::PageSize() const noexcept
     return _pageSize;
 }
 
+auto FilePageStore::Flush() -> std::expected<void, CowTreeError>
+{
+    // Exactly the group-commit boundary the interval would have reached on its
+    // own, taken on demand: fsync the data, write the buffered meta to the
+    // non-durable slot, fsync the meta, and release the pages whose freeing
+    // that meta has now made durable.
+    std::scoped_lock const lock { _ioMutex };
+    return FlushBatchLocked();
+}
+
 std::size_t FilePageStore::PageCount() const noexcept
 {
     std::scoped_lock const lock { _ioMutex };

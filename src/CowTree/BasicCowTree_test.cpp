@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <format>
 #include <map>
+#include <optional>
 #include <random>
 #include <ranges>
 #include <span>
@@ -335,6 +336,123 @@ TEST_CASE("ForEach stops when the callback asks it to, and calls that success", 
                 })
                 .has_value());
     REQUIRE(seen == std::vector<std::string> { "key-0000", "key-0001", "key-0002" });
+}
+
+TEST_CASE("ForEachAfter resumes strictly after the key it is given", "[cowtree][foreach]")
+{
+    CowTree::InMemoryPageStore store { CowTree::MinPageSize };
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    for (auto const i: std::views::iota(0, 400))
+        PutCommit(tree, std::format("key-{:04d}", i), "v");
+
+    std::vector<std::string> seen;
+    auto reader = tree.BeginRead();
+    REQUIRE(reader
+                .ForEachAfter(B("key-0197"),
+                              [&](CowTree::BytesView k, CowTree::BytesView) {
+                                  seen.emplace_back(CowTree::AsStringView(k));
+                                  return true;
+                              })
+                .has_value());
+
+    // Strictly after: the bound itself was handled by whoever recorded it.
+    REQUIRE(seen.size() == 202);
+    REQUIRE(seen.front() == "key-0198");
+    REQUIRE(seen.back() == "key-0399");
+    REQUIRE(std::ranges::is_sorted(seen));
+}
+
+TEST_CASE("ForEachAfter in slices visits every key exactly once", "[cowtree][foreach]")
+{
+    // The property a resumable job depends on: slicing the walk and restarting
+    // it from the last key handled must produce the same sequence as one pass,
+    // with nothing dropped at a boundary and nothing done twice.
+    CowTree::InMemoryPageStore store { CowTree::MinPageSize };
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    for (auto const i: std::views::iota(0, 400))
+        PutCommit(tree, std::format("key-{:04d}", i), "v");
+
+    std::vector<std::string> sliced;
+    std::optional<std::string> resume;
+    while (true)
+    {
+        std::vector<std::string> slice;
+        auto const visit = [&](CowTree::BytesView k, CowTree::BytesView) {
+            slice.emplace_back(CowTree::AsStringView(k));
+            return slice.size() < 37; // a slice size that divides nothing evenly
+        };
+        auto reader = tree.BeginRead();
+        REQUIRE((resume.has_value() ? reader.ForEachAfter(B(*resume), visit) : reader.ForEach(visit)).has_value());
+        if (slice.empty())
+            break;
+        resume = slice.back();
+        sliced.insert(sliced.end(), slice.begin(), slice.end());
+    }
+
+    std::vector<std::string> whole;
+    auto reader = tree.BeginRead();
+    REQUIRE(reader
+                .ForEach([&](CowTree::BytesView k, CowTree::BytesView) {
+                    whole.emplace_back(CowTree::AsStringView(k));
+                    return true;
+                })
+                .has_value());
+    REQUIRE(sliced == whole);
+}
+
+TEST_CASE("ForEachAfter past the last key visits nothing", "[cowtree][foreach]")
+{
+    CowTree::InMemoryPageStore store { CowTree::MinPageSize };
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    for (auto const i: std::views::iota(0, 400))
+        PutCommit(tree, std::format("key-{:04d}", i), "v");
+
+    auto visited = 0;
+    auto reader = tree.BeginRead();
+    REQUIRE(reader
+                .ForEachAfter(B("key-9999"),
+                              [&](CowTree::BytesView, CowTree::BytesView) {
+                                  ++visited;
+                                  return true;
+                              })
+                .has_value());
+    REQUIRE(visited == 0);
+}
+
+TEST_CASE("ForEachAfter skips subtrees rather than reading and filtering them", "[cowtree][foreach]")
+{
+    // The pruning is the point: without it a job that resumes N times reads the
+    // whole store N times. Counted through the page store, because "it returned
+    // the right keys" is true either way.
+    CowTree::InMemoryPageStore store { CowTree::MinPageSize };
+    CowTree::CowTree tree { store };
+    REQUIRE(tree.Open().has_value());
+    for (auto const i: std::views::iota(0, 800))
+        PutCommit(tree, std::format("key-{:04d}", i), "v");
+
+    auto const countPages = [&](std::optional<std::string> const& after) {
+        auto reader = tree.BeginRead();
+        auto pages = std::size_t { 0 };
+        auto const visit = [&](CowTree::BytesView, CowTree::BytesView) {
+            return true;
+        };
+        // Every page the walk reads is a Read on the store, so the difference
+        // between a pruned and an unpruned walk shows up here.
+        auto const before = store.ReadCount();
+        REQUIRE((after.has_value() ? reader.ForEachAfter(B(*after), visit) : reader.ForEach(visit)).has_value());
+        pages = store.ReadCount() - before;
+        return pages;
+    };
+
+    auto const whole = countPages(std::nullopt);
+    auto const tail = countPages(std::string { "key-0799" });
+    REQUIRE(whole > 10);
+    // Resuming past the last key must descend one root-to-leaf path, not the
+    // whole tree.
+    REQUIRE(tail < whole / 2);
 }
 
 TEST_CASE("ForEach refuses a tree whose child pointer loops back on itself", "[cowtree][foreach]")
