@@ -95,6 +95,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x15` | no-cluster | This node runs no cluster, so there is nothing to administer. Distinct from `not-leader`, which names somewhere else to ask. |
 | `0x16` | invalid-cluster-change | The cluster cannot accept that change — a setting nobody has heard of, a member named with no address, a field a verb ignores. The message says which. |
 | `0x17` | endpoint-busy | This endpoint has reached its own concurrent-request cap or in-flight byte budget. A statement about one node's front door, never about the fleet. |
+| `0x18` | malformed-registration | A REGISTER named its toolchain, its endpoint or its version in bytes that are not valid UTF-8. The message says which field. Refused rather than repaired: a fingerprint is matched byte for byte, so a worker admitted under a cleaned-up name would match nothing and never be picked. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean

@@ -306,21 +306,78 @@ fault.
     `std::string` in it ends that property for the whole codebase. A version is also
     not a scheduling input -- nothing weighs it -- which is what `NodeCapacity`
     holds. It lives beside the other registration strings on `WorkerInfo`.
-  - **A version this build cannot parse is reported, not refused.** It is a string
-    an operator reads rather than one any code branches on, so an unrecognised shape
-    is a peer to report; refusing the registration would take a working machine out
-    of the fleet over a diagnostic field. It reaches an HTML page, so it is escaped
-    like every other value that came off a wire.
+  - **A version whose SHAPE this build cannot parse is reported, not refused.** It
+    is a string an operator reads rather than one any code branches on, so an
+    unrecognised shape is a peer to report; refusing the registration over a
+    diagnostic field's *format* would take a working machine out of the fleet. That
+    is a different question from whether it is text at all -- see below, which does
+    refuse. It reaches an HTML page, so it is escaped like every other value that
+    came off a wire.
+
+## Text a peer sent is text, or the fleet refuses it
+
+Every string a peer states about itself -- a toolchain fingerprint, an endpoint,
+a version, a cluster member id -- is copied into the leader's view of the fleet
+and read back out of it by an operator: `/fleet.json`, the page, the charts,
+`--cluster-status`, the logs. One byte belonging to no valid UTF-8 sequence made
+`/fleet.json` a document a strict parser may reject **for the whole fleet**, not
+for the row that carried it (issue #141). RFC 8259 §8.1 requires UTF-8 of JSON
+exchanged between systems, and an SVG is XML, which a strict parser refuses
+outright rather than drawing with a gap.
+
+- **It is refused where it enters, never repaired by a renderer.** A renderer
+  that sanitises is a second place the value is decided, and every *other*
+  surface still carries the original. `SchedulerService::Register` refuses the
+  registration outright.
+- **The consensus door is deliberately still open, and refusing at the proposer
+  is NOT the way to close it** (issue #159). `Cluster::Validate` looks like the
+  matching place and is a trap twice over: it also governs `RemoveMember`, so a
+  bad id already in replicated state could never be *forgotten* -- the member
+  would count towards quorum forever -- and `ConsensusTier::Reconcile` returns on
+  the first refused proposal, which is correct for the transient refusal it was
+  written for and makes a permanent one stall admission of every peer, silently,
+  at Info. Whatever closes it belongs where a peer's claimed id enters, not where
+  a proposal is made.
+- **Refused, not cleaned up, and the reason is per-field.** A fingerprint is
+  matched byte for byte, so a worker admitted under a repaired name would match
+  nothing and sit in the fleet never being picked. A member id is what every
+  later `RemoveMember` has to name, so a repaired one could never be removed by
+  the name its operator typed. A repair is the failure that is quiet.
+- **All the strings, from a table.** A fourth string added to
+  `WorkerRegistration` or to `Cluster::Command` that nobody remembered to check
+  is the failure this guards against, and it stays invisible until a peer sends
+  one.
+- **And the encoders are total anyway.** That is not a second answer to the same
+  question -- it is what an encoder owes its own format, exactly as escaping a
+  quote is. Entry validation cannot be the whole story: a consensus entry is
+  applied AFTER it is committed, so a peer built before the refusal existed can
+  still replicate a member id past it with nobody left to refuse. Both escapers
+  in `FleetText.hpp` walk one shared decoder so they cannot disagree.
+- **Markup carries what XML's `Char` production admits, and that is a rule about
+  CODE POINTS, not bytes.** JSON spells every control byte with a legal
+  `\uXXXX` escape and puts no hole in its character range at all. XML admits
+  only tab, LF and CR below `0x20` and forbids the rest **outright** -- there is
+  no reference that makes a NUL legal -- and it stops at `U+FFFD`, so `U+FFFE`
+  and `U+FFFF` are excluded while being perfectly good UTF-8. A byte-level check
+  cannot see the second case, and a test asserting only "the output is UTF-8"
+  passes on a document no XML parser will take. Both halves were missed exactly
+  that way, one after the other.
+- **The rule is about encoding, not about ASCII.** A fingerprint is opaque by
+  design and a node id may be in the operator's own language. Narrowing either to
+  ASCII would be a second restriction nobody announced.
 
 ## Open work
 
-- **[#141](https://github.com/LASTRADA-Software/fastcached/issues/141)** —
-  `AppendJsonText` passes every byte from `0x80` up through verbatim, which is
-  right for UTF-8 and produces a non-UTF-8 document for anything else, so one peer
-  registering a non-UTF-8 fingerprint makes `/fleet.json` a response a strict
-  parser may reject for the whole fleet. The fix belongs in `WorkerRegistry`, where
-  the bytes enter: a renderer that sanitises is a second place the value is
-  decided, and `/fleet`, `--cluster-status` and the logs still see the originals.
+- **[#159](https://github.com/LASTRADA-Software/fastcached/issues/159)** — a
+  cluster member id, its consensus endpoint and its scheduler endpoint reach
+  `/fleet.json`, the page and `--cluster-status` without ever being asked whether
+  they are text. The document itself is safe -- the encoders repair what reaches
+  them -- but the leader's state holds bytes nobody can name. Refusing them in
+  `Cluster::Validate` was written, verified and reverted before merge: it governs
+  `RemoveMember` too, so a bad id could never be forgotten, and
+  `ConsensusTier::Reconcile` returns on the first refused proposal, which turns a
+  permanent refusal into a cluster that silently stops admitting anyone. The
+  ticket carries both failures in full.
 - **[#142](https://github.com/LASTRADA-Software/fastcached/issues/142)** —
   `LeaseTable` exposes `LiveCount()` and `IsInFlight(key)` and no way to walk what
   is held, so the page can say *seven leases* and not *which*. That is the wrong

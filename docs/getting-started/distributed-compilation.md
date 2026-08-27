@@ -249,6 +249,7 @@ On the scheduler, the `/metrics` endpoint counts the outcomes:
 | `fastcached_dispatch_leases_withdrawn_total` | The fleet is **unavailable** — slots free on paper, machines busy elsewhere or out of scratch space. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
+| `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. Any rise names a machine that is **not** in the fleet. |
 
 The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and

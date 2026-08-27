@@ -319,3 +319,15 @@ readable and silently ignored. Every rule below has already been one of them.
   `space.free`: the difference is the root-reserved portion, which an unprivileged
   worker cannot write and must not offer to a scheduler as room it has.
 
+
+## Open work
+
+- **[#155](https://github.com/LASTRADA-Software/fastcached/issues/155)** — `argv`
+  on Windows carries the ANSI code page, and nothing in this tree converts it to
+  UTF-8. It did not matter while every string a peer sent was passed through
+  unexamined; #141 made a node's fingerprint, endpoint and version have to be
+  UTF-8, so a non-ASCII value an operator typed on a Windows console is now
+  refused by the scheduler for a reason invisible from where it was typed. The
+  seam belongs in `Platform/Environment`, which is already the one place the
+  environment is read — but `fastcache-cc` does not link `FastCache`, so what
+  that seam may depend on is part of the question.

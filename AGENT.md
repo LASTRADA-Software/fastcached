@@ -12,7 +12,8 @@ transport, a manual clock and a scripted reactor.
 src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
-                Compression, WireFrame + WireFields (the shared framing), Profiling
+                Utf8 (the one strict decoder), Compression, WireFrame + WireFields
+                (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
                 bounded, closable), IReactor (Run/Stop/Submit/Schedule/
@@ -248,6 +249,13 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every
   enumerator; the renderer walks the table rather than a hand-picked list.
 - A refusal's wire code and its counter are one row — one fact, two audiences.
+- Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
+  makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
+  (`SchedulerService::Register`) and never repaired by a renderer — and the
+  encoders are total anyway, because a consensus entry is applied after it is
+  committed, with nobody left to refuse it. Markup's rule is XML's `Char`
+  production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
+  illegal in an SVG.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - A duration is a `_sum`/`_count` pair, never a gauge.
