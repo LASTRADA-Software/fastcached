@@ -133,6 +133,24 @@ namespace
             return TimePoint::max();
         if (v == std::numeric_limits<std::int64_t>::min())
             return TimePoint::min();
+
+        // Clamped, because this number comes off DISK and the clock counts in
+        // nanoseconds: constructing the time point multiplies by a thousand, and
+        // a microsecond count that does not fit overflows a signed integer --
+        // undefined behaviour rather than a wrong timestamp, on a path any
+        // damaged record can reach. UBSan trips on it, which is how it was
+        // found: the first test to feed the parser arbitrary bytes reached it
+        // immediately.
+        //
+        // The sentinels above are the only values that MEAN anything at the
+        // extremes, so anything else out there is a damaged field, and the
+        // nearest representable instant is a better answer than a trap.
+        constexpr auto MaxMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::max()).count();
+        constexpr auto MinMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::min()).count();
+        if (v >= MaxMicros)
+            return TimePoint::max();
+        if (v <= MinMicros)
+            return TimePoint::min();
         return TimePoint { std::chrono::microseconds { v } };
     }
 

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -1702,6 +1703,62 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
     // grow four times as much; one bounded by a slice grows about the same.
     INFO("growth: 2000 records -> " << small << " bytes, 8000 records -> " << large << " bytes");
     REQUIRE(large < small * 2);
+}
+
+TEST_CASE("A record whose expiry does not fit the clock is decoded, not undefined", "[cowstorage][format]")
+{
+    // The timestamps come off DISK, and the clock counts in nanoseconds, so
+    // building a time point from a microsecond count multiplies by a thousand.
+    // A damaged field near the type's range therefore overflows a signed
+    // integer -- undefined behaviour rather than a wrong timestamp, on a path
+    // any corrupt record can reach. Only a sanitizer sees it, which is why this
+    // pins the value rather than the absence of a crash.
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    // Rewrite the record's expiry field to a microsecond count that is huge but
+    // not the "never expires" sentinel, so the conversion below is a real one.
+    constexpr std::int64_t Overflowing = (std::numeric_limits<std::int64_t>::max() / 16) + 1;
+    {
+        CowTree::CowTree tree { store };
+        REQUIRE(tree.Open().has_value());
+        std::vector<std::byte> record;
+        {
+            auto const reader = tree.BeginRead();
+            auto const got = reader.Get(CowTree::AsBytes("k"));
+            REQUIRE(got.has_value());
+            REQUIRE(got->has_value());
+            record = FastCache::Testing::Unwrap(*got);
+        }
+        // kind(1) + codec(1) + flags(4) + cas(8) puts expiry at offset 14.
+        constexpr std::size_t ExpiryOffset = 1 + 1 + 4 + 8;
+        REQUIRE(record.size() > ExpiryOffset + sizeof(std::int64_t));
+        auto const raw = static_cast<std::uint64_t>(Overflowing);
+        for (auto const i: std::views::iota(std::size_t { 0 }, sizeof(std::uint64_t)))
+            record[ExpiryOffset + i] = static_cast<std::byte>((raw >> (8U * i)) & 0xFFU);
+
+        auto txn = tree.BeginWrite();
+        REQUIRE(txn.Put(CowTree::AsBytes("k"), CowTree::BytesView { record.data(), record.size() }).has_value());
+        REQUIRE(txn.Commit().has_value());
+    }
+
+    FastCache::CowTreeStorage::Options opts;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+
+    // Clamped to "never", which is the nearest representable instant, and the
+    // entry is still readable rather than the process being in undefined
+    // behaviour.
+    auto const got = (*storage)->Peek("k", FastCache::ManualClock {}.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+    REQUIRE(got->entry.expiry == FastCache::TimePoint::max());
 }
 
 TEST_CASE("A store older than any reader is refused, not rewritten in place", "[cowstorage][format][migrate]")
