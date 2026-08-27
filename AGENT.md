@@ -265,6 +265,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - An install is judged by the **startup** rules as well as the install-time ones:
   a registration replays its command line forever, so refuse it while somebody is
   watching.
+- A refusal that depends on nothing but the parsed configuration belongs in a table
+  — the option row for a grammar, `StartupPolicyRejection` for a cross-flag rule —
+  never in the tier that happens to need it. An install returns before any tier
+  exists.
 - Whatever reaches a supervisor must survive this project's own parser round trip
   — including the flags the *installer itself* adds, which are the daemon's only
   when the spec names an application.
