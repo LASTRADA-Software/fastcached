@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/DiscoveryService.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/HostPort.hpp>
 
 #include <algorithm>
 #include <ranges>
@@ -75,10 +76,46 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                 return DiscoveryEvent::Ignored;
 
             // The directory decides whether this beacon is even ours -- wrong
-            // cluster, our own, or nothing to reach. Only then is a challenge
-            // worth the datagram.
-            if (!_directory.NoteBeacon(beacon->clusterId, beacon->nodeId, beacon->raftEndpoint))
-                return DiscoveryEvent::Ignored;
+            // cluster, our own, or an identity nothing could record. Only then is a
+            // challenge worth the datagram, and a peer it declined is one no
+            // membership proposal can ever be generated for.
+            // A `switch` without a `default`, so a fifth outcome is a build failure
+            // rather than one nobody reports: "deliberately silent" and "somebody
+            // forgot" are otherwise the same state, and three of the four here are
+            // deliberately silent.
+            switch (_directory.NoteBeacon(beacon->clusterId, beacon->nodeId, beacon->raftEndpoint))
+            {
+                case BeaconOutcome::Recorded:
+                    break;
+
+                // Both ordinary. This node's own beacon comes back on every
+                // broadcast, and another fleet's is what a shared segment carries,
+                // so reporting either would bury the one that is a fault.
+                case BeaconOutcome::OtherCluster:
+                case BeaconOutcome::Self:
+                    return DiscoveryEvent::Ignored;
+
+                case BeaconOutcome::Unnameable:
+                    // Throttled, because one unauthenticated datagram provokes this
+                    // and nothing on the segment has to hold the key to send it --
+                    // see `UnnameableReportInterval`.
+                    //
+                    // Reported by the address it came FROM rather than by what it
+                    // claimed, for two reasons that happen to agree. The claim is
+                    // the thing that is not text, so it is the one part of such a
+                    // beacon that cannot be printed at all -- and the address is
+                    // what says which machine to go and look at, which is where the
+                    // identity was typed.
+                    if (auto const now = _clock.Now(); now >= _nextUnnameableReport)
+                    {
+                        _nextUnnameableReport = now + UnnameableReportInterval;
+                        _logger.Logf(LogLevel::Warn,
+                                     "discovery: the beacon from {} names an id or endpoint this node cannot record "
+                                     "as a member -- empty, or not valid UTF-8; ignoring",
+                                     FormatHostPort(received->from.host, received->from.port));
+                    }
+                    return DiscoveryEvent::Ignored;
+            }
 
             IssueChallenge(*beacon, received->from);
             return DiscoveryEvent::PeerSeen;

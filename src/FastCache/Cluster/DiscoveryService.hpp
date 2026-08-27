@@ -91,6 +91,19 @@ class DiscoveryService
     /// @param directory Who is known and who has proved themselves.
     /// @param config What this node announces and accepts.
     /// @param logger Where joins and rejections are reported.
+    /// How often a beacon nobody can name is reported, at most.
+    ///
+    /// Throttled rather than logged per datagram, and the reason is the one that
+    /// makes `_pending` one entry per node: a beacon is unauthenticated by
+    /// construction, so a single spoofable datagram provokes this line and anything
+    /// on the segment can send them at line rate. A log an attacker can grow without
+    /// holding the key is a disk-exhaustion hole reached from outside the fleet.
+    ///
+    /// Generous, because the fault it reports is a *standing* one -- a peer whose
+    /// identity is not text stays that way -- and the beacons repeat on their own
+    /// interval, so an operator who looks at any minute of the log sees it.
+    static constexpr std::chrono::seconds UnnameableReportInterval { 60 };
+
     DiscoveryService(IDatagramSocket& socket,
                      IClock& clock,
                      IRandomSource& random,
@@ -147,6 +160,12 @@ class DiscoveryService
     /// who could make this table grow per datagram would have a memory-exhaustion
     /// hole reached without holding the key.
     std::unordered_map<std::string, Pending> _pending;
+
+    /// When a beacon nobody can name may next be reported.
+    ///
+    /// Value-initialized so the first one always is: the epoch is behind any clock
+    /// this runs on, including a `ManualClock` that has never been advanced.
+    TimePoint _nextUnnameableReport {};
 };
 
 } // namespace FastCache::Cluster

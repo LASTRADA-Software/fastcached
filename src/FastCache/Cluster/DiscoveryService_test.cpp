@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -218,6 +219,67 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
     REQUIRE(atSecond.size() == 1);
     CHECK(atSecond.front().nodeId == "first");
     CHECK(atSecond.front().raftEndpoint == "10.0.0.1:7000");
+}
+
+TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][discovery][service]")
+{
+    // #159, one layer up from `PeerDirectory`. The refusal is worth asserting from
+    // here as well as there, because two things follow from it that the directory
+    // alone cannot show: no challenge is spent on such a peer -- the HMAC and the
+    // `_pending` entry are both work an unauthenticated broadcast should not be
+    // able to provoke -- and the datagram is REPORTED, which its two siblings
+    // (another fleet's beacon, and this node's own) deliberately are not.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    CapturingLogger logger;
+
+    Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
+
+    // A lone surrogate: valid in shape, refused by every strict decoder, and the
+    // sequence a lenient encoder is most likely to emit by accident.
+    Node rogue { bus, clock, random, logger, "rogue-\xED\xA0\x80", "10.0.0.2:7000", "prod", "secret" };
+
+    REQUIRE(rogue.service.SendBeacon());
+    CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+
+    CHECK(listener.directory.Size() == 0);
+
+    // Exactly one datagram is waiting for the rogue -- its own beacon, which a
+    // broadcast doubles back to its sender -- and a challenge would make it two.
+    // That is the half the directory cannot show: a challenge is an HMAC and a
+    // `_pending` entry, and an unauthenticated broadcast must not provoke either.
+    CHECK(Drain(rogue) == 1);
+
+    // Reported by the address it came from, which is the only part of such a
+    // beacon that can be printed -- and the part that says which machine to look
+    // at.
+    auto const reported = [&logger] {
+        return std::ranges::count_if(logger.Snapshot(), [](CapturingLogger::Record const& record) {
+            return record.level == LogLevel::Warn && record.message.contains("10.0.0.2:7000")
+                   && record.message.contains("cannot record");
+        });
+    };
+    CHECK(reported() == 1);
+
+    // And once, however many arrive. This is the half a per-datagram log line gets
+    // wrong: one unauthenticated datagram provokes it, so anything on the segment
+    // can drive it at line rate without ever holding the cluster key, which is a
+    // disk-exhaustion hole reached from outside the fleet.
+    for (auto round = 0; round < 5; ++round)
+    {
+        REQUIRE(rogue.service.SendBeacon());
+        CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+    }
+    CHECK(reported() == 1);
+
+    // Until the interval has passed. The fault is a STANDING one -- a peer whose
+    // identity is not text stays that way -- so an operator who starts reading the
+    // log an hour later must still find it.
+    clock.Advance(DiscoveryService::UnnameableReportInterval);
+    REQUIRE(rogue.service.SendBeacon());
+    CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+    CHECK(reported() == 2);
 }
 
 TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discovery][service]")
