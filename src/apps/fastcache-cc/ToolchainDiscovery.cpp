@@ -41,11 +41,38 @@ namespace
         "bin/Hostx86/x86";
 #endif
 
+    /// The bindir a Visual Studio install keeps its BUNDLED LLVM in.
+    ///
+    /// Visual Studio ships clang-cl itself, under `VC/Tools/Llvm` rather than beside
+    /// `cl` -- so the MSVC row above walks straight past it, and every one of the
+    /// three LLVM rows below wants a STANDALONE install (a registry key, or
+    /// `%ProgramFiles%/LLVM`). A machine whose only clang-cl came with Visual Studio
+    /// therefore registered no clang-cl toolchain at all: builds using it were
+    /// cached, because the launcher does not need a worker for that, and could never
+    /// be dispatched, because no worker ever advertised the fingerprint. Nothing
+    /// reported it -- half of what the fleet is for, off, silently.
+    ///
+    /// Native architecture only, for the reason `MsvcNativeBinPath` is: the other
+    /// directory holds a compiler built for a different HOST, which this machine
+    /// cannot run. `VC/Tools/Llvm/bin` is where a 32-bit host's copy sits, matching
+    /// the layout Visual Studio used before it grew per-architecture directories.
+    constexpr std::string_view VsLlvmNativeBinPath =
+#if defined(_M_ARM64) || defined(__aarch64__)
+        "VC/Tools/Llvm/ARM64/bin";
+#elif defined(_M_X64) || defined(__x86_64__)
+        "VC/Tools/Llvm/x64/bin";
+#else
+        "VC/Tools/Llvm/bin";
+#endif
+
     /// The bindir every non-MSVC layout keeps its compilers in.
     constexpr std::array<std::string_view, 1> BinOnly { "bin" };
 
     /// MSVC's, for the architecture this build targets.
     constexpr std::array<std::string_view, 1> MsvcBin { MsvcNativeBinPath };
+
+    /// The LLVM Visual Studio bundles, for the architecture this build targets.
+    constexpr std::array<std::string_view, 1> VsLlvmBin { VsLlvmNativeBinPath };
 
     /// The three MSYS2 environments that ship a usable compiler.
     ///
@@ -59,10 +86,15 @@ namespace
     /// What an MSVC layout is looked for.
     constexpr std::array<std::string_view, 1> MsvcBinaries { "cl" };
 
-    /// What an LLVM layout is looked for.
+    /// What an LLVM layout is looked for, in order of PREFERENCE.
     ///
-    /// `clang-cl` first so the more specific stem is reported before the prefix it
-    /// contains, matching the order `ClassifyCompiler`'s own stem table uses.
+    /// `clang-cl` first, and the order is load-bearing rather than cosmetic. All
+    /// three fingerprint identically -- clang's banner does not name its own
+    /// `argv[0]` the way a GNU driver's does, and they own one include tree -- so a
+    /// worker keeps the first and drops the rest as duplicates. The first must
+    /// therefore be the driver a client on this machine actually invokes, and the
+    /// arguments it will be handed are spelled in that driver's grammar: an MSVC-
+    /// spelled job routed to `clang++` is read as a list of filenames.
     constexpr std::array<std::string_view, 4> LlvmBinaries { "clang-cl", "clang++", "clang", "cc" };
 
     /// What a GNU-shaped layout is looked for.
@@ -126,6 +158,20 @@ namespace
           .versionHintFile = "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt",
           .binPaths = MsvcBin,
           .binaries = MsvcBinaries,
+          .match = NameMatch::Exact },
+        // The same installation, one directory over. No `versionRoot`: the bundled
+        // LLVM is not versioned side by side the way the MSVC toolsets are, so the
+        // bindir hangs directly off the installation path.
+        { .name = "visual-studio-llvm",
+          .root = LayoutRoot::VsWhere,
+          .rootPath = {},
+          .environmentVariable = {},
+          .view = RegistryView::Native,
+          .registryKey = {},
+          .versionRoot = {},
+          .versionHintFile = {},
+          .binPaths = VsLlvmBin,
+          .binaries = LlvmBinaries,
           .match = NameMatch::Exact },
         { .name = "llvm-registry",
           .root = LayoutRoot::RegistryValue,
@@ -269,15 +315,65 @@ namespace
         return key;
     }
 
+    /// `vswhere`'s answer, held so it is asked once however many rows want it.
+    ///
+    /// Two rows describe one Visual Studio installation -- its MSVC toolsets and the
+    /// LLVM it bundles -- and `vswhere` is a PROCESS. Asking per row would spawn it
+    /// once for each, at every node start, forever, to be told the same thing; and a
+    /// third row wanting the same installation would make it three. Filled only
+    /// when a row actually reaches it, so the "no installer means no run at all"
+    /// guard still holds.
+    ///
+    /// A flag beside the vector rather than an `optional<vector>`: an empty answer is
+    /// a real answer here, so the two states are "asked" and "not asked" rather than
+    /// "has a value" and "does not". It also keeps the read a plain member access --
+    /// GCC's `-Wnull-dereference` cannot see through an inlined `optional` deref at
+    /// `-O3` and rejects the copy out of one.
+    struct VsWhereInstallations
+    {
+        std::vector<std::string> paths; ///< The installations; empty when there are none.
+        bool asked { false };           ///< Whether the question has been put to `vswhere` yet.
+    };
+
+    /// Ask `vswhere` which Visual Studio installations this machine has.
+    ///
+    /// @param host The machine, for the installer directory.
+    /// @param runner Process-spawning seam.
+    /// @return The installation paths; empty when Visual Studio is not installed here.
+    [[nodiscard]] std::vector<std::string> AskVsWhere(IToolchainHost& host, IProcessRunner& runner)
+    {
+        auto const installer = host.Environment(ProgramFilesX86Variable);
+        if (!installer.has_value() || installer->empty())
+            return {};
+        auto const vswhere = JoinPath(*installer, VsWhereRelativePath);
+        if (!host.ExecutableExists(vswhere))
+            return {};
+
+        std::vector<std::string> argv;
+        argv.reserve(VsWhereArguments.size() + 1);
+        argv.push_back(vswhere);
+        for (auto const& argument: VsWhereArguments)
+            argv.emplace_back(argument);
+
+        // Combined, because `vswhere` writes its own diagnostics to stderr and a run
+        // that reports nothing useful there is indistinguishable from one that
+        // reports nothing at all. The exit code is not checked for the reason the GNU
+        // include probe does not check its own: parsing decides whether the output is
+        // usable.
+        return ParseVsWhereInstallations(runner.RunCaptureCombined(argv).out);
+    }
+
     /// The root directories a layout row names on this machine.
     ///
     /// @param layout The row.
     /// @param host The machine.
     /// @param runner Process-spawning seam, for `vswhere`.
+    /// @param vsWhere Memo for `vswhere`'s answer, shared across rows.
     /// @return Its roots; empty when the layout is not installed here.
     [[nodiscard]] std::vector<std::string> RootsOf(ToolchainLayout const& layout,
                                                    IToolchainHost& host,
-                                                   IProcessRunner& runner)
+                                                   IProcessRunner& runner,
+                                                   VsWhereInstallations& vsWhere)
     {
         // No `default:`, so a mechanism added to the enum is a compile error here
         // rather than a row that silently finds nothing.
@@ -306,25 +402,15 @@ namespace
             }
 
             case LayoutRoot::VsWhere: {
-                auto const installer = host.Environment(ProgramFilesX86Variable);
-                if (!installer.has_value() || installer->empty())
-                    return {};
-                auto const vswhere = JoinPath(*installer, VsWhereRelativePath);
-                if (!host.ExecutableExists(vswhere))
-                    return {};
-
-                std::vector<std::string> argv;
-                argv.reserve(VsWhereArguments.size() + 1);
-                argv.push_back(vswhere);
-                for (auto const& argument: VsWhereArguments)
-                    argv.emplace_back(argument);
-
-                // Combined, because `vswhere` writes its own diagnostics to stderr
-                // and a run that reports nothing useful there is indistinguishable
-                // from one that reports nothing at all. The exit code is not checked
-                // for the reason the GNU include probe does not check its own:
-                // parsing decides whether the output is usable.
-                return ParseVsWhereInstallations(runner.RunCaptureCombined(argv).out);
+                // Memoized whatever the answer, the empty ones included: "not
+                // installed here" is as much an answer as a list of installations,
+                // and a second row re-deriving it would probe the filesystem again.
+                if (!vsWhere.asked)
+                {
+                    vsWhere.asked = true;
+                    vsWhere.paths = AskVsWhere(host, runner);
+                }
+                return vsWhere.paths;
             }
 
             case LayoutRoot::Xcrun:
@@ -479,6 +565,7 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
     std::vector<ToolchainCandidate> candidates;
 
     std::set<std::string> seen;
+    VsWhereInstallations vsWhere;
     for (auto const& layout: ToolchainLayouts())
     {
         auto record = [&](std::string compiler) {
@@ -494,7 +581,7 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
             continue;
         }
 
-        for (auto const& root: RootsOf(layout, host, runner))
+        for (auto const& root: RootsOf(layout, host, runner, vsWhere))
         {
             if (root.empty() || !host.DirectoryExists(root))
                 continue;
@@ -515,41 +602,48 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
                     return std::ranges::binary_search(entries, name);
                 };
 
-                for (auto const& entry: entries)
-                {
-                    // An extensionless entry loses to its `.exe` sibling, and the rule
-                    // is about the DESCRIBED machine rather than the host running this,
-                    // so a Windows bindir stays testable from anywhere. An MSYS2 or
-                    // Cygwin bindir routinely holds a shell wrapper named `gcc` beside
-                    // the launchable `gcc.exe`; Windows resolves a bare name through
-                    // PATHEXT and never runs the first, and `ExecutableExists` cannot
-                    // tell them apart because that filesystem has no execute bit.
-                    // Registering the wrapper would hand the fleet a toolchain that
-                    // cannot be spawned.
-                    if (!entry.ends_with(WindowsExecutableSuffix)
-                        && present(entry + std::string { WindowsExecutableSuffix }))
-                        continue;
+                // The ROW's order outside, the directory's inside. That order is a
+                // preference and not decoration: several drivers in one bindir can
+                // share a fingerprint -- `clang-cl`, `clang++` and `clang` do, since
+                // clang's banner does not name its own `argv[0]` the way a GNU
+                // driver's does -- and a worker serves the FIRST of them and drops
+                // the rest as duplicates. Left to the listing, `clang++.exe` won on
+                // alphabetical order alone, so a Windows node advertised the GNU
+                // driver and every clang-cl job routed to it arrived spelled in a
+                // grammar that driver does not read.
+                for (auto const& sought: layout.binaries)
+                    for (auto const& entry: entries)
+                    {
+                        // An extensionless entry loses to its `.exe` sibling, and the
+                        // rule is about the DESCRIBED machine rather than the host
+                        // running this, so a Windows bindir stays testable from
+                        // anywhere. An MSYS2 or Cygwin bindir routinely holds a shell
+                        // wrapper named `gcc` beside the launchable `gcc.exe`; Windows
+                        // resolves a bare name through PATHEXT and never runs the
+                        // first, and `ExecutableExists` cannot tell them apart because
+                        // that filesystem has no execute bit. Registering the wrapper
+                        // would hand the fleet a toolchain that cannot be spawned.
+                        if (!entry.ends_with(WindowsExecutableSuffix)
+                            && present(entry + std::string { WindowsExecutableSuffix }))
+                            continue;
 
-                    auto entryName = std::string_view { entry };
-                    if (entryName.ends_with(WindowsExecutableSuffix))
-                        entryName.remove_suffix(WindowsExecutableSuffix.size());
+                        auto entryName = std::string_view { entry };
+                        if (entryName.ends_with(WindowsExecutableSuffix))
+                            entryName.remove_suffix(WindowsExecutableSuffix.size());
 
-                    auto const wanted = std::ranges::any_of(layout.binaries, [&](std::string_view sought) {
-                        return MatchesCompilerName(entryName, sought, layout.match);
-                    });
-                    if (!wanted)
-                        continue;
+                        if (!MatchesCompilerName(entryName, sought, layout.match))
+                            continue;
 
-                    // Asked of the HOST rather than inferred from the name, because
-                    // only the host knows: a POSIX bindir holds `gcc` beside `gcc.1`
-                    // and the execute bit is what separates them, while on Windows the
-                    // filesystem has no such bit and the name is all there is. A
-                    // manual page offered as a compiler would register a toolchain
-                    // that fails every job it is sent.
-                    auto full = JoinPath(directory, entry);
-                    if (host.ExecutableExists(full))
-                        record(std::move(full));
-                }
+                        // Asked of the HOST rather than inferred from the name,
+                        // because only the host knows: a POSIX bindir holds `gcc`
+                        // beside `gcc.1` and the execute bit is what separates them,
+                        // while on Windows the filesystem has no such bit and the name
+                        // is all there is. A manual page offered as a compiler would
+                        // register a toolchain that fails every job it is sent.
+                        auto full = JoinPath(directory, entry);
+                        if (host.ExecutableExists(full))
+                            record(std::move(full));
+                    }
             }
         }
     }

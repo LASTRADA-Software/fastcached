@@ -198,6 +198,82 @@ TEST_CASE("A Visual Studio install is found through vswhere", "[toolchain-discov
     CHECK(candidates.front().layout == "visual-studio");
 }
 
+TEST_CASE("The clang-cl Visual Studio bundles is found too", "[toolchain-discovery]")
+{
+    // Visual Studio ships clang-cl under `VC/Tools/Llvm`, not beside `cl` -- and the
+    // three LLVM rows all want a STANDALONE install. A machine whose only clang-cl
+    // came with Visual Studio therefore advertised no clang-cl toolchain at all, so
+    // builds using it were cached and could never be dispatched, with nothing
+    // reporting why.
+    constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    ScriptedToolchainHost host;
+    host.SetEnvironment("ProgramFiles(x86)", "C:/Program Files (x86)");
+    host.AddExecutable("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe");
+    for (auto const& architecture: { "x64", "ARM64" })
+        for (auto const& binary: { "clang-cl.exe", "clang.exe", "clang++.exe" })
+            host.AddExecutable(std::string { vs } + "/VC/Tools/Llvm/" + architecture + "/bin/" + binary);
+
+    ScriptedRunner runner;
+    runner.Answer("vswhere", std::string { vs } + "\r\n");
+
+    auto const candidates = DiscoverToolchainCandidates(host, runner);
+    auto const paths = PathsOf(candidates);
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+    constexpr std::string_view nativeBin = "VC/Tools/Llvm/ARM64/bin";
+    constexpr std::string_view otherBin = "VC/Tools/Llvm/x64/bin";
+#else
+    constexpr std::string_view nativeBin = "VC/Tools/Llvm/x64/bin";
+    constexpr std::string_view otherBin = "VC/Tools/Llvm/ARM64/bin";
+#endif
+
+    // Not `CHECK(!empty)` afterwards: an empty result would make the layout loop
+    // below pass vacuously, which is the shape this whole case exists to catch.
+    REQUIRE(!candidates.empty());
+    CHECK(std::ranges::find(paths, std::string { vs } + "/" + std::string { nativeBin } + "/clang-cl.exe") != paths.end());
+    // The other directory holds a compiler built for a different HOST, which this
+    // machine cannot run -- so it is not offered, for the reason the MSVC row offers
+    // only its native bindir.
+    CHECK(std::ranges::none_of(paths, [&](std::string const& p) { return p.contains(otherBin); }));
+
+    // clang-cl BEFORE clang++, though the directory lists them the other way round.
+    // All three drivers here fingerprint identically, so a worker keeps the first and
+    // drops the rest -- and on Windows the driver clients invoke is clang-cl. Ordered
+    // by the listing, `clang++.exe` won on alphabet alone and the node advertised the
+    // GNU driver, so every clang-cl job routed to it arrived spelled in a grammar
+    // that driver reads as a list of filenames.
+    REQUIRE(paths.size() >= 2);
+    CHECK(paths[0] == std::string { vs } + "/" + std::string { nativeBin } + "/clang-cl.exe");
+
+    for (auto const& candidate: candidates)
+        CHECK(candidate.layout == "visual-studio-llvm");
+}
+
+TEST_CASE("Two rows describing one Visual Studio install ask vswhere once", "[toolchain-discovery]")
+{
+    // `vswhere` is a process, and the MSVC toolsets and the bundled LLVM are two
+    // rows of one installation. Asking per row would spawn it once for each at every
+    // node start, forever, to be told the same thing.
+    constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    ScriptedToolchainHost host;
+    host.SetEnvironment("ProgramFiles(x86)", "C:/Program Files (x86)");
+    host.AddExecutable("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe");
+    host.AddExecutable(std::string { vs } + "/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe");
+    host.AddExecutable(std::string { vs } + "/VC/Tools/MSVC/14.51.36231/bin/Hostarm64/arm64/cl.exe");
+    for (auto const& architecture: { "x64", "ARM64" })
+        host.AddExecutable(std::string { vs } + "/VC/Tools/Llvm/" + architecture + "/bin/clang-cl.exe");
+
+    ScriptedRunner runner;
+    runner.Answer("vswhere", std::string { vs } + "\r\n");
+
+    auto const candidates = DiscoverToolchainCandidates(host, runner);
+    // Both rows produced something, so both genuinely reached the installation
+    // rather than one of them being skipped into a passing count.
+    CHECK(std::ranges::any_of(candidates, [](ToolchainCandidate const& c) { return c.layout == "visual-studio"; }));
+    CHECK(std::ranges::any_of(candidates, [](ToolchainCandidate const& c) { return c.layout == "visual-studio-llvm"; }));
+    CHECK(runner.Calls() == 1);
+}
+
 TEST_CASE("No Visual Studio installer means no vswhere run at all", "[toolchain-discovery]")
 {
     // The installer directory is what says Visual Studio might be here, and `xcrun`

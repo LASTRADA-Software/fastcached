@@ -188,6 +188,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.
+- A discovery layout describes a **directory layout, not a vendor**: Visual Studio
+  ships its own clang-cl under `VC\Tools\Llvm`, which the `visual-studio` row walked
+  past and the three standalone-LLVM rows never reached — so those builds were cached
+  and could never be dispatched. One installation, two rows; `vswhere`'s answer is
+  memoized across them, empty answers included.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - What a node holds back from compiles is what its tier **built**, never what a flag

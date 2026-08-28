@@ -648,6 +648,17 @@ caught in review:
   fingerprint *differently*, because a GNU driver prints its own `argv[0]` in the
   banner its clients hash. Collapsing them looks like tidiness and costs the fleet
   every `cc` build.
+- **A layout describes a DIRECTORY LAYOUT, not a vendor.** Visual Studio ships
+  clang-cl of its own, under `VC\Tools\Llvm` rather than beside `cl` — so the
+  `visual-studio` row walked past it while all three LLVM rows wanted a *standalone*
+  install, and a machine whose only clang-cl came with Visual Studio advertised none.
+  The failure is the quiet half of the pair the whole feature exists to avoid: those
+  builds were still **cached**, because a launcher needs no worker for that, and could
+  never be **dispatched**, because nothing advertised the fingerprint. A green fleet,
+  a working cache, and distribution simply off. One installation reached by two rows
+  is normal; what must not double is the *process* — `vswhere`'s answer is memoized
+  across rows, empty answers included, or a second row spawns it again at every start
+  forever to be told the same thing.
 
 **Only the native MSVC target variant is offered, and only what the filesystem
 confirms.** This was once forced: every target variant of one toolset — x64, x86,
