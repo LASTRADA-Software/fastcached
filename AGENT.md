@@ -378,6 +378,12 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   illegal in an SVG.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
+- Its converse: an absence must not be counted as an event. `NoUpstream`'s honest
+  `false` was read as a failed store, so a machine with no shared cache reported a
+  100% upstream failure rate. An outcome that can be *not attempted* is an enum, not
+  a `bool` — and it is fixed at the seam, never at the one call site that noticed.
+- A counter is a tally, so zero is the truth about events that never happened;
+  absence is modelled in the **snapshot**, never by dropping a counter row.
 - A duration is a `_sum`/`_count` pair, never a gauge.
 - A merged snapshot is one tier's answer standing in for all of them:
   `SnapshotTiers()` reports the split, the `tier` label comes from a table, and a

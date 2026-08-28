@@ -93,6 +93,26 @@ struct MetricsSnapshot
     /// does not schedule against would be noise.
     std::optional<HostCapacity> host;
 
+    /// Whether this node has a shared cache to read through to, absent when the
+    /// question does not apply.
+    ///
+    /// The daemon leaves it absent -- it IS the shared cache -- and a compile node
+    /// answers it. It exists because the upstream counters cannot: they are
+    /// cumulative, so a node with no upstream and a node with one it has not yet
+    /// written to both read zero, and an operator cannot tell a developer laptop
+    /// from a fleet whose shared cache is unreachable.
+    ///
+    /// A gauge rather than an absent counter row on purpose. The counters are
+    /// exported in full, deliberately (see the loop below), and a per-counter
+    /// "does this apply?" predicate is the mechanism that once left seven of nine
+    /// live counters unexported. Absence is modelled HERE, in the snapshot, the way
+    /// `storage`, `storageTiers` and `host` already model it.
+    /// Default-initialized like `storageTiers`, and for a mechanical reason as well
+    /// as a semantic one: a designated-initializer list that omits a field WITHOUT a
+    /// default member initializer is a clang-tidy error, so a field added without one
+    /// breaks every exhaustive brace-init of this struct in the tree.
+    std::optional<bool> upstreamConfigured {};
+
     Uptime uptime {};
 };
 

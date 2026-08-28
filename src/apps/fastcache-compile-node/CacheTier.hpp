@@ -107,6 +107,18 @@ class CacheTier
         return _storage->SnapshotTiers();
     }
 
+    /// Whether this tier reads through to a shared cache.
+    ///
+    /// Read off the upstream that was actually BUILT rather than off the
+    /// configuration that asked for one, the same way `StorageTiersOf` reads the
+    /// storage: those are the two things that can disagree, and the scrape must
+    /// describe what is running.
+    /// @return True when a shared cache is configured.
+    [[nodiscard]] bool HasUpstream() const noexcept
+    {
+        return _upstream->Configured();
+    }
+
   private:
     CacheTier(std::unique_ptr<IStorage> storage,
               std::unique_ptr<ICacheUpstream> upstream,

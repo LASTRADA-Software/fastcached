@@ -48,6 +48,10 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
                                    .diskCapacityBytes = static_cast<std::uint64_t>(disk.capacityBytes),
                                    .diskFreeBytes = static_cast<std::uint64_t>(disk.freeBytes),
                                    .busySlots = sources.busySlots() },
+            // Absent when there is no cache at all: a node running none has no
+            // upstream question to answer either, and a `0` there would claim it
+            // does and has none.
+            .upstreamConfigured = sources.cache != nullptr ? std::optional { sources.cache->HasUpstream() } : std::nullopt,
             .uptime =
                 Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt) },
         };

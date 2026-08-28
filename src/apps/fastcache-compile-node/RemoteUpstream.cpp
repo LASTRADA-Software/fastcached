@@ -77,11 +77,14 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
     co_return std::move(outcome.value);
 }
 
-Task<bool> RemoteUpstream::Store(std::string_view key, std::span<std::byte const> value)
+Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::byte const> value)
 {
     auto client = co_await Cc::DialEndpoint(&_connector, _endpoint, _connectTimeout);
     if (client == nullptr)
-        co_return false;
+        // `Declined`, not `NotConfigured`: there IS a shared cache and this node
+        // could not reach it, which is exactly the condition an operator wants the
+        // failure counter to be counting.
+        co_return UpstreamStore::Declined;
 
     auto const bound = ArmExchangeDeadline(_reactor, _ioTimeout, client.get());
 
@@ -103,7 +106,7 @@ Task<bool> RemoteUpstream::Store(std::string_view key, std::span<std::byte const
     // `CacheOutcomeKind` names the STATUS rather than the verb. Anything else --
     // a refusal, a transport failure -- is the fleet declining the object, which
     // `LocalCache` has already been told costs this machine nothing.
-    co_return outcome.kind == Cc::CacheOutcomeKind::Hit;
+    co_return outcome.kind == Cc::CacheOutcomeKind::Hit ? UpstreamStore::Stored : UpstreamStore::Declined;
 }
 
 } // namespace FastCache::Node

@@ -229,7 +229,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .prometheusName = "fastcache_node_cache_upstream_store_failures_total",
       .help = "Objects the shared cache would not take. Best-effort by contract -- the local "
               "write already succeeded -- so this says the FLEET is unreachable, not that "
-              "this node is broken.",
+              "this node is broken. Zero on a node with no shared cache at all, which "
+              "fastcache_node_upstream_configured is what distinguishes.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",

@@ -7,6 +7,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,6 +15,25 @@
 
 namespace FastCache::Node
 {
+
+/// What became of one object offered to the shared cache.
+///
+/// Three outcomes, and the `bool` this replaced had two values for them. `false`
+/// meant both "there is a shared cache and it declined this" and "there is no shared
+/// cache", and `LocalCache` counted every one of them as a failure -- so a machine
+/// with no upstream reported a **100 % upstream store failure rate**, 1800 failures
+/// against 1800 sets, which reads exactly like a shared cache that is down (#214).
+///
+/// The distinction has to exist at the seam rather than at the call site. A caller
+/// told "false" cannot recover which of the two it was, and the next caller would
+/// read it the same wrong way.
+enum class UpstreamStore : std::uint8_t
+{
+    Stored,        ///< The shared cache took it.
+    Declined,      ///< There is one, and it did not take it. An operator's problem.
+    NotConfigured, ///< There is no shared cache. Not a failure, and not an event.
+    Last
+};
 
 /// The shared cache this node reads through to, as a seam.
 ///
@@ -49,8 +69,22 @@ class ICacheUpstream
     /// here costs the *fleet* a shared entry and costs this machine nothing.
     /// @param key The object key.
     /// @param value The encoded compile value.
-    /// @return Whether the shared cache took it.
-    [[nodiscard]] virtual Task<bool> Store(std::string_view key, std::span<std::byte const> value) = 0;
+    /// @return Which of the three outcomes it was. An implementation that has no
+    ///         shared cache answers `NotConfigured` and is never counted as having
+    ///         failed at something it did not attempt.
+    [[nodiscard]] virtual Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) = 0;
+
+    /// Whether there is a shared cache behind this at all.
+    ///
+    /// The same fact `UpstreamStore::NotConfigured` reports, asked before a store
+    /// rather than about one -- and it has to be askable that way, because the store
+    /// counters are cumulative: a node with no upstream and a node with one it has
+    /// not written to yet both report zero, so neither counter can answer it. Both
+    /// are properties of the implementation rather than of any state, so they cannot
+    /// drift apart: an implementation answering `false` here answers `NotConfigured`
+    /// there, always.
+    /// @return True when a shared cache is configured.
+    [[nodiscard]] virtual bool Configured() const noexcept = 0;
 };
 
 /// An upstream that is not there.
@@ -75,9 +109,18 @@ class NoUpstream final: public ICacheUpstream
     }
 
     /// @copydoc ICacheUpstream::Store
-    [[nodiscard]] Task<bool> Store(std::string_view /*key*/, std::span<std::byte const> /*value*/) override
+    ///
+    /// `NotConfigured`, which is the whole point of the enum: this used to answer
+    /// `false` and be counted as a failed store on every single local write.
+    [[nodiscard]] Task<UpstreamStore> Store(std::string_view /*key*/, std::span<std::byte const> /*value*/) override
     {
-        co_return false;
+        co_return UpstreamStore::NotConfigured;
+    }
+
+    /// @copydoc ICacheUpstream::Configured
+    [[nodiscard]] bool Configured() const noexcept override
+    {
+        return false;
     }
 };
 
