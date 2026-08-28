@@ -362,9 +362,13 @@ TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
 
     // Naming the token the grant carried, not some other one: a release that names
     // nothing the scheduler issued is refused and resolves no key at all.
-    auto const token = Wire::DecodeReleasePayload(frames[1].subspan(Wire::RequestHeaderSize));
-    REQUIRE(token.has_value());
-    CHECK(Wire::AsStringView(Unwrap(token)) == "l1");
+    auto const resolved = Wire::DecodeReleasePayload(frames[1].subspan(Wire::RequestHeaderSize));
+    REQUIRE(resolved.has_value());
+    CHECK(Wire::AsStringView(Unwrap(resolved).leaseToken) == "l1");
+    // And the key it was granted on, which is what makes the release resolve THIS
+    // client's lease rather than whichever a restarted scheduler reissued the
+    // number to.
+    CHECK(Wire::AsStringView(Unwrap(resolved).key) == "objkey");
 }
 
 TEST_CASE("A scheduler that has gone away by then changes nothing", "[dispatch]")

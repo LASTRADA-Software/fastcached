@@ -139,7 +139,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         CHECK(service.Lease(Insider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
         // Resolving is a write against the LEADER's own lease table, so a follower
         // has nothing to resolve and answering anything but this would be a lie.
-        CHECK(service.Release(Insider, "l1").error == Wire::ErrorCode::NotLeader);
+        CHECK(service.Release(Insider, "l1", "abc").error == Wire::ErrorCode::NotLeader);
     }
 }
 
@@ -154,7 +154,7 @@ TEST_CASE("A non-member is refused the fleet but not the cache", "[distributed][
     CHECK(fleet.service.Register(Outsider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotAMember);
     CHECK(fleet.service.Heartbeat(Outsider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotAMember);
     CHECK(fleet.service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotAMember);
-    CHECK(fleet.service.Release(Outsider, "l1").error == Wire::ErrorCode::NotAMember);
+    CHECK(fleet.service.Release(Outsider, "l1", "abc").error == Wire::ErrorCode::NotAMember);
 
     // And nothing was admitted along the way: a refused registration must not leave
     // the worker in the registry, or the next Lease would hand out an endpoint the
@@ -415,7 +415,7 @@ TEST_CASE("A resolved lease stops suppressing its key at once", "[distributed][s
     REQUIRE(granted.status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "hot-key")).error == Wire::ErrorCode::AlreadyInFlight);
 
-    REQUIRE(fleet.service.Release(Insider, TokenOf(granted)).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Release(Insider, TokenOf(granted), "hot-key").status == Wire::Status::Ok);
 
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "hot-key")).status == Wire::Status::Ok);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
@@ -438,7 +438,7 @@ TEST_CASE("A resolved lease gives the worker back its slot", "[distributed][sche
     REQUIRE(first.status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoCapacity);
 
-    REQUIRE(fleet.service.Release(Insider, TokenOf(first)).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Release(Insider, TokenOf(first), "key-1").status == Wire::Status::Ok);
 
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).status == Wire::Status::Ok);
 }
@@ -454,12 +454,12 @@ TEST_CASE("A lease that is already gone is refused, not waved through", "[distri
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
     REQUIRE(granted.status == Wire::Status::Ok);
-    REQUIRE(fleet.service.Release(Insider, TokenOf(granted)).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Release(Insider, TokenOf(granted), "key-1").status == Wire::Status::Ok);
 
-    auto const again = fleet.service.Release(Insider, TokenOf(granted));
+    auto const again = fleet.service.Release(Insider, TokenOf(granted), "key-1");
     CHECK(again.status == Wire::Status::Error);
     CHECK(again.error == Wire::ErrorCode::UnknownLease);
-    CHECK(fleet.service.Release(Insider, "no-such-token").error == Wire::ErrorCode::UnknownLease);
+    CHECK(fleet.service.Release(Insider, "no-such-token", "key-1").error == Wire::ErrorCode::UnknownLease);
 
     // Uncounted by design: it is a statement about one client's timing, not about
     // the capacity an operator sizes a fleet from.
@@ -498,30 +498,53 @@ TEST_CASE("A machine that goes away takes its leases with it", "[distributed][sc
     CHECK(live.front().endpoint == "10.0.0.3:7100");
 }
 
-TEST_CASE("A worker that restarts does not keep the leases it lost", "[distributed][scheduler]")
+TEST_CASE("A re-registering worker keeps the leases it may still be running", "[distributed][scheduler]")
 {
-    // The route reaping cannot see. A node that crashes and comes back inside the
-    // heartbeat window re-registers onto its existing entry, keeping its id and
-    // refreshing `lastSeen` -- so `ExpireStale` never names it, and its keys would
-    // stay marked in-flight for the full lease timeout even though the jobs behind
-    // them died with the process.
+    // The tempting symmetry, and it is wrong. `WorkerRegistry::Register` resets
+    // `inFlight` on the reasoning that a re-registering worker restarted and
+    // whatever it was running is gone -- but a node re-registers after ANY refused
+    // heartbeat, `EndpointBusy` or a `NotLeader` during an election included, and
+    // not only after a restart. Releasing here would wipe leases for compiles that
+    // are still running and hand a second client the same work. `inFlight` recovers
+    // from that guess at the next heartbeat; a lease does not.
     //
-    // The clock does not move at all here, which is what makes this a statement
-    // about re-registration rather than about expiry.
+    // A worker that genuinely restarted needs nothing here: its client's compile
+    // exchange fails and the client resolves its own lease on that path.
     Leading fleet;
     auto twoSlots = OneSlot("gcc-14", "10.0.0.2:7100");
     twoSlots.slots = 2;
     REQUIRE(fleet.service.Register(Insider, twoSlots).status == Wire::Status::Ok);
-    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).status == Wire::Status::Ok);
-    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).error == Wire::ErrorCode::AlreadyInFlight);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "still-running")).status == Wire::Status::Ok);
 
     REQUIRE(fleet.service.Register(Insider, twoSlots).status == Wire::Status::Ok);
 
-    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).status == Wire::Status::Ok);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 1);
-    // Nothing was dropped from the fleet -- the machine is the same one, and it is
-    // back.
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersExpired) == 0);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "still-running")).error == Wire::ErrorCode::AlreadyInFlight);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 0);
+}
+
+TEST_CASE("A release names its key, so a reissued token resolves nothing", "[distributed][scheduler]")
+{
+    // Tokens are `l1`, `l2`, ... from a counter that starts again at one in every
+    // freshly constructed table -- so after a scheduler restart a client still
+    // holding `l1` from the previous instance would otherwise resolve whatever this
+    // one has since issued under that number, freeing a key somebody is building and
+    // decrementing a worker that is busy. Two schedulers here is exactly that: the
+    // second is the restarted process, and `before` is a token minted by the first.
+    Leading first;
+    REQUIRE(first.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const before = TokenOf(first.service.Lease(Insider, Ask("gcc-14", "old-key")));
+
+    Leading restarted;
+    REQUIRE(restarted.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const after = restarted.service.Lease(Insider, Ask("gcc-14", "new-key"));
+    REQUIRE(after.status == Wire::Status::Ok);
+    REQUIRE(TokenOf(after) == before); // the collision this guards, spelled out
+
+    CHECK(restarted.service.Release(Insider, before, "old-key").error == Wire::ErrorCode::UnknownLease);
+    // And the live lease it collided with is untouched -- neither resolved nor
+    // erased, so the client that holds it can still resolve it itself.
+    CHECK(restarted.service.Lease(Insider, Ask("gcc-14", "new-key")).error == Wire::ErrorCode::AlreadyInFlight);
+    CHECK(restarted.service.Release(Insider, TokenOf(after), "new-key").status == Wire::Status::Ok);
 }
 
 TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]")
@@ -539,7 +562,7 @@ TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]"
 
     fleet.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
 
-    CHECK(fleet.service.Release(Insider, TokenOf(slow)).error == Wire::ErrorCode::UnknownLease);
+    CHECK(fleet.service.Release(Insider, TokenOf(slow), "slow-key").error == Wire::ErrorCode::UnknownLease);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
 }
 

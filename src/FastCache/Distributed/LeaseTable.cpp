@@ -70,11 +70,19 @@ void LeaseTable::Forget(std::unordered_map<std::string, Entry>::iterator entry)
     _byToken.erase(entry);
 }
 
-std::optional<Lease> LeaseTable::Release(std::string_view token)
+std::optional<Lease> LeaseTable::Release(std::string_view token, std::string_view key)
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _byToken.find(std::string { token });
     if (it == _byToken.end())
+        return std::nullopt;
+
+    // A token that names a different key is not this caller's, so nothing is
+    // resolved AND nothing is erased -- erasing would free the lease of whoever
+    // legitimately holds this number. The reachable case is a scheduler that
+    // restarted: `_nextToken` began again at one, and a client still holding `l3`
+    // from the previous instance is describing a lease that no longer exists.
+    if (it->second.lease.key != key)
         return std::nullopt;
 
     // Liveness, not mere presence -- the same rule `Find` and `IsInFlight` follow,

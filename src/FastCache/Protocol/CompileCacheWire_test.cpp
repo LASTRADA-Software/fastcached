@@ -464,10 +464,13 @@ TEST_CASE("Every dispatch verb round-trips its fields")
     }
     SECTION("RELEASE")
     {
-        auto const frame = EncodeRelease("l42");
+        auto const frame = EncodeRelease(ReleaseRequest { .leaseToken = "l42", .key = "objkey" });
         auto const decoded = DecodeReleasePayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
-        CHECK(AsStringView(Unwrap(decoded)) == "l42");
+        CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l42");
+        // The key is what makes a release the CALLER's: a token alone is a number a
+        // restarted scheduler will have reissued.
+        CHECK(AsStringView(Unwrap(decoded).key) == "objkey");
     }
     SECTION("COMPILE")
     {
@@ -619,7 +622,7 @@ TEST_CASE("A dispatch payload decoded as the wrong verb fails")
 
     // And the other way round: RELEASE carries one field, so a three-field LEASE
     // cannot be read out of it either.
-    auto const release = EncodeRelease("l1");
+    auto const release = EncodeRelease(ReleaseRequest { .leaseToken = "l1", .key = "k" });
     auto const releasePayload = std::span<std::byte const> { release }.subspan(RequestHeaderSize);
     CHECK_FALSE(DecodeLeasePayload(releasePayload).has_value());
     CHECK(DecodeReleasePayload(releasePayload).has_value());

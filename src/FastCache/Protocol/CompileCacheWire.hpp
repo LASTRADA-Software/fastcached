@@ -194,6 +194,9 @@ enum class Op : std::uint8_t
     /// lease was issued to and is the only party that knows every way a job can
     /// end: the worker never sees a job whose dispatch failed to reach it.
     ///
+    /// It names the KEY as well as the token, so a release resolves the client's own
+    /// lease or nothing -- see `EncodeRelease`.
+    ///
     /// Numbered after the cluster verbs rather than beside `Lease`, because the
     /// byte is the contract and the ones already spoken cannot move.
     Release = 0x0C,
@@ -444,7 +447,7 @@ inline constexpr std::array OpTable {
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Release,
                    .name = "release",
-                   .fieldCount = 1, // leaseToken
+                   .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
@@ -934,25 +937,6 @@ namespace Detail
                                                                                         std::size_t expectedCount)
 {
     return WireFields::SplitExactly(payload, expectedCount);
-}
-
-/// Split the payload of a verb whose whole request is one field.
-///
-/// The degenerate case of `SplitFields`, written once rather than once per such
-/// verb: `CLUSTER-FORGET` carries a member id and `RELEASE` a lease token, and
-/// their decoders differed by nothing but the opcode they took their arity from.
-/// The named per-verb wrappers stay, because the strictness is per verb — the
-/// arity still comes from that op's own row, so one verb's payload cannot be read
-/// as another's.
-/// @param payload The bytes following the request header.
-/// @param op The verb, whose descriptor supplies the expected arity.
-/// @return The sole field, or nullopt when malformed.
-[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeSoleField(std::span<std::byte const> payload, Op op)
-{
-    auto const fields = SplitFields(payload, OpFieldCount(op));
-    if (!fields.has_value())
-        return std::nullopt;
-    return (*fields)[0];
 }
 
 /// Split a STORE payload into its five named fields.
@@ -1879,28 +1863,54 @@ struct HeartbeatView
     return LeaseView { .fingerprint = (*fields)[0], .key = (*fields)[1], .acceptedCodecs = DecodeCodecList((*fields)[2]) };
 }
 
+/// A client reporting that the job it leased has ended.
+struct ReleaseRequest
+{
+    std::string_view leaseToken; ///< The token the scheduler granted.
+    std::string_view key;        ///< The object key that lease was taken on.
+};
+
+/// The same, as views into a received payload.
+struct ReleaseView
+{
+    std::span<std::byte const> leaseToken;
+    std::span<std::byte const> key;
+};
+
 /// Frame a RELEASE request.
 ///
-/// The token alone, and nothing about how the job went: the scheduler resolves a
-/// lease the same way whatever the outcome -- `LeaseTable::Release` is documented
-/// as "however the job ended" -- and a field nothing reads is a field two builds
-/// can disagree about. The top-level arity of a verb is exact and fixed forever, so
-/// an outcome added later would arrive as a nested record, the way `Register`
-/// carries capacity.
-/// @param leaseToken The token the scheduler granted.
+/// The key travels beside the token, and it is not redundant: a token is a small
+/// integer minted by whichever `LeaseTable` is alive, and that counter starts again
+/// at one in a scheduler that has just restarted. Without the key, a client
+/// reporting a job it started before the restart would resolve whatever lease the
+/// new instance had since issued under the same number -- freeing a key somebody is
+/// building, and decrementing a worker that is busy. Naming both makes a release
+/// resolve *the client's own* lease or nothing, which is also what stops one member
+/// resolving another's by guessing a number.
+///
+/// Nothing about how the job went, though: the scheduler resolves a lease the same
+/// way whatever the outcome -- `LeaseTable::Release` is documented as "however the
+/// job ended" -- and a field nothing reads is a field two builds can disagree
+/// about. The top-level arity of a verb is exact and fixed forever, so an outcome
+/// added later would arrive as a nested record, the way `Register` carries capacity.
+/// @param request The token and the key it was taken on.
 /// @param version Version to advertise.
 /// @return The framed request.
-[[nodiscard]] inline std::vector<std::byte> EncodeRelease(std::string_view leaseToken, WireVersion version = CurrentVersion)
+[[nodiscard]] inline std::vector<std::byte> EncodeRelease(ReleaseRequest const& request,
+                                                          WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::Release, { AsBytes(leaseToken) });
+    return Detail::EncodeRequest(version, Op::Release, { AsBytes(request.leaseToken), AsBytes(request.key) });
 }
 
 /// Split a RELEASE payload.
 /// @param payload The bytes following the request header.
-/// @return The lease token, or nullopt when malformed.
-[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeReleasePayload(std::span<std::byte const> payload)
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ReleaseView> DecodeReleasePayload(std::span<std::byte const> payload)
 {
-    return DecodeSoleField(payload, Op::Release);
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Release));
+    if (!fields.has_value())
+        return std::nullopt;
+    return ReleaseView { .leaseToken = (*fields)[0], .key = (*fields)[1] };
 }
 
 /// An operator changing one replicated cluster setting.
@@ -1965,7 +1975,10 @@ struct ClusterSetView
 /// @return The member id, or nullopt when malformed.
 [[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeClusterForgetPayload(std::span<std::byte const> payload)
 {
-    return DecodeSoleField(payload, Op::ClusterForget);
+    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterForget));
+    if (!fields.has_value())
+        return std::nullopt;
+    return (*fields)[0];
 }
 
 /// An operator adding a member to the cluster, or moving one.

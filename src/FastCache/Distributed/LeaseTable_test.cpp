@@ -79,7 +79,7 @@ TEST_CASE("Releasing a lease frees its key for the next client", "[distributed][
     auto const lease = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(lease.has_value());
 
-    auto const released = fix.leases.Release(Unwrap(lease).token);
+    auto const released = fix.leases.Release(Unwrap(lease).token, "objkey-1");
     REQUIRE(released.has_value());
     CHECK(Unwrap(released).key == "objkey-1");
     CHECK(fix.leases.LiveCount() == 0);
@@ -89,7 +89,7 @@ TEST_CASE("Releasing a lease frees its key for the next client", "[distributed][
 TEST_CASE("Releasing an unknown token is a no-op, not a crash", "[distributed][lease]")
 {
     Fixture fix;
-    CHECK_FALSE(fix.leases.Release("nope").has_value());
+    CHECK_FALSE(fix.leases.Release("nope", "objkey-1").has_value());
 }
 
 TEST_CASE("An abandoned lease expires and the key becomes leasable again", "[distributed][lease]")
@@ -125,9 +125,29 @@ TEST_CASE("Releasing an expired lease does not evict the client that replaced it
     auto const second = fix.leases.Acquire("objkey-1", "w2");
     REQUIRE(second.has_value());
 
-    (void) fix.leases.Release(Unwrap(first).token); // the abandoned client finally reports
+    (void) fix.leases.Release(Unwrap(first).token, "objkey-1"); // the abandoned client finally reports
     CHECK(fix.leases.Find(Unwrap(second).token).has_value());
     CHECK_FALSE(fix.leases.Acquire("objkey-1", "w3").has_value());
+}
+
+TEST_CASE("A token that names another key resolves nothing, and erases nothing", "[distributed][lease]")
+{
+    // The token is a small integer this table minted, and `_nextToken` starts again
+    // at one in a table that has just been constructed -- so a client reporting a
+    // job it began before the scheduler restarted arrives holding a number this
+    // instance has since issued to somebody else. Resolving on the number alone
+    // would free a key that is being built and decrement a worker that is busy.
+    //
+    // Nothing is erased either: the entry belongs to whoever legitimately holds that
+    // number, and they must still be able to resolve it themselves.
+    Fixture fix;
+    auto const mine = fix.leases.Acquire("objkey-1", "w1");
+    REQUIRE(mine.has_value());
+
+    CHECK_FALSE(fix.leases.Release(Unwrap(mine).token, "some-other-key").has_value());
+
+    CHECK(fix.leases.IsInFlight("objkey-1"));
+    CHECK(fix.leases.Release(Unwrap(mine).token, "objkey-1").has_value());
 }
 
 TEST_CASE("An expired lease reports as gone rather than as freed", "[distributed][lease]")
@@ -143,7 +163,7 @@ TEST_CASE("An expired lease reports as gone rather than as freed", "[distributed
     REQUIRE(lease.has_value());
 
     fix.clock.Advance(std::chrono::milliseconds { 1001 });
-    CHECK_FALSE(fix.leases.Release(Unwrap(lease).token).has_value());
+    CHECK_FALSE(fix.leases.Release(Unwrap(lease).token, "objkey-1").has_value());
 
     // And the entry went with it rather than being left for a later `Acquire` to
     // sweep -- observable as the key still leasing cleanly, under a NEW token.
@@ -187,7 +207,7 @@ TEST_CASE("Re-leasing an expired key does not leak the old token", "[distributed
     REQUIRE(fix.leases.Acquire("objkey-1", "w2").has_value());
 
     // The old token is gone entirely, not merely expired.
-    CHECK_FALSE(fix.leases.Release(Unwrap(first).token).has_value());
+    CHECK_FALSE(fix.leases.Release(Unwrap(first).token, "objkey-1").has_value());
 }
 
 TEST_CASE("A clock that moves backwards does not expire live leases", "[distributed][lease]")

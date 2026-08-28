@@ -264,10 +264,10 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                        .acceptedCodecs = fields->acceptedCodecs });
         }
         case Wire::Op::Release: {
-            auto const token = Wire::DecodeReleasePayload(payload);
-            if (!token.has_value())
+            auto const fields = Wire::DecodeReleasePayload(payload);
+            if (!fields.has_value())
                 return SchedulerReply::Malformed();
-            return _service.Release(caller, Wire::AsStringView(*token));
+            return _service.Release(caller, Wire::AsStringView(fields->leaseToken), Wire::AsStringView(fields->key));
         }
         case Wire::Op::ClusterStatus:
             // A payload that is not empty is still refused, and by the same rule as

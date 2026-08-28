@@ -209,18 +209,22 @@ namespace
     /// the client can do nothing about and the fleet recovers from on its own, and
     /// there is no caller decision it could change.
     /// @param dialer How to reach the scheduler.
-    /// @param schedulerEndpoint Where the lease came from.
+    /// @param request The job, for the scheduler endpoint and the key.
     /// @param leaseToken The token that was granted.
     /// @param credential Presented to the scheduler.
     void ReleaseLease(IEndpointDialer& dialer,
-                      std::string_view schedulerEndpoint,
+                      DispatchRequest const& request,
                       std::string_view leaseToken,
                       Credential const& credential)
     {
-        auto scheduler = dialer.Dial(schedulerEndpoint);
+        auto scheduler = dialer.Dial(request.schedulerEndpoint);
         if (scheduler == nullptr)
             return;
-        (void) SyncRun(ExchangeFramed(scheduler.get(), Wire::EncodeRelease(leaseToken), credential));
+        // The key travels with the token: a token alone is a number a restarted
+        // scheduler will have reissued, and resolving the wrong lease frees a key
+        // somebody else is building.
+        auto const frame = Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = leaseToken, .key = request.objectKey });
+        (void) SyncRun(ExchangeFramed(scheduler.get(), frame, credential));
     }
 
 } // namespace
@@ -295,7 +299,7 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
     // rather than a run of early returns: an unreachable worker, a refused job and
     // a finished one all mean the same thing to the scheduler -- this key is no
     // longer being built here.
-    ReleaseLease(dialer, request.schedulerEndpoint, token, credential);
+    ReleaseLease(dialer, request, token, credential);
     return result;
 }
 

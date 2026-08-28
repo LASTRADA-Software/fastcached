@@ -1110,7 +1110,7 @@ TEST_CASE("The cache refuses every scheduling verb, and says where they went", "
                  Wire::EncodeRegister(
                      Wire::RegisterRequest { .fingerprint = "gcc", .endpoint = "h:1", .slots = 1, .acceptedCodecs = {} }),
                  Wire::EncodeHeartbeat("w1", 0),
-                 Wire::EncodeRelease("l1") }),
+                 Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = "l1", .key = "k" }) }),
         SessionContext {});
 
     auto const frames = SplitReplies(reply);

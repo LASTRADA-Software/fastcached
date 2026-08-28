@@ -199,7 +199,8 @@ TEST_CASE("A whole register-heartbeat-lease-release exchange crosses the wire", 
     // And back again, which is the transition that had no verb at all: the token
     // the grant carried is what resolves the lease, so a field read out of order in
     // either encoder would leave a key pinned until it expired (#212).
-    auto const done = Wire::EncodeRelease(Wire::AsStringView(Unwrap(grant).leaseToken));
+    auto const done = Wire::EncodeRelease(
+        Wire::ReleaseRequest { .leaseToken = Wire::AsStringView(Unwrap(grant).leaseToken), .key = "k1" });
     CHECK(StatusOf(fixture.protocol.Answer(done, Insider)) == Wire::Status::Ok);
 
     // Spent, so the same token now names nothing.

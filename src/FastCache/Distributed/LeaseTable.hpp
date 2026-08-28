@@ -91,6 +91,15 @@ class LeaseTable
 
     /// Resolve a lease, however the job ended.
     ///
+    /// The caller states the **key** as well as the token, and a mismatch resolves
+    /// nothing. A token is a small integer minted by this table, and `_nextToken`
+    /// starts again at one in a table that has just been constructed -- so a client
+    /// reporting a job it began before the scheduler restarted would otherwise
+    /// resolve whatever lease the new instance had since issued under the same
+    /// number, freeing a key somebody is building. Naming both is what makes a
+    /// release resolve the caller's own lease or nothing, and it is checked here
+    /// rather than above because this is the layer that decides atomically.
+    ///
     /// An **expired** token counts as already gone, and reports so rather than
     /// answering as though it had freed something: the key it named stopped being
     /// suppressed when the lifetime ran out, and the client saying otherwise has a
@@ -99,9 +108,10 @@ class LeaseTable
     /// translation unit. The entry is dropped either way; nothing else ever visits
     /// an expired token but an `Acquire` for the same key.
     /// @param token The token.
-    /// @return The lease that was released, or nullopt when it was expired or
-    ///         already gone.
-    [[nodiscard]] std::optional<Lease> Release(std::string_view token);
+    /// @param key The object key the caller believes it holds that token on.
+    /// @return The lease that was released, or nullopt when it named another key,
+    ///         had expired, or was already gone.
+    [[nodiscard]] std::optional<Lease> Release(std::string_view token, std::string_view key);
 
     /// Release every lease held against a worker.
     ///

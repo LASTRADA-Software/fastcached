@@ -369,19 +369,17 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
 
     auto const id = _workers.Register(registration);
 
-    // Whatever it was compiling is gone, so whatever it held is too. `Register`'s
-    // re-registration path already resets `inFlight` and `load` on exactly this
-    // reasoning, and a lease is the same fact one layer up: a node that restarts
-    // inside the heartbeat window keeps its entry, so `ExpireStale` never names it
-    // and its keys would otherwise stay marked in-flight for the full lease
-    // timeout -- the same ten-minute pin, reached by the one route reaping cannot
-    // see.
+    // A re-registration deliberately does NOT release this worker's leases, even
+    // though it resets `inFlight` two lines above on the reasoning that whatever it
+    // was running is gone. The two are not the same bet: a node re-registers after
+    // any refused heartbeat -- `EndpointBusy`, or `NotLeader` during an election --
+    // and not only after a restart, so releasing here would wipe leases for compiles
+    // that are still running and hand a second client the same work. `inFlight`
+    // recovers from that guess at the next heartbeat; a lease does not.
     //
-    // A no-op for a worker registering for the first time, which is why it needs no
-    // "was this a re-registration" flag: nothing is held against an id that has just
-    // been issued.
-    if (auto const reclaimed = _leases.ReleaseWorker(id); reclaimed != 0)
-        _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
+    // A worker that genuinely restarted needs nothing here anyway: its client's
+    // compile exchange fails, and the client resolves its own lease on that path
+    // like every other (#212).
 
     // Counted as an event, not as fleet size. This interface is counter-only, so it
     // cannot express a gauge -- and the event turns out to be the more useful
@@ -494,19 +492,21 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
         Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs }));
 }
 
-SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken)
+SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
 
-    auto const lease = _leases.Release(leaseToken);
+    auto const lease = _leases.Release(leaseToken, key);
     if (!lease.has_value())
-        // Already gone: it expired under a job that outlived its lease, or this is a
-        // second release of one token. Answered rather than accepted silently,
-        // because the first of those is a fleet whose `DefaultLeaseTimeout` is
-        // shorter than its slowest translation unit -- and a client that is told
-        // nothing has nothing to report. Uncounted by design: it is a statement
-        // about one client's timing, not about the fleet's capacity.
+        // Already gone: it expired under a job that outlived its lease, this is a
+        // second release of one token, or the token belongs to a scheduler instance
+        // that no longer exists and this one has since reissued the number.
+        // Answered rather than accepted silently, because the first of those is a
+        // fleet whose `DefaultLeaseTimeout` is shorter than its slowest translation
+        // unit -- and a client that is told nothing has nothing to report.
+        // Uncounted by design: it is a statement about one client's timing, not
+        // about the fleet's capacity.
         return Refuse(Wire::ErrorCode::UnknownLease, "unknown or already-resolved lease");
 
     // The registry's speculative count, undone. `JobStarted` at `Lease` above is what

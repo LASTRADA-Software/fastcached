@@ -167,7 +167,7 @@ HEARTBEAT  [workerId][inFlight][load]                       -> Ok
 LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
                                                             -> [exitCode][object][stdout][stderr]
-RELEASE    [leaseToken]                                     -> Ok
+RELEASE    [leaseToken][objectKey]                          -> Ok
 ```
 
 `capacity` and `load` are **nested** records rather than fields of their own, and
@@ -217,7 +217,14 @@ compile. The same applies to a machine leaving the fleet: dropping a worker
 releases the leases held against it, rather than leaving its keys pinned until each
 one times out.
 
-A `RELEASE` naming a token the scheduler does not have is refused
+`RELEASE` names the **key** as well as the token, and that is not redundant. A
+token is a small integer the scheduler minted, and its counter starts again at one
+in a scheduler that has just restarted — so a client reporting a job it began
+before the restart would otherwise resolve whatever lease the new instance had
+since issued under the same number, freeing a key somebody is building. Naming
+both makes a release resolve the client's own lease or nothing.
+
+A `RELEASE` the scheduler cannot match is refused
 `unknown-lease` rather than accepted quietly. That is the diagnostic for a job
 that outlived its lease, which means the fleet's lease timeout is shorter than its
 slowest translation unit — and there is nowhere else that fact could be observed.
