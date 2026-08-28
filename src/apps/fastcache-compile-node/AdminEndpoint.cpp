@@ -112,7 +112,7 @@ namespace
         if (auto const& hostName = host.Facts().hostName; !hostName.empty())
             names.push_back(hostName);
 
-        if (auto const endpoint = ParseEndpoint(cfg.adminListen, "127.0.0.1"); endpoint.has_value())
+        if (auto const endpoint = ParseEndpoint(cfg.adminListen, AdminListenDefaultHost); endpoint.has_value())
         {
             constexpr std::array<std::string_view, 3> Wildcards { "0.0.0.0", "::", "[::]" };
             auto const& bindHost = endpoint->first;
@@ -560,7 +560,7 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     }
 
     auto started = AdminEndpoint::Start(cfg.adminListen,
-                                        "127.0.0.1",
+                                        AdminListenDefaultHost,
                                         metrics,
                                         std::move(snapshot),
                                         logger,

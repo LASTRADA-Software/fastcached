@@ -856,6 +856,25 @@ without `--admin-listen`, and the rest — is refused here too. Each is decided 
 the command line alone, and a registration replays that command line forever, so
 there is nothing to gain by waiting for the first boot to say so.
 
+That includes a **value that is not an address**. `--listen-scheduler`,
+`--admin-listen`, `--listen-cache` and `--discovery` each name one, and a typo in
+any of them is refused where you typed it rather than when the surface is opened —
+the message names the flag and echoes what you wrote. A bare port is fine for the
+three that are bound — it takes that surface's own default host. A port with a bare
+colon in front of it is **not** the same thing and is refused: an empty host binds
+the wildcard, so `--listen-cache=:6674` would serve this node's private cache to the
+whole network rather than to loopback. `--discovery` is *sent to* an address, so it
+takes `<address>:<port>` and nothing shorter.
+
+Addresses this node **dials** rather than opens — `--advertise`, `--scheduler`,
+`--upstream`, `--fleet-member` — and `--bind`, are not checked at install today.
+Whether one *resolves* genuinely cannot be settled then: a host that is down on
+the day you install may be the right one by the time the worker boots. Whether it
+is the right *shape* could be, and is not yet
+([#208](https://github.com/LASTRADA-Software/fastcached/issues/208)) — so a typo
+in `--advertise` still installs, and the worker registers, is leased out and is
+never reached.
+
 `--requirepass` is refused too, for the reason it is on the daemon: a supervisor
 records launch arguments where every local account can read them, and for a
 worker that token is what the scheduler authenticates it *by*.

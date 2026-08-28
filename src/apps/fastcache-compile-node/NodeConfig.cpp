@@ -264,6 +264,41 @@ namespace
         return static_cast<std::uint64_t>(*parsed);
     }
 
+    /// Whether text names an address, with a host somebody wrote.
+    ///
+    /// `SplitHostPort` and `ParseTcpPort`, which is what `DiscoveryTier::Start` asks
+    /// -- plus the host, which it does not. An empty one is refused because both
+    /// tiers that would receive it treat it as something the operator did not say:
+    /// `UdpSocket::Send` rejects an empty destination outright, and an empty BIND
+    /// host reaches `getaddrinfo` as nullptr under `AI_PASSIVE`
+    /// (`SocketAddress.cpp:163`), which is the wildcard on every platform. So
+    /// `--listen-cache=:6674` would quietly bind every interface -- the exposure
+    /// `CacheListenDefaultHost`'s loopback exists to make a decision rather than a
+    /// typo -- and `--discovery=:6681` would announce to nobody.
+    /// @param text The value as an operator wrote it.
+    /// @return Whether it names a host and a port.
+    [[nodiscard]] bool ParsesAsBeaconAddress(std::string_view text)
+    {
+        auto const address = SplitHostPort(text);
+        return address.has_value() && !address->first.empty() && ParseTcpPort(address->second).has_value();
+    }
+
+    /// Whether text names an address a listen surface can bind.
+    ///
+    /// The grammar above, plus the one thing a bound surface takes and a beacon
+    /// cannot: a bare port, which binds that surface's own `*ListenDefaultHost`.
+    /// Written in terms of the other rather than beside it, because "an address, or
+    /// just a port" is the whole of the difference and a second copy of the address
+    /// half is how the two would come to disagree.
+    /// @param text The value as an operator wrote it.
+    /// @return Whether the tier could bind it.
+    [[nodiscard]] bool ParsesAsListenEndpoint(std::string_view text)
+    {
+        if (!SplitHostPort(text).has_value())
+            return ParseTcpPort(text).has_value();
+        return ParsesAsBeaconAddress(text);
+    }
+
     /// One cluster member, from the `<id>=<host>:<port>` an operator typed.
     ///
     /// Through `Cluster::ParseMemberSpec`, which is the grammar `--cluster-admit`
@@ -1006,6 +1041,74 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 
 std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
 {
+    // The value each listen flag takes, judged here rather than inside the tier that
+    // binds it. Every one of these grammars used to be checked in its tier -- which
+    // `--install-service` returns long before reaching -- so a typo registered
+    // cleanly and then exited at every boot into a log nobody reads (#186).
+    //
+    // A table because the four differ only in the flag's name, where its text lives
+    // and which grammar it takes; written out as four rules they would be the
+    // copy-paste-differing-by-a-constant this codebase keeps a list about. Each row
+    // asks its OWN tier's question, which is why `--discovery` carries a different
+    // one: a beacon is sent TO an address, so no bare port may default to a host,
+    // and a shared "is this an endpoint" test would accept `6681` here and leave
+    // the tier to refuse it at every boot.
+    //
+    // `--listen-raft` is deliberately absent: its own rows already refuse it both
+    // absent and unusable, and a second row would answer in their place.
+    struct EndpointFlag
+    {
+        std::string_view flag;            ///< The flag, as an operator types it.
+        std::string NodeConfig::* value;  ///< Where its text lives.
+        bool (*parses)(std::string_view); ///< Its tier's own grammar.
+        std::string_view shape;           ///< What it should have looked like.
+    };
+
+    constexpr auto EndpointFlags = std::to_array<EndpointFlag>({
+        { .flag = "--listen-scheduler",
+          .value = &NodeConfig::schedulerListen,
+          .parses = ParsesAsListenEndpoint,
+          .shape = "[<address>:]<port>" },
+        { .flag = "--admin-listen",
+          .value = &NodeConfig::adminListen,
+          .parses = ParsesAsListenEndpoint,
+          .shape = "[<address>:]<port>" },
+        { .flag = "--listen-cache",
+          .value = &NodeConfig::cacheListen,
+          .parses = ParsesAsListenEndpoint,
+          .shape = "[<address>:]<port>" },
+        { .flag = "--discovery",
+          .value = &NodeConfig::discoveryAddress,
+          .parses = ParsesAsBeaconAddress,
+          .shape = "<address>:<port>" },
+    });
+
+    // "Parses when GIVEN", never "must parse". Empty is how three of these say the
+    // surface is off, and `--listen-cache` carries a non-empty default every
+    // ordinary node runs with -- so a rule spelled the other way would refuse the
+    // default deployment outright.
+    //
+    // Asked before the rules below, because a value that is not an address is a typo
+    // and answering it with a policy rule about the flag it was typed on describes
+    // the wrong problem. Unlike those rules, whose messages are static prose, this
+    // one echoes what the operator wrote -- which is the half a table row cannot do
+    // and the half that matters when four ports were typed and one is wrong.
+    for (auto const& endpoint: EndpointFlags)
+    {
+        auto const& text = cfg.*endpoint.value;
+        if (text.empty() || endpoint.parses(text))
+            continue;
+
+        // "cannot use" rather than "cannot bind": three of these are bound and the
+        // fourth is sent to, and a message that named the wrong verb would send an
+        // operator looking for a listening socket discovery never opens.
+        return std::format("{}={} is not {}. The surface it configures cannot use an address that was never one, so "
+                           "this node refuses to start.",
+                           endpoint.flag,
+                           text,
+                           endpoint.shape);
+    }
+
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
     // an install-time one: this misconfiguration is fatal every time the process
     // runs, not only when a registration is written, and gating it on
@@ -1130,10 +1233,11 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               [](NodeConfig const& c) {
                   if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
                       return false;
-                  // The same default host `AdminEndpoint::Start` binds with, so
-                  // this rule judges the address the endpoint will actually take
-                  // rather than the text an operator typed.
-                  auto const endpoint = ParseEndpoint(c.adminListen, "127.0.0.1");
+                  // The same default host `AdminEndpoint::Start` binds with --
+                  // the constant, not a second copy of the literal -- so this rule
+                  // judges the address the endpoint will actually take rather than
+                  // the text an operator typed.
+                  auto const endpoint = ParseEndpoint(c.adminListen, AdminListenDefaultHost);
                   return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
               },
           .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "
