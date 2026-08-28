@@ -324,6 +324,10 @@ A node running consensus additionally binds `--listen-raft` and, with discovery
 on, a UDP `--discovery` port plus a per-node answering port; none has a
 conventional number, and all are off unless configured.
 
+For who dials whom on each of these — and what a machine needs to accept rather
+than merely bind — see
+[Cluster communication](../operations/cluster-communication.md#what-to-open-on-a-firewall).
+
 The dispatch endpoint is separate from the cache **on purpose**. The cache may
 reasonably be reachable across a build LAN; the surface that causes a compiler to
 *run* on another machine should be something you switch on and firewall

@@ -59,6 +59,11 @@ points at. It serves the cache verbs and nothing else: a scheduling verb arrivin
 at one of its listeners is refused with a typed `dispatch-not-permitted` naming
 where the scheduler went.
 
+The picture above is the compile path. For the whole topology — consensus,
+discovery and the dashboard history alongside it — plus a directional table of
+every connection and what to open on a firewall, see
+[Cluster communication](../operations/cluster-communication.md).
+
 ### Why the scheduler knows what is already being compiled
 
 A `LEASE` request names the **object key**, not just the toolchain — so the one
@@ -523,24 +528,10 @@ list and all three surfaces follow it. That matters most for the compile port,
 which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
 would otherwise have your machine run their compiler on source they chose.
 
-A node has **no inbound credential**. Its three framed surfaces serve no `AUTH`
-verb, so `--requirepass` on a node is only the secret it *presents* when it dials
-somebody else — and it works in exactly one direction: against a `fastcached`
-`--upstream`, which does serve `AUTH`. Presented to another node it is refused
-`dispatch-not-permitted`, and because the launcher reports that in place of the
-answer to the request it actually sent, the effect is silent:
+--8<-- "node-credential-gap.md"
 
-| You set | What breaks |
-|---|---|
-| `--requirepass` on a worker | `REGISTER` is refused; the worker never joins the fleet. |
-| `FASTCACHE_TOKEN` on a client with `FASTCACHE_SCHEDULER` set | Every `LEASE` is declined; every compile happens locally, and the build goes green. |
-| `--requirepass` with `--cluster-status` and friends | Refused, naming a verb the operator never typed. |
-
-That is [#198](https://github.com/LASTRADA-Software/fastcached/issues/198), and it
-is a gap rather than a design: what an inbound credential should be spelled, and
-what `AUTH` means against a node that has none configured, are the questions it is
-open on. Until it closes, treat the fleet's boundary as **network reachability
-plus membership**, and size the network accordingly.
+Until it closes, treat the fleet's boundary as **network reachability plus
+membership**, and size the network accordingly.
 
 So: keep `--listen-scheduler` off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
@@ -591,6 +582,8 @@ so a build LAN where addresses can be spoofed is not a boundary this can hold.
 
 - [fastcache-compile-node](../tools/fastcache-compile-node.md) — every flag, the
   node's cache tier, the cluster, and the fleet dashboard.
+- [Cluster communication](../operations/cluster-communication.md) — one compile
+  as the fleet sees it, every connection in one table, and firewall rules.
 - [Cluster discovery](cluster-discovery.md) — how nodes find each other, and the
   pre-shared key that admits them.
 - [Compile cache protocol](../protocols/compile-cache.md) — the wire format.
