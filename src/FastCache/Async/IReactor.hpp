@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <coroutine>
@@ -17,7 +18,7 @@ namespace FastCache
 /// cross-thread wake mechanism), but Run() must be called from exactly one
 /// thread for the lifetime of the loop, and resumed coroutines run on that
 /// thread.
-class IReactor
+class IReactor: public IExecutor
 {
   public:
     IReactor() = default;
@@ -25,7 +26,7 @@ class IReactor
     IReactor(IReactor&&) = delete;
     IReactor& operator=(IReactor const&) = delete;
     IReactor& operator=(IReactor&&) = delete;
-    virtual ~IReactor() = default;
+    ~IReactor() override = default;
 
     /// Block on the event loop until Stop() is called and the ready queue
     /// drains. Re-entry is undefined behaviour.
@@ -41,7 +42,7 @@ class IReactor
     /// implementation (TestReactor: FIFO of arrival; production reactors:
     /// best-effort FIFO).
     /// @param handle Coroutine to resume. Must remain alive until resumed.
-    virtual void Submit(std::coroutine_handle<> handle) = 0;
+    void Submit(std::coroutine_handle<> handle) override = 0;
 
     /// Resume a coroutine handle when the reactor's clock advances to or
     /// past the given deadline. Ordering between concurrently-scheduled
