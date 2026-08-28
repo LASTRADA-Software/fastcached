@@ -49,6 +49,23 @@ struct StorageStats
     std::size_t itemCount { 0 };
     std::size_t bytesUsed { 0 };
     std::size_t bytesLimit { 0 };
+    /// Resident bytes this tier spends on its own key index, or 0 where it has none
+    /// distinct from `bytesUsed`.
+    ///
+    /// A separate figure because it is separately DENOMINATED. `bytesUsed` and
+    /// `bytesLimit` are whatever the tier's budget is measured in -- RAM for the
+    /// in-memory tier, bytes on a filesystem for the disk one -- while this is always
+    /// RAM. For `CowTreeStorage` the two are different units entirely, which is the
+    /// whole of #175: a disk cache reported a budget in disk bytes and held a key
+    /// index in memory that no figure anywhere described.
+    ///
+    /// Reported by BOTH tiers, and that is not symmetry for its own sake: an
+    /// in-memory tier's budget counts value bytes only -- `InMemoryLruStorage` says so
+    /// outright -- so its keys and per-entry overhead are exactly as unaccounted as
+    /// the disk tier's. The difference is degree rather than kind, since at least that
+    /// budget is denominated in the same unit as what it omits. A tier reporting zero
+    /// here therefore means an EMPTY index, never one that costs nothing.
+    std::size_t indexBytes { 0 };
     std::uint64_t evictions { 0 };
 
     std::uint64_t cmdGet { 0 };
@@ -102,6 +119,9 @@ inline constexpr std::array StorageStatsSizeFields {
     &StorageStats::itemCount,
     &StorageStats::bytesUsed,
     &StorageStats::bytesLimit,
+    // Summed like the rest, and correctly: a `ShardedStorage` of N disk tiers holds N
+    // mirrors, and their RAM adds up the way their item counts do.
+    &StorageStats::indexBytes,
 };
 
 /// The counter fields of `StorageStats`, as member pointers.

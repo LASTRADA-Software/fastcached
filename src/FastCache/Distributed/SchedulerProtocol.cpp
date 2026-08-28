@@ -152,7 +152,8 @@ NodeCacheLoad CacheLoadFromWire(Wire::CacheLoadFields const& fields)
                                [](Wire::CacheTierUsage const& usage) {
                                    return CacheTierUsage { .itemCount = usage.itemCount,
                                                            .bytesUsed = usage.bytesUsed,
-                                                           .evictions = usage.evictions };
+                                                           .evictions = usage.evictions,
+                                                           .indexBytes = usage.indexBytes };
                                }),
                            .hits = fields.hits,
                            .misses = fields.misses };
@@ -165,7 +166,8 @@ Wire::CacheLoadFields CacheLoadToWire(NodeCacheLoad const& cache)
                                        [](CacheTierUsage const& usage) {
                                            return Wire::CacheTierUsage { .itemCount = usage.itemCount,
                                                                          .bytesUsed = usage.bytesUsed,
-                                                                         .evictions = usage.evictions };
+                                                                         .evictions = usage.evictions,
+                                                                         .indexBytes = usage.indexBytes };
                                        }),
                                    .hits = cache.hits,
                                    .misses = cache.misses };

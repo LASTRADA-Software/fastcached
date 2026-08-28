@@ -107,6 +107,9 @@ void InMemoryLruStorage::EraseAt(Iterator it)
     if (_sweepCursor == it)
         ++_sweepCursor;
     _bytesUsed -= it->entry.ValueSize();
+    // Before the erase, because the key it is measured from lives in the node being
+    // dropped.
+    _indexBytes -= IndexBytesFor(it->key.size());
     _index.erase(it->key);
     _lru.erase(it);
 }
@@ -162,6 +165,7 @@ CasToken InMemoryLruStorage::InsertNew(std::string key,
     _lru.push_front(std::move(node));
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += storedSize;
+    _indexBytes += IndexBytesFor(_lru.front().key.size());
 
     EvictToFit();
     return cas;
@@ -620,6 +624,7 @@ StorageStats InMemoryLruStorage::Snapshot() const noexcept
     _stats.itemCount = _lru.size();
     _stats.bytesUsed = _bytesUsed;
     _stats.bytesLimit = _maxBytes;
+    _stats.indexBytes = _indexBytes;
     // Fold in the atomic read-path counters (Approximate mode bumps these
     // instead of the plain `_stats` members). Snapshot runs under the shard's
     // exclusive lock, so the structure reads are stable; the atomics are read
@@ -683,6 +688,7 @@ void InMemoryLruStorage::InsertVerbatim(std::string_view key, CacheEntry entry)
     _lru.push_front(std::move(node));
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += size;
+    _indexBytes += IndexBytesFor(_lru.front().key.size());
     EvictToFit();
 }
 

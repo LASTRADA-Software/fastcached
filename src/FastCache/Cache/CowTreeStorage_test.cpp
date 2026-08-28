@@ -127,6 +127,56 @@ auto WithOpenStorageCompressed(std::filesystem::path const& path, FastCache::Com
 // Single-session roundtrip
 // ============================================================================
 
+TEST_CASE("CowTreeStorage reports what its key index costs in RAM", "[cowstorage][index]")
+{
+    // #175. This tier's budget is bytes on a FILESYSTEM, and `StorageTierTraits` says
+    // so -- but the LRU mirror it keeps beside the tree is resident memory that grows
+    // with the object count, and nothing named it. A node could hold a gigabyte of
+    // index for a disk cache it had been told was costing it no RAM.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto storage = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(storage.has_value());
+
+    // Empty means empty, so a node with a disk tier and nothing in it reserves
+    // nothing -- the direction that matters, since the alternative is a machine that
+    // holds memory back for a cache it is not using.
+    REQUIRE((*storage)->Snapshot().indexBytes == 0);
+
+    REQUIRE((*storage)->Set("a-key", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    auto const one = (*storage)->Snapshot().indexBytes;
+    REQUIRE(one > 0);
+
+    // It GROWS with the count, which is the property the figure exists to expose.
+    REQUIRE((*storage)->Set("another-key", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Snapshot().indexBytes > one);
+
+    // A longer key costs more than a short one, which is why this is accumulated
+    // rather than `itemCount` times an average: a compile cache's keys are uniform
+    // hashes and a daemon client's are whatever it sent.
+    TempFile wide;
+    FastCache::CowTreeStorage::Options wideOpts;
+    wideOpts.path = wide.path;
+    auto wideStorage = FastCache::CowTreeStorage::Open(wideOpts);
+    REQUIRE(wideStorage.has_value());
+    REQUIRE((*wideStorage)->Set(std::string(200, 'k'), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*wideStorage)->Snapshot().indexBytes > one);
+
+    // And it comes back down, or a long-running node would report an index that only
+    // ever grew -- which is worse than reporting nothing, because it would be
+    // believed.
+    REQUIRE((*storage)->Delete("another-key", FastCache::TimePoint::min()).has_value());
+    REQUIRE((*storage)->Snapshot().indexBytes == one);
+
+    // Overwriting is not a second entry. `TouchOrInsert` takes the existing-key path
+    // there, and an accumulator that counted it twice would drift upward on exactly
+    // the workload a compile cache runs.
+    REQUIRE((*storage)->Set("a-key", MakeBytes("a longer value than before"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Snapshot().indexBytes == one);
+}
+
 TEST_CASE("CowTreeStorage Set + Get round-trips", "[cowstorage]")
 {
     TempFile tmp;

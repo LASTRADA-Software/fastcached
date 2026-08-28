@@ -417,6 +417,7 @@ carries the split a merged view cannot:
 | `fastcached_tier_bytes_used{tier=…}` | Bytes it holds. |
 | `fastcached_tier_bytes_limit{tier=…}` | Its budget; `0` means unbounded. |
 | `fastcached_tier_evictions_total{tier=…}` | Entries it dropped to stay inside that budget. |
+| `fastcached_tier_index_bytes{tier=…}` | Resident memory its key index costs. Always RAM, even for a disk tier, so it is **not** comparable with `bytes_limit` and must not be added to it. |
 
 **Do not sum across tiers.** The memory tier mirrors what it reads out of the disk
 tier, so adding the two item counts counts the mirrored entries twice — and the
@@ -1084,7 +1085,7 @@ What it shows, and why each part is split the way it is:
 | Machines | One row **per machine**, not per toolchain: the software version it is running, cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
 | Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. |
 | Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
-| Cache tiers | Items, bytes, budget and evictions **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. |
+| Cache tiers | Items, bytes, budget, evictions and index RAM **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. `index-ram` is what the tier's key index costs in memory: always RAM, even for a disk tier whose budget is bytes on a filesystem, so the two are not comparable and must not be added. |
 | Over time | Four charts over 24 hours or 7 days: compiles dispatched, refusals stacked four ways, offerable capacity against jobs in flight, and cache hit rate per bucket. |
 | Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
 

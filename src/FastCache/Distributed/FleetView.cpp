@@ -420,7 +420,7 @@ namespace
         FleetCell (*project)(NodeReport const&, StorageTier);
     };
 
-    constexpr std::array<TierColumn, 4> TierColumns {
+    constexpr std::array<TierColumn, 5> TierColumns {
         TierColumn { .suffix = "items",
                      .help = "Entries this tier holds.",
                      .format = CellFormat::Count,
@@ -458,6 +458,28 @@ namespace
                          [](NodeReport const& n, StorageTier tier) {
                              auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
                              return usage.has_value() ? FleetCell::Of(usage->evictions) : FleetCell::Nothing();
+                         } },
+        // The column #175 exists to produce. Without it a memory-bound disk-cache node
+        // showed `Memory` as its binding limit and nothing anywhere said the cache's
+        // own key index was what consumed the memory -- the next question an operator
+        // asks, and the one the page could not answer.
+        //
+        // Bytes, and NOT comparable with `budget` beside it: that one is denominated
+        // in whatever the tier is bounded by, which for a disk tier is bytes on a
+        // filesystem, while this is always RAM. The help text has to say so, because
+        // two byte columns side by side otherwise invite the sum nobody should take.
+        TierColumn { .suffix = "index-ram",
+                     .help = "RAM this tier spends on its key index. Always memory, even for a disk tier, so it is "
+                             "not comparable with the budget beside it.",
+                     .format = CellFormat::Bytes,
+                     .project =
+                         [](NodeReport const& n, StorageTier tier) {
+                             auto const& usage = n.load.cache.tiers[static_cast<std::size_t>(tier)];
+                             // Zero is rendered rather than suppressed: an in-memory
+                             // tier genuinely spends none SEPARATELY -- its index is
+                             // inside the bytes it already reports -- and a blank
+                             // would read as "did not say" instead.
+                             return usage.has_value() ? FleetCell::Of(usage->indexBytes) : FleetCell::Nothing();
                          } },
     };
 

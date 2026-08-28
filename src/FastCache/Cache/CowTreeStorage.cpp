@@ -1327,6 +1327,13 @@ void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize, 
                               .generation = _liveGeneration });
     _index.emplace(_lru.front().key, _lru.begin());
     _bytesUsed += valueSize;
+
+    // The one place a mirror entry comes into existence, matching `EraseNode` as the
+    // one place one leaves. Accounted here rather than recomputed from `_index.size()`
+    // at read time because the keys differ in length, and an average would be right
+    // for a compile cache's uniform hashes and wrong for whatever a daemon client
+    // sent.
+    _indexBytes += IndexBytesFor(key.size());
 }
 
 void CowTreeStorage::EraseFromLru(std::string_view key)
@@ -1345,6 +1352,12 @@ void CowTreeStorage::EraseNode(Iterator it)
     if (_sweepCursor == it)
         ++_sweepCursor;
     _bytesUsed -= it->bytes;
+
+    // Before the erase, because the key it is measured from lives in the node being
+    // dropped -- the same ordering `ReclaimDeadRecord` documents one function down,
+    // and for the same reason.
+    _indexBytes -= IndexBytesFor(it->key.size());
+
     _index.erase(it->key);
     _lru.erase(it);
 }
@@ -1951,6 +1964,7 @@ StorageStats CowTreeStorage::Snapshot() const noexcept
     _stats.itemCount = _index.size();
     _stats.bytesUsed = _bytesUsed;
     _stats.bytesLimit = _options.maxBytes;
+    _stats.indexBytes = _indexBytes;
     return _stats;
 }
 
