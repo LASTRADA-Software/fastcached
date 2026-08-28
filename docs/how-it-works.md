@@ -42,6 +42,11 @@ complete, useful setup; everything else is added when you want it.
 Your build system runs `fastcache-cc g++ -c foo.cpp -o foo.o` instead of
 `g++ -c foo.cpp -o foo.o`. Here is what happens between those two commands.
 
+This is the **client's** side of the story. If a fleet is involved, the same
+compile seen from the machines it touches — what the scheduler decides, what a
+worker is trusted with — is
+[One compile, as the fleet sees it](operations/cluster-communication.md#one-compile-as-the-fleet-sees-it).
+
 ```mermaid
 flowchart TD
     start["build runs<br/>fastcache-cc g++ -c foo.cpp"] --> id["1. Identify the compiler<br/>banner + target triple"]
@@ -545,6 +550,8 @@ unit took.
   statistics, and the fall-back reasons by name.
 - [Distributed compilation](getting-started/distributed-compilation.md) — setting
   up a fleet, and what to watch once it runs.
+- [Cluster communication](operations/cluster-communication.md) — the same compile
+  from the fleet's side, every connection in one table, and firewall rules.
 - [fastcache-compile-node](tools/fastcache-compile-node.md) — every flag, the
   node's cache tier, the cluster, and the fleet dashboard.
 - [Architecture](internals/architecture.md) — the module map, for contributors.

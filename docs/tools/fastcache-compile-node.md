@@ -26,25 +26,15 @@ all — read [How it works](../how-it-works.md#who-leads-and-what-happens-when-t
 
 ## How the pieces fit
 
-```
- fastcache-cc          fastcache-compile-node          fastcache-compile-node
- ────────────           (this one leads)                     (a worker)
-                     :6675 scheduler                           :6676
-                     :6676 compile     ◄── register + heartbeat ──┘
-                     :6674 cache tier ──► fastcached  (--upstream)
+A node is up to four surfaces in one process: a **compile worker** always, and
+optionally a **scheduler**, a **cache tier** and a **consensus member**. A client
+misses its cache, asks the scheduler for a worker, sends that worker preprocessed
+text, and stores the object it gets back.
 
- preprocess ─► key ─► FETCH ──hit──► done
-        │
-       miss
-        ▼
-   ask for a worker  ──────────►  match the toolchain exactly
-   ◄── endpoint + lease token     pick the one with the most free slots
-        │                          (or refuse: compile locally)
-        ├── send the preprocessed TU ──────────────────────────►
-        ◄────────── object + diagnostics ───────────────────────
-        │
-        └─► write the object ─► STORE it (the client, not the worker)
-```
+[Cluster communication](../operations/cluster-communication.md) draws the whole
+fleet and follows one compile across it, including the parts below the surface —
+what the scheduler decides and on what evidence, and what the nodes say to each
+other.
 
 **Every refusal ends in a local compile.** No matching toolchain, no free slot,
 another client already compiling this key, an unreachable worker — all of them
@@ -1424,28 +1414,12 @@ What the counters mean is tabulated under
 
 ## Security
 
-!!! danger "A node has no inbound credential, and setting one breaks it"
+--8<-- "node-credential-gap.md"
 
-    None of this node's three framed surfaces — scheduler, compile port, cache
-    tier — serves the `AUTH` verb, so there is nothing for a credential to
-    authenticate against. `--requirepass` here is only the secret this node
-    **presents** when it dials somebody else, and it works in exactly one
-    direction: against a `fastcached` named by `--upstream`, which does serve
-    `AUTH`. Presented to another *node* it is refused `dispatch-not-permitted`,
-    and the caller reports that in place of the answer to the request it actually
-    sent:
-
-    | You set | What breaks |
-    |---|---|
-    | `--requirepass` on a worker | `REGISTER` is refused; the worker never joins the fleet. |
-    | `FASTCACHE_TOKEN` on a client with `FASTCACHE_SCHEDULER` set | Every `LEASE` is declined and every compile happens locally, behind a green build. |
-    | `--requirepass` with `--cluster-status` and friends | Refused, naming a verb you never typed. |
-
-    That is [#198](https://github.com/LASTRADA-Software/fastcached/issues/198).
-    Until it closes, a fleet's boundary is **network reachability plus
-    membership**, and a token on it is worse than no token. The credentials that
-    *are* real: `--dashboard-token-file` for the fleet page, and `fastcached`'s own
-    `--requirepass` for the shared cache.
+Until it closes, a fleet's boundary is **network reachability plus membership**,
+and a token on it is worse than no token. The credentials that *are* real:
+`--dashboard-token-file` for the fleet page, and `fastcached`'s own
+`--requirepass` for the shared cache.
 
 Keep `--listen-scheduler` off any network you would not run a compiler for. That
 is why it is a separate process from the cache: the cache may reasonably be

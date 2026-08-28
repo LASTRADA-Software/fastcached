@@ -8,7 +8,10 @@ It is off unless you ask for it. Turn it on with `--discovery`, which needs
 cluster is exactly the `--raft-peer` list an operator typed, which works and is
 the right answer for a fleet that does not change. The flags, and what a
 deployment looks like end to end, are under
-[finding peers instead of typing them](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them).
+[finding peers instead of typing them](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them);
+where this exchange sits among everything else a fleet says to itself — and which
+ports it needs open — is
+[Cluster communication](../operations/cluster-communication.md).
 
 ## What problem it solves
 

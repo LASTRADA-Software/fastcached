@@ -164,6 +164,7 @@ nav:
     - Unsupported Redis commands: commands/redis/unsupported.md
   - Operations:
     - Deployment: operations/deployment.md
+    - Cluster communication: operations/cluster-communication.md
     - Running a compile cache: operations/compile-cache-server.md
     - Upgrading a store: operations/upgrading-a-store.md
     - Known limitations: operations/known-limitations.md
