@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <format>
 #include <ranges>
+#include <string>
 
 namespace FastCache::Distributed
 {
@@ -141,14 +142,34 @@ namespace
         return ChartWidth * static_cast<double>(index) / static_cast<double>(count - 1);
     }
 
-    /// One polyline per unbroken run of known points.
+    /// The geometry of one series: path data, and the readings that have no line.
+    ///
+    /// Two strings and not one, because they are two different KINDS of markup.
+    /// `path` is the value of a `d` attribute; `dots` is a run of elements. Handing
+    /// back a single string concatenating both -- which this did -- puts
+    /// `<circle .../>` inside `d="..."`, and a browser parsing an `<img>`-referenced
+    /// SVG as XML refuses the entire document over it. The chart then arrives with a
+    /// 200 and a plausible length and renders as a broken image saying nothing.
+    struct SeriesGeometry
+    {
+        std::string path; ///< `d` data: one `M`/`L` run per unbroken stretch of readings.
+        std::string dots; ///< `<circle>` elements for the runs of one, which have no line.
+    };
+
+    /// One polyline per unbroken run of known points, plus a dot per run of one.
     ///
     /// Runs and not one path, because a single path across a gap would draw a line
     /// through hours nobody observed -- which is the zero-versus-absent confusion
     /// this whole surface is built to avoid, in its most misleading form.
-    [[nodiscard]] std::string RunsPath(FleetSeriesValues const& values, double max, bool close)
+    ///
+    /// @param values   The series, absent where nothing was observed.
+    /// @param max      The value the vertical axis tops out at.
+    /// @param close    Fill each run down to the baseline. A closed run of one has no
+    ///                 area to fill, so `dots` comes back empty for a filled shape.
+    /// @return The `d` data and the standalone dot elements, never concatenated.
+    [[nodiscard]] SeriesGeometry RunsGeometry(FleetSeriesValues const& values, double max, bool close)
     {
-        std::string out;
+        SeriesGeometry out;
         std::size_t index = 0;
         while (index < values.size())
         {
@@ -174,7 +195,9 @@ namespace
             {
                 // A single known point has no line to draw, so it gets a dot -- a
                 // run of one is still a reading and dropping it would under-report.
-                out += std::format(
+                // An ELEMENT, kept apart from the path data the caller is about to
+                // put in a `d` attribute.
+                out.dots += std::format(
                     R"(<circle cx="{:.2f}" cy="{:.2f}" r="1.6"/>)", XAt(runStart, values.size()), ScaleY(firstOfRun, max));
                 continue;
             }
@@ -184,7 +207,7 @@ namespace
                                     ChartHeight - PadBottom,
                                     XAt(runStart, values.size()),
                                     ChartHeight - PadBottom);
-            out += path;
+            out.path += path;
         }
         return out;
     }
@@ -482,14 +505,14 @@ std::string RenderChartSvg(FleetChartRow const& chart,
         for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count) | std::views::reverse)
         {
             auto const& row = FleetSeriesTable[chart.first + offset];
-            auto const band = RunsPath(tops[offset], max, true);
+            auto const band = RunsGeometry(tops[offset], max, true);
             // An element with an empty `d` is not nothing: it is a shape a renderer
             // still has to consider, and it makes "this series was never observed"
             // indistinguishable from "this series was flat" in the output.
-            if (band.empty())
+            if (band.path.empty())
                 continue;
-            out +=
-                std::format(R"(<path d="{}" fill="{}" fill-opacity="0.85"/>)", band, std::format("var(--{})", row.colour));
+            out += std::format(
+                R"(<path d="{}" fill="{}" fill-opacity="0.85"/>)", band.path, std::format("var(--{})", row.colour));
         }
     }
     else
@@ -501,14 +524,21 @@ std::string RenderChartSvg(FleetChartRow const& chart,
             // it. The gap between the two lines is what this chart is about, and a
             // reader who cannot tell which line is the limit reads that gap backwards.
             auto const ceiling = row.stroke == FleetSeriesStroke::Dashed;
-            if (auto const area = RunsPath(series[offset], max, true); !area.empty())
-                out += std::format(R"(<path d="{}" fill="{}" fill-opacity="{}"/>)", area, colour, ceiling ? "0.10" : "0.14");
-            if (auto const line = RunsPath(series[offset], max, false); !line.empty())
+            if (auto const area = RunsGeometry(series[offset], max, true); !area.path.empty())
+                out += std::format(
+                    R"(<path d="{}" fill="{}" fill-opacity="{}"/>)", area.path, colour, ceiling ? "0.10" : "0.14");
+            auto const line = RunsGeometry(series[offset], max, false);
+            if (!line.path.empty())
                 out += std::format(R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.6" )"
                                    R"(stroke-linejoin="round"{}/>)",
-                                   line,
+                                   line.path,
                                    colour,
                                    ceiling ? R"( stroke-dasharray="4 3")" : "");
+            // Siblings of the path rather than part of it, and grouped so the fill is
+            // named once: a dot inherits nothing from the path it belongs to, and an
+            // unfilled circle renders black -- a colour belonging to no series here.
+            if (!line.dots.empty())
+                out += std::format(R"(<g fill="{}">{}</g>)", colour, line.dots);
         }
 
     out += AxisLabels(buckets);

@@ -6,8 +6,10 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -62,6 +64,42 @@ constexpr std::int64_t DaySeconds = 300;
             return row;
     FAIL("no chart named " << key);
     return FleetChartTable[0];
+}
+
+/// The offset of the first `<` sitting inside an attribute value, if there is one.
+///
+/// A browser parses an `<img>`-referenced SVG as XML and refuses the whole document
+/// over one stray `<` there. The chart then arrives with a 200 and a plausible byte
+/// count and renders as a broken image, with nothing anywhere saying why -- so the
+/// assertion has to be on the markup rather than on what the server returned with
+/// it. Deliberately narrow: this is the one malformation the renderer can produce,
+/// by putting an element where path data belongs.
+[[nodiscard]] std::optional<std::size_t> MarkupInAttribute(std::string_view svg)
+{
+    bool inTag = false;
+    bool inValue = false;
+    for (auto const index: std::views::iota(std::size_t { 0 }, svg.size()))
+    {
+        auto const character = svg[index];
+        if (inValue)
+        {
+            if (character == '"')
+                inValue = false;
+            else if (character == '<')
+                return index;
+        }
+        else if (character == '<')
+        {
+            if (inTag)
+                return index; // A tag opening inside a tag: the same fault, unquoted.
+            inTag = true;
+        }
+        else if (character == '>')
+            inTag = false;
+        else if (character == '"' && inTag)
+            inValue = true;
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -212,6 +250,33 @@ TEST_CASE("An all-absent series draws nothing at all", "[distributed][fleetchart
     CHECK(svg.ends_with("</svg>"));
 }
 
+TEST_CASE("A reading with no neighbours is a dot beside the path, never inside it", "[distributed][fleetchart]")
+{
+    // Two adjacent samples with a gap either side. A share needs the bucket before
+    // it, so exactly one point is known and it has no line to draw. The live
+    // dashboard's hit-rate chart is full of these -- a mostly idle daemon samples in
+    // short adjacent runs -- and every one of them was emitted as a `<circle>`
+    // element INSIDE the `d` attribute of the path, which made the whole document
+    // unparseable and the chart a broken image.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::CacheHits, 10 }, { FleetMetric::CacheMisses, 5 } }),
+        At(600'000, { { FleetMetric::CacheHits, 14 }, { FleetMetric::CacheMisses, 5 } }),
+        Gap(900'000),
+    };
+
+    auto const svg = RenderChartSvg(ChartByKey("hit-rate"), buckets, FleetRange::Day, FleetTheme::Light);
+    INFO(svg);
+    CHECK_FALSE(MarkupInAttribute(svg).has_value());
+
+    // The reading is still drawn: a run of one is a reading, and dropping it would
+    // under-report. It carries the series colour itself, because a document loaded
+    // through `<img>` inherits nothing -- an unfilled circle renders black, which on
+    // this page is a colour belonging to no series at all.
+    CHECK(svg.contains("<circle"));
+    CHECK(svg.contains("<g fill=\"var(--ok)\">"));
+}
+
 TEST_CASE("A chart is a document a browser may load as an image", "[distributed][fleetchart]")
 {
     std::vector<FleetBucket> buckets;
@@ -223,10 +288,22 @@ TEST_CASE("A chart is a document a browser may load as an image", "[distributed]
                                { FleetMetric::OfferableSlots, 24 },
                                { FleetMetric::JobsInFlight, static_cast<std::uint64_t>(index) % 5 } }));
 
+    // The same readings with every third window unobserved. Gaps are the ordinary
+    // case on a real dashboard rather than an edge one -- a node samples only while
+    // it runs -- and they are what produce a run of a single point. A renderer that
+    // is well-formed only over dense data is a renderer that is broken on the live
+    // page and passing here.
+    auto gapped = buckets;
+    for (auto const index: std::views::iota(std::size_t { 0 }, gapped.size()))
+        if (index % 3 == 0)
+            gapped[index] = Gap(gapped[index].startMillis);
+
     for (auto const& chart: FleetChartTable)
     {
         auto const svg = RenderChartSvg(chart, buckets, FleetRange::Day, FleetTheme::Auto);
         INFO("chart " << chart.key);
+        CHECK_FALSE(MarkupInAttribute(svg).has_value());
+        CHECK_FALSE(MarkupInAttribute(RenderChartSvg(chart, gapped, FleetRange::Day, FleetTheme::Auto)).has_value());
         // Served as its own resource and loaded through <img>, so a script would not
         // run anyway -- but nothing here has any business emitting one, and a chart
         // that started to would be worth failing over rather than discovering later.
