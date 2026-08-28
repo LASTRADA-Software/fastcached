@@ -6,7 +6,10 @@
 #include <cstdint>
 #include <optional>
 #include <ranges>
+#include <span>
+#include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace FastCache
 {
@@ -159,6 +162,65 @@ struct Utf8CodePoint
         text.remove_prefix(length);
     }
     return true;
+}
+
+/// One named string of @p Record that has to be text, and where to read it.
+///
+/// The shape every "is this text" table in this tree takes, written once. There are
+/// two of them -- what a worker states about itself, and what a cluster command
+/// records -- and they differ only in the record they project from, which is the
+/// definition of a table rather than of two tables.
+///
+/// A table rather than a check per field, because the failure it guards against is a
+/// field being ADDED and nobody remembering to check it: that stays invisible until
+/// a peer sends one that is not text, by which time the bytes are in the leader's
+/// view of the fleet and in everything rendered from it.
+template <typename Record>
+struct TextField
+{
+    std::string_view name;                      ///< What a refusal calls it.
+    std::string_view (*project)(Record const&); ///< Where to read it.
+};
+
+/// The first of @p fields whose value in @p record is not well-formed UTF-8.
+///
+/// Answers with the field's NAME rather than a bare bool, because that is the whole
+/// value of the table: a refusal that says which field was at fault sends an
+/// operator to one place, and one that says "something was wrong" sends them to all
+/// of them.
+///
+/// `Record` is deduced from @p record alone: the span is a **non-deduced** parameter,
+/// which is what lets a caller hand over its `std::array` as it stands. A
+/// `std::array` converts to a dynamic-extent span happily, but deducing from the
+/// argument would fix the extent from the array's size and then fail to match the
+/// dynamic-extent one the body wants.
+/// @param record What to read the fields from.
+/// @param fields The fields to check, in the order a refusal should prefer.
+/// @return The offending field's name, or nullopt when every one of them is text.
+template <typename Record>
+[[nodiscard]] constexpr std::optional<std::string_view> FirstFieldNotText(
+    Record const& record, std::type_identity_t<std::span<TextField<Record> const>> fields) noexcept
+{
+    for (auto const& field: fields)
+        if (!IsValidUtf8(field.project(record)))
+            return field.name;
+    return std::nullopt;
+}
+
+/// What a refusal says about a field that is not text.
+///
+/// One sentence rather than one per surface. The refusals themselves are different
+/// -- a registration is refused on the wire with `malformed-registration`, a cluster
+/// command as an invalid change -- but what they SAY about a field is one fact, and
+/// two spellings of it drift the first time either is touched.
+/// Concatenated rather than formatted, so this header stays what it otherwise is: a
+/// `constexpr` leaf that six translation units include for the decoder alone. One
+/// interpolation is not worth `<format>` in all of them.
+/// @param field The field's name, as `FirstFieldNotText` reports it.
+/// @return The message.
+[[nodiscard]] inline std::string NotTextRefusal(std::string_view field)
+{
+    return std::string { field } + " is not valid UTF-8";
 }
 
 } // namespace FastCache

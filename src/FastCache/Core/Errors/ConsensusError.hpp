@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
+
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -31,6 +33,80 @@ enum class ConsensusErrorCode : std::uint8_t
     UnsupportedVersion, ///< A frame version outside the range this build decodes.
     Last,               ///< Not a code, and has no row: the length of a table keyed by one.
 };
+
+/// What a consensus refusal is *about*.
+///
+/// The distinction a retrying caller needs, and the one that has no other spelling:
+/// a refusal either describes the **command** -- in which case offering it again
+/// changes nothing, ever -- or it describes the **moment**, in which case the command
+/// is fine and the next one would be refused identically.
+///
+/// It exists because `ConsensusTier::Reconcile` proposes a LIST. Abandoning the pass
+/// at the first refusal is right for a moment-shaped one, and it was the only kind
+/// that could arise when that code was written; a command-shaped one silently costs
+/// the cluster everything after it in the list -- including the quorum reconciliation
+/// that follows -- on every pass, forever, with one log line per interval as the
+/// symptom. That is half of the trap #159 records.
+enum class RefusalSubject : std::uint8_t
+{
+    Command, ///< This change, permanently. Skip it; the rest of the list may be fine.
+    Moment,  ///< This node, or now. The rest of the list would be refused identically.
+};
+
+/// What each refusal is about, one row per `ConsensusErrorCode`.
+///
+/// A table rather than a comparison against the one enumerator that is different
+/// today, because the failure it guards against is a code appended later and
+/// classified by whichever way an `if` happened to be written -- which is a silent
+/// cluster-wide stall if it lands on the wrong side.
+struct RefusalSubjectRow
+{
+    ConsensusErrorCode code; ///< The refusal.
+    RefusalSubject subject;  ///< What it is about.
+};
+
+/// One row per `ConsensusErrorCode`, in enumerator order.
+///
+/// Only `InvalidConfiguration` describes a command; everything else describes this
+/// node or this instant. `StorageFailure` is the one worth pausing on and it is a
+/// moment: the write that failed says nothing about the command, and the next
+/// command would fail the same way -- so a caller should stop, not skip.
+///
+/// **The classification is a property of the code, and one producer disagrees.**
+/// `RaftNode::ProposeMembership` also answers `InvalidConfiguration` for two
+/// conditions that are plainly moments -- a configuration change already in flight,
+/// and a proposed member set equal to the current one -- so this table is right for a
+/// refusal that came back from proposing a `Cluster::Command`, where
+/// `Cluster::Validate` is the only producer, and wrong for one that came back from
+/// proposing a *membership change*. `SubjectOf` says so at its own doc, and
+/// `ConsensusTier::ReconcileQuorum` deliberately does not consult it. Making the code
+/// carry the property properly means splitting the enumerator, which is
+/// https://github.com/LASTRADA-Software/fastcached/issues/196.
+inline constexpr EnumTable<ConsensusErrorCode, RefusalSubjectRow> RefusalSubjects { {
+    { .code = ConsensusErrorCode::InvalidConfiguration, .subject = RefusalSubject::Command },
+    { .code = ConsensusErrorCode::NotLeader, .subject = RefusalSubject::Moment },
+    { .code = ConsensusErrorCode::StorageFailure, .subject = RefusalSubject::Moment },
+    { .code = ConsensusErrorCode::MalformedFrame, .subject = RefusalSubject::Moment },
+    { .code = ConsensusErrorCode::UnknownMessageType, .subject = RefusalSubject::Moment },
+    { .code = ConsensusErrorCode::UnsupportedVersion, .subject = RefusalSubject::Moment },
+} };
+
+static_assert(RowsInEnumeratorOrder(RefusalSubjects, &RefusalSubjectRow::code),
+              "RefusalSubjects must hold one row per ConsensusErrorCode, in enumerator order");
+
+/// What @p code is about, for a refusal produced by proposing a `Cluster::Command`.
+///
+/// **Not for a membership-change refusal.** `RaftNode::ProposeMembership` answers
+/// `InvalidConfiguration` for transient conditions as well, so a caller on that path
+/// would read "wait for the change in flight to commit" as permanent and report it
+/// as such every interval -- which is the misleading-symptom failure the split this
+/// table exists for was meant to remove. See `RefusalSubjects`.
+/// @param code The refusal.
+/// @return Whether it describes the command or the moment.
+[[nodiscard]] constexpr RefusalSubject SubjectOf(ConsensusErrorCode code) noexcept
+{
+    return RefusalSubjects[static_cast<std::size_t>(code)].subject;
+}
 
 /// Structured consensus error.
 struct ConsensusError

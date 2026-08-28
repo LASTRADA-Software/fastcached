@@ -329,15 +329,40 @@ outright rather than drawing with a gap.
   that sanitises is a second place the value is decided, and every *other*
   surface still carries the original. `SchedulerService::Register` refuses the
   registration outright.
-- **The consensus door is deliberately still open, and refusing at the proposer
-  is NOT the way to close it** (issue #159). `Cluster::Validate` looks like the
-  matching place and is a trap twice over: it also governs `RemoveMember`, so a
-  bad id already in replicated state could never be *forgotten* -- the member
-  would count towards quorum forever -- and `ConsensusTier::Reconcile` returns on
-  the first refused proposal, which is correct for the transient refusal it was
-  written for and makes a permanent one stall admission of every peer, silently,
-  at Info. Whatever closes it belongs where a peer's claimed id enters, not where
-  a proposal is made.
+- **A cluster member's identity enters by three doors, and the shape of each
+  refusal is decided by what that door can do about one** (#159). A peer's beacon
+  repeats forever, so it is *filtered*, at `PeerDirectory::NoteBeacon` -- a peer
+  this node cannot name is a peer it does not remember, which means no
+  permanently-refusable proposal is ever generated. A cluster change is one-shot
+  with somebody reading the answer, so it is *refused*, at
+  `SchedulerService::Offer` and again in `Cluster::Validate`. And this node's own
+  `--node-id` and `--raft-peer` are refused where they are **parsed**
+  (`ParseUtf8Text` / `ParseRaftPeer`, #155) -- in front of whoever typed them,
+  which is why no startup rule needs to say it again.
+- **The wire door is not the flag door, and neither replaces the other.** The
+  option table refuses what an operator typed into *this* binary;
+  `SchedulerService::Offer` refuses what arrives as a request, from a client built
+  before that check existed or from a peer. A cluster entry is applied after it is
+  committed, with nobody left to refuse it, so the surface that accepts the request
+  is the last place anybody can be told.
+- **`Cluster::Validate` carries the rule per VERB, and `RemoveMember`'s row is
+  empty.** One rule for every verb alike was written, verified and reverted once
+  (#159), because `Validate` governs removal too and a removal's key *is* the
+  offending id: a bad member already in replicated state could then never be
+  forgotten and would count towards quorum forever, refused by the very check
+  meant to keep it out. The empty row is load-bearing and named rather than
+  omitted, and a test forgets an unnameable member so that tidying it away fails.
+- **A refusal describes the command or the moment, and a proposer of a LIST has
+  to know which.** `ConsensusTier::Reconcile` returned on the first refusal --
+  right for a moment-shaped one, and the only kind that could arise when it was
+  written. A command-shaped one is permanent, so that `return` skipped every
+  later proposal *and* `ReconcileQuorum` on every pass forever, with one Info
+  line per interval as the symptom: a cluster that silently stops admitting
+  anybody. `RefusalSubject` is the distinction, as a table over
+  `ConsensusErrorCode` so a code appended later cannot be classified by accident.
+  What the beacon door filters, what it deliberately does not, and why nothing
+  prints a claim a peer has not proved are `Cluster/` facts and live in
+  [`consensus-and-cluster.md`](consensus-and-cluster.md).
 - **Refused, not cleaned up, and the reason is per-field.** A fingerprint is
   matched byte for byte, so a worker admitted under a repaired name would match
   nothing and sit in the fleet never being picked. A member id is what every
@@ -368,16 +393,6 @@ outright rather than drawing with a gap.
 
 ## Open work
 
-- **[#159](https://github.com/LASTRADA-Software/fastcached/issues/159)** — a
-  cluster member id, its consensus endpoint and its scheduler endpoint reach
-  `/fleet.json`, the page and `--cluster-status` without ever being asked whether
-  they are text. The document itself is safe -- the encoders repair what reaches
-  them -- but the leader's state holds bytes nobody can name. Refusing them in
-  `Cluster::Validate` was written, verified and reverted before merge: it governs
-  `RemoveMember` too, so a bad id could never be forgotten, and
-  `ConsensusTier::Reconcile` returns on the first refused proposal, which turns a
-  permanent refusal into a cluster that silently stops admitting anyone. The
-  ticket carries both failures in full.
 - **[#142](https://github.com/LASTRADA-Software/fastcached/issues/142)** —
   `LeaseTable` exposes `LiveCount()` and `IsInFlight(key)` and no way to walk what
   is held, so the page can say *seven leases* and not *which*. That is the wrong

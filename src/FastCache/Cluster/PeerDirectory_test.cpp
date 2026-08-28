@@ -16,7 +16,7 @@ TEST_CASE("PeerDirectory records a peer and forgets it when its beacons stop", "
     ManualClock clock;
     PeerDirectory directory { clock, "prod", "self", 90s };
 
-    CHECK(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677"));
+    CHECK(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
     REQUIRE(directory.Size() == 1);
 
     // Still inside the window: a beacon may be lost without costing a peer its
@@ -37,18 +37,88 @@ TEST_CASE("PeerDirectory ignores another cluster and its own beacons", "[cluster
     PeerDirectory directory { clock, "prod", "self" };
 
     // Two unrelated fleets on one segment must not disturb each other.
-    CHECK_FALSE(directory.NoteBeacon("staging", "worker-a", "10.0.0.5:6677"));
+    CHECK(directory.NoteBeacon("staging", "worker-a", "10.0.0.5:6677") == BeaconOutcome::OtherCluster);
 
     // A node's own beacon comes back to it on a broadcast address. Recording it
     // would make a lone node believe it has a peer, and propose a membership
     // change to admit itself.
-    CHECK_FALSE(directory.NoteBeacon("prod", "self", "10.0.0.1:6677"));
+    CHECK(directory.NoteBeacon("prod", "self", "10.0.0.1:6677") == BeaconOutcome::Self);
 
     // Nothing to reach or to name in a membership entry.
-    CHECK_FALSE(directory.NoteBeacon("prod", "", "10.0.0.5:6677"));
-    CHECK_FALSE(directory.NoteBeacon("prod", "worker-a", ""));
+    CHECK(directory.NoteBeacon("prod", "", "10.0.0.5:6677") == BeaconOutcome::Unnameable);
+    CHECK(directory.NoteBeacon("prod", "worker-a", "") == BeaconOutcome::Unnameable);
 
     CHECK(directory.Size() == 0);
+}
+
+TEST_CASE("PeerDirectory remembers only a peer it could name", "[cluster][discovery]")
+{
+    // The regression for #159, at the door it enters by -- `BeaconOutcome` carries
+    // why it is this door and not the proposer. One fixture for the rule and its two
+    // edges, because that is what they are.
+    ManualClock clock;
+
+    SECTION("a peer whose claim is not text")
+    {
+        PeerDirectory directory { clock, "prod", "self" };
+
+        // Both halves are asked, which is what this pins. WHICH sequences are invalid
+        // is `Core/Utf8`'s question and is asserted there, over the whole taxonomy --
+        // overlong forms, lone surrogates and the ceiling included.
+        CHECK(directory.NoteBeacon("prod", "worker-\x80", "10.0.0.5:6677") == BeaconOutcome::Unnameable);
+        CHECK(directory.NoteBeacon("prod", "worker-b", "10.0.0.5:6677\xE2\x82") == BeaconOutcome::Unnameable);
+
+        // Nothing was remembered, so nothing can be published, desired or proposed --
+        // and no challenge is worth the datagram either.
+        CHECK(directory.Size() == 0);
+    }
+
+    SECTION("a peer named in multi-byte UTF-8, which is text")
+    {
+        // Encoding, not ASCII. Hex escapes rather than the characters themselves,
+        // which is this tree's idiom for the same reason it is anywhere: a narrow
+        // literal's meaning otherwise depends on the compiler's source charset.
+        PeerDirectory directory { clock, "prod", "self" };
+
+        CHECK(directory.NoteBeacon("prod", "arbeiter-\xC3\xA9\xE2\x82\xAC", "b\xC3\xBCro.example:6677")
+              == BeaconOutcome::Recorded);
+        REQUIRE(directory.Peers().size() == 1);
+        CHECK(directory.Peers().front().nodeId == "arbeiter-\xC3\xA9\xE2\x82\xAC");
+    }
+
+    SECTION("a cluster id, which is compared and never recorded")
+    {
+        // The deliberate hole in the rule, pinned so nobody closes it. A cluster id
+        // never reaches replicated state -- it is matched byte for byte and thrown
+        // away -- so subjecting it to the same filter would buy nothing and would cost
+        // a fleet named in some other encoding every peer it has, silently, because
+        // both ends would agree to ignore each other.
+        PeerDirectory directory { clock, "prod-\x80", "self" };
+
+        CHECK(directory.NoteBeacon("prod-\x80", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
+        CHECK(directory.Size() == 1);
+    }
+}
+
+TEST_CASE("PeerDirectory keeps a peer it can name when the next beacon is one it cannot", "[cluster][discovery]")
+{
+    // A refused beacon changes nothing, which matters because the endpoint path it
+    // does not reach is destructive: a peer that advertises a DIFFERENT endpoint
+    // loses its authenticated bit. Letting an unrecordable claim take that path
+    // would let anything on the segment un-admit a proved peer by beaconing
+    // garbage in its name once per interval.
+    ManualClock clock;
+    PeerDirectory directory { clock, "prod", "self" };
+
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
+    REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.AuthenticatedPeers().size() == 1);
+
+    CHECK(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677\xFF") == BeaconOutcome::Unnameable);
+
+    REQUIRE(directory.Peers().size() == 1);
+    CHECK(directory.Peers().front().raftEndpoint == "10.0.0.5:6677");
+    CHECK(directory.AuthenticatedPeers().size() == 1);
 }
 
 TEST_CASE("PeerDirectory keeps 'seen' and 'proved' apart", "[cluster][discovery]")
@@ -60,7 +130,7 @@ TEST_CASE("PeerDirectory keeps 'seen' and 'proved' apart", "[cluster][discovery]
     ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
-    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
     REQUIRE(directory.Peers().size() == 1);
     CHECK_FALSE(directory.Peers().front().authenticated);
     CHECK(directory.AuthenticatedPeers().empty());
@@ -73,7 +143,7 @@ TEST_CASE("PeerDirectory will not authenticate an endpoint nobody proved", "[clu
 {
     ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
-    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
 
     // A proof covers a (node, endpoint) PAIR, because both are inside the MAC.
     // Accepting one against a different endpoint would let a beacon sent between
@@ -96,11 +166,11 @@ TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][dis
     ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
-    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677"));
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
     REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.5:6677"));
     REQUIRE(directory.AuthenticatedPeers().size() == 1);
 
-    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677"));
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677") == BeaconOutcome::Recorded);
     CHECK(directory.AuthenticatedPeers().empty());
     REQUIRE(directory.Peers().size() == 1);
     CHECK(directory.Peers().front().raftEndpoint == "10.0.0.9:6677");
@@ -108,7 +178,7 @@ TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][dis
     // A repeated beacon for the SAME endpoint must not drop it, or a peer would
     // lose its place every beacon interval and the cluster would never settle.
     REQUIRE(directory.MarkAuthenticated("worker-a", "10.0.0.9:6677"));
-    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677"));
+    REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.9:6677") == BeaconOutcome::Recorded);
     CHECK(directory.AuthenticatedPeers().size() == 1);
 }
 
@@ -121,7 +191,7 @@ TEST_CASE("PeerDirectory answers in a stable order", "[cluster][discovery]")
     PeerDirectory directory { clock, "prod", "self" };
 
     for (auto const* const id: { "worker-c", "worker-a", "worker-b" })
-        REQUIRE(directory.NoteBeacon("prod", id, "10.0.0.1:6677"));
+        REQUIRE(directory.NoteBeacon("prod", id, "10.0.0.1:6677") == BeaconOutcome::Recorded);
 
     auto const peers = directory.Peers();
     REQUIRE(peers.size() == 3);

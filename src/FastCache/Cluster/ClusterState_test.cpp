@@ -26,6 +26,15 @@ namespace
         .kind = kind, .key = std::move(key), .value = std::move(value), .schedulerEndpoint = std::move(scheduler)
     };
 }
+/// Why `command` may not be proposed, having required that it may not.
+/// @param command The change.
+/// @return The refusal's context, which is what an operator reads.
+[[nodiscard]] std::string Refused(Command const& command)
+{
+    auto const answer = Validate(command);
+    REQUIRE_FALSE(answer.has_value());
+    return answer.error().context;
+}
 } // namespace
 
 TEST_CASE("A member is admitted with an endpoint, never without one", "[cluster][state]")
@@ -39,11 +48,54 @@ TEST_CASE("A member is admitted with an endpoint, never without one", "[cluster]
     // Refused at the PROPOSER, which is the only place a change can be refused: an
     // entry is applied after it is committed, so by then there is nobody left to
     // report to and no way to un-commit it.
-    auto const addressless = Validate(Cmd(CommandKind::AddMember, "n1"));
-    REQUIRE_FALSE(addressless.has_value());
-    CHECK(addressless.error().context.contains("endpoint"));
+    CHECK(Refused(Cmd(CommandKind::AddMember, "n1")).contains("endpoint"));
 
     CHECK_FALSE(Validate(Cmd(CommandKind::AddMember, "", "10.0.0.1:6675")).has_value());
+}
+
+TEST_CASE("A member the cluster records has to be one it can name", "[cluster][state]")
+{
+    // #159. Everything `AddMember` records becomes a `ClusterMember` and is read back
+    // out as TEXT -- by `/fleet.json`, which RFC 8259 requires to be UTF-8; by the
+    // fleet page, which embeds an SVG, which is XML; by `--cluster-status`; and by
+    // the logs. The encoders repair what reaches them, deliberately and as a last
+    // resort, but a leader whose state holds bytes nobody can name has a member
+    // nobody can name.
+    // All three, and the field is named because they send an operator to three
+    // different places: an id is typed into `--cluster-admit`, a consensus endpoint
+    // into `--raft-peer`, and a scheduler endpoint is announced by the member itself.
+    CHECK(Refused(Cmd(CommandKind::AddMember, "n\x80", "10.0.0.1:6675")).contains("a member id"));
+    CHECK(Refused(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675\xE2\x82")).contains("consensus endpoint"));
+    CHECK(Refused(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000\xFF")).contains("scheduler endpoint"));
+
+    // And a setting's value, which is free-form and therefore the likeliest of the
+    // lot to carry something surprising. Its NAME needs no rule of its own: a key
+    // this build does not know is already refused whatever its bytes are.
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674\x80")).contains("setting's value"));
+
+    // Encoding, not ASCII -- an id is opaque to consensus, which matches it byte for
+    // byte.
+    CHECK(Validate(Cmd(CommandKind::AddMember, "arbeiter-\xC3\xA9\xE2\x82\xAC", "b\xC3\xBCro.example:6675")).has_value());
+}
+
+TEST_CASE("A member that cannot be named can still be forgotten", "[cluster][state]")
+{
+    // The trap #159 exists to record, pinned open. `Validate` governs every verb, so
+    // a rule applied to all of them alike would also govern `RemoveMember` -- whose
+    // key IS the offending id. A member that reached replicated state through a peer
+    // built before any of this existed would then count towards quorum forever,
+    // refused by the very check meant to keep it out, with `--cluster-forget` the
+    // one thing that could have removed it.
+    //
+    // So the answer is a property of the VERB, and this is the case that says so.
+    CHECK(Validate(Cmd(CommandKind::RemoveMember, "n\x80")).has_value());
+
+    // Which is only useful if it does what it says: the state has to lose it.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n\x80", "10.0.0.1:6675"));
+    REQUIRE(state.members.size() == 1);
+    Apply(state, Cmd(CommandKind::RemoveMember, "n\x80"));
+    CHECK(state.members.empty());
 }
 
 TEST_CASE("A setting this build does not know is refused, not stored", "[cluster][state]")
@@ -54,9 +106,7 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
     CHECK(Validate(Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674")).has_value());
     CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "1")).has_value());
 
-    auto const unknown = Validate(Cmd(CommandKind::SetSetting, "upsteam", "typo"));
-    REQUIRE_FALSE(unknown.has_value());
-    CHECK(unknown.error().context.contains("upsteam"));
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "upsteam", "typo")).contains("upsteam"));
 
     // The table is the only source of truth for what is a setting, so a local flag
     // that describes ONE machine is not one -- replicating `--slots` would impose one

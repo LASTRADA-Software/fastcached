@@ -561,11 +561,40 @@ void ConsensusTier::Reconcile()
         auto const proposed = Propose(command);
         if (!proposed.has_value())
         {
-            // One line and out. The commonest reason is that leadership moved
-            // between the check above and here, which is not a fault and is not
-            // repaired by trying the rest of the list against the same lost term.
-            _logger.Logf(LogLevel::Info, "cluster: cannot record {} right now: {}", command.key, proposed.error().context);
-            return;
+            // What the refusal is ABOUT decides whether the rest of the list is
+            // still worth trying, and getting that wrong is silent both ways.
+            //
+            // A refusal about the MOMENT -- and the commonest by far is that
+            // leadership moved between the check above and here -- says nothing
+            // about this command and everything about the next one, so the pass
+            // ends. That is not a fault and is not repaired by re-offering the
+            // rest against the same lost term.
+            //
+            // A refusal about the COMMAND is permanent: offering it again next
+            // interval changes nothing. Returning on one is what turns a single
+            // bad record into a cluster that stops admitting ANYBODY, because the
+            // rest of the proposals and `ReconcileQuorum` below are skipped every
+            // pass forever, with one line per interval as the only symptom. It is
+            // half of the trap #159 records, and nothing in this build can produce
+            // one any more -- discovery will not remember a peer it cannot name
+            // (`PeerDirectory::NoteBeacon`), and the option table refuses a
+            // `--node-id` or `--raft-peer` that is not text before this process
+            // starts (`ParseUtf8Text`, #155). Which is exactly why it is worth
+            // being loud rather than fatal.
+            if (SubjectOf(proposed.error().code) == RefusalSubject::Moment)
+            {
+                _logger.Logf(
+                    LogLevel::Info, "cluster: cannot record {} right now: {}", command.key, proposed.error().context);
+                return;
+            }
+
+            // Warn, and "never" rather than "right now", because the two want
+            // different things from whoever reads them: one is a leader election
+            // in progress and the other is a record that has to be corrected
+            // before it can ever be agreed.
+            _logger.Logf(
+                LogLevel::Warn, "cluster: {} can never be recorded as it stands: {}", command.key, proposed.error().context);
+            continue;
         }
 
         _logger.Logf(LogLevel::Info,
@@ -656,8 +685,16 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
     auto const proposed = _driver->ProposeMembership(*change, std::chrono::steady_clock::now());
     if (!proposed.has_value())
     {
-        // One line and out, exactly as above: the commonest reason is that
-        // leadership moved between the two, which is not a fault.
+        // One line and out, and deliberately WITHOUT the `SubjectOf` split the
+        // proposal loop above uses. `ProposeMembership` answers
+        // `InvalidConfiguration` for two conditions that are plainly moments -- a
+        // change already in flight, and a member set equal to the current one -- so
+        // classifying by code here would report "wait for it to commit" as permanent,
+        // at Warn, every interval. That is issue #196; until it is split, this path
+        // treats every refusal as the moment it usually is.
+        //
+        // The commonest reason is that leadership moved between the two, which is
+        // not a fault.
         _logger.Logf(LogLevel::Info, "cluster: cannot change the quorum right now: {}", proposed.error().context);
         return;
     }

@@ -139,6 +139,47 @@ TEST_CASE("Two nodes holding one key find and prove each other", "[node][discove
     CHECK_FALSE(first.seen.front().schedulerEndpoint.has_value());
 }
 
+TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]")
+{
+    // #159 at the far end of the path it travels: what this tier hands its observer
+    // becomes `ConsensusTier::Desire`, then a `MembershipProposals` entry, then a
+    // `ClusterMember` in replicated state.
+    //
+    // Stopped at the directory rather than filtered here, so that no proposal is
+    // ever GENERATED. One a leader would refuse every pass, forever, is the shape
+    // that stalls a cluster: `Reconcile` abandons the pass at the first refusal and
+    // never reaches `ReconcileQuorum`.
+    DatagramBus bus;
+    Peer good { bus, "n1", TestKey() };
+
+    // A truncated three-byte sequence -- the shape is right and the bytes stop
+    // early -- which reaches the endpoint too, since a node's endpoint is derived
+    // from its id here exactly as an operator's `--raft-peer` derives from what
+    // they typed.
+    Peer nameless { bus, "n2-\xE2\x82", TestKey() };
+
+    // Four rounds is well over the three legs a handshake takes, so this fails as
+    // "it was admitted" rather than as "it had not finished yet".
+    for (auto round = 0; round < 4; ++round)
+    {
+        CHECK(good.tier->Step(Step));
+        CHECK(nameless.tier->Step(Step));
+    }
+
+    // Never seen, so never proved, so never desired. The key was right and made no
+    // difference: this is a refusal about what the peer CLAIMS rather than about
+    // what it holds.
+    CHECK(good.tier->AuthenticatedCount() == 0);
+    CHECK(good.seen.empty());
+
+    // And the other way round, which is what makes this a one-sided refusal rather
+    // than a segment that stops working: the refusal is about what a peer CLAIMS,
+    // so the node nobody can name still sees, proves and desires everybody else.
+    CHECK(nameless.tier->AuthenticatedCount() == 1);
+    REQUIRE(nameless.seen.size() == 1);
+    CHECK(nameless.seen.front().id == "n1");
+}
+
 TEST_CASE("A node holding the wrong key is never admitted", "[node][discovery]")
 {
     // The refusal that matters, because an admitted node is assigned compile jobs and

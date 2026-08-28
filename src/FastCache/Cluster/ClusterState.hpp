@@ -180,6 +180,11 @@ struct ClusterState
 /// An `enum class` rather than three payload types, so the wire carries one byte a
 /// receiver switches on and an unknown verb is refused rather than mistaken for a
 /// known one.
+///
+/// **Append only.** The numeric values are a wire contract twice over -- the byte a
+/// peer decodes, and the index of a table keyed by this enum -- so reordering these
+/// silently remaps every verb a running fleet has already replicated. `Last` is the
+/// count and never travels.
 enum class CommandKind : std::uint8_t
 {
     /// Add a member, or update the endpoint of one already present.
@@ -190,6 +195,7 @@ enum class CommandKind : std::uint8_t
     AddMember = 0,
     RemoveMember,
     SetSetting,
+    Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
 
 /// One change to the cluster's state, as it travels in a log entry.
@@ -252,7 +258,22 @@ void Apply(ClusterState& state, Command const& command);
 ///
 /// The only place a change can be refused, for the reason `Apply` cannot be. Called
 /// by the leader before it appends, so an operator gets an error rather than a
-/// silently ignored entry replicated to the whole cluster.
+/// silently ignored entry replicated to the whole cluster -- and called by
+/// `SchedulerService::Offer` as well, so the surface an operator types at refuses
+/// whatever sits behind its cluster seam rather than only a proposer that happens to
+/// ask this question itself.
+///
+/// **Everything it records has to be text**, and which strings those are is a
+/// property of the VERB. `AddMember`'s three become a `ClusterMember`, which
+/// `/fleet.json` emits -- RFC 8259 requires that document to be UTF-8 -- which the
+/// fleet page embeds in an SVG, which is XML, and which `--cluster-status` and the
+/// logs print. `SetSetting` constrains its value; its name is already settled by
+/// `FindSetting`. And `RemoveMember` constrains **nothing**, which is the rule that
+/// matters: its key *is* the id being forgotten, so a member that reached replicated
+/// state through a peer built before any of this existed has to stay forgettable.
+/// One rule for every verb alike would refuse the one id an operator most needs to
+/// type, and that member would count towards quorum forever -- which is the trap
+/// #159 records.
 /// @param command The change.
 /// @return Nothing when it may be proposed, or why it may not.
 [[nodiscard]] std::expected<void, ConsensusError> Validate(Command const& command);

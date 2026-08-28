@@ -42,6 +42,24 @@ Every rule below has already been a bug.
     they answer; a caller proposes. Admitting a node is a Raft decision only a
     leader may make, and a layer that proposed directly would have every node on
     the segment proposing the same change at once.
+  - **A peer this node cannot NAME is a peer it does not remember.** `NoteBeacon`
+    refuses an id or endpoint that is empty or is not valid UTF-8, alongside the
+    wrong-cluster and own-beacon filters, because what the directory holds is what
+    is eventually proposed as a `ClusterMember` -- and every surface reads that back
+    out as text (#159). Filtered here rather than at any later layer, which is what
+    keeps a permanently-refusable proposal from ever being generated; it also keeps
+    such a peer out of the challenge table, out of `Peers()`, and out of the line
+    logged when a peer proves the key. The beacon's *cluster id* is deliberately
+    exempt: it is compared and never recorded, and filtering it would take every
+    peer away from a fleet named in some other encoding, silently.
+  - **A claim a peer has not proved is printed only once it is TEXT, and never
+    unthrottled.** The mismatch line for a proof does name the endpoint it claimed --
+    that is a real diagnostic, because the ordinary cause is a peer that moved -- so
+    what is refused first is a claim that is not text, before the line that would
+    have carried it. An unnameable beacon has no such diagnostic to offer and is
+    reported by the address it came *from* instead. Both are provokable by anything
+    on the segment holding no key, which is why the beacon line is rate-limited and
+    why neither may ever grow a table.
 - **A node listens where the segment shouts and answers from an address of its
   own. Sharing a port buys hearing a broadcast and nothing else.** Every node binds
   the beacon port on the wildcard, shared, because a beacon is a broadcast and a

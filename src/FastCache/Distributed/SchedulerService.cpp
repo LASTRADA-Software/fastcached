@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <format>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -151,13 +152,6 @@ namespace
         return PickErrorTable[static_cast<std::size_t>(error)].reported;
     }
 
-    /// One text field a worker states about itself.
-    struct RegistrationTextField
-    {
-        std::string_view name;                                  ///< What a refusal calls it.
-        std::string_view (*project)(WorkerRegistration const&); ///< Where to read it.
-    };
-
     /// Every string a REGISTER carries, in one place.
     ///
     /// A table rather than three checks written out, because the failure this
@@ -165,16 +159,23 @@ namespace
     /// nobody remembering to check it -- which stays invisible until a peer sends
     /// one that is not text, by which time the bytes are in the leader's view of
     /// the fleet and in everything rendered from it.
+    ///
+    /// The extent is DEDUCED rather than spelled out. A row count written beside the
+    /// rows is a second place the same fact lives, and the two part company the first
+    /// time somebody appends one -- which is not hypothetical here: this table has
+    /// already grown its fourth row once.
     constexpr std::array RegistrationTextFields {
-        RegistrationTextField { .name = "fingerprint",
-                                .project = [](WorkerRegistration const& r) { return r.fingerprint; } },
-        RegistrationTextField { .name = "endpoint", .project = [](WorkerRegistration const& r) { return r.endpoint; } },
-        RegistrationTextField { .name = "version", .project = [](WorkerRegistration const& r) { return r.version; } },
+        TextField<WorkerRegistration> { .name = "fingerprint",
+                                        .project = [](WorkerRegistration const& r) { return r.fingerprint; } },
+        TextField<WorkerRegistration> { .name = "endpoint",
+                                        .project = [](WorkerRegistration const& r) { return r.endpoint; } },
+        TextField<WorkerRegistration> { .name = "version",
+                                        .project = [](WorkerRegistration const& r) { return r.version; } },
         // The fourth string this table's own comment anticipated. It matters more than
         // most: it is raw compiler output rather than anything this project composed,
         // so it is the likeliest field to arrive as bytes that are not text.
-        RegistrationTextField { .name = "toolchain label",
-                                .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
+        TextField<WorkerRegistration> { .name = "toolchain label",
+                                        .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
     };
 
     /// The counter a refusal moves, if any.
@@ -217,6 +218,24 @@ void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoi
 
 SchedulerReply SchedulerService::Offer(Cluster::Command const& command)
 {
+    // Asked here as well as by whoever proposes, and `Validate` in full rather than
+    // the one rule this surface happens to care about.
+    //
+    // The honest statement of why: `IClusterAdmin` is an untrusted seam. Its contract
+    // says nothing about validation, so an implementation that skipped it would take
+    // an empty key, an endpointless member and an unknown setting name as readily as
+    // a name that is not text -- and this surface is what answers an operator. With
+    // the only implementation in this tree, `ConsensusTier`, the reply is identical
+    // either way, so what this buys is that the answer does not depend on which
+    // implementation is behind the seam.
+    //
+    // Safe to refuse here precisely because this door is one-shot: an operator typed
+    // `--cluster-admit`, `--cluster-set` or `--cluster-forget` and is reading the
+    // answer. The reconciler is where the identical refusal is a trap, because it
+    // would re-offer the same command every interval forever.
+    if (auto const allowed = Cluster::Validate(command); !allowed.has_value())
+        return Refuse(WireCodeFor(allowed.error().code), allowed.error().context);
+
     auto const proposed = _admin->ProposeToCluster(command);
     if (proposed.has_value())
         // Appended, not committed, and the reply says only that. A leader cannot
@@ -334,9 +353,8 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // match nothing and sit in the fleet never being picked. A refusal reaches the
     // worker's own log through `DescribeOutcome`; the counter is what an operator
     // sees when the peer is not one of ours and never says anything at all.
-    for (auto const& field: RegistrationTextFields)
-        if (!IsValidUtf8(field.project(registration)))
-            return Refuse(Wire::ErrorCode::MalformedRegistration, std::format("{} is not valid UTF-8", field.name));
+    if (auto const field = FirstFieldNotText(registration, RegistrationTextFields); field.has_value())
+        return Refuse(Wire::ErrorCode::MalformedRegistration, NotTextRefusal(*field));
 
     // No zero-slot refusal any more, and its removal is a decision rather than a
     // simplification. A zero used to mean "a worker that will never be picked" and

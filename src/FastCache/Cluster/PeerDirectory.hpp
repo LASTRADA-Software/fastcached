@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -12,6 +13,28 @@
 
 namespace FastCache::Cluster
 {
+
+/// What a directory did with a beacon.
+///
+/// An enum rather than the `bool` this used to be, because that bool meant four
+/// different things and a caller could tell none of them apart -- which is why
+/// nothing could ever be said about the one that is worth saying something about.
+/// Three of these are ordinary traffic on a shared segment; only `Unnameable` is
+/// a fault, and only it is reported.
+enum class BeaconOutcome : std::uint8_t
+{
+    Recorded,     ///< A peer this node can name and reach; it may now be challenged.
+    OtherCluster, ///< Announced for a fleet this node is not in.
+    Self,         ///< This node's own beacon, come back to it on the broadcast.
+
+    /// Names nothing this node could ever record as a member.
+    ///
+    /// An empty id or endpoint, or one that is not valid UTF-8. The two are one
+    /// answer because they are one rule -- a member is `(id, endpoint)` and both
+    /// halves have to survive being written down, replicated, and read back out by
+    /// `/fleet.json`, the page, `--cluster-status` and every log line.
+    Unnameable,
+};
 
 /// A peer this node has heard from, and when.
 struct KnownPeer
@@ -66,17 +89,28 @@ class PeerDirectory
 
     /// Record a beacon.
     ///
-    /// Ignores a beacon for another cluster and this node's own, and never marks
-    /// a peer authenticated -- only `MarkAuthenticated` does that.
+    /// Ignores a beacon for another cluster and this node's own, ignores one whose
+    /// claimed identity could never be written down, and never marks a peer
+    /// authenticated -- only `MarkAuthenticated` does that.
     ///
     /// The cluster filter lives here rather than in the caller so that "two
     /// unrelated fleets share a segment" is a unit test rather than a property of
-    /// whoever happens to be reading datagrams.
+    /// whoever happens to be reading datagrams. So does the "can this be named"
+    /// filter, and for a sharper version of the same reason: what this directory
+    /// remembers is what a leader eventually proposes as a member, so a peer it
+    /// declines to remember is one no proposal can ever be generated for. A caller
+    /// that filtered afterwards would leave the bytes in the directory, in its own
+    /// log lines, and in whatever reads it next.
+    ///
+    /// The beacon's `clusterId` is deliberately **not** subject to that filter. It
+    /// is compared and never recorded, so checking it would buy nothing and would
+    /// cost a fleet whose `--cluster-id` is not UTF-8 every peer it has -- silently,
+    /// because both sides would agree to ignore each other.
     /// @param clusterId The cluster the beacon claims.
     /// @param nodeId Who sent it.
     /// @param raftEndpoint Where they say they answer.
-    /// @return True when it was recorded, false when it was ignored.
-    bool NoteBeacon(std::string_view clusterId, std::string_view nodeId, std::string_view raftEndpoint);
+    /// @return What was done with it, so a caller can report the one that is a fault.
+    BeaconOutcome NoteBeacon(std::string_view clusterId, std::string_view nodeId, std::string_view raftEndpoint);
 
     /// Record that a peer proved it holds the cluster key.
     ///
