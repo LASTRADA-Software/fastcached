@@ -113,13 +113,6 @@ namespace Detail
         return SendFlags;
     }
 
-    void ArmCloseOnExec(NativeSocket /*socket*/) noexcept
-    {
-        // Windows has no per-descriptor close-on-exec: handle inheritance is
-        // decided per CreateProcess call, and a socket is not inheritable unless
-        // it is asked for.
-    }
-
     bool SetNonBlocking(NativeSocket socket) noexcept
     {
         u_long mode = 1;
@@ -245,14 +238,6 @@ namespace Detail
     int NoSignalSendFlags() noexcept
     {
         return SendFlags;
-    }
-
-    void ArmCloseOnExec(NativeSocket socket) noexcept
-    {
-        auto const flags = ::fcntl(static_cast<int>(socket), F_GETFD, 0);
-        if (flags < 0)
-            return;
-        std::ignore = ::fcntl(static_cast<int>(socket), F_SETFD, flags | FD_CLOEXEC);
     }
 
     bool SetNonBlocking(NativeSocket socket) noexcept

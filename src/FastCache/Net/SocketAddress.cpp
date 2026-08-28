@@ -22,6 +22,7 @@
 
     #include <cerrno>
 
+    #include <fcntl.h>
     #include <netdb.h>
     #include <unistd.h>
 
@@ -111,8 +112,36 @@ namespace
 namespace Detail
 {
 
+    void ArmCloseOnExec(NativeSocket socket) noexcept
+    {
+#if defined(_WIN32)
+        // Windows DOES have a per-handle inheritance flag, and a socket IS
+        // inheritable unless something says otherwise -- both halves of what this
+        // used to claim were wrong, which is why the leak below survived so long.
+        // `::socket()` and `::accept()` hand back inheritable handles, so every
+        // accepted client connection was being handed to every compiler this
+        // process spawned. `IocpConnector` had it right for the dialled side all
+        // along, with `WSA_FLAG_NO_HANDLE_INHERIT` and a comment saying why.
+        std::ignore = ::SetHandleInformation(reinterpret_cast<HANDLE>(static_cast<SOCKET>(socket)), HANDLE_FLAG_INHERIT, 0);
+#else
+        auto const flags = ::fcntl(static_cast<int>(socket), F_GETFD, 0);
+        if (flags < 0)
+            return;
+        std::ignore = ::fcntl(static_cast<int>(socket), F_SETFD, flags | FD_CLOEXEC);
+#endif
+    }
+
     void ApplyHotSocketOptions(NativeSocket socket) noexcept
     {
+        // Every socket this process ends up owning passes through here -- accepted
+        // and dialled, on all four backends -- which is what makes it the one place
+        // this can be armed. `BlockingListener::Accept` uses a plain `::accept()`
+        // on both platforms and got it from nowhere else, so `fastcache-compile-node`
+        // handed each compiler it spawned every client connection then in flight.
+        // Invisible while a worker served one at a time; `slots` of them at once
+        // once it did not.
+        ArmCloseOnExec(socket);
+
         // TCP_NODELAY disables Nagle's algorithm so a small reply isn't held
         // back waiting for the peer's ACK of a previous segment. Best-effort.
         int const one = 1;

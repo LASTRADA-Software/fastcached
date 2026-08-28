@@ -123,15 +123,22 @@ namespace Detail
 
     /// Mark a socket close-on-exec, so a child process does not inherit it.
     ///
-    /// The accept path already gets this from `SOCK_CLOEXEC`; a *dialled* socket
-    /// is created by a plain `::socket` and does not. It matters because
-    /// `fastcache-compile-node` spawns a compiler for every job, and a compiler
-    /// holding an open peer connection keeps it alive after the worker is gone --
-    /// the same shape of defect `AdoptInheritedListeners` records for the
-    /// listening socket, reached from the outbound side.
+    /// It matters because `fastcache-compile-node` spawns a compiler for every job,
+    /// and a compiler holding an open peer connection keeps it alive after the
+    /// worker is gone -- the same shape of defect `AdoptInheritedListeners` records
+    /// for the listening socket, reached from the accepted and dialled sides.
     ///
-    /// Best-effort, and a no-op on Windows, where handle inheritance is opt-in
-    /// per `CreateProcess` call rather than per descriptor.
+    /// **Neither platform gives this for free, and Windows is not exempt.** The
+    /// `SOCK_CLOEXEC` the epoll and kqueue accept paths pass is theirs alone;
+    /// `BlockingListener::Accept` uses a plain `::accept()` on both platforms and a
+    /// dialled socket a plain `::socket`, and neither is close-on-exec. On Windows
+    /// a handle has its own `HANDLE_FLAG_INHERIT` and a socket arrives with it SET
+    /// -- this was documented here as a no-op on the belief that inheritance was
+    /// opt-in per `CreateProcess`, which is what let every accepted connection reach
+    /// every compiler the node spawned.
+    ///
+    /// Called from `ApplyHotSocketOptions`, which every socket this process owns
+    /// passes through; there is no second place to remember. Best-effort.
     /// @param socket The socket handle to mark.
     void ArmCloseOnExec(NativeSocket socket) noexcept;
 

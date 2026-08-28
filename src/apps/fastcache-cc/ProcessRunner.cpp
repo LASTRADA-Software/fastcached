@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,6 +26,7 @@
 
     #include <cerrno>
 
+    #include <fcntl.h>
     #include <poll.h>
     #include <spawn.h>
     #include <unistd.h>
@@ -111,6 +113,81 @@ namespace
             dst.append(buf.data(), n);
     }
 
+    /// A `CreateProcess` attribute list carrying the handles a child may inherit.
+    ///
+    /// `CreateProcess` with `bInheritHandles = TRUE` hands the child EVERY inheritable
+    /// handle the process owns -- not the ones this call set up. That is a
+    /// process-wide fact, so it only became visible once a worker ran several
+    /// compiles at once: a sibling's child holds another job's pipe write-end open,
+    /// that job's drain never sees EOF, and the compile hangs until the unrelated
+    /// sibling exits. Accepted sockets are the same hazard, and worse -- Windows
+    /// `::socket()` returns an inheritable handle, so a compiler process was pinning
+    /// client connections open after the client had gone.
+    ///
+    /// The list turns the question around: the child inherits exactly what is named
+    /// here and nothing else, so a handle added anywhere else in the process cannot
+    /// leak into a compile by being forgotten.
+    class InheritList
+    {
+      public:
+        /// @param handles The complete set the child may inherit.
+        explicit InheritList(std::span<HANDLE const> handles)
+        {
+            SIZE_T bytes = 0;
+            // The first call always "fails"; it is how the size is asked for.
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+            _storage.resize(bytes);
+            _list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(_storage.data());
+            if (!InitializeProcThreadAttributeList(_list, 1, 0, &bytes))
+            {
+                _list = nullptr;
+                return;
+            }
+            // UpdateProcThreadAttribute does not copy: the array must outlive the
+            // spawn, which is why it is a member rather than the caller's temporary.
+            _handles.assign(handles.begin(), handles.end());
+            if (!UpdateProcThreadAttribute(_list,
+                                           0,
+                                           PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                           _handles.data(),
+                                           _handles.size() * sizeof(HANDLE),
+                                           nullptr,
+                                           nullptr))
+            {
+                DeleteProcThreadAttributeList(_list);
+                _list = nullptr;
+            }
+        }
+
+        ~InheritList()
+        {
+            if (_list != nullptr)
+                DeleteProcThreadAttributeList(_list);
+        }
+
+        InheritList(InheritList const&) = delete;
+        InheritList& operator=(InheritList const&) = delete;
+        InheritList(InheritList&&) = delete;
+        InheritList& operator=(InheritList&&) = delete;
+
+        /// Whether the list was built; a false value means do not spawn.
+        [[nodiscard]] bool Valid() const noexcept
+        {
+            return _list != nullptr;
+        }
+
+        /// The list to hand to `STARTUPINFOEX`.
+        [[nodiscard]] LPPROC_THREAD_ATTRIBUTE_LIST Get() const noexcept
+        {
+            return _list;
+        }
+
+      private:
+        std::vector<std::byte> _storage;
+        std::vector<HANDLE> _handles;
+        LPPROC_THREAD_ATTRIBUTE_LIST _list { nullptr };
+    };
+
     /// Windows process runner: CreateProcess with two inherited pipes.
     class WindowsProcessRunner final: public IProcessRunner
     {
@@ -164,20 +241,60 @@ namespace
             if (errR != nullptr)
                 SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
 
-            STARTUPINFOA si {};
-            si.cb = sizeof(si);
-            si.dwFlags = STARTF_USESTDHANDLES;
-            si.hStdOutput = outW;
-            si.hStdError = merge == Merge::Yes ? outW : errW;
-            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            // Everything the child is allowed to inherit, named explicitly. A std
+            // handle passed here MUST also appear in the list, or CreateProcess
+            // refuses the call outright.
+            std::vector<HANDLE> inheritable { outW };
+            if (errW != nullptr)
+                inheritable.push_back(errW);
+
+            // The parent's stdin is passed through when it is something a child can
+            // inherit -- under a service there is no console, and naming a handle the
+            // list cannot carry would fail every spawn.
+            HANDLE stdIn = GetStdHandle(STD_INPUT_HANDLE);
+            DWORD stdInFlags = 0;
+            if (stdIn == INVALID_HANDLE_VALUE || stdIn == nullptr || !GetHandleInformation(stdIn, &stdInFlags)
+                || (stdInFlags & HANDLE_FLAG_INHERIT) == 0)
+                stdIn = nullptr;
+            else
+                inheritable.push_back(stdIn);
+
+            STARTUPINFOEXA si {};
+            si.StartupInfo.cb = sizeof(si);
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdOutput = outW;
+            si.StartupInfo.hStdError = merge == Merge::Yes ? outW : errW;
+            si.StartupInfo.hStdInput = stdIn;
+
+            InheritList const allowed { inheritable };
+            if (!allowed.Valid())
+            {
+                CloseHandle(outR);
+                CloseHandle(outW);
+                if (errR != nullptr)
+                {
+                    CloseHandle(errR);
+                    CloseHandle(errW);
+                }
+                return result;
+            }
+            si.lpAttributeList = allowed.Get();
 
             std::string const cmd = JoinCommand(argv);
             std::vector<char> mutableCmd { cmd.begin(), cmd.end() };
             mutableCmd.push_back('\0');
 
             PROCESS_INFORMATION pi {};
-            BOOL const ok =
-                CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+            BOOL const ok = CreateProcessA(nullptr,
+                                           mutableCmd.data(),
+                                           nullptr,
+                                           nullptr,
+                                           TRUE,
+                                           EXTENDED_STARTUPINFO_PRESENT,
+                                           nullptr,
+                                           nullptr,
+                                           &si.StartupInfo,
+                                           &pi);
             // Parent closes the write ends so its reads see EOF when the child exits.
             CloseHandle(outW);
             if (errW != nullptr)
@@ -292,6 +409,49 @@ namespace
             int _fd { -1 };
         };
 
+        /// Serializes pipe creation with spawning, so no child is created while a
+        /// descriptor exists that has not yet been marked close-on-exec.
+        ///
+        /// Held only across those two steps -- never across the compile itself -- so
+        /// concurrent jobs still run concurrently. `pipe2(O_CLOEXEC)` would make the
+        /// window disappear on Linux, but macOS has no `pipe2`, and one mechanism
+        /// that holds everywhere beats two that differ by platform.
+        [[nodiscard]] static std::mutex& SpawnLock()
+        {
+            static std::mutex lock;
+            return lock;
+        }
+
+        /// Create a pipe whose ends are both close-on-exec.
+        ///
+        /// Close-on-exec is what keeps ONE job's pipe out of ANOTHER job's child.
+        /// Without it a sibling compile inherits this pipe's write end, holds it open
+        /// for as long as it runs, and the drain below never sees EOF -- so a job
+        /// blocks until an unrelated one finishes. Invisible while a worker served
+        /// one compile at a time; a hang once it serves several.
+        ///
+        /// The child's own stdout/stderr are unaffected: `dup2` clears the flag on
+        /// the descriptor it creates.
+        ///
+        /// @param fds Filled with {read, write} on success.
+        /// @return Whether the pipe was created and marked.
+        [[nodiscard]] static bool MakePipe(std::array<int, 2>& fds)
+        {
+            if (::pipe(fds.data()) != 0)
+                return false;
+            for (int const fd: fds)
+            {
+                int const flags = ::fcntl(fd, F_GETFD);
+                if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+                {
+                    ::close(fds[0]);
+                    ::close(fds[1]);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         /// Spawn `argv`, capturing output either merged or split.
         ///
         /// Both read-ends are polled in one loop, so neither stream can block the
@@ -306,70 +466,80 @@ namespace
             if (argv.empty())
                 return result;
 
-            std::array<int, 2> outPipe { -1, -1 };
-            std::array<int, 2> errPipe { -1, -1 };
-            if (::pipe(outPipe.data()) != 0)
-                return result;
-            Fd outRead { outPipe[0] };
-            Fd outWrite { outPipe[1] };
-
+            Fd outRead;
+            Fd outWrite;
             Fd errRead;
             Fd errWrite;
-            if (merge == Merge::No)
+            ::pid_t pid = -1;
+
+            // Everything up to and including the spawn happens under the lock; the
+            // drain below deliberately does not, because the drain IS the compile.
             {
-                if (::pipe(errPipe.data()) != 0)
+                auto const spawning = std::scoped_lock { SpawnLock() };
+
+                std::array<int, 2> outPipe { -1, -1 };
+                std::array<int, 2> errPipe { -1, -1 };
+                if (!MakePipe(outPipe))
                     return result;
-                errRead = Fd { errPipe[0] };
-                errWrite = Fd { errPipe[1] };
-            }
+                outRead = Fd { outPipe[0] };
+                outWrite = Fd { outPipe[1] };
 
-            // Child stdout -> outWrite; stderr -> errWrite (or outWrite when merged).
-            //
-            // When merged, BOTH dup2 actions target the same descriptor. File
-            // actions run in order, so nothing may close outWrite between them:
-            // adding an addclose(outWrite) below would leave the second dup2
-            // duplicating a closed descriptor and silently lose all stderr. The
-            // parent closes the write ends after the spawn instead, where the
-            // ordering cannot matter.
-            int const childErrWrite = merge == Merge::Yes ? outWrite.Get() : errWrite.Get();
+                if (merge == Merge::No)
+                {
+                    if (!MakePipe(errPipe))
+                        return result;
+                    errRead = Fd { errPipe[0] };
+                    errWrite = Fd { errPipe[1] };
+                }
 
-            posix_spawn_file_actions_t actions {};
-            if (::posix_spawn_file_actions_init(&actions) != 0)
-                return result;
-            // The read ends must not leak into the child: if the child holds them
-            // open, the parent never sees EOF and the drain loop hangs forever.
-            ::posix_spawn_file_actions_addclose(&actions, outRead.Get());
-            if (errRead.Valid())
-                ::posix_spawn_file_actions_addclose(&actions, errRead.Get());
-            ::posix_spawn_file_actions_adddup2(&actions, outWrite.Get(), STDOUT_FILENO);
-            ::posix_spawn_file_actions_adddup2(&actions, childErrWrite, STDERR_FILENO);
+                // Child stdout -> outWrite; stderr -> errWrite (or outWrite when merged).
+                //
+                // When merged, BOTH dup2 actions target the same descriptor. File
+                // actions run in order, so nothing may close outWrite between them:
+                // adding an addclose(outWrite) below would leave the second dup2
+                // duplicating a closed descriptor and silently lose all stderr. The
+                // parent closes the write ends after the spawn instead, where the
+                // ordering cannot matter.
+                int const childErrWrite = merge == Merge::Yes ? outWrite.Get() : errWrite.Get();
 
-            // posix_spawn takes a non-const argv; the strings are copied by the
-            // child's exec, so this vector only needs to outlive the spawn call.
-            std::vector<std::string> owned { argv.begin(), argv.end() };
-            std::vector<char*> cargv;
-            cargv.reserve(owned.size() + 1);
-            for (auto& a: owned)
-                cargv.push_back(a.data());
-            cargv.push_back(nullptr);
+                posix_spawn_file_actions_t actions {};
+                if (::posix_spawn_file_actions_init(&actions) != 0)
+                    return result;
+                // The read ends must not leak into the child: if the child holds them
+                // open, the parent never sees EOF and the drain loop hangs forever.
+                ::posix_spawn_file_actions_addclose(&actions, outRead.Get());
+                if (errRead.Valid())
+                    ::posix_spawn_file_actions_addclose(&actions, errRead.Get());
+                ::posix_spawn_file_actions_adddup2(&actions, outWrite.Get(), STDOUT_FILENO);
+                ::posix_spawn_file_actions_adddup2(&actions, childErrWrite, STDERR_FILENO);
 
-            // The child inherits our environment: the compiler needs INCLUDE,
-            // PATH and friends exactly as the build system set them.
+                // posix_spawn takes a non-const argv; the strings are copied by the
+                // child's exec, so this vector only needs to outlive the spawn call.
+                std::vector<std::string> owned { argv.begin(), argv.end() };
+                std::vector<char*> cargv;
+                cargv.reserve(owned.size() + 1);
+                for (auto& a: owned)
+                    cargv.push_back(a.data());
+                cargv.push_back(nullptr);
+
+                // The child inherits our environment: the compiler needs INCLUDE,
+                // PATH and friends exactly as the build system set them.
     #if defined(__APPLE__)
-            char** const inherited = *::_NSGetEnviron();
+                char** const inherited = *::_NSGetEnviron();
     #else
-            char** const inherited = environ;
+                char** const inherited = environ;
     #endif
 
-            ::pid_t pid = -1;
-            int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), inherited);
-            ::posix_spawn_file_actions_destroy(&actions);
-            if (spawned != 0)
-                return result;
+                int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), inherited);
+                ::posix_spawn_file_actions_destroy(&actions);
+                if (spawned != 0)
+                    return result;
 
-            // Parent closes the write ends so its reads see EOF when the child exits.
-            outWrite.Close();
-            errWrite.Close();
+                // Parent closes the write ends so its reads see EOF when the child
+                // exits.
+                outWrite.Close();
+                errWrite.Close();
+            }
 
             DrainBoth(outRead, errRead, result);
 

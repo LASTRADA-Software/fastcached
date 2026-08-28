@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -19,6 +20,7 @@
 #else
     #include <sys/socket.h>
 
+    #include <fcntl.h>
     #include <unistd.h>
 
     #include <arpa/inet.h>
@@ -430,4 +432,48 @@ TEST_CASE("A scoped IPv6 literal is classified by the platform, and either answe
     // reported as a literal, because it would then be handed to `connect` as an
     // address rather than looked up.
     CHECK_FALSE(FastCache::Detail::IsNumericHost("fe80-scoped.example.com"));
+}
+
+TEST_CASE("A socket this process owns is not handed to the children it spawns", "[net][listener]")
+{
+    // `fastcache-compile-node` accepts connections and spawns a compiler for every
+    // job, so a socket a child inherits is a client connection that stays open for
+    // as long as an unrelated compile runs. `ApplyHotSocketOptions` is where this is
+    // armed because it is the one function EVERY socket this process owns passes
+    // through -- accepted and dialled, on all four backends.
+
+    // Winsock is per process and lazily started; every other case here reaches it
+    // through BindAndListen, and a bare `::socket` before it returns INVALID_SOCKET.
+    FastCache::Detail::EnsureNetworkInitialised();
+
+    auto const native = static_cast<FastCache::Detail::NativeSocket>(::socket(AF_INET, SOCK_STREAM, 0));
+    REQUIRE(native != FastCache::Detail::InvalidSocket);
+
+#if defined(_WIN32)
+    // The default is asserted too, and it is the half that was got wrong: a Windows
+    // socket IS inheritable unless something says otherwise, which is exactly the
+    // opposite of what this code used to claim while doing nothing.
+    DWORD before = 0;
+    auto const handle = reinterpret_cast<HANDLE>(static_cast<SOCKET>(native));
+    REQUIRE(::GetHandleInformation(handle, &before) != 0);
+    CHECK((before & HANDLE_FLAG_INHERIT) != 0);
+
+    FastCache::Detail::ApplyHotSocketOptions(native);
+
+    DWORD after = 0;
+    REQUIRE(::GetHandleInformation(handle, &after) != 0);
+    CHECK((after & HANDLE_FLAG_INHERIT) == 0);
+#else
+    // Same on POSIX: a plain `::socket` is NOT close-on-exec, and `::accept` does
+    // not inherit the flag from its listener either.
+    auto const fd = static_cast<int>(native);
+    REQUIRE(::fcntl(fd, F_GETFD) >= 0);
+    CHECK((::fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0);
+
+    FastCache::Detail::ApplyHotSocketOptions(native);
+
+    CHECK((::fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+#endif
+
+    CloseRaw(native);
 }

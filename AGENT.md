@@ -269,6 +269,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   which makes `StorageTier`'s enumerator order a wire contract.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
+- A child inherits this process's sockets too, and neither platform stops it: a
+  Windows handle arrives inheritable and `BlockingListener::Accept` is a plain
+  `::accept()`. Armed once, in `ApplyHotSocketOptions`. A spawn names what it hands
+  over (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
   Windows, where `SO_REUSEADDR` lets a second process take a port already being
   served. Sharing a port is `ReusePort::Yes`, and only that.
