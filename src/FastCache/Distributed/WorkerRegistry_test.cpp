@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <tests/Unwrap.hpp>
 
@@ -197,12 +198,28 @@ TEST_CASE("Finishing a job at zero outstanding does not wrap the counter", "[dis
     CHECK(picked->inFlight == 0);
 }
 
-TEST_CASE("A removed worker is gone immediately", "[distributed][registry]")
+TEST_CASE("Expiring the stale names what it dropped", "[distributed][registry]")
 {
+    // Expiry was a filter and nothing else: `IsLive` hid a dead worker from `Pick`
+    // while its entry stayed in the map forever, so a machine going away was never
+    // an EVENT anything could act on -- and whatever was held against that worker
+    // was held until it timed out on its own.
     Fixture fix;
-    auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
-    fix.registry.Remove(id);
-    CHECK_FALSE(fix.registry.Pick(Gcc13).has_value());
+    auto const alive = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    auto const dying = fix.registry.Register(Announce(Gcc14, "10.0.0.2:6676", 4));
+
+    CHECK(fix.registry.ExpireStale().empty()); // a live fleet drops nothing
+
+    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    REQUIRE(fix.registry.Heartbeat(alive, NodeLoad {}));
+
+    CHECK(fix.registry.ExpireStale() == std::vector { dying });
+
+    // Erased, not merely filtered: a second call has nothing left to report, and
+    // the survivor is untouched.
+    CHECK(fix.registry.ExpireStale().empty());
+    CHECK(fix.registry.Pick(Gcc13).has_value());
+    CHECK_FALSE(fix.registry.Pick(Gcc14).has_value());
 }
 
 TEST_CASE("A clock that moves backwards does not expire the fleet", "[distributed][registry]")

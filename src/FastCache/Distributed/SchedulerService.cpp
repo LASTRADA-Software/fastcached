@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <span>
@@ -367,6 +368,19 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // never picked.
 
     auto const id = _workers.Register(registration);
+
+    // A re-registration deliberately does NOT release this worker's leases, even
+    // though it resets `inFlight` two lines above on the reasoning that whatever it
+    // was running is gone. The two are not the same bet: a node re-registers after
+    // any refused heartbeat -- `EndpointBusy`, or `NotLeader` during an election --
+    // and not only after a restart, so releasing here would wipe leases for compiles
+    // that are still running and hand a second client the same work. `inFlight`
+    // recovers from that guess at the next heartbeat; a lease does not.
+    //
+    // A worker that genuinely restarted needs nothing here anyway: its client's
+    // compile exchange fails, and the client resolves its own lease on that path
+    // like every other (#212).
+
     // Counted as an event, not as fleet size. This interface is counter-only, so it
     // cannot express a gauge -- and the event turns out to be the more useful
     // number anyway: a rate that stays high means workers keep re-registering,
@@ -393,10 +407,42 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::str
     return SchedulerReply::Success();
 }
 
+void SchedulerService::ReapExpiredWorkers()
+{
+    // Two locks, taken one after the other rather than one spanning both, and the
+    // gap is deliberate: the registry and the lease table each guard their own, and
+    // a lock covering the pair would put every reader of either behind the other.
+    // What fits in the gap is a concurrent `Lease` that picked this worker just
+    // before it was erased, whose lease is then held against a worker no later reap
+    // can name. It is not stranded: the client that took it resolves it when its
+    // job ends, and expiry is behind that -- which is exactly the pair of
+    // guarantees every lease already has.
+    auto const dropped = _workers.ExpireStale();
+    if (dropped.empty())
+        // The ordinary case on a live fleet, and this is a hot path -- every lease
+        // request runs it.
+        return;
+
+    std::size_t reclaimed = 0;
+    for (auto const& workerId: dropped)
+        reclaimed += _leases.ReleaseWorker(workerId);
+
+    _metrics.Increment(IMetricsSink::Counter::DispatchWorkersExpired, static_cast<std::uint64_t>(dropped.size()));
+    if (reclaimed != 0)
+        _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
+}
+
 SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseRequest const& request)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
+
+    // Before the key is asked about, not after: a worker that vanished mid-job left
+    // its leases behind, and duplicate suppression consults the key first -- so
+    // every client that later missed on one of those keys was refused
+    // `AlreadyInFlight` and compiled locally until the lease timed out. Losing one
+    // machine quietly stopped distributing part of the build.
+    ReapExpiredWorkers();
 
     // Duplicate suppression is asked BEFORE capacity, and the order is the
     // diagnostic. `Acquire` needs a worker id, so the code this was lifted from had
@@ -444,6 +490,32 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     // payload has already crossed the network.
     return SchedulerReply::Success(Wire::EncodeLeaseGrant(
         Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs }));
+}
+
+SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    auto const lease = _leases.Release(leaseToken, key);
+    if (!lease.has_value())
+        // Already gone: it expired under a job that outlived its lease, this is a
+        // second release of one token, or the token belongs to a scheduler instance
+        // that no longer exists and this one has since reissued the number.
+        // Answered rather than accepted silently, because the first of those is a
+        // fleet whose `DefaultLeaseTimeout` is shorter than its slowest translation
+        // unit -- and a client that is told nothing has nothing to report.
+        // Uncounted by design: it is a statement about one client's timing, not
+        // about the fleet's capacity.
+        return Refuse(Wire::ErrorCode::UnknownLease, "unknown or already-resolved lease");
+
+    // The registry's speculative count, undone. `JobStarted` at `Lease` above is what
+    // stops the scheduler over-assigning a worker inside one heartbeat window, and
+    // without this it only ever climbed -- corrected solely by the next heartbeat
+    // overwrite, so a burst of leases took a worker out of rotation until it landed.
+    _workers.JobFinished(lease->workerId);
+    _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReleased);
+    return SchedulerReply::Success();
 }
 
 } // namespace FastCache::Distributed

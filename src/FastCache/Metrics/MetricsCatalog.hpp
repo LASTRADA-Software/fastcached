@@ -85,6 +85,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .prometheusName = "fastcached_dispatch_leases_granted_total",
       .help = "Lease requests answered with a worker; work is being distributed.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesReleased,
+      .prometheusName = "fastcached_dispatch_leases_released_total",
+      .help = "Leases a client resolved when its job ended. Subtracted from the "
+              "granted count this is what is outstanding; flat while that one "
+              "climbs means clients are dying mid-job.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesNoWorker,
       .prometheusName = "fastcached_dispatch_leases_no_worker_total",
       .help = "Lease requests refused because no registered worker matched the "
@@ -117,6 +123,18 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Worker registrations refused because the worker did not name its "
               "toolchain, endpoint or version in UTF-8. Any rise names a peer that "
               "is not in the fleet and cannot say so itself.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkersExpired,
+      .prometheusName = "fastcached_dispatch_workers_expired_total",
+      .help = "Workers dropped for having stopped heartbeating. Rising beside a "
+              "rising registration count is a fleet whose heartbeats are not "
+              "arriving, not one that is growing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesReclaimed,
+      .prometheusName = "fastcached_dispatch_leases_reclaimed_total",
+      .help = "Leases freed because the worker holding them was dropped. Work "
+              "nobody will report done; every one of these keys was being refused "
+              "as in-flight until it was reclaimed.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",

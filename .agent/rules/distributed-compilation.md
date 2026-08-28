@@ -201,6 +201,41 @@ Consequences that are each load-bearing:
   *liveness*, not presence — an expired entry is left behind until the next
   `Acquire` for that key sweeps it, so a check on the map alone would refuse one key
   forever after a single client abandoned it, with nothing saying so.
+- **A lease has THREE transitions and expiry is only the third.** `Acquire` takes
+  one, `Release` resolves it, and the lifetime running out is the safety net for a
+  client that *died* — `Ctrl-C` on a build. For a long time only two of the three
+  were built: there was no wire verb for resolving, so `LeaseTable::Release`,
+  `ReleaseWorker` and `WorkerRegistry::JobFinished` had no production caller at all,
+  and every key stayed suppressed for the full 600-second timeout. Recompiling one
+  translation unit inside ten minutes of dispatching it was refused
+  `AlreadyInFlight` and fell back to a local compile, while `inFlight` only ever
+  climbed between heartbeat overwrites. **The client sends `Release`, not the
+  worker**, and on *every* path out of the compile — an object built, a job refused,
+  a worker that was not there — because the client is who the lease was issued to
+  and the only party that sees all three. That is why the compile half of `Dispatch`
+  is a function: four early returns are four places to forget it. The release rides
+  a **fresh** connection; the scheduler sweeps one idle for five seconds and a
+  compile is longer, so reusing the lease socket would fail exactly when there was
+  something to release.
+- **A resolve answers on liveness, never on presence, and an unknown token is
+  refused.** Nothing visits an expired token but an `Acquire` for the same key, so
+  an expired entry is still sitting in the table when its holder finally reports —
+  and calling that a successful release would leave the one condition worth naming,
+  a job that outlived its lease, with nowhere to be observed. The entry is dropped
+  either way, through the one helper `Release` and `ReleaseWorker` share: the key
+  index is erased only when it still points at *this* token, and two copies of that
+  guard is how one of them comes to evict the client that replaced the lease.
+- **A worker being dropped has to be an EVENT, or nothing can release what was held
+  against it.** Registry expiry used to be a filter — `IsLive` hid a dead worker
+  from `Pick` while its entry stayed in the map forever — so `ReleaseWorker` had no
+  moment to be called at, and a fleet losing a machine went on refusing every client
+  that missed on one of its keys until each lease timed out. `ExpireStale()` erases
+  and *names* what it erased; the registry does not touch the lease table itself,
+  because that is its sibling rather than its dependency, so `SchedulerService` pairs
+  them — from `Lease` and nowhere else, that being the one decision the leftovers
+  corrupt. Reaping cannot see the second route to the same pin: a node that restarts
+  inside the heartbeat window keeps its entry, so `Register` releases its leases too,
+  on the same reasoning that already resets `inFlight` there.
 - **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
   code with the counter it moves, and `std::nullopt` is a legitimate row: a
   malformed frame is a *client* defect, and counting it beside the capacity

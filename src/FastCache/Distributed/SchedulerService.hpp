@@ -203,6 +203,43 @@ class SchedulerService
     /// @return `Ok` carrying an encoded `LeaseGrant`, or a refusal.
     [[nodiscard]] SchedulerReply Lease(CallerContext const& caller, CompileCacheWire::LeaseRequest const& request);
 
+    /// Resolve a lease whose job has ended, however it ended.
+    ///
+    /// The transition that was missing for as long as there was no verb to carry
+    /// it (#212). Without it a key stayed marked in-flight for the full lease
+    /// timeout, so recompiling the same translation unit inside ten minutes of a
+    /// dispatch was refused `AlreadyInFlight` and fell back to a local compile --
+    /// with expiry, which the lease table documents as the safety net for a client
+    /// that *died*, doing the work of the ordinary path.
+    ///
+    /// Answered by the CLIENT rather than by the worker, because the client is who
+    /// the lease was issued to and is the only party that sees every way a job can
+    /// end: a dispatch that never reached its worker is invisible to that worker.
+    ///
+    /// An unknown token is refused rather than waved through, and the refusal is
+    /// the diagnostic: it means the lease had already expired under this job, which
+    /// is an operator telling their fleet that `DefaultLeaseTimeout` is shorter
+    /// than their slowest translation unit.
+    ///
+    /// The key is stated too, and a token naming a different one resolves nothing:
+    /// `LeaseTable` mints tokens sequentially, so the pair is what makes this the
+    /// caller's own lease rather than whichever the number happens to land on --
+    /// after a scheduler restart, or from a member guessing.
+    ///
+    /// The residual, stated rather than left looking like an oversight: a member
+    /// that knows both a key and its token can still resolve somebody else's lease
+    /// on it, and inside one build that pair is not secret. What it costs is one
+    /// duplicated compile and one premature decrement the next heartbeat corrects
+    /// -- a fairness question in a trusted fleet, not a security one, and strictly
+    /// smaller than what the same member could do by taking leases on keys it has
+    /// no intention of compiling. Unforgeable tokens belong with the surface's
+    /// authentication as a whole (#180), not bolted onto one verb.
+    /// @param caller Who is asking.
+    /// @param leaseToken The token this client was granted.
+    /// @param key The object key it was granted on.
+    /// @return `Ok`, or a refusal.
+    [[nodiscard]] SchedulerReply Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key);
+
     /// Report what the cluster has agreed.
     ///
     /// Behind the same gate as everything else here, which for a *read* is worth
@@ -298,6 +335,21 @@ class SchedulerService
     /// @param caller Who is asking.
     /// @return A refusal, or nullopt when the caller may proceed.
     [[nodiscard]] std::optional<SchedulerReply> Gate(CallerContext const& caller) const;
+
+    /// Drop workers that stopped heartbeating, and free what they were holding.
+    ///
+    /// The registry and the lease table are siblings and neither may reach the
+    /// other, so the pairing lives here -- which is also the only place that knows
+    /// a dropped worker's leases were about a machine that is gone rather than a
+    /// job that finished.
+    ///
+    /// Run from `Lease` and nowhere else, because that is the one decision a stale
+    /// worker's leftover leases corrupt: duplicate suppression asks about the key
+    /// first, so a machine that vanished mid-job made every later client miss on
+    /// one of its keys fall back to a local compile until the lease timed out. On
+    /// a live fleet it walks the registry and drops nothing, which is the same
+    /// walk `Pick` does immediately afterwards.
+    void ReapExpiredWorkers();
 
     /// Build a refusal, counting it when the table names a counter.
     /// @param code Why.

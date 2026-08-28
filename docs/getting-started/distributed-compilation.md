@@ -318,12 +318,15 @@ start it with `--admin-listen` and these count the outcomes.
 | Counter | Rising means |
 |---------|--------------|
 | `fastcached_dispatch_leases_granted_total` | Work is being distributed. |
+| `fastcached_dispatch_leases_released_total` | Clients are reporting their jobs done. Granted minus released is what is outstanding; flat while granted climbs means clients are dying mid-job, or predate the verb. |
 | `fastcached_dispatch_leases_no_worker_total` | The fleet is **misconfigured** — workers are up but nobody matches. |
 | `fastcached_dispatch_leases_no_capacity_total` | The fleet is **too small** — full of your own build. |
 | `fastcached_dispatch_leases_withdrawn_total` | The fleet is **unavailable** — slots free on paper, machines busy elsewhere or out of scratch space. |
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. Any rise names a machine that is **not** in the fleet. |
+| `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. Rising beside a rising registration count is a fleet whose heartbeats are not arriving, not one that is growing. |
+| `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job, or restarted, and the keys it was building were freed. Work nobody will report done — a build that lost part of its distribution, which is a different thing to fix from a fleet that is merely full. |
 
 The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and

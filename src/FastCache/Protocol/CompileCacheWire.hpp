@@ -181,6 +181,25 @@ enum class Op : std::uint8_t
     ClusterSet = 0x09,    ///< Operator changes a replicated setting.
     ClusterForget = 0x0A, ///< Operator removes a member.
     ClusterAdmit = 0x0B,  ///< Operator adds a member, or moves one.
+
+    /// Client tells the scheduler the job it leased has ended, however it ended.
+    ///
+    /// The third transition of a lease's life, and for a long time the missing one:
+    /// a lease was acquired and could only ever expire, so a key stayed marked
+    /// in-flight for the full lease timeout and every later compile of it was
+    /// refused `AlreadyInFlight` (#212). Expiry is the safety net for a client that
+    /// DIED -- `Ctrl-C` on a build -- and this is the ordinary path.
+    ///
+    /// Sent by the CLIENT rather than the worker, because the client is who the
+    /// lease was issued to and is the only party that knows every way a job can
+    /// end: the worker never sees a job whose dispatch failed to reach it.
+    ///
+    /// It names the KEY as well as the token, so a release resolves the client's own
+    /// lease or nothing -- see `EncodeRelease`.
+    ///
+    /// Numbered after the cluster verbs rather than beside `Lease`, because the
+    /// byte is the contract and the ones already spoken cannot move.
+    Release = 0x0C,
 };
 
 /// Reply status, the first byte of every reply.
@@ -362,7 +381,7 @@ struct OpDescriptor
 inline constexpr std::size_t MaxAuthPayload = 4096;
 
 /// Payload ceiling for the scheduler's control verbs (`Register`, `Heartbeat`,
-/// `Lease`).
+/// `Lease`, `Release`).
 ///
 /// These carry identifiers, an endpoint, a fingerprint and small integers — never
 /// anything that scales with a build artefact. `Compile` is the deliberate
@@ -423,6 +442,12 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
                    .fieldCount = 3, // fingerprint, key, accepted codecs
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = false,
+                   .maxPayload = MaxControlPayload },
+    OpDescriptor { .code = Op::Release,
+                   .name = "release",
+                   .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = false,
                    .maxPayload = MaxControlPayload },
@@ -1836,6 +1861,56 @@ struct HeartbeatView
     if (!fields.has_value())
         return std::nullopt;
     return LeaseView { .fingerprint = (*fields)[0], .key = (*fields)[1], .acceptedCodecs = DecodeCodecList((*fields)[2]) };
+}
+
+/// A client reporting that the job it leased has ended.
+struct ReleaseRequest
+{
+    std::string_view leaseToken; ///< The token the scheduler granted.
+    std::string_view key;        ///< The object key that lease was taken on.
+};
+
+/// The same, as views into a received payload.
+struct ReleaseView
+{
+    std::span<std::byte const> leaseToken;
+    std::span<std::byte const> key;
+};
+
+/// Frame a RELEASE request.
+///
+/// The key travels beside the token, and it is not redundant: a token is a small
+/// integer minted by whichever `LeaseTable` is alive, and that counter starts again
+/// at one in a scheduler that has just restarted. Without the key, a client
+/// reporting a job it started before the restart would resolve whatever lease the
+/// new instance had since issued under the same number -- freeing a key somebody is
+/// building, and decrementing a worker that is busy. Naming both makes a release
+/// resolve *the client's own* lease or nothing, which is also what stops one member
+/// resolving another's by guessing a number.
+///
+/// Nothing about how the job went, though: the scheduler resolves a lease the same
+/// way whatever the outcome -- `LeaseTable::Release` is documented as "however the
+/// job ended" -- and a field nothing reads is a field two builds can disagree
+/// about. The top-level arity of a verb is exact and fixed forever, so an outcome
+/// added later would arrive as a nested record, the way `Register` carries capacity.
+/// @param request The token and the key it was taken on.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeRelease(ReleaseRequest const& request,
+                                                          WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::Release, { AsBytes(request.leaseToken), AsBytes(request.key) });
+}
+
+/// Split a RELEASE payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ReleaseView> DecodeReleasePayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Release));
+    if (!fields.has_value())
+        return std::nullopt;
+    return ReleaseView { .leaseToken = (*fields)[0], .key = (*fields)[1] };
 }
 
 /// An operator changing one replicated cluster setting.

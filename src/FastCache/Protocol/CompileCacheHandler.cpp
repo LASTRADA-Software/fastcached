@@ -77,6 +77,10 @@ namespace
                         .code = Wire::ErrorCode::DispatchNotPermitted,
                         .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
                                "endpoint the lease named" },
+        RelocatedVerb { .op = Wire::Op::Release,
+                        .code = Wire::ErrorCode::DispatchNotPermitted,
+                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                               "fastcache-compile-node --listen-scheduler and point clients at it" },
         RelocatedVerb { .op = Wire::Op::ClusterStatus,
                         .code = Wire::ErrorCode::NoCluster,
                         .why = "this endpoint is a cache and belongs to no cluster; ask a "
@@ -632,6 +636,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::Heartbeat:
             case Wire::Op::Lease:
             case Wire::Op::Compile:
+            case Wire::Op::Release:
             case Wire::Op::ClusterStatus:
             case Wire::Op::ClusterSet:
             case Wire::Op::ClusterForget:

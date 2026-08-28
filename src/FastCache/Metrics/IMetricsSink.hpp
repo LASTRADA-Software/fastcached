@@ -57,6 +57,15 @@ class IMetricsSink
         /// refusals below it -- a fleet where every lease is granted and a fleet
         /// nobody asks look identical on this counter alone.
         DispatchLeasesGranted,
+        /// Leases a client resolved when its job ended, however it ended.
+        ///
+        /// The pair of `DispatchLeasesGranted`, and the difference between the two
+        /// is the outstanding count. Its absence is what let a whole missing
+        /// transition go unnoticed: every lease was granted, none was ever
+        /// resolved, and the only number saying so was one nobody exported. A
+        /// granted count that climbs while this one stays flat means clients are
+        /// dying mid-job, or are older than this verb.
+        DispatchLeasesReleased,
         /// Lease requests refused because no registered worker matched the
         /// toolchain. The counter that says a fleet is MISCONFIGURED rather than
         /// busy: it rises when workers are up but nobody can use them, which is
@@ -95,6 +104,24 @@ class IMetricsSink
         /// leaves on the leader -- a node whose `--toolchain` override carries a
         /// stray byte otherwise vanishes from the fleet with nothing saying why.
         DispatchWorkerRegistrationsMalformed,
+        /// Workers dropped for having stopped heartbeating.
+        ///
+        /// The counterpart of `DispatchWorkerRegistrations`, and the fleet's only
+        /// trace of a machine going away: expiry used to be a filter that hid a
+        /// worker from `Pick` while leaving its entry in place, so losing a machine
+        /// was invisible from every direction. Rising steadily beside a rising
+        /// registration count is a fleet whose heartbeats are not arriving rather
+        /// than one that is growing.
+        DispatchWorkersExpired,
+        /// Leases freed because the worker holding them was dropped.
+        ///
+        /// Distinct from `DispatchLeasesReleased`, which is a client reporting its
+        /// own job done. This is work nobody will ever report: the machine went
+        /// away mid-job, and every one of these keys was being refused
+        /// `AlreadyInFlight` until it was reclaimed. Rising here says a build lost
+        /// part of its distribution, which is a different thing to fix from a fleet
+        /// that is merely full.
+        DispatchLeasesReclaimed,
 
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this

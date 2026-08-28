@@ -330,9 +330,24 @@ class WorkerRegistry
     /// @param workerId The worker.
     void JobFinished(std::string_view workerId);
 
-    /// Drop a worker outright (it said goodbye, or answered nothing).
-    /// @param workerId The worker.
-    void Remove(std::string_view workerId);
+    /// Drop every worker that has gone unheard-from, and say which.
+    ///
+    /// Expiry used to be a FILTER and nothing else: `IsLive` hid a dead worker from
+    /// `Pick` and from every report, while its entry stayed in the map forever. That
+    /// is enough for scheduling and not enough for anything holding state *against*
+    /// a worker -- a lease is issued to one, and a fleet that lost a machine went on
+    /// refusing every client that missed on one of its keys until each lease timed
+    /// out ten minutes later. Nothing could notice, because the drop was never an
+    /// event.
+    ///
+    /// So this is the event: it erases, and it names what it erased so the caller can
+    /// release what it was holding. The registry does not do that itself -- the lease
+    /// table is its sibling, not its dependency, and pairing them is the scheduler's
+    /// job.
+    /// @return The ids dropped, ordered so a caller's own accounting is
+    ///         reproducible. Empty when the whole fleet is live, which is the
+    ///         ordinary case.
+    [[nodiscard]] std::vector<std::string> ExpireStale();
 
     /// Every live worker, for `/metrics` and diagnostics.
     /// @return A snapshot; expired workers are excluded.

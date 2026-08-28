@@ -1109,11 +1109,12 @@ TEST_CASE("The cache refuses every scheduling verb, and says where they went", "
         Concat({ Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc", .key = "k", .acceptedCodecs = {} }),
                  Wire::EncodeRegister(
                      Wire::RegisterRequest { .fingerprint = "gcc", .endpoint = "h:1", .slots = 1, .acceptedCodecs = {} }),
-                 Wire::EncodeHeartbeat("w1", 0) }),
+                 Wire::EncodeHeartbeat("w1", 0),
+                 Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = "l1", .key = "k" }) }),
         SessionContext {});
 
     auto const frames = SplitReplies(reply);
-    REQUIRE(frames.size() == 3);
+    REQUIRE(frames.size() == 4);
     for (auto const& frame: frames)
     {
         CHECK(ErrorOf(frame).code == Wire::ErrorCode::DispatchNotPermitted);
