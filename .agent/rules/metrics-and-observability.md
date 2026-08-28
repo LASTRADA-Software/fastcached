@@ -299,6 +299,27 @@ fault.
   then multiply into a colour that belongs to no series -- which is the "four
   reasons collapse into one" that chart exists to prevent, reintroduced by the
   renderer.
+- **A `<circle>` is not path data.** One helper produced both the `d` value for a
+  run of readings and the dot for a run of *one*, and returned them concatenated
+  in a single string the caller put in `d="..."`. A browser parses an
+  `<img>`-referenced SVG as XML and refuses the **whole document** over a `<` in an
+  attribute value, so the chart arrived with a 200, a plausible byte count, and
+  rendered as a broken image saying nothing. Markup of two different kinds comes
+  back as two members, so the type says which is an attribute value and which is an
+  element -- and the dots are then siblings carrying their own `fill`, because a
+  document that inherits nothing renders an unfilled circle black.
+- **A run of one reading is a dot, filled shape or not.** Closing a run of one
+  gives `M x y L x bottom L x bottom Z`: a shape with no width, which draws
+  nothing while leaving a non-empty `d` that says the series *was* observed, so the
+  "never observed" guard beside it does not fire either. Every refusal series is a
+  rate and a rate needs the bucket before it, so one sampled pair between two gaps
+  is exactly one value -- a single refusal in an otherwise quiet hour, which is the
+  reading somebody opened that chart for.
+- **A renderer tested only on dense data is a renderer tested on data nobody has.**
+  Both faults above were invisible for as long as every case rendered a full run of
+  buckets: a run of one cannot occur there. Gaps are the ordinary case on a live
+  dashboard -- a node samples only while it runs -- and the assertion that catches
+  this class is a scan for `<` inside an attribute value, over gap-laden data.
 - **A gridline's value label goes below its line.** The topmost gridline sits
   `PadTop` from the edge of the viewBox, so a label placed above *that* one has its
   ascenders outside it -- clipped silently, and only ever on the line carrying the

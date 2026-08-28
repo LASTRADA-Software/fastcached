@@ -188,6 +188,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.
+- A discovery layout describes a **directory layout, not a vendor**: Visual Studio
+  ships its own clang-cl under `VC\Tools\Llvm`, which the `visual-studio` row walked
+  past and the three standalone-LLVM rows never reached — so those builds were cached
+  and could never be dispatched. One installation, two rows; `vswhere`'s answer is
+  memoized across them, empty answers included.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - What a node holds back from compiles is what its tier **built**, never what a flag
@@ -367,6 +372,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   substitution would mislead, default where it cannot.
 - A stacked area is drawn **top band first**, or translucent fills multiply into a
   colour belonging to no series.
+- A `<circle>` is not path data. One `<` in an attribute value makes a browser refuse
+  the whole SVG, and the chart is then a broken image behind a 200. A run of one
+  reading is a dot whether the shape is filled or not — closing it gives a shape with
+  no width that draws nothing and still claims the series was observed. Neither is
+  visible in a test that renders dense data: gaps are what a live dashboard has.
 - The dashboard credential is its own file, never `--requirepass`; a non-loopback
   bind without one is a startup refusal, and TLS does not substitute for it.
 - Plain HTTP is a supported way to serve the admin surface. TLS is on by naming

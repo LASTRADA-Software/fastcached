@@ -180,11 +180,24 @@ that ends up with nothing to serve refuses to start and prints where it looked.
 | Layout | Where |
 |---|---|
 | `visual-studio` | `vswhere`, then every toolset under `VC\Tools\MSVC` |
+| `visual-studio-llvm` | the same installation's bundled clang-cl, under `VC\Tools\Llvm` |
 | `llvm-registry`, `llvm-program-files` | `HKLM\SOFTWARE\LLVM\LLVM`, `%ProgramFiles%\LLVM` |
 | `msys2`, `mingw-w64` | `C:\msys64\{ucrt64,mingw64,clang64}`, `C:\mingw64` |
 | `usr-local`, `usr` | `/usr/local/bin`, `/usr/bin` — version suffixes included (`g++-13`) |
 | `macports`, `homebrew` | `/opt/local/bin`, `/opt/homebrew/bin` |
 | `xcode` | `xcrun --find` |
+
+**Visual Studio is two rows, not one.** It ships clang-cl itself, under
+`VC\Tools\Llvm` rather than beside `cl`, and the three LLVM rows all describe a
+*standalone* install. A machine whose only clang-cl came with Visual Studio would
+otherwise advertise no clang-cl toolchain at all — its clang-cl builds would still
+be **cached**, since a launcher needs no worker for that, and could never be
+**dispatched**, since nothing advertised the fingerprint. `vswhere` is still run
+once: the two rows share its answer.
+
+Only the bindir matching this machine's own architecture is offered, from either
+row. The other holds a compiler built for a different *host*, which this machine
+cannot run.
 
 The fingerprint is a digest of the compiler's version banner **and its whole
 include tree**, so two machines with the same compiler at different install

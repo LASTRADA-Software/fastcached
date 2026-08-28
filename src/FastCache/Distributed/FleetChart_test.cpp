@@ -6,8 +6,10 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -62,6 +64,42 @@ constexpr std::int64_t DaySeconds = 300;
             return row;
     FAIL("no chart named " << key);
     return FleetChartTable[0];
+}
+
+/// The offset of the first `<` sitting inside an attribute value, if there is one.
+///
+/// A browser parses an `<img>`-referenced SVG as XML and refuses the whole document
+/// over one stray `<` there. The chart then arrives with a 200 and a plausible byte
+/// count and renders as a broken image, with nothing anywhere saying why -- so the
+/// assertion has to be on the markup rather than on what the server returned with
+/// it. Deliberately narrow: this is the one malformation the renderer can produce,
+/// by putting an element where path data belongs.
+[[nodiscard]] std::optional<std::size_t> MarkupInAttribute(std::string_view svg)
+{
+    bool inTag = false;
+    bool inValue = false;
+    for (auto const index: std::views::iota(std::size_t { 0 }, svg.size()))
+    {
+        auto const character = svg[index];
+        if (inValue)
+        {
+            if (character == '"')
+                inValue = false;
+            else if (character == '<')
+                return index;
+        }
+        else if (character == '<')
+        {
+            if (inTag)
+                return index; // A tag opening inside a tag: the same fault, unquoted.
+            inTag = true;
+        }
+        else if (character == '>')
+            inTag = false;
+        else if (character == '"' && inTag)
+            inValue = true;
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -212,6 +250,60 @@ TEST_CASE("An all-absent series draws nothing at all", "[distributed][fleetchart
     CHECK(svg.ends_with("</svg>"));
 }
 
+TEST_CASE("A reading with no neighbours is a dot beside the path, never inside it", "[distributed][fleetchart]")
+{
+    // Two adjacent samples with a gap either side. A share needs the bucket before
+    // it, so exactly one point is known and it has no line to draw. The live
+    // dashboard's hit-rate chart is full of these -- a mostly idle daemon samples in
+    // short adjacent runs -- and every one of them was emitted as a `<circle>`
+    // element INSIDE the `d` attribute of the path, which made the whole document
+    // unparseable and the chart a broken image.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::CacheHits, 10 }, { FleetMetric::CacheMisses, 5 } }),
+        At(600'000, { { FleetMetric::CacheHits, 14 }, { FleetMetric::CacheMisses, 5 } }),
+        Gap(900'000),
+    };
+
+    auto const svg = RenderChartSvg(ChartByKey("hit-rate"), buckets, FleetRange::Day, FleetTheme::Light);
+    INFO(svg);
+    CHECK_FALSE(MarkupInAttribute(svg).has_value());
+
+    // The reading is still drawn: a run of one is a reading, and dropping it would
+    // under-report. It carries the series colour itself, because a document loaded
+    // through `<img>` inherits nothing -- an unfilled circle renders black, which on
+    // this page is a colour belonging to no series at all.
+    CHECK(svg.contains("<circle"));
+    CHECK(svg.contains("<g fill=\"var(--ok)\">"));
+}
+
+TEST_CASE("A lone reading in a stacked band is a dot, not a shape with no width", "[distributed][fleetchart]")
+{
+    // A rate needs the bucket before it, so these four windows hold exactly one
+    // known value each, at index 2. Closing a run of one gives
+    // `M x y L x bottom L x bottom Z` -- a shape with no width, so it draws nothing,
+    // while its non-empty `d` still says the series was observed. Refusals are the
+    // stacked chart, and a single refusal in an otherwise quiet hour is precisely
+    // the reading somebody came to this chart for.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::DispatchNoWorker, 4 } }),
+        At(600'000, { { FleetMetric::DispatchNoWorker, 9 } }),
+        Gap(900'000),
+    };
+
+    auto const svg = RenderChartSvg(ChartByKey("refusals"), buckets, FleetRange::Day, FleetTheme::Light);
+    INFO(svg);
+    CHECK_FALSE(MarkupInAttribute(svg).has_value());
+    CHECK(svg.contains("<circle"));
+    // At the band's own opacity, so a dot reads as part of its band rather than as a
+    // fifth thing on a chart whose entire point is four distinguishable reasons.
+    CHECK(svg.contains("<g fill=\"var(--crit)\" fill-opacity=\"0.85\">"));
+    // Nothing is left drawing nothing: every run here is of one, so there is no
+    // filled shape to emit at all.
+    CHECK_FALSE(svg.contains("<path"));
+}
+
 TEST_CASE("A chart is a document a browser may load as an image", "[distributed][fleetchart]")
 {
     std::vector<FleetBucket> buckets;
@@ -223,10 +315,22 @@ TEST_CASE("A chart is a document a browser may load as an image", "[distributed]
                                { FleetMetric::OfferableSlots, 24 },
                                { FleetMetric::JobsInFlight, static_cast<std::uint64_t>(index) % 5 } }));
 
+    // The same readings with every third window unobserved. Gaps are the ordinary
+    // case on a real dashboard rather than an edge one -- a node samples only while
+    // it runs -- and they are what produce a run of a single point. A renderer that
+    // is well-formed only over dense data is a renderer that is broken on the live
+    // page and passing here.
+    auto gapped = buckets;
+    for (auto const index: std::views::iota(std::size_t { 0 }, gapped.size()))
+        if (index % 3 == 0)
+            gapped[index] = Gap(gapped[index].startMillis);
+
     for (auto const& chart: FleetChartTable)
     {
         auto const svg = RenderChartSvg(chart, buckets, FleetRange::Day, FleetTheme::Auto);
         INFO("chart " << chart.key);
+        CHECK_FALSE(MarkupInAttribute(svg).has_value());
+        CHECK_FALSE(MarkupInAttribute(RenderChartSvg(chart, gapped, FleetRange::Day, FleetTheme::Auto)).has_value());
         // Served as its own resource and loaded through <img>, so a script would not
         // run anyway -- but nothing here has any business emitting one, and a chart
         // that started to would be worth failing over rather than discovering later.
@@ -305,6 +409,29 @@ TEST_CASE("The sparkline inherits the page's palette rather than carrying one", 
     CHECK(spark.contains("<path"));
 
     CHECK_FALSE(RenderSparklineSvg({ Gap(0), Gap(300'000) }).contains("<path"));
+}
+
+TEST_CASE("The sparkline draws a lone reading rather than an empty strip", "[distributed][fleetchart]")
+{
+    // A rate needs the bucket before it, so this holds exactly one value. The tile
+    // built its path with its own copy of the run-splitting loop, which emitted
+    // `M x y` and nothing else -- a move-to strokes no ink, so the strip came out
+    // blank on precisely the quiet stretch the one reading was there to report.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::DispatchGranted, 2 } }),
+        At(600'000, { { FleetMetric::DispatchGranted, 20 } }),
+        Gap(900'000),
+    };
+
+    auto const spark = RenderSparklineSvg(buckets);
+    INFO(spark);
+    CHECK_FALSE(MarkupInAttribute(spark).has_value());
+    CHECK(spark.contains("<circle"));
+    CHECK(spark.contains("<g fill=\"var(--accent)\">"));
+    // Nothing but the dot: a run of one has no line, and a lone `M` would be a `d`
+    // that says the series was drawn while drawing nothing.
+    CHECK_FALSE(spark.contains("<path"));
 }
 
 TEST_CASE("A range with nothing in it folds to nothing, and does not walk backwards", "[distributed][fleetchart]")
