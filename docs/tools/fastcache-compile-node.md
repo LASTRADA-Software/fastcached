@@ -1221,12 +1221,70 @@ moving once it is large, so an afternoon of misses barely bends it. A bucket tha
 served no reads has no hit rate at all and is absent, because 0% is the claim that
 the cache missed everything.
 
+### Eight windows, and what each one is folded from
+
+The range control offers **1 h, 2 h, 8 h, 24 h, 7 d, 1 month, 6 months and
+12 months**. Three rings are stored — one bucket a minute for a day, one an hour
+for a month, one a day for four hundred days — and every window is a fold of one
+of them, so a longer view is a wider bucket rather than a longer file. Every
+sample is written into all three as it is taken, rather than a coarse ring being
+filled by buckets ageing out of the one below: both give the same numbers, and
+this way there is no second code path that first runs twenty-four hours in.
+
+Folding sixty readings into one bucket would throw away the part worth looking at,
+so each bucket also keeps the **low, the high and the total** per slot. A refusal
+spike averaged over a day is invisible; a gauge's floor — the moment the fleet had
+nothing left — is the end that matters. Neither can be recovered afterwards, so
+both are computed while folding.
+
+### Every node records itself, and a leader keeps what the others send
+
+A node samples **its own** figures — its cache, its offerable slots, its compiles
+— once a minute whether or not it leads, and hands its closed buckets to the
+scheduler on the heartbeat it already sends. Nothing extra is dialled and nothing
+is acknowledged: the leader keeps a high-water mark per machine, so a heartbeat
+redelivered after a reply the node never saw is ignored rather than counted twice.
+
+The **fleet-wide** figures — the dispatch outcomes — stay leader-only, because only
+a scheduler produces them and a follower's registry holds whatever registered
+against *it*. A leader therefore has a complete record of the windows it was
+elected for, and fills the rest from what the machines handed over. Those windows
+are marked, and their scheduler-scoped series read `null` rather than zero: no
+machine can answer for a dispatch outcome, and a zero drawn there would be a
+refusal count nobody measured.
+
+That is why the fleet's year survives an election. A machine decommissioned last
+month is still in the twelve-month view, and a leader elected this morning does not
+show a chart that starts at breakfast.
+
+### Partly observed windows
+
+A bucket carries how many samples actually landed in it. On the 24 h view a full
+bucket holds five; a node that was down for four of those five minutes contributes
+one. The reading is still true — a gauge's last sample, a rate over the span
+actually seen — so it is drawn like any other point, and the page says in words how
+many settled windows were only partly observed rather than implying the number
+itself is suspect. `/fleet/series.json` carries `coverage` per bucket beside
+`covers`, which is what a fully observed one holds.
+
+The newest window is never counted there. It is still filling, and is partly
+covered by definition.
+
+### Where it is kept
+
 Where the history is kept follows the directories the node already has: the
 `--cluster-dir` if there is one, otherwise the `--cache-dir`, otherwise memory
 only — and the page says which. There is no flag for it: a third place to say "put
-state here" is a third place to point at the wrong disk. Any failure to read that
-file — missing, short, wrong version, bad checksum — starts empty and logs one
-line. History is a convenience and must never keep a node from starting.
+state here" is a third place to point at the wrong disk. Three files live there:
+this machine's own series, the fleet-wide series, and what the other machines
+handed over.
+
+Any failure to read one — missing, short, wrong version, bad checksum — starts
+empty and logs one line. History is a convenience and must never keep a node from
+starting. One case is different and is called out at `WARN`: a file written by a
+**newer** build than the one running is kept and never written over, because
+replacing it would destroy readings the build it was rolled back from could still
+read.
 
 Each chart is **its own resource** rather than being inlined, so a browser caches
 it:
@@ -1238,9 +1296,10 @@ curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
      "localhost:6677/fleet/series.json?range=24h" | jq .
 ```
 
-`range` is `24h` or `7d`, and an unrecognised one is refused with `400` rather
-than quietly served as the other — a substituted range puts a reader on a
-different axis with nothing on the page saying so. `theme` is `auto` (the
+`range` is one of `1h`, `2h`, `8h`, `24h`, `7d`, `1mo`, `6mo` or `12mo`, and an
+unrecognised one is refused with `400` that **names** the ones that are served —
+a substituted range puts a reader on a different axis with nothing on the page
+saying so. `theme` is `auto` (the
 default), `light` or `dark`, and an unrecognised one *is* silently `auto`, because
 that one renders correctly under either setting and costs a reader nothing.
 

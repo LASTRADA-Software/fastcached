@@ -261,11 +261,59 @@ fault.
   mid-write leaves the previous file rather than half of this one. Where it lives
   follows the directories the node already has (`--cluster-dir`, else
   `--cache-dir`, else memory only) rather than a flag of its own: a third place to
-  say "put state here" is a third place to point at the wrong disk.
-- **Sampling happens only while this node LEADS.** A follower's registry holds
-  whatever registered against *it*, so a sample taken there records a fraction of
-  the fleet as though it were the whole -- and the chart then shows the fleet
-  shrinking every time leadership moves, which is the opposite of what happened.
+  say "put state here" is a third place to point at the wrong disk -- and every one
+  of those files is a row of one table, or the third gets derived by string surgery
+  on the second's answer.
+  - **A file a LATER build wrote is kept and never written over**, and that rule
+    belongs to the ENVELOPE rather than to each store. Magic, version, length,
+    CRC32C, temp-then-rename and the refusal are one `FileEnvelope` descriptor
+    precisely because the second store was written by copying the first and lost
+    exactly that clause: it started empty on a newer file and then overwrote it,
+    which for the store holding *every other machine's* year is a bigger loss than
+    for a node's own, not a smaller one.
+- **A node records ITSELF always; only the FLEET-wide slots are leader-only.** A
+  follower's registry holds whatever registered against *it*, so a fleet-wide sample
+  taken there records a fraction as though it were the whole, and the chart then
+  shows the fleet shrinking every time leadership moves. What a machine can claim
+  about itself -- its cache, its slots, its own compiles -- is true whoever leads,
+  and a node that stopped recording it on losing an election gave its year to
+  whichever peer happened to be leading. Which of the two a slot is is the `scope`
+  column of `FleetMetricTable`, never a conditional, and a `static_assert` requires
+  both scopes to be populated: all-`Fleet` reads exactly like the guard this
+  replaced, all-`Node` has followers reporting counters they never produced, and
+  neither is visible in any other check.
+  - **Every node samples, whatever surfaces it serves.** The sampler is not part of
+    the admin surface: `StartAdminSurfaceOrExplain` returns before building anything
+    when `--admin-listen` is empty, so a sampler owned there left a *pure worker* --
+    the machine actually doing the compiles -- recording nothing at all, with the
+    hole invisible because the leader's own series stayed complete for every window
+    it was elected for.
+- **A BACKFILLED window answers for a machine, never for the scheduler.** A window
+  the leader was not elected for is assembled by summing what the nodes handed over,
+  and no machine can answer for a dispatch outcome -- so `BackfillInto` fills the
+  node-scoped slots and leaves the rest at zero. **Zero is a legitimate reading for
+  every slot here**, so a renderer that takes it draws a fleet that granted nothing
+  between one that granted a thousand and one that granted two thousand: a rate
+  running backwards, swallowed as a restart, then a spike of two thousand. Neither
+  happened, and both sit in the twelve-month ring long after the election that
+  caused them. The predicate is `bucket.backfilled` against the metric's `scope`,
+  applied at every reader of a bucket's values -- the per-bucket series and the
+  range summary alike.
+- **The page reaches a history through ONE door.** `IFleetHistoryView` is what the
+  routes hold, and the two halves of a leader's record -- what it sampled while
+  leading, and what the machines handed over for the windows it missed -- meet
+  behind it. Handed a raw `FleetHistory const*` instead, the routes drew the raw
+  series: the whole handover was filled, persisted, restored and never once drawn,
+  while the merge function's own comment claimed a route could not reach past it.
+  **Assert the wiring, through a route, not the merge.**
+- **Coverage is how much of a window was observed, and it is said in words.** A
+  bucket observed for one minute of five is drawn exactly like one observed for all
+  five -- its value is a true reading either way, a gauge's last sample or a rate
+  over the span actually seen -- so the difference belongs in the meta line and in
+  `/fleet/series.json` (`covers` beside `coverage[]`), not in a different shape that
+  would imply the number itself is suspect. The **newest** window is excluded from
+  that count, always: it is still filling and is partly covered by definition, so
+  counting it puts a number on every live page that means nothing.
 - **A chart served as its own resource cannot see the page's custom properties.**
   An `<img>`-referenced SVG is a *separate document* and inherits nothing, so each
   one carries its own palette and its own `prefers-color-scheme` block -- and the

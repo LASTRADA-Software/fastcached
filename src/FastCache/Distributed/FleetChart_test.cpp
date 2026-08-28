@@ -194,6 +194,120 @@ TEST_CASE("A rate is never taken across a gap", "[distributed][fleetchart]")
     CHECK_FALSE(values[2].has_value());
 }
 
+TEST_CASE("A counter's difference is never taken across a change of population", "[distributed][fleetchart]")
+{
+    // Adjacent and answering is not enough. A window this leader sampled sums a
+    // counter over the workers registered at that moment; a backfilled one sums it
+    // over every machine that has ever handed history over, and nothing erases an
+    // entry. Ten workstations with two of them on a build new enough to hand history
+    // over, and the first leader-sampled window after the boundary is credited with
+    // everything the other eight had accumulated since they started.
+    auto handed = At(0, { { FleetMetric::CacheHits, 2'000'000 }, { FleetMetric::CacheMisses, 0 } });
+    handed.backfilled = true;
+    auto stillHanded = At(300'000, { { FleetMetric::CacheHits, 2'100'000 }, { FleetMetric::CacheMisses, 0 } });
+    stillHanded.backfilled = true;
+
+    std::vector<FleetBucket> const buckets {
+        handed,
+        stillHanded,
+        At(600'000, { { FleetMetric::CacheHits, 10'000'000 }, { FleetMetric::CacheMisses, 0 } }),
+        At(900'000, { { FleetMetric::CacheHits, 10'000'100 }, { FleetMetric::CacheMisses, 0 } }),
+    };
+
+    auto const values = ValuesFor(SeriesByKey("hit-rate"), buckets, DaySeconds);
+    REQUIRE(values.size() == 4);
+    // Two backfilled windows in a row are the same population, so their difference
+    // stands: this is the half the handover exists to keep.
+    CHECK(values[1].has_value());
+    // The boundary itself is unknowable rather than eight million, which is the same
+    // answer a restart gets.
+    CHECK_FALSE(values[2].has_value());
+    // And past it, two leader-sampled windows are comparable again.
+    CHECK(values[3].has_value());
+
+    // The range summary follows the same rule, and it is the figure the headline
+    // tile shows: taking that boundary would report the fleet's whole history as
+    // one range's work.
+    auto const dispatchedBuckets = std::vector<FleetBucket> {
+        [] {
+            auto bucket = At(0, { { FleetMetric::DispatchGranted, 1000 } });
+            bucket.backfilled = true;
+            return bucket;
+        }(),
+        At(300'000, { { FleetMetric::DispatchGranted, 1000 } }),
+        At(600'000, { { FleetMetric::DispatchGranted, 1100 } }),
+    };
+    auto const total = RangeValueOf(SeriesByKey("dispatched"), dispatchedBuckets, DaySeconds);
+    REQUIRE(total.has_value());
+    // A hundred, not eleven hundred: the backfilled window cannot answer for a
+    // dispatch counter at all, so only the last pair contributes.
+    CHECK(Unwrap(total) == 100.0);
+}
+
+TEST_CASE("The series JSON says how much of each window was observed", "[distributed][fleetchart]")
+{
+    // A consumer cannot compare two windows without it, and cannot derive it either:
+    // how many samples a full window holds depends on this build's sample interval,
+    // so `covers` travels beside the counts rather than being assumed.
+    auto observed = At(0, { { FleetMetric::DispatchGranted, 1 } });
+    observed.coverage = FullCoverageOf(FleetRange::Day);
+    auto thin = At(300'000, { { FleetMetric::DispatchGranted, 2 } });
+    thin.coverage = 1;
+    auto handed = At(600'000, { { FleetMetric::JobsInFlight, 3 } });
+    handed.coverage = 2;
+    handed.backfilled = true;
+    FleetBucket const gap {};
+
+    std::vector<FleetBucket> const buckets { observed, thin, handed, gap };
+    auto const json = RenderSeriesJson(buckets, FleetRange::Day);
+
+    CHECK(json.contains(std::format(R"("covers":{})", FullCoverageOf(FleetRange::Day))));
+    // `null` for the window nobody sampled, and never 0: a fleet that did nothing
+    // and a fleet nobody was watching are different facts, which is the same
+    // distinction the series values already make.
+    CHECK(json.contains(std::format(R"("coverage":[{},1,2,null])", FullCoverageOf(FleetRange::Day))));
+    // And which windows this leader holds only because the machines handed them
+    // over, so a consumer knows why their scheduler-scoped series are null.
+    CHECK(json.contains(R"("backfilled":[false,false,true,false])"));
+}
+
+TEST_CASE("A backfilled window answers for a machine, never for the scheduler", "[distributed][fleetchart]")
+{
+    // A window this leader was not elected for is filled by summing what the nodes
+    // reported, and a machine cannot answer for a dispatch outcome -- `BackfillInto`
+    // leaves those slots at zero for exactly that reason. Zero is a legitimate
+    // reading for every slot here, so taking it would draw a fleet that granted
+    // nothing between one that granted a thousand and one that granted two: a rate
+    // of MINUS a thousand read as a restart, then a spike of two thousand. Neither
+    // happened, and both would sit in the year-long ring afterwards.
+    auto const& dispatched = SeriesByKey("dispatched");
+
+    auto filled = At(300'000, { { FleetMetric::DispatchGranted, 0 }, { FleetMetric::JobsInFlight, 7 } });
+    filled.backfilled = true;
+
+    std::vector<FleetBucket> const buckets {
+        At(0, { { FleetMetric::DispatchGranted, 1000 } }),
+        filled,
+        At(600'000, { { FleetMetric::DispatchGranted, 2000 } }),
+    };
+
+    auto const values = ValuesFor(dispatched, buckets, DaySeconds);
+    REQUIRE(values.size() == 3);
+    // The backfilled window itself: nothing there can answer.
+    CHECK_FALSE(values[1].has_value());
+    // And the window AFTER it, whose only neighbour is that one. A rate needs two
+    // adjacent readings and there is one.
+    CHECK_FALSE(values[2].has_value());
+
+    // The half a machine CAN answer for is drawn, which is the whole reason the
+    // handover exists: in-flight is a node-scoped gauge and the sum is a real
+    // reading of the fleet.
+    auto const levels = ValuesFor(SeriesByKey("in-flight"), buckets, DaySeconds);
+    REQUIRE(levels.size() == 3);
+    REQUIRE(levels[1].has_value());
+    CHECK(Unwrap(levels[1]) == 7.0);
+}
+
 TEST_CASE("A gauge is the bucket's own reading, with no bucket before it needed", "[distributed][fleetchart]")
 {
     std::vector<FleetBucket> const buckets { At(0, { { FleetMetric::JobsInFlight, 7 } }) };

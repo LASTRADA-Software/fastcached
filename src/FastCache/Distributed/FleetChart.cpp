@@ -63,6 +63,62 @@ namespace
         return bucket.values[static_cast<std::size_t>(metric)];
     }
 
+    /// Whether this bucket holds a reading for this slot at all.
+    ///
+    /// `present` answers it for a window this leader sampled. A BACKFILLED window is
+    /// different: it was assembled by summing what the machines reported for a window
+    /// this leader was not elected for, and a machine cannot answer for a dispatch
+    /// outcome -- only a scheduler produces one, and `BackfillInto` leaves those slots
+    /// at zero for exactly that reason.
+    ///
+    /// Zero is a legitimate reading for every slot here, so a renderer that took it
+    /// would draw a fleet that granted nothing between one that granted a thousand
+    /// and one that granted two thousand: a rate running backwards, read as a
+    /// restart, and then a spike of two thousand. Neither happened, and both would
+    /// sit in the twelve-month ring long after the election that caused them.
+    /// @param bucket The window.
+    /// @param metric The slot.
+    /// @return True when the number in that slot means something.
+    [[nodiscard]] bool Answers(FleetBucket const& bucket, FleetMetric metric) noexcept
+    {
+        return !bucket.backfilled || FleetMetricTable[static_cast<std::size_t>(metric)].scope == FleetMetricScope::Node;
+    }
+
+    /// Whether a bucket can answer for every slot a series reads.
+    ///
+    /// Both slots, unconditionally: `denominator` is set on every row -- a `Rate` row
+    /// names its numerator twice -- so there is no kind to special-case here, and a
+    /// `Share` whose two slots disagreed about who can answer would be half a
+    /// reading.
+    /// @param bucket The window.
+    /// @param series What is being drawn.
+    /// @return True when the window is a reading for it.
+    [[nodiscard]] bool Answers(FleetBucket const& bucket, FleetSeriesRow const& series) noexcept
+    {
+        return bucket.present && Answers(bucket, series.numerator) && Answers(bucket, series.denominator);
+    }
+
+    /// Whether a counter's difference may be taken between these two windows.
+    ///
+    /// Adjacent and answering is not enough: the two must also be assembled from the
+    /// same POPULATION. A window this leader sampled sums a counter over the workers
+    /// registered at that moment; a backfilled one sums it over every machine that has
+    /// ever handed history over, and nothing erases an entry. Across that boundary the
+    /// difference of two cumulative totals is a difference between two different sets
+    /// of machines -- with ten workstations and two of them on a build new enough to
+    /// hand history over, one five-minute bucket gets credited with the eight million
+    /// cache reads the other eight had accumulated since they started.
+    ///
+    /// Unknowable rather than large, which is the same answer a restart gets.
+    /// @param here The newer window.
+    /// @param prior The window immediately before it.
+    /// @param series What is being drawn.
+    /// @return True when the pair is a difference somebody can act on.
+    [[nodiscard]] bool Comparable(FleetBucket const& here, FleetBucket const& prior, FleetSeriesRow const& series) noexcept
+    {
+        return Answers(here, series) && Answers(prior, series) && here.backfilled == prior.backfilled;
+    }
+
     /// The palette an SVG carries, since it cannot reach the page's.
     ///
     /// The same hexes as the stylesheet, which is a duplication with a reason: a
@@ -397,7 +453,7 @@ FleetSeriesValues ValuesFor(FleetSeriesRow const& series,
     for (auto const index: std::views::iota(std::size_t { 0 }, buckets.size()))
     {
         auto const& here = buckets[index];
-        if (!here.present)
+        if (!Answers(here, series))
             continue;
 
         if (series.kind == FleetSeriesKind::Level)
@@ -409,7 +465,7 @@ FleetSeriesValues ValuesFor(FleetSeriesRow const& series,
         // A rate and a share both need the bucket before this one, and it must be
         // the one immediately before: a delta taken across a gap would spread work
         // over hours nobody observed and report a rate nobody saw.
-        if (index == 0 || !buckets[index - 1].present)
+        if (index == 0 || !Comparable(here, buckets[index - 1], series))
             continue;
         auto const& prior = buckets[index - 1];
 
@@ -481,7 +537,11 @@ std::optional<double> RangeValueOf(FleetSeriesRow const& series,
     {
         auto const& here = buckets[index];
         auto const& prior = buckets[index - 1];
-        if (!here.present || !prior.present)
+        // The same rule the per-bucket values follow, for the same two reasons: a
+        // window backfilled from what the machines reported cannot answer for a
+        // dispatch outcome, and a difference taken across that boundary is a
+        // difference between two different sets of machines.
+        if (!Comparable(here, prior, series))
             continue;
 
         auto const numeratorNow = SlotOf(here, series.numerator);
@@ -671,6 +731,40 @@ std::string RenderSparklineSvg(std::vector<FleetBucket> const& buckets)
     return out;
 }
 
+namespace
+{
+    /// One per-bucket array the series JSON carries beside `series`.
+    struct BucketArrayRow
+    {
+        std::string_view key;                      ///< Its JSON name.
+        std::string (*render)(FleetBucket const&); ///< What one bucket contributes.
+    };
+
+    /// Every array that runs parallel to `series`, in the order they are written.
+    ///
+    /// A table because a consumer reads them by index against the series arrays, so
+    /// one that walked a different set of buckets than another would misalign
+    /// silently -- the loop is written once and every row rides it.
+    constexpr std::array<BucketArrayRow, 3> BucketArrayTable {
+        BucketArrayRow { .key = "start",
+                         .render = [](FleetBucket const& bucket) { return std::format("{}", bucket.startMillis); } },
+        // `null` for a window nobody sampled, and never 0: a fleet that did nothing
+        // and a fleet nobody was watching are different facts, which is the same
+        // distinction the series values themselves make.
+        BucketArrayRow { .key = "coverage",
+                         .render =
+                             [](FleetBucket const& bucket) {
+                                 return bucket.present ? std::format("{}", bucket.coverage) : std::string { "null" };
+                             } },
+        // Which windows this leader did not sample itself, and holds only because the
+        // machines handed their own records over. Their scheduler-scoped series are
+        // `null` throughout, because no machine can answer for a dispatch outcome.
+        BucketArrayRow {
+            .key = "backfilled",
+            .render = [](FleetBucket const& bucket) { return std::string { bucket.backfilled ? "true" : "false" }; } },
+    };
+} // namespace
+
 std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange range)
 {
     auto const& row = FleetRangeTable[static_cast<std::size_t>(range)];
@@ -680,10 +774,26 @@ std::string RenderSeriesJson(std::vector<FleetBucket> const& buckets, FleetRange
     AppendJsonText(out, "range");
     out += ':';
     AppendJsonText(out, row.key);
-    out += std::format(R"(,"bucketSeconds":{},"points":{},"start":[)", seconds, buckets.size());
-    for (auto const index: std::views::iota(std::size_t { 0 }, buckets.size()))
-        out += std::format("{}{}", index == 0 ? "" : ",", buckets[index].startMillis);
-    out += R"(],"series":{)";
+    // `covers` is what a window nobody missed a sample of holds, so a consumer can
+    // read `coverage` as a fraction without knowing this build's sample interval.
+    out += std::format(R"(,"bucketSeconds":{},"points":{},"covers":{})", seconds, buckets.size(), FullCoverageOf(range));
+
+    // One row per per-bucket array, so a fourth is a row rather than a fourth
+    // hand-written loop spelling "comma-separated over the buckets" a fourth way.
+    for (auto const& array: BucketArrayTable)
+    {
+        out += ',';
+        AppendJsonText(out, array.key);
+        out += ":[";
+        for (auto const index: std::views::iota(std::size_t { 0 }, buckets.size()))
+        {
+            if (index != 0)
+                out += ',';
+            out += array.render(buckets[index]);
+        }
+        out += ']';
+    }
+    out += R"(,"series":{)";
 
     for (auto const index: std::views::iota(std::size_t { 0 }, FleetSeriesTable.size()))
     {
