@@ -518,3 +518,30 @@ TEST_CASE("A theme's key round-trips", "[distributed][fleetchart]")
         CHECK(FleetThemeKey(row.theme) == row.key);
     }
 }
+
+TEST_CASE("A chart whose ticks are a day apart labels them with dates", "[distributed][fleetchart]")
+{
+    // Day-aligned buckets land at midnight every time, so `HH:MM` prints `00:00` at
+    // every tick and the axis says nothing at all. Invisible while the longest view
+    // was a week; true of every range past one.
+    std::vector<FleetBucket> daily;
+    for (auto const index: std::views::iota(0, 60))
+        daily.push_back(At(static_cast<std::int64_t>(index) * 86'400'000,
+                           { { FleetMetric::DispatchGranted, static_cast<std::uint64_t>(index) * 10 } }));
+
+    auto const svg = RenderChartSvg(ChartByKey("dispatched"), daily, FleetRange::SixMonths, FleetTheme::Light);
+    INFO(svg);
+    CHECK_FALSE(MarkupInAttribute(svg).has_value());
+    // `MM-DD`, and emphatically not six midnights in a row.
+    CHECK(svg.contains("01-01"));
+    CHECK_FALSE(svg.contains(">00:00<"));
+
+    // A short view is unchanged: a clock is what a reader wants inside a day, and
+    // the threshold is the span between ticks rather than the range's name.
+    std::vector<FleetBucket> minutes;
+    for (auto const index: std::views::iota(0, 60))
+        minutes.push_back(At(static_cast<std::int64_t>(index) * 60'000,
+                             { { FleetMetric::DispatchGranted, static_cast<std::uint64_t>(index) } }));
+    auto const short_ = RenderChartSvg(ChartByKey("dispatched"), minutes, FleetRange::OneHour, FleetTheme::Light);
+    CHECK(short_.contains(">00:00<"));
+}

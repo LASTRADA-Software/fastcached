@@ -606,6 +606,7 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     {
         FleetSampler sampler { sources, wall, file, logger };
         CHECK(sampler.Durable());
+        CHECK_FALSE(sampler.History().ReadOnly());
         REQUIRE(sampler.SampleOnce());
         // Written by the destructor, so a clean shutdown does not throw away what
         // the page will be asked about the moment the node comes back.
@@ -739,6 +740,44 @@ TEST_CASE("An unknown range is refused rather than quietly served as another", "
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").status == "400 Bad Request");
 
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "theme=solarized").status == "200 OK");
+
+    // And the refusal NAMES what it would accept, off the table rather than out of a
+    // sentence: two windows were hand-listed here while eight were served, so the one
+    // message a reader who just guessed wrong actually reads was the stalest thing on
+    // the surface.
+    for (auto const& row: Distributed::FleetRangeTable)
+    {
+        INFO("range " << row.key);
+        CHECK(fixture.Get("/fleet", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet/series.json", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").body.contains(row.key));
+        // ...and each of them is genuinely served, or naming it is worse than not.
+        CHECK(fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key)).status == "200 OK");
+    }
+}
+
+TEST_CASE("A long range is not cached past its next sample", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    // `max-age` used to be "until this bucket closes", which is how long the chart's
+    // SHAPE is settled rather than how long it is current: the newest bucket is
+    // always still open and gains a reading every sample. On a five-minute bucket
+    // that was four minutes of staleness; on the twelve-month view, whose buckets are
+    // a day wide, it was a chart frozen in the browser for twenty-four hours while
+    // the fleet moved underneath it.
+    constexpr std::int64_t SampleSeconds = 60;
+    for (auto const& row: Distributed::FleetRangeTable)
+    {
+        INFO("range " << row.key);
+        auto const response = fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key));
+        REQUIRE(response.status == "200 OK");
+        auto const control = std::string { ChartFixture::HeaderValue(response, "Cache-Control: ") };
+        REQUIRE(control.starts_with("max-age="));
+        auto const seconds = std::stoll(control.substr(std::string_view { "max-age=" }.size()));
+        CHECK(seconds >= 1);
+        CHECK(seconds <= SampleSeconds);
+    }
 }
 
 TEST_CASE("The series behind the charts are served as JSON", "[node][admin][chart]")
@@ -776,4 +815,58 @@ TEST_CASE("The page carries the range control and one image per chart", "[node][
     CHECK_FALSE(page.body.contains(R"(src="http)"));
     CHECK_FALSE(page.body.contains(R"(href="http)"));
     CHECK_FALSE(page.body.contains("@import"));
+}
+
+TEST_CASE("A history a newer build wrote stops the sampler promising durability", "[node][admin][fleethistory]")
+{
+    // The page says a durable history is "written to disk, so it survives a restart".
+    // A node holding a file a LATER build wrote persists nothing at all, so saying
+    // that would contradict the warning printed beside it at startup -- and an
+    // operator reading the page would have no reason to go looking for the warning.
+    Testing::ScratchDirectory const scratch { "fleet-sampler-readonly" };
+    auto const file = scratch.Path() / "history.bin";
+
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    {
+        FleetSampler writer { sources, wall, file, logger };
+        REQUIRE(writer.SampleOnce());
+    }
+    REQUIRE(std::filesystem::exists(file));
+
+    // Raise the version byte to something no reader claims; everything else stays
+    // valid, so nothing but the version can be what refuses it.
+    {
+        std::fstream patch { file, std::ios::binary | std::ios::in | std::ios::out };
+        patch.seekp(4);
+        patch.put(static_cast<char>(200));
+    }
+    auto const before = [&] {
+        std::ifstream in { file, std::ios::binary };
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        return buffer.str();
+    }();
+
+    {
+        FleetSampler sampler { sources, wall, file, logger };
+        CHECK(sampler.History().ReadOnly());
+        CHECK_FALSE(sampler.Durable());
+        // Sampling continues -- the page is live either way, and only persistence
+        // stops.
+        CHECK(sampler.SampleOnce());
+        CHECK_FALSE(sampler.History().Empty());
+    }
+
+    // Left byte-identical, including by the destructor's own save.
+    std::ifstream in { file, std::ios::binary };
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    CHECK(buffer.str() == before);
 }

@@ -180,9 +180,13 @@ class FleetSampler
     }
 
     /// Whether the ring is written to disk.
+    ///
+    /// Both halves, because the page says "written to disk, so it survives a restart"
+    /// and a history holding a file a NEWER build wrote persists nothing at all. A
+    /// path alone would have the page contradicting the startup warning beside it.
     [[nodiscard]] bool Durable() const noexcept
     {
-        return !_path.empty();
+        return !_path.empty() && !_history.ReadOnly();
     }
 
     /// Take one sample now, whatever the timer is doing.

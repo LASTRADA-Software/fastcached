@@ -279,28 +279,76 @@ namespace
         return out;
     }
 
-    /// Clock labels along the bottom, spaced so they do not collide.
+    /// The civil date and time one instant falls on, in UTC.
+    ///
+    /// Hand-rolled from the epoch rather than through `localtime`, which is not
+    /// thread-safe, and through UTC rather than local time because a chart served as
+    /// its own resource is read on machines in other zones than the one that drew it.
+    struct CivilTime
+    {
+        int month;  ///< 1-12.
+        int day;    ///< 1-31.
+        int hour;   ///< 0-23.
+        int minute; ///< 0-59.
+    };
+
+    /// @param millis Milliseconds since the epoch.
+    /// @return Its UTC civil fields.
+    [[nodiscard]] CivilTime CivilFromMillis(std::int64_t millis) noexcept
+    {
+        auto const days = std::chrono::floor<std::chrono::days>(std::chrono::milliseconds { millis });
+        auto const ymd = std::chrono::year_month_day { std::chrono::sys_days { days } };
+        auto const rest = std::chrono::milliseconds { millis } - days;
+        auto const hours = std::chrono::duration_cast<std::chrono::hours>(rest);
+        auto const minutes = std::chrono::duration_cast<std::chrono::minutes>(rest - hours);
+        return CivilTime { .month = static_cast<int>(static_cast<unsigned>(ymd.month())),
+                           .day = static_cast<int>(static_cast<unsigned>(ymd.day())),
+                           .hour = static_cast<int>(hours.count()),
+                           .minute = static_cast<int>(minutes.count()) };
+    }
+
+    /// Whether a chart's ticks need a DATE rather than a clock.
+    ///
+    /// A tick every twenty-four hours lands at midnight every time, so `HH:MM` prints
+    /// `00:00` six times and the axis says nothing at all -- which is what the two
+    /// short ranges never revealed, and what every range past a week does. The
+    /// threshold is the span between ticks rather than the range's name, so it stays
+    /// right as rows are added.
+    ///
+    /// @param buckets What is being drawn.
+    /// @param step How many buckets apart the ticks are.
+    /// @return True when the labels should read `MM-DD`.
+    [[nodiscard]] bool TicksNeedADate(std::vector<FleetBucket> const& buckets, std::size_t step) noexcept
+    {
+        if (buckets.size() < 2 || step == 0)
+            return false;
+        auto const width = buckets[1].startMillis - buckets[0].startMillis;
+        constexpr std::int64_t DayMillis = 24 * 60 * 60 * 1000;
+        return width * static_cast<std::int64_t>(step) >= DayMillis;
+    }
+
+    /// Labels along the bottom, spaced so they do not collide.
     [[nodiscard]] std::string AxisLabels(std::vector<FleetBucket> const& buckets)
     {
         constexpr std::size_t Wanted = 6;
         if (buckets.size() < 2)
             return {};
         auto const step = std::max<std::size_t>(1, buckets.size() / Wanted);
+        auto const dated = TicksNeedADate(buckets, step);
 
         std::string out;
         for (std::size_t index = 0; index < buckets.size(); index += step)
         {
-            auto const seconds = buckets[index].startMillis / 1000;
-            auto const hour = (seconds / 3600) % 24;
-            auto const minute = (seconds / 60) % 60;
+            auto const civil = CivilFromMillis(buckets[index].startMillis);
+            auto const label = dated ? std::format("{:02}-{:02}", civil.month, civil.day)
+                                     : std::format("{:02}:{:02}", civil.hour, civil.minute);
             out += std::format(
-                R"(<text x="{:.1f}" y="{:.0f}" font-size="9" fill="{}" font-family="ui-monospace,monospace" text-anchor="{}">{:02}:{:02}</text>)",
+                R"(<text x="{:.1f}" y="{:.0f}" font-size="9" fill="{}" font-family="ui-monospace,monospace" text-anchor="{}">{}</text>)",
                 XAt(index, buckets.size(), FullChart),
                 ChartHeight - 5.0,
                 FaintVar,
                 index == 0 ? "start" : "middle",
-                hour,
-                minute);
+                label);
         }
         return out;
     }

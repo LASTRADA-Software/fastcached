@@ -173,6 +173,25 @@ namespace
         return AdminResponse { .status = "400 Bad Request", .contentType = contentType, .body = std::move(body) };
     }
 
+    /// Every range key this build serves, comma-separated.
+    ///
+    /// Walked out of the table rather than written into the message, because a
+    /// refusal that hand-lists what it accepts goes stale the first time a row is
+    /// added -- and it goes stale in the one place a reader who just guessed wrong is
+    /// looking. Two windows were named here while eight were served.
+    /// @return The keys, in the order the control renders them.
+    [[nodiscard]] std::string KnownRangeKeys()
+    {
+        std::string out;
+        for (auto const& row: Distributed::FleetRangeTable)
+        {
+            if (!out.empty())
+                out += ", ";
+            out += row.key;
+        }
+        return out;
+    }
+
     /// A chart tail that names nothing in the table.
     [[nodiscard]] AdminResponse NoSuchChart()
     {
@@ -209,7 +228,16 @@ namespace
                                    .body = "this node keeps no fleet history\n" };
 
         auto const tag = std::format(R"("{}-{}")", identity, history.history->Generation());
-        auto const maxAge = history.history->UntilBucketCloses(range).count();
+        // Bounded by the SAMPLE interval, not only by the bucket. The newest bucket is
+        // always still open and gains a reading every sample, so "until this bucket
+        // closes" is how long the chart's shape is settled -- not how long it is
+        // current. On a five-minute bucket the difference was four minutes of
+        // staleness; on the twelve-month view, whose buckets are a day wide, it is a
+        // chart frozen in the browser for twenty-four hours while the fleet moves.
+        // Revalidation is cheap: the ETag makes it a bodyless 304 whenever nothing
+        // closed.
+        auto const settled = history.history->UntilBucketCloses(range);
+        auto const maxAge = std::min(settled, Distributed::FleetSampleInterval).count();
         std::vector<std::string> headers { std::format("ETag: {}", tag),
                                            std::format("Cache-Control: max-age={}, must-revalidate", maxAge) };
 
@@ -282,9 +310,9 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                 auto const range = rangeAsked(request.query);
                 if (!range.has_value())
                     return BadRange("text/html; charset=utf-8",
-                                    "<!doctype html><title>fastcache fleet</title>"
-                                    "<p>Unknown <code>range</code>. Try <code>?range=24h</code> or "
-                                    "<code>?range=7d</code>.</p>");
+                                    std::format("<!doctype html><title>fastcache fleet</title>"
+                                                "<p>Unknown <code>range</code>. Try one of: <code>{}</code>.</p>",
+                                                KnownRangeKeys()));
                 return AdminResponse { .status = statusFor(snapshot),
                                        .contentType = "text/html; charset=utf-8",
                                        .body = Distributed::RenderFleetHtml(snapshot, viewFor(*range), refreshSeconds) };
@@ -303,22 +331,23 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
 
     routes.push_back(AdminRoute {
         .path = std::string_view { Distributed::FleetSeriesPath },
-        .handler = gated([] { return Unauthorised("application/json", R"({"error":"credential required"})"); },
-                         [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
-                                                                   AdminRequest const& request) -> AdminResponse {
-                             auto const range = rangeAsked(request.query);
-                             if (!range.has_value())
-                                 return BadRange("application/json", R"({"error":"unknown range"})");
-                             auto const view = viewFor(*range);
-                             return Conditional(
-                                 request,
-                                 history,
-                                 *range,
-                                 std::format("s-{}", Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key),
-                                 statusFor(snapshot),
-                                 "application/json",
-                                 [&view, &range] { return Distributed::RenderSeriesJson(view.buckets, *range); });
-                         }),
+        .handler = gated(
+            [] { return Unauthorised("application/json", R"({"error":"credential required"})"); },
+            [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                      AdminRequest const& request) -> AdminResponse {
+                auto const range = rangeAsked(request.query);
+                if (!range.has_value())
+                    return BadRange("application/json",
+                                    std::format(R"({{"error":"unknown range","known":"{}"}})", KnownRangeKeys()));
+                auto const view = viewFor(*range);
+                return Conditional(request,
+                                   history,
+                                   *range,
+                                   std::format("s-{}", Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key),
+                                   statusFor(snapshot),
+                                   "application/json",
+                                   [&view, &range] { return Distributed::RenderSeriesJson(view.buckets, *range); });
+            }),
     });
 
     routes.push_back(AdminRoute {
@@ -337,7 +366,7 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
 
                              auto const range = rangeAsked(request.query);
                              if (!range.has_value())
-                                 return BadRange("text/plain", "unknown range\n");
+                                 return BadRange("text/plain", std::format("unknown range; known: {}\n", KnownRangeKeys()));
                              auto const theme = Distributed::FleetThemeFromKey(QueryValue(request.query, "theme"));
                              auto const& row = Distributed::FleetChartTable[static_cast<std::size_t>(*chart)];
 
@@ -428,6 +457,16 @@ FleetSampler::FleetSampler(Distributed::FleetSources sources,
     {
         if (_history.Load(_path))
             _logger.Logf(LogLevel::Info, "fleet history restored from {}", _path.string());
+        else if (_history.ReadOnly())
+            // Named at WARN and named specifically, because this one is not the
+            // ordinary "nothing to restore": a later build wrote that file, this one
+            // cannot read it, and the reason it is not being replaced is that doing
+            // so would destroy readings the other build could still use. An operator
+            // who sees only "starts empty" would reasonably delete it.
+            _logger.Logf(LogLevel::Warn,
+                         "fleet history at {} was written by a NEWER build; starting empty and leaving it alone. "
+                         "Sampling continues, nothing is persisted, and the file is safe for that build to read again",
+                         _path.string());
         else
             _logger.Logf(LogLevel::Info, "fleet history starts empty at {}", _path.string());
     }
@@ -482,6 +521,11 @@ bool FleetSampler::SampleOnce()
 void FleetSampler::Persist()
 {
     if (_path.empty() || _history.Empty())
+        return;
+    // A refusal to overwrite a newer file is not a write failure, and reporting it as
+    // one every save interval would bury the single WARN at startup that explains it
+    // under a stream of "could not write" saying the opposite of what is true.
+    if (_history.ReadOnly())
         return;
     if (!_history.Save(_path))
         _logger.Logf(LogLevel::Warn, "could not write fleet history to {}", _path.string());
