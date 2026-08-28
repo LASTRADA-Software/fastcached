@@ -63,6 +63,22 @@ inline constexpr EnumTable<FleetRing, FleetRingRow> FleetRingTable {
 };
 static_assert(RowsInEnumeratorOrder(FleetRingTable, &FleetRingRow::ring));
 
+/// What one history's rings cost in memory, exactly.
+///
+/// Computed from the ring table and `sizeof(FleetBucket)` rather than estimated in
+/// prose, because an operator asked to give a process a year of history is entitled
+/// to the real number -- which is the whole of the paragraph above this table. Every
+/// ring is allocated in full at construction, so this is the steady state rather
+/// than a ceiling something grows towards.
+/// @return Bytes one `FleetHistory` occupies.
+[[nodiscard]] constexpr std::size_t FleetHistoryBytes() noexcept
+{
+    std::size_t total = 0;
+    for (auto const& row: FleetRingTable)
+        total += row.slots * sizeof(FleetBucket);
+    return total;
+}
+
 /// How far back a view reaches, and how coarse its buckets are.
 ///
 /// Shortest first, which is the order the control renders them in.

@@ -1270,6 +1270,23 @@ itself is suspect. `/fleet/series.json` carries `coverage` per bucket beside
 The newest window is never counted there. It is still filling, and is partly
 covered by definition.
 
+### What it costs
+
+Fixed, and reported rather than estimated. The rings do not grow: 1440 + 720 + 400
+buckets are allocated in full at construction, so this is the steady state rather
+than a ceiling to watch.
+
+| | measured |
+|---|---|
+| one series, in memory and on disk | **800 KiB** (819,253 bytes) |
+| a node's own two series | 1.6 MiB |
+| a leader, per machine reporting to it | + 800 KiB |
+
+A leader of a twenty-machine fleet therefore holds about 18 MiB of history, for
+twelve months of it. The node logs the same figures at startup, so the number an
+operator sizes against comes from the build they are running rather than from this
+page.
+
 ### Where it is kept
 
 Where the history is kept follows the directories the node already has: the

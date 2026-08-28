@@ -306,6 +306,12 @@ fault.
   series: the whole handover was filled, persisted, restored and never once drawn,
   while the merge function's own comment claimed a route could not reach past it.
   **Assert the wiring, through a route, not the merge.**
+- **A retention cost is REPORTED, never estimated.** The rings are allocated in
+  full at construction and do not grow, so `FleetHistoryBytes()` is the steady
+  state rather than a ceiling -- 800 KiB a series, 1.6 MiB for a node's own two,
+  and another 800 KiB on a leader for every machine that reports to it. The node
+  logs it at startup, because a number an operator sizes a machine against has to
+  come from the build they are running rather than from a document.
 - **Coverage is how much of a window was observed, and it is said in words.** A
   bucket observed for one minute of five is drawn exactly like one observed for all
   five -- its value is a true reading either way, a gauge's last sample or a rate

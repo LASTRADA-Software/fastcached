@@ -582,6 +582,18 @@ FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
             _logger.Logf(LogLevel::Info, "{} history starts empty at {}", each.what, each.path.string());
     }
 
+    // Reported, never estimated. A ring is allocated in full at construction, so
+    // this is what the process is holding now rather than what it might grow to --
+    // and a leader additionally holds one of these per machine that reports, which
+    // is the number an operator sizing a fleet's leader actually needs.
+    constexpr auto PerSeriesKiB = Distributed::FleetHistoryBytes() / 1024;
+    _logger.Logf(LogLevel::Info,
+                 "fleet history holds {} KiB per series ({} KiB for this node's own two), and a leader keeps a "
+                 "further {} KiB for every machine that reports to it",
+                 PerSeriesKiB,
+                 PerSeriesKiB * 2,
+                 PerSeriesKiB);
+
     _thread = std::jthread { [this](std::stop_token stop) {
         auto sinceSave = std::chrono::steady_clock::duration::zero();
         while (!stop.stop_requested())
