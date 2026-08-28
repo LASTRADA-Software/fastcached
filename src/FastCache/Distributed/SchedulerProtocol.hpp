@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -83,6 +84,32 @@ namespace FastCache::Distributed
 /// @param inFlight The job count, which travels outside the record.
 /// @return The facts.
 [[nodiscard]] NodeLoad LoadFromWire(CompileCacheWire::LoadFields const& fields, std::uint32_t inFlight);
+
+/// The wire carries exactly `FleetMetric`'s slots, positionally.
+///
+/// `CompileCacheWire.hpp` cannot include `FleetHistory.hpp` -- it stays
+/// dependency-free because `fastcache-cc` compiles it without linking `FastCache` --
+/// so the count is spelled there too, and this file, which converts between the two,
+/// is the one place both spellings are visible. A tenth metric added without moving
+/// `HistorySlotCount` would have every peer reading nine of them and silently
+/// dropping the tenth, which is the same shape of defect `StorageTier`'s positional
+/// carrying already records.
+static_assert(EnumeratorCount<FleetMetric> == CompileCacheWire::HistorySlotCount,
+              "a slot added to FleetMetric must move HistorySlotCount, or it never reaches the leader");
+
+/// Convert closed buckets to the shape the wire carries.
+/// @param buckets What a node is handing over.
+/// @return The wire records, in the same order.
+[[nodiscard]] std::vector<CompileCacheWire::HistoryBucketFields> HistoryToWire(std::span<FleetBucket const> buckets);
+
+/// Convert wire records back to buckets.
+///
+/// `present` is set on every one of them, because a node only ever hands over
+/// buckets it recorded -- there is nothing on the wire that could mean a gap, and a
+/// gap is the absence of a record rather than a record saying so.
+/// @param records What arrived.
+/// @return The buckets, in the same order.
+[[nodiscard]] std::vector<FleetBucket> HistoryFromWire(std::span<CompileCacheWire::HistoryBucketFields const> records);
 
 /// Turn one `0xFC` request into one reply, for a fleet scheduler.
 ///

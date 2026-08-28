@@ -10,6 +10,7 @@
 #include <ranges>
 #include <span>
 #include <sstream>
+#include <utility>
 
 namespace FastCache::Distributed
 {
@@ -25,14 +26,43 @@ namespace
             .count();
     }
 
-    /// What this build writes.
+    /// What a store's file says about itself.
     ///
     /// A file that could not say which build wrote it makes an upgrade a silent
     /// corruption, which is the reasoning `ClusterState`'s own version byte records.
-    /// Unlike that one, an OLDER version is not an error -- `HistoryFormats` carries
-    /// a reader for it and inflates it forward.
-    constexpr std::array<char, 4> FileMagic { 'F', 'C', 'F', 'H' };
-    constexpr std::uint8_t FileVersion = 2;
+    /// Unlike that one, an OLDER version is not necessarily an error: `HistoryFormats`
+    /// carries a reader for one and inflates it forward.
+    ///
+    /// A descriptor rather than a base class, because the two stores share the
+    /// framing and nothing else -- one holds rings, the other a body per machine. A
+    /// third store is then a third constant, and it gets the durability, the checksum
+    /// and the never-overwrite-a-newer-file rule by construction rather than by
+    /// somebody remembering to copy them.
+    struct FileEnvelope
+    {
+        std::array<char, 4> magic; ///< What this file is.
+        std::uint8_t newest;       ///< The newest version this build writes.
+    };
+
+    /// A node's own series: three rings in one file.
+    constexpr FileEnvelope RingFile { .magic = { 'F', 'C', 'F', 'H' }, .newest = 2 };
+
+    /// The received-histories store: one nested `FleetHistory` body per machine.
+    ///
+    /// Its own magic, so a path typed into the wrong flag is refused by name rather
+    /// than read as a truncated history.
+    constexpr FileEnvelope NodeStoreFile { .magic = { 'F', 'C', 'N', 'H' }, .newest = 1 };
+
+    /// Magic, version byte, body length, body checksum.
+    constexpr std::size_t EnvelopeSize = 4 + 1 + (sizeof(std::uint64_t) * 2);
+
+    /// What one bucket costs in a body: four scalars, the readings, and the fold.
+    ///
+    /// Derived from the metric table rather than written down, so a tenth metric
+    /// moves it. Only a reservation hint -- being wrong costs a reallocation, not a
+    /// wrong file -- but a hint nothing keeps current is a hint that stops helping.
+    constexpr std::size_t BucketBytes =
+        (4 + EnumeratorCount<FleetMetric> + (EnumeratorCount<FleetMetric> * 3)) * sizeof(std::uint64_t);
 
     /// The largest ring this build keeps, as a ceiling on a declared bucket count.
     ///
@@ -193,10 +223,143 @@ namespace
         out.append(bytes.data(), bytes.size());
     }
 
+    /// Stamp a big-endian word over one already appended.
+    /// @param out The buffer.
+    /// @param offset Where the word sits.
+    /// @param value What it should say.
+    void WriteU64(std::string& out, std::size_t offset, std::uint64_t value)
+    {
+        auto const encoded = HostToBigEndian(value);
+        std::array<char, sizeof(encoded)> bytes {};
+        std::memcpy(bytes.data(), &encoded, sizeof(encoded));
+        std::ranges::copy(bytes, out.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+
     [[nodiscard]] std::uint64_t ReadU64(std::string_view bytes, std::size_t offset) noexcept
     {
         return ReadBigEndian<std::uint64_t>(
             std::span { reinterpret_cast<std::byte const*>(bytes.data()) + offset, sizeof(std::uint64_t) });
+    }
+
+    /// A buffer with the header's bytes reserved in front, ready for a body.
+    ///
+    /// The body is appended straight into the buffer that becomes the file, because
+    /// a received-histories store is most of a megabyte per machine: composing the
+    /// body separately would copy all of it twice, once to join the header and once
+    /// again to reach the stream.
+    /// @return The buffer, `EnvelopeSize` placeholder bytes long.
+    [[nodiscard]] std::string FramedBuffer()
+    {
+        return std::string(EnvelopeSize, char { 0 });
+    }
+
+    /// Stamp the header onto such a buffer and put it where a crash cannot leave
+    /// half of it.
+    /// @param path Where the file belongs.
+    /// @param envelope What to stamp.
+    /// @param file The whole file: header space, then the body.
+    /// @return True when the rename succeeded.
+    [[nodiscard]] bool WriteFramed(std::filesystem::path const& path, FileEnvelope const& envelope, std::string& file)
+    {
+        std::string_view const body { file.data() + EnvelopeSize, file.size() - EnvelopeSize };
+
+        std::string header;
+        header.reserve(EnvelopeSize);
+        header.append(envelope.magic.data(), envelope.magic.size());
+        header.push_back(static_cast<char>(envelope.newest));
+        AppendU64(header, body.size());
+        AppendU64(header, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
+        std::ranges::copy(header, file.begin());
+
+        // Temp then rename: a crash between the two leaves the previous file whole
+        // rather than half of this one.
+        auto const temp = std::filesystem::path { path }.concat(".tmp");
+        {
+            std::ofstream out { temp, std::ios::binary | std::ios::trunc };
+            if (!out)
+                return false;
+            out.write(file.data(), static_cast<std::streamsize>(file.size()));
+            if (!out)
+                return false;
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+        if (ec)
+        {
+            std::filesystem::remove(temp, ec);
+            return false;
+        }
+        return true;
+    }
+
+    /// What reading a framed file produced.
+    enum class FramedOutcome : std::uint8_t
+    {
+        Ok,      ///< The body is there and its checksum matched.
+        Missing, ///< Absent, short, not ours, or damaged: start empty, overwrite freely.
+        Newer,   ///< Ours, and written by a LATER build: start empty and NEVER write.
+    };
+
+    /// A framed file's contents.
+    ///
+    /// `body` OWNS its bytes rather than viewing a buffer this returned by value: a
+    /// struct a decoder hands back must not borrow from what it decoded, or the
+    /// obvious spelling is a use-after-free.
+    struct FramedFile
+    {
+        FramedOutcome outcome { FramedOutcome::Missing }; ///< Whether there is anything to read.
+        std::uint8_t version { 0 };                       ///< Which build's shape the body is in.
+        std::string body;                                 ///< The bytes after the header.
+    };
+
+    /// Read a framed file and check everything about it except the shape of its body.
+    /// @param path Where to look.
+    /// @param envelope What the file must claim to be.
+    /// @return The body, or why there is none.
+    [[nodiscard]] FramedFile ReadFramed(std::filesystem::path const& path, FileEnvelope const& envelope)
+    {
+        std::ifstream in { path, std::ios::binary };
+        if (!in)
+            return {};
+
+        // Sized and read in one go rather than through `istreambuf_iterator`: GCC at
+        // -O3 inlines that far enough to trip `-Werror=null-dereference`, which this
+        // codebase has already worked around twice.
+        in.seekg(0, std::ios::end);
+        auto const end = in.tellg();
+        if (end < 0)
+            return {};
+        in.seekg(0, std::ios::beg);
+
+        std::string raw(static_cast<std::size_t>(end), char { 0 });
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (in.gcount() != static_cast<std::streamsize>(raw.size()))
+            return {};
+
+        if (raw.size() < EnvelopeSize)
+            return {};
+        if (!std::equal(envelope.magic.begin(), envelope.magic.end(), raw.begin()))
+            return {};
+
+        auto const version = static_cast<std::uint8_t>(raw[envelope.magic.size()]);
+        // The magic matched, so this IS one of ours -- and a version above the newest
+        // this build writes was written by a LATER one. Everything else here is
+        // recoverable by waiting; overwriting a year of readings that the newer build
+        // could still have read is not.
+        if (version > envelope.newest)
+            return FramedFile { .outcome = FramedOutcome::Newer, .version = version, .body = {} };
+
+        auto const declared = ReadU64(raw, envelope.magic.size() + 1);
+        auto const checksum = ReadU64(raw, envelope.magic.size() + 1 + sizeof(std::uint64_t));
+        // The header is dropped rather than copied past: what is left IS the body.
+        raw.erase(0, EnvelopeSize);
+        if (raw.size() != declared)
+            return {};
+        if (Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(raw.data()), raw.size() }) != checksum)
+            return {};
+
+        return FramedFile { .outcome = FramedOutcome::Ok, .version = version, .body = std::move(raw) };
     }
 
     /// A cursor over a file's body, so a reader cannot walk off the end by omission.
@@ -217,6 +380,22 @@ namespace
                 return false;
             into = ReadU64(_body, _cursor);
             _cursor += sizeof(std::uint64_t);
+            return true;
+        }
+
+        /// @param length How many bytes to take.
+        /// @param into A view of them, valid as long as the body is.
+        /// @return False when the body is exhausted, leaving @p into untouched.
+        ///
+        /// Written as a remaining-length comparison rather than `_cursor + length`,
+        /// because a length read off a damaged file can overflow that sum and let a
+        /// bounds check pass on a span that runs off the end.
+        bool Take(std::uint64_t length, std::string_view& into) noexcept
+        {
+            if (length > _body.size() - _cursor)
+                return false;
+            into = _body.substr(_cursor, static_cast<std::size_t>(length));
+            _cursor += static_cast<std::size_t>(length);
             return true;
         }
 
@@ -452,7 +631,20 @@ std::int64_t FleetHistory::NowMillis() const noexcept
 
 void FleetHistory::Record(EnumTable<FleetMetric, std::uint64_t> const& values)
 {
-    auto const now = NowMillis();
+    RecordAt(NowMillis(), values);
+}
+
+void FleetHistory::Adopt(FleetBucket const& bucket)
+{
+    if (!bucket.present)
+        return;
+    // Its own sample instant, not this leader's clock. See the header: stamping a
+    // catch-up with the moment it arrived would pile a day into one window.
+    RecordAt(bucket.sampleMillis, bucket.values);
+}
+
+void FleetHistory::RecordAt(std::int64_t now, EnumTable<FleetMetric, std::uint64_t> const& values)
+{
     auto const guard = std::scoped_lock { _mutex };
 
     // A delta is only a rate when the two readings are ADJACENT. A node samples only
@@ -528,6 +720,49 @@ std::vector<FleetBucket> FleetHistory::Buckets(FleetRange range) const
     return out;
 }
 
+std::vector<FleetBucket> FleetHistory::ClosedBucketsAfter(std::int64_t afterMillis, std::size_t limit) const
+{
+    if (limit == 0)
+        return {};
+
+    auto const width = RingWidthMillis(FleetRing::Minute);
+    auto const now = NowMillis();
+    // The bucket `now` falls in is still OPEN -- it gains a reading every sample --
+    // so the newest one that may travel is the one before it. Sending an open bucket
+    // would hand the leader a partial window it could never be told to correct.
+    auto const newestClosedStart = ((now / width) * width) - width;
+
+    auto const guard = std::scoped_lock { _mutex };
+    auto const& ring = _rings[static_cast<std::size_t>(FleetRing::Minute)];
+
+    // Selected by INDEX first, and the buckets copied only once the batch is known.
+    // A node catching up after a restart matches most of a day's ring, and a bucket
+    // is three hundred bytes: sorting the buckets themselves moved half a megabyte
+    // per heartbeat round to keep a hundred and twenty-eight of them, under this
+    // lock, while the sampler waited to record the next one.
+    std::vector<std::pair<std::int64_t, std::size_t>> chosen;
+    for (auto const index: std::views::iota(std::size_t { 0 }, ring.size()))
+    {
+        auto const& slot = ring[index];
+        if (!slot.present || slot.startMillis <= afterMillis || slot.startMillis > newestClosedStart)
+            continue;
+        chosen.emplace_back(slot.startMillis, index);
+    }
+
+    // A ring is stored by `number % slots`, so its iteration order is wherever the
+    // lap happens to sit rather than time order. Ordered here because "oldest first"
+    // is the whole of how a catch-up converges: taking an arbitrary 128 would leave
+    // the gap open forever. Only the prefix that fits is fully ordered.
+    auto const taken = std::min(limit, chosen.size());
+    std::ranges::partial_sort(chosen, chosen.begin() + static_cast<std::ptrdiff_t>(taken));
+
+    std::vector<FleetBucket> out;
+    out.reserve(taken);
+    for (auto const& [start, index]: std::span { chosen }.first(taken))
+        out.push_back(ring[index]);
+    return out;
+}
+
 std::uint64_t FleetHistory::Generation() const noexcept
 {
     auto const guard = std::scoped_lock { _mutex };
@@ -560,120 +795,94 @@ bool FleetHistory::ReadOnly() const noexcept
     return _readOnly;
 }
 
-bool FleetHistory::Save(std::filesystem::path const& path) const
+void FleetHistory::AppendBody(std::string& out) const
 {
-    std::string body;
+    // Its OWN lock, not the caller's. `FleetNodeHistories::Save` walks a map of
+    // these and holds only the map's mutex, so a body composed under that alone
+    // would be read while the machine it belongs to was still recording into it.
+    auto const guard = std::scoped_lock { _mutex };
+
+    // The whole of what this appends, so a store of a hundred machines does not
+    // grow its buffer twenty times per machine.
+    auto reserved = sizeof(std::uint64_t);
+    for (auto const& row: FleetRingTable)
+        reserved += sizeof(std::uint64_t) + (_rings[static_cast<std::size_t>(row.ring)].size() * BucketBytes);
+    out.reserve(out.size() + reserved);
+
+    AppendU64(out, _generation);
+    // One ring per table row, in enumerator order -- the same order `ReadVersion2`
+    // reads them back in, and the reason neither writes a ring count.
+    for (auto const& row: FleetRingTable)
     {
-        auto const guard = std::scoped_lock { _mutex };
-
-        // Refused BEFORE a byte is composed, and the file is left exactly as it was.
-        // A node rolled back to an older build read a history it could not
-        // understand; overwriting it would destroy a year of readings that the build
-        // it was rolled back FROM could still have read. Everything else in this
-        // class is recoverable by waiting.
-        if (_readOnly)
-            return false;
-
-        AppendU64(body, _generation);
-        // One ring per table row, in enumerator order -- the same order `ReadVersion2`
-        // reads them back in, and the reason neither writes a ring count.
-        for (auto const& row: FleetRingTable)
+        auto const& ring = _rings[static_cast<std::size_t>(row.ring)];
+        AppendU64(out, ring.size());
+        for (auto const& bucket: ring)
         {
-            auto const& ring = _rings[static_cast<std::size_t>(row.ring)];
-            AppendU64(body, ring.size());
-            for (auto const& bucket: ring)
+            AppendU64(out, static_cast<std::uint64_t>(bucket.startMillis));
+            AppendU64(out, static_cast<std::uint64_t>(bucket.sampleMillis));
+            AppendU64(out, bucket.present ? 1U : 0U);
+            AppendU64(out, bucket.coverage);
+            for (auto const value: bucket.values)
+                AppendU64(out, value);
+            for (auto const& fold: bucket.fold)
             {
-                AppendU64(body, static_cast<std::uint64_t>(bucket.startMillis));
-                AppendU64(body, static_cast<std::uint64_t>(bucket.sampleMillis));
-                AppendU64(body, bucket.present ? 1U : 0U);
-                AppendU64(body, bucket.coverage);
-                for (auto const value: bucket.values)
-                    AppendU64(body, value);
-                for (auto const& fold: bucket.fold)
-                {
-                    AppendU64(body, fold.low);
-                    AppendU64(body, fold.high);
-                    AppendU64(body, fold.total);
-                }
+                AppendU64(out, fold.low);
+                AppendU64(out, fold.high);
+                AppendU64(out, fold.total);
             }
         }
     }
+}
 
-    std::string file;
-    file.append(FileMagic.data(), FileMagic.size());
-    file.push_back(static_cast<char>(FileVersion));
-    AppendU64(file, body.size());
-    AppendU64(file, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
-    file += body;
-
-    // Temp then rename: a crash between the two leaves the previous file whole
-    // rather than half of this one.
-    auto const temp = std::filesystem::path { path }.concat(".tmp");
-    {
-        std::ofstream out { temp, std::ios::binary | std::ios::trunc };
-        if (!out)
-            return false;
-        out.write(file.data(), static_cast<std::streamsize>(file.size()));
-        if (!out)
-            return false;
-    }
-
-    std::error_code ec;
-    std::filesystem::rename(temp, path, ec);
-    if (ec)
-    {
-        std::filesystem::remove(temp, ec);
+bool FleetHistory::ReadBody(std::string_view body)
+{
+    LoadedHistory loaded;
+    BodyReader reader { body };
+    if (!ReadVersion2(reader, loaded))
         return false;
-    }
+
+    auto const guard = std::scoped_lock { _mutex };
+    _rings = std::move(loaded.rings);
+    _generation = loaded.generation;
     return true;
+}
+
+bool FleetHistory::Save(std::filesystem::path const& path) const
+{
+    // Refused BEFORE a byte is composed, and the file is left exactly as it was. A
+    // node rolled back to an older build read a history it could not understand;
+    // overwriting it would destroy a year of readings that the build it was rolled
+    // back FROM could still have read. Everything else in this class is recoverable
+    // by waiting.
+    if (ReadOnly())
+        return false;
+
+    auto file = FramedBuffer();
+    AppendBody(file);
+    return WriteFramed(path, RingFile, file);
 }
 
 bool FleetHistory::Load(std::filesystem::path const& path)
 {
-    std::ifstream in { path, std::ios::binary };
-    if (!in)
-        return false;
-
-    // Through the stream buffer rather than an iterator: GCC at -O3 inlines
-    // `istreambuf_iterator` far enough to trip `-Werror=null-dereference`, which
-    // this codebase has already worked around twice.
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    auto const raw = buffer.str();
-
-    constexpr std::size_t HeaderSize = FileMagic.size() + 1 + (sizeof(std::uint64_t) * 2);
-    if (raw.size() < HeaderSize)
-        return false;
-    if (!std::equal(FileMagic.begin(), FileMagic.end(), raw.begin()))
-        return false;
-
-    auto const version = static_cast<std::uint8_t>(raw[FileMagic.size()]);
-    auto const* format = FormatFor(version);
-    if (format == nullptr)
+    auto const opened = ReadFramed(path, RingFile);
+    if (opened.outcome == FramedOutcome::Newer)
     {
-        // The magic matched, so this IS one of ours -- and a version this build has no
-        // reader for, above the newest it knows, was written by a LATER build. Start
-        // empty, but never write: see `_readOnly`. A version below the oldest row is a
-        // format deliberately dropped, and overwriting that is the decision the row's
-        // removal already made.
-        if (version > FileVersion)
-        {
-            auto const guard = std::scoped_lock { _mutex };
-            _readOnly = true;
-        }
+        auto const guard = std::scoped_lock { _mutex };
+        _readOnly = true;
         return false;
     }
-
-    auto const declared = ReadU64(raw, FileMagic.size() + 1);
-    auto const checksum = ReadU64(raw, FileMagic.size() + 1 + sizeof(std::uint64_t));
-    std::string_view const body { raw.data() + HeaderSize, raw.size() - HeaderSize };
-    if (body.size() != declared)
+    if (opened.outcome != FramedOutcome::Ok)
         return false;
-    if (Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }) != checksum)
+
+    // A version at or below the newest this build writes, and still no reader, is a
+    // format deliberately dropped from the table. Overwriting that is the decision
+    // the row's removal already made.
+    auto const* const format = FormatFor(opened.version);
+    if (format == nullptr)
         return false;
 
     LoadedHistory loaded;
-    BodyReader reader { body };
+    BodyReader reader { opened.body };
     if (!format->read(reader, loaded))
         return false;
 
@@ -683,6 +892,221 @@ bool FleetHistory::Load(std::filesystem::path const& path)
     // client's cached chart match an ETag it had already been served.
     _generation = loaded.generation;
     return true;
+}
+
+FleetNodeHistories::FleetNodeHistories(IWallClock const& wall):
+    _wall { &wall }
+{
+}
+
+std::size_t FleetNodeHistories::AcceptHistory(std::string_view endpoint, std::span<FleetBucket const> buckets)
+{
+    // The map's lock covers finding the entry and moving its mark, and nothing else.
+    // Adopting a batch walks three rings up to a hundred and twenty-eight times, and
+    // doing that here would put every other machine's heartbeat behind this one's.
+    // The entry itself outlives the lock: nothing ever erases one, and the history is
+    // held by pointer so a rehash cannot move it.
+    Entry* entry = nullptr;
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        auto found = _nodes.find(endpoint);
+        if (found == _nodes.end())
+            found = _nodes
+                        .emplace(std::string { endpoint },
+                                 Entry { .history = std::make_unique<FleetHistory>(*_wall), .highWater = -1 })
+                        .first;
+        entry = &found->second;
+    }
+
+    std::size_t taken = 0;
+    for (auto const& bucket: buckets)
+    {
+        // At or below the mark is a replay, not news. Ignored rather than refused:
+        // the node is behaving correctly when it resends after a reply it never saw,
+        // and the only wrong answer here is to add the reading twice.
+        if (!bucket.present || bucket.startMillis <= entry->highWater)
+            continue;
+        entry->history->Adopt(bucket);
+        // Plain assignment: the guard above already established that this bucket is
+        // strictly newer, so a `max` could only ever pick it.
+        entry->highWater = bucket.startMillis;
+        ++taken;
+    }
+    return taken;
+}
+
+void FleetNodeHistories::BackfillInto(std::vector<FleetBucket>& into, FleetRange range) const
+{
+    // The steady-state case on a leader that has been up as long as the view is
+    // wide: every window is its own, and there is nothing to fill. Asked before a
+    // single machine's series is rendered, because rendering them all is the
+    // expensive half of this function.
+    if (std::ranges::none_of(into, [](FleetBucket const& each) { return !each.present; }))
+        return;
+
+    std::vector<FleetHistory const*> histories;
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        histories.reserve(_nodes.size());
+        for (auto const& [endpoint, entry]: _nodes)
+            histories.push_back(entry.history.get());
+    }
+    if (histories.empty())
+        return;
+
+    // Each machine's own view of the same windows, so the sums line up with the
+    // fleet view being filled rather than with whatever resolution happened to be
+    // stored. Rendered with the map's lock RELEASED: this is a page being drawn, and
+    // a heartbeat must not wait behind it.
+    std::vector<std::vector<FleetBucket>> perNode;
+    perNode.reserve(histories.size());
+    for (auto const* history: histories)
+        perNode.push_back(history->Buckets(range));
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, into.size()))
+    {
+        // A window this leader sampled is left alone. Its readings are the registry's
+        // own totals -- what the page has always plotted -- and replacing them with a
+        // sum assembled from a different set of machines would make the chart step
+        // wherever the two disagreed.
+        if (into[index].present)
+            continue;
+
+        FleetBucket filled = into[index];
+        auto contributors = std::size_t { 0 };
+        for (auto const& node: perNode)
+        {
+            if (index >= node.size() || !node[index].present)
+                continue;
+            ++contributors;
+            filled.sampleMillis = std::max(filled.sampleMillis, node[index].sampleMillis);
+            filled.coverage = std::max(filled.coverage, node[index].coverage);
+            for (auto const& row: FleetMetricTable)
+            {
+                // NODE-scoped only. A machine cannot answer for a dispatch outcome,
+                // so summing one would be summing zeroes into a number a reader would
+                // take for a measurement.
+                if (row.scope != FleetMetricScope::Node)
+                    continue;
+                auto const slot = static_cast<std::size_t>(row.metric);
+                filled.values[slot] += node[index].values[slot];
+                filled.fold[slot].low += node[index].fold[slot].low;
+                filled.fold[slot].high += node[index].fold[slot].high;
+                filled.fold[slot].total += node[index].fold[slot].total;
+            }
+        }
+
+        if (contributors == 0)
+            continue;
+        filled.present = true;
+        filled.backfilled = true;
+        into[index] = filled;
+    }
+}
+
+bool FleetNodeHistories::Save(std::filesystem::path const& path) const
+{
+    // The same refusal `FleetHistory::Save` makes, and for the same reason: a build
+    // that cannot read this file must not replace it with one it can.
+    std::vector<std::pair<std::string, Entry const*>> listed;
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        if (_readOnly)
+            return false;
+        listed.reserve(_nodes.size());
+        for (auto const& [endpoint, entry]: _nodes)
+            listed.emplace_back(endpoint, &entry);
+    }
+
+    // Composed with the map's lock RELEASED. One machine's series is most of a
+    // megabyte, so serializing a fleet of them under the lock every heartbeat has to
+    // take would put each inbound `Accept` behind all of it. Each `FleetHistory`
+    // guards itself, and nothing erases an entry once made.
+    auto file = FramedBuffer();
+    AppendU64(file, listed.size());
+    for (auto const& [endpoint, entry]: listed)
+    {
+        AppendU64(file, endpoint.size());
+        file += endpoint;
+        AppendU64(file, static_cast<std::uint64_t>(entry->highWater));
+        // The nested body, written by the very code that reads it back. A second copy
+        // of the ring encoding here would drift from that one the first time a bucket
+        // grew a field -- and would drift silently, because both halves would still
+        // round-trip against themselves.
+        //
+        // Its length is stamped afterwards rather than composed apart and joined,
+        // because joining copies the whole of it a second time.
+        auto const lengthAt = file.size();
+        AppendU64(file, 0);
+        auto const bodyAt = file.size();
+        entry->history->AppendBody(file);
+        WriteU64(file, lengthAt, file.size() - bodyAt);
+    }
+    return WriteFramed(path, NodeStoreFile, file);
+}
+
+bool FleetNodeHistories::Load(std::filesystem::path const& path)
+{
+    auto const opened = ReadFramed(path, NodeStoreFile);
+    if (opened.outcome == FramedOutcome::Newer)
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        _readOnly = true;
+        return false;
+    }
+    if (opened.outcome != FramedOutcome::Ok)
+        return false;
+
+    BodyReader reader { opened.body };
+    std::uint64_t count = 0;
+    if (!reader.Take(count))
+        return false;
+    // A count no body could hold is refused before anything is allocated against it,
+    // the same guard `ReadRing` applies to a bucket count.
+    if (count > opened.body.size())
+        return false;
+
+    std::map<std::string, Entry, std::less<>> restored;
+    for ([[maybe_unused]] auto const index: std::views::iota(std::uint64_t { 0 }, count))
+    {
+        std::uint64_t length = 0;
+        std::string_view endpoint;
+        std::uint64_t highWater = 0;
+        std::uint64_t nestedSize = 0;
+        std::string_view nested;
+        if (!reader.Take(length) || !reader.Take(length, endpoint) || !reader.Take(highWater) || !reader.Take(nestedSize)
+            || !reader.Take(nestedSize, nested))
+            return false;
+
+        auto history = std::make_unique<FleetHistory>(*_wall);
+        if (!history->ReadBody(nested))
+            return false;
+        restored.emplace(std::string { endpoint },
+                         Entry { .history = std::move(history), .highWater = static_cast<std::int64_t>(highWater) });
+    }
+
+    auto const guard = std::scoped_lock { _mutex };
+    _nodes = std::move(restored);
+    return true;
+}
+
+bool FleetNodeHistories::ReadOnly() const
+{
+    auto const guard = std::scoped_lock { _mutex };
+    return _readOnly;
+}
+
+std::size_t FleetNodeHistories::Count() const
+{
+    auto const guard = std::scoped_lock { _mutex };
+    return _nodes.size();
+}
+
+std::int64_t FleetNodeHistories::HighWaterFor(std::string_view endpoint) const
+{
+    auto const guard = std::scoped_lock { _mutex };
+    auto const found = _nodes.find(endpoint);
+    return found == _nodes.end() ? -1 : found->second.highWater;
 }
 
 } // namespace FastCache::Distributed

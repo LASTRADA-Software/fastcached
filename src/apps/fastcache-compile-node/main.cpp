@@ -210,6 +210,107 @@ constexpr int ExitUsage = 2;
 
 /// What `main` returns when the worker served until it was asked to stop.
 constexpr int ExitOk = 0;
+/// Everything one heartbeat round reads, so the round itself is a function rather
+/// than a hundred lines nested three deep inside `WorkerBody`.
+///
+/// References throughout: every one of these outlives the heartbeat thread, which is
+/// joined by its `jthread` before any of them goes.
+struct HeartbeatRound
+{
+    NodeConfig const& cfg;                        ///< Where the scheduler is.
+    std::vector<Cc::WorkerRegistrar>& registrars; ///< One per toolchain this node serves.
+    Node::WorkerServer const& server;             ///< For the in-flight count.
+    IHostLoadSampler& loadSampler;                ///< CPU, memory and scratch.
+    Node::CacheTier const* cacheTier;             ///< Null on a node with no cache.
+    IMetricsSink const& metrics;                  ///< Where the cache figures are read.
+    Node::FleetSampler& sampler;                  ///< This machine's own series.
+    Cc::Credential const& credential;             ///< What the scheduler requires.
+    ILogger& logger;                              ///< Where a refusal is named.
+};
+
+/// Announce this machine to every scheduler entry it serves, once.
+///
+/// Registration and heartbeating are one concern: a worker is registered exactly as
+/// long as it keeps saying so, and a scheduler that has forgotten it answers the
+/// heartbeat by telling it to register again. Splitting them would need the two
+/// halves to agree about which owns recovery.
+/// @param round What to announce and where to read it from.
+/// @param client A connected scheduler.
+void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
+{
+    // Counted rather than short-circuited: one toolchain the scheduler refuses must
+    // not stop the others from being announced, or a single bad entry silently
+    // un-registers the whole worker.
+    std::size_t accepted = 0;
+    auto const inFlight = static_cast<std::uint32_t>(round.server.InFlight());
+
+    // Sampled once per round rather than once per registrar: every entry describes
+    // the SAME machine, so sampling per toolchain would report several different
+    // views of one host and, worse, would cut the CPU interval into pieces too short
+    // to mean anything.
+    auto const sampled = round.loadSampler.Sample();
+    // The cache is sampled here too, and per ROUND rather than per registrar for the
+    // same reason: a node with two `--toolchain` flags is two registry entries
+    // against one machine and one cache, so both entries carry the same figures.
+    // Summing them across entries counts that cache twice, which is what
+    // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
+    auto load =
+        Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
+                                                        .cpuBusyPermille = sampled.cpuBusyPermille,
+                                                        .availableMemoryBytes = sampled.availableMemoryBytes,
+                                                        .freeScratchBytes = sampled.freeScratchBytes,
+                                                        .cache = Node::CacheLoadOf(round.cacheTier, round.metrics) });
+
+    // This machine's own closed buckets, so the fleet's record of it survives an
+    // election. Bounded per round: a node absent for a day has 1440 to hand over and
+    // a heartbeat has a payload ceiling, so a catch-up converges across rounds from
+    // the oldest end.
+    //
+    // Attached to the shared load and therefore sent once per registrar, which is
+    // redundant for a machine serving several toolchains and deliberately left so:
+    // the leader's high-water mark already makes a repeat a no-op, and threading a
+    // per-registrar payload through would buy a few kilobytes at the cost of the one
+    // place this is assembled.
+    auto const outbox = round.sampler.NextHistoryBatch(Wire::MaxHistoryBucketsPerHeartbeat);
+    load.history = Distributed::HistoryToWire(outbox);
+    // Set by a HEARTBEAT and by nothing else. `accepted` also counts a registration,
+    // which carries no history at all -- so a round where every heartbeat failed and
+    // one re-register succeeded would step the cursor over a batch never sent.
+    auto handedOver = false;
+
+    for (auto& registrar: round.registrars)
+    {
+        if (!registrar.WorkerId().empty() && registrar.Heartbeat(client, inFlight, load, round.credential))
+        {
+            ++accepted;
+            handedOver = true;
+            continue;
+        }
+
+        // The scheduler's own reason, logged per toolchain. The summary below can
+        // only say how many did not register, and "0 of 1" is exactly as much as an
+        // operator knew about a node that had silently dropped out of the fleet -- a
+        // fingerprint the scheduler will not accept, a cluster this node is not a
+        // member of, a leader that has moved.
+        if (auto const registered = registrar.Register(client, round.credential); registered.has_value())
+            ++accepted;
+        else
+            round.logger.Logf(LogLevel::Warn,
+                              "scheduler {} did not register {}: {}",
+                              round.cfg.scheduler,
+                              registrar.Fingerprint(),
+                              registered.error());
+    }
+    if (handedOver && !outbox.empty())
+        round.sampler.HistoryHandedThrough(outbox.back().startMillis);
+
+    bool const ok = accepted == round.registrars.size();
+    round.logger.Logf(ok ? LogLevel::Debug : LogLevel::Warn,
+                      "scheduler {}: {} of {} toolchain(s) registered",
+                      round.cfg.scheduler,
+                      accepted,
+                      round.registrars.size());
+}
 
 /// Serve until asked to stop.
 ///
@@ -488,29 +589,47 @@ constexpr int ExitOk = 0;
     // Declared AFTER the tiers it reads, which is what makes the pointers safe:
     // locals are destroyed in reverse, so the surface stops serving -- and joins
     // its thread -- before the scheduler, the cluster and the cache tier are gone.
-    auto surfaceOrRefusal = Node::StartAdminSurfaceOrExplain(
-        cfg,
-        *host,
-        metrics,
-        // Built by a function rather than spelled as a lambda here, for the reason
-        // above: a node with no cache must report NO cache rather than an empty
-        // one, and that branch has to be reachable from a test.
+    // Built by a function rather than spelled as a lambda here: a node with no cache
+    // must report NO cache rather than an empty one, and that branch has to be
+    // reachable from a test. Held in a local because the sampler and the scrape
+    // surface both read it, and they must not disagree about the machine.
+    auto snapshotProvider =
         Node::MakeNodeSnapshotProvider(Node::NodeScrapeSources { .host = host.get(),
                                                                  .busySlots = [&server] { return server.InFlight(); },
                                                                  .cache = cacheTier.get(),
                                                                  .slots = slots,
                                                                  .scratchRoot = jobs.ScratchRoot() },
-                                       std::chrono::steady_clock::now()),
-        // Absent when this node runs no scheduler: there is then no registry to
-        // report, so no fleet route is registered and `/fleet` is a plain 404.
-        schedulerTier ? std::optional { Distributed::FleetSources { .scheduler = &schedulerTier->Service(),
-                                                                    // Legitimately null: a node with no
-                                                                    // `--node-id` leads itself and has no
-                                                                    // replicated state for anybody to read.
-                                                                    .cluster = consensusTier.get(),
-                                                                    .metrics = &metrics } }
-                      : std::nullopt,
-        logger);
+                                       std::chrono::steady_clock::now());
+
+    // Absent when this node runs no scheduler: there is then no registry to report,
+    // so no fleet route is registered and `/fleet` is a plain 404.
+    auto const fleetSources = schedulerTier
+                                  ? std::optional { Distributed::FleetSources { .scheduler = &schedulerTier->Service(),
+                                                                                // Legitimately null: a node with no
+                                                                                // `--node-id` leads itself and has no
+                                                                                // replicated state for anybody to read.
+                                                                                .cluster = consensusTier.get(),
+                                                                                .metrics = &metrics } }
+                                  : std::nullopt;
+
+    // EVERY node samples itself, whatever surfaces it serves. A pure worker runs no
+    // dashboard and often no admin endpoint at all, and it is exactly the machine
+    // doing the compiles -- so a sampler that existed only alongside a page would
+    // leave the fleet's year with a hole where its busiest members should be.
+    //
+    // Declared AFTER the tiers it reads and BEFORE the surface that reads it, which
+    // is what makes both sets of pointers safe: locals are destroyed in reverse.
+    static SystemWallClock const wall;
+    Node::FleetSampler sampler { fleetSources, metrics, snapshotProvider, wall, Node::HistoryPaths::For(cfg), logger };
+
+    // Wired here because this is the one scope holding both: the scheduler tier is
+    // built before the sampler that receives for it, so the sink cannot be a
+    // constructor argument on either.
+    if (schedulerTier != nullptr)
+        schedulerTier->SetHistorySink(&sampler.Received());
+
+    auto surfaceOrRefusal =
+        Node::StartAdminSurfaceOrExplain(cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, logger);
 
     // Fatal rather than a warning, unlike the daemon's: an operator who asked a
     // *worker* for an endpoint is almost always wiring a probe to it, and a worker
@@ -594,6 +713,17 @@ constexpr int ExitOk = 0;
     // so the `SyncRun` inside it is sound by construction rather than by comment.
     BlockingConnector heartbeatConnector { DefaultAddressResolver(),
                                            BlockingConnectorOptions { .ioTimeout = HeartbeatIoTimeout } };
+
+    HeartbeatRound const round { .cfg = cfg,
+                                 .registrars = registrars,
+                                 .server = server,
+                                 .loadSampler = *loadSampler,
+                                 .cacheTier = cacheTier.get(),
+                                 .metrics = metrics,
+                                 .sampler = sampler,
+                                 .credential = credential,
+                                 .logger = logger };
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
@@ -601,61 +731,7 @@ constexpr int ExitOk = 0;
             if (client == nullptr)
                 logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
             else
-            {
-                // Counted rather than short-circuited: one toolchain the scheduler
-                // refuses must not stop the others from being announced, or a
-                // single bad entry silently un-registers the whole worker.
-                std::size_t accepted = 0;
-                auto const inFlight = static_cast<std::uint32_t>(server.InFlight());
-
-                // Sampled once per round rather than once per registrar: every
-                // entry describes the SAME machine, so sampling per toolchain would
-                // report several different views of one host and, worse, would cut
-                // the CPU interval into pieces too short to mean anything.
-                auto const sampled = loadSampler->Sample();
-                // The cache is sampled here too, and per ROUND rather than per
-                // registrar for the same reason: a node with two `--toolchain`
-                // flags is two registry entries against one machine and one cache,
-                // so both entries carry the same figures. Summing them across
-                // entries counts that cache twice, which is what
-                // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
-                auto const load =
-                    Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
-                                                                    .cpuBusyPermille = sampled.cpuBusyPermille,
-                                                                    .availableMemoryBytes = sampled.availableMemoryBytes,
-                                                                    .freeScratchBytes = sampled.freeScratchBytes,
-                                                                    .cache = Node::CacheLoadOf(cacheTier.get(), metrics) });
-
-                for (auto& registrar: registrars)
-                {
-                    if (!registrar.WorkerId().empty() && registrar.Heartbeat(*client, inFlight, load, credential))
-                    {
-                        ++accepted;
-                        continue;
-                    }
-
-                    // The scheduler's own reason, logged per toolchain. The
-                    // summary below can only say how many did not register, and
-                    // "0 of 1" is exactly as much as an operator knew about a
-                    // node that had silently dropped out of the fleet -- a
-                    // fingerprint the scheduler will not accept, a cluster this
-                    // node is not a member of, a leader that has moved.
-                    if (auto const registered = registrar.Register(*client, credential); registered.has_value())
-                        ++accepted;
-                    else
-                        logger.Logf(LogLevel::Warn,
-                                    "scheduler {} did not register {}: {}",
-                                    cfg.scheduler,
-                                    registrar.Fingerprint(),
-                                    registered.error());
-                }
-                bool const ok = accepted == registrars.size();
-                logger.Logf(ok ? LogLevel::Debug : LogLevel::Warn,
-                            "scheduler {}: {} of {} toolchain(s) registered",
-                            cfg.scheduler,
-                            accepted,
-                            registrars.size());
-            }
+                AnnounceOnce(round, *client);
 
             // Slept in slices so a stop request is observed promptly: a worker that
             // took a full heartbeat interval to exit would hold its port that long
@@ -707,6 +783,14 @@ constexpr int ExitOk = 0;
                 toolchains.size());
 
     SyncRun(server.Run());
+
+    // Unwired BEFORE the sampler goes, and that ordering is the whole reason this
+    // line exists: locals are destroyed in reverse declaration order, so the
+    // scheduler tier -- declared before the sampler because the sampler reads its
+    // registry -- outlives the store it routes to. A heartbeat arriving in that
+    // window would file a machine's buckets through a pointer to a destroyed one.
+    if (schedulerTier != nullptr)
+        schedulerTier->SetHistorySink(nullptr);
 
     // Unblocks the admin accept loop so its jthread can join -- without this the
     // destructor's implicit join waits on a thread parked in accept(), and a worker

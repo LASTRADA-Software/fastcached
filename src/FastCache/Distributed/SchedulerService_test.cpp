@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -8,11 +9,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <format>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include <tests/FleetHistoryFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -221,6 +226,71 @@ TEST_CASE("A member registers, heartbeats and is leased", "[distributed][schedul
     REQUIRE(grant.has_value());
     CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "10.0.0.2:7100");
     CHECK_FALSE(Unwrap(grant).leaseToken.empty());
+}
+
+TEST_CASE("A heartbeat's history is routed under the machine, not the worker id", "[distributed][scheduler][fleethistory]")
+{
+    // A machine with two `--toolchain` flags registers twice and heartbeats twice
+    // with the same figures. Keyed per worker id the fleet would hold one machine's
+    // series once per toolchain and sum it that many times -- the rule
+    // `WorkerRegistry::NodeCaches()` already exists to enforce on the neighbouring
+    // number.
+    Leading fleet;
+    Testing::RecordingHistorySink sink;
+    fleet.service.SetHistorySink(&sink);
+
+    auto const first = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100"));
+    auto const second = fleet.service.Register(Insider, OneSlot("clang-20", "10.0.0.2:7100"));
+    REQUIRE(first.status == Wire::Status::Ok);
+    REQUIRE(second.status == Wire::Status::Ok);
+
+    auto const batch = std::array { Testing::ClosedBucket(60'000), Testing::ClosedBucket(120'000) };
+    for (auto const& reply: { first, second })
+        CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(reply.payload) }, NodeLoad {}, batch).status
+              == Wire::Status::Ok);
+
+    REQUIRE(sink.calls.size() == 2);
+    for (auto const& call: sink.calls)
+    {
+        CHECK(call.endpoint == "10.0.0.2:7100");
+        CHECK(call.buckets.size() == 2);
+    }
+}
+
+TEST_CASE("History from a worker the scheduler does not know is not routed", "[distributed][scheduler][fleethistory]")
+{
+    // The refusal is what tells the node to register again. Taking the readings
+    // anyway would file them under an endpoint this scheduler cannot name, because
+    // the endpoint comes from the registry entry that is missing.
+    Leading fleet;
+    Testing::RecordingHistorySink sink;
+    fleet.service.SetHistorySink(&sink);
+
+    auto const batch = std::array { Testing::ClosedBucket(60'000) };
+    CHECK(fleet.service.Heartbeat(Insider, "worker-that-never-was", NodeLoad {}, batch).error
+          == Wire::ErrorCode::UnknownLease);
+    CHECK(sink.calls.empty());
+
+    // And a heartbeat carrying nothing reaches no sink at all, so an empty batch is
+    // not a machine reporting an empty window.
+    auto const admitted = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100"));
+    REQUIRE(admitted.status == Wire::Status::Ok);
+    CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(admitted.payload) }, NodeLoad {}).status
+          == Wire::Status::Ok);
+    CHECK(sink.calls.empty());
+}
+
+TEST_CASE("A scheduler with no history sink still heartbeats", "[distributed][scheduler][fleethistory]")
+{
+    // The sink is wiring the admin surface installs, and a node that runs no
+    // dashboard installs none. The verb must not depend on it.
+    Leading fleet;
+    auto const admitted = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.4:7100"));
+    REQUIRE(admitted.status == Wire::Status::Ok);
+
+    auto const batch = std::array { Testing::ClosedBucket(60'000) };
+    CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(admitted.payload) }, NodeLoad {}, batch).status
+          == Wire::Status::Ok);
 }
 
 TEST_CASE("A worker that names no slot count is sized from its own hardware", "[distributed][scheduler]")

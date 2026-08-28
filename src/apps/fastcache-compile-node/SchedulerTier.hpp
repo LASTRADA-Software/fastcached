@@ -86,6 +86,19 @@ class SchedulerTier
         return _service;
     }
 
+    /// Route handed-over history somewhere, or nowhere.
+    ///
+    /// A WIRING door rather than a verb, like `SetRole` and `Administer` above it:
+    /// the sink lives with the sampler, which is built after this tier that it
+    /// receives for. A forwarder rather than a mutable `Service()`, so the rule
+    /// stated there -- a report can read the fleet and cannot change it -- still
+    /// holds for every other caller.
+    /// @param sink Where to route it; must outlive this tier.
+    void SetHistorySink(Distributed::IFleetHistorySink* sink) noexcept
+    {
+        _service.SetHistorySink(sink);
+    }
+
     /// The address the scheduler surface bound.
     [[nodiscard]] std::string const& BoundEndpoint() const noexcept
     {

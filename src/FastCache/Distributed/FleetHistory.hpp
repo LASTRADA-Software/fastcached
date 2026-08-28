@@ -3,212 +3,23 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/FleetSample.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace FastCache::Distributed
 {
-
-/// One number a sample records.
-///
-/// Nine slots rather than nine members, so a tenth is a row and every walk over
-/// them -- sampling, encoding, decoding, rendering -- picks it up without being
-/// edited. The five dispatch counters are `LeaseOutcomeTable`'s, read through the
-/// same `IMetricsSink::Counter` values so the page and the history cannot drift
-/// into two vocabularies for one fact.
-enum class FleetMetric : std::uint8_t
-{
-    DispatchGranted = 0, ///< Cumulative: compiles handed to a worker.
-    DispatchNoWorker,    ///< Cumulative: nothing registered for that toolchain.
-    DispatchNoCapacity,  ///< Cumulative: every matching worker full of our own work.
-    DispatchWithdrawn,   ///< Cumulative: a ceiling withdrew the slots.
-    DispatchDuplicate,   ///< Cumulative: already being built somewhere.
-    CacheHits,           ///< Cumulative, summed over machines.
-    CacheMisses,         ///< Cumulative, summed over machines.
-    OfferableSlots,      ///< Gauge: slots a compile could start on.
-    JobsInFlight,        ///< Gauge: this fleet's compiles running.
-    Last
-};
-
-/// Whether a slot accumulates or is read afresh each time.
-///
-/// The distinction is load-bearing at render: a counter's *rate* is the
-/// difference between two buckets, while a gauge's value is the bucket itself.
-/// Getting it wrong draws a monotonic ramp for everything.
-enum class FleetMetricKind : std::uint8_t
-{
-    Counter = 0, ///< Monotonic; the interesting quantity is the delta.
-    Gauge,       ///< A level; the interesting quantity is the value.
-};
-
-/// Whether a MACHINE can answer for a slot about itself.
-///
-/// Not "which series carries it" -- the fleet series carries every slot, because a
-/// leader can answer for all nine and its readings are fleet-wide sums. This is the
-/// narrower question the node series asks: is there a version of this number that is
-/// true of one machine, whoever happens to be leading?
-///
-/// For a cache figure or a slot count there is, and it is what that machine did. For
-/// a dispatch outcome there is not: only a scheduler produces one, a follower has
-/// none, and a follower reporting zero refusals is indistinguishable from a leader
-/// that genuinely refused none.
-enum class FleetMetricScope : std::uint8_t
-{
-    /// A machine can answer this about itself: its cache, its slots, its compiles.
-    Node = 0,
-    /// Only a scheduler can, and only a leader has one that means anything.
-    Fleet,
-    Last
-};
-
-/// What one slot is, for the walks that need to know.
-struct FleetMetricRow
-{
-    FleetMetric metric;     ///< The slot this row describes.
-    FleetMetricKind kind;   ///< Delta or level.
-    FleetMetricScope scope; ///< Who can answer for it.
-    std::string_view key;   ///< Stable name, for JSON and for the on-disk header.
-};
-
-/// Every slot, in enumerator order.
-inline constexpr EnumTable<FleetMetric, FleetMetricRow> FleetMetricTable {
-    FleetMetricRow { .metric = FleetMetric::DispatchGranted,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Fleet,
-                     .key = "granted" },
-    FleetMetricRow { .metric = FleetMetric::DispatchNoWorker,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Fleet,
-                     .key = "no-worker" },
-    FleetMetricRow { .metric = FleetMetric::DispatchNoCapacity,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Fleet,
-                     .key = "no-capacity" },
-    FleetMetricRow { .metric = FleetMetric::DispatchWithdrawn,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Fleet,
-                     .key = "withdrawn" },
-    FleetMetricRow { .metric = FleetMetric::DispatchDuplicate,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Fleet,
-                     .key = "duplicate" },
-    FleetMetricRow { .metric = FleetMetric::CacheHits,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Node,
-                     .key = "cache-hits" },
-    FleetMetricRow { .metric = FleetMetric::CacheMisses,
-                     .kind = FleetMetricKind::Counter,
-                     .scope = FleetMetricScope::Node,
-                     .key = "cache-misses" },
-    FleetMetricRow { .metric = FleetMetric::OfferableSlots,
-                     .kind = FleetMetricKind::Gauge,
-                     .scope = FleetMetricScope::Node,
-                     .key = "offerable" },
-    FleetMetricRow { .metric = FleetMetric::JobsInFlight,
-                     .kind = FleetMetricKind::Gauge,
-                     .scope = FleetMetricScope::Node,
-                     .key = "in-flight" },
-};
-static_assert(RowsInEnumeratorOrder(FleetMetricTable, &FleetMetricRow::metric));
-
-/// Both scopes are populated, or the split this table exists to express does nothing.
-///
-/// A table where every row said `Fleet` would make a node record nothing about itself
-/// and read exactly like the leadership guard this replaced; one where every row said
-/// `Node` would have a follower reporting dispatch counters it never produced. Either
-/// is silent, and both survive every other check here.
-static_assert(std::ranges::any_of(FleetMetricTable,
-                                  [](FleetMetricRow const& row) { return row.scope == FleetMetricScope::Node; })
-                  && std::ranges::any_of(FleetMetricTable,
-                                         [](FleetMetricRow const& row) { return row.scope == FleetMetricScope::Fleet; }),
-              "a scope no row carries is a split that quietly does nothing");
-
-/// What folding several samples into one bucket kept, per slot.
-///
-/// A bucket wider than the sample interval is a fold, and a fold that kept only its
-/// last reading has thrown away the part an operator reads: **a refusal spike
-/// averaged over a day is invisible**, and a gauge's floor -- the moment the fleet
-/// had nothing left -- is the end that matters. Neither is recoverable afterwards,
-/// so both are computed while folding.
-///
-/// What each field means depends on the slot's `FleetMetricKind`, and that is the
-/// same split `values` already lives with: a counter's interesting quantity is its
-/// delta and a gauge's is its level.
-struct FleetFold
-{
-    /// Gauge: the smallest reading in the bucket. Unused by a counter, whose floor
-    /// is a rate rather than a level and is not a fact anybody acts on.
-    std::uint64_t low { 0 };
-
-    /// Gauge: the largest reading. Counter: the largest per-SAMPLE delta folded in
-    /// -- the peak rate inside the window, which is exactly what an average over a
-    /// day destroys.
-    std::uint64_t high { 0 };
-
-    /// Gauge: the readings summed, so a mean survives alongside `coverage`. Unused
-    /// by a counter, whose mean over a window is the delta across it and needs no
-    /// second number.
-    std::uint64_t total { 0 };
-};
-
-/// One bucket of the history.
-///
-/// `present` rather than a sentinel value, because zero is a legitimate reading
-/// for every slot here. A bucket nobody sampled is a **gap** -- a fleet that did
-/// nothing and a fleet nobody was watching are different facts, and the page draws
-/// them differently.
-struct FleetBucket
-{
-    /// Wall-clock start of the bucket, in milliseconds since the epoch.
-    ///
-    /// Wall clock and not `TimePoint`: this outlives the process, and a steady
-    /// clock's origin is meaningless across a restart.
-    std::int64_t startMillis { 0 };
-
-    /// Wall-clock instant the reading in `values` was actually taken.
-    ///
-    /// Separate from `startMillis` because the two answer different questions and
-    /// only one of them can be the bucket's x-position. `Buckets()` folds a window
-    /// down to its newest sample and then stamps the WINDOW's start on it, so the
-    /// chart's points are evenly spaced -- which is right for plotting and wrong
-    /// for dividing by. The newest bucket is always still open, so a rate that
-    /// divided the delta by the nominal width reported a fraction of the truth on
-    /// exactly the point an operator reads first.
-    ///
-    /// Persisted, and it has to be. That was once derived from the stored bucket's
-    /// own `startMillis`, on the argument that a ring's bucket IS its sample instant
-    /// at sub-bucket granularity -- true when the coarsest ring was the hour a Week
-    /// view read one-for-one, and false the moment a ring folds sixty samples into a
-    /// bucket. Restoring a partly-sampled day bucket with its window's start would
-    /// divide its delta by a nominal twenty-four hours, which is precisely the error
-    /// this field exists to prevent.
-    std::int64_t sampleMillis { 0 };
-    EnumTable<FleetMetric, std::uint64_t> values {}; ///< Raw readings, counters cumulative.
-
-    /// What was lost between the first reading in this bucket and `values`.
-    ///
-    /// Meaningful only where `coverage` exceeds one; in the base ring a bucket is
-    /// one sample and every field here equals the reading itself.
-    EnumTable<FleetMetric, FleetFold> fold {};
-
-    /// How many samples folded into this bucket.
-    ///
-    /// The third state. `present` distinguishes *nobody sampled* from *somebody
-    /// did*; this distinguishes a day a node contributed three hours to from one it
-    /// contributed twenty-four to, which are both `present` and must not be
-    /// compared like for like. A node absent for most of a year is the ORDINARY
-    /// case for a workstation on a VPN, not an edge one.
-    std::uint64_t coverage { 0 };
-
-    bool present { false }; ///< False means nobody sampled this bucket.
-};
 
 /// How often a sample is taken, and therefore what every ring is fed by.
 ///
@@ -424,10 +235,44 @@ class FleetHistory
     /// @param values The nine readings, counters cumulative.
     void Record(EnumTable<FleetMetric, std::uint64_t> const& values);
 
+    /// Replay a bucket another machine recorded, at ITS instant rather than now.
+    ///
+    /// The leader's half of the handover. Identical to `Record` except for where the
+    /// timestamp comes from -- which is the whole point: a bucket arriving over a
+    /// heartbeat describes a window that has already closed, and stamping it with the
+    /// moment it happened to arrive would pile a node's whole catch-up into one
+    /// window and leave the rest of the day a gap.
+    ///
+    /// Folds into the coarse rings exactly as a live sample does, so a node's sixty
+    /// adopted minutes become one hour bucket with a coverage of sixty rather than
+    /// sixty separate claims.
+    /// @param bucket What the other machine reported.
+    void Adopt(FleetBucket const& bucket);
+
     /// The buckets a range renders, oldest first, gaps included.
     /// @param range Which view.
     /// @return Exactly `FleetRangeTable[range].points` buckets.
     [[nodiscard]] std::vector<FleetBucket> Buckets(FleetRange range) const;
+
+    /// Closed base-ring buckets newer than @p afterMillis, oldest first.
+    ///
+    /// What a node hands to its leader. **Closed only**: the newest bucket is still
+    /// open and gains a reading every sample, so shipping it would send a partial
+    /// window that the leader could never correct.
+    ///
+    /// Oldest first and bounded, because a node absent for a day has 1440 of these
+    /// and a heartbeat has a payload ceiling -- so a catch-up makes progress from the
+    /// far end across rounds rather than resending the newest and never closing the
+    /// gap.
+    ///
+    /// The BASE ring only. The coarser rings are folds of it, and a leader recording
+    /// these into its own history folds them again itself -- shipping all three would
+    /// be shipping the same readings three times.
+    ///
+    /// @param afterMillis Exclusive lower bound on `startMillis`; -1 for everything.
+    /// @param limit At most this many.
+    /// @return The buckets, oldest first.
+    [[nodiscard]] std::vector<FleetBucket> ClosedBucketsAfter(std::int64_t afterMillis, std::size_t limit) const;
 
     /// How many buckets have closed since this object was made.
     ///
@@ -481,6 +326,33 @@ class FleetHistory
     [[nodiscard]] bool ReadOnly() const noexcept;
 
   private:
+    /// The store nests one of these per machine inside its own file.
+    ///
+    /// A friend rather than a public body accessor, because `AppendBody`/`ReadBody`
+    /// are a serialization detail of this class and nothing else has business
+    /// reaching them -- a public one would be an invitation to write a third encoder
+    /// that drifts from these two.
+    friend class FleetNodeHistories;
+
+    /// This history's rings, as they sit in a file.
+    ///
+    /// Exposed so `FleetNodeHistories` can nest one per machine inside its own file
+    /// rather than carrying a second copy of the ring encoding -- which would drift
+    /// from this one the first time a bucket grew a field, and drift silently,
+    /// because both halves would still round-trip against themselves.
+    /// @param out Appended to.
+    void AppendBody(std::string& out) const;
+
+    /// Read rings back from a nested body.
+    /// @param body The bytes `AppendBody` wrote.
+    /// @return True when they were understood.
+    bool ReadBody(std::string_view body);
+
+    /// One reading at a stated instant; `Record` and `Adopt` differ only in that.
+    /// @param now When the reading was taken.
+    /// @param values The reading.
+    void RecordAt(std::int64_t now, EnumTable<FleetMetric, std::uint64_t> const& values);
+
     [[nodiscard]] std::int64_t NowMillis() const noexcept;
 
     IWallClock const* _wall;
@@ -522,6 +394,97 @@ class FleetHistory
     /// year of readings the newer build could still have read -- so it keeps the
     /// file and refuses to write, rather than starting empty and saving over it.
     /// Everything else here is recoverable by waiting; this is not.
+    bool _readOnly { false };
+};
+
+/// Every node's own series, as the leader received them.
+///
+/// One history per NODE ENDPOINT, never per registry entry: a worker with two
+/// `--toolchain` flags registers twice against one machine and both entries
+/// heartbeat the same figures, so keying per entry would count one machine twice --
+/// the rule `WorkerRegistry::NodeCaches()` already exists to enforce.
+///
+/// This is what makes a fleet's record survive an election. The leader's own fleet
+/// series only covers windows it was leading for; these cover the rest, because each
+/// machine kept recording itself throughout.
+class FleetNodeHistories final: public IFleetHistorySink
+{
+  public:
+    /// @param wall Where a bucket's timestamp comes from; injected so a test can place one.
+    explicit FleetNodeHistories(IWallClock const& wall);
+
+    /// Take what a node handed over.
+    ///
+    /// **Idempotent.** A bucket at or below what this endpoint has already
+    /// contributed is ignored, so a heartbeat redelivered after a reply the node
+    /// never saw cannot count twice. That high-water mark is what lets the wire carry
+    /// no acknowledgement at all: the node advances its own watermark on a successful
+    /// heartbeat and the leader is safe against the replay that follows a lost one.
+    ///
+    /// @param endpoint Which machine reported.
+    /// @param buckets Its closed buckets, oldest first.
+    /// @return How many were new.
+    std::size_t AcceptHistory(std::string_view endpoint, std::span<FleetBucket const> buckets) override;
+
+    /// Fill a rendered fleet view's gaps by summing what the nodes reported.
+    ///
+    /// **Gaps only.** A window this leader sampled itself is left exactly as it is:
+    /// its readings are the registry's own totals and are what the page has always
+    /// plotted. Only a window with no reading at all is filled, and it is then marked
+    /// `backfilled` so nothing reads a dispatch counter off it.
+    ///
+    /// @param into The fleet view, as `FleetHistory::Buckets` returned it.
+    /// @param range Which view, so the same windows are summed.
+    void BackfillInto(std::vector<FleetBucket>& into, FleetRange range) const;
+
+    /// How many machines have reported.
+    [[nodiscard]] std::size_t Count() const;
+
+    /// The newest bucket start this endpoint has contributed, or -1.
+    /// @param endpoint Which machine.
+    /// @return Its high-water mark.
+    [[nodiscard]] std::int64_t HighWaterFor(std::string_view endpoint) const;
+
+    /// Read a saved store back.
+    ///
+    /// Every failure -- absent, short, wrong version, bad checksum -- starts empty
+    /// and says so, exactly as `FleetHistory::Load` does. History is a convenience,
+    /// and no state of this file may keep a node from starting.
+    /// @param path Where `Save` wrote.
+    /// @return True when anything was restored.
+    bool Load(std::filesystem::path const& path);
+
+    /// Whether `Load` found a file a LATER build wrote, which is never written over.
+    /// @return True when this store will refuse to save.
+    [[nodiscard]] bool ReadOnly() const;
+
+    /// Write the store out, atomically.
+    ///
+    /// Not an optimisation. A node advances its own watermark once a heartbeat is
+    /// accepted and never resends, so a leader that forgot what it had been handed
+    /// would leave those windows a gap for as long as the rings hold them -- which is
+    /// the failure this whole phase removes, reintroduced by a restart.
+    /// @param path Where to write.
+    /// @return True on success.
+    [[nodiscard]] bool Save(std::filesystem::path const& path) const;
+
+  private:
+    IWallClock const* _wall;
+    mutable std::mutex _mutex;
+
+    /// One entry per machine: its series, and how far it has reported.
+    struct Entry
+    {
+        std::unique_ptr<FleetHistory> history; ///< What that machine recorded.
+        std::int64_t highWater { -1 };         ///< Newest `startMillis` accepted from it.
+    };
+    std::map<std::string, Entry, std::less<>> _nodes;
+
+    /// Set when `Load` read a file a LATER build wrote; see `FleetHistory::_readOnly`.
+    ///
+    /// The same rule, because it is the same loss: this store holds every OTHER
+    /// machine's year, so overwriting one a newer build could still have read
+    /// discards more than a node's own file does, not less.
     bool _readOnly { false };
 };
 

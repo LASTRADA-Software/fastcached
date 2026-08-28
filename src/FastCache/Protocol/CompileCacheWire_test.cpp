@@ -441,10 +441,12 @@ TEST_CASE("Every dispatch verb round-trips its fields")
         // Every field a distinct value again, and the three inside the load record
         // are of two different widths -- which is where a transposition here would
         // land, since swapping the two u64s is the one mistake that still decodes.
-        auto const frame = EncodeHeartbeat(
-            "w7",
-            3,
-            LoadFields { .cpuBusyPermille = 640, .availableMemoryBytes = 8589934592, .freeScratchBytes = 274877906944 });
+        auto const frame = EncodeHeartbeat("w7",
+                                           3,
+                                           LoadFields { .cpuBusyPermille = 640,
+                                                        .availableMemoryBytes = 8589934592,
+                                                        .freeScratchBytes = 274877906944,
+                                                        .history = {} });
         auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).workerId) == "w7");
@@ -580,7 +582,9 @@ TEST_CASE("A load record tells silence apart from a measured zero")
     SECTION("a worker reporting a measured zero")
     {
         auto const frame = EncodeHeartbeat(
-            "w1", 0, LoadFields { .cpuBusyPermille = 0, .availableMemoryBytes = std::nullopt, .freeScratchBytes = 0 });
+            "w1",
+            0,
+            LoadFields { .cpuBusyPermille = 0, .availableMemoryBytes = std::nullopt, .freeScratchBytes = 0, .history = {} });
         auto const decoded = DecodeHeartbeatPayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         REQUIRE(Unwrap(decoded).load.cpuBusyPermille.has_value());
@@ -749,4 +753,92 @@ TEST_CASE("The scheduler's control verbs are bounded well below the session cap"
     // COMPILE is the deliberate exception: it carries a preprocessed translation
     // unit, so the operator's own cap is the only sensible bound.
     CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::Compile), SessionCap) == SessionCap);
+}
+
+TEST_CASE("A heartbeat carries closed history buckets and gets them back", "[wire][compile-cache][history]")
+{
+    using namespace FastCache::CompileCacheWire;
+
+    LoadFields sent {};
+    sent.cpuBusyPermille = 420;
+    for (auto const index: std::views::iota(0, 3))
+    {
+        HistoryBucketFields bucket {};
+        bucket.startMillis = 1'700'000'000'000 + (static_cast<std::uint64_t>(index) * 60'000);
+        bucket.sampleMillis = bucket.startMillis + 137;
+        bucket.values[5] = static_cast<std::uint64_t>(index) * 11; // cache hits
+        bucket.values[8] = static_cast<std::uint64_t>(index) % 4;  // in flight
+        sent.history.push_back(bucket);
+    }
+
+    auto const decoded = DecodeLoad(EncodeLoad(sent));
+    REQUIRE(decoded.has_value());
+    auto const& read = Unwrap(decoded);
+    REQUIRE(read.history.size() == sent.history.size());
+    for (auto const index: std::views::iota(std::size_t { 0 }, sent.history.size()))
+    {
+        INFO("bucket " << index);
+        CHECK(read.history[index].startMillis == sent.history[index].startMillis);
+        // Carried rather than derived: a ring that folds sixty readings has no way to
+        // recover when the last of them landed, and a rate divided by a nominal width
+        // instead of the span observed understates by whatever was never sampled.
+        CHECK(read.history[index].sampleMillis == sent.history[index].sampleMillis);
+        CHECK(read.history[index].values == sent.history[index].values);
+    }
+    // The fields beside it are untouched: this is an addition to the nested record,
+    // not a reshaping of it.
+    CHECK(read.cpuBusyPermille == sent.cpuBusyPermille);
+}
+
+TEST_CASE("A heartbeat from a peer that sends no history is not a refusal", "[wire][compile-cache][history]")
+{
+    using namespace FastCache::CompileCacheWire;
+
+    // What every build before this field looks like on the wire: the nested record
+    // simply ends earlier. It has to decode to "no buckets" rather than to a
+    // rejection, or the field could never have been added at all -- a refused
+    // heartbeat is a worker the fleet stops seeing.
+    LoadFields older {};
+    older.availableMemoryBytes = 4096;
+    auto const encoded = WireFields::Encode({ std::span<std::byte const> {},
+                                              std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(4096) },
+                                              std::span<std::byte const> {},
+                                              std::span<std::byte const> { EncodeCacheLoad(CacheLoadFields {}) } });
+
+    auto const decoded = DecodeLoad(encoded);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).history.empty());
+    CHECK(Unwrap(decoded).availableMemoryBytes == older.availableMemoryBytes);
+}
+
+TEST_CASE("A history batch above the ceiling is refused, not truncated", "[wire][compile-cache][history]")
+{
+    using namespace FastCache::CompileCacheWire;
+
+    // The encoder takes at most the ceiling, oldest first, and the rest wait for the
+    // next round -- a node absent for a day has 1440 buckets to hand over.
+    std::vector<HistoryBucketFields> many(MaxHistoryBucketsPerHeartbeat + 40);
+    for (auto const index: std::views::iota(std::size_t { 0 }, many.size()))
+        many[index].startMillis = 1'700'000'000'000 + (index * 60'000);
+
+    auto const decoded = DecodeHistoryBuckets(EncodeHistoryBuckets(many));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).size() == MaxHistoryBucketsPerHeartbeat);
+    // Oldest first, so a catch-up makes progress from the far end rather than
+    // repeatedly resending the newest and never closing the gap.
+    CHECK(Unwrap(decoded).front().startMillis == many.front().startMillis);
+
+    // And a PEER that ignores the ceiling is refused rather than quietly clipped:
+    // keeping the first 128 would leave the rest looking delivered.
+    std::vector<std::span<std::byte const>> overSized;
+    std::vector<std::vector<std::byte>> owned;
+    for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, MaxHistoryBucketsPerHeartbeat + 1))
+    {
+        owned.push_back(WireFields::Encode({ std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(0) },
+                                             std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(0) },
+                                             std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(0) },
+                                             std::span<std::byte const> {} }));
+        overSized.emplace_back(owned.back());
+    }
+    CHECK_FALSE(DecodeHistoryBuckets(WireFields::Encode(WireFields::FieldList { overSized })).has_value());
 }

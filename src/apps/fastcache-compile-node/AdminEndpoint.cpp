@@ -215,19 +215,19 @@ namespace
     /// @return The rendered answer, or a bodyless `304`.
     template <typename Render>
     [[nodiscard]] AdminResponse Conditional(AdminRequest const& request,
-                                            FleetHistorySource const& history,
+                                            IFleetHistoryView const* history,
                                             Distributed::FleetRange range,
                                             std::string const& identity,
                                             std::string_view status,
                                             std::string_view contentType,
                                             Render&& render)
     {
-        if (history.history == nullptr)
+        if (history == nullptr)
             return AdminResponse { .status = "503 Service Unavailable",
                                    .contentType = "text/plain",
                                    .body = "this node keeps no fleet history\n" };
 
-        auto const tag = std::format(R"("{}-{}")", identity, history.history->Generation());
+        auto const tag = std::format(R"("{}-{}")", identity, history->Generation());
         // Bounded by the SAMPLE interval, not only by the bucket. The newest bucket is
         // always still open and gains a reading every sample, so "until this bucket
         // closes" is how long the chart's shape is settled -- not how long it is
@@ -236,7 +236,7 @@ namespace
         // chart frozen in the browser for twenty-four hours while the fleet moves.
         // Revalidation is cheap: the ETag makes it a bodyless 304 whenever nothing
         // closed.
-        auto const settled = history.history->UntilBucketCloses(range);
+        auto const settled = history->UntilBucketCloses(range);
         auto const maxAge = std::min(settled, Distributed::FleetSampleInterval).count();
         std::vector<std::string> headers { std::format("ETag: {}", tag),
                                            std::format("Cache-Control: max-age={}, must-revalidate", maxAge) };
@@ -256,7 +256,7 @@ namespace
 std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                         AdminCredential const& credential,
                                         unsigned refreshSeconds,
-                                        FleetHistorySource history)
+                                        IFleetHistoryView const* history)
 {
     // Every route reads the fleet the same way and is gated the same way; only what
     // it renders differs. **The gate is written once and the renderer is the
@@ -288,9 +288,11 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
     };
 
     auto const viewFor = [history](Distributed::FleetRange range) {
-        Distributed::FleetHistoryView view { .range = range, .buckets = {}, .durable = history.durable };
-        if (history.history != nullptr)
-            view.buckets = history.history->Buckets(range);
+        Distributed::FleetHistoryView view { .range = range,
+                                             .buckets = {},
+                                             .durable = history != nullptr && history->Durable() };
+        if (history != nullptr)
+            view.buckets = history->Buckets(range);
         return view;
     };
 
@@ -478,27 +480,29 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink c
     return values;
 }
 
-std::filesystem::path HistoryPathFor(NodeConfig const& cfg, Distributed::FleetMetricScope scope)
+std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which)
 {
-    // One row per scope, in enumerator order, so a scope added to that enum is a file
-    // here rather than a third path spelled somewhere nobody looks. The fleet file
-    // keeps the name it always had, so an existing install's fleet series survives
-    // the upgrade that split the two.
+    // One row per file, in enumerator order, so a fourth file is a row rather than a
+    // path spelled somewhere nobody looks. The fleet file keeps the name it always
+    // had, so an existing install's fleet series survives the upgrade that split it
+    // from the others.
     struct FileNameRow
     {
-        Distributed::FleetMetricScope scope; ///< The series this row names a file for.
-        std::string_view name;               ///< What that file is called.
+        HistoryFile which;     ///< The file this row names.
+        std::string_view name; ///< What it is called.
     };
-    // A row that states its own scope, and the guard every enumerator-indexed table
-    // in this tree carries. Filled positionally it compiled either way, and swapping
-    // the two enumerators would have swapped the two files -- silently, because both
-    // share a format, so each would load the other's readings without complaint.
-    static constexpr EnumTable<Distributed::FleetMetricScope, FileNameRow> fileNames {
-        FileNameRow { .scope = Distributed::FleetMetricScope::Node, .name = "node-history.bin" },
-        FileNameRow { .scope = Distributed::FleetMetricScope::Fleet, .name = "fleet-history.bin" },
+    // A row that states its own enumerator, and the guard every enumerator-indexed
+    // table in this tree carries. Filled positionally it compiled either way, and
+    // swapping two rows would have swapped two files -- silently for the pair that
+    // share a format, since each would then load the other's readings without
+    // complaint.
+    static constexpr EnumTable<HistoryFile, FileNameRow> fileNames {
+        FileNameRow { .which = HistoryFile::Node, .name = "node-history.bin" },
+        FileNameRow { .which = HistoryFile::Fleet, .name = "fleet-history.bin" },
+        FileNameRow { .which = HistoryFile::Received, .name = "received-history.bin" },
     };
-    static_assert(RowsInEnumeratorOrder(fileNames, &FileNameRow::scope));
-    auto const name = fileNames[static_cast<std::size_t>(scope)].name;
+    static_assert(RowsInEnumeratorOrder(fileNames, &FileNameRow::which));
+    auto const name = fileNames[static_cast<std::size_t>(which)].name;
     if (!cfg.clusterDir.empty())
         return cfg.clusterDir / name;
     if (!cfg.cacheDir.empty())
@@ -506,34 +510,64 @@ std::filesystem::path HistoryPathFor(NodeConfig const& cfg, Distributed::FleetMe
     return {};
 }
 
-std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
+HistoryPaths HistoryPaths::For(NodeConfig const& cfg)
 {
-    return HistoryPathFor(cfg, Distributed::FleetMetricScope::Fleet);
+    return HistoryPaths { .fleet = HistoryPathFor(cfg, HistoryFile::Fleet),
+                          .node = HistoryPathFor(cfg, HistoryFile::Node),
+                          .received = HistoryPathFor(cfg, HistoryFile::Received) };
 }
 
-FleetSampler::FleetSampler(Distributed::FleetSources sources,
+std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
+{
+    return HistoryPathFor(cfg, HistoryFile::Fleet);
+}
+
+FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
+                           IMetricsSink const& metrics,
                            AdminHttpServer::SnapshotProvider node,
                            IWallClock const& wall,
-                           std::filesystem::path fleetPath,
-                           std::filesystem::path nodePath,
+                           HistoryPaths paths,
                            ILogger& logger):
     _sources { sources },
+    _metrics { metrics },
     _nodeFacts { std::move(node) },
     _fleet { wall },
     _node { wall },
-    _fleetPath { std::move(fleetPath) },
-    _nodePath { std::move(nodePath) },
+    _received { wall },
+    // Every store is a row, so restoring and saving are one loop each. The received
+    // store is here rather than beside the loop because a store restored and never
+    // saved is a year of readings discovered missing at the next restart -- and what
+    // it holds is what makes a fleet's record survive an election, which a node
+    // advancing its own watermark and never resending cannot rebuild.
+    _stores { Store { .path = std::move(paths.fleet),
+                      .what = "fleet",
+                      .load = [this](auto const& at) { return _fleet.Load(at); },
+                      .save = [this](auto const& at) { return _fleet.Save(at); },
+                      .readOnly = [this] { return _fleet.ReadOnly(); },
+                      .worthWriting = [this] { return !_fleet.Empty(); } },
+              Store { .path = std::move(paths.node),
+                      .what = "node",
+                      .load = [this](auto const& at) { return _node.Load(at); },
+                      .save = [this](auto const& at) { return _node.Save(at); },
+                      .readOnly = [this] { return _node.ReadOnly(); },
+                      .worthWriting = [this] { return !_node.Empty(); } },
+              Store { .path = std::move(paths.received),
+                      .what = "received",
+                      .load = [this](auto const& at) { return _received.Load(at); },
+                      .save = [this](auto const& at) { return _received.Save(at); },
+                      .readOnly = [this] { return _received.ReadOnly(); },
+                      .worthWriting = [this] { return _received.Count() > 0; } } },
     _logger { logger }
 {
     // Every failure to read starts empty and says so once. History is a
-    // convenience, and no state of either file may keep a node from starting.
-    for (auto const& each: EachSeries())
+    // convenience, and no state of any of these files may keep a node from starting.
+    for (auto const& each: _stores)
     {
-        if (each.path->empty())
+        if (each.path.empty())
             continue;
-        if (each.history->Load(*each.path))
-            _logger.Logf(LogLevel::Info, "{} history restored from {}", each.what, each.path->string());
-        else if (each.history->ReadOnly())
+        if (each.load(each.path))
+            _logger.Logf(LogLevel::Info, "{} history restored from {}", each.what, each.path.string());
+        else if (each.readOnly())
             // Named at WARN and named specifically, because this one is not the
             // ordinary "nothing to restore": a later build wrote that file, this one
             // cannot read it, and the reason it is not being replaced is that doing
@@ -543,9 +577,9 @@ FleetSampler::FleetSampler(Distributed::FleetSources sources,
                          "{} history at {} was written by a NEWER build; starting empty and leaving it alone. "
                          "Sampling continues, nothing is persisted, and the file is safe for that build to read again",
                          each.what,
-                         each.path->string());
+                         each.path.string());
         else
-            _logger.Logf(LogLevel::Info, "{} history starts empty at {}", each.what, each.path->string());
+            _logger.Logf(LogLevel::Info, "{} history starts empty at {}", each.what, each.path.string());
     }
 
     _thread = std::jthread { [this](std::stop_token stop) {
@@ -582,10 +616,21 @@ FleetSampler::~FleetSampler()
     Persist();
 }
 
-std::array<FleetSampler::Series, 2> FleetSampler::EachSeries()
+std::vector<Distributed::FleetBucket> FleetSampler::NextHistoryBatch(std::size_t limit) const
 {
-    return { Series { .history = &_fleet, .path = &_fleetPath, .what = "fleet" },
-             Series { .history = &_node, .path = &_nodePath, .what = "node" } };
+    return _node.ClosedBucketsAfter(_handedThrough.load(std::memory_order_relaxed), limit);
+}
+
+void FleetSampler::HistoryHandedThrough(std::int64_t startMillis) noexcept
+{
+    _handedThrough.store(startMillis, std::memory_order_relaxed);
+}
+
+std::vector<Distributed::FleetBucket> FleetSampler::Buckets(Distributed::FleetRange range) const
+{
+    auto view = _fleet.Buckets(range);
+    _received.BackfillInto(view, range);
+    return view;
 }
 
 bool FleetSampler::SampleOnce()
@@ -595,10 +640,17 @@ bool FleetSampler::SampleOnce()
     // the moment it lost an election is a node whose year of history belongs to
     // whichever peer happened to be leading at the time. This is the half that
     // survives an election, and in Phase 5 it is the half that rebuilds the leader's.
-    if (_nodeFacts && _sources.metrics != nullptr)
-        _node.Record(NodeSampleFrom(*_sources.metrics, _nodeFacts()));
+    if (_nodeFacts)
+        _node.Record(NodeSampleFrom(_metrics, _nodeFacts()));
 
-    auto const snapshot = Distributed::CollectFleet(_sources);
+    // A node with no scheduler has no fleet to answer for, and says so by recording
+    // nothing rather than by recording zeroes. It still keeps the series above,
+    // which is the whole point: a pure worker is exactly the machine whose windows
+    // the fleet would otherwise be missing.
+    if (!_sources.has_value())
+        return false;
+
+    auto const snapshot = Distributed::CollectFleet(*_sources);
     // The fleet series stays leader-only, and for the original reason: a follower's
     // registry holds whatever registered against IT, so a fleet-scoped sample there
     // records a fraction as though it were the whole -- and the chart would show the
@@ -612,18 +664,18 @@ bool FleetSampler::SampleOnce()
 
 void FleetSampler::Persist()
 {
-    for (auto const& each: EachSeries())
+    for (auto const& each: _stores)
     {
-        if (each.path->empty() || each.history->Empty())
+        if (each.path.empty() || !each.worthWriting())
             continue;
         // A refusal to overwrite a newer file is not a write failure, and reporting
         // it as one every save interval would bury the single WARN at startup that
         // explains it under a stream of "could not write" saying the opposite of
         // what is true.
-        if (each.history->ReadOnly())
+        if (each.readOnly())
             continue;
-        if (!each.history->Save(*each.path))
-            _logger.Logf(LogLevel::Warn, "could not write {} history to {}", each.what, each.path->string());
+        if (!each.save(each.path))
+            _logger.Logf(LogLevel::Warn, "could not write {} history to {}", each.what, each.path.string());
     }
 }
 
@@ -632,6 +684,7 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                                                     IMetricsSink& metrics,
                                                                     AdminHttpServer::SnapshotProvider snapshot,
                                                                     std::optional<Distributed::FleetSources> fleet,
+                                                                    FleetSampler const* sampler,
                                                                     ILogger& logger)
 {
     AdminSurface surface;
@@ -685,24 +738,12 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     // node with no scheduler passes nullopt, and `/fleet` is then a plain 404
     // rather than a route answering with an empty fleet.
     std::vector<AdminRoute> routes;
+    // The sampler is reached as an `IFleetHistoryView`, which is the ONLY door:
+    // the two halves of a leader's record -- what it sampled while leading, and
+    // what the other machines handed over for the windows it missed -- meet
+    // behind it, and no route can reach the raw series past it.
     if (cfg.dashboard && fleet.has_value())
-    {
-        // The sampler outlives the routes that read it: `AdminSurface` declares it
-        // before `endpoint`, so the endpoint and its serving thread are torn down
-        // first. See the comment on that member -- the ordering is the contract.
-        static SystemWallClock const wall;
-        surface.sampler = std::make_unique<FleetSampler>(*fleet,
-                                                         snapshot,
-                                                         wall,
-                                                         HistoryPathFor(cfg, Distributed::FleetMetricScope::Fleet),
-                                                         HistoryPathFor(cfg, Distributed::FleetMetricScope::Node),
-                                                         logger);
-        routes = MakeFleetRoutes(
-            *fleet,
-            credential,
-            DashboardRefreshSeconds,
-            FleetHistorySource { .history = &surface.sampler->History(), .durable = surface.sampler->Durable() });
-    }
+        routes = MakeFleetRoutes(*fleet, credential, DashboardRefreshSeconds, sampler);
 
     auto started = AdminEndpoint::Start(cfg.adminListen,
                                         AdminListenDefaultHost,

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
+#include <FastCache/Distributed/SchedulerProtocol.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -15,38 +17,15 @@
 #include <string>
 #include <string_view>
 
+#include <tests/FleetHistoryFakes.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Distributed;
+using FastCache::Testing::PlacedWallClock;
 
 namespace
 {
-
-/// A wall clock a case can place, so a bucket boundary is a decision rather than
-/// a race with the machine this runs on.
-class PlacedWallClock final: public IWallClock
-{
-  public:
-    [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept override
-    {
-        return _now;
-    }
-
-    void Set(std::chrono::system_clock::time_point at) noexcept
-    {
-        _now = at;
-    }
-    void Advance(std::chrono::seconds by) noexcept
-    {
-        _now += by;
-    }
-
-  private:
-    /// A round epoch offset, so a bucket start is easy to reason about in a failure
-    /// message: 2026-01-01T00:00:00Z is a whole number of hours and of minutes.
-    std::chrono::system_clock::time_point _now { std::chrono::seconds { 1'767'225'600 } };
-};
 
 /// One reading with every slot set, so a case varies only what it is about.
 [[nodiscard]] EnumTable<FleetMetric, std::uint64_t> Reading(std::uint64_t granted, std::uint64_t inFlight = 0)
@@ -648,4 +627,310 @@ TEST_CASE("A restart keeps when a bucket was sampled, not when its window opened
     CHECK(week.back().sampleMillis == sampled);
     // And it is genuinely not the window's start, or this case would pass on a bug.
     CHECK(week.back().sampleMillis != week.back().startMillis);
+}
+
+TEST_CASE("A node hands over closed buckets, oldest first, and never the open one", "[distributed][fleethistory]")
+{
+    // What rides the heartbeat. The newest bucket is still open -- it gains a reading
+    // every sample -- so shipping it would hand the leader a partial window it could
+    // never be told to correct.
+    PlacedWallClock clock;
+    FleetHistory history { clock };
+
+    for (auto const minute: std::views::iota(0, 5))
+    {
+        history.Record(Reading(static_cast<std::uint64_t>(minute) + 1));
+        clock.Advance(std::chrono::minutes { 1 });
+    }
+    // Five recorded, and the clock now sits in a sixth, empty window. Four are
+    // closed; the fifth is the one the clock left behind and is closed too.
+    auto const all = history.ClosedBucketsAfter(-1, 100);
+    REQUIRE(all.size() == 5);
+    CHECK(std::ranges::is_sorted(all, {}, &FleetBucket::startMillis));
+    CHECK(GrantedOf(all.front()) == 1);
+    CHECK(GrantedOf(all.back()) == 5);
+
+    // Record into the current window: it is now open, and must not travel.
+    history.Record(Reading(6));
+    auto const closed = history.ClosedBucketsAfter(-1, 100);
+    CHECK(closed.size() == 5);
+    CHECK(GrantedOf(closed.back()) == 5);
+
+    // The watermark excludes what has already been handed over.
+    auto const after = history.ClosedBucketsAfter(all[2].startMillis, 100);
+    REQUIRE(after.size() == 2);
+    CHECK(GrantedOf(after.front()) == 4);
+
+    // And the ceiling takes the OLDEST, so a catch-up converges from the far end
+    // rather than resending the newest and never closing the gap.
+    auto const bounded = history.ClosedBucketsAfter(-1, 2);
+    REQUIRE(bounded.size() == 2);
+    CHECK(GrantedOf(bounded.front()) == 1);
+    CHECK(GrantedOf(bounded.back()) == 2);
+
+    CHECK(history.ClosedBucketsAfter(-1, 0).empty());
+}
+
+TEST_CASE("A leader fills the windows it missed from what the nodes kept", "[distributed][fleethistory]")
+{
+    // The whole point of the issue. This leader was elected part-way through, so its
+    // own series has nothing for the earlier windows -- but every machine kept
+    // recording itself throughout, and handed that over.
+    PlacedWallClock clock;
+
+    // Two machines, each recording four minutes.
+    FleetHistory nodeA { clock };
+    FleetHistory nodeB { clock };
+    for (auto const minute: std::views::iota(0, 4))
+    {
+        auto const value = static_cast<std::uint64_t>(minute) + 1;
+        nodeA.Record(Reading(0, value));      // in flight: 1,2,3,4
+        nodeB.Record(Reading(0, value * 10)); // in flight: 10,20,30,40
+        clock.Advance(std::chrono::minutes { 1 });
+    }
+
+    FleetNodeHistories received { clock };
+    CHECK(received.AcceptHistory("a:1", nodeA.ClosedBucketsAfter(-1, 100)) == 4);
+    CHECK(received.AcceptHistory("b:1", nodeB.ClosedBucketsAfter(-1, 100)) == 4);
+    CHECK(received.Count() == 2);
+
+    // A leader whose own series is empty: it was not leading for any of that.
+    FleetHistory leader { clock };
+    auto view = leader.Buckets(FleetRange::OneHour);
+    CHECK(std::ranges::none_of(view, [](FleetBucket const& b) { return b.present; }));
+
+    received.BackfillInto(view, FleetRange::OneHour);
+
+    auto filledCount = 0;
+    for (auto const& bucket: view)
+    {
+        if (!bucket.present)
+            continue;
+        ++filledCount;
+        // Summed across machines, and marked so nothing reads a dispatch counter off
+        // a window this leader was not scheduling for.
+        CHECK(bucket.backfilled);
+        auto const inFlight = bucket.values[static_cast<std::size_t>(FleetMetric::JobsInFlight)];
+        CHECK(inFlight % 11 == 0); // n + 10n
+    }
+    CHECK(filledCount == 4);
+}
+
+TEST_CASE("A window the leader sampled itself is never replaced by a sum", "[distributed][fleethistory]")
+{
+    // Gaps only. A window this leader sampled holds the registry's own totals -- what
+    // the page has always plotted -- and replacing them with a sum assembled from a
+    // different set of machines would step the chart wherever the two disagreed.
+    PlacedWallClock clock;
+
+    FleetHistory node { clock };
+    node.Record(Reading(0, 7));
+    clock.Advance(std::chrono::minutes { 1 });
+
+    FleetHistory leader { clock };
+    leader.Record(Reading(0, 999));
+
+    FleetNodeHistories received { clock };
+    received.AcceptHistory("a:1", node.ClosedBucketsAfter(-1, 100));
+
+    auto view = leader.Buckets(FleetRange::OneHour);
+    received.BackfillInto(view, FleetRange::OneHour);
+
+    auto const own = std::ranges::find_if(view, [](FleetBucket const& b) {
+        return b.present && b.values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] == 999;
+    });
+    REQUIRE(own != view.end());
+    CHECK_FALSE(own->backfilled);
+}
+
+TEST_CASE("A redelivered heartbeat does not count twice", "[distributed][fleethistory]")
+{
+    // The wire carries no acknowledgement, so a node that never saw a reply resends.
+    // The high-water mark is what makes that safe -- and it is why no reply field was
+    // needed in the first place.
+    PlacedWallClock clock;
+
+    FleetHistory node { clock };
+    for ([[maybe_unused]] auto const minute: std::views::iota(0, 3))
+    {
+        node.Record(Reading(0, 5));
+        clock.Advance(std::chrono::minutes { 1 });
+    }
+    auto const batch = node.ClosedBucketsAfter(-1, 100);
+    REQUIRE(batch.size() == 3);
+
+    FleetNodeHistories received { clock };
+    CHECK(received.AcceptHistory("a:1", batch) == 3);
+    // The very same batch again, as a lost reply would produce.
+    CHECK(received.AcceptHistory("a:1", batch) == 0);
+    CHECK(received.HighWaterFor("a:1") == batch.back().startMillis);
+
+    FleetHistory leader { clock };
+    auto view = leader.Buckets(FleetRange::OneHour);
+    received.BackfillInto(view, FleetRange::OneHour);
+
+    for (auto const& bucket: view)
+        if (bucket.present)
+            // Five, not ten. A machine reporting the same window twice must not
+            // double the fleet's reading of it.
+            CHECK(bucket.values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] == 5);
+
+    CHECK(received.HighWaterFor("nobody:1") == -1);
+}
+
+TEST_CASE("A handover carries no fold, and the leader rebuilds one", "[distributed][fleethistory]")
+{
+    // What the wire record leaves out and why it can. A counter's peak is a RATE and
+    // cannot be recovered from a single reading -- but it can be recovered from the
+    // SEQUENCE of readings, which is exactly what travels. Carrying the fold as well
+    // would be a second answer to a question already answered, and the one a decoder
+    // trusted would be the one nothing kept correct.
+    PlacedWallClock clock;
+
+    // A NODE-scoped counter, because that is what a machine can answer for and
+    // therefore all the backfill sums: a dispatch outcome belongs to the scheduler,
+    // and summing one across machines would be summing zeroes into a number a
+    // reader would take for a measurement.
+    constexpr auto Hits = static_cast<std::size_t>(FleetMetric::CacheHits);
+    FleetHistory node { clock };
+    // A counter that steps hard once: 0, then 100, then 10 more.
+    for (auto const hits: std::array<std::uint64_t, 3> { 0, 100, 110 })
+    {
+        EnumTable<FleetMetric, std::uint64_t> values {};
+        values[Hits] = hits;
+        node.Record(values);
+        clock.Advance(std::chrono::minutes { 1 });
+    }
+
+    auto const own = node.Buckets(FleetRange::OneHour);
+    auto const spike =
+        std::ranges::find_if(own, [](FleetBucket const& each) { return each.present && each.fold[Hits].high == 100; });
+    REQUIRE(spike != own.end());
+
+    // Out through the wire and back, which is the only shape the leader ever sees.
+    // Three closed buckets, not two: the clock was advanced past the last reading,
+    // so the window it landed in has closed as well.
+    auto const handed = HistoryFromWire(HistoryToWire(node.ClosedBucketsAfter(-1, 100)));
+    REQUIRE(handed.size() == 3);
+    for (auto const& bucket: handed)
+        CHECK(bucket.fold[Hits].high == 0);
+
+    FleetNodeHistories received { clock };
+    REQUIRE(received.AcceptHistory("a:1", handed) == 3);
+
+    FleetHistory leader { clock };
+    auto view = leader.Buckets(FleetRange::OneHour);
+    received.BackfillInto(view, FleetRange::OneHour);
+
+    auto const rebuilt = std::ranges::find_if(
+        view, [&spike](FleetBucket const& each) { return each.present && each.startMillis == spike->startMillis; });
+    REQUIRE(rebuilt != view.end());
+    // The same peak the node itself recorded, from readings alone.
+    CHECK(rebuilt->fold[Hits].high == 100);
+}
+
+TEST_CASE("A leader's record of the other machines survives a restart", "[distributed][fleethistory]")
+{
+    // Not an optimisation. A node advances its own watermark once a heartbeat is
+    // accepted and never resends it, so a leader that forgot what it had been handed
+    // would leave those windows a gap for as long as the rings hold them -- the very
+    // failure the handover exists to remove, reintroduced by a restart.
+    Testing::ScratchDirectory const scratch { "fleet-received-roundtrip" };
+    auto const file = scratch.Path() / "received-history.bin";
+
+    PlacedWallClock clock;
+    FleetHistory nodeA { clock };
+    FleetHistory nodeB { clock };
+    for (auto const minute: std::views::iota(0, 4))
+    {
+        auto const value = static_cast<std::uint64_t>(minute) + 1;
+        nodeA.Record(Reading(0, value));
+        nodeB.Record(Reading(0, value * 10));
+        clock.Advance(std::chrono::minutes { 1 });
+    }
+
+    std::int64_t highA = 0;
+    auto const batchA = nodeA.ClosedBucketsAfter(-1, 100);
+    {
+        FleetNodeHistories received { clock };
+        REQUIRE(received.AcceptHistory("a:1", batchA) == 4);
+        REQUIRE(received.AcceptHistory("b:1", nodeB.ClosedBucketsAfter(-1, 100)) == 4);
+        highA = received.HighWaterFor("a:1");
+        REQUIRE(received.Save(file));
+    }
+
+    FleetNodeHistories restored { clock };
+    REQUIRE(restored.Load(file));
+    CHECK(restored.Count() == 2);
+    // The mark as well as the readings: without it a restarted leader would take the
+    // batch a node resends after a reply it never saw and count every window twice.
+    CHECK(restored.HighWaterFor("a:1") == highA);
+    CHECK(restored.AcceptHistory("a:1", batchA) == 0);
+
+    FleetHistory leader { clock };
+    auto view = leader.Buckets(FleetRange::OneHour);
+    restored.BackfillInto(view, FleetRange::OneHour);
+
+    auto filledCount = 0;
+    for (auto const& bucket: view)
+    {
+        if (!bucket.present)
+            continue;
+        ++filledCount;
+        CHECK(bucket.backfilled);
+        CHECK(bucket.values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] % 11 == 0);
+    }
+    CHECK(filledCount == 4);
+}
+
+TEST_CASE("A received-history file that cannot be trusted starts empty", "[distributed][fleethistory]")
+{
+    // The same rule as a node's own history, and for the same reason: this is a
+    // convenience, and no state of the file may keep a leader from coming up.
+    Testing::ScratchDirectory const scratch { "fleet-received-damaged" };
+    PlacedWallClock clock;
+
+    SECTION("absent")
+    {
+        FleetNodeHistories received { clock };
+        CHECK_FALSE(received.Load(scratch.Path() / "nothing-here.bin"));
+        CHECK(received.Count() == 0);
+    }
+
+    SECTION("another file's magic")
+    {
+        // A node series and a received store sit in the same directory, so pointing
+        // one reader at the other's file is a configuration slip rather than a
+        // fantasy -- and it must be refused rather than half-read.
+        auto const file = scratch.Path() / "wrong-magic.bin";
+        {
+            FleetHistory own { clock };
+            own.Record(Reading(3));
+            REQUIRE(own.Save(file));
+        }
+        FleetNodeHistories received { clock };
+        CHECK_FALSE(received.Load(file));
+        CHECK(received.Count() == 0);
+    }
+
+    SECTION("corrupt body")
+    {
+        auto const file = scratch.Path() / "corrupt.bin";
+        {
+            FleetHistory node { clock };
+            node.Record(Reading(0, 7));
+            clock.Advance(std::chrono::minutes { 1 });
+            FleetNodeHistories received { clock };
+            REQUIRE(received.AcceptHistory("a:1", node.ClosedBucketsAfter(-1, 100)) == 1);
+            REQUIRE(received.Save(file));
+        }
+        {
+            std::fstream patch { file, std::ios::binary | std::ios::in | std::ios::out };
+            patch.seekp(64);
+            patch.put(static_cast<char>(0xFF));
+        }
+        FleetNodeHistories received { clock };
+        CHECK_FALSE(received.Load(file));
+        CHECK(received.Count() == 0);
+    }
 }
