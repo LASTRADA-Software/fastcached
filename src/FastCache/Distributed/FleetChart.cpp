@@ -164,8 +164,8 @@ namespace
     ///
     /// @param values   The series, absent where nothing was observed.
     /// @param max      The value the vertical axis tops out at.
-    /// @param close    Fill each run down to the baseline. A closed run of one has no
-    ///                 area to fill, so `dots` comes back empty for a filled shape.
+    /// @param close    Fill each run down to the baseline. Does not change what a run
+    ///                 of one becomes: a single reading has no width to fill either.
     /// @return The `d` data and the standalone dot elements, never concatenated.
     [[nodiscard]] SeriesGeometry RunsGeometry(FleetSeriesValues const& values, double max, bool close)
     {
@@ -191,10 +191,13 @@ namespace
                     "{}{:.2f} {:.2f}", index == runStart ? "M" : "L", XAt(index, values.size()), ScaleY(*reading, max));
                 ++index;
             }
-            if (index - runStart < 2 && !close)
+            if (index - runStart < 2)
             {
                 // A single known point has no line to draw, so it gets a dot -- a
                 // run of one is still a reading and dropping it would under-report.
+                // Closing one instead does not rescue it: `M x y L x bottom L x
+                // bottom Z` is a shape with no width, which draws nothing while
+                // leaving a non-empty `d` that says the series WAS observed.
                 // An ELEMENT, kept apart from the path data the caller is about to
                 // put in a `d` attribute.
                 out.dots += std::format(
@@ -506,13 +509,17 @@ std::string RenderChartSvg(FleetChartRow const& chart,
         {
             auto const& row = FleetSeriesTable[chart.first + offset];
             auto const band = RunsGeometry(tops[offset], max, true);
+            auto const colour = std::format("var(--{})", row.colour);
             // An element with an empty `d` is not nothing: it is a shape a renderer
             // still has to consider, and it makes "this series was never observed"
             // indistinguishable from "this series was flat" in the output.
-            if (band.path.empty())
-                continue;
-            out += std::format(
-                R"(<path d="{}" fill="{}" fill-opacity="0.85"/>)", band.path, std::format("var(--{})", row.colour));
+            if (!band.path.empty())
+                out += std::format(R"(<path d="{}" fill="{}" fill-opacity="0.85"/>)", band.path, colour);
+            // A band's isolated readings are dots too, at the band's own top and at
+            // the band's own opacity -- a reading a stacked chart cannot fill is
+            // still a reading, and the alternative here is drawing nothing.
+            if (!band.dots.empty())
+                out += std::format(R"(<g fill="{}" fill-opacity="0.85">{}</g>)", colour, band.dots);
         }
     }
     else
@@ -524,6 +531,8 @@ std::string RenderChartSvg(FleetChartRow const& chart,
             // it. The gap between the two lines is what this chart is about, and a
             // reader who cannot tell which line is the limit reads that gap backwards.
             auto const ceiling = row.stroke == FleetSeriesStroke::Dashed;
+            // `.path` only: the same isolated readings come back from both calls, and
+            // the line pass below is where they are drawn.
             if (auto const area = RunsGeometry(series[offset], max, true); !area.path.empty())
                 out += std::format(
                     R"(<path d="{}" fill="{}" fill-opacity="{}"/>)", area.path, colour, ceiling ? "0.10" : "0.14");

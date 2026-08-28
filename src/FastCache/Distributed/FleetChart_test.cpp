@@ -277,6 +277,33 @@ TEST_CASE("A reading with no neighbours is a dot beside the path, never inside i
     CHECK(svg.contains("<g fill=\"var(--ok)\">"));
 }
 
+TEST_CASE("A lone reading in a stacked band is a dot, not a shape with no width", "[distributed][fleetchart]")
+{
+    // A rate needs the bucket before it, so these four windows hold exactly one
+    // known value each, at index 2. Closing a run of one gives
+    // `M x y L x bottom L x bottom Z` -- a shape with no width, so it draws nothing,
+    // while its non-empty `d` still says the series was observed. Refusals are the
+    // stacked chart, and a single refusal in an otherwise quiet hour is precisely
+    // the reading somebody came to this chart for.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::DispatchNoWorker, 4 } }),
+        At(600'000, { { FleetMetric::DispatchNoWorker, 9 } }),
+        Gap(900'000),
+    };
+
+    auto const svg = RenderChartSvg(ChartByKey("refusals"), buckets, FleetRange::Day, FleetTheme::Light);
+    INFO(svg);
+    CHECK_FALSE(MarkupInAttribute(svg).has_value());
+    CHECK(svg.contains("<circle"));
+    // At the band's own opacity, so a dot reads as part of its band rather than as a
+    // fifth thing on a chart whose entire point is four distinguishable reasons.
+    CHECK(svg.contains("<g fill=\"var(--crit)\" fill-opacity=\"0.85\">"));
+    // Nothing is left drawing nothing: every run here is of one, so there is no
+    // filled shape to emit at all.
+    CHECK_FALSE(svg.contains("<path"));
+}
+
 TEST_CASE("A chart is a document a browser may load as an image", "[distributed][fleetchart]")
 {
     std::vector<FleetBucket> buckets;
