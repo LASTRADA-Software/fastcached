@@ -261,6 +261,36 @@ Every rule below has already been a bug.
     disposition assertion instead. A regression test for a fatal signal that
     cannot be seen to fail is worth nothing.
 
+- **The same process hands those children its SOCKETS, and neither platform stops
+  it.** A compiler that inherits a client connection holds it open for as long as it
+  runs, so the client's peer sees a socket that will not finish closing -- and on a
+  node serving `slots` compiles at once, an arriving connection is inherited by every
+  compiler spawned while it is open. Three beliefs kept this invisible:
+  - `SOCK_CLOEXEC` covers the accept path — it covers the *epoll and kqueue* accept
+    paths. `BlockingListener::Accept` uses a plain `::accept()` on both platforms,
+    and that is the listener the worker port runs on.
+  - Windows has no per-descriptor close-on-exec — it has `HANDLE_FLAG_INHERIT`, and
+    `ArmCloseOnExec` was written as a no-op saying so.
+  - A Windows socket is not inheritable unless asked for — it arrives **inheritable**;
+    `IocpConnector` passes `WSA_FLAG_NO_HANDLE_INHERIT` for exactly that reason, and
+    that lone correct site is what the rest drifted from.
+
+  It is armed in `ApplyHotSocketOptions`, which every socket this process owns passes
+  through — accepted and dialled, on all four backends — because a rule that has
+  already been forgotten at three sites does not get a fourth chance. The test
+  asserts the platform default as well as the result: without the *before* half it
+  would pass on a platform where the call did nothing.
+
+- **Naming what a child may inherit beats marking what it may not.** The launcher's
+  own spawn does the other half: `CreateProcess` with `bInheritHandles = TRUE` hands
+  over every inheritable handle in the process, so a sibling's compiler held another
+  job's pipe write-end and that job's drain never saw EOF. Windows passes an explicit
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` rather than chasing handles one at a time,
+  which also closes whatever the next inheritable handle turns out to be. POSIX has
+  no equivalent, so both pipe ends are marked close-on-exec under a lock that also
+  covers the spawn — the window between creating a descriptor and marking it is a
+  window a sibling can spawn in, and `pipe2` does not exist on macOS.
+
 - **A listening socket claims its address, and the option that says so is spelled
   differently on each platform.** `Detail::BindAndListen` set `SO_REUSEADDR`
   unconditionally, commented "so restart-after-crash rebinds without TIME_WAIT
