@@ -1194,7 +1194,12 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
     KpiReadout KpiLeases(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
-        return KpiReadout { .value = std::to_string(snapshot.liveLeases), .unit = {}, .sub = "granted, not yet claimed" };
+        // "Not yet resolved", not "not yet claimed". Nothing claimed a lease and
+        // nothing ever could -- the only way one left this figure was by expiring,
+        // ten minutes after the job it named had finished, so on a busy fleet it
+        // read as a backlog that did not exist. A client now hands its lease back
+        // when its job ends (#212), which is what makes this a live number.
+        return KpiReadout { .value = std::to_string(snapshot.liveLeases), .unit = {}, .sub = "granted, not yet resolved" };
     }
 
     KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)

@@ -3,10 +3,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -80,13 +83,31 @@ class ScriptedDialer final: public IEndpointDialer
         _scripts.emplace(std::move(endpoint), std::move(replies));
     }
 
+    /// Stop answering `endpoint` after `dials` connections.
+    ///
+    /// The peer that was there and is not any more -- a scheduler that restarted or
+    /// lost leadership while a compile ran. Reachability has to change *during* a
+    /// dispatch to be that case at all, which is why it is a count rather than a
+    /// registration the test could simply omit.
+    void ReachableFor(std::string endpoint, std::size_t dials)
+    {
+        _limits.insert_or_assign(std::move(endpoint), dials);
+    }
+
     std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
     {
-        _dialled.emplace_back(hostPort);
-        auto const it = _scripts.find(std::string { hostPort });
+        auto const key = std::string { hostPort };
+        _dialled.push_back(key);
+        auto const it = _scripts.find(key);
         if (it == _scripts.end())
             return nullptr;
-        return std::make_unique<ScriptedPeer>(it->second, &_sent[std::string { hostPort }]);
+        if (auto const limit = _limits.find(key); limit != _limits.end())
+        {
+            if (limit->second == 0)
+                return nullptr;
+            --limit->second;
+        }
+        return std::make_unique<ScriptedPeer>(it->second, &_sent[key]);
     }
 
     /// Endpoints dialled, in order. The ORDER is the assertion in several cases:
@@ -107,6 +128,7 @@ class ScriptedDialer final: public IEndpointDialer
     std::vector<std::string> _dialled;
     std::map<std::string, std::vector<std::byte>> _sent;
     std::map<std::string, std::vector<std::byte>> _scripts;
+    std::map<std::string, std::size_t> _limits;
 };
 
 constexpr std::string_view Scheduler = "sched:6675";
@@ -131,6 +153,45 @@ constexpr std::string_view Worker = "worker:6676";
         Wire::Status::Ok,
         Wire::EncodeCompileResult(Wire::CompileResult {
             .exitCode = exitCode, .object = enveloped, .stdoutText = {}, .stderrText = Wire::AsBytes(err) }));
+}
+
+/// The request frames written to `endpoint`, split apart.
+///
+/// A connection here carries more than one request now -- a LEASE and, later, the
+/// RELEASE that resolves it -- so a test that decoded the buffer from offset zero
+/// would only ever see the first.
+/// @param dialer The dialer that recorded them.
+/// @param endpoint Whose connection to read.
+/// @return One span per whole frame, in the order they were written.
+[[nodiscard]] std::vector<std::span<std::byte const>> FramesTo(ScriptedDialer& dialer, std::string_view endpoint)
+{
+    auto const& bytes = dialer.SentTo(std::string { endpoint });
+    std::vector<std::span<std::byte const>> frames;
+    for (std::size_t offset = 0; offset + Wire::RequestHeaderSize <= bytes.size();)
+    {
+        auto const rest = std::span<std::byte const> { bytes }.subspan(offset);
+        auto const header = Wire::DecodeRequestHeader(rest);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::RequestHeaderSize + header->payloadLength;
+        if (whole > rest.size())
+            break;
+        frames.push_back(rest.subspan(0, whole));
+        offset += whole;
+    }
+    return frames;
+}
+
+/// The opcode a request frame declares.
+/// @param frame A whole request frame.
+/// @return Its op, or nullopt when the header does not decode.
+[[nodiscard]] std::optional<Wire::Op> OpOf(std::span<std::byte const> frame)
+{
+    auto const header = Wire::DecodeRequestHeader(frame);
+    if (!header.has_value())
+        return std::nullopt;
+    auto const* const descriptor = Wire::FindOp(header->opRaw);
+    return descriptor != nullptr ? std::optional { descriptor->code } : std::nullopt;
 }
 
 [[nodiscard]] DispatchRequest Request(std::span<std::string const> args)
@@ -160,10 +221,14 @@ TEST_CASE("A dispatched compile reaches the worker the scheduler named", "[dispa
     CHECK(result.workerEndpoint == Worker);
 
     // The scheduler is asked first, then the worker it named -- the client never
-    // guesses at an endpoint.
-    REQUIRE(dialer.Dialled().size() == 2);
+    // guesses at an endpoint -- and then the scheduler again, to hand the lease
+    // back. A FRESH connection for that, not the one the grant arrived on: the
+    // scheduler sweeps a connection idle for five seconds and a compile takes
+    // longer, so reusing it would fail exactly when there was something to release.
+    REQUIRE(dialer.Dialled().size() == 3);
     CHECK(dialer.Dialled()[0] == Scheduler);
     CHECK(dialer.Dialled()[1] == Worker);
+    CHECK(dialer.Dialled()[2] == Scheduler);
 }
 
 TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")
@@ -249,6 +314,79 @@ TEST_CASE("A worker refusing the job is a decline, not a compile", "[dispatch]")
     CHECK(result.status == DispatchStatus::Declined);
     CHECK_FALSE(result.Ran());
     CHECK(result.detail.contains("unknown-lease"));
+}
+
+TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
+{
+    // The client is the party the lease was issued to, and every branch below is a
+    // way its job can end. Before there was a verb for this the key stayed marked
+    // in-flight for the scheduler's whole lease timeout -- ten minutes -- so
+    // recompiling the same translation unit inside that window was refused
+    // `already-in-flight` and fell back to a local compile (#212).
+    //
+    // Asserted per outcome rather than once, because "somebody added a branch and
+    // forgot the release" is exactly the regression the shape of `Dispatch` was
+    // changed to prevent.
+    ScriptedDialer dialer;
+    dialer.Serve(std::string { Scheduler }, GrantReply());
+    std::vector<std::string> const args { "-O2" };
+
+    SECTION("after a compile that ran")
+    {
+        dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+        REQUIRE(Dispatch(dialer, Request(args)).Ran());
+    }
+    SECTION("after the worker refused the job")
+    {
+        dialer.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
+        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Declined);
+    }
+    SECTION("after a worker that was not there at all")
+    {
+        // The case the old comment argued was not worth a verb -- "a client that
+        // cannot reach the worker is exactly the client least able to report
+        // anything about it". It is holding the token, nothing was compiled, and
+        // the key is pinned until it says so.
+        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+    }
+    SECTION("after a result it could not decode")
+    {
+        dialer.Serve(std::string { Worker }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("junk")));
+        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+    }
+
+    auto const frames = FramesTo(dialer, Scheduler);
+    REQUIRE(frames.size() == 2);
+    CHECK(OpOf(frames[0]) == Wire::Op::Lease);
+    REQUIRE(OpOf(frames[1]) == Wire::Op::Release);
+
+    // Naming the token the grant carried, not some other one: a release that names
+    // nothing the scheduler issued is refused and resolves no key at all.
+    auto const token = Wire::DecodeReleasePayload(frames[1].subspan(Wire::RequestHeaderSize));
+    REQUIRE(token.has_value());
+    CHECK(Wire::AsStringView(Unwrap(token)) == "l1");
+}
+
+TEST_CASE("A scheduler that has gone away by then changes nothing", "[dispatch]")
+{
+    // The release is best effort and must stay that way: the scheduler restarting
+    // or losing leadership during a compile is ordinary, the lease expires on its
+    // own, and a dispatch that had already succeeded must not be reported as a
+    // failure because of what happened after it.
+    ScriptedDialer dialer;
+    dialer.Serve(std::string { Scheduler }, GrantReply());
+    dialer.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    dialer.ReachableFor(std::string { Scheduler }, 1);
+
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(dialer, Request(args));
+
+    REQUIRE(result.Ran());
+    CHECK(std::string(reinterpret_cast<char const*>(result.object.data()), result.object.size()) == "OBJECTBYTES");
+    CHECK(result.detail.empty());
+    // It did try, which is the other half: a silent skip would look the same here.
+    REQUIRE(dialer.Dialled().size() == 3);
+    CHECK(dialer.Dialled()[2] == Scheduler);
 }
 
 TEST_CASE("A malformed grant or result is unavailable, never a silent success", "[dispatch]")

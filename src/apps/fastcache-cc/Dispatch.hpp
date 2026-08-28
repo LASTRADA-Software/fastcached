@@ -92,11 +92,30 @@ struct DispatchRequest
 
 /// Ask the scheduler for a worker and have it compile this translation unit.
 ///
-/// Two exchanges, each a short request/reply on a fresh connection: a `Lease` to
-/// the scheduler, then a `Compile` to whichever worker it named. The client never
-/// waits in a queue — a scheduler with nothing free refuses immediately, and the
-/// caller compiles locally. That is not a fallback bolted on afterwards; it is why
-/// the scheduler is allowed to refuse at all.
+/// Three exchanges, each a short request/reply on a fresh connection: a `Lease` to
+/// the scheduler, a `Compile` to whichever worker it named, and a `Release` back to
+/// the scheduler saying the job is over. The client never waits in a queue — a
+/// scheduler with nothing free refuses immediately, and the caller compiles
+/// locally. That is not a fallback bolted on afterwards; it is why the scheduler is
+/// allowed to refuse at all.
+///
+/// **The release is not optional and not the caller's to remember.** A lease
+/// suppresses every other client's attempt at the same key, so one that is never
+/// resolved pins that key for the scheduler's whole lease timeout — ten minutes by
+/// default (#212). It therefore happens here, on every path out of the compile,
+/// rather than being handed back for the caller to do: expiry exists for a client
+/// that *died*, not for one that forgot. It costs a second connection to the
+/// scheduler per dispatched translation unit; the one the grant arrived on cannot
+/// carry it, because that port sweeps a connection idle for five seconds and a
+/// compile is longer than that.
+///
+/// The residual, deliberately: the lease is resolved when the compile ends, and the
+/// caller stores the object afterwards, so for the length of that store the key is
+/// neither in flight nor in the cache and a client arriving inside that window can
+/// be granted a lease for work already done. It costs one duplicate compile of one
+/// object, and the alternative — holding the lease across work this function does
+/// not control, on paths where the caller may legitimately never store at all — is
+/// how a lease comes to be resolved by expiry again.
 ///
 /// **The object comes back to the client, and the client stores it.** A worker is
 /// never given cache credentials. Today a `STORE` is trusted because whoever stores
