@@ -367,6 +367,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   substitution would mislead, default where it cannot.
 - A stacked area is drawn **top band first**, or translucent fills multiply into a
   colour belonging to no series.
+- A `<circle>` is not path data. One `<` in an attribute value makes a browser refuse
+  the whole SVG, and the chart is then a broken image behind a 200. A run of one
+  reading is a dot whether the shape is filled or not — closing it gives a shape with
+  no width that draws nothing and still claims the series was observed. Neither is
+  visible in a test that renders dense data: gaps are what a live dashboard has.
 - The dashboard credential is its own file, never `--requirepass`; a non-loopback
   bind without one is a startup refusal, and TLS does not substitute for it.
 - Plain HTTP is a supported way to serve the admin surface. TLS is on by naming
