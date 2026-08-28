@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Distributed/LeaseTable.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <format>
 #include <utility>
 #include <vector>
@@ -142,15 +144,60 @@ bool LeaseTable::IsInFlight(std::string_view key) const
     return entry != _byToken.end() && IsLive(entry->second, _clock.Now());
 }
 
-std::size_t LeaseTable::LiveCount() const
+LeaseListing LeaseTable::LiveLeases(std::size_t limit) const
 {
     std::scoped_lock const guard { _mutex };
+    // ONE reading for the whole snapshot, not one per entry: asking per lease would
+    // let a single listing report ages measured against different instants, and
+    // order rows by a clock that moved underneath the sort. `WorkerRegistry` states
+    // the same rule where it takes `now` once for a report.
     auto const now = _clock.Now();
-    std::size_t live = 0;
+
+    // A pointer and a duration per lease, not a `LeaseReport`: this runs under the
+    // SAME lock `Acquire` and `Release` take, so against the thousands of leases a
+    // busy fleet holds, a page scrape would otherwise stall dispatch while it
+    // copied two strings per lease and sorted all of them. Only what survives the
+    // bound is materialised.
+    struct Candidate
+    {
+        Entry const* entry;
+        std::chrono::milliseconds age;
+    };
+
+    std::vector<Candidate> live;
     for (auto const& [token, entry]: _byToken)
-        if (IsLive(entry, now))
-            ++live;
-    return live;
+    {
+        if (!IsLive(entry, now))
+            continue;
+        live.push_back(Candidate { .entry = &entry,
+                                   .age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       now < entry.issuedAt ? Duration::zero() : now - entry.issuedAt) });
+    }
+
+    // The total is taken from the same walk under the same lock as the listing.
+    // Two calls would be two samples, and a lease resolved between them makes a
+    // window look like the whole set -- so the truncation notice a reader relies on
+    // would be wrong in exactly the situation it exists for.
+    LeaseListing listing { .oldest = {}, .total = live.size() };
+
+    // Oldest first, and the key breaks the tie so a snapshot is reproducible: an
+    // unordered_map's iteration order is neither stable nor meaningful, and two
+    // leases taken in the same tick are ordinary on a wide parallel build.
+    //
+    // `partial_sort` rather than a full one, for the same reason the candidates are
+    // pointers: the answer is identical and the work is bounded by what was asked
+    // for rather than by how busy the fleet is.
+    auto const keep = std::min(limit, live.size());
+    std::ranges::partial_sort(live, live.begin() + static_cast<std::ptrdiff_t>(keep), [](Candidate a, Candidate b) {
+        return a.age != b.age ? a.age > b.age : a.entry->lease.key < b.entry->lease.key;
+    });
+    live.resize(keep);
+
+    listing.oldest.reserve(live.size());
+    for (auto const& candidate: live)
+        listing.oldest.push_back(LeaseReport {
+            .key = candidate.entry->lease.key, .workerId = candidate.entry->lease.workerId, .age = candidate.age });
+    return listing;
 }
 
 } // namespace FastCache::Distributed

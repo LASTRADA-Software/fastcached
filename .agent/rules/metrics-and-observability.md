@@ -143,6 +143,28 @@ fault.
   `StorageTierTable`. A hand-written list of `<td>`s is the same defect as a
   hand-written list of series, and a list of *expected* columns written out beside
   the table is what goes stale, maintained by whoever forgot the renderer.
+- **A bounded listing carries its own total, sampled with it.** The outstanding
+  leases the fleet page shows are the *oldest fifty* -- a fleet at full tilt holds
+  thousands and a page that rendered all of them is one nobody can read -- so the
+  section says which it is showing (`the 50 oldest of 900`) and the JSON key is
+  named `leases-outstanding-oldest` rather than leaving a reader to take a window
+  for the whole set. The count comes back from the SAME call under the SAME lock as
+  the rows (`LeaseListing`): asked separately they are two samples, and a lease
+  resolved between them makes a window look complete -- the truncation notice
+  wrong in exactly the situation it exists for. Which end is not presentation
+  either: the oldest are the leases that have stopped moving, and a lease still
+  outstanding after minutes is a client that died mid-build rather than one waiting
+  to age out, because a client resolves its own lease when the job ends.
+- **A pill's threshold belongs to what it is measuring.** `CellDecor::Freshness`
+  turns amber after fifteen seconds, which is right for a heartbeat and wrong for
+  everything else: a fifteen-second-old lease is an ordinary compile still running,
+  so reusing that decor for a lease age would paint every row amber and the colour
+  would stop meaning anything at all. `LeaseAge` is its own row, at half
+  `LeaseTable::DefaultLeaseTimeout` -- past which a lease is closer to expiring than
+  to having been taken -- and it is *derived* from that constant rather than typed
+  as a number, so a threshold cannot silently stop tracking the timeout it is about.
+  Both draw through one helper, because two near-identical `case` bodies is how a
+  pair comes to differ for no reason anybody intended.
 - **Absent is not zero, one level further in than a series: at the cell.** Every
   `optional` in `NodeLoad`, `NodeCacheLoad` and `NodeCacheCapacity` reaches a cell
   unflattened -- `null` in JSON, a dash on the page, the spelling `--cluster-status`
@@ -393,11 +415,6 @@ outright rather than drawing with a gap.
 
 ## Open work
 
-- **[#142](https://github.com/LASTRADA-Software/fastcached/issues/142)** —
-  `LeaseTable` exposes `LiveCount()` and `IsInFlight(key)` and no way to walk what
-  is held, so the page can say *seven leases* and not *which*. That is the wrong
-  grain for the moment the tile matters: a lease outstanding for twenty minutes is
-  a worker that died mid-compile, and the count cannot say so.
 - **[#143](https://github.com/LASTRADA-Software/fastcached/issues/143)** —
   `/fleet` collects and renders a full snapshot per request and the page carries a
   meta refresh, so tabs left open are steady load on the node that also schedules

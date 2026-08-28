@@ -128,6 +128,10 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
                                                              .load = Busy(1),
                                                              .codecs = {} },
                                         .heartbeatAge = std::chrono::milliseconds { 30 } } };
+    snapshot.outstandingLeases = { LeaseHolding { .key = "0123456789abcdef0123456789abcdef",
+                                                  .workerId = "w1",
+                                                  .workerEndpoint = "10.0.0.2:7100",
+                                                  .age = std::chrono::milliseconds { 4000 } } };
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
     auto const json = RenderFleetJson(snapshot);
@@ -161,12 +165,124 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
     }
+    for (auto const& name: { "key", "worker", "age" })
+    {
+        INFO("lease column " << name);
+        CHECK(html.contains(std::string { ">" } + name + "</th>"));
+        CHECK(json.contains(std::string { "\"" } + name + "\":"));
+    }
     // And every lease outcome, by the key its row carries.
     for (auto const& row: LeaseOutcomeTable)
     {
         INFO("lease outcome " << row.key);
         CHECK(json.contains(std::string { "\"" } + std::string { row.key } + "\":"));
         CHECK(html.contains(std::string { row.label }));
+    }
+}
+
+TEST_CASE("Outstanding leases are listed, and the truncation is visible", "[distributed][fleetview]")
+{
+    // The count alone was the whole read surface, and it is the wrong grain for the
+    // moment the tile matters: an operator on a fleet that has stopped moving needs
+    // which keys are held and by whom. A bounded list has to say it is bounded at
+    // the SECTION, because a reader who takes fifty rows for the fleet's whole work
+    // draws the wrong conclusion from a correct table.
+    auto snapshot = LeadingSnapshot();
+    snapshot.liveLeases = 200;
+    snapshot.outstandingLeases = { LeaseHolding { .key = "aaaa1111",
+                                                  .workerId = "w1",
+                                                  .workerEndpoint = "10.0.0.2:7100",
+                                                  .age = std::chrono::milliseconds { 90'000 } },
+                                   LeaseHolding { .key = "bbbb2222",
+                                                  .workerId = "w2",
+                                                  .workerEndpoint = "10.0.0.3:7100",
+                                                  .age = std::chrono::milliseconds { 1000 } } };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    auto const json = RenderFleetJson(snapshot);
+
+    CHECK(html.contains("Leases outstanding"));
+    CHECK(html.contains("the 2 oldest of 200"));
+    CHECK(html.contains("aaaa1111"));
+    CHECK(html.contains("bbbb2222"));
+
+    // A key of its own rather than replacing the count, and named for what it is:
+    // a scraper reading only `leases-outstanding` keeps the total it always had.
+    CHECK(json.contains(R"("leases-outstanding":200)"));
+    CHECK(json.contains(R"("leases-outstanding-oldest":[)"));
+    CHECK(json.contains(R"("key":"aaaa1111")"));
+    CHECK(json.contains(R"("worker":"w2")"));
+    CHECK(json.contains(R"("age":90000)"));
+}
+
+TEST_CASE("A complete lease listing does not claim to be truncated", "[distributed][fleetview]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.liveLeases = 1;
+    snapshot.outstandingLeases = { LeaseHolding {
+        .key = "only-one", .workerId = "w1", .workerEndpoint = "10.0.0.2:7100", .age = std::chrono::milliseconds { 5 } } };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    CHECK(html.contains("oldest first"));
+    CHECK_FALSE(html.contains("oldest of"));
+}
+
+TEST_CASE("A lease whose worker has gone renders an absence, not a blank", "[distributed][fleetview]")
+{
+    // The one cell where emptiness is the ANSWER: the lease is held against a worker
+    // that is no longer registered, which is what an operator came to find out. A
+    // blank cell says the same thing as a missing one and means something else.
+    auto snapshot = LeadingSnapshot();
+    snapshot.liveLeases = 1;
+    snapshot.outstandingLeases = { LeaseHolding {
+        .key = "orphan", .workerId = "w9", .workerEndpoint = {}, .age = std::chrono::milliseconds { 1000 } } };
+
+    CHECK(RenderFleetJson(snapshot).contains(R"("endpoint":null)"));
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains("&ndash;"));
+}
+
+TEST_CASE("A fleet holding no leases renders an empty table, not a broken one", "[distributed][fleetview]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.liveLeases = 0;
+    snapshot.outstandingLeases = {};
+
+    CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains("(none)"));
+    CHECK(RenderFleetJson(snapshot).contains(R"("leases-outstanding-oldest":[])"));
+}
+
+TEST_CASE("A lease age is not a heartbeat age, and is not coloured like one", "[distributed][fleetview]")
+{
+    // The reason `CellDecor::LeaseAge` exists at all. A heartbeat is stale after
+    // fifteen seconds; a lease that old is an ordinary compile still running, so
+    // reusing the heartbeat's threshold would paint every row amber and the colour
+    // would stop meaning anything. Amber is half the lease lifetime -- past it, a
+    // lease is closer to expiring than to having been taken.
+    //
+    // Asserted on the rendered PILL rather than on the bare class name, which the
+    // page's own stylesheet also carries, and on the tone rather than on the
+    // formatted age: the fixture's one machine has a 250 ms heartbeat, so nothing
+    // else here draws a warning pill.
+    constexpr std::string_view WarnPill = R"(pill--warn"><span class="dot">)";
+    auto snapshot = LeadingSnapshot();
+    snapshot.liveLeases = 1;
+
+    SECTION("an ordinary compile, long past a heartbeat's patience, is not flagged")
+    {
+        snapshot.outstandingLeases = { LeaseHolding { .key = "busy",
+                                                      .workerId = "w1",
+                                                      .workerEndpoint = "10.0.0.2:7100",
+                                                      .age = std::chrono::milliseconds { 15'000 } } };
+        CHECK_FALSE(RenderFleetHtml(snapshot, NoHistory(), 10).contains(WarnPill));
+    }
+
+    SECTION("one closer to expiring than to being taken is")
+    {
+        snapshot.outstandingLeases = { LeaseHolding { .key = "stuck",
+                                                      .workerId = "w1",
+                                                      .workerEndpoint = "10.0.0.2:7100",
+                                                      .age = LeaseTable::DefaultLeaseTimeout / 2 } };
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains(WarnPill));
     }
 }
 

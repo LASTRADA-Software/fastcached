@@ -5,7 +5,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <format>
 #include <optional>
+#include <ranges>
 #include <string>
 
 #include <tests/Unwrap.hpp>
@@ -56,7 +58,7 @@ TEST_CASE("Different keys lease independently", "[distributed][lease]")
     Fixture fix;
     CHECK(fix.leases.Acquire("objkey-1", "w1").has_value());
     CHECK(fix.leases.Acquire("objkey-2", "w1").has_value());
-    CHECK(fix.leases.LiveCount() == 2);
+    CHECK(fix.leases.LiveLeases(0).total == 2);
 }
 
 TEST_CASE("Finding does not consume the lease", "[distributed][lease]")
@@ -82,7 +84,7 @@ TEST_CASE("Releasing a lease frees its key for the next client", "[distributed][
     auto const released = fix.leases.Release(Unwrap(lease).token, "objkey-1");
     REQUIRE(released.has_value());
     CHECK(Unwrap(released).key == "objkey-1");
-    CHECK(fix.leases.LiveCount() == 0);
+    CHECK(fix.leases.LiveLeases(0).total == 0);
     CHECK(fix.leases.Acquire("objkey-1", "w2").has_value());
 }
 
@@ -104,7 +106,7 @@ TEST_CASE("An abandoned lease expires and the key becomes leasable again", "[dis
 
     fix.clock.Advance(std::chrono::milliseconds { 1001 });
     CHECK_FALSE(fix.leases.Find(Unwrap(lease).token).has_value());
-    CHECK(fix.leases.LiveCount() == 0);
+    CHECK(fix.leases.LiveLeases(0).total == 0);
 
     auto const second = fix.leases.Acquire("objkey-1", "w2");
     REQUIRE(second.has_value());
@@ -170,7 +172,7 @@ TEST_CASE("An expired lease reports as gone rather than as freed", "[distributed
     auto const next = fix.leases.Acquire("objkey-1", "w2");
     REQUIRE(next.has_value());
     CHECK(Unwrap(next).token != Unwrap(lease).token);
-    CHECK(fix.leases.LiveCount() == 1);
+    CHECK(fix.leases.LiveLeases(0).total == 1);
 }
 
 TEST_CASE("Dropping a worker releases every lease held against it", "[distributed][lease]")
@@ -184,7 +186,7 @@ TEST_CASE("Dropping a worker releases every lease held against it", "[distribute
     REQUIRE(fix.leases.Acquire("objkey-3", "w2").has_value());
 
     CHECK(fix.leases.ReleaseWorker("w1") == 2);
-    CHECK(fix.leases.LiveCount() == 1);
+    CHECK(fix.leases.LiveLeases(0).total == 1);
     CHECK(fix.leases.Acquire("objkey-1", "w2").has_value());
     CHECK_FALSE(fix.leases.Acquire("objkey-3", "w1").has_value());
 }
@@ -208,6 +210,90 @@ TEST_CASE("Re-leasing an expired key does not leak the old token", "[distributed
 
     // The old token is gone entirely, not merely expired.
     CHECK_FALSE(fix.leases.Release(Unwrap(first).token, "objkey-1").has_value());
+}
+
+TEST_CASE("The live leases can be walked, oldest first", "[distributed][lease]")
+{
+    // The grain a count cannot answer at. A fleet that has stopped making
+    // progress shows a number; what an operator needs is which keys are held and by
+    // whom -- and since a lease is resolved by the client that took it, one still
+    // outstanding after minutes is a client that died mid-build whose worker is
+    // still heartbeating.
+    Fixture fix;
+    REQUIRE(fix.leases.Acquire("oldest", "w1").has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 300 });
+    REQUIRE(fix.leases.Acquire("middle", "w2").has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 100 });
+    REQUIRE(fix.leases.Acquire("newest", "w1").has_value());
+
+    auto const held = fix.leases.LiveLeases(10).oldest;
+    REQUIRE(held.size() == 3);
+
+    // Ordered by descending age, not by insertion or by hash: `_byToken` is an
+    // unordered_map, so without the sort this assertion would pass or fail by
+    // accident.
+    CHECK(held[0].key == "oldest");
+    CHECK(held[1].key == "middle");
+    CHECK(held[2].key == "newest");
+
+    // The holder travels with it -- the actionable half -- and the age is measured
+    // against the injected clock rather than a real one.
+    CHECK(held[0].workerId == "w1");
+    CHECK(held[1].workerId == "w2");
+    CHECK(held[0].age == std::chrono::milliseconds { 400 });
+    CHECK(held[2].age == std::chrono::milliseconds { 0 });
+}
+
+TEST_CASE("The lease listing is bounded, and keeps the oldest", "[distributed][lease]")
+{
+    // A fleet at full tilt holds thousands, so any listing is bounded -- and WHICH
+    // end it keeps is the whole point: the newest fifty of three thousand would
+    // answer nothing, while the oldest are the ones that have stopped moving. The
+    // total travels beside the listing, sampled under the same lock, so the
+    // truncation is visible rather than silent.
+    Fixture fix;
+    for (auto const index: std::views::iota(0, 5))
+    {
+        REQUIRE(fix.leases.Acquire(std::format("key-{}", index), "w1").has_value());
+        fix.clock.Advance(std::chrono::milliseconds { 10 });
+    }
+
+    auto const listing = fix.leases.LiveLeases(2);
+    REQUIRE(listing.oldest.size() == 2);
+    CHECK(listing.oldest[0].key == "key-0");
+    CHECK(listing.oldest[1].key == "key-1");
+    // The total comes back from the SAME call, under the same lock: asked
+    // separately the two can disagree, and the truncation notice a reader relies on
+    // is then wrong in exactly the situation it exists for.
+    CHECK(listing.total == 5);
+
+    CHECK(fix.leases.LiveLeases(0).oldest.empty());
+}
+
+TEST_CASE("An expired lease is not listed, even while it is still in the table", "[distributed][lease]")
+{
+    // Presence is not liveness -- the split `IsInFlight` and `Release` already make.
+    // Nothing re-leased this key, so the entry is still sitting in the token map, and
+    // listing it would put a lease on the page that stopped suppressing anything.
+    Fixture fix;
+    REQUIRE(fix.leases.Acquire("abandoned", "w1").has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    REQUIRE(fix.leases.Acquire("live-one", "w1").has_value());
+
+    auto const held = fix.leases.LiveLeases(10).oldest;
+    REQUIRE(held.size() == 1);
+    CHECK(held[0].key == "live-one");
+}
+
+TEST_CASE("A resolved lease leaves the listing at once", "[distributed][lease]")
+{
+    Fixture fix;
+    auto const lease = fix.leases.Acquire("objkey-1", "w1");
+    REQUIRE(lease.has_value());
+    REQUIRE(fix.leases.LiveLeases(10).oldest.size() == 1);
+
+    REQUIRE(fix.leases.Release(Unwrap(lease).token, "objkey-1").has_value());
+    CHECK(fix.leases.LiveLeases(10).oldest.empty());
 }
 
 TEST_CASE("A clock that moves backwards does not expire live leases", "[distributed][lease]")

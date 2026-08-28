@@ -304,14 +304,19 @@ class SchedulerService
         return _leaderEndpoint;
     }
 
-    /// Leases outstanding right now.
+    /// What is outstanding right now: the oldest few, and how many there are.
     ///
     /// Narrow on purpose: a reporting caller has no business holding a
     /// `LeaseTable&`, which is mutable and whose other verbs account for capacity.
-    /// @return The live lease count.
-    [[nodiscard]] std::size_t LiveLeaseCount() const
+    /// Bounded for a reason of its own -- a busy fleet holds thousands, so a report
+    /// shows the oldest few beside the total rather than all of them, and which end
+    /// is not a presentation choice: the oldest are the leases that have stopped
+    /// moving.
+    /// @param limit How many entries to return at most; zero asks only for the total.
+    /// @return The listing, both halves sampled together.
+    [[nodiscard]] LeaseListing OutstandingLeases(std::size_t limit) const
     {
-        return _leases.LiveCount();
+        return _leases.LiveLeases(limit);
     }
 
     /// The registry, for the admin endpoint and for tests.
