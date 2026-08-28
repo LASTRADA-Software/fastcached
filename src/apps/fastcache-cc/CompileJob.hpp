@@ -3,6 +3,7 @@
 
 #include "IProcessRunner.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -92,6 +93,13 @@ class CompileJobRunner
                      std::map<std::string, std::string> toolchains);
 
     /// Run one job to completion.
+    ///
+    /// **Callable from several threads at once**, which is what a worker serving
+    /// `slots` compiles does through one of these. Everything it reads is fixed at
+    /// construction; the only mutable state is the job counter, and every path a
+    /// job writes hangs off the directory that counter names.
+    ///
+    /// The process runner it is given must accept concurrent calls too.
     /// @param job The job.
     /// @return What the compiler produced, or why the job was refused.
     [[nodiscard]] std::expected<CompileOutcome, JobRefusal> Run(CompileJob const& job);
@@ -116,7 +124,17 @@ class CompileJobRunner
     IProcessRunner& _runner;
     std::filesystem::path _scratchRoot;
     std::map<std::string, std::string> _toolchains;
-    std::uint64_t _nextJob { 1 };
+    /// Atomic because a worker runs `slots` compiles at once, on `slots` threads,
+    /// through ONE of these.
+    ///
+    /// A plain `++` here let two jobs read the same number and derive the same
+    /// scratch directory -- and with it the same source path and the same hard-coded
+    /// `tu.o`. One then read the other's object and returned it to its client, which
+    /// cached it under its own key: silent wrong-object delivery, which is the worst
+    /// thing a compile cache can do. The gentler interleaving is one job's
+    /// `ScratchGuard` deleting the directory under the other, reported as
+    /// `ScratchUnavailable` and blamed on the disk.
+    std::atomic<std::uint64_t> _nextJob { 1 };
 };
 
 /// Whether `arg` is one this worker will pass to a compiler.

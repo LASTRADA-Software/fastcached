@@ -5,11 +5,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <latch>
+#include <mutex>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -66,6 +75,79 @@ class ScriptedRunner final: public IProcessRunner
     std::string _stdoutText;
     std::string _stderrText;
     std::vector<std::string> _argv;
+};
+
+/// A runner that echoes each invocation's own SOURCE back as its object, and does
+/// not return until `Overlap` of them are inside it at once.
+///
+/// Both halves are the test. The echo makes "this job got another job's bytes"
+/// visible, where a canned object would look identical either way. The barrier
+/// makes the overlap a fact rather than a hope -- a race reproduced by timing is a
+/// test that passes on the machine that has the bug.
+class OverlappingEchoRunner final: public IProcessRunner
+{
+  public:
+    static constexpr std::size_t Overlap = 2;
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        // argv is [compiler, ...args, "-c", <source>, "-o<object>"].
+        std::string source;
+        std::string object;
+        for (auto const& arg: argv)
+        {
+            if (arg.starts_with("-o") && arg.size() > 2)
+                object = arg.substr(2);
+            else if (arg.ends_with(".cpp"))
+                source = arg;
+        }
+
+        // Everyone waits until every job has written its source, so a shared scratch
+        // directory has certainly been shared by the time anything is read back.
+        {
+            auto guard = std::unique_lock { _mutex };
+            ++_inside;
+            _changed.notify_all();
+            // Bounded, and it says what it waited for: the other job reaching the
+            // compiler. Unbounded here would hang the suite rather than fail it.
+            (void) _changed.wait_for(guard, std::chrono::seconds { 5 }, [this] { return _inside >= Overlap; });
+        }
+
+        // Sized and read in one go rather than through `istreambuf_iterator`, for
+        // the reason `CompileJob.cpp` already records: GCC at -O3 inlines that
+        // iterator's `sgetc` and reports a potential null dereference inside
+        // libstdc++'s own `streambuf`, which `-Werror` turns into a failed build on
+        // one compiler only. Invisible under the debug preset this was written
+        // against.
+        std::ifstream in { source, std::ios::binary | std::ios::ate };
+        auto const size = in.tellg();
+        std::string text;
+        if (size > 0)
+        {
+            text.resize(static_cast<std::size_t>(size));
+            in.seekg(0, std::ios::beg);
+            in.read(text.data(), size);
+        }
+        std::ofstream { object, std::ios::binary } << text;
+        return CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// Rearm for the next pair. Called from the test thread with nothing inside.
+    void NextRound()
+    {
+        auto const guard = std::scoped_lock { _mutex };
+        _inside = 0;
+    }
+
+  private:
+    std::mutex _mutex;
+    std::condition_variable _changed;
+    std::size_t _inside { 0 };
 };
 
 /// A scratch root that cleans itself up.
@@ -361,5 +443,83 @@ TEST_CASE("The output flag follows the worker's own driver family", "[compile-jo
         REQUIRE(!argv.empty());
         CHECK(std::ranges::any_of(argv, [](std::string const& a) { return a.starts_with("-o"); }));
         CHECK(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("/Fo"); }));
+    }
+}
+
+TEST_CASE("Concurrent jobs each get their OWN object rather than a sibling's", "[compile-job]")
+{
+    // The reason this exists: since #213 a worker runs `slots` compiles at once
+    // through ONE CompileJobRunner, so the per-job scratch directory has to be
+    // unique across threads and not merely across calls. It was derived from a plain
+    // `++`, and every path below it -- the source, and the hard-coded `tu.o` -- is
+    // inside it. Two jobs landing on the same number therefore compiled into the
+    // same file and one returned the OTHER's object, which its client then cached
+    // under its own key. A worker that answers with the wrong object is worse than
+    // one that answers with nothing.
+    //
+    // Asserting on the returned BYTES is the point. The counters agree in both
+    // worlds; only the payload tells them apart.
+    //
+    // A few rounds rather than one, but no illusions about what that buys: measured
+    // against the defect, one round caught it in 50 runs out of 300 and thirty-two
+    // rounds caught it in exactly the same proportion. A lost update is a race, and
+    // a black-box test cannot make one certain.
+    //
+    // What this case IS certain about is the shape: any regression that gives two
+    // concurrent jobs the same path -- a shared directory, a fixed object name --
+    // fails it every time, because the barrier guarantees the overlap. The race on
+    // the counter itself is caught deterministically by ThreadSanitizer, which is
+    // why `Run` being callable from several threads is written down in its docs.
+    constexpr std::size_t Rounds = 4;
+
+    ScratchDirectory scratch { "fc-jobtest" };
+    OverlappingEchoRunner runner;
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+
+    // Same source NAME, different source TEXT -- exactly the case a shared scratch
+    // directory collapses, and exactly what a real fleet does when two machines
+    // compile their own `main.cpp` on the same worker.
+    std::array<std::string, OverlappingEchoRunner::Overlap> const texts { "int a = 1;", "long b = 2;" };
+
+    // Rendered back to text so a failure names the bytes rather than their length.
+    auto const asText = [](std::vector<std::byte> const& bytes) {
+        std::string out;
+        out.reserve(bytes.size());
+        for (auto const byte: bytes)
+            out.push_back(static_cast<char>(byte));
+        return out;
+    };
+
+    for (auto const round: std::views::iota(std::size_t { 0 }, Rounds))
+    {
+        INFO("round " << round);
+        std::array<std::expected<CompileOutcome, JobRefusal>, OverlappingEchoRunner::Overlap> results {};
+
+        // Both threads enter Run() together rather than whenever they happen to be
+        // scheduled. Without this the first job can finish before the second starts,
+        // and the round reports a pass having never overlapped at all.
+        std::latch start { static_cast<std::ptrdiff_t>(OverlappingEchoRunner::Overlap) };
+
+        {
+            std::vector<std::jthread> threads;
+            for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+                threads.emplace_back([&, index] {
+                    auto job = Job();
+                    job.preprocessed = texts.at(index);
+                    start.arrive_and_wait();
+                    // No Catch2 macro on this thread: the assertion macros are not
+                    // thread-safe, so the answer is carried back and checked below.
+                    results.at(index) = jobs.Run(job);
+                });
+        } // joined
+
+        for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+        {
+            INFO("job " << index);
+            REQUIRE(results.at(index).has_value());
+            REQUIRE(asText(results.at(index)->object) == texts.at(index));
+        }
+
+        runner.NextRound();
     }
 }

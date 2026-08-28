@@ -179,7 +179,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     // Every path below is the worker's. Nothing the client sent decides where a byte
     // lands -- not the source name, not the object name, not the directory.
     std::error_code ec;
-    auto const scratch = _scratchRoot / std::format("job-{}", _nextJob++);
+    auto const scratch = _scratchRoot / std::format("job-{}", _nextJob.fetch_add(1, std::memory_order_relaxed));
     std::filesystem::create_directories(scratch, ec);
     if (ec)
         return std::unexpected(JobRefusal::ScratchUnavailable);
