@@ -58,6 +58,43 @@ namespace FastCache::Cc
 /// @return The search paths, in order.
 [[nodiscard]] std::vector<std::string> ParseIncludeEnvironment(std::string_view value);
 
+/// The files found under a toolchain's include roots, and whether that is all of them.
+///
+/// The second field draws the same line `IncludeSearchRoots::answered` draws one
+/// layer up, for the same reason and against a worse failure. A root that is not
+/// THERE is ordinary -- a driver lists search paths it would use if they existed --
+/// and so is an entry that is not a regular file. A root that is there and could not
+/// be read, or a walk that stopped partway, is neither: the digest then covers less
+/// of the toolchain than the toolchain has, and says so to nobody.
+///
+/// Worse than the unrun probe of `IncludeSearchRoots::answered`, because a short walk
+/// moves no stamp. `ComputeToolchainStamp` folds each root's path and mtime, not its
+/// contents, so an I/O failure inside a root leaves the stamp identical -- the wrong
+/// fingerprint is written under a stamp that still validates, and every later run
+/// hits it without walking anything. There is no self-correcting run to wait for.
+struct ToolchainFileScan
+{
+    /// One entry per readable file, unsorted (the digest sorts).
+    std::vector<ToolchainFile> files;
+
+    /// False when content was omitted for a reason other than not being there.
+    ///
+    /// The signals that clear it are a root that could not be opened or stat'd, a walk
+    /// that ended early, a file with no relative spelling, and a regular file whose
+    /// bytes could not be read -- the last being what an antivirus holding a header
+    /// looks like. What they share is that they are accidents of one moment on one
+    /// machine, so two ends running this same code disagree.
+    ///
+    /// Two omissions deliberately do NOT clear it, and both would refuse healthy
+    /// toolchains. A failed `is_regular_file` is one: that query fails on a dangling
+    /// symlink, which a real toolchain tree contains. A root whose bytes this process
+    /// cannot decode into a path is the other, and it is the subtler of the two --
+    /// whether those bytes decode is a property of the bytes and of the narrow
+    /// encoding every executable here pins to UTF-8, so a launcher and a worker reach
+    /// the same answer and digest the same narrower tree, which still matches.
+    bool complete { true };
+};
+
 /// Walk include search roots and digest every file under them.
 ///
 /// **This is the I/O half** — it opens files, and it is deliberately not
@@ -74,8 +111,8 @@ namespace FastCache::Cc
 /// that would dwarf the compile it is trying to accelerate.
 ///
 /// @param roots Include search paths, as a driver reported them.
-/// @return One entry per readable file, unsorted (the digest sorts).
-[[nodiscard]] std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> roots);
+/// @return The files, and whether every root was walked to the end.
+[[nodiscard]] ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots);
 
 /// How this compiler is invoked to learn what it is.
 ///
@@ -458,6 +495,17 @@ enum class IdentityDefect : std::uint8_t
     /// remedy if the failure is indistinguishable from success.
     UnrunProbe,
 
+    /// Part of the include tree could not be read, so the digest covers less of the
+    /// toolchain than the toolchain has.
+    ///
+    /// The same shape as `UnrunProbe` one layer down, and the more dangerous of the
+    /// two on its own: an unrun probe empties the root list and so moves the stamp,
+    /// while a short walk inside a root that IS there leaves every stamped input
+    /// identical. Cached, it would validate forever against a walk that never
+    /// happens again. See `ToolchainFileScan::complete` for what does and does not
+    /// count as short.
+    PartialTree,
+
     Last, ///< Not a defect, and has no row: the table's length.
 };
 
@@ -487,6 +535,12 @@ inline constexpr EnumTable<IdentityDefect, IdentityDefectRow> IdentityDefectTabl
                 "probed it successfully computes the same value",
       .remedy = "Nothing was cached, so probing again is the remedy; a spawn that fails only sometimes is usually "
                 "a scanner or a resource limit rather than the toolchain." },
+    { .defect = IdentityDefect::PartialTree,
+      .reason = "part of its include tree could not be read, so its fingerprint covers less of the toolchain than "
+                "the toolchain has -- and a root that is merely absent does not count, so this is an I/O failure "
+                "rather than a layout this machine does not have",
+      .remedy = "Nothing was cached, so probing again is the remedy; check whether a scanner or a permission is "
+                "holding files under the compiler's include roots." },
 } };
 
 static_assert(RowsInEnumeratorOrder(IdentityDefectTable, &IdentityDefectRow::defect),

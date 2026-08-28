@@ -6,6 +6,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#if defined(_WIN32)
+    // For the exclusive open that `UnreadableFile` denies a read with. Same guard
+    // shape as `ToolchainProbe.cpp`'s; the target already defines
+    // WIN32_LEAN_AND_MEAN and NOMINMAX.
+    #include <windows.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -207,8 +214,10 @@ TEST_CASE("Probing records every file relative to its own root", "[toolchain-pro
     tree.Write("a/nested/y.hpp", "content-y");
 
     std::vector<std::string> const roots { (tree / "a").string() };
-    auto const files = ProbeToolchainFiles(roots);
+    auto const scan = ProbeToolchainFiles(roots);
+    auto const& files = scan.files;
 
+    CHECK(scan.complete);
     REQUIRE(files.size() == 2);
     CHECK(HasPath(files, "x.hpp"));
     CHECK(HasPath(files, "nested/y.hpp"));
@@ -235,8 +244,8 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     std::vector<std::string> const rootsOne { (one / "inc").string() };
     std::vector<std::string> const rootsTwo { (two / (std::string { deeper } + "/inc")).string() };
 
-    auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne));
-    auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo));
+    auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne).files);
+    auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo).files);
     CHECK(first == second);
     CHECK(!first.empty());
 }
@@ -246,10 +255,10 @@ TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
     std::vector<std::string> const roots { (tree / "inc").string() };
-    auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots));
+    auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
 
     tree.Write("inc/a.hpp", "edited!");
-    auto const after = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots));
+    auto const after = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
 
     CHECK(before != after);
 }
@@ -263,15 +272,21 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
     tree.Write("inc/a.hpp", "x");
 
     std::vector<std::string> const roots { (tree / "does-not-exist").string(), (tree / "inc").string() };
-    auto const files = ProbeToolchainFiles(roots);
+    auto const scan = ProbeToolchainFiles(roots);
 
-    REQUIRE(files.size() == 1);
-    CHECK(HasPath(files, "a.hpp"));
+    REQUIRE(scan.files.size() == 1);
+    CHECK(HasPath(scan.files, "a.hpp"));
+
+    // And COMPLETE, which is the half that keeps the new guard from firing on an
+    // ordinary machine: a root that is not there is a layout this install does not
+    // have, not content that failed to arrive.
+    CHECK(scan.complete);
 }
 
 TEST_CASE("Probing nothing yields nothing", "[toolchain-probe]")
 {
-    CHECK(ProbeToolchainFiles({}).empty());
+    CHECK(ProbeToolchainFiles({}).files.empty());
+    CHECK(ProbeToolchainFiles({}).complete);
 }
 
 // --- discovery over the driver table ----------------------------------------
@@ -766,13 +781,13 @@ TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]
     auto const digestOf = [&](std::string const& compiler) {
         auto const roots = MsvcToolsetIncludeRoots(host, compiler);
         REQUIRE_FALSE(roots.empty());
-        auto const files = ProbeToolchainFiles(roots);
+        auto const scan = ProbeToolchainFiles(roots);
         // Not vacuous: two empty walks would digest equal and the check below would
         // pass having compared nothing.
-        REQUIRE(files.size() == 2);
+        REQUIRE(scan.files.size() == 2);
         // "cl" for both, which is what the banner fallback gives every MSVC
         // toolchain -- so the roots are the only thing that can tell these apart.
-        return ComputeToolchainFingerprint("cl", files);
+        return ComputeToolchainFingerprint("cl", scan.files);
     };
 
     CHECK(digestOf(older) != digestOf(newer));
@@ -1309,6 +1324,64 @@ class SequencedRunner final: public IProcessRunner
 {
     return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
 }
+
+/// Makes a file's CONTENTS unreadable for as long as it is alive.
+///
+/// Two mechanisms, because the two OSes deny a read differently and only one of
+/// them is the case this guards against. On Windows it is an exclusive open --
+/// share mode zero -- which is literally what a scanner holding a header does, and
+/// is the failure this whole defect was traced from; POSIX permission bits do
+/// nothing there, since `std::filesystem::permissions` only toggles the read-only
+/// attribute and a read-only file reads perfectly well. On POSIX it is the
+/// permission bits, which root then ignores.
+///
+/// Neither is guaranteed, so `Held()` asks rather than assumes: a case that quietly
+/// degraded to "the file was readable after all" would assert nothing while looking
+/// green. The directory entry stays visible and stat-able under both, which is what
+/// makes this reach `HashFileContents` rather than being skipped earlier.
+class UnreadableFile
+{
+  public:
+    explicit UnreadableFile(std::filesystem::path path):
+        _path { std::move(path) }
+    {
+#if defined(_WIN32)
+        _handle = ::CreateFileA(_path.string().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+#else
+        std::error_code ec;
+        std::filesystem::permissions(_path, std::filesystem::perms::none, ec);
+#endif
+    }
+
+    ~UnreadableFile()
+    {
+#if defined(_WIN32)
+        if (_handle != INVALID_HANDLE_VALUE)
+            ::CloseHandle(_handle);
+#else
+        std::error_code ec;
+        std::filesystem::permissions(_path, std::filesystem::perms::owner_all, ec);
+#endif
+    }
+
+    UnreadableFile(UnreadableFile const&) = delete;
+    UnreadableFile& operator=(UnreadableFile const&) = delete;
+    UnreadableFile(UnreadableFile&&) = delete;
+    UnreadableFile& operator=(UnreadableFile&&) = delete;
+
+    /// @return True when the contents really cannot be read now.
+    [[nodiscard]] bool Held() const
+    {
+        std::ifstream probe { _path, std::ios::binary };
+        return !probe.good();
+    }
+
+  private:
+    std::filesystem::path _path;
+#if defined(_WIN32)
+    HANDLE _handle { INVALID_HANDLE_VALUE };
+#endif
+};
 } // namespace
 
 TEST_CASE("A fingerprint from a probe that never ran is refused, not returned as an identity", "[toolchain-probe]")
@@ -1384,6 +1457,55 @@ TEST_CASE("A driver that answered with no roots is still cached", "[toolchain-pr
 
     CHECK(identity.defect == IdentityDefect::NoEvidence);
     CHECK(StoredFingerprint(state) == identity.fingerprint);
+}
+
+TEST_CASE("A header that could not be read leaves the walk incomplete and uncached", "[toolchain-probe]")
+{
+    // The same defect class as issue #225 one layer down, and the worse of the two on
+    // its own. A short walk inside a root that IS there moves NOTHING the stamp
+    // covers -- `ComputeToolchainStamp` folds each root's path and mtime, never its
+    // contents -- so before this the short digest was written under a stamp that
+    // still validated, and every later run hit it without walking anything. There was
+    // no self-correcting run to wait for.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-partial" };
+    tree.Write("inc/readable.hpp", "content");
+    tree.Write("inc/locked.hpp", "secret");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const includeDir = std::filesystem::path { tree.Path().string() } / "inc";
+    auto const locked = includeDir / "locked.hpp";
+
+    UnreadableFile const held { locked };
+
+    // REQUIRED rather than skipped past, and `SKIP` is deliberately not used here at
+    // all: Catch2 exits 4 when every case was skipped and ALSO exits with the number
+    // of failed assertions, so wiring `SKIP_RETURN_CODE 4` into `catch_discover_tests`
+    // would report any case with exactly four failed assertions as skipped -- and the
+    // pre-fix run of this very case produced exactly four. Both supported platforms
+    // can deny a read, so a host where this does not hold is a case that cannot do its
+    // job, and saying so beats passing without asserting anything.
+    REQUIRE(held.Held());
+
+    std::vector<std::string> const roots { includeDir.string() };
+    auto const scan = ProbeToolchainFiles(roots);
+
+    // The readable header still arrives -- one bad file must not cost the rest.
+    CHECK(scan.files.size() == 1);
+    CHECK(HasPath(scan.files, "readable.hpp"));
+    CHECK_FALSE(scan.complete);
+
+    // And the identity built on it is refused and left out of the cache.
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-partial-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+    CountingRunner runner { VerboseNaming(includeDir.string()) };
+    ScriptedToolchainHost host;
+
+    auto const identity =
+        CachedToolchainFingerprint(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
+
+    CHECK_FALSE(identity.Usable());
+    CHECK(identity.defect == IdentityDefect::PartialTree);
+    CHECK(StoredFingerprint(state).empty());
 }
 
 TEST_CASE("Every defect can be explained to an operator", "[toolchain-probe]")

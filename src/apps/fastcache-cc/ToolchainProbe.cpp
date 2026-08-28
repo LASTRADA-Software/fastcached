@@ -118,9 +118,9 @@ std::vector<std::string> ParseIncludeEnvironment(std::string_view value)
     return paths;
 }
 
-std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> roots)
+ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots)
 {
-    std::vector<ToolchainFile> files;
+    ToolchainFileScan scan;
 
     for (auto const& root: roots)
     {
@@ -129,12 +129,36 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
         // from bytes this process cannot read THROWS, before the `error_code`
         // below is ever consulted. A root that cannot be read is one this
         // fingerprint does not cover, exactly as an absent one is.
+        //
+        // NOT a completeness signal, unlike every I/O failure below, and the
+        // difference is determinism. Whether these bytes decode is a property of the
+        // bytes and of this project's own narrow encoding, which every executable
+        // here pins to UTF-8 -- so a launcher and a worker reach the SAME answer and
+        // digest the same narrower tree, which still matches. The failures below are
+        // accidents of one moment on one machine, and that is what makes them worth
+        // refusing over.
         auto const base = PathFromNarrowText(root);
         if (!base.has_value())
             continue;
 
+        // Keyed on the resolved TYPE rather than on `ec`, and that distinction is the
+        // whole correctness of this test. An absent root sets `ec` on some standard
+        // libraries and clears it on others -- MSVC reports `no_such_file_or_directory`
+        // for a path that is merely not there -- so "`ec` is set" would have called
+        // every machine without `/usr/local/include` incomplete and refused its
+        // toolchain. `file_type::none` is the one answer that means the status could
+        // not be determined at all; `not_found` is a real answer and an ordinary one.
         std::error_code ec;
-        if (!std::filesystem::is_directory(*base, ec) || ec)
+        auto const status = std::filesystem::status(*base, ec);
+        if (status.type() == std::filesystem::file_type::none)
+        {
+            scan.complete = false;
+            continue;
+        }
+        if (!std::filesystem::is_directory(status))
+            // Not there, or there and not a directory. A driver lists search paths it
+            // would use IF they existed, so this is a layout this install does not
+            // have rather than content that failed to arrive.
             continue;
 
         // `skip_permission_denied` because a search path the driver lists is not
@@ -146,18 +170,35 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
         auto options = std::filesystem::directory_options::skip_permission_denied;
         std::filesystem::recursive_directory_iterator it { *base, options, ec };
         if (ec)
+        {
+            // The root IS a directory and could not be opened. Nothing under it
+            // reached the digest, and nothing about the stamp records that.
+            scan.complete = false;
             continue;
+        }
 
         std::filesystem::recursive_directory_iterator const end;
         for (; it != end; it.increment(ec))
         {
             if (ec)
+            {
+                // The walk stopped PARTWAY, so what was collected is a prefix of
+                // this root rather than the root. The most valuable of these
+                // signals: everything after the failing entry is missing, and the
+                // digest is short by an unknown amount.
+                scan.complete = false;
                 break;
+            }
 
             // `is_regular_file`, so a directory symlink loop cannot be followed
             // and a device node is not read. The iterator does not follow
             // directory symlinks by default, which is what keeps an SDK's
             // `Current -> A` framework links from being walked twice.
+            // NOT a completeness signal, and that exclusion is deliberate. This
+            // query fails on a dangling symlink, which the comment above records as
+            // an ordinary thing to find in a toolchain tree -- so treating its
+            // failure as a gap would refuse toolchains that are entirely fine, which
+            // is a worse error than the one being caught.
             if (!it->is_regular_file(ec) || ec)
             {
                 ec.clear();
@@ -167,17 +208,29 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
             auto const relative = std::filesystem::relative(it->path(), *base, ec);
             if (ec)
             {
+                // A file that was found and cannot be NAMED relative to its root has
+                // no spelling the digest can carry, so it is content that silently
+                // did not arrive.
+                scan.complete = false;
                 ec.clear();
                 continue;
             }
 
             auto hash = HashFileContents(it->path().string());
             if (hash.empty())
-                // Unreadable. Skipped rather than recorded as empty: an entry
-                // whose hash is "" would make two DIFFERENT unreadable files look
+            {
+                // Unreadable. Skipped rather than recorded as empty: an entry whose
+                // hash is "" would make two DIFFERENT unreadable files look
                 // identical, which is a false match in the one direction that
                 // dispatches to the wrong toolchain.
+                //
+                // And reported, because this is a REGULAR FILE that is there and
+                // whose bytes did not arrive -- a scanner holding a header, a
+                // permission, a share violation. It is the likeliest of these on
+                // Windows and the one a stamp is blindest to.
+                scan.complete = false;
                 continue;
+            }
 
             // `/`-separated, always. The relative path is part of the digest, and
             // `std::filesystem` spells it with the HOST's preferred separator --
@@ -186,11 +239,11 @@ std::vector<ToolchainFile> ProbeToolchainFiles(std::span<std::string const> root
             // to share work, which is the exact failure this relativization exists
             // to prevent.
             auto spelling = relative.generic_string();
-            files.emplace_back(ToolchainFile { .relativePath = std::move(spelling), .contentHash = std::move(hash) });
+            scan.files.emplace_back(ToolchainFile { .relativePath = std::move(spelling), .contentHash = std::move(hash) });
         }
     }
 
-    return files;
+    return scan;
 }
 
 namespace
@@ -1082,7 +1135,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // not be run the banner has usually fallen back too -- so both would hold, and
     // only one of them names the cause. Reporting "no include roots were found" for
     // a probe that was never run sends an operator looking for a broken install.
-    auto const defect = [&] {
+    auto const probeDefect = [&] {
         if (!discovered.answered)
             return IdentityDefect::UnrunProbe;
         if (spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler))
@@ -1122,21 +1175,39 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // `NoEvidence` is deliberately still cached. It is a stable property of the
     // machine rather than an accident of one moment, and re-walking a toolchain that
     // will reach the same answer buys nothing.
-    auto const cacheable = discovered.answered;
-
-    if (!forceRefresh && cacheable && !stamp.empty() && !cachePath.empty())
+    //
+    // A cache HIT needs only this test, because a hit did no walk: the entry it
+    // returns was written by a run that completed one.
+    if (!forceRefresh && discovered.answered && !stamp.empty() && !cachePath.empty())
     {
         auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
         if (!cachedStamp.empty() && cachedStamp == stamp)
-            return ToolchainIdentity { .fingerprint = cachedFingerprint, .defect = defect };
+            return ToolchainIdentity { .fingerprint = cachedFingerprint, .defect = probeDefect };
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
-    auto const fingerprint = ComputeToolchainFingerprint(banner, ProbeToolchainFiles(roots));
+    auto scan = ProbeToolchainFiles(roots);
+    auto const complete = scan.complete;
+    auto const fingerprint = ComputeToolchainFingerprint(banner, std::move(scan.files));
 
-    if (cacheable && !stamp.empty() && !cachePath.empty())
+    // A short walk is excluded from the cache for a HARSHER reason than an unrun
+    // probe is, and this is the line that matters most in this function. An unrun
+    // probe empties the root list, so it moves the stamp and a later good run
+    // recomputes. A walk that stopped inside a root that IS there leaves every
+    // stamped input identical -- the path and the mtime of each root, never their
+    // contents -- so the short digest would validate against its own stamp forever,
+    // and no later run would ever walk again to notice.
+    if (discovered.answered && complete && !stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
+    // Mutually exclusive in practice -- every probe-level defect leaves the root list
+    // empty, and an empty list has nothing to walk incompletely -- but ordered
+    // anyway, so the more specific cause survives if that stops being true.
+    auto const defect = [&] {
+        if (probeDefect != IdentityDefect::None)
+            return probeDefect;
+        return complete ? IdentityDefect::None : IdentityDefect::PartialTree;
+    }();
     return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect };
 }
 
