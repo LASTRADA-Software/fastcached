@@ -16,8 +16,10 @@ src/FastCache/
                 (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,
-                bounded, closable), IReactor (Run/Stop/Submit/Schedule/
-                CancelPending) + TestReactor and the platform reactors
+                bounded, closable), IExecutor (the one thing ResumeOn needs)
+                with ThreadPoolExecutor for work that BLOCKS, IReactor
+                (an IExecutor plus Run/Stop/Schedule/CancelPending)
+                + TestReactor and the platform reactors
                 (EpollReactor / IocpReactor / KqueueReactor)
   Net/          ISocket, IListener, IConnector (BlockingConnector for threads
                 that may block; PlatformConnector -> Epoll/Kqueue/IocpConnector
