@@ -411,6 +411,29 @@ TEST_CASE("The sparkline inherits the page's palette rather than carrying one", 
     CHECK_FALSE(RenderSparklineSvg({ Gap(0), Gap(300'000) }).contains("<path"));
 }
 
+TEST_CASE("The sparkline draws a lone reading rather than an empty strip", "[distributed][fleetchart]")
+{
+    // A rate needs the bucket before it, so this holds exactly one value. The tile
+    // built its path with its own copy of the run-splitting loop, which emitted
+    // `M x y` and nothing else -- a move-to strokes no ink, so the strip came out
+    // blank on precisely the quiet stretch the one reading was there to report.
+    std::vector<FleetBucket> const buckets {
+        Gap(0),
+        At(300'000, { { FleetMetric::DispatchGranted, 2 } }),
+        At(600'000, { { FleetMetric::DispatchGranted, 20 } }),
+        Gap(900'000),
+    };
+
+    auto const spark = RenderSparklineSvg(buckets);
+    INFO(spark);
+    CHECK_FALSE(MarkupInAttribute(spark).has_value());
+    CHECK(spark.contains("<circle"));
+    CHECK(spark.contains("<g fill=\"var(--accent)\">"));
+    // Nothing but the dot: a run of one has no line, and a lone `M` would be a `d`
+    // that says the series was drawn while drawing nothing.
+    CHECK_FALSE(spark.contains("<path"));
+}
+
 TEST_CASE("A range with nothing in it folds to nothing, and does not walk backwards", "[distributed][fleetchart]")
 {
     // A node that has just started leading has no buckets at all, and every KPI

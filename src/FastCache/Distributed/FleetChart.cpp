@@ -26,6 +26,30 @@ namespace
     constexpr double SparkWidth = 120.0;
     constexpr double SparkHeight = 24.0;
 
+    /// The box a series is drawn into.
+    ///
+    /// A descriptor rather than two sets of constants read by two loops, because the
+    /// tile sparkline and the full chart split their readings into runs by exactly
+    /// the same rules -- and the copy that did it a second time by hand drew a lone
+    /// reading as a bare `M x y`, which strokes nothing at all.
+    struct ChartGeometry
+    {
+        double width;     ///< viewBox width.
+        double height;    ///< viewBox height.
+        double padTop;    ///< Room above the tallest reading.
+        double padBottom; ///< Room below the baseline; the axis labels sit in it.
+        double dotRadius; ///< Radius of the dot a run of one reading becomes.
+    };
+
+    constexpr ChartGeometry FullChart {
+        .width = ChartWidth, .height = ChartHeight, .padTop = PadTop, .padBottom = PadBottom, .dotRadius = 1.6
+    };
+
+    /// One line of a tile: a pixel of padding, and a dot small enough to read as one.
+    constexpr ChartGeometry SparkChart {
+        .width = SparkWidth, .height = SparkHeight, .padTop = 1.0, .padBottom = 1.0, .dotRadius = 1.2
+    };
+
     // A `var(...)` reference ends in `)`, so spelling one inside a raw string puts
     // the sequence `)"` into the literal and terminates it early -- silently, at the
     // wrong place. Named here and passed as format arguments instead, which keeps
@@ -118,12 +142,17 @@ namespace
         return out;
     }
 
-    [[nodiscard]] double ScaleY(double value, double max) noexcept
+    [[nodiscard]] double Baseline(ChartGeometry const& geometry) noexcept
+    {
+        return geometry.height - geometry.padBottom;
+    }
+
+    [[nodiscard]] double ScaleY(double value, double max, ChartGeometry const& geometry) noexcept
     {
         if (max <= 0.0)
-            return ChartHeight - PadBottom;
-        auto const usable = ChartHeight - PadTop - PadBottom;
-        return PadTop + (usable * (1.0 - std::min(value / max, 1.0)));
+            return Baseline(geometry);
+        auto const usable = geometry.height - geometry.padTop - geometry.padBottom;
+        return geometry.padTop + (usable * (1.0 - std::min(value / max, 1.0)));
     }
 
     /// Round a maximum up to something a gridline label can say plainly.
@@ -135,11 +164,11 @@ namespace
         return std::ceil(value / magnitude) * magnitude;
     }
 
-    [[nodiscard]] double XAt(std::size_t index, std::size_t count) noexcept
+    [[nodiscard]] double XAt(std::size_t index, std::size_t count, ChartGeometry const& geometry) noexcept
     {
         if (count <= 1)
             return 0.0;
-        return ChartWidth * static_cast<double>(index) / static_cast<double>(count - 1);
+        return geometry.width * static_cast<double>(index) / static_cast<double>(count - 1);
     }
 
     /// The geometry of one series: path data, and the readings that have no line.
@@ -166,8 +195,12 @@ namespace
     /// @param max      The value the vertical axis tops out at.
     /// @param close    Fill each run down to the baseline. Does not change what a run
     ///                 of one becomes: a single reading has no width to fill either.
+    /// @param geometry The box to draw into: a full chart, or a tile's sparkline.
     /// @return The `d` data and the standalone dot elements, never concatenated.
-    [[nodiscard]] SeriesGeometry RunsGeometry(FleetSeriesValues const& values, double max, bool close)
+    [[nodiscard]] SeriesGeometry RunsGeometry(FleetSeriesValues const& values,
+                                              double max,
+                                              bool close,
+                                              ChartGeometry const& geometry)
     {
         SeriesGeometry out;
         std::size_t index = 0;
@@ -187,8 +220,10 @@ namespace
                 auto const& reading = values[index];
                 if (!reading.has_value())
                     break;
-                path += std::format(
-                    "{}{:.2f} {:.2f}", index == runStart ? "M" : "L", XAt(index, values.size()), ScaleY(*reading, max));
+                path += std::format("{}{:.2f} {:.2f}",
+                                    index == runStart ? "M" : "L",
+                                    XAt(index, values.size(), geometry),
+                                    ScaleY(*reading, max, geometry));
                 ++index;
             }
             if (index - runStart < 2)
@@ -200,16 +235,18 @@ namespace
                 // leaving a non-empty `d` that says the series WAS observed.
                 // An ELEMENT, kept apart from the path data the caller is about to
                 // put in a `d` attribute.
-                out.dots += std::format(
-                    R"(<circle cx="{:.2f}" cy="{:.2f}" r="1.6"/>)", XAt(runStart, values.size()), ScaleY(firstOfRun, max));
+                out.dots += std::format(R"(<circle cx="{:.2f}" cy="{:.2f}" r="{}"/>)",
+                                        XAt(runStart, values.size(), geometry),
+                                        ScaleY(firstOfRun, max, geometry),
+                                        geometry.dotRadius);
                 continue;
             }
             if (close)
                 path += std::format("L{:.2f} {:.2f}L{:.2f} {:.2f}Z",
-                                    XAt(index - 1, values.size()),
-                                    ChartHeight - PadBottom,
-                                    XAt(runStart, values.size()),
-                                    ChartHeight - PadBottom);
+                                    XAt(index - 1, values.size(), geometry),
+                                    Baseline(geometry),
+                                    XAt(runStart, values.size(), geometry),
+                                    Baseline(geometry));
             out.path += path;
         }
         return out;
@@ -221,7 +258,7 @@ namespace
         for (auto const step: std::views::iota(0, GridLines + 1))
         {
             auto const value = max * static_cast<double>(step) / GridLines;
-            auto const y = ScaleY(value, max);
+            auto const y = ScaleY(value, max, FullChart);
             out += std::format(R"(<line x1="0" x2="{:.0f}" y1="{:.1f}" y2="{:.1f}" stroke="{}" stroke-width="1"/>)",
                                ChartWidth,
                                y,
@@ -258,7 +295,7 @@ namespace
             auto const minute = (seconds / 60) % 60;
             out += std::format(
                 R"(<text x="{:.1f}" y="{:.0f}" font-size="9" fill="{}" font-family="ui-monospace,monospace" text-anchor="{}">{:02}:{:02}</text>)",
-                XAt(index, buckets.size()),
+                XAt(index, buckets.size(), FullChart),
                 ChartHeight - 5.0,
                 FaintVar,
                 index == 0 ? "start" : "middle",
@@ -508,7 +545,7 @@ std::string RenderChartSvg(FleetChartRow const& chart,
         for (auto const offset: std::views::iota(std::size_t { 0 }, chart.count) | std::views::reverse)
         {
             auto const& row = FleetSeriesTable[chart.first + offset];
-            auto const band = RunsGeometry(tops[offset], max, true);
+            auto const band = RunsGeometry(tops[offset], max, true, FullChart);
             auto const colour = std::format("var(--{})", row.colour);
             // An element with an empty `d` is not nothing: it is a shape a renderer
             // still has to consider, and it makes "this series was never observed"
@@ -533,10 +570,10 @@ std::string RenderChartSvg(FleetChartRow const& chart,
             auto const ceiling = row.stroke == FleetSeriesStroke::Dashed;
             // `.path` only: the same isolated readings come back from both calls, and
             // the line pass below is where they are drawn.
-            if (auto const area = RunsGeometry(series[offset], max, true); !area.path.empty())
+            if (auto const area = RunsGeometry(series[offset], max, true, FullChart); !area.path.empty())
                 out += std::format(
                     R"(<path d="{}" fill="{}" fill-opacity="{}"/>)", area.path, colour, ceiling ? "0.10" : "0.14");
-            auto const line = RunsGeometry(series[offset], max, false);
+            auto const line = RunsGeometry(series[offset], max, false, FullChart);
             if (!line.path.empty())
                 out += std::format(R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.6" )"
                                    R"(stroke-linejoin="round"{}/>)",
@@ -572,25 +609,16 @@ std::string RenderSparklineSvg(std::vector<FleetBucket> const& buckets)
         SparkWidth,
         SparkHeight);
 
-    std::string path;
-    bool open = false;
-    for (auto const index: std::views::iota(std::size_t { 0 }, values.size()))
-    {
-        auto const& reading = values[index];
-        if (!reading.has_value())
-        {
-            open = false;
-            continue;
-        }
-        auto const x =
-            SparkWidth * static_cast<double>(index) / static_cast<double>(std::max<std::size_t>(1, values.size() - 1));
-        auto const y = max > 0.0 ? ((SparkHeight - 2.0) * (1.0 - (*reading / max))) + 1.0 : SparkHeight - 1.0;
-        path += std::format("{}{:.1f} {:.1f}", open ? "L" : "M", x, y);
-        open = true;
-    }
-    if (!path.empty())
+    // The same run-splitter the full charts use, at the tile's size: a second copy
+    // of this loop is what left a lone reading here as a bare `M x y`, which strokes
+    // nothing -- the tile then showed an empty strip on exactly the quiet stretch
+    // the reading was reporting.
+    auto const line = RunsGeometry(values, max, false, SparkChart);
+    if (!line.path.empty())
         out += std::format(
-            R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linejoin="round"/>)", path, AccentVar);
+            R"(<path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linejoin="round"/>)", line.path, AccentVar);
+    if (!line.dots.empty())
+        out += std::format(R"(<g fill="{}">{}</g>)", AccentVar, line.dots);
     out += "</svg>";
     return out;
 }
