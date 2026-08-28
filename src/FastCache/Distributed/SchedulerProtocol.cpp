@@ -242,6 +242,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                           // arity is exact and fixed forever -- but kept out of
                                                           // `NodeCapacity`, which must stay a literal type.
                                                           .version = fields->capacity.version,
+                                                          .toolchainLabel = fields->capacity.toolchainLabel,
                                                           .slots = fields->slots,
                                                           .codecs = fields->acceptedCodecs,
                                                           .capacity = *capacity });

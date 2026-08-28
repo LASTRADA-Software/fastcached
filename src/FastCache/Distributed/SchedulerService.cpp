@@ -170,6 +170,11 @@ namespace
                                 .project = [](WorkerRegistration const& r) { return r.fingerprint; } },
         RegistrationTextField { .name = "endpoint", .project = [](WorkerRegistration const& r) { return r.endpoint; } },
         RegistrationTextField { .name = "version", .project = [](WorkerRegistration const& r) { return r.version; } },
+        // The fourth string this table's own comment anticipated. It matters more than
+        // most: it is raw compiler output rather than anything this project composed,
+        // so it is the likeliest field to arrive as bytes that are not text.
+        RegistrationTextField { .name = "toolchain label",
+                                .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
     };
 
     /// The counter a refusal moves, if any.

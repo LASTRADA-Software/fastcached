@@ -360,7 +360,7 @@ namespace
     };
 
     /// What a worker row shows.
-    constexpr std::array<FleetColumn<WorkerReport>, 8> WorkerColumns {
+    constexpr std::array<FleetColumn<WorkerReport>, 9> WorkerColumns {
         FleetColumn<WorkerReport> { .name = "id",
                                     .help = "The id this leader assigned at registration.",
                                     .format = CellFormat::Text,
@@ -369,6 +369,25 @@ namespace
                                     .help = "Matched byte-for-byte. A job never crosses fingerprints.",
                                     .format = CellFormat::Text,
                                     .project = [](WorkerReport const& w) { return FleetCell::Of(w.info.fingerprint); } },
+        // BESIDE the fingerprint, never instead of it. The digest is what a launcher
+        // compares and what decides every match; this decides nothing and exists to be
+        // read (#194). One machine with two MSVC toolsets -- what an ordinary Visual
+        // Studio update leaves behind -- showed two opaque hashes here and no way to
+        // tell which was which, and the digest deliberately stopped being something a
+        // person can derive.
+        FleetColumn<WorkerReport> {
+            .name = "compiler",
+            .help = "What this toolchain is, for a reader. Never matched on -- the fingerprint beside it is what "
+                    "decides. Absent when the node did not say, which a pinned --toolchain override never does.",
+            .format = CellFormat::Text,
+            // Absent rather than blank, like `version` above and for the same reason:
+            // a node too old to report one, or one whose fingerprint an operator
+            // pinned by hand, is exactly the row somebody is looking for -- so it must
+            // not render as the emptiest-looking cell in the table.
+            .project =
+                [](WorkerReport const& w) {
+                    return w.info.toolchainLabel.empty() ? FleetCell::Nothing() : FleetCell::Of(w.info.toolchainLabel);
+                } },
         FleetColumn<WorkerReport> { .name = "endpoint",
                                     .help = "host:port a client is sent to.",
                                     .format = CellFormat::Text,

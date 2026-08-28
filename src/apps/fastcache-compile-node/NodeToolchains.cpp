@@ -55,6 +55,21 @@ namespace
     /// deployment `--node-class=workstation` exists for.
     constexpr std::size_t MaxFingerprintThreads = 4;
 
+    /// What the survey learned about one entry: its identity, and the label a person
+    /// reads it by.
+    ///
+    /// Two fields rather than a field on `Cc::ToolchainIdentity`, because they answer
+    /// different questions and only one of them is load-bearing: the fingerprint
+    /// decides whether a client matches this worker, while the label decides nothing
+    /// at all and exists to be read (#194). Putting a display string on the identity
+    /// type would invite exactly the second way of deciding what a compiler IS that
+    /// `ToolchainDiscovery` warns against.
+    struct SurveyedToolchain
+    {
+        Cc::ToolchainIdentity identity;
+        std::string label; ///< Empty when there was no banner to derive one from.
+    };
+
     /// Compute every entry's identity, several at a time.
     ///
     /// **The INJECTED runner is what every worker uses**, rather than one made per
@@ -74,13 +89,13 @@ namespace
     /// @param runner Process-spawning seam, called from several threads at once.
     /// @param host The machine's filesystem, registry and environment.
     /// @param logger Startup log.
-    /// @return One identity per entry, in the same order.
-    [[nodiscard]] std::vector<Cc::ToolchainIdentity> FingerprintAll(std::vector<ToolchainEntry> const& entries,
-                                                                    Cc::IProcessRunner& runner,
-                                                                    Cc::IToolchainHost& host,
-                                                                    ILogger& logger)
+    /// @return One survey per entry, in the same order.
+    [[nodiscard]] std::vector<SurveyedToolchain> FingerprintAll(std::vector<ToolchainEntry> const& entries,
+                                                                Cc::IProcessRunner& runner,
+                                                                Cc::IToolchainHost& host,
+                                                                ILogger& logger)
     {
-        std::vector<Cc::ToolchainIdentity> fingerprints(entries.size());
+        std::vector<SurveyedToolchain> fingerprints(entries.size());
         std::atomic<std::size_t> next { 0 };
 
         auto identify = [&] {
@@ -92,7 +107,12 @@ namespace
                     // An operator pinned it by hand, which is the documented way to
                     // give a worker an identity this process could not compute.
                     // Second-guessing it here would refuse the escape hatch.
-                    fingerprints[index] = Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .degenerate = false };
+                    // No label: an override is never probed, so there is no banner
+                    // to read one out of. Empty travels as "did not say" (#194), which
+                    // is the honest answer -- and is why the fingerprint column stays
+                    // beside the label rather than being replaced by it.
+                    fingerprints[index].identity =
+                        Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .degenerate = false };
                     continue;
                 }
 
@@ -108,8 +128,14 @@ namespace
                 logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", entry.compiler);
                 auto const banner = Cc::CompilerBanner(runner, entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
-                fingerprints[index] =
+                fingerprints[index].identity =
                     Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, Cc::DriverOf(flavor));
+
+                // Derived from the banner that was just computed, rather than by
+                // asking the compiler a second time: the digest is a hash OF this
+                // string, so the readable name was already in hand and was being
+                // thrown away (#194).
+                fingerprints[index].label = Cc::ToolchainLabel(entry.compiler, banner);
             }
         };
 
@@ -168,11 +194,11 @@ std::string SearchedLayouts()
     return names;
 }
 
-std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig const& cfg,
-                                                                    Cc::IToolchainDiscovery* discovery,
-                                                                    Cc::IProcessRunner& runner,
-                                                                    Cc::IToolchainHost& host,
-                                                                    ILogger& logger)
+std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
+                                                                        Cc::IToolchainDiscovery* discovery,
+                                                                        Cc::IProcessRunner& runner,
+                                                                        Cc::IToolchainHost& host,
+                                                                        ILogger& logger)
 {
     // One fact, stated once. The set is the machine's when the operator named none
     // and there is something to ask -- which is also what decides whether the count
@@ -236,11 +262,11 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
 
     // Indexed rather than zipped: `std::views::zip` is C++23 and not uniformly
     // available across the four standard libraries this project builds against.
-    std::map<std::string, std::string> toolchains;
+    std::map<std::string, ServedToolchain> toolchains;
     for (auto const index: std::views::iota(std::size_t { 0 }, entries.size()))
     {
         auto const& entry = entries[index];
-        auto const& identity = fingerprints[index];
+        auto const& identity = fingerprints[index].identity;
 
         // Refused rather than registered, and this is the backstop that survives the
         // next layout nobody anticipated. A worker whose digest carries no
@@ -273,14 +299,15 @@ std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig c
         // was scheduled: a fingerprint mismatch is invisible from both ends, so this
         // log is where two machines' digests get compared, and one ordered by which
         // thread finished first would be a poor place to do it.
-        auto const [existing, inserted] = toolchains.emplace(fingerprint, entry.compiler);
+        auto const [existing, inserted] = toolchains.emplace(
+            fingerprint, ServedToolchain { .compiler = entry.compiler, .label = fingerprints[index].label });
         if (inserted)
             logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
         else
             logger.Logf(LogLevel::Info,
                         "{} is the same toolchain as {} ({}); serving it once",
                         entry.compiler,
-                        existing->second,
+                        existing->second.compiler,
                         fingerprint);
     }
 

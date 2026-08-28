@@ -51,6 +51,11 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         // reporting the old binary for as long as the process stayed up, which is
         // the one thing this column must never do.
         existing->second.info.version = std::string { registration.version };
+        // Refreshed for the same reason, one step narrower: a toolchain UPDATE is what
+        // this path looks like when Visual Studio moves a toolset under a node that
+        // kept its fingerprint pinned, and a label held over would name the compiler
+        // that is no longer there.
+        existing->second.info.toolchainLabel = std::string { registration.toolchainLabel };
         // Reset rather than kept, both of them, and for one reason: a re-registering
         // worker has restarted, so whatever it was running is gone and whatever its
         // machine was doing is a reading from before that. Carrying either forward
@@ -68,6 +73,7 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
                                                   .fingerprint = std::string { registration.fingerprint },
                                                   .endpoint = std::string { registration.endpoint },
                                                   .version = std::string { registration.version },
+                                                  .toolchainLabel = std::string { registration.toolchainLabel },
                                                   .slots = OfferableSlots(registration.capacity, registration.slots),
                                                   .inFlight = 0,
                                                   .capacity = registration.capacity,

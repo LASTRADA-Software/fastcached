@@ -59,6 +59,23 @@ struct WorkerInfo
     /// an omission: a peer built before the field existed cannot report a version,
     /// and a fleet part-way through an upgrade is when somebody is reading it.
     std::string version {};
+
+    /// What a person calls this entry's toolchain, e.g. `cl 19.44.35207`.
+    ///
+    /// **Display only, and never an identity.** `fingerprint` decides every match;
+    /// nothing keys on, compares or routes by this. Both are kept because they answer
+    /// different questions -- the digest is what a launcher compares, and this is what
+    /// an operator reads. A machine with two MSVC toolsets showed two opaque hashes
+    /// and no way to tell which was which, and the digest deliberately stopped being
+    /// derivable by hand (#194).
+    ///
+    /// Per ENTRY rather than per node, unlike `version` above: one machine may serve
+    /// several compilers, and telling them apart is the whole point.
+    ///
+    /// Empty means the node did not say -- an operator's `<fingerprint>=<compiler>`
+    /// override is never probed, so there is no banner to read a label out of.
+    std::string toolchainLabel {};
+
     std::uint32_t slots {};    ///< Concurrent jobs it will accept in general.
     std::uint32_t inFlight {}; ///< Jobs currently outstanding on it.
 
@@ -189,9 +206,13 @@ struct NodeCacheReport
 /// would be transposable at a call site, and a fifth field is a foreseeable change.
 struct WorkerRegistration
 {
-    std::string_view fingerprint;     ///< Toolchain identity.
-    std::string_view endpoint;        ///< host:port clients should use.
-    std::string_view version {};      ///< What software the node runs; empty means it did not say.
+    std::string_view fingerprint; ///< Toolchain identity.
+    std::string_view endpoint;    ///< host:port clients should use.
+    std::string_view version {};  ///< What software the node runs; empty means it did not say.
+
+    /// What a person calls the toolchain, e.g. `cl 19.44.35207`; empty means it did
+    /// not say. Display only -- see `WorkerInfo::toolchainLabel` (#194).
+    std::string_view toolchainLabel {};
     std::uint32_t slots {};           ///< Concurrent job limit it asks for; 0 to derive.
     std::vector<std::uint8_t> codecs; ///< What it can decode.
 

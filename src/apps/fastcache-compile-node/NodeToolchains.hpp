@@ -24,6 +24,25 @@ struct ToolchainEntry
     std::string compiler;    ///< Path to the compiler.
 };
 
+/// One toolchain this worker serves, once its identity is known.
+struct ServedToolchain
+{
+    std::string compiler; ///< Path to the compiler.
+
+    /// What a person calls it, e.g. `cl 19.44.35207`. Empty when nothing said.
+    ///
+    /// **Display only.** The fingerprint decides every match; this decides nothing,
+    /// and both are reported because they answer different questions -- the digest is
+    /// what a launcher compares, and this is what an operator reads (#194). A machine
+    /// with two MSVC toolsets showed two opaque hashes and no way to tell which was
+    /// which, and the fingerprint deliberately stopped being derivable by hand.
+    ///
+    /// Empty for an operator's `<fingerprint>=<compiler>` override, which is never
+    /// probed and so has no banner to read a label out of. Empty means "did not say"
+    /// everywhere it travels, and is rendered as absent rather than as a blank.
+    std::string label;
+};
+
 /// Split a `--toolchain` value into its fingerprint and compiler.
 ///
 /// Two accepted shapes, and the bare one is what operators should use:
@@ -96,12 +115,13 @@ struct ToolchainEntry
 /// @param runner Process-spawning seam, for the compiler probes.
 /// @param host The machine's filesystem, registry and environment.
 /// @param logger Startup log.
-/// @return Fingerprint to compiler path -- never empty -- or nullopt when a
-///         `--toolchain` value is malformed or there is nothing to serve.
-[[nodiscard]] std::optional<std::map<std::string, std::string>> ResolveToolchains(NodeConfig const& cfg,
-                                                                                  Cc::IToolchainDiscovery* discovery,
-                                                                                  Cc::IProcessRunner& runner,
-                                                                                  Cc::IToolchainHost& host,
-                                                                                  ILogger& logger);
+/// @return Fingerprint to what this worker serves under it -- never empty -- or
+///         nullopt when a `--toolchain` value is malformed or there is nothing to
+///         serve.
+[[nodiscard]] std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
+                                                                                      Cc::IToolchainDiscovery* discovery,
+                                                                                      Cc::IProcessRunner& runner,
+                                                                                      Cc::IToolchainHost& host,
+                                                                                      ILogger& logger);
 
 } // namespace FastCache::Node

@@ -16,10 +16,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <ranges>
@@ -675,6 +677,45 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
     // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.
     return NormalizedCompilerName(compiler);
+}
+
+std::string ToolchainLabel(std::string_view compiler, std::string_view banner)
+{
+    auto tool = NormalizedCompilerName(compiler);
+    if (tool.empty())
+        return {};
+
+    // The first token that STARTS with a digit, with trailing punctuation trimmed.
+    //
+    // Starting with one is what makes this safe, and skipping leading characters
+    // instead was a real bug: a GNU driver prints its own name first, so
+    // `g++-13 (Ubuntu 13.3.0-6ubuntu2) 13.3.0` would have had `g++-13` stripped down
+    // to `13` and been labelled `g++-13 13` -- and two nodes on 13.2.0 and 13.3.0
+    // would then have rendered identically, which is the confusion this whole feature
+    // exists to remove. `aarch64-none-elf-gcc` became `64` the same way, and a
+    // version-suffixed driver is a first-class discovered case rather than a curiosity.
+    //
+    // A dot is required as well, so a stray number in a banner -- a year, a word size
+    // -- is not mistaken for a version. The cost is that a compiler whose version has
+    // no dot goes unlabelled, which is the safe direction: the tool's name alone is
+    // still true, while a wrong number is worse than none.
+    for (auto const word: std::views::split(banner, ' '))
+    {
+        std::string_view token { word.begin(), word.end() };
+        if (token.empty() || std::isdigit(static_cast<unsigned char>(token.front())) == 0)
+            continue;
+        while (!token.empty() && std::isdigit(static_cast<unsigned char>(token.back())) == 0)
+            token.remove_suffix(1);
+        if (LooksLikeVersion(token) && token.contains('.'))
+            return std::format("{} {}", tool, token);
+    }
+
+    // No version in the banner is not a failure. `cl` on a locale that translates its
+    // banner, a wrapper that prints its own name, and the basename fallback
+    // `CompilerBanner` returns for a compiler that could not be run all land here --
+    // and the tool's name alone still tells two DIFFERENT compilers apart, which is
+    // more than the fingerprint alone was doing.
+    return tool;
 }
 
 bool LooksLikeVersion(std::string_view name) noexcept
