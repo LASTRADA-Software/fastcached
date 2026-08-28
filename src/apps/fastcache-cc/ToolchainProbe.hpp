@@ -218,6 +218,42 @@ namespace FastCache::Cc
 ///         is installed, and always empty off Windows.
 [[nodiscard]] std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host);
 
+/// Where a driver searches for system headers, and whether it could be asked.
+///
+/// The second field exists because the first cannot carry it. An empty root list is
+/// an ORDINARY answer -- `IncludeDiscovery::None` has none by construction, an MSVC
+/// install whose layout is not derivable has none to give, and a wrapper that does
+/// not understand `-print-resource-dir` names none -- and every one of those is
+/// deliberately served on a banner-only fingerprint (see `ToolchainIdentity`). A
+/// driver that could not be SPAWNED is none of them: nothing was measured, so the
+/// digest that follows describes no toolchain at all while looking exactly like the
+/// digest of one whose include tree is genuinely empty.
+///
+/// Conflating the two is issue #225. A transient spawn failure at fingerprint time
+/// yielded a well-formed hex string no other machine agrees with; `NoEvidence` did
+/// not fire, because the banner was a real version line; and the value was written to
+/// the fingerprint cache, so a machine that keeps failing settles on it permanently.
+/// Both ends stay silent -- the worker registers and is never matched, the client
+/// sees `NoWorker` and compiles locally.
+struct IncludeSearchRoots
+{
+    /// The search paths, in the driver's own order. Empty is an ordinary answer.
+    std::vector<std::string> roots;
+
+    /// False ONLY when a mechanism that has to run the driver could not run it.
+    ///
+    /// True where nothing is spawned at all -- `IncludeDiscovery::None`, and
+    /// `MsvcLayout`, which reads the filesystem, the registry and the environment.
+    /// "Nothing was asked" and "the answer is missing" are different states, and a
+    /// mechanism that asks no process has genuinely answered.
+    ///
+    /// A non-zero exit does NOT clear this, deliberately: a driver prints its search
+    /// list before anything that could fail and exits non-zero for reasons that leave
+    /// the list perfectly good. Only `CompileRun::exitCode == NotSpawned`, which
+    /// `IProcessRunner` defines as "could not be spawned at all", clears it.
+    bool answered { true };
+};
+
 /// A clang driver's own resource directory: the headers that ship WITH it.
 ///
 /// `<prefix>/lib/clang/<version>/include` -- `stddef.h`, `stdarg.h`, the intrinsics
@@ -248,11 +284,10 @@ namespace FastCache::Cc
 /// @param runner Process-spawning seam.
 /// @param host The machine's filesystem.
 /// @param compiler The compiler being identified, bare name or path.
-/// @return Its resource include root, or empty when the driver did not name one
-///         that exists.
-[[nodiscard]] std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner,
-                                                                 IToolchainHost& host,
-                                                                 std::string const& compiler);
+/// @return Its resource include root, and whether the driver could be asked at all.
+[[nodiscard]] IncludeSearchRoots ClangResourceIncludeRoots(IProcessRunner& runner,
+                                                           IToolchainHost& host,
+                                                           std::string const& compiler);
 
 /// Extract the target triple from a clang driver's `-###` output.
 ///
@@ -326,21 +361,27 @@ namespace FastCache::Cc
 /// Dispatches on `spec.includeDiscovery` with no `default:`, so a mechanism added
 /// to the table is a compile error here rather than a silent empty result.
 ///
-/// Every failure yields an empty list rather than an error: discovery is
-/// best-effort by construction. A toolchain whose paths cannot be discovered
-/// falls back to a banner-only fingerprint, which is weaker but still correct in
-/// the direction that matters -- it can only cause two genuinely-identical
-/// toolchains to be treated as identical, never two different ones.
+/// A driver that ANSWERS badly yields an empty list rather than an error:
+/// discovery is best-effort by construction. A toolchain whose paths cannot be
+/// discovered falls back to a banner-only fingerprint, which is weaker but still
+/// correct in the direction that matters -- it can only cause two
+/// genuinely-identical toolchains to be treated as identical, never two different
+/// ones.
+///
+/// A driver that could not be RUN is the one case that argument does not cover, and
+/// it is reported rather than folded into the empty list: see
+/// `IncludeSearchRoots::answered`. Best-effort is a statement about how much of a
+/// toolchain was measured, and it needs something to have been measured.
 ///
 /// @param runner Process-spawning seam.
 /// @param host The machine's filesystem, registry and environment.
 /// @param compiler The compiler to interrogate.
 /// @param spec The driver's table row.
-/// @return Search paths in the driver's own order; empty when undiscoverable.
-[[nodiscard]] std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
-                                                            IToolchainHost& host,
-                                                            std::string const& compiler,
-                                                            DriverSpec const& spec);
+/// @return Search paths in the driver's own order, and whether it answered at all.
+[[nodiscard]] IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
+                                                      IToolchainHost& host,
+                                                      std::string const& compiler,
+                                                      DriverSpec const& spec);
 
 /// A cheap check that a cached fingerprint still describes this toolchain.
 ///

@@ -538,7 +538,7 @@ void ReplayStreams(std::string_view out, std::string_view err)
 {
     auto const run = RunCaptureSplit(argv);
     ReplayStreams(run.out, run.err);
-    return run.exitCode == -1 ? 1 : run.exitCode;
+    return run.exitCode == Cc::NotSpawned ? 1 : run.exitCode;
 }
 
 // --- file helpers -----------------------------------------------------------
@@ -1759,10 +1759,10 @@ void RecordManifest(Config const& cfg,
         run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
     ReplayStreams(run->out, run->err);
-    // A spawn failure reports -1, which a POSIX exit status truncates to 255 —
+    // A spawn failure reports `NotSpawned`, which a POSIX exit status truncates to 255 —
     // an arbitrary code no build system can interpret. Normalize it the same way
     // the fall-back path does.
-    int const code = run->exitCode == -1 ? 1 : run->exitCode;
+    int const code = run->exitCode == Cc::NotSpawned ? 1 : run->exitCode;
     if (code != 0)
         return code; // do not cache a failed compile
 

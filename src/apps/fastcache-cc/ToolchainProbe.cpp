@@ -825,7 +825,7 @@ std::vector<std::string> WindowsKitIncludeRoots(IToolchainHost& host)
     return roots;
 }
 
-std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, IToolchainHost& host, std::string const& compiler)
+IncludeSearchRoots ClangResourceIncludeRoots(IProcessRunner& runner, IToolchainHost& host, std::string const& compiler)
 {
     std::array<std::string, 2> const argv { compiler, std::string { ClangResourceDirFlag } };
 
@@ -834,8 +834,15 @@ std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, ITool
     // stdout and nothing else.
     auto const run = runner.RunCaptureSplit(argv);
 
-    // The exit code is not consulted, for the reason the GNU arm below states: a
-    // driver can exit non-zero for reasons that leave its answer perfectly good.
+    // The one exit code that is read, and read for the opposite reason to the next
+    // paragraph: nothing was printed, so every test below would reject it and hand
+    // back the same empty list a wrapper that understood nothing gives. See
+    // `IncludeSearchRoots::answered`.
+    if (run.exitCode == NotSpawned)
+        return IncludeSearchRoots { .roots = {}, .answered = false };
+
+    // Any OTHER exit code is not consulted, for the reason the GNU arm below states:
+    // a driver can exit non-zero for reasons that leave its answer perfectly good.
     // What decides is whether the answer NAMES A DIRECTORY -- which is also what
     // rejects a wrapper that did not understand the flag, since its diagnostic is
     // not a path that exists.
@@ -850,11 +857,14 @@ std::vector<std::string> ClangResourceIncludeRoots(IProcessRunner& runner, ITool
 
     auto const resourceDir = Trim(line);
     if (resourceDir.empty())
-        return {};
+        // Answered, badly. A driver that printed nothing usable is still served, on a
+        // banner-only fingerprint -- which is what the case above must not collapse
+        // into.
+        return IncludeSearchRoots { .roots = {}, .answered = true };
 
     std::vector<std::string> roots;
     AppendIfDirectory(host, roots, resourceDir, ClangResourceIncludeSubdirectory);
-    return roots;
+    return IncludeSearchRoots { .roots = std::move(roots), .answered = true };
 }
 
 std::string ParseDriverTargetTriple(std::string_view driverOutput)
@@ -937,10 +947,10 @@ std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& comp
     return {};
 }
 
-std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
-                                              IToolchainHost& host,
-                                              std::string const& compiler,
-                                              DriverSpec const& spec)
+IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,
+                                        IToolchainHost& host,
+                                        std::string const& compiler,
+                                        DriverSpec const& spec)
 {
     // No `default:`, so a mechanism added to the table fails to compile here
     // rather than silently returning nothing -- which would present as a
@@ -948,21 +958,34 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
     switch (spec.includeDiscovery)
     {
         case IncludeDiscovery::None:
-            return {};
+            // Nothing is asked, so nothing is missing: a driver with no mechanism is
+            // not one whose mechanism failed. See `IncludeSearchRoots::answered`.
+            return IncludeSearchRoots { .roots = {}, .answered = true };
 
         case IncludeDiscovery::GnuVerbose: {
             auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.includeProbeFlags));
-            // The exit code is deliberately NOT checked. The list is printed
+
+            // Nothing was printed, so the parse below would return the same empty
+            // list a driver that ran and listed nothing gives -- and that one is
+            // legitimately served. See `IncludeSearchRoots::answered` (issue #225).
+            if (run.exitCode == NotSpawned)
+                return IncludeSearchRoots { .roots = {}, .answered = false };
+
+            // Any OTHER exit code is deliberately NOT checked. The list is printed
             // before anything that could fail, and a driver can exit non-zero for
             // reasons that leave it perfectly valid -- a missing SDK component, a
             // warning promoted by a wrapper script. Parsing decides whether the
             // output is usable; an exit code cannot.
             //
             // Read from stderr, which is where every GNU-family driver prints it.
-            return ParseGnuIncludeSearchPaths(run.err);
+            return IncludeSearchRoots { .roots = ParseGnuIncludeSearchPaths(run.err), .answered = true };
         }
 
         case IncludeDiscovery::MsvcLayout: {
+            // Every source below is a filesystem, registry or environment read, so
+            // there is no spawn to fail and this mechanism always answers -- including
+            // when the answer is nothing at all, which is the underivable-layout case
+            // `ToolchainIdentity` deliberately serves on a banner-only fingerprint.
             auto roots = MsvcToolsetIncludeRoots(host, compiler);
 
             // The fallback is gated on the TOOLSET half, not on the merged list, and
@@ -975,7 +998,7 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
             // headers from its identity. Two such toolchains then digest IDENTICALLY,
             // which is exactly the false match this mechanism exists to prevent.
             if (roots.empty())
-                return IncludeEnvironmentRoots(host);
+                return IncludeSearchRoots { .roots = IncludeEnvironmentRoots(host), .answered = true };
 
             // A partial layout answer IS kept rather than topped up from `INCLUDE`:
             // both ends of a dispatch run this same code and so reach the same partial
@@ -983,7 +1006,7 @@ std::vector<std::string> DiscoverIncludePaths(IProcessRunner& runner,
             // how the two stop agreeing.
             auto kits = WindowsKitIncludeRoots(host);
             roots.insert(roots.end(), std::make_move_iterator(kits.begin()), std::make_move_iterator(kits.end()));
-            return roots;
+            return IncludeSearchRoots { .roots = std::move(roots), .answered = true };
         }
 
         case IncludeDiscovery::ClangResourceLayout:
@@ -1048,7 +1071,8 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
                                              DriverSpec const& spec,
                                              bool forceRefresh)
 {
-    auto const roots = DiscoverIncludePaths(runner, host, compiler, spec);
+    auto const discovered = DiscoverIncludePaths(runner, host, compiler, spec);
+    auto const& roots = discovered.roots;
 
     // Decided here, where the banner and the roots are both in hand, rather than
     // left for a caller to reconstruct -- see `ToolchainIdentity::degenerate` for

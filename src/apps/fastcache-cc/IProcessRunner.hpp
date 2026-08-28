@@ -8,12 +8,24 @@
 namespace FastCache::Cc
 {
 
+/// The exit code a `CompileRun` carries when the process could not be spawned.
+///
+/// Named because it is a value callers BRANCH on rather than report -- a toolchain
+/// probe that never ran must not be mistaken for one that ran and found nothing
+/// (issue #225), and a compiler that cannot be executed must not be registered as a
+/// worker's toolchain. Both of those tests used to spell `-1` by hand, in files that
+/// share no header but this one.
+///
+/// No real process can produce it: a POSIX exit status is 8 bits and a Windows one is
+/// unsigned, so the negative range is free for this to occupy.
+inline constexpr int NotSpawned = -1;
+
 /// The result of running a child process to completion with its output
-/// captured. `exitCode` is -1 when the process could not be spawned at all,
-/// which callers must distinguish from a compiler that ran and failed.
+/// captured. `exitCode` is `NotSpawned` when the process could not be started at
+/// all, which callers must distinguish from a compiler that ran and failed.
 struct CompileRun
 {
-    int exitCode { -1 };
+    int exitCode { NotSpawned };
     std::string out; ///< Captured stdout (empty for combined captures).
     std::string err; ///< Captured stderr (empty for combined captures).
 };

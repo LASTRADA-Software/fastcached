@@ -244,7 +244,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     argv.push_back(std::string { ObjectOutputPrefixFor(family) } + object.string());
 
     auto run = _runner.RunCaptureSplit(argv);
-    if (run.exitCode == -1)
+    if (run.exitCode == NotSpawned)
         // The compiler could not be spawned at all. Deliberately NOT reported as a
         // failed compile: the client must be able to tell "this worker is broken"
         // from "your code does not compile", because only the second is its answer.

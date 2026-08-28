@@ -28,7 +28,7 @@ namespace
     /// process cannot execute, such as a cross-compiler or a wrapper that must not run
     /// at configuration time.
     ///
-    /// `exitCode == -1` is the one answer that means "could not spawn"; a compiler that
+    /// `Cc::NotSpawned` is the one answer that means "could not spawn"; a compiler that
     /// ran and then failed has run, and that is the question.
     ///
     /// The argv is `Cc::VersionProbeCommand`'s and not a second spelling of it, because
@@ -42,7 +42,7 @@ namespace
     /// @return True when the process started.
     [[nodiscard]] bool CanSpawn(Cc::IProcessRunner& runner, std::string const& compiler)
     {
-        return runner.RunCaptureCombined(Cc::VersionProbeCommand(compiler)).exitCode != -1;
+        return runner.RunCaptureCombined(Cc::VersionProbeCommand(compiler)).exitCode != Cc::NotSpawned;
     }
 
     /// How many toolchains are fingerprinted at once.

@@ -334,8 +334,10 @@ TEST_CASE("A GNU driver is asked verbosely, and its stderr is what is read", "[t
         .exitCode = 0, .out = "should not be read", .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
 
-    auto const paths = DiscoverIncludePaths(runner, host, "/usr/bin/c++", SpecFor(Flavor::Clang));
+    auto const discovered = DiscoverIncludePaths(runner, host, "/usr/bin/c++", SpecFor(Flavor::Clang));
+    auto const& paths = discovered.roots;
 
+    CHECK(discovered.answered);
     REQUIRE(paths.size() == 4);
     CHECK(paths[0].contains("c++/v1"));
     REQUIRE(runner.LastArgv().size() >= 2);
@@ -351,15 +353,65 @@ TEST_CASE("A non-zero exit does not discard a printed search list", "[toolchain-
     // silently drop the include tree on exactly those toolchains.
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
-    CHECK(DiscoverIncludePaths(runner, host, "cc", SpecFor(Flavor::Clang)).size() == 4);
+    auto const discovered = DiscoverIncludePaths(runner, host, "cc", SpecFor(Flavor::Clang));
+    CHECK(discovered.roots.size() == 4);
+
+    // And the driver ANSWERED: a non-zero exit is a process that ran. Only a
+    // process that never started clears this, which is what keeps the two apart.
+    CHECK(discovered.answered);
 }
 
 TEST_CASE("An unknown driver is not interrogated at all", "[toolchain-probe]")
 {
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
-    CHECK(DiscoverIncludePaths(runner, host, "mystery", SpecFor(Flavor::Unknown)).empty());
+    auto const discovered = DiscoverIncludePaths(runner, host, "mystery", SpecFor(Flavor::Unknown));
+    CHECK(discovered.roots.empty());
     CHECK(runner.Calls() == 0);
+
+    // Nothing was asked, so nothing is missing. A driver with no mechanism is not a
+    // driver whose mechanism failed, and only the second is a defective identity.
+    CHECK(discovered.answered);
+}
+
+TEST_CASE("A GNU driver that could not be spawned is not a driver that listed nothing", "[toolchain-probe]")
+{
+    // Issue #225. The two states produce the SAME empty list, and the digest built
+    // over it is a well-formed hex string either way -- so a transient spawn failure
+    // gave one machine a fingerprint no other machine computes, with `NoEvidence`
+    // silent because the banner was a real version line.
+    //
+    // `exitCode == NotSpawned` is what separates them, and it is separated HERE
+    // rather than at the digest, because this is the only layer that still knows a
+    // process was supposed to run.
+    ScriptedRunner runner { CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+
+    auto const discovered = DiscoverIncludePaths(runner, host, "clang++", SpecFor(Flavor::Clang));
+
+    CHECK(discovered.roots.empty());
+    CHECK_FALSE(discovered.answered);
+
+    // It was ATTEMPTED, which is what makes the answer a failure rather than an
+    // absent mechanism -- the distinction the unknown-driver case above holds.
+    CHECK(runner.Calls() == 1);
+}
+
+TEST_CASE("A clang-cl that could not be spawned is not a wrapper that named no root", "[toolchain-probe]")
+{
+    // The same defect on the other spawning arm. Its neighbour -- a wrapper whose
+    // diagnostic is not a path -- is deliberately served on a banner-only
+    // fingerprint, so the empty list alone cannot carry the difference.
+    ScriptedRunner runner { CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+    host.AddExecutable("C:/LLVM/bin/clang-cl.exe");
+
+    auto const direct = ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe");
+    CHECK(direct.roots.empty());
+    CHECK_FALSE(direct.answered);
+
+    // And through the table, since that is how the fingerprint reaches it.
+    CHECK_FALSE(DiscoverIncludePaths(runner, host, "C:/LLVM/bin/clang-cl.exe", SpecFor(Flavor::ClangCl)).answered);
 }
 
 TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-probe]")
@@ -368,8 +420,15 @@ TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-pro
     // would cost a process per launcher invocation and return nothing.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
-    (void) DiscoverIncludePaths(runner, host, "cl.exe", SpecFor(Flavor::Cl));
+    auto const discovered = DiscoverIncludePaths(runner, host, "cl.exe", SpecFor(Flavor::Cl));
     CHECK(runner.Calls() == 0);
+
+    // A mechanism that spawns nothing cannot fail to spawn, so it always answers --
+    // even here, where the scripted machine has no layout and no `INCLUDE` and the
+    // list comes back empty. That is the underivable-layout case, which is served on
+    // a banner-only fingerprint rather than refused.
+    CHECK(discovered.roots.empty());
+    CHECK(discovered.answered);
 }
 
 // --- the MSVC install layout -------------------------------------------------
@@ -656,8 +715,8 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     DescribeWindowsMachine(developerPrompt);
     developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
 
-    auto const underService = DiscoverIncludePaths(runner, service, "cl", SpecFor(Flavor::Cl));
-    auto const underPrompt = DiscoverIncludePaths(runner, developerPrompt, "cl", SpecFor(Flavor::Cl));
+    auto const underService = DiscoverIncludePaths(runner, service, "cl", SpecFor(Flavor::Cl)).roots;
+    auto const underPrompt = DiscoverIncludePaths(runner, developerPrompt, "cl", SpecFor(Flavor::Cl)).roots;
 
     CHECK_FALSE(underService.empty());
     CHECK(underService == underPrompt);
@@ -735,7 +794,7 @@ TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[
     host.SetEnvironment("INCLUDE", "C:/legacy/include;C:/legacy/atl");
 
     REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
-    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/cl.exe", SpecFor(Flavor::Cl))
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/cl.exe", SpecFor(Flavor::Cl)).roots
           == std::vector<std::string> { "C:/legacy/include", "C:/legacy/atl" });
     CHECK(runner.Calls() == 0);
 }
@@ -753,7 +812,7 @@ TEST_CASE("A toolset with no SDK keeps its VC roots rather than falling back", "
     host.AddDirectory(std::string { toolset } + "/include");
     host.SetEnvironment("INCLUDE", "C:/should/not/be/used");
 
-    CHECK(DiscoverIncludePaths(runner, host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe", SpecFor(Flavor::Cl))
+    CHECK(DiscoverIncludePaths(runner, host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe", SpecFor(Flavor::Cl)).roots
           == std::vector<std::string> { std::string { toolset } + "/include" });
 }
 
@@ -763,7 +822,7 @@ TEST_CASE("clang-cl is asked where its own headers are", "[toolchain-probe]")
     ScriptedToolchainHost host;
     DescribeLlvmInstall(host, "C:/Program Files/LLVM", "21");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/Program Files/LLVM/bin/clang-cl.exe")
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/Program Files/LLVM/bin/clang-cl.exe").roots
           == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
 
     REQUIRE(runner.LastArgv().size() == 2);
@@ -786,7 +845,7 @@ TEST_CASE("The driver's answer wins over anything derivable from its path", "[to
     for (auto const& stale: { "20", "20.1.2", "22", "22.1.8" })
         host.AddDirectory(std::string { "/usr/lib/clang/" } + stale + "/include");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "/usr/bin/clang-cl-20")
+    CHECK(ClangResourceIncludeRoots(runner, host, "/usr/bin/clang-cl-20").roots
           == std::vector<std::string> { "/usr/lib/llvm-20/lib/clang/20/include" });
 }
 
@@ -800,7 +859,7 @@ TEST_CASE("A resource directory with no include beneath it is not a root", "[too
     host.AddExecutable("C:/LLVM/bin/clang-cl.exe");
     host.AddDirectory("C:/LLVM/lib/clang/21");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").empty());
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").roots.empty());
 }
 
 TEST_CASE("A driver that does not understand the flag names no root", "[toolchain-probe]")
@@ -812,7 +871,13 @@ TEST_CASE("A driver that does not understand the flag names no root", "[toolchai
     ScriptedToolchainHost host;
     host.AddExecutable("C:/wrappers/clang-cl.exe");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/wrappers/clang-cl.exe").empty());
+    auto const discovered = ClangResourceIncludeRoots(runner, host, "C:/wrappers/clang-cl.exe");
+    CHECK(discovered.roots.empty());
+
+    // It ANSWERED -- badly, but it ran, and that is the whole distinction. A wrapper
+    // that names no root is served on a banner-only fingerprint; a driver that could
+    // not be started is not served at all.
+    CHECK(discovered.answered);
 }
 
 TEST_CASE("A resource directory answered with CRLF is still a path", "[toolchain-probe]")
@@ -824,7 +889,7 @@ TEST_CASE("A resource directory answered with CRLF is still a path", "[toolchain
     ScriptedToolchainHost host;
     host.AddDirectory("C:/LLVM/lib/clang/21/include");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe")
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").roots
           == std::vector<std::string> { "C:/LLVM/lib/clang/21/include" });
 }
 
@@ -847,8 +912,8 @@ TEST_CASE("A clang-cl service and a developer prompt derive the same roots", "[t
     DescribeLlvmInstall(developerPrompt, "C:/Program Files/LLVM", "21");
     developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
 
-    auto const underService = DiscoverIncludePaths(serviceRunner, service, "clang-cl", SpecFor(Flavor::ClangCl));
-    auto const underPrompt = DiscoverIncludePaths(promptRunner, developerPrompt, "clang-cl", SpecFor(Flavor::ClangCl));
+    auto const underService = DiscoverIncludePaths(serviceRunner, service, "clang-cl", SpecFor(Flavor::ClangCl)).roots;
+    auto const underPrompt = DiscoverIncludePaths(promptRunner, developerPrompt, "clang-cl", SpecFor(Flavor::ClangCl)).roots;
 
     CHECK_FALSE(underService.empty());
     CHECK(underService == underPrompt);
@@ -871,7 +936,7 @@ TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[t
     host.AddExecutable("C:/wrappers/clang-cl.exe");
     host.SetEnvironment("INCLUDE", "C:/from/the/prompt");
 
-    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/clang-cl.exe", SpecFor(Flavor::ClangCl)).empty());
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/clang-cl.exe", SpecFor(Flavor::ClangCl)).roots.empty());
 }
 
 TEST_CASE("An MSVC layout on the machine contributes nothing to clang-cl", "[toolchain-probe]")
@@ -889,7 +954,7 @@ TEST_CASE("An MSVC layout on the machine contributes nothing to clang-cl", "[too
 
     REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
     REQUIRE_FALSE(MsvcToolsetIncludeRoots(host, "cl").empty());
-    CHECK(DiscoverIncludePaths(runner, host, "clang-cl", SpecFor(Flavor::ClangCl))
+    CHECK(DiscoverIncludePaths(runner, host, "clang-cl", SpecFor(Flavor::ClangCl)).roots
           == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
 }
 

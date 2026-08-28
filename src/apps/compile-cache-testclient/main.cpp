@@ -150,12 +150,12 @@ constexpr auto GnuDriver = DriverSpec { .objectFlag = "-o",
     if (runner == nullptr)
         Die("failed to create a process runner");
     auto run = runner->RunCaptureCombined(argv);
-    // `== -1` and not `< 0`, which is the convention `CompileRun` states and every
-    // other caller follows: a Windows process that dies of a structured exception
-    // reports its status as a NEGATIVE exit code (0xC0000005 arrives as
+    // The exact sentinel and not `< 0`, which is the convention `CompileRun` states
+    // and every other caller follows: a Windows process that dies of a structured
+    // exception reports its status as a NEGATIVE exit code (0xC0000005 arrives as
     // -1073741819), so `< 0` calls a compiler that ran and crashed a spawn failure
     // and throws away the diagnostics it captured on the way down.
-    if (run.exitCode == -1)
+    if (run.exitCode == Cc::NotSpawned)
         Die("failed to spawn compiler: " + argv.front());
     return { run.exitCode, std::move(run.out) };
 }
