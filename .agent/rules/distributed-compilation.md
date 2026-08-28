@@ -644,6 +644,50 @@ caught in review:
   precondition that the banner is a real version string. Check the precondition where
   both halves are known. An operator-pinned identity is never judged this way; it is
   the escape hatch for exactly the compiler this process cannot interrogate.
+- **A probe that did not RUN is not a probe that answered nothing**
+  ([#225](https://github.com/LASTRADA-Software/fastcached/issues/225)). Include-root
+  discovery spawns the driver, and `DiscoverIncludePaths` returned a bare vector
+  documented "empty when undiscoverable" — so a spawn that failed produced the same
+  value as a driver that ran and listed nothing, which is a state this fingerprint
+  legitimately serves. The digest was then taken over nothing and returned as the
+  toolchain's identity. The refusal above does not fire, because it also requires the
+  banner to be the fallback name, and a driver whose *include* probe failed usually
+  answered `--version` perfectly well. `CompileRun::exitCode == NotSpawned` already
+  told the two apart and nobody asked.
+  - **The cache is not the self-correcting half it looks like.** The roots feed the
+    stamp as well as the digest, so one failure stamps differently and the next good
+    run recomputes — which is why the value moved and moved back. But a machine whose
+    probe keeps failing stamps that failure *consistently*, hits its own entry, and
+    settles on the wrong fingerprint permanently. A probe that did not run therefore
+    neither reads nor writes the cache.
+  - **A short WALK is worse, and is the case with no self-correcting run at all.**
+    `ComputeToolchainStamp` folds each root's path and mtime, never its contents, so a
+    walk that stopped inside a root that is there leaves every stamped input
+    identical: the short digest validates against its own stamp forever and nothing
+    walks again to notice. `ToolchainFileScan::complete` reports it.
+  - **What is NOT a gap is half the rule**, and the test is DETERMINISM rather than
+    "did something go wrong". A gap is worth refusing over when two ends running this
+    same code would disagree about it. Three omissions are not: a root that is merely
+    absent (drivers list paths they would search if they existed), an entry that is not
+    a regular file, and a root whose bytes this process cannot decode into a path —
+    that last one being a property of the bytes and of the UTF-8 narrow encoding every
+    executable here pins, so both ends digest the same narrower tree and still match.
+    Two of the three are easy to get wrong in the same direction: keying the
+    absent-root test on `error_code` rather than on the resolved `file_type` calls
+    every machine without `/usr/local/include` incomplete, because MSVC reports
+    `no_such_file_or_directory` for a path that is simply not there; and treating a
+    failed `is_regular_file` as a gap refuses every toolchain tree containing a
+    dangling symlink. Refusing a healthy toolchain is a worse error than the one being
+    caught.
+  - **Why refuse rather than serve it anyway.** Both ends are silent otherwise: the
+    worker registers, heartbeats and is matched by nobody, and the client sees
+    `NoWorker` and compiles locally. Neither names a cause, and the failure is
+    intermittent by nature. `IdentityDefect` carries which way an identity is
+    unusable, and its reason and remedy are columns of a table because two surfaces
+    report them — the node's refusal and `--print-toolchain-fingerprint`'s warning.
+  - Related: [#148](https://github.com/LASTRADA-Software/fastcached/issues/148) is the
+    same fact discarded one function away — `CompilerBanner` knows whether it spawned
+    and reports only the banner, so `CanSpawn` runs the identical command again.
 - **`cc` and `gcc` stay two candidates.** Usually one binary under two names, and they
   fingerprint *differently*, because a GNU driver prints its own `argv[0]` in the
   banner its clients hash. Collapsing them looks like tidiness and costs the fleet

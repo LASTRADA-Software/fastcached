@@ -198,6 +198,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - What a node holds back from compiles is what its tier **built**, never what a flag
   asked for — so capacity is derived *below* the tier startup. Which tiers cost RAM
   is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing.
+- A probe that did not RUN is not one that answered nothing, and an identity built on
+  one is neither served nor cached. Empty roots are ordinary — several mechanisms
+  legitimately have none — so the guard is `exitCode == NotSpawned`, never the count.
+  A short include-tree WALK is worse still: it moves nothing the stamp covers, so the
+  short digest validates forever. What counts as a gap is what two ends would DISAGREE
+  about, so an absent root, a dangling symlink and an undecodable root name are none —
+  and keying the first on `error_code` rather than on the resolved `file_type` refuses
+  every machine without `/usr/local/include`.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same
