@@ -172,7 +172,7 @@ TEST_CASE("A payload that does not fill its declared length is refused", "[distr
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 0);
 }
 
-TEST_CASE("A whole register-heartbeat-lease exchange crosses the wire", "[distributed][scheduler][protocol]")
+TEST_CASE("A whole register-heartbeat-lease-release exchange crosses the wire", "[distributed][scheduler][protocol]")
 {
     // End to end through the framing, because the service's own tests call it
     // directly and would not notice a field read out of order here.
@@ -195,6 +195,15 @@ TEST_CASE("A whole register-heartbeat-lease exchange crosses the wire", "[distri
     auto const grant = Wire::DecodeLeaseGrant(PayloadOf(granted));
     REQUIRE(grant.has_value());
     CHECK(Wire::AsStringView(Unwrap(grant).endpoint) == "10.0.0.2:7100");
+
+    // And back again, which is the transition that had no verb at all: the token
+    // the grant carried is what resolves the lease, so a field read out of order in
+    // either encoder would leave a key pinned until it expired (#212).
+    auto const done = Wire::EncodeRelease(Wire::AsStringView(Unwrap(grant).leaseToken));
+    CHECK(StatusOf(fixture.protocol.Answer(done, Insider)) == Wire::Status::Ok);
+
+    // Spent, so the same token now names nothing.
+    CHECK(ErrorOf(fixture.protocol.Answer(done, Insider)) == Wire::ErrorCode::UnknownLease);
 }
 
 TEST_CASE("The service's refusals reach the wire with their codes intact", "[distributed][scheduler][protocol]")

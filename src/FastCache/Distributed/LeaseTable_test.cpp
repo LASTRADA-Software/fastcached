@@ -130,6 +130,29 @@ TEST_CASE("Releasing an expired lease does not evict the client that replaced it
     CHECK_FALSE(fix.leases.Acquire("objkey-1", "w3").has_value());
 }
 
+TEST_CASE("An expired lease reports as gone rather than as freed", "[distributed][lease]")
+{
+    // The case the key index cannot show: nothing re-leased this key, so the entry
+    // is still sitting in the token map when its holder finally reports. Presence is
+    // not liveness -- the key stopped being suppressed when the lifetime ran out --
+    // and answering as though this call had freed something would hide the one
+    // condition worth reporting: a job that outlived its lease, which is a timeout
+    // shorter than the fleet's slowest translation unit.
+    Fixture fix;
+    auto const lease = fix.leases.Acquire("objkey-1", "w1");
+    REQUIRE(lease.has_value());
+
+    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    CHECK_FALSE(fix.leases.Release(Unwrap(lease).token).has_value());
+
+    // And the entry went with it rather than being left for a later `Acquire` to
+    // sweep -- observable as the key still leasing cleanly, under a NEW token.
+    auto const next = fix.leases.Acquire("objkey-1", "w2");
+    REQUIRE(next.has_value());
+    CHECK(Unwrap(next).token != Unwrap(lease).token);
+    CHECK(fix.leases.LiveCount() == 1);
+}
+
 TEST_CASE("Dropping a worker releases every lease held against it", "[distributed][lease]")
 {
     // Without this, a worker dying mid-job leaves its keys marked in-flight until

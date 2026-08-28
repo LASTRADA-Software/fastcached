@@ -57,6 +57,15 @@ class IMetricsSink
         /// refusals below it -- a fleet where every lease is granted and a fleet
         /// nobody asks look identical on this counter alone.
         DispatchLeasesGranted,
+        /// Leases a client resolved when its job ended, however it ended.
+        ///
+        /// The pair of `DispatchLeasesGranted`, and the difference between the two
+        /// is the outstanding count. Its absence is what let a whole missing
+        /// transition go unnoticed: every lease was granted, none was ever
+        /// resolved, and the only number saying so was one nobody exported. A
+        /// granted count that climbs while this one stays flat means clients are
+        /// dying mid-job, or are older than this verb.
+        DispatchLeasesReleased,
         /// Lease requests refused because no registered worker matched the
         /// toolchain. The counter that says a fleet is MISCONFIGURED rather than
         /// busy: it rises when workers are up but nobody can use them, which is

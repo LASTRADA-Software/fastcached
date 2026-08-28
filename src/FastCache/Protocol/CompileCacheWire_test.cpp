@@ -462,6 +462,13 @@ TEST_CASE("Every dispatch verb round-trips its fields")
         CHECK(AsStringView(Unwrap(decoded).fingerprint) == "gcc-13-abc");
         CHECK(AsStringView(Unwrap(decoded).key) == "objkey");
     }
+    SECTION("RELEASE")
+    {
+        auto const frame = EncodeRelease("l42");
+        auto const decoded = DecodeReleasePayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded)) == "l42");
+    }
     SECTION("COMPILE")
     {
         auto const args = Bytes({ 0x01, 0x02 });
@@ -607,7 +614,15 @@ TEST_CASE("A dispatch payload decoded as the wrong verb fails")
     auto const payload = std::span<std::byte const> { lease }.subspan(RequestHeaderSize);
     CHECK_FALSE(DecodeRegisterPayload(payload).has_value());
     CHECK_FALSE(DecodeCompilePayload(payload).has_value());
+    CHECK_FALSE(DecodeReleasePayload(payload).has_value());
     CHECK(DecodeLeasePayload(payload).has_value());
+
+    // And the other way round: RELEASE carries one field, so a three-field LEASE
+    // cannot be read out of it either.
+    auto const release = EncodeRelease("l1");
+    auto const releasePayload = std::span<std::byte const> { release }.subspan(RequestHeaderSize);
+    CHECK_FALSE(DecodeLeasePayload(releasePayload).has_value());
+    CHECK(DecodeReleasePayload(releasePayload).has_value());
 }
 
 TEST_CASE("A codec envelope round-trips its tag, raw size and bytes")

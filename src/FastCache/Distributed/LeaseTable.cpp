@@ -58,6 +58,18 @@ std::optional<Lease> LeaseTable::Find(std::string_view token) const
     return it->second.lease;
 }
 
+void LeaseTable::Forget(std::unordered_map<std::string, Entry>::iterator entry)
+{
+    // Erase the key index only when it still points AT THIS token. An expired
+    // lease's key may already have been re-leased to somebody else, and removing
+    // that mapping here would release a live lease held by another client --
+    // letting a third client dispatch the same work while the second is running it.
+    auto const& lease = entry->second.lease;
+    if (auto const byKey = _tokenByKey.find(lease.key); byKey != _tokenByKey.end() && byKey->second == lease.token)
+        _tokenByKey.erase(byKey);
+    _byToken.erase(entry);
+}
+
 std::optional<Lease> LeaseTable::Release(std::string_view token)
 {
     std::scoped_lock const guard { _mutex };
@@ -65,20 +77,25 @@ std::optional<Lease> LeaseTable::Release(std::string_view token)
     if (it == _byToken.end())
         return std::nullopt;
 
+    // Liveness, not mere presence -- the same rule `Find` and `IsInFlight` follow,
+    // and it is what makes a refusal here mean something. An expired token belongs
+    // to a job that outlived its lease, and telling that client `Ok` would leave
+    // the one fleet condition worth reporting -- a lease timeout shorter than the
+    // slowest translation unit -- with nowhere to be observed.
     auto lease = it->second.lease;
-    // Erase the key index only when it still points AT THIS token. An expired
-    // lease's key may already have been re-leased to somebody else, and removing
-    // that mapping here would release a live lease held by another client --
-    // letting a third client dispatch the same work while the second is running it.
-    if (auto const byKey = _tokenByKey.find(lease.key); byKey != _tokenByKey.end() && byKey->second == lease.token)
-        _tokenByKey.erase(byKey);
-    _byToken.erase(it);
-    return lease;
+    bool const live = IsLive(it->second, _clock.Now());
+
+    // Dropped either way. Nothing else ever visits an expired token except an
+    // `Acquire` for the same key, so answering without erasing would leave one
+    // entry in each map for every lease a client reported late.
+    Forget(it);
+    return live ? std::optional { std::move(lease) } : std::nullopt;
 }
 
 std::size_t LeaseTable::ReleaseWorker(std::string_view workerId)
 {
     std::scoped_lock const guard { _mutex };
+    auto const now = _clock.Now();
 
     // Collected first, then erased: erasing while iterating the map invalidates the
     // iterator, and the key index has to be visited per lease anyway.
@@ -87,16 +104,20 @@ std::size_t LeaseTable::ReleaseWorker(std::string_view workerId)
         if (entry.lease.workerId == workerId)
             tokens.push_back(token);
 
+    std::size_t released = 0;
     for (auto const& token: tokens)
     {
         auto const it = _byToken.find(token);
         if (it == _byToken.end())
             continue;
-        if (auto const byKey = _tokenByKey.find(it->second.lease.key); byKey != _tokenByKey.end() && byKey->second == token)
-            _tokenByKey.erase(byKey);
-        _byToken.erase(it);
+        // Counted only when it was still suppressing its key. An entry that had
+        // already expired is swept here rather than left, but reporting it as a
+        // lease this call freed would overstate what dropping the worker achieved.
+        if (IsLive(it->second, now))
+            ++released;
+        Forget(it);
     }
-    return tokens.size();
+    return released;
 }
 
 bool LeaseTable::IsInFlight(std::string_view key) const

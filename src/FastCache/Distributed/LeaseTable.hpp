@@ -90,8 +90,17 @@ class LeaseTable
     [[nodiscard]] std::optional<Lease> Find(std::string_view token) const;
 
     /// Resolve a lease, however the job ended.
+    ///
+    /// An **expired** token counts as already gone, and reports so rather than
+    /// answering as though it had freed something: the key it named stopped being
+    /// suppressed when the lifetime ran out, and the client saying otherwise has a
+    /// job that outlived its lease -- which is the one condition worth telling an
+    /// operator about, since it means `leaseTimeout` is shorter than their slowest
+    /// translation unit. The entry is dropped either way; nothing else ever visits
+    /// an expired token but an `Acquire` for the same key.
     /// @param token The token.
-    /// @return The lease that was released, or nullopt when it was already gone.
+    /// @return The lease that was released, or nullopt when it was expired or
+    ///         already gone.
     [[nodiscard]] std::optional<Lease> Release(std::string_view token);
 
     /// Release every lease held against a worker.
@@ -101,7 +110,9 @@ class LeaseTable
     /// that missed on one would be refused in the meantime — the fleet losing a
     /// machine would quietly stop distributing part of the build.
     /// @param workerId The worker.
-    /// @return How many leases were released.
+    /// @return How many LIVE leases were released. An expired entry held against
+    ///         the worker is swept too, and not counted: it had stopped suppressing
+    ///         its key already, so reporting it would overstate what this achieved.
     [[nodiscard]] std::size_t ReleaseWorker(std::string_view workerId);
 
     /// Whether somebody is already compiling `key` right now.
@@ -133,6 +144,15 @@ class LeaseTable
 
     /// Whether `entry` is still within its lease lifetime.
     [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+
+    /// Drop one entry from both maps.
+    ///
+    /// One implementation rather than one per caller: the key index must be erased
+    /// only when it still points at *this* token, and two copies of that guard is
+    /// how one of them comes to evict the client that replaced an expired lease.
+    /// Caller holds `_mutex`.
+    /// @param entry The token entry to remove; invalidated by the call.
+    void Forget(std::unordered_map<std::string, Entry>::iterator entry);
 
     IClock& _clock;
     std::chrono::milliseconds _leaseTimeout;

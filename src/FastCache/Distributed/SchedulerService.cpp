@@ -446,4 +446,28 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
         Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs }));
 }
 
+SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    auto const lease = _leases.Release(leaseToken);
+    if (!lease.has_value())
+        // Already gone: it expired under a job that outlived its lease, or this is a
+        // second release of one token. Answered rather than accepted silently,
+        // because the first of those is a fleet whose `DefaultLeaseTimeout` is
+        // shorter than its slowest translation unit -- and a client that is told
+        // nothing has nothing to report. Uncounted by design: it is a statement
+        // about one client's timing, not about the fleet's capacity.
+        return Refuse(Wire::ErrorCode::UnknownLease, "unknown or already-resolved lease");
+
+    // The registry's speculative count, undone. `JobStarted` at `Lease` above is what
+    // stops the scheduler over-assigning a worker inside one heartbeat window, and
+    // without this it only ever climbed -- corrected solely by the next heartbeat
+    // overwrite, so a burst of leases took a worker out of rotation until it landed.
+    _workers.JobFinished(lease->workerId);
+    _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReleased);
+    return SchedulerReply::Success();
+}
+
 } // namespace FastCache::Distributed

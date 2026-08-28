@@ -21,9 +21,9 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps { Wire::Op::Register,      Wire::Op::Heartbeat,  Wire::Op::Lease,
-                                        Wire::Op::ClusterStatus, Wire::Op::ClusterSet, Wire::Op::ClusterForget,
-                                        Wire::Op::ClusterAdmit };
+    constexpr std::array SchedulerOps { Wire::Op::Register,      Wire::Op::Heartbeat,     Wire::Op::Lease,
+                                        Wire::Op::Release,       Wire::Op::ClusterStatus, Wire::Op::ClusterSet,
+                                        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.
@@ -262,6 +262,12 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                   Wire::LeaseRequest { .fingerprint = Wire::AsStringView(fields->fingerprint),
                                                        .key = Wire::AsStringView(fields->key),
                                                        .acceptedCodecs = fields->acceptedCodecs });
+        }
+        case Wire::Op::Release: {
+            auto const token = Wire::DecodeReleasePayload(payload);
+            if (!token.has_value())
+                return SchedulerReply::Malformed();
+            return _service.Release(caller, Wire::AsStringView(*token));
         }
         case Wire::Op::ClusterStatus:
             // A payload that is not empty is still refused, and by the same rule as

@@ -203,6 +203,38 @@ class SchedulerService
     /// @return `Ok` carrying an encoded `LeaseGrant`, or a refusal.
     [[nodiscard]] SchedulerReply Lease(CallerContext const& caller, CompileCacheWire::LeaseRequest const& request);
 
+    /// Resolve a lease whose job has ended, however it ended.
+    ///
+    /// The transition that was missing for as long as there was no verb to carry
+    /// it (#212). Without it a key stayed marked in-flight for the full lease
+    /// timeout, so recompiling the same translation unit inside ten minutes of a
+    /// dispatch was refused `AlreadyInFlight` and fell back to a local compile --
+    /// with expiry, which the lease table documents as the safety net for a client
+    /// that *died*, doing the work of the ordinary path.
+    ///
+    /// Answered by the CLIENT rather than by the worker, because the client is who
+    /// the lease was issued to and is the only party that sees every way a job can
+    /// end: a dispatch that never reached its worker is invisible to that worker.
+    ///
+    /// An unknown token is refused rather than waved through, and the refusal is
+    /// the diagnostic: it means the lease had already expired under this job, which
+    /// is an operator telling their fleet that `DefaultLeaseTimeout` is shorter
+    /// than their slowest translation unit.
+    ///
+    /// The residual, stated rather than left looking like an oversight: a token
+    /// proves nothing about who holds it, and `LeaseTable` issues them
+    /// sequentially, so any member that passes the gate can resolve a lease it was
+    /// not granted. What that costs is one duplicated compile and one premature
+    /// decrement the next heartbeat corrects -- a fairness question inside a
+    /// trusted fleet, not a security one, and strictly smaller than what the same
+    /// member could already do by taking leases on keys it has no intention of
+    /// compiling. Unforgeable tokens belong with the surface's authentication as a
+    /// whole (#180), not bolted onto one verb.
+    /// @param caller Who is asking.
+    /// @param leaseToken The token this client was granted.
+    /// @return `Ok`, or a refusal.
+    [[nodiscard]] SchedulerReply Release(CallerContext const& caller, std::string_view leaseToken);
+
     /// Report what the cluster has agreed.
     ///
     /// Behind the same gate as everything else here, which for a *read* is worth
