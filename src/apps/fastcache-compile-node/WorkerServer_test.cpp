@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "WorkerServer.hpp"
 
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <coroutine>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -43,6 +52,88 @@ class StubRunner final: public Cc::IProcessRunner
         Cc::Test::WriteStubObject(argv);
         return Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
     }
+};
+
+/// A runner that reports it started and then blocks, so a case can hold several
+/// compiles in flight at once and look at the worker while they are.
+///
+/// The wait is BOUNDED and the arrival count is what a case asserts on. An
+/// unbounded one would turn a regression -- a worker that serves one at a time --
+/// into a suite that hangs rather than one that fails, which this file has a
+/// paragraph about further down.
+class HoldingRunner final: public Cc::IProcessRunner
+{
+  public:
+    Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        {
+            auto const guard = std::scoped_lock { _mutex };
+            ++_started;
+        }
+        _changed.notify_all();
+        {
+            auto guard = std::unique_lock { _mutex };
+            (void) _changed.wait_for(guard, std::chrono::seconds { 5 }, [this] { return _released; });
+        }
+        Cc::Test::WriteStubObject(argv);
+        return Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// @param many How many compiles to wait for.
+    /// @return Whether that many had started before the bound elapsed.
+    [[nodiscard]] bool WaitForStarted(std::size_t many)
+    {
+        auto guard = std::unique_lock { _mutex };
+        return _changed.wait_for(guard, std::chrono::seconds { 5 }, [this, many] { return _started >= many; });
+    }
+
+    void Release()
+    {
+        {
+            auto const guard = std::scoped_lock { _mutex };
+            _released = true;
+        }
+        _changed.notify_all();
+    }
+
+  private:
+    std::mutex _mutex;
+    std::condition_variable _changed;
+    std::size_t _started { 0 };
+    bool _released { false };
+};
+
+/// A listener that hands out prepared connections in order and then reports EOF.
+class ScriptedListener final: public IListener
+{
+  public:
+    explicit ScriptedListener(std::vector<std::unique_ptr<ISocket>> sockets):
+        _sockets { std::move(sockets) }
+    {
+    }
+
+    AcceptAwaitable Accept() override
+    {
+        if (_next < _sockets.size())
+            return AcceptAwaitable { AcceptResult { std::move(_sockets[_next++]) } };
+        return AcceptAwaitable { AcceptResult { std::unexpect,
+                                                NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+    }
+    void Close() noexcept override {}
+
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
+  private:
+    std::vector<std::unique_ptr<ISocket>> _sockets;
+    std::size_t _next { 0 };
 };
 
 /// A listener that hands out one prepared connection and then reports EOF, so a
@@ -146,9 +237,26 @@ class IdleListener final: public IListener
     int _polls { 0 };
 };
 
+/// An executor that resumes on the caller's thread, so a case stays single-threaded.
+///
+/// `ResumeOn` always suspends and posts, so this is a real hop through the seam
+/// rather than a bypass of it -- the coroutine continues inside `Submit`. What it
+/// buys is determinism: a case that asserts on a reply after `Run()` returns is
+/// asserting on work that has finished, which a pool cannot promise and does not
+/// need to.
+class InlineExecutor final: public IExecutor
+{
+  public:
+    void Submit(std::coroutine_handle<> handle) override
+    {
+        handle.resume();
+    }
+};
+
 struct Fixture
 {
     StubRunner runner;
+    InlineExecutor executor;
     ScratchDirectory scratch { "fc-ws" };
     Cc::CompileJobRunner jobs;
     AtomicMetricsSink metrics;
@@ -185,20 +293,28 @@ struct Fixture
                                                       .sourceName = "a.cpp" });
 }
 
-/// Drive one request through a server and return everything written back.
-[[nodiscard]] std::vector<std::byte> ServeOne(Fixture& fix, std::vector<std::byte> const& request, std::size_t slots)
+/// A COMPILE header that declares `declared` payload bytes and carries none.
+///
+/// The budget is checked on the DECLARED length before a payload byte is read, so a
+/// case can hold the whole of it with a header and never allocate 256 MiB.
+/// @param declared What the header claims will follow.
+/// @return Exactly `Wire::RequestHeaderSize` bytes.
+[[nodiscard]] std::vector<std::byte> DeclaringHeader(std::uint32_t declared)
 {
-    auto pair = InMemorySocketPair::Create();
-    REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
-        auto const r = co_await s->Write(std::span<std::byte const> { bytes });
-        co_return r.has_value();
-    }(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
+    std::vector<std::byte> header(Wire::RequestHeaderSize);
+    WireFrame::PutHeader(std::span<std::byte> { header },
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Compile),
+                         declared);
+    return header;
+}
 
-    OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, slots, fix.membership, fix.metrics, fix.logger };
-    SyncRun(server.Run());
-
+/// Read everything a server wrote back on one connection.
+/// @param client The client side of the pair.
+/// @return The bytes written back, which may be empty.
+[[nodiscard]] std::vector<std::byte> ReadAll(ISocket& client)
+{
     return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
         std::vector<std::byte> out;
         while (true)
@@ -212,7 +328,24 @@ struct Fixture
                 break;
         }
         co_return out;
-    }(pair.client.get()));
+    }(&client));
+}
+
+/// Drive one request through a server and return everything written back.
+[[nodiscard]] std::vector<std::byte> ServeOne(Fixture& fix, std::vector<std::byte> const& request, std::size_t slots)
+{
+    auto pair = InMemorySocketPair::Create();
+    REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const r = co_await s->Write(std::span<std::byte const> { bytes });
+        co_return r.has_value();
+    }(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+
+    OneShotListener listener { std::move(pair.server) };
+    WorkerServer server { listener, fix.protocol, slots, fix.membership, fix.metrics, fix.logger, fix.executor };
+    SyncRun(server.Run());
+
+    return ReadAll(*pair.client);
 }
 
 [[nodiscard]] Wire::ErrorCode ErrorOf(std::vector<std::byte> const& frame)
@@ -288,9 +421,62 @@ TEST_CASE("In-flight returns to zero after a job", "[worker-server]")
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, 2, fix.membership, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, 2, fix.membership, fix.metrics, fix.logger, fix.executor };
     SyncRun(server.Run());
     CHECK(server.InFlight() == 0);
+}
+
+TEST_CASE("A worker serves its slots at once, not one at a time", "[worker-server]")
+{
+    // The whole of #213. A node registers `--slots` and the scheduler dispatches
+    // against it, so a worker that served inline advertised thirty and ran one --
+    // `_inFlight` could never exceed 1, the cap was unreachable, and the busiest
+    // reading a saturated fleet could report was `1 / 30 compiling`.
+    ScratchDirectory const scratch { "worker-concurrent" };
+    HoldingRunner runner;
+    Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    AtomicMetricsSink metrics;
+    Cc::WorkerProtocol protocol {
+        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
+    };
+    Distributed::OpenMembership membership;
+    NullLogger logger;
+    ThreadPoolExecutor pool { 2 };
+
+    // Three clients at a worker with two slots.
+    std::vector<std::unique_ptr<ISocket>> accepted;
+    std::vector<InMemorySocketPair> pairs;
+    for ([[maybe_unused]] auto const index: { 0, 1, 2 })
+    {
+        auto pair = InMemorySocketPair::Create();
+        auto const request = CompileFrame();
+        REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+            auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+            co_return written.has_value();
+        }(pair.client.get(), request)));
+        pair.client->ShutdownWrite();
+        accepted.push_back(std::move(pair.server));
+        pairs.push_back(std::move(pair));
+    }
+
+    ScriptedListener listener { std::move(accepted) };
+    {
+        WorkerServer server { listener, protocol, 2, membership, metrics, logger, pool };
+        SyncRun(server.Run());
+
+        // TWO compiles inside the compiler at the same moment, which one thread
+        // could not produce however long it was given.
+        CHECK(runner.WaitForStarted(2));
+        CHECK(server.InFlight() == 2);
+
+        // And the third is refused rather than queued, which is the cap doing the
+        // job it was written for -- unreachable until now.
+        CHECK(metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 1);
+
+        runner.Release();
+    } // ~WorkerServer drains the two held compiles; the pool is joined below
+
+    CHECK(metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 1);
 }
 
 TEST_CASE("A poll timeout keeps the accept loop running", "[worker-server]")
@@ -305,7 +491,7 @@ TEST_CASE("A poll timeout keeps the accept loop running", "[worker-server]")
     Fixture fix;
     WorkerServer* running = nullptr;
     IdleListener listener { 3, [&] { running->Shutdown(); } };
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger, fix.executor };
     running = &server;
 
     SyncRun(server.Run());
@@ -322,7 +508,7 @@ TEST_CASE("Shutdown ends an idle accept loop", "[worker-server]")
     // supervisor's stop would time out and escalate to SIGKILL.
     Fixture fix;
     IdleListener listener;
-    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger };
+    WorkerServer server { listener, fix.protocol, /*slots=*/2, fix.membership, fix.metrics, fix.logger, fix.executor };
 
     server.Shutdown();
     SyncRun(server.Run());
@@ -396,7 +582,7 @@ TEST_CASE("A stranger is refused this machine's CPU before it can send a payload
         pair.client->ShutdownWrite();
 
         OneShotListener listener { std::move(pair.server) };
-        WorkerServer server { listener, fix.protocol, 2, listed, fix.metrics, fix.logger };
+        WorkerServer server { listener, fix.protocol, 2, listed, fix.metrics, fix.logger, fix.executor };
         SyncRun(server.Run());
 
         return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
@@ -446,5 +632,57 @@ TEST_CASE("A stranger is refused this machine's CPU before it can send a payload
         auto const header = Wire::DecodeReplyHeader(reply);
         REQUIRE(header.has_value());
         CHECK(Unwrap(header).status == Wire::Status::Ok);
+    }
+}
+
+TEST_CASE("A worker bounds the payload bytes it reads at once, not just the jobs", "[worker-server]")
+{
+    // The other half of #213, and the rulebook says it had to land in the same
+    // commit as the detach rather than after it: serving one compile at a time
+    // bounded peak memory to a single request by accident, and serving `slots` of
+    // them makes it `slots` times that -- 8 GiB on a 32-slot node, asked for by any
+    // cluster member. A fix that opens a memory-exhaustion hole is not a fix.
+    //
+    // `MaxInFlightBytes` is deliberately one request's worth, so ordinary
+    // translation units run side by side and a single monster cannot be joined.
+    constexpr std::uint32_t WholeBudget = 256U * 1024U * 1024U;
+
+    Fixture fix;
+
+    // The first client declares the entire budget and sends none of it, so its job
+    // is parked inside the payload read holding the reservation. No shutdown here:
+    // the point is a job that is still reading, not one that failed.
+    auto holder = InMemorySocketPair::Create();
+    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+        co_return written.has_value();
+    }(holder.client.get(), DeclaringHeader(WholeBudget))));
+
+    // The second is an ordinary compile, and there is a slot free for it.
+    auto second = InMemorySocketPair::Create();
+    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+        co_return written.has_value();
+    }(second.client.get(), CompileFrame())));
+    second.client->ShutdownWrite();
+
+    std::vector<std::unique_ptr<ISocket>> accepted;
+    accepted.push_back(std::move(holder.server));
+    accepted.push_back(std::move(second.server));
+
+    ScriptedListener listener { std::move(accepted) };
+    {
+        WorkerServer server { listener, fix.protocol, /*slots=*/4, fix.membership, fix.metrics, fix.logger, fix.executor };
+        SyncRun(server.Run());
+
+        // Refused for MEMORY, with a slot free -- which is why it is its own code and
+        // its own counter. Reported as NoCapacity it would send an operator to buy
+        // machines over something more machines would not fix.
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 1);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
+        CHECK(ErrorOf(ReadAll(*second.client)) == Wire::ErrorCode::EndpointBusy);
+
+        // Let the holder go, or the destructor waits for a job nothing will finish.
+        holder.client->Close();
     }
 }

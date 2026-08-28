@@ -182,6 +182,29 @@ code is a **successful exchange** — the compiler ran and rejected the code —
 the client answers that by recompiling locally to get diagnostics with the right
 line numbers.
 
+A worker runs **`slots` compiles at once**, each on its own thread, while the port
+goes straight back to accepting. That is the number it registered, so what the
+scheduler dispatches against and what the machine actually serves are the same
+figure. Until
+[#213](https://github.com/LASTRADA-Software/fastcached/issues/213) they were not:
+the port served each connection to completion before accepting the next, so a node
+advertising thirty ran one, and the busiest reading a saturated fleet could show
+was `1 / 30 compiling`. Everything a job touches is derived per thread rather than
+per job — the scratch directory above is unique across the compiles running
+together, or two of them would build into the same file.
+
+Two refusals are the worker's own rather than the scheduler's four, and both
+answer a client that already holds a valid grant:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `no-capacity` | Every slot on this worker is busy | Nothing at once; the client compiles locally. Persistent means the fleet is small |
+| `endpoint-busy` | Slots were free but the payloads already being read fill this worker's memory budget | Nothing to buy — more machines would not have helped |
+
+Neither is queued, and that is deliberate: the client has a local compile waiting
+either way, while queueing would hide the overload from the scheduler that is
+trying to route around it.
+
 ### 7. The client hands the lease back
 
 On **every** path out of the compile: an object built, a worker that refused the

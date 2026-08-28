@@ -449,6 +449,68 @@ spelled it the same way, which is what makes this a drift rather than a discover
     includes `FrameEndpoint.hpp`; the endpoint holds an `IListener` rather than the
     platform type, which is what `IListener::BoundPort()` was added for.
 
+- **A worker's compile port had the SAME defect, and the slot cap hid it.**
+  `WorkerServer::Run` awaited each compile inline, so a node advertising 32 slots ran
+  exactly one at a time: `_inFlight` could never exceed 1, the cap it enforces was
+  unreachable, and the scheduler dispatched 32 jobs to a machine that would serve them
+  in a queue. Nothing reported it -- every client got a correct object, and the fleet
+  page showed a worker that was never busy because it never was. A cap that cannot be
+  reached is indistinguishable from a cap that is never hit.
+  - **A compile cannot go on a reactor.** It spawns a process and holds its thread for
+    seconds, so `ResumeOn { someReactor }` would stall every other coroutine that
+    reactor owns -- the same defect one layer over. It goes on a `ThreadPoolExecutor`,
+    which is what `IExecutor` was split out of `IReactor` for: `ResumeOn` only ever
+    needed `Submit`, and a pool is not a reactor.
+  - **The hop is one-way only because the worker's listener BLOCKS.**
+    `BlockingSocket::Read` does its `recv` eagerly and returns an already-ready
+    awaitable, so nothing after `ResumeOn { _jobs }` suspends and the whole of
+    `Serve` stays on the pool thread. Move that port onto a reactor and every read
+    would resume the coroutine on the reactor thread -- putting the compile back
+    there, invisibly, with no call site changed.
+  - **The pool is sized to the cap, and the cap is what refuses.** The pool does not
+    bound admission -- it runs what it is given -- so an unsized pool would queue
+    silently and hide the overload from the scheduler trying to route around it.
+    `WorkerServer` refuses over the cap and the pool has one thread per slot, which is
+    what makes an admitted job always find a thread.
+  - **The payload cap became a per-connection cap the moment serialization went**,
+    exactly as it did for `FrameEndpoint`, and the byte budget had to land in the
+    same commit rather than after it. Serving one at a time bounded peak memory to a
+    single `MaxRequestBytes` by accident; `slots` jobs each declaring the maximum is
+    `slots` times it -- 8 GiB on a 32-slot node, asked for by any cluster member.
+    Checked on the DECLARED length before a payload byte is read, and refused with
+    `EndpointBusy` and its own counter: slots were free and memory was not, so
+    reporting it as `NoCapacity` would send an operator to buy machines that would
+    not help.
+  - **Concurrency turned a per-call scratch path into a per-thread one.**
+    `CompileJobRunner` derived `job-N` from a plain `++`, and the source file and the
+    hard-coded `tu.o` both live inside it. Two jobs reading the same counter compiled
+    into the same file and one returned the OTHER's object -- which its client then
+    cached under its own key. Silent wrong-object delivery is the worst thing a
+    compile cache can do, and it was reachable in about one run in six once two jobs
+    started together. Anything a worker derives per job is derived per THREAD now, and
+    `Run` says in its docs that it may be called concurrently.
+  - **A spawned child inherits what the PROCESS has, not what the call set up.**
+    `CreateProcess` with `bInheritHandles = TRUE` hands over every inheritable handle
+    in the process, and a POSIX fd without `FD_CLOEXEC` survives `exec`. So a
+    sibling's compiler held another job's pipe write-end open, that job's drain never
+    saw EOF, and it blocked until an unrelated compile finished. Windows names what
+    may be inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than chasing what
+    may not -- which also closed a live leak of *accepted client sockets*, since
+    `::socket()` returns an inheritable handle. POSIX marks both pipe ends
+    close-on-exec, under a lock that also covers the spawn, because the window between
+    creating a descriptor and marking it is a window a sibling can spawn in.
+  - **A drain must not wake on an atomic it is about to destroy.** `~WorkerServer`
+    waited on `_inFlight.wait()`; an atomic wait can return on observing the store
+    alone, so the destructor could finish and free the object while the job that
+    released the last slot was still inside `notify_all` on a member of it. It waits
+    on a condition variable whose notifier holds the mutex, which is what proves the
+    notifier is past its critical section before the waiter can run.
+  - **A destructor that drains closes the door first.** Waiting without `Shutdown()`
+    races the accept loop admitting one more job just as the count reaches zero, and
+    the wait then returns while that job is starting. The loop re-checks the flag after
+    `Accept()` returns too, since the check at the top of the loop was made before it
+    parked.
+
 - **`EndpointBusy` is not `NoCapacity`, and the split is for whoever reads it.**
   `NoCapacity` is a statement about the FLEET -- every matching worker full of this
   build's own work, which an operator answers by buying machines. `EndpointBusy` is

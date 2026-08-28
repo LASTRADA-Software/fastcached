@@ -182,6 +182,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "nor a cluster member. A rise means something is trying to spend a "
               "machine it has no claim on.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy,
+      .prometheusName = "fastcache_worker_jobs_refused_endpoint_busy_total",
+      .help = "Jobs refused because the payloads already being read fill this "
+              "worker's in-flight byte budget. Distinct from no_slot: slots were "
+              "free and memory was not, so more slots would not have helped.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerBytesReceived,
       .prometheusName = "fastcache_worker_bytes_received_total",
       .help = "Request payload bytes read from clients.",

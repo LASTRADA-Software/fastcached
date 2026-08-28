@@ -175,6 +175,7 @@ class IMetricsSink
         /// An operator reads it very differently, which is the whole reason the
         /// refusals are split.
         WorkerJobsRefusedNotAMember,
+        WorkerJobsRefusedEndpointBusy,
 
         /// Bytes of request payload read from clients, and of reply written back.
         /// The pair is what says whether a codec negotiation is doing anything:
