@@ -104,7 +104,7 @@ class SpawnScript final: public Cc::IProcessRunner
     /// Let @p compiler run but say nothing, and fail while doing it.
     ///
     /// This is what drives `CompilerBanner` onto its FALLBACK, and that fallback is
-    /// half of what makes an identity degenerate. A stub, a wrapper script, or a
+    /// half of what makes an identity `NoEvidence`. A stub, a wrapper script, or a
     /// driver whose version probe this build does not know -- no longer `cl`, which
     /// is asked bare and answers (issue #195).
     ///
@@ -113,6 +113,22 @@ class SpawnScript final: public Cc::IProcessRunner
     SpawnScript& Speechless(std::string compiler)
     {
         _speechless.push_back(std::move(compiler));
+        return *this;
+    }
+
+    /// Let @p compiler answer its version, but fail to spawn for the INCLUDE probe.
+    ///
+    /// The shape issue #225 was reported as, and it cannot be expressed with
+    /// `Unspawnable`: that one fails every invocation, so `CanSpawn` drops the
+    /// candidate at discovery and the fingerprint is never computed. A transient
+    /// failure lands between those two spawns, which is precisely why the identity it
+    /// produces looks healthy -- a real banner over an include tree nobody measured.
+    ///
+    /// @param compiler The path whose include probe fails.
+    /// @return This runner, for chaining.
+    SpawnScript& Unprobeable(std::string compiler)
+    {
+        _unprobeable.push_back(std::move(compiler));
         return *this;
     }
 
@@ -135,9 +151,15 @@ class SpawnScript final: public Cc::IProcessRunner
     Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
     {
         if (!argv.empty() && std::ranges::contains(_unspawnable, argv.front()))
-            // -1 is the ONE answer meaning "could not spawn". A compiler that ran
-            // and then failed has run, and takes the other branch.
-            return Cc::CompileRun { .exitCode = -1, .out = {}, .err = {} };
+            // `NotSpawned` is the ONE answer meaning "could not spawn". A compiler
+            // that ran and then failed has run, and takes the other branch.
+            return Cc::CompileRun { .exitCode = Cc::NotSpawned, .out = {}, .err = {} };
+
+        // Keyed on the FLAGS as well as the compiler, because that is what separates
+        // the two questions asked of one binary: `-E` belongs to the include probe
+        // and to nothing else the survey runs.
+        if (!argv.empty() && std::ranges::contains(_unprobeable, argv.front()) && std::ranges::contains(argv, "-E"))
+            return Cc::CompileRun { .exitCode = Cc::NotSpawned, .out = {}, .err = {} };
 
         // The banner names the compiler, so two distinct compilers get two distinct
         // identities. A constant banner would make every fake compiler fingerprint
@@ -160,6 +182,7 @@ class SpawnScript final: public Cc::IProcessRunner
 
   private:
     std::vector<std::string> _unspawnable;
+    std::vector<std::string> _unprobeable;
     std::vector<std::string> _speechless;
     std::vector<std::pair<std::string, std::string>> _banners;
 };
@@ -252,6 +275,37 @@ TEST_CASE("NodeToolchains: a discovered path that would abort the operator parse
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 2);
     CHECK_FALSE(Logged(logger, "malformed"));
+}
+
+TEST_CASE("NodeToolchains: a toolchain whose include probe did not run is refused", "[node][toolchains]")
+{
+    // Issue #225. This candidate spawns for its banner and fails for its include
+    // probe, so `CanSpawn` admits it and the fingerprint is then computed over an
+    // include tree nobody measured. The digest is well-formed and wrong, and both
+    // ends are silent about it: the worker registers, heartbeats, and is matched by
+    // nobody, while every client compiles locally with `NoWorker`.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/gcc"), Candidate("/usr/bin/clang++") } };
+    SpawnScript runner;
+    runner.Unprobeable("/usr/bin/clang++");
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+
+    // The healthy one is still served -- one bad probe does not cost the machine its
+    // other toolchains.
+    REQUIRE(resolved.has_value());
+    REQUIRE(Unwrap(resolved).size() == 1);
+    CHECK(Unwrap(resolved).begin()->second.compiler == "/usr/bin/gcc");
+
+    // And the refusal names the compiler and the cause. It is NOT the
+    // "cannot be executed" line: that one is discovery's, and sending an operator
+    // to look at a binary that runs perfectly well is the wrong investigation.
+    CHECK(Logged(logger, "refusing /usr/bin/clang++"));
+    CHECK(Logged(logger, "the driver could not be run at all"));
+    CHECK_FALSE(Logged(logger, "ignoring /usr/bin/clang++"));
 }
 
 TEST_CASE("NodeToolchains: a discovered compiler that cannot be spawned is dropped", "[node][toolchains]")

@@ -6,6 +6,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#if defined(_WIN32)
+    // For the exclusive open that `UnreadableFile` denies a read with. Same guard
+    // shape as `ToolchainProbe.cpp`'s; the target already defines
+    // WIN32_LEAN_AND_MEAN and NOMINMAX.
+    #include <windows.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -207,8 +214,10 @@ TEST_CASE("Probing records every file relative to its own root", "[toolchain-pro
     tree.Write("a/nested/y.hpp", "content-y");
 
     std::vector<std::string> const roots { (tree / "a").string() };
-    auto const files = ProbeToolchainFiles(roots);
+    auto const scan = ProbeToolchainFiles(roots);
+    auto const& files = scan.files;
 
+    CHECK(scan.complete);
     REQUIRE(files.size() == 2);
     CHECK(HasPath(files, "x.hpp"));
     CHECK(HasPath(files, "nested/y.hpp"));
@@ -235,8 +244,8 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     std::vector<std::string> const rootsOne { (one / "inc").string() };
     std::vector<std::string> const rootsTwo { (two / (std::string { deeper } + "/inc")).string() };
 
-    auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne));
-    auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo));
+    auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne).files);
+    auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo).files);
     CHECK(first == second);
     CHECK(!first.empty());
 }
@@ -246,10 +255,10 @@ TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
     std::vector<std::string> const roots { (tree / "inc").string() };
-    auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots));
+    auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
 
     tree.Write("inc/a.hpp", "edited!");
-    auto const after = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots));
+    auto const after = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
 
     CHECK(before != after);
 }
@@ -263,15 +272,21 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
     tree.Write("inc/a.hpp", "x");
 
     std::vector<std::string> const roots { (tree / "does-not-exist").string(), (tree / "inc").string() };
-    auto const files = ProbeToolchainFiles(roots);
+    auto const scan = ProbeToolchainFiles(roots);
 
-    REQUIRE(files.size() == 1);
-    CHECK(HasPath(files, "a.hpp"));
+    REQUIRE(scan.files.size() == 1);
+    CHECK(HasPath(scan.files, "a.hpp"));
+
+    // And COMPLETE, which is the half that keeps the new guard from firing on an
+    // ordinary machine: a root that is not there is a layout this install does not
+    // have, not content that failed to arrive.
+    CHECK(scan.complete);
 }
 
 TEST_CASE("Probing nothing yields nothing", "[toolchain-probe]")
 {
-    CHECK(ProbeToolchainFiles({}).empty());
+    CHECK(ProbeToolchainFiles({}).files.empty());
+    CHECK(ProbeToolchainFiles({}).complete);
 }
 
 // --- discovery over the driver table ----------------------------------------
@@ -334,8 +349,10 @@ TEST_CASE("A GNU driver is asked verbosely, and its stderr is what is read", "[t
         .exitCode = 0, .out = "should not be read", .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
 
-    auto const paths = DiscoverIncludePaths(runner, host, "/usr/bin/c++", SpecFor(Flavor::Clang));
+    auto const discovered = DiscoverIncludePaths(runner, host, "/usr/bin/c++", SpecFor(Flavor::Clang));
+    auto const& paths = discovered.roots;
 
+    CHECK(discovered.answered);
     REQUIRE(paths.size() == 4);
     CHECK(paths[0].contains("c++/v1"));
     REQUIRE(runner.LastArgv().size() >= 2);
@@ -351,15 +368,65 @@ TEST_CASE("A non-zero exit does not discard a printed search list", "[toolchain-
     // silently drop the include tree on exactly those toolchains.
     ScriptedRunner runner { CompileRun { .exitCode = 1, .out = {}, .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
-    CHECK(DiscoverIncludePaths(runner, host, "cc", SpecFor(Flavor::Clang)).size() == 4);
+    auto const discovered = DiscoverIncludePaths(runner, host, "cc", SpecFor(Flavor::Clang));
+    CHECK(discovered.roots.size() == 4);
+
+    // And the driver ANSWERED: a non-zero exit is a process that ran. Only a
+    // process that never started clears this, which is what keeps the two apart.
+    CHECK(discovered.answered);
 }
 
 TEST_CASE("An unknown driver is not interrogated at all", "[toolchain-probe]")
 {
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = std::string { AppleClangVerbose } } };
     ScriptedToolchainHost host;
-    CHECK(DiscoverIncludePaths(runner, host, "mystery", SpecFor(Flavor::Unknown)).empty());
+    auto const discovered = DiscoverIncludePaths(runner, host, "mystery", SpecFor(Flavor::Unknown));
+    CHECK(discovered.roots.empty());
     CHECK(runner.Calls() == 0);
+
+    // Nothing was asked, so nothing is missing. A driver with no mechanism is not a
+    // driver whose mechanism failed, and only the second is a defective identity.
+    CHECK(discovered.answered);
+}
+
+TEST_CASE("A GNU driver that could not be spawned is not a driver that listed nothing", "[toolchain-probe]")
+{
+    // Issue #225. The two states produce the SAME empty list, and the digest built
+    // over it is a well-formed hex string either way -- so a transient spawn failure
+    // gave one machine a fingerprint no other machine computes, with `NoEvidence`
+    // silent because the banner was a real version line.
+    //
+    // `exitCode == NotSpawned` is what separates them, and it is separated HERE
+    // rather than at the digest, because this is the only layer that still knows a
+    // process was supposed to run.
+    ScriptedRunner runner { CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+
+    auto const discovered = DiscoverIncludePaths(runner, host, "clang++", SpecFor(Flavor::Clang));
+
+    CHECK(discovered.roots.empty());
+    CHECK_FALSE(discovered.answered);
+
+    // It was ATTEMPTED, which is what makes the answer a failure rather than an
+    // absent mechanism -- the distinction the unknown-driver case above holds.
+    CHECK(runner.Calls() == 1);
+}
+
+TEST_CASE("A clang-cl that could not be spawned is not a wrapper that named no root", "[toolchain-probe]")
+{
+    // The same defect on the other spawning arm. Its neighbour -- a wrapper whose
+    // diagnostic is not a path -- is deliberately served on a banner-only
+    // fingerprint, so the empty list alone cannot carry the difference.
+    ScriptedRunner runner { CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} } };
+    ScriptedToolchainHost host;
+    host.AddExecutable("C:/LLVM/bin/clang-cl.exe");
+
+    auto const direct = ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe");
+    CHECK(direct.roots.empty());
+    CHECK_FALSE(direct.answered);
+
+    // And through the table, since that is how the fingerprint reaches it.
+    CHECK_FALSE(DiscoverIncludePaths(runner, host, "C:/LLVM/bin/clang-cl.exe", SpecFor(Flavor::ClangCl)).answered);
 }
 
 TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-probe]")
@@ -368,8 +435,15 @@ TEST_CASE("An MSVC driver is not spawned to discover its paths", "[toolchain-pro
     // would cost a process per launcher invocation and return nothing.
     ScriptedRunner runner { CompileRun { .exitCode = 0, .out = {}, .err = {} } };
     ScriptedToolchainHost host;
-    (void) DiscoverIncludePaths(runner, host, "cl.exe", SpecFor(Flavor::Cl));
+    auto const discovered = DiscoverIncludePaths(runner, host, "cl.exe", SpecFor(Flavor::Cl));
     CHECK(runner.Calls() == 0);
+
+    // A mechanism that spawns nothing cannot fail to spawn, so it always answers --
+    // even here, where the scripted machine has no layout and no `INCLUDE` and the
+    // list comes back empty. That is the underivable-layout case, which is served on
+    // a banner-only fingerprint rather than refused.
+    CHECK(discovered.roots.empty());
+    CHECK(discovered.answered);
 }
 
 // --- the MSVC install layout -------------------------------------------------
@@ -656,8 +730,8 @@ TEST_CASE("An MSVC service and a developer prompt derive the same roots", "[tool
     DescribeWindowsMachine(developerPrompt);
     developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
 
-    auto const underService = DiscoverIncludePaths(runner, service, "cl", SpecFor(Flavor::Cl));
-    auto const underPrompt = DiscoverIncludePaths(runner, developerPrompt, "cl", SpecFor(Flavor::Cl));
+    auto const underService = DiscoverIncludePaths(runner, service, "cl", SpecFor(Flavor::Cl)).roots;
+    auto const underPrompt = DiscoverIncludePaths(runner, developerPrompt, "cl", SpecFor(Flavor::Cl)).roots;
 
     CHECK_FALSE(underService.empty());
     CHECK(underService == underPrompt);
@@ -707,13 +781,13 @@ TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]
     auto const digestOf = [&](std::string const& compiler) {
         auto const roots = MsvcToolsetIncludeRoots(host, compiler);
         REQUIRE_FALSE(roots.empty());
-        auto const files = ProbeToolchainFiles(roots);
+        auto const scan = ProbeToolchainFiles(roots);
         // Not vacuous: two empty walks would digest equal and the check below would
         // pass having compared nothing.
-        REQUIRE(files.size() == 2);
+        REQUIRE(scan.files.size() == 2);
         // "cl" for both, which is what the banner fallback gives every MSVC
         // toolchain -- so the roots are the only thing that can tell these apart.
-        return ComputeToolchainFingerprint("cl", files);
+        return ComputeToolchainFingerprint("cl", scan.files);
     };
 
     CHECK(digestOf(older) != digestOf(newer));
@@ -735,7 +809,7 @@ TEST_CASE("INCLUDE is the fallback when no toolset layout can be determined", "[
     host.SetEnvironment("INCLUDE", "C:/legacy/include;C:/legacy/atl");
 
     REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
-    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/cl.exe", SpecFor(Flavor::Cl))
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/cl.exe", SpecFor(Flavor::Cl)).roots
           == std::vector<std::string> { "C:/legacy/include", "C:/legacy/atl" });
     CHECK(runner.Calls() == 0);
 }
@@ -753,7 +827,7 @@ TEST_CASE("A toolset with no SDK keeps its VC roots rather than falling back", "
     host.AddDirectory(std::string { toolset } + "/include");
     host.SetEnvironment("INCLUDE", "C:/should/not/be/used");
 
-    CHECK(DiscoverIncludePaths(runner, host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe", SpecFor(Flavor::Cl))
+    CHECK(DiscoverIncludePaths(runner, host, std::string { toolset } + "/bin/Hostx64/x64/cl.exe", SpecFor(Flavor::Cl)).roots
           == std::vector<std::string> { std::string { toolset } + "/include" });
 }
 
@@ -763,7 +837,7 @@ TEST_CASE("clang-cl is asked where its own headers are", "[toolchain-probe]")
     ScriptedToolchainHost host;
     DescribeLlvmInstall(host, "C:/Program Files/LLVM", "21");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/Program Files/LLVM/bin/clang-cl.exe")
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/Program Files/LLVM/bin/clang-cl.exe").roots
           == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
 
     REQUIRE(runner.LastArgv().size() == 2);
@@ -786,7 +860,7 @@ TEST_CASE("The driver's answer wins over anything derivable from its path", "[to
     for (auto const& stale: { "20", "20.1.2", "22", "22.1.8" })
         host.AddDirectory(std::string { "/usr/lib/clang/" } + stale + "/include");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "/usr/bin/clang-cl-20")
+    CHECK(ClangResourceIncludeRoots(runner, host, "/usr/bin/clang-cl-20").roots
           == std::vector<std::string> { "/usr/lib/llvm-20/lib/clang/20/include" });
 }
 
@@ -800,7 +874,7 @@ TEST_CASE("A resource directory with no include beneath it is not a root", "[too
     host.AddExecutable("C:/LLVM/bin/clang-cl.exe");
     host.AddDirectory("C:/LLVM/lib/clang/21");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").empty());
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").roots.empty());
 }
 
 TEST_CASE("A driver that does not understand the flag names no root", "[toolchain-probe]")
@@ -812,7 +886,13 @@ TEST_CASE("A driver that does not understand the flag names no root", "[toolchai
     ScriptedToolchainHost host;
     host.AddExecutable("C:/wrappers/clang-cl.exe");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/wrappers/clang-cl.exe").empty());
+    auto const discovered = ClangResourceIncludeRoots(runner, host, "C:/wrappers/clang-cl.exe");
+    CHECK(discovered.roots.empty());
+
+    // It ANSWERED -- badly, but it ran, and that is the whole distinction. A wrapper
+    // that names no root is served on a banner-only fingerprint; a driver that could
+    // not be started is not served at all.
+    CHECK(discovered.answered);
 }
 
 TEST_CASE("A resource directory answered with CRLF is still a path", "[toolchain-probe]")
@@ -824,7 +904,7 @@ TEST_CASE("A resource directory answered with CRLF is still a path", "[toolchain
     ScriptedToolchainHost host;
     host.AddDirectory("C:/LLVM/lib/clang/21/include");
 
-    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe")
+    CHECK(ClangResourceIncludeRoots(runner, host, "C:/LLVM/bin/clang-cl.exe").roots
           == std::vector<std::string> { "C:/LLVM/lib/clang/21/include" });
 }
 
@@ -847,8 +927,8 @@ TEST_CASE("A clang-cl service and a developer prompt derive the same roots", "[t
     DescribeLlvmInstall(developerPrompt, "C:/Program Files/LLVM", "21");
     developerPrompt.SetEnvironment("INCLUDE", "C:/somewhere/else;C:/and/another");
 
-    auto const underService = DiscoverIncludePaths(serviceRunner, service, "clang-cl", SpecFor(Flavor::ClangCl));
-    auto const underPrompt = DiscoverIncludePaths(promptRunner, developerPrompt, "clang-cl", SpecFor(Flavor::ClangCl));
+    auto const underService = DiscoverIncludePaths(serviceRunner, service, "clang-cl", SpecFor(Flavor::ClangCl)).roots;
+    auto const underPrompt = DiscoverIncludePaths(promptRunner, developerPrompt, "clang-cl", SpecFor(Flavor::ClangCl)).roots;
 
     CHECK_FALSE(underService.empty());
     CHECK(underService == underPrompt);
@@ -859,7 +939,7 @@ TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[t
 {
     // Where this mechanism deliberately parts company with `MsvcLayout`. That one
     // falls back to `INCLUDE` because a `cl` outside the VC layout would otherwise
-    // be left with a degenerate identity -- its banner is the constant `cl`, so the
+    // be left with a `NoEvidence` identity -- its banner is the constant `cl`, so the
     // headers are the only identity it has. `clang-cl` announces a genuine version,
     // so a driver that cannot answer degrades to a banner-only fingerprint, which is
     // weaker but still tells one clang from another. Reading `INCLUDE` here would
@@ -871,7 +951,7 @@ TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[t
     host.AddExecutable("C:/wrappers/clang-cl.exe");
     host.SetEnvironment("INCLUDE", "C:/from/the/prompt");
 
-    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/clang-cl.exe", SpecFor(Flavor::ClangCl)).empty());
+    CHECK(DiscoverIncludePaths(runner, host, "C:/wrappers/clang-cl.exe", SpecFor(Flavor::ClangCl)).roots.empty());
 }
 
 TEST_CASE("An MSVC layout on the machine contributes nothing to clang-cl", "[toolchain-probe]")
@@ -889,7 +969,7 @@ TEST_CASE("An MSVC layout on the machine contributes nothing to clang-cl", "[too
 
     REQUIRE_FALSE(WindowsKitIncludeRoots(host).empty());
     REQUIRE_FALSE(MsvcToolsetIncludeRoots(host, "cl").empty());
-    CHECK(DiscoverIncludePaths(runner, host, "clang-cl", SpecFor(Flavor::ClangCl))
+    CHECK(DiscoverIncludePaths(runner, host, "clang-cl", SpecFor(Flavor::ClangCl)).roots
           == std::vector<std::string> { "C:/Program Files/LLVM/lib/clang/21/include" });
 }
 
@@ -1013,6 +1093,19 @@ class CountingRunner final: public IProcessRunner
 {
     return "#include <...> search starts here:\n " + root + "\nEnd of search list.\n";
 }
+
+/// Where `CacheFilePath` puts fingerprint entries under a scripted state directory.
+///
+/// Named once because it is a layout contract two cases assert against, and a
+/// second spelling of it would go stale silently -- as a test looking in an empty
+/// directory and concluding nothing was written.
+///
+/// @param state The scratch state directory the launcher was pointed at.
+/// @return The directory holding `*.fingerprint` entries.
+[[nodiscard]] std::filesystem::path CacheDirectory(FastCache::Testing::ScratchDirectory const& state)
+{
+    return std::filesystem::path { state.Path().string() } / "fastcache-cc" / "toolchains";
+}
 } // namespace
 
 TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-probe]")
@@ -1082,7 +1175,7 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // path used to key different entries that each missed the other.
     std::error_code ec;
     std::size_t entries = 0;
-    auto const cacheDirectory = std::filesystem::path { state.Path().string() } / "fastcache-cc" / "toolchains";
+    auto const cacheDirectory = CacheDirectory(state);
     for (auto const& entry: std::filesystem::directory_iterator { cacheDirectory, ec })
         if (entry.path().extension() == ".fingerprint")
             ++entries;
@@ -1162,6 +1255,275 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
     CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint.empty());
+}
+
+// --- an identity that must not be served --------------------------------------
+
+namespace
+{
+/// Answers a scripted sequence, one entry per spawn, then refuses to spawn.
+///
+/// A sequence rather than a constant, because the defect this pins is a probe that
+/// works, then does not, then works again -- which is what issue #225 actually
+/// observed and which no single-answer runner can express.
+class SequencedRunner final: public IProcessRunner
+{
+  public:
+    explicit SequencedRunner(std::vector<CompileRun> script):
+        _script { std::move(script) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> /*argv*/) override
+    {
+        if (_next >= _script.size())
+            return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
+        return _script[_next++];
+    }
+
+  private:
+    std::vector<CompileRun> _script;
+    std::size_t _next { 0 };
+};
+
+/// The fingerprint the one cache entry under @p state holds.
+///
+/// Read from the file rather than inferred from a later call's answer, because
+/// "was it written" is the actual question and a hit is only its shadow.
+///
+/// @param state The scratch state directory the launcher was pointed at.
+/// @return The stored fingerprint, or empty when no entry exists.
+[[nodiscard]] std::string StoredFingerprint(FastCache::Testing::ScratchDirectory const& state)
+{
+    auto const directory = CacheDirectory(state);
+    std::error_code ec;
+    for (auto const& entry: std::filesystem::directory_iterator { directory, ec })
+    {
+        if (entry.path().extension() != ".fingerprint")
+            continue;
+        std::ifstream in { entry.path(), std::ios::binary };
+        std::string stamp;
+        std::string fingerprint;
+        if (std::getline(in, stamp) && std::getline(in, fingerprint))
+        {
+            if (!fingerprint.empty() && fingerprint.back() == '\r')
+                fingerprint.pop_back();
+            return fingerprint;
+        }
+    }
+    return {};
+}
+
+/// A run in which the include probe could not be started.
+[[nodiscard]] CompileRun NeverSpawned()
+{
+    return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
+}
+
+/// Makes a file's CONTENTS unreadable for as long as it is alive.
+///
+/// Two mechanisms, because the two OSes deny a read differently and only one of
+/// them is the case this guards against. On Windows it is an exclusive open --
+/// share mode zero -- which is literally what a scanner holding a header does, and
+/// is the failure this whole defect was traced from; POSIX permission bits do
+/// nothing there, since `std::filesystem::permissions` only toggles the read-only
+/// attribute and a read-only file reads perfectly well. On POSIX it is the
+/// permission bits, which root then ignores.
+///
+/// Neither is guaranteed, so `Held()` asks rather than assumes: a case that quietly
+/// degraded to "the file was readable after all" would assert nothing while looking
+/// green. The directory entry stays visible and stat-able under both, which is what
+/// makes this reach `HashFileContents` rather than being skipped earlier.
+class UnreadableFile
+{
+  public:
+    explicit UnreadableFile(std::filesystem::path path):
+        _path { std::move(path) }
+    {
+#if defined(_WIN32)
+        _handle = ::CreateFileA(_path.string().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+#else
+        std::error_code ec;
+        std::filesystem::permissions(_path, std::filesystem::perms::none, ec);
+#endif
+    }
+
+    ~UnreadableFile()
+    {
+#if defined(_WIN32)
+        if (_handle != INVALID_HANDLE_VALUE)
+            ::CloseHandle(_handle);
+#else
+        std::error_code ec;
+        std::filesystem::permissions(_path, std::filesystem::perms::owner_all, ec);
+#endif
+    }
+
+    UnreadableFile(UnreadableFile const&) = delete;
+    UnreadableFile& operator=(UnreadableFile const&) = delete;
+    UnreadableFile(UnreadableFile&&) = delete;
+    UnreadableFile& operator=(UnreadableFile&&) = delete;
+
+    /// @return True when the contents really cannot be read now.
+    [[nodiscard]] bool Held() const
+    {
+        std::ifstream probe { _path, std::ios::binary };
+        return !probe.good();
+    }
+
+  private:
+    std::filesystem::path _path;
+#if defined(_WIN32)
+    HANDLE _handle { INVALID_HANDLE_VALUE };
+#endif
+};
+} // namespace
+
+TEST_CASE("A fingerprint from a probe that never ran is refused, not returned as an identity", "[toolchain-probe]")
+{
+    // Issue #225, as reported: `clang++` digested one value, then another, then the
+    // first again across five node startups, with nothing at either end saying so.
+    // The include probe is the unstable half -- it spawns a process, and a spawn can
+    // fail for reasons that have nothing to do with the toolchain.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-unrun" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-unrun-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    auto const good = CompileRun { .exitCode = 0, .out = {}, .err = VerboseNaming(root) };
+    SequencedRunner runner { { good, NeverSpawned(), NeverSpawned(), good } };
+    ScriptedToolchainHost host;
+
+    // A REAL version line throughout, which is what took this past the existing
+    // guard: `NoEvidence` needs the banner to be the fallback name, and it is not.
+    constexpr std::string_view banner = "clang version 20.1.8";
+    auto const first = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    CHECK(first.Usable());
+    CHECK_FALSE(first.fingerprint.empty());
+
+    auto const failed = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const failedAgain = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+
+    // Named, so both surfaces can say WHICH way the identity is unusable.
+    CHECK_FALSE(failed.Usable());
+    CHECK(failed.defect == IdentityDefect::UnrunProbe);
+
+    // The second consecutive failure is the half a stamp cannot fix on its own. The
+    // roots feed the stamp too, so a failure stamps CONSISTENTLY -- before this, the
+    // first failure's value was written and the second one hit it, and a machine
+    // whose probe kept failing settled on the wrong fingerprint permanently.
+    CHECK_FALSE(failedAgain.Usable());
+    CHECK(failedAgain.defect == IdentityDefect::UnrunProbe);
+
+    // Read BEFORE the recovering call, which is the whole point of reading it: a
+    // later success rewrites the entry, so an assertion made after one cannot tell a
+    // cache that was never polluted from one that was and got overwritten.
+    CHECK(StoredFingerprint(state) == first.fingerprint);
+
+    // And a probe that works again is the same toolchain it always was.
+    auto const recovered = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    CHECK(recovered.Usable());
+    CHECK(recovered.fingerprint == first.fingerprint);
+}
+
+TEST_CASE("A driver that answered with no roots is still cached", "[toolchain-probe]")
+{
+    // The over-correction guard. `NoEvidence` is a stable property of the machine --
+    // a compiler that cannot be asked its version and has no derivable include tree
+    // is that on every run -- so re-walking it buys nothing, and only the probe that
+    // did NOT RUN is excluded from the cache.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-noevidence" };
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-noevidence-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    // Exit 0 with no search list: the driver ANSWERED, and listed nothing.
+    CountingRunner runner { "" };
+    ScriptedToolchainHost host;
+
+    // The banner is the fallback name, which is the third condition.
+    auto const identity = CachedToolchainFingerprint(runner, host, compiler, "cc", DriverOf(Flavor::Clang));
+
+    CHECK(identity.defect == IdentityDefect::NoEvidence);
+    CHECK(StoredFingerprint(state) == identity.fingerprint);
+}
+
+TEST_CASE("A header that could not be read leaves the walk incomplete and uncached", "[toolchain-probe]")
+{
+    // The same defect class as issue #225 one layer down, and the worse of the two on
+    // its own. A short walk inside a root that IS there moves NOTHING the stamp
+    // covers -- `ComputeToolchainStamp` folds each root's path and mtime, never its
+    // contents -- so before this the short digest was written under a stamp that
+    // still validated, and every later run hit it without walking anything. There was
+    // no self-correcting run to wait for.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-partial" };
+    tree.Write("inc/readable.hpp", "content");
+    tree.Write("inc/locked.hpp", "secret");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const includeDir = std::filesystem::path { tree.Path().string() } / "inc";
+    auto const locked = includeDir / "locked.hpp";
+
+    UnreadableFile const held { locked };
+
+    // REQUIRED rather than skipped past, and `SKIP` is deliberately not used here at
+    // all: Catch2 exits 4 when every case was skipped and ALSO exits with the number
+    // of failed assertions, so wiring `SKIP_RETURN_CODE 4` into `catch_discover_tests`
+    // would report any case with exactly four failed assertions as skipped -- and the
+    // pre-fix run of this very case produced exactly four. Both supported platforms
+    // can deny a read, so a host where this does not hold is a case that cannot do its
+    // job, and saying so beats passing without asserting anything.
+    REQUIRE(held.Held());
+
+    std::vector<std::string> const roots { includeDir.string() };
+    auto const scan = ProbeToolchainFiles(roots);
+
+    // The readable header still arrives -- one bad file must not cost the rest.
+    CHECK(scan.files.size() == 1);
+    CHECK(HasPath(scan.files, "readable.hpp"));
+    CHECK_FALSE(scan.complete);
+
+    // And the identity built on it is refused and left out of the cache.
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-partial-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+    CountingRunner runner { VerboseNaming(includeDir.string()) };
+    ScriptedToolchainHost host;
+
+    auto const identity =
+        CachedToolchainFingerprint(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
+
+    CHECK_FALSE(identity.Usable());
+    CHECK(identity.defect == IdentityDefect::PartialTree);
+    CHECK(StoredFingerprint(state).empty());
+}
+
+TEST_CASE("Every defect can be explained to an operator", "[toolchain-probe]")
+{
+    // The `RowsInEnumeratorOrder` assert checks that a row SITS at its enumerator,
+    // not that anyone filled it in -- so a defect added with an empty row would
+    // compile and then refuse a toolchain with a blank sentence after the colon.
+    CHECK(ExplainDefect(IdentityDefect::None).reason.empty());
+    CHECK(ExplainDefect(IdentityDefect::None).remedy.empty());
+
+    for (auto const& row: IdentityDefectTable)
+    {
+        if (row.defect == IdentityDefect::None)
+            continue;
+        INFO("defect " << static_cast<int>(row.defect));
+        CHECK_FALSE(row.reason.empty());
+        CHECK_FALSE(row.remedy.empty());
+    }
 }
 
 // --- the compiler banner ------------------------------------------------------
