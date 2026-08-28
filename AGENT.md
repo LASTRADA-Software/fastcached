@@ -214,6 +214,20 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   every machine without `/usr/local/include`.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
+  inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
+  the cap it advertises was unreachable while every client still got a correct object.
+- Detaching the compiles made the per-request payload cap a per-connection one; the
+  in-flight byte budget lands in the same change, refusing with `EndpointBusy` because
+  a slot was free and memory was not.
+- Anything a worker derives per job is derived per THREAD: two compiles sharing a
+  scratch number shared `tu.o`, and one answered with the other's object.
+- A child inherits what the PROCESS has, not what the call set up. Windows names the
+  handles it may inherit; POSIX marks both pipe ends close-on-exec, under the lock that
+  covers the spawn.
+- A drain waits on a condition variable, never `atomic::wait` — an atomic wait can
+  return without the notify and free the object the notifier is still inside. And it
+  calls `Shutdown()` first, or the accept loop admits one more job behind it.
 - `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same
   arithmetic with each named, and a tie names the earlier limit in enumerator order.
 - A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` —

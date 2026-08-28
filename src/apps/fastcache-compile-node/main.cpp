@@ -22,6 +22,7 @@
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
@@ -565,7 +566,14 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     auto const capacity = Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()));
     auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
 
-    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger };
+    // Sized to the slot cap, which is what makes an admitted job always find a
+    // thread: the cap admits at most `slots` at once, so one is free by
+    // construction and nothing an operator can configure makes a job queue behind
+    // another. Declared BEFORE the server, so the server -- which waits for its own
+    // jobs in its destructor -- is torn down first and never outlived by the pool
+    // it was handing work to.
+    ThreadPoolExecutor compilePool { slots };
+    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger, compilePool };
 
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a
@@ -751,11 +759,10 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // it -- on POSIX via the poll timeout the loop already treats as "not a
     // failure", which is the mechanism WorkerServer::Run documents.
     //
-    // In-flight work needs no separate drain: compiles are served INLINE in the
-    // accept loop, so by the time Run() returns there is nothing still running.
-    // A worker that detached its jobs would need one here, and would need to
-    // decide how long to wait; serving inline is what makes that question not
-    // arise.
+    // Run() returning does NOT mean the worker is idle: since #213 a compile is
+    // detached onto `compilePool`, so jobs admitted before the listener closed are
+    // still running. ~WorkerServer is what waits for them, and it runs before
+    // ~ThreadPoolExecutor because `server` is declared after the pool.
     std::jthread const stopWatch { [&](std::stop_token const& stop) {
         while (!stop.stop_requested() && !DaemonControls::Instance().StopRequested())
             std::this_thread::sleep_for(StopPollInterval);

@@ -1020,6 +1020,32 @@ prevent. A job over the cap is refused rather than queued, because the client ha
 a local compile waiting either way and queueing only hides the overload from the
 scheduler trying to route around it.
 
+It is also the number this worker actually runs at once. Each admitted compile is
+handed to a pool of that many threads, so a 30-slot machine serves thirty; the
+accept loop stays free to answer the thirty-first with a refusal rather than
+making it wait. Until
+[#213](https://github.com/LASTRADA-Software/fastcached/issues/213) the loop
+served each connection inline, which meant a worker advertising thirty ran
+exactly one at a time — the cap could never be reached, the
+`fastcache_worker_jobs_refused_no_slot_total` counter could never move, and a
+saturated fleet reported `1 / 30 compiling`.
+
+Slots bound CPU; they do not bound memory, and the two are separate questions now
+that compiles run side by side. A worker also caps the payload bytes all its jobs
+are reading at once at 256 MiB — one request's worth, so ordinary translation units
+run together and a single enormous one cannot be joined by a second. A job refused
+by that budget is told `endpoint-busy` rather than `no-capacity`, and counted as
+`fastcache_worker_jobs_refused_endpoint_busy_total`: slots were free and memory was
+not, so more machines would not have helped.
+
+Because the compiles now outlive the accept loop, stopping the node waits for
+them. A stop closes the listener first, so nothing new is admitted, and then
+blocks until every compile still running has finished and answered its client.
+There is no deadline on that wait: a compile is a client's answer, and abandoning
+one would hand that client a broken connection to save a few seconds of shutdown.
+A node stopping while it is full therefore takes as long as its longest running
+translation unit.
+
 ### Withdrawing while the machine is busy
 
 The class reserve is static — two cores held back permanently. What happens when
