@@ -416,6 +416,12 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::Fleet
     // Summed over `NodeReports()`, never over `LiveWorkers()`: a node started with
     // two --toolchain flags is two registry entries carrying one machine's cache,
     // and summing there counts that cache once per toolchain.
+    //
+    // Every slot, including the ones a machine can also answer for itself. This is
+    // the FLEET series and a leader can answer for all nine -- these are fleet-wide
+    // sums, which is a different number from any one machine's and the one this page
+    // draws. `FleetMetricScope` is about what a NODE may claim about itself, not
+    // about what belongs here.
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     for (auto const& node: snapshot.nodes)
@@ -432,43 +438,114 @@ EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::Fleet
     return values;
 }
 
-std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
+EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink const& metrics,
+                                                                  MetricsSnapshot const& snapshot)
 {
-    constexpr std::string_view FileName = "fleet-history.bin";
+    EnumTable<Distributed::FleetMetric, std::uint64_t> values {};
+    auto const put = [&values](Distributed::FleetMetric metric, std::uint64_t value) {
+        auto const& row = Distributed::FleetMetricTable[static_cast<std::size_t>(metric)];
+        if (row.scope != Distributed::FleetMetricScope::Node)
+            return;
+        values[static_cast<std::size_t>(metric)] = value;
+    };
+
+    // From the SAME counters `CacheTier::Snapshot` reports to the fleet, not from
+    // `StorageStats::getHits`. Those are a different number -- the store's own GET
+    // tally, which also counts everything served over the cache port -- and using
+    // them here would have one page showing two disagreeing answers for one machine's
+    // cache, with nothing saying which was which.
+    //
+    // A node with no cache reports zero and zero, which is the truth about it: unlike
+    // `/metrics`, where absent and zero are different claims, a history slot has no
+    // way to say "no cache" and a rate across two zeroes is zero either way.
+    put(Distributed::FleetMetric::CacheHits, metrics.Read(IMetricsSink::Counter::NodeCacheHits));
+    put(Distributed::FleetMetric::CacheMisses, metrics.Read(IMetricsSink::Counter::NodeCacheMisses));
+
+    // Free slots, not configured ones: the series is about what a compile could have
+    // started on, and a machine with every slot busy is offering nothing however many
+    // it advertises. Saturating, because a scrape landing between the two figures
+    // moving must not wrap into billions.
+    //
+    // A process reporting no host capacity is not a worker, and zero offered with
+    // zero running is the truth about it rather than a gap this format could express.
+    if (snapshot.host.has_value())
+    {
+        auto const busy = snapshot.host->busySlots;
+        auto const configured = snapshot.host->configuredSlots;
+        put(Distributed::FleetMetric::OfferableSlots, configured > busy ? configured - busy : 0);
+        put(Distributed::FleetMetric::JobsInFlight, busy);
+    }
+    return values;
+}
+
+std::filesystem::path HistoryPathFor(NodeConfig const& cfg, Distributed::FleetMetricScope scope)
+{
+    // One row per scope, in enumerator order, so a scope added to that enum is a file
+    // here rather than a third path spelled somewhere nobody looks. The fleet file
+    // keeps the name it always had, so an existing install's fleet series survives
+    // the upgrade that split the two.
+    struct FileNameRow
+    {
+        Distributed::FleetMetricScope scope; ///< The series this row names a file for.
+        std::string_view name;               ///< What that file is called.
+    };
+    // A row that states its own scope, and the guard every enumerator-indexed table
+    // in this tree carries. Filled positionally it compiled either way, and swapping
+    // the two enumerators would have swapped the two files -- silently, because both
+    // share a format, so each would load the other's readings without complaint.
+    static constexpr EnumTable<Distributed::FleetMetricScope, FileNameRow> fileNames {
+        FileNameRow { .scope = Distributed::FleetMetricScope::Node, .name = "node-history.bin" },
+        FileNameRow { .scope = Distributed::FleetMetricScope::Fleet, .name = "fleet-history.bin" },
+    };
+    static_assert(RowsInEnumeratorOrder(fileNames, &FileNameRow::scope));
+    auto const name = fileNames[static_cast<std::size_t>(scope)].name;
     if (!cfg.clusterDir.empty())
-        return cfg.clusterDir / FileName;
+        return cfg.clusterDir / name;
     if (!cfg.cacheDir.empty())
-        return cfg.cacheDir / FileName;
+        return cfg.cacheDir / name;
     return {};
 }
 
+std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
+{
+    return HistoryPathFor(cfg, Distributed::FleetMetricScope::Fleet);
+}
+
 FleetSampler::FleetSampler(Distributed::FleetSources sources,
+                           AdminHttpServer::SnapshotProvider node,
                            IWallClock const& wall,
-                           std::filesystem::path path,
+                           std::filesystem::path fleetPath,
+                           std::filesystem::path nodePath,
                            ILogger& logger):
     _sources { sources },
-    _history { wall },
-    _path { std::move(path) },
+    _nodeFacts { std::move(node) },
+    _fleet { wall },
+    _node { wall },
+    _fleetPath { std::move(fleetPath) },
+    _nodePath { std::move(nodePath) },
     _logger { logger }
 {
     // Every failure to read starts empty and says so once. History is a
-    // convenience, and no state of this file may keep a node from starting.
-    if (!_path.empty())
+    // convenience, and no state of either file may keep a node from starting.
+    for (auto const& each: EachSeries())
     {
-        if (_history.Load(_path))
-            _logger.Logf(LogLevel::Info, "fleet history restored from {}", _path.string());
-        else if (_history.ReadOnly())
+        if (each.path->empty())
+            continue;
+        if (each.history->Load(*each.path))
+            _logger.Logf(LogLevel::Info, "{} history restored from {}", each.what, each.path->string());
+        else if (each.history->ReadOnly())
             // Named at WARN and named specifically, because this one is not the
             // ordinary "nothing to restore": a later build wrote that file, this one
             // cannot read it, and the reason it is not being replaced is that doing
             // so would destroy readings the other build could still use. An operator
-            // who sees only "starts empty" would reasonably delete it.
+            // who saw only "starts empty" would reasonably delete it.
             _logger.Logf(LogLevel::Warn,
-                         "fleet history at {} was written by a NEWER build; starting empty and leaving it alone. "
+                         "{} history at {} was written by a NEWER build; starting empty and leaving it alone. "
                          "Sampling continues, nothing is persisted, and the file is safe for that build to read again",
-                         _path.string());
+                         each.what,
+                         each.path->string());
         else
-            _logger.Logf(LogLevel::Info, "fleet history starts empty at {}", _path.string());
+            _logger.Logf(LogLevel::Info, "{} history starts empty at {}", each.what, each.path->string());
     }
 
     _thread = std::jthread { [this](std::stop_token stop) {
@@ -505,30 +582,49 @@ FleetSampler::~FleetSampler()
     Persist();
 }
 
+std::array<FleetSampler::Series, 2> FleetSampler::EachSeries()
+{
+    return { Series { .history = &_fleet, .path = &_fleetPath, .what = "fleet" },
+             Series { .history = &_node, .path = &_nodePath, .what = "node" } };
+}
+
 bool FleetSampler::SampleOnce()
 {
+    // ALWAYS, whoever leads. What this machine's cache did and how many of its slots
+    // were busy are facts about the machine, and a node that stopped recording them
+    // the moment it lost an election is a node whose year of history belongs to
+    // whichever peer happened to be leading at the time. This is the half that
+    // survives an election, and in Phase 5 it is the half that rebuilds the leader's.
+    if (_nodeFacts && _sources.metrics != nullptr)
+        _node.Record(NodeSampleFrom(*_sources.metrics, _nodeFacts()));
+
     auto const snapshot = Distributed::CollectFleet(_sources);
-    // Only while leading. A follower's registry holds whatever registered against
-    // it, so a sample there records a fraction of the fleet as though it were the
-    // whole -- and the chart would then show the fleet shrinking whenever
-    // leadership moved, which is the opposite of what happened.
+    // The fleet series stays leader-only, and for the original reason: a follower's
+    // registry holds whatever registered against IT, so a fleet-scoped sample there
+    // records a fraction as though it were the whole -- and the chart would show the
+    // fleet shrinking whenever leadership moved, which is the opposite of what
+    // happened. What changed is that this no longer stops the node recording itself.
     if (!Distributed::LeadsTheFleet(snapshot))
         return false;
-    _history.Record(SampleFrom(snapshot));
+    _fleet.Record(SampleFrom(snapshot));
     return true;
 }
 
 void FleetSampler::Persist()
 {
-    if (_path.empty() || _history.Empty())
-        return;
-    // A refusal to overwrite a newer file is not a write failure, and reporting it as
-    // one every save interval would bury the single WARN at startup that explains it
-    // under a stream of "could not write" saying the opposite of what is true.
-    if (_history.ReadOnly())
-        return;
-    if (!_history.Save(_path))
-        _logger.Logf(LogLevel::Warn, "could not write fleet history to {}", _path.string());
+    for (auto const& each: EachSeries())
+    {
+        if (each.path->empty() || each.history->Empty())
+            continue;
+        // A refusal to overwrite a newer file is not a write failure, and reporting
+        // it as one every save interval would bury the single WARN at startup that
+        // explains it under a stream of "could not write" saying the opposite of
+        // what is true.
+        if (each.history->ReadOnly())
+            continue;
+        if (!each.history->Save(*each.path))
+            _logger.Logf(LogLevel::Warn, "could not write {} history to {}", each.what, each.path->string());
+    }
 }
 
 std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
@@ -595,7 +691,12 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
         // before `endpoint`, so the endpoint and its serving thread are torn down
         // first. See the comment on that member -- the ordering is the contract.
         static SystemWallClock const wall;
-        surface.sampler = std::make_unique<FleetSampler>(*fleet, wall, FleetHistoryPath(cfg), logger);
+        surface.sampler = std::make_unique<FleetSampler>(*fleet,
+                                                         snapshot,
+                                                         wall,
+                                                         HistoryPathFor(cfg, Distributed::FleetMetricScope::Fleet),
+                                                         HistoryPathFor(cfg, Distributed::FleetMetricScope::Node),
+                                                         logger);
         routes = MakeFleetRoutes(
             *fleet,
             credential,

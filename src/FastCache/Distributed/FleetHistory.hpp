@@ -48,27 +48,87 @@ enum class FleetMetricKind : std::uint8_t
     Gauge,       ///< A level; the interesting quantity is the value.
 };
 
+/// Whether a MACHINE can answer for a slot about itself.
+///
+/// Not "which series carries it" -- the fleet series carries every slot, because a
+/// leader can answer for all nine and its readings are fleet-wide sums. This is the
+/// narrower question the node series asks: is there a version of this number that is
+/// true of one machine, whoever happens to be leading?
+///
+/// For a cache figure or a slot count there is, and it is what that machine did. For
+/// a dispatch outcome there is not: only a scheduler produces one, a follower has
+/// none, and a follower reporting zero refusals is indistinguishable from a leader
+/// that genuinely refused none.
+enum class FleetMetricScope : std::uint8_t
+{
+    /// A machine can answer this about itself: its cache, its slots, its compiles.
+    Node = 0,
+    /// Only a scheduler can, and only a leader has one that means anything.
+    Fleet,
+    Last
+};
+
 /// What one slot is, for the walks that need to know.
 struct FleetMetricRow
 {
-    FleetMetric metric;   ///< The slot this row describes.
-    FleetMetricKind kind; ///< Delta or level.
-    std::string_view key; ///< Stable name, for JSON and for the on-disk header.
+    FleetMetric metric;     ///< The slot this row describes.
+    FleetMetricKind kind;   ///< Delta or level.
+    FleetMetricScope scope; ///< Who can answer for it.
+    std::string_view key;   ///< Stable name, for JSON and for the on-disk header.
 };
 
 /// Every slot, in enumerator order.
 inline constexpr EnumTable<FleetMetric, FleetMetricRow> FleetMetricTable {
-    FleetMetricRow { .metric = FleetMetric::DispatchGranted, .kind = FleetMetricKind::Counter, .key = "granted" },
-    FleetMetricRow { .metric = FleetMetric::DispatchNoWorker, .kind = FleetMetricKind::Counter, .key = "no-worker" },
-    FleetMetricRow { .metric = FleetMetric::DispatchNoCapacity, .kind = FleetMetricKind::Counter, .key = "no-capacity" },
-    FleetMetricRow { .metric = FleetMetric::DispatchWithdrawn, .kind = FleetMetricKind::Counter, .key = "withdrawn" },
-    FleetMetricRow { .metric = FleetMetric::DispatchDuplicate, .kind = FleetMetricKind::Counter, .key = "duplicate" },
-    FleetMetricRow { .metric = FleetMetric::CacheHits, .kind = FleetMetricKind::Counter, .key = "cache-hits" },
-    FleetMetricRow { .metric = FleetMetric::CacheMisses, .kind = FleetMetricKind::Counter, .key = "cache-misses" },
-    FleetMetricRow { .metric = FleetMetric::OfferableSlots, .kind = FleetMetricKind::Gauge, .key = "offerable" },
-    FleetMetricRow { .metric = FleetMetric::JobsInFlight, .kind = FleetMetricKind::Gauge, .key = "in-flight" },
+    FleetMetricRow { .metric = FleetMetric::DispatchGranted,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "granted" },
+    FleetMetricRow { .metric = FleetMetric::DispatchNoWorker,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "no-worker" },
+    FleetMetricRow { .metric = FleetMetric::DispatchNoCapacity,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "no-capacity" },
+    FleetMetricRow { .metric = FleetMetric::DispatchWithdrawn,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "withdrawn" },
+    FleetMetricRow { .metric = FleetMetric::DispatchDuplicate,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Fleet,
+                     .key = "duplicate" },
+    FleetMetricRow { .metric = FleetMetric::CacheHits,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Node,
+                     .key = "cache-hits" },
+    FleetMetricRow { .metric = FleetMetric::CacheMisses,
+                     .kind = FleetMetricKind::Counter,
+                     .scope = FleetMetricScope::Node,
+                     .key = "cache-misses" },
+    FleetMetricRow { .metric = FleetMetric::OfferableSlots,
+                     .kind = FleetMetricKind::Gauge,
+                     .scope = FleetMetricScope::Node,
+                     .key = "offerable" },
+    FleetMetricRow { .metric = FleetMetric::JobsInFlight,
+                     .kind = FleetMetricKind::Gauge,
+                     .scope = FleetMetricScope::Node,
+                     .key = "in-flight" },
 };
 static_assert(RowsInEnumeratorOrder(FleetMetricTable, &FleetMetricRow::metric));
+
+/// Both scopes are populated, or the split this table exists to express does nothing.
+///
+/// A table where every row said `Fleet` would make a node record nothing about itself
+/// and read exactly like the leadership guard this replaced; one where every row said
+/// `Node` would have a follower reporting dispatch counters it never produced. Either
+/// is silent, and both survive every other check here.
+static_assert(std::ranges::any_of(FleetMetricTable,
+                                  [](FleetMetricRow const& row) { return row.scope == FleetMetricScope::Node; })
+                  && std::ranges::any_of(FleetMetricTable,
+                                         [](FleetMetricRow const& row) { return row.scope == FleetMetricScope::Fleet; }),
+              "a scope no row carries is a split that quietly does nothing");
 
 /// What folding several samples into one bucket kept, per slot.
 ///

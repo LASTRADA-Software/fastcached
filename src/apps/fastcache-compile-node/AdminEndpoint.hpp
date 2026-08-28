@@ -13,6 +13,7 @@
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -159,11 +160,27 @@ class FleetSampler
     static constexpr auto SaveInterval = std::chrono::minutes { 5 };
 
     /// Start sampling.
-    /// @param sources What to read; the same bundle the routes collect from.
+    ///
+    /// TWO series, because they answer different questions and only one of them has
+    /// a leader. The fleet series is the scheduler's own -- dispatch outcomes nobody
+    /// but a leader produces -- and the node series is this machine's cache and
+    /// slots, which are facts about it whoever leads. Sampling only while leading is
+    /// why the record used to change machine under an election.
+    ///
+    /// @param sources What the fleet series reads; the same bundle the routes collect
+    ///                from.
+    /// @param node What the node series reads: the same provider `/metrics` scrapes,
+    ///             so the two cannot disagree about the machine they describe.
     /// @param wall Where a bucket's timestamp comes from.
-    /// @param path Where to keep the history, or empty for memory-only.
+    /// @param fleetPath Where to keep the fleet series, or empty for memory-only.
+    /// @param nodePath Where to keep the node series, or empty for memory-only.
     /// @param logger Shared logger.
-    FleetSampler(Distributed::FleetSources sources, IWallClock const& wall, std::filesystem::path path, ILogger& logger);
+    FleetSampler(Distributed::FleetSources sources,
+                 AdminHttpServer::SnapshotProvider node,
+                 IWallClock const& wall,
+                 std::filesystem::path fleetPath,
+                 std::filesystem::path nodePath,
+                 ILogger& logger);
 
     /// Stops the thread and writes the ring out one last time.
     ~FleetSampler();
@@ -173,20 +190,34 @@ class FleetSampler
     FleetSampler(FleetSampler&&) = delete;
     FleetSampler& operator=(FleetSampler&&) = delete;
 
-    /// What the routes read.
+    /// What the routes read: the fleet-wide series.
+    ///
+    /// The dashboard is the leader's page and shows the fleet, so this is the one the
+    /// charts draw. A follower's copy stays empty, which is the truth about what it
+    /// can see.
     [[nodiscard]] Distributed::FleetHistory const& History() const noexcept
     {
-        return _history;
+        return _fleet;
     }
 
-    /// Whether the ring is written to disk.
+    /// This machine's own series, recorded whether or not it leads.
     ///
-    /// Both halves, because the page says "written to disk, so it survives a restart"
+    /// What a node contributes rather than what the fleet did, and the half that
+    /// survives an election -- the leader's view of the fleet is rebuilt from these.
+    [[nodiscard]] Distributed::FleetHistory const& NodeHistory() const noexcept
+    {
+        return _node;
+    }
+
+    /// Whether both rings are written to disk.
+    ///
+    /// Every half, because the page says "written to disk, so it survives a restart"
     /// and a history holding a file a NEWER build wrote persists nothing at all. A
-    /// path alone would have the page contradicting the startup warning beside it.
+    /// path alone would have the page contradicting the startup warning beside it,
+    /// and one series persisting while the other does not is not "durable" either.
     [[nodiscard]] bool Durable() const noexcept
     {
-        return !_path.empty() && !_history.ReadOnly();
+        return !_fleetPath.empty() && !_nodePath.empty() && !_fleet.ReadOnly() && !_node.ReadOnly();
     }
 
     /// Take one sample now, whatever the timer is doing.
@@ -194,22 +225,45 @@ class FleetSampler
     /// The seam a test drives instead of waiting a minute for the thread: every
     /// rule about *what* a sample holds is then a case over a scripted registry
     /// rather than a sleep.
-    /// @return True when a sample was taken; false when this node does not lead.
+    /// The NODE series is recorded either way; the return value is about the fleet
+    /// one, which only a leader can answer for.
+    /// @return True when a fleet sample was taken; false when this node does not lead.
     bool SampleOnce();
 
   private:
+    /// One of the two series, paired with where it is written and what to call it.
+    struct Series
+    {
+        Distributed::FleetHistory* history; ///< The ring.
+        std::filesystem::path const* path;  ///< Where it is kept, or empty for memory-only.
+        std::string_view what;              ///< What a log line calls it.
+    };
+
+    /// Both series, in one place.
+    ///
+    /// Stated ONCE: restoring at construction and saving on the timer walk exactly
+    /// this list, so a third series cannot be something one of them silently misses
+    /// -- which for the save half would be a year of readings that is never written
+    /// and is discovered only at the next restart.
+    /// @return The two, fleet first.
+    [[nodiscard]] std::array<Series, 2> EachSeries();
+
     void Persist();
 
     Distributed::FleetSources _sources;
-    Distributed::FleetHistory _history;
-    std::filesystem::path _path;
+    /// This machine's own facts, read the same way `/metrics` reads them.
+    AdminHttpServer::SnapshotProvider _nodeFacts;
+    Distributed::FleetHistory _fleet;
+    Distributed::FleetHistory _node;
+    std::filesystem::path _fleetPath;
+    std::filesystem::path _nodePath;
     ILogger& _logger;
     std::mutex _wakeMutex;
     std::condition_variable_any _wake;
     std::jthread _thread;
 };
 
-/// Turn one fleet snapshot into the nine readings a sample holds.
+/// Turn one fleet snapshot into the FLEET-scoped readings a sample holds.
 ///
 /// Separate from the sampler so it is a pure function of a snapshot: which slot
 /// each number lands in is the part worth a unit test, and it needs no thread, no
@@ -217,6 +271,30 @@ class FleetSampler
 /// @param snapshot What `CollectFleet` returned.
 /// @return The readings, counters cumulative.
 [[nodiscard]] EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::FleetSnapshot const& snapshot);
+
+/// Turn one metrics scrape into the NODE-scoped readings a sample holds.
+///
+/// From the same provider `/metrics` reads, so a machine cannot describe itself two
+/// ways -- the argument `NodeScrapeSources::host` already makes about a scrape and a
+/// registration. Node-scoped slots only; the rest stay zero, because a node that is
+/// not scheduling has not refused anything and must not say it refused nothing.
+///
+/// @param metrics Where this node's own cache counters are read -- the same ones
+///                `CacheTier::Snapshot` reports to the fleet, so one machine cannot
+///                be described two ways on one page.
+/// @param snapshot What this node reports about itself.
+/// @return The readings, node-scoped slots filled.
+[[nodiscard]] EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink const& metrics,
+                                                                                MetricsSnapshot const& snapshot);
+
+/// Where one of a node's two history files lives.
+///
+/// The same enum names the slots and the file that holds them, so a scope added there
+/// is a file here rather than a third path spelled somewhere else.
+/// @param cfg The parsed configuration.
+/// @param scope Which series.
+/// @return The path, or empty when this node keeps no state directory.
+[[nodiscard]] std::filesystem::path HistoryPathFor(NodeConfig const& cfg, Distributed::FleetMetricScope scope);
 
 /// Where a node keeps its fleet history.
 ///
