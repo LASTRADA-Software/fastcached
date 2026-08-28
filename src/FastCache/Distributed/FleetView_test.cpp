@@ -83,6 +83,20 @@ class FakeCluster final: public IClusterAdmin
 constexpr auto MemoryIndex = static_cast<std::size_t>(StorageTier::Memory);
 constexpr auto DiskIndex = static_cast<std::size_t>(StorageTier::Disk);
 
+/// One KPI tile's sub-line, as the page actually renders it.
+///
+/// Spelled as markup rather than as words, because the words are not unique:
+/// `LeaseOutcomeTable`'s no-capacity meaning carries "this fleet's own work" too,
+/// and a bare `contains` for that phrase matched it from three sections away —
+/// asserting the tile said something it had stopped saying. The apostrophe arrives
+/// escaped for the same reason it does everywhere else on this page.
+/// @param text The sub-line, already in its escaped spelling.
+/// @return The markup to search for.
+[[nodiscard]] std::string KpiSub(std::string_view text)
+{
+    return std::format(R"(<span class="kpi-sub">{}</span>)", text);
+}
+
 /// A history nobody has sampled yet, for a case that is not about the charts.
 ///
 /// Empty rather than fabricated: most cases here are about the snapshot, and a
@@ -507,6 +521,124 @@ TEST_CASE("Fleet capacity is summed per machine and splits busy from withheld", 
     CHECK(totals.free == 10);
     CHECK(totals.withheld == 10);
     CHECK(totals.inFlight + totals.free + totals.withheld == totals.registered);
+}
+
+TEST_CASE("A fleet nothing was ever dispatched to says so, rather than reading as idle",
+          "[distributed][fleetview][capacity]")
+{
+    // The reported defect. Dispatch is opt-in -- a client asks for a lease only
+    // when FASTCACHE_SCHEDULER names a scheduler -- so a node deployed as a shared
+    // CACHE registers its slots, grants nothing, and renders `0 compiling` forever
+    // while the machine around it compiles flat out. The old panel then read the
+    // host CPU, found none of it accounted for by work this fleet had handed out,
+    // and told the operator their own build belonged to somebody else.
+    auto snapshot = LeadingSnapshot();
+    snapshot.leases = { 0, 0, 0, 0, 0 }; // registered, and never asked
+    snapshot.liveLeases = 0;             // nor is anything outstanding
+    auto busy = Machine("10.0.0.1:7100", 16);
+    busy.registeredSlots = 16;
+    busy.fleetJobsInFlight = 0;
+    busy.load = WithCpu(0, 900); // the operator's own compiles, not the fleet's
+    snapshot.nodes = { busy };
+
+    auto const totals = TotalsFor(snapshot);
+    REQUIRE(totals.registered == 16);
+    REQUIRE(totals.inFlight == 0);
+    REQUIRE(totals.withheld > 0); // the misattribution the note used to make
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains("Nothing has been dispatched to this fleet"));
+    CHECK(html.contains("FASTCACHE_SCHEDULER"));
+    // And it must REPLACE the reading it explains, not sit beside it: two notes
+    // disagreeing about whose work is loading the machine is worse than one wrong.
+    CHECK_FALSE(html.contains("Read the hatching first"));
+    // The tile the operator actually stares at names which zero this is.
+    CHECK(html.contains(KpiSub("nothing dispatched yet")));
+    CHECK_FALSE(html.contains(KpiSub("this fleet&#39;s own work")));
+}
+
+TEST_CASE("A fleet that has dispatched keeps the withheld reading", "[distributed][fleetview][capacity]")
+{
+    // The other direction, so the case above cannot pass by suppressing the note
+    // for everyone. Once a lease has been granted, host CPU this fleet cannot
+    // account for genuinely is somebody else's, and that sentence is the one an
+    // operator has to act on.
+    auto snapshot = LeadingSnapshot(); // leases = { 100, ... }: it has dispatched
+    auto busy = Machine("10.0.0.1:7100", 16);
+    busy.registeredSlots = 16;
+    busy.fleetJobsInFlight = 4;
+    busy.load = WithCpu(4, 900);
+    snapshot.nodes = { busy };
+
+    REQUIRE(TotalsFor(snapshot).withheld > 0);
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK(html.contains("Read the hatching first"));
+    CHECK_FALSE(html.contains("Nothing has been dispatched"));
+    CHECK(html.contains(KpiSub("this fleet&#39;s own work")));
+    CHECK_FALSE(html.contains(KpiSub("nothing dispatched yet")));
+}
+
+TEST_CASE("A scheduler that has just taken over does not call a working fleet unused", "[distributed][fleetview][capacity]")
+{
+    // `DispatchLeasesGranted` counts what THIS process granted since it started,
+    // and leadership moves. A scheduler that has just won an election has granted
+    // nothing, while heartbeats have already told it what the machines are running
+    // -- so the counter alone would print "no compile has been handed to any of
+    // them" on a page whose own bar shows four running, and would displace the
+    // withheld reading that is the actually useful one.
+    auto snapshot = LeadingSnapshot();
+    snapshot.leases = { 0, 0, 0, 0, 0 }; // this leader has granted nothing yet
+    snapshot.liveLeases = 0;             // and holds no lease of its own
+    auto busy = Machine("10.0.0.1:7100", 16);
+    busy.registeredSlots = 16;
+    busy.fleetJobsInFlight = 4; // but the fleet is demonstrably working
+    busy.load = WithCpu(4, 900);
+    snapshot.nodes = { busy };
+
+    REQUIRE(TotalsFor(snapshot).inFlight == 4);
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK_FALSE(html.contains("Nothing has been dispatched"));
+    CHECK(html.contains("Read the hatching first"));
+    CHECK(html.contains(KpiSub("this fleet&#39;s own work")));
+}
+
+TEST_CASE("A lease outstanding is dispatch, even before the count catches up", "[distributed][fleetview][capacity]")
+{
+    // The other half of the same guard, and the one a failover hits first: a lease
+    // has been granted and the job has not started, so nothing is in flight yet.
+    // `liveLeases` is the only thing that knows, and without it this page would
+    // announce an unused fleet in the gap between a grant and its job.
+    auto snapshot = LeadingSnapshot();
+    snapshot.leases = { 0, 0, 0, 0, 0 };
+    snapshot.liveLeases = 2;
+    auto idle = Machine("10.0.0.1:7100", 16);
+    idle.registeredSlots = 16;
+    idle.fleetJobsInFlight = 0;
+    idle.load = NodeLoad {};
+    snapshot.nodes = { idle };
+
+    CHECK_FALSE(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Nothing has been dispatched"));
+}
+
+TEST_CASE("A snapshot carrying no lease figures claims nothing about dispatch", "[distributed][fleetview][capacity]")
+{
+    // Absent is not zero, at the one place on this page where reading it as zero
+    // would print the strongest sentence there is. `CollectFleet` always fills
+    // every row of `LeaseOutcomeTable`; a snapshot that carries none is a caller
+    // who never said, and it must fall through to the ordinary readings.
+    auto snapshot = LeadingSnapshot();
+    snapshot.leases.clear();
+    auto idle = Machine("10.0.0.1:7100", 16);
+    idle.registeredSlots = 16;
+    idle.fleetJobsInFlight = 0;
+    idle.load = NodeLoad {};
+    snapshot.nodes = { idle };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
+    CHECK_FALSE(html.contains("Nothing has been dispatched"));
+    CHECK(html.contains("Nothing is being withheld"));
 }
 
 TEST_CASE("A memory-bound worker is not dressed as a busy one", "[distributed][fleetview]")

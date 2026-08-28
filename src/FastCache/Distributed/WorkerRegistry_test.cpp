@@ -551,8 +551,9 @@ TEST_CASE("One machine serving two toolchains is one node, and its cores are not
     // entries carrying ONE machine's cores -- and summing them across
     // `LiveWorkers()` reports a fleet twice the size of the one an operator owns.
     //
-    // Deliberately different slot counts and job counts per entry, so a max/sum
-    // transposition fails rather than passing on equal numbers.
+    // Deliberately different slot counts per entry, so a max/sum transposition in
+    // `registeredSlots` fails rather than passing on equal numbers. The job count
+    // is checked by the two cases below, which is where the grain lives now.
     Fixture fix;
     auto gcc = Announce(Gcc13, "10.0.0.2:7100", 6);
     gcc.capacity = NodeCapacity { .logicalCores = 32, .totalMemoryBytes = 64ULL << 30 };
@@ -574,12 +575,70 @@ TEST_CASE("One machine serving two toolchains is one node, and its cores are not
     CHECK(nodes[0].capacity.logicalCores == 32);
     // The maximum, because both were derived from the same cores.
     CHECK(nodes[0].registeredSlots == 6);
-    // The sum, because those genuinely are three different jobs.
+    // Three jobs on one machine, counted once. `JobStarted` moves every entry at
+    // the endpoint, so both siblings read 3 and the fold takes it once.
     CHECK(nodes[0].fleetJobsInFlight == 3);
     // Both toolchains named, sorted so the column order cannot move between reads.
     REQUIRE(nodes[0].fingerprints.size() == 2);
     CHECK(nodes[0].fingerprints[0] == Gcc13);
     CHECK(nodes[0].fingerprints[1] == Gcc14);
+}
+
+TEST_CASE("A heartbeat's job count is one machine's, not one per toolchain", "[distributed][registry][node-report]")
+{
+    // Exactly what a node does: `main.cpp` samples one `WorkerServer::InFlight()`
+    // per round -- there being only one worker server per node, whatever it serves
+    // -- and sends that ONE number to every registrar. Summing it across siblings
+    // reported this machine's four jobs as eight, which is more work than it
+    // registered slots for, and `TotalsFor` then rendered the difference as
+    // capacity withheld by somebody else.
+    //
+    // This is the case that fails against a `+=` fold. The one above cannot: its
+    // numbers arrive through `JobStarted`, which moves every sibling together, so
+    // max and sum agree there by construction.
+    Fixture fix;
+    auto const gcc = fix.registry.Register(Announce(Gcc13, "10.0.0.2:7100", 6));
+    auto const clang = fix.registry.Register(Announce(Gcc14, "10.0.0.2:7100", 6));
+
+    REQUIRE(fix.registry.Heartbeat(gcc, Busy(4)));
+    REQUIRE(fix.registry.Heartbeat(clang, Busy(4)));
+
+    auto const nodes = fix.registry.NodeReports();
+    REQUIRE(nodes.size() == 1);
+    CHECK(nodes[0].fleetJobsInFlight == 4);
+}
+
+TEST_CASE("A job occupies the machine, not the toolchain it was leased against", "[distributed][registry][node-report]")
+{
+    // A lease names one entry, but the cores it consumes are the host's. Counting
+    // it against that entry alone left the machine's OTHER toolchain advertising a
+    // full complement of slots it was already using -- the "a worker accepts more
+    // jobs than the scheduler believes it has" failure `SlotCeilingsFor` exists to
+    // prevent, reached from the registry side.
+    Fixture fix;
+    auto const gcc = fix.registry.Register(Announce(Gcc13, "10.0.0.3:7100", 4));
+    auto const clang = fix.registry.Register(Announce(Gcc14, "10.0.0.3:7100", 4));
+    // A second machine, so the walk cannot pass by moving every entry it has.
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.4:7100", 4));
+
+    fix.registry.JobStarted(gcc);
+
+    auto const live = fix.registry.LiveWorkers();
+    REQUIRE(live.size() == 3);
+    for (auto const& worker: live)
+    {
+        INFO("worker " << worker.id << " at " << worker.endpoint);
+        CHECK(worker.inFlight == (worker.endpoint == "10.0.0.3:7100" ? 1U : 0U));
+    }
+
+    // And back down again, on the same entries. A pair that moved different ones
+    // would drift by a toolchain per job.
+    fix.registry.JobFinished(clang);
+    for (auto const& worker: fix.registry.LiveWorkers())
+    {
+        INFO("worker " << worker.id);
+        CHECK(worker.inFlight == 0U);
+    }
 }
 
 TEST_CASE("Two machines are two node reports", "[distributed][registry][node-report]")

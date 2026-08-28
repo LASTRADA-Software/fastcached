@@ -117,8 +117,18 @@ struct WorkerReport
 ///     and are taken from a single contributing entry, chosen by the rule below.
 ///   - **`registeredSlots` is the maximum**, not the sum: the siblings describe one
 ///     machine's offer, and `OfferableSlots` derived each from the same cores.
-///   - **`fleetJobsInFlight` is the sum**: those are genuinely different jobs, one
-///     count per toolchain, running side by side on the one machine.
+///   - **`fleetJobsInFlight` is the maximum too**, for the same reason and one
+///     more. A node runs ONE `WorkerServer` for every toolchain it serves, so the
+///     only job count that exists anywhere is machine-wide: its heartbeat samples
+///     `InFlight()` once per round and sends that one number to every registrar.
+///     Summing it reported a machine running four jobs as running eight, and the
+///     page that read it then had four slots of the operator's own work to account
+///     for and blamed them on an external ceiling.
+///
+/// A per-toolchain job count is not merely unimplemented here; there is nowhere
+/// for one to come from. `JobStarted`/`JobFinished` therefore move every sibling
+/// entry together, so the speculative count and the authoritative one that
+/// corrects it are the same quantity rather than two grains folded by one rule.
 struct NodeReport
 {
     /// host:port the node answers on — the key an operator means by "node".
@@ -130,12 +140,19 @@ struct NodeReport
     /// What it is doing, from the contributing entry.
     ///
     /// Its machine-wide fields — CPU, memory, scratch, cache — are what this grain
-    /// is for. Its `inFlight` is the contributing *entry's* job count; the machine's
-    /// is `fleetJobsInFlight` below.
+    /// is for. Its `inFlight` is one entry's copy of a figure that is machine-wide
+    /// at every writer, so it agrees with `fleetJobsInFlight` below rather than
+    /// describing a narrower thing; the two are separate only because this one is
+    /// whatever the *contributing* entry last carried, and that one is folded
+    /// across all of them.
     NodeLoad load {};
     /// The largest slot count any of this machine's entries registered with.
     std::uint32_t registeredSlots { 0 };
-    /// This fleet's jobs running on the machine, summed across its entries.
+    /// This fleet's jobs running on the machine.
+    ///
+    /// The maximum across its entries, not the sum: every writer of the underlying
+    /// count is machine-wide, so adding siblings reports one machine's work once
+    /// per toolchain it serves. See the class doc above.
     std::uint32_t fleetJobsInFlight { 0 };
     /// Since the contributing entry was last heard from.
     std::chrono::milliseconds heartbeatAge {};
@@ -277,10 +294,18 @@ class WorkerRegistry
     [[nodiscard]] std::expected<WorkerInfo, PickError> Pick(std::string_view fingerprint) const;
 
     /// Note that a job has been dispatched to a worker.
+    ///
+    /// Moves every entry sharing that worker's endpoint, because a job occupies the
+    /// **machine** and not one of its toolchains — see `NodeReport`. Counting it
+    /// against the leased entry alone let the scheduler offer a host's other
+    /// toolchain a full complement of slots it was already using.
     /// @param workerId The worker.
     void JobStarted(std::string_view workerId);
 
     /// Note that a job on a worker has finished, however it finished.
+    ///
+    /// Machine-wide, exactly as `JobStarted` is; the pair has to move the same
+    /// entries or a node's count drifts by a toolchain per job.
     /// @param workerId The worker.
     void JobFinished(std::string_view workerId);
 
@@ -339,6 +364,28 @@ class WorkerRegistry
 
     /// Whether `entry` has been heard from recently enough to dispatch to.
     [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+
+    /// Which way `AdjustMachineInFlight` moves a machine's count.
+    ///
+    /// An enumeration rather than a signed delta: only two values are meaningful,
+    /// and a parameter typed to admit four billion of them says so at every call
+    /// site — the reason this codebase spells a two-way choice as a type.
+    enum class JobTransition : std::uint8_t
+    {
+        Started,  ///< One more job on the machine.
+        Finished, ///< One fewer, saturating at zero.
+    };
+
+    /// Move the in-flight count of every entry sharing a worker's endpoint.
+    ///
+    /// One implementation for both directions: `JobStarted` and `JobFinished`
+    /// differ by that direction and by nothing else, and two copies of "find the
+    /// endpoint, then walk its siblings" is how the pair comes to move different
+    /// entries. Caller holds `_mutex`.
+    /// @param workerId The worker the job was leased to; its endpoint selects the
+    ///        entries to move.
+    /// @param transition Which way to move them.
+    void AdjustMachineInFlight(std::string_view workerId, JobTransition transition);
 
     /// How long ago an entry was last heard from, clamped at zero.
     ///
