@@ -91,6 +91,13 @@ namespace
         Plain = 0, ///< The value, as text.
         Limit,     ///< Which ceiling bound a worker: a chip, coloured by which one.
         Freshness, ///< A heartbeat age: a pill that goes amber once the value is stale.
+        /// A lease age: the same pill on a far longer scale.
+        ///
+        /// Not `Freshness`, and the difference is the threshold rather than the
+        /// drawing. A heartbeat is stale after fifteen seconds; a lease that old is
+        /// an ordinary compile still running, so reusing that decor would paint
+        /// every row amber and the colour would stop meaning anything at all.
+        LeaseAge,
     };
 
     /// One column: what it is called, and how to read it off one subject.
@@ -427,6 +434,59 @@ namespace
                 [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count())); } },
     };
 
+    /// What an outstanding-lease row shows.
+    ///
+    /// Four columns and deliberately not five: the toolchain is a property of the
+    /// WORKER, and the id below joins to the table above, where the fingerprint and
+    /// the compiler already are. A column repeating it here would be a second place
+    /// for the same fact to be right.
+    constexpr std::array<FleetColumn<LeaseHolding>, 4> LeaseColumns {
+        // The key earns its place despite being a digest, and it is the only column
+        // that answers the question an operator arrives with. A client refused
+        // `already-in-flight` was refused ON a key, and `fastcache-cc` prints that
+        // same key when it dispatches -- so this is what joins a stuck build to
+        // whoever is holding it.
+        FleetColumn<LeaseHolding> { .name = "key",
+                                    .help = "The object key being compiled. What an already-in-flight refusal named, "
+                                            "and what the launcher logs as key=.",
+                                    .format = CellFormat::Text,
+                                    .project = [](LeaseHolding const& l) { return FleetCell::Of(l.key); } },
+        FleetColumn<LeaseHolding> { .name = "worker",
+                                    .help = "The worker it was leased to; its row is in the table above.",
+                                    .format = CellFormat::Text,
+                                    .project = [](LeaseHolding const& l) { return FleetCell::Of(l.workerId); } },
+        FleetColumn<LeaseHolding> {
+            .name = "endpoint",
+            .help = "host:port that worker answers on. Absent when it is no longer registered, which is the "
+                    "answer rather than a missing cell.",
+            .format = CellFormat::Text,
+            .project =
+                [](LeaseHolding const& l) {
+                    return l.workerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(l.workerEndpoint);
+                } },
+        FleetColumn<LeaseHolding> {
+            .name = "age",
+            .help = "Since the lease was taken. A client resolves its own lease when the job ends, so an old one "
+                    "is a client that died mid-build whose worker is still answering.",
+            .format = CellFormat::Millis,
+            .decor = CellDecor::LeaseAge,
+            .project = [](LeaseHolding const& l) { return FleetCell::Of(static_cast<std::uint64_t>(l.age.count())); } },
+    };
+
+    /// What the lease section says about its own completeness.
+    ///
+    /// The truncation has to be legible at the section, not discovered by counting
+    /// rows against a tile elsewhere on the page: a reader who takes fifty rows for
+    /// the whole fleet's work draws the wrong conclusion from a correct table.
+    /// @param snapshot The report.
+    /// @return The header's meta line.
+    [[nodiscard]] std::string OutstandingLeaseMeta(FleetSnapshot const& snapshot)
+    {
+        if (snapshot.outstandingLeases.size() < snapshot.liveLeases)
+            return std::format("the {} oldest of {}", snapshot.outstandingLeases.size(), snapshot.liveLeases);
+        return "oldest first";
+    }
+
     /// The per-tier cache columns, rendered once per tier a member actually runs.
     ///
     /// A projection for the reason `TierMetric` is one: the tiers come from
@@ -637,7 +697,31 @@ FleetSnapshot CollectFleet(FleetSources const& sources)
     snapshot.leaderEndpoint = sources.scheduler->LeaderEndpoint();
     snapshot.nodes = sources.scheduler->Workers().NodeReports();
     snapshot.workers = sources.scheduler->Workers().LiveWorkerReports();
-    snapshot.liveLeases = sources.scheduler->LiveLeaseCount();
+
+    // Both halves from ONE call, so the count and the listing cannot disagree about
+    // how much was left out -- see `LeaseListing`.
+    auto const held = sources.scheduler->OutstandingLeases(OutstandingLeaseRows);
+    snapshot.liveLeases = held.total;
+
+    // Joined against `snapshot.workers`, which is already in hand -- so the address
+    // an operator needs costs no second walk of the registry and no lookup API that
+    // exists for one caller. A worker that has gone since the lease was taken leaves
+    // the endpoint empty, and that absence is the diagnosis rather than a hole.
+    snapshot.outstandingLeases.reserve(held.oldest.size());
+    for (auto const& lease: held.oldest)
+    {
+        // The projection returns a REFERENCE. Returning `std::string` by value
+        // constructs one per comparison, which on a fleet of a few hundred workers
+        // is thousands of allocations per page request for a lookup that reads a
+        // name and discards it.
+        auto const holder = std::ranges::find(
+            snapshot.workers, lease.workerId, [](WorkerReport const& w) -> std::string const& { return w.info.id; });
+        snapshot.outstandingLeases.push_back(
+            LeaseHolding { .key = lease.key,
+                           .workerId = lease.workerId,
+                           .workerEndpoint = holder != snapshot.workers.end() ? holder->info.endpoint : std::string {},
+                           .age = lease.age });
+    }
 
     // Absent rather than empty: a node started without `--node-id` leads itself and
     // has no replicated state at all, which is not the same claim as a cluster that
@@ -688,6 +772,32 @@ namespace
         out += ']';
     }
 
+    /// When a heartbeat age stops being one a reader should trust the row behind.
+    constexpr std::uint64_t HeartbeatStaleAfterMillis = 15'000;
+
+    /// When an outstanding lease has been outstanding long enough to look at.
+    ///
+    /// Half the lease lifetime: past it, a lease is closer to expiring than to
+    /// having been taken. Derived from `DefaultLeaseTimeout` rather than typed as a
+    /// number, so it stays half of whatever that becomes -- a threshold that
+    /// silently stopped tracking the timeout would colour rows by nothing.
+    constexpr std::uint64_t LeaseOldAfterMillis = static_cast<std::uint64_t>(LeaseTable::DefaultLeaseTimeout.count()) / 2;
+
+    /// An age, as a pill that goes amber past `staleAfter`.
+    ///
+    /// One implementation for both age decors, which differ by their threshold and
+    /// by nothing else. Two near-identical `case` bodies is how the pair comes to
+    /// draw differently for no reason anybody intended.
+    /// @param text The already-formatted value.
+    /// @param millis The age, for the comparison.
+    /// @param staleAfter Where the pill turns amber.
+    /// @return The cell's inner HTML.
+    [[nodiscard]] std::string AgePill(std::string_view text, std::uint64_t millis, std::uint64_t staleAfter)
+    {
+        auto const* const tone = millis >= staleAfter ? "pill--warn" : "pill--ok";
+        return std::format(R"(<span class="pill pill--value {}"><span class="dot"></span>{}</span>)", tone, text);
+    }
+
     /// Dress one cell the way its column asks.
     ///
     /// An absent cell is never decorated: a chip saying nothing, or a pill that is
@@ -711,13 +821,12 @@ namespace
                 break;
             case CellDecor::Limit:
                 return std::format(R"(<span class="chip {}">{}</span>)", ChipClassFor(cell.text), text);
-            case CellDecor::Freshness: {
+            case CellDecor::Freshness:
                 // Amber past the point where a reader should stop trusting the
                 // rest of the row. Everything on it is as old as this number.
-                constexpr std::uint64_t StaleAfterMillis = 15'000;
-                auto const* const tone = cell.number >= StaleAfterMillis ? "pill--warn" : "pill--ok";
-                return std::format(R"(<span class="pill pill--value {}"><span class="dot"></span>{}</span>)", tone, text);
-            }
+                return AgePill(text, cell.number, HeartbeatStaleAfterMillis);
+            case CellDecor::LeaseAge:
+                return AgePill(text, cell.number, LeaseOldAfterMillis);
         }
         return text;
     }
@@ -833,6 +942,16 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
     out += ',';
     AppendJsonString(out, "leases-outstanding");
     out += std::format(":{}", snapshot.liveLeases);
+
+    // A separate key from the count above rather than a replacement for it, and its
+    // name says what it is: the OLDEST of them, because a busy fleet holds thousands
+    // and a document that grew without limit would be one nothing could consume. A
+    // reader comparing the two sees the truncation instead of having to know about
+    // it.
+    out += ',';
+    AppendJsonString(out, "leases-outstanding-oldest");
+    out += ':';
+    AppendJsonRows(out, LeaseColumns, snapshot.outstandingLeases);
     out += ',';
     AppendJsonString(out, "registrations");
     out += std::format(":{}", snapshot.registrations);
@@ -1545,6 +1664,21 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
            R"(<div class="panel wrap">)";
     AppendHtmlRows(out, WorkerColumns, snapshot.workers);
     out += "</div></section>";
+
+    // ---- leases outstanding -------------------------------------------------
+    // Placed after Workers because the `worker` column joins to it, and before the
+    // refusal counters because this is the section somebody reaches for when the
+    // fleet has stopped moving rather than when it is refusing.
+    out += std::format(R"(<section><div class="sec-head"><h2>Leases outstanding</h2><span class="rule"></span>)"
+                       R"(<span class="meta">{}</span></div><div class="panel wrap">)",
+                       EscapeHtml(OutstandingLeaseMeta(snapshot)));
+    AppendHtmlRows(out, LeaseColumns, snapshot.outstandingLeases);
+    out += "</div>";
+    out += R"(<p class="note">A client hands its lease back when the job ends, however it ended, so one that has )"
+           R"(been outstanding for minutes is not waiting to age out: it is a client that died mid-build, and the )"
+           R"(endpoint beside it is where its work was going. A row with no endpoint is a lease against a worker )"
+           R"(that is no longer registered &mdash; dropping one releases its leases, but that happens when the next )"
+           R"(lease is asked for, so an idle fleet can show these until somebody compiles again.</p></section>)";
 
     // ---- why requests were refused -----------------------------------------
     out += R"(<section><div class="sec-head"><h2>Why requests were refused</h2><span class="rule"></span>)"

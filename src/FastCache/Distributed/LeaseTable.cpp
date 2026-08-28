@@ -144,7 +144,7 @@ bool LeaseTable::IsInFlight(std::string_view key) const
     return entry != _byToken.end() && IsLive(entry->second, _clock.Now());
 }
 
-std::vector<LeaseReport> LeaseTable::LiveLeases(std::size_t limit) const
+LeaseListing LeaseTable::LiveLeases(std::size_t limit) const
 {
     std::scoped_lock const guard { _mutex };
     // ONE reading for the whole snapshot, not one per entry: asking per lease would
@@ -174,6 +174,12 @@ std::vector<LeaseReport> LeaseTable::LiveLeases(std::size_t limit) const
                                        now < entry.issuedAt ? Duration::zero() : now - entry.issuedAt) });
     }
 
+    // The total is taken from the same walk under the same lock as the listing.
+    // Two calls would be two samples, and a lease resolved between them makes a
+    // window look like the whole set -- so the truncation notice a reader relies on
+    // would be wrong in exactly the situation it exists for.
+    LeaseListing listing { .oldest = {}, .total = live.size() };
+
     // Oldest first, and the key breaks the tie so a snapshot is reproducible: an
     // unordered_map's iteration order is neither stable nor meaningful, and two
     // leases taken in the same tick are ordinary on a wide parallel build.
@@ -187,23 +193,11 @@ std::vector<LeaseReport> LeaseTable::LiveLeases(std::size_t limit) const
     });
     live.resize(keep);
 
-    std::vector<LeaseReport> out;
-    out.reserve(live.size());
+    listing.oldest.reserve(live.size());
     for (auto const& candidate: live)
-        out.push_back(LeaseReport {
+        listing.oldest.push_back(LeaseReport {
             .key = candidate.entry->lease.key, .workerId = candidate.entry->lease.workerId, .age = candidate.age });
-    return out;
-}
-
-std::size_t LeaseTable::LiveCount() const
-{
-    std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
-    std::size_t live = 0;
-    for (auto const& [token, entry]: _byToken)
-        if (IsLive(entry, now))
-            ++live;
-    return live;
+    return listing;
 }
 
 } // namespace FastCache::Distributed

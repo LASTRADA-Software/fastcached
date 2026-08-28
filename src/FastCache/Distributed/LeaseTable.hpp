@@ -42,6 +42,21 @@ struct LeaseReport
     std::chrono::milliseconds age {}; ///< Since the lease was taken.
 };
 
+/// What is outstanding, as one answer.
+///
+/// The bounded listing and the total travel together because they are **one
+/// sample under one lock**. Asked separately they can disagree -- a lease resolved
+/// between the two calls makes a window look like the whole set, or the whole set
+/// look like a window -- and the truncation notice a reader relies on is then
+/// wrong in exactly the situation it exists for.
+struct LeaseListing
+{
+    /// The oldest live leases, ordered by descending age, at most as many as asked.
+    std::vector<LeaseReport> oldest;
+    /// How many are live in total, whether or not they are listed above.
+    std::size_t total { 0 };
+};
+
 /// The set of leases the scheduler has issued and not yet seen resolved.
 ///
 /// **Pure with respect to I/O**, over an injected `IClock`, for the reason
@@ -162,28 +177,24 @@ class LeaseTable
     /// @return True when a live lease is outstanding for it.
     [[nodiscard]] bool IsInFlight(std::string_view key) const;
 
-    /// The live leases, oldest first, at most `limit` of them.
+    /// What is outstanding: the oldest few of them, and how many there are.
     ///
-    /// The counterpart of `LiveCount()`, and the grain that number cannot answer
-    /// at: a fleet that has stopped making progress shows a count, and what an
-    /// operator needs is *which* keys are held and by whom. Since a lease is
-    /// resolved by the client that took it, one that is still outstanding after
-    /// minutes is a client that died mid-build whose worker is still heartbeating
-    /// -- a specific machine to go and look at, rather than "something is
-    /// happening".
+    /// A count alone is the wrong grain for the moment it matters: a fleet that has
+    /// stopped making progress shows a number, and what an operator needs is
+    /// *which* keys are held and by whom. Since a lease is resolved by the client
+    /// that took it, one still outstanding after minutes is a client that died
+    /// mid-build whose worker is still heartbeating -- a specific machine to go and
+    /// look at, rather than "something is happening".
     ///
     /// **Oldest first, and that is the diagnostic rather than an ordering
     /// preference.** A fleet at full tilt holds thousands, so any listing is
     /// bounded; the newest fifty of three thousand would answer nothing, while the
-    /// oldest are the ones that have stopped moving. The total stays available
-    /// through `LiveCount()` so the truncation is visible rather than silent.
-    /// @param limit How many to return at most; zero returns none.
-    /// @return The oldest live leases, ordered by descending age. Expired entries
-    ///         are excluded even while they are still present in the table.
-    [[nodiscard]] std::vector<LeaseReport> LiveLeases(std::size_t limit) const;
-
-    /// Number of live (unexpired) leases. For diagnostics and tests.
-    [[nodiscard]] std::size_t LiveCount() const;
+    /// oldest are the ones that have stopped moving.
+    /// @param limit How many entries to return at most; zero returns the total and
+    ///        no entries, which is how a caller asks the cheap question.
+    /// @return The listing. Expired entries are excluded from both halves even
+    ///         while they are still present in the table.
+    [[nodiscard]] LeaseListing LiveLeases(std::size_t limit) const;
 
   private:
     struct Entry

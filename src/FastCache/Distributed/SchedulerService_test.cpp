@@ -96,6 +96,34 @@ TEST_CASE("A granted lease reaches the fleet page's compiling figure", "[distrib
     CHECK(RenderFleetHtml(after, FleetHistoryView {}, 0).contains("<b>1</b> <span>compiling"));
 }
 
+TEST_CASE("A granted lease reaches the fleet page as a row, with its holder's address",
+          "[distributed][scheduler][fleetview]")
+{
+    // The wiring assertion for #142, in the sense the rulebook means it. Every case
+    // in `FleetView_test.cpp` assigns `outstandingLeases` onto a snapshot literal,
+    // so a listing that had come unwired at either end -- the scheduler never asked,
+    // or the endpoint join never joined -- would leave all of them green.
+    //
+    // The endpoint is the half worth pinning: `LeaseTable` knows only the worker id,
+    // and the address an operator goes and looks at is joined in from the registry.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "stuck-key")).status == Wire::Status::Ok);
+    fleet.clock.Advance(2s);
+
+    auto const snapshot =
+        CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
+    REQUIRE(snapshot.outstandingLeases.size() == 1);
+    CHECK(snapshot.outstandingLeases.front().key == "stuck-key");
+    CHECK(snapshot.outstandingLeases.front().workerEndpoint == "10.0.0.2:7100");
+    CHECK(snapshot.outstandingLeases.front().age == 2s);
+    CHECK(snapshot.liveLeases == 1);
+
+    // And it reaches the markup, because a row that never renders is a row nobody
+    // reads.
+    CHECK(RenderFleetHtml(snapshot, FleetHistoryView {}, 0).contains("stuck-key"));
+}
+
 TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
 {
     // A follower's registry is a stale copy of somebody else's, so admitting a

@@ -69,6 +69,31 @@ inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
                       .meaning = "that object is already being built somewhere: not a shortage." },
 };
 
+/// One outstanding lease, joined to where its holder answers.
+///
+/// `LeaseReport` carries the worker's **id**, because that is what the lease table
+/// knows; an operator needs the address to go and look at. The join belongs here
+/// rather than in `LeaseTable`, which must not learn about the registry -- the two
+/// are siblings under `SchedulerService`, and a report is the one place they
+/// legitimately meet.
+struct LeaseHolding
+{
+    std::string key;      ///< The object key being compiled.
+    std::string workerId; ///< The worker it was leased to.
+    /// host:port that worker answers on, or **empty** when it is no longer
+    /// registered -- which is itself the diagnosis rather than a gap in the row.
+    std::string workerEndpoint;
+    std::chrono::milliseconds age {}; ///< Since the lease was taken.
+};
+
+/// How many outstanding leases a report lists.
+///
+/// A bound rather than the whole set, because a fleet at full tilt holds thousands
+/// and a page that renders all of them is one nobody can read -- and a JSON
+/// document that grows without limit. The total travels beside it, so the
+/// truncation is visible rather than silent.
+inline constexpr std::size_t OutstandingLeaseRows = 50;
+
 /// Everything a fleet report shows, gathered once.
 ///
 /// **Pure data.** Collecting it reads the scheduler and the cluster; rendering it
@@ -94,6 +119,12 @@ struct FleetSnapshot
     std::vector<std::uint64_t> leases;
     /// Leases outstanding right now.
     std::size_t liveLeases { 0 };
+    /// The oldest of those, at most `OutstandingLeaseRows` of them.
+    ///
+    /// Beside `liveLeases` rather than replacing it: the count is the total and
+    /// this is a window onto it, and a reader that could not tell them apart would
+    /// read a truncated list as the whole fleet's work.
+    std::vector<LeaseHolding> outstandingLeases;
     /// Worker registrations accepted since this leader started counting.
     std::uint64_t registrations { 0 };
     /// Which cache tiers any member reports.
