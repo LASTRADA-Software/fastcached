@@ -12,6 +12,7 @@
 #include <iterator>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1359,6 +1360,44 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     constexpr std::string_view LeaseNote =
         "Do not add these together. An empty fleet, a busy one, machines somebody else is using and an object "
         "already being built are four different problems with four different fixes, and a total hides all of them.";
+    /// What to say about windows the range only partly observed, or nothing.
+    ///
+    /// The NEWEST window is excluded, always: it is still filling and is partly
+    /// covered by definition, so counting it would put "1 window partly observed" on
+    /// every live page and make the number mean nothing. What is left is downtime --
+    /// a window this fleet was only watched for part of -- which is worth a reader's
+    /// attention precisely because the chart cannot show it: a bucket observed for
+    /// one minute of five is drawn exactly like one observed for all five.
+    ///
+    /// A BACKFILLED window is excluded too, and for a sharper reason: its `coverage`
+    /// is not the same quantity. `BackfillInto` takes the best contributing machine's
+    /// sample count, which is compared here against a FLEET sample denominator -- so
+    /// fifteen workstations each up eight hours a day would report every one of a
+    /// year's backfilled days as partly observed, permanently, which is exactly the
+    /// noise excluding the newest bucket exists to avoid.
+    /// @param history What is being drawn.
+    /// @return The note, or empty when every settled window was fully observed.
+    [[nodiscard]] std::string CoverageNote(FleetHistoryView const& history)
+    {
+        if (history.buckets.empty())
+            return {};
+
+        auto const full = FullCoverageOf(history.range);
+        auto partial = std::size_t { 0 };
+        auto settled = std::size_t { 0 };
+        for (auto const& bucket: std::span { history.buckets }.first(history.buckets.size() - 1))
+        {
+            if (!bucket.present || bucket.backfilled)
+                continue;
+            ++settled;
+            if (bucket.coverage < full)
+                ++partial;
+        }
+        if (partial == 0)
+            return {};
+        return std::format("{} of {} windows partly observed", partial, settled);
+    }
+
     /// Append the whole "Over time" section: the range control, the charts, the note.
     ///
     /// Its own function rather than more of `RenderFleetHtml`, and not only for
@@ -1380,17 +1419,22 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                                row.range == history.range ? R"( class="on")" : "",
                                EscapeHtml(row.key),
                                EscapeHtml(row.label));
-        out += std::format(R"(</span><span class="rule"></span><span class="meta">{} &middot; {}</span></div>)",
+        auto const coverage = CoverageNote(history);
+        out += std::format(R"(</span><span class="rule"></span><span class="meta">{}{}{} &middot; {}</span></div>)",
                            EscapeHtml(rangeRow.bucketLabel),
+                           coverage.empty() ? "" : " &middot; ",
+                           coverage,
                            history.durable ? "kept on disk" : "kept in memory only");
         if (std::ranges::none_of(history.buckets, [](auto const& bucket) { return bucket.present; }))
             // A frame with nothing in it reads as a broken chart. Absent is not zero
             // here either: nobody was watching, which is not a fleet that did nothing.
             out += R"(<div class="panel occ"><p class="note">Nothing has been recorded for this range yet. )"
-                   R"(A node samples the fleet once a minute <strong>while it leads</strong> &mdash; a follower's )"
-                   R"(registry holds only what registered against it, so sampling there would record a fraction )"
-                   R"(as though it were the whole. The first points appear a minute after this node won the )"
-                   R"(election.</p></div>)";
+                   R"(The fleet-wide numbers are sampled once a minute <strong>while this node leads</strong> &mdash; )"
+                   R"(a follower's registry holds only what registered against it, so sampling there would record )"
+                   R"(a fraction as though it were the whole. Windows another node was leading for are filled in )"
+                   R"(from the records the machines themselves keep and hand over, so they carry what each machine )"
+                   R"(can answer for and not the scheduler's own counters. The first points appear a minute after )"
+                   R"(this node won the election.</p></div>)";
         else
         {
             out += R"(<div class="charts">)";
@@ -1432,7 +1476,11 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         out += std::format(R"(<p class="note"><strong>This history is the leader's.</strong> It is sampled by )"
                            R"(whichever node currently leads, so a failover moves this page to a machine with a )"
                            R"(different past. A bucket nobody sampled draws a <em>gap</em>, never a zero &mdash; )"
-                           R"(zero says the fleet did nothing, a gap says nobody was watching. {} The same series )"
+                           R"(zero says the fleet did nothing, a gap says nobody was watching. A window another )"
+                           R"(node was leading for is filled in from the records the machines themselves keep, so )"
+                           R"(it carries what each machine can answer for &mdash; its cache and its slots &mdash; )"
+                           R"(and leaves the dispatch charts a gap, because no machine produces a scheduler's )"
+                           R"(counters. {} The same series )"
                            R"(are available as JSON at <a href="{}?range={}">{}</a>, and for anything you would )"
                            R"(alert on, /metrics remains the source of truth.</p></section>)",
                            history.durable ? "It is written to disk, so it survives a restart."

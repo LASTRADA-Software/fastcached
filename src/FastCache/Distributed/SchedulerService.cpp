@@ -392,7 +392,15 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     return SchedulerReply::Success(std::vector<std::byte> { bytes.begin(), bytes.end() });
 }
 
-SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::string_view workerId, NodeLoad const& load)
+void SchedulerService::SetHistorySink(IFleetHistorySink* sink) noexcept
+{
+    _history = sink;
+}
+
+SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
+                                           std::string_view workerId,
+                                           NodeLoad const& load,
+                                           std::span<FleetBucket const> history)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
@@ -401,8 +409,17 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::str
     // expired this worker, and the worker's correct response is to register again.
     // Silence would leave it heartbeating into a void forever while the fleet ran
     // without it.
-    if (!_workers.Heartbeat(workerId, load))
+    auto const endpoint = _workers.Heartbeat(workerId, load);
+    if (!endpoint.has_value())
         return Refuse(Wire::ErrorCode::UnknownLease, "unknown worker; register again");
+
+    // Under the ENDPOINT, never the worker id: a machine with two `--toolchain`
+    // flags heartbeats twice with the same figures, and keying per id would have the
+    // fleet counting one machine's contribution once per toolchain -- the rule
+    // `WorkerRegistry::NodeCaches()` already exists to enforce on the neighbouring
+    // number.
+    if (_history != nullptr && !history.empty())
+        _history->AcceptHistory(*endpoint, history);
 
     return SchedulerReply::Success();
 }

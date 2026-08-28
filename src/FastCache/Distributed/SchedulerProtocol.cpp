@@ -205,10 +205,16 @@ std::optional<NodeCapacity> CapacityFromWire(Wire::CapacityFields const& fields)
 
 Wire::LoadFields LoadToWire(NodeLoad const& load)
 {
+    // `history` is stated and left empty: a node's own buckets are attached by the
+    // heartbeat loop, which is the only thing that knows how far this machine has
+    // handed its series over. Named rather than defaulted because clang-tidy fails
+    // the build on a designated initializer that skips a field -- which is how a
+    // field added to this record would otherwise be silently dropped here.
     return Wire::LoadFields { .cpuBusyPermille = load.cpuBusyPermille,
                               .availableMemoryBytes = load.availableMemoryBytes,
                               .freeScratchBytes = load.freeScratchBytes,
-                              .cache = CacheLoadToWire(load.cache) };
+                              .cache = CacheLoadToWire(load.cache),
+                              .history = {} };
 }
 
 NodeLoad LoadFromWire(Wire::LoadFields const& fields, std::uint32_t inFlight)
@@ -251,8 +257,10 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             auto const fields = Wire::DecodeHeartbeatPayload(payload);
             if (!fields.has_value())
                 return SchedulerReply::Malformed();
-            return _service.Heartbeat(
-                caller, Wire::AsStringView(fields->workerId), LoadFromWire(fields->load, fields->inFlight));
+            return _service.Heartbeat(caller,
+                                      Wire::AsStringView(fields->workerId),
+                                      LoadFromWire(fields->load, fields->inFlight),
+                                      HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Lease: {
             auto const fields = Wire::DecodeLeasePayload(payload);
@@ -308,6 +316,37 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                 .status = Wire::Status::Error, .error = Wire::ErrorCode::DispatchNotPermitted, .message = {}, .payload = {}
             };
     }
+}
+
+std::vector<CompileCacheWire::HistoryBucketFields> HistoryToWire(std::span<FleetBucket const> buckets)
+{
+    std::vector<CompileCacheWire::HistoryBucketFields> out;
+    out.reserve(buckets.size());
+    for (auto const& bucket: buckets)
+    {
+        auto& record = out.emplace_back();
+        record.startMillis = static_cast<std::uint64_t>(bucket.startMillis);
+        record.sampleMillis = static_cast<std::uint64_t>(bucket.sampleMillis);
+        // One assignment: `EnumTable` IS `std::array`, and the static_assert in the
+        // header ties the two extents, so these are the same type.
+        record.values = bucket.values;
+    }
+    return out;
+}
+
+std::vector<FleetBucket> HistoryFromWire(std::span<CompileCacheWire::HistoryBucketFields const> records)
+{
+    std::vector<FleetBucket> out;
+    out.reserve(records.size());
+    for (auto const& record: records)
+    {
+        auto& bucket = out.emplace_back();
+        bucket.startMillis = static_cast<std::int64_t>(record.startMillis);
+        bucket.sampleMillis = static_cast<std::int64_t>(record.sampleMillis);
+        bucket.values = record.values;
+        bucket.present = true;
+    }
+    return out;
 }
 
 } // namespace FastCache::Distributed

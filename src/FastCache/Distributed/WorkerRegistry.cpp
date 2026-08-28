@@ -83,12 +83,12 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
     return id;
 }
 
-bool WorkerRegistry::Heartbeat(std::string_view workerId, NodeLoad const& load)
+std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId, NodeLoad const& load)
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _workers.find(std::string { workerId });
     if (it == _workers.end())
-        return false;
+        return std::nullopt;
 
     // The worker's own count wins. The registry's drifts whenever a client dies
     // between taking a lease and sending the job, and only the worker knows what it
@@ -96,7 +96,7 @@ bool WorkerRegistry::Heartbeat(std::string_view workerId, NodeLoad const& load)
     it->second.info.inFlight = load.inFlight;
     it->second.info.load = load;
     it->second.lastSeen = _clock.Now();
-    return true;
+    return it->second.info.endpoint;
 }
 
 namespace

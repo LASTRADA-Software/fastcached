@@ -1703,6 +1703,153 @@ struct CompileView
                           .capacity = *capacity };
 }
 
+/// How many readings one history bucket carries.
+///
+/// A WIRE CONTRACT, and the same kind `StorageTier`'s enumerator order already is:
+/// the slots travel POSITIONALLY, so this number and `FleetMetric`'s enumerator
+/// count are one fact spelled in two places that cannot include each other -- this
+/// header stays dependency-free because `fastcache-cc` compiles it without linking
+/// `FastCache`. The assertion tying them together lives on the side that can see
+/// both.
+///
+/// Every slot travels, including the ones only a scheduler can answer for, which
+/// come across as zero. Sending just the node-scoped ones would make the arity
+/// depend on a table the two peers might disagree about, and a misaligned reading is
+/// worse than five wasted words.
+inline constexpr std::size_t HistorySlotCount = 9;
+
+/// One closed bucket of a node's own history.
+///
+/// Two instants and the readings: nothing a receiver can recompute travels. A
+/// bucket's fold and its coverage are both derived by replaying these readings at
+/// these instants, which the leader does anyway to fold them into its coarser rings
+/// -- so carrying either would be a second answer to a question already answered,
+/// and the one a decoder trusted would be the one nothing kept correct. Nor would a
+/// fold help: the leader merges these into a FLEET-wide series whose peak is the
+/// peak of the sums, which is not the sum of the peaks. The nested record is
+/// variable-arity, so a build that finds a use can add a field without a version.
+struct HistoryBucketFields
+{
+    std::uint64_t startMillis { 0 };                       ///< Wall-clock start of the bucket.
+    std::uint64_t sampleMillis { 0 };                      ///< When the reading in `values` was taken.
+    std::array<std::uint64_t, HistorySlotCount> values {}; ///< The readings, positionally.
+};
+
+/// The most closed buckets one heartbeat may carry.
+///
+/// A node absent for a day has 1440 minute-buckets to hand over and a heartbeat is
+/// bounded at `MaxControlPayload`, so this is a real ceiling rather than defensive
+/// padding: what does not fit waits for the next round, oldest first. At a 20-second
+/// heartbeat that clears a full day inside four minutes, while steady state is one
+/// bucket every three rounds and never approaches it.
+inline constexpr std::size_t MaxHistoryBucketsPerHeartbeat = 128;
+
+/// What one encoded bucket costs at most, framing included.
+///
+/// Three fields, each a length-prefixed word or array, plus the prefix on the record
+/// itself. Written out rather than measured so the ceiling below is a compile-time
+/// fact, and in terms of `FieldPrefixSize` rather than a literal 4, which would
+/// restate the framing contract beside the one place it is defined.
+inline constexpr std::size_t MaxHistoryBucketBytes =
+    (2 * (sizeof(std::uint64_t) + WireFields::FieldPrefixSize))
+    + ((HistorySlotCount * sizeof(std::uint64_t)) + WireFields::FieldPrefixSize) + WireFields::FieldPrefixSize;
+
+/// The batch fits, with the rest of a heartbeat still to fit beside it.
+///
+/// A ceiling nobody checked is a ceiling that becomes a frame a peer refuses -- and
+/// a refused heartbeat is a worker the fleet stops seeing, which is the failure this
+/// whole subsystem exists to make visible rather than to cause. Half the payload is
+/// left for everything else, which is two orders of magnitude more than the rest of
+/// a heartbeat needs.
+static_assert(MaxHistoryBucketsPerHeartbeat * MaxHistoryBucketBytes <= MaxControlPayload / 2,
+              "a history batch must leave room for the heartbeat carrying it");
+
+/// Frame a run of closed buckets as one nested field list.
+///
+/// @param buckets What to encode; at most `MaxHistoryBucketsPerHeartbeat` are taken,
+///                oldest first, and the rest wait for the next round.
+/// @return The nested record's bytes, to be carried as a single load field.
+[[nodiscard]] inline std::vector<std::byte> EncodeHistoryBuckets(std::span<HistoryBucketFields const> buckets)
+{
+    auto const count = std::min(buckets.size(), MaxHistoryBucketsPerHeartbeat);
+    std::vector<std::vector<std::byte>> owned;
+    std::vector<std::span<std::byte const>> fields;
+    owned.reserve(count);
+    fields.reserve(count);
+    for (auto const& bucket: buckets.subspan(0, count))
+    {
+        std::vector<std::byte> packed;
+        packed.reserve(HistorySlotCount * sizeof(std::uint64_t));
+        for (auto const value: bucket.values)
+        {
+            auto const word = WireFields::ToBigEndian<std::uint64_t>(value);
+            packed.insert(packed.end(), word.begin(), word.end());
+        }
+        owned.push_back(
+            WireFields::Encode({ std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(bucket.startMillis) },
+                                 std::span<std::byte const> { WireFields::ToBigEndian<std::uint64_t>(bucket.sampleMillis) },
+                                 std::span<std::byte const> { packed } }));
+        fields.emplace_back(owned.back());
+    }
+    return WireFields::Encode(WireFields::FieldList { fields });
+}
+
+/// Read a run of closed buckets back.
+///
+/// Tolerant of a peer carrying more slots than this build knows and of one carrying
+/// fewer, exactly as `DecodeLoad` is: the extra are ignored and the missing stay
+/// zero. Strict about WIDTH, because a slot at the wrong width is a number nobody
+/// can interpret rather than one somebody can ignore.
+///
+/// @param field The nested record's bytes.
+/// @return The buckets, or nullopt when a field is present at the wrong width.
+[[nodiscard]] inline std::optional<std::vector<HistoryBucketFields>> DecodeHistoryBuckets(std::span<std::byte const> field)
+{
+    std::vector<HistoryBucketFields> out;
+    if (field.empty())
+        return out;
+
+    auto const entries = WireFields::SplitAll(field);
+    if (!entries.has_value())
+        return std::nullopt;
+    // Refused rather than truncated: a batch above the ceiling is a peer that did not
+    // honour it, and quietly keeping the first 128 would leave the rest looking
+    // delivered.
+    if (entries->size() > MaxHistoryBucketsPerHeartbeat)
+        return std::nullopt;
+
+    out.reserve(entries->size());
+    for (auto const& entry: *entries)
+    {
+        auto const parts = WireFields::SplitAll(entry);
+        if (!parts.has_value() || parts->size() < 3)
+            return std::nullopt;
+
+        HistoryBucketFields bucket;
+        auto const start = WireFields::FromBigEndian<std::uint64_t>((*parts)[0]);
+        auto const sampled = WireFields::FromBigEndian<std::uint64_t>((*parts)[1]);
+        if (!start.has_value() || !sampled.has_value())
+            return std::nullopt;
+        bucket.startMillis = *start;
+        bucket.sampleMillis = *sampled;
+
+        auto const packed = (*parts)[2];
+        if (packed.size() % sizeof(std::uint64_t) != 0)
+            return std::nullopt;
+        auto const carried = packed.size() / sizeof(std::uint64_t);
+        for (auto const slot: std::views::iota(std::size_t { 0 }, std::min(carried, HistorySlotCount)))
+        {
+            auto const read = WireFields::FromBigEndian<std::uint64_t>(
+                packed.subspan(slot * sizeof(std::uint64_t), sizeof(std::uint64_t)));
+            if (!read.has_value())
+                return std::nullopt;
+            bucket.values[slot] = *read;
+        }
+        out.push_back(bucket);
+    }
+    return out;
+}
+
 /// What a worker reports about itself beyond its job count.
 ///
 /// Every field optional in the same sense `CapacityFields::reservedCores` is:
@@ -1727,6 +1874,18 @@ struct LoadFields
     /// same numbers, so anything summing them across entries counts one cache
     /// twice. `WorkerRegistry::NodeCaches()` is what dedupes.
     CacheLoadFields cache {};
+
+    /// Closed history buckets this node has not had acknowledged.
+    ///
+    /// Carried HERE rather than as a fourth HEARTBEAT field, and that is forced
+    /// rather than chosen: `SplitFields` reads a heartbeat with `SplitExactly`, so
+    /// its top-level arity is three forever and a fourth field would be a frame every
+    /// existing peer refuses. This record is the variable-arity one -- which is the
+    /// whole reason it is nested, as the comment on `EncodeLoad` says.
+    ///
+    /// Empty on almost every heartbeat: a bucket closes once a minute and a heartbeat
+    /// goes every twenty seconds.
+    std::vector<HistoryBucketFields> history;
 };
 
 /// Frame a live-load record as one nested field list.
@@ -1744,11 +1903,13 @@ struct LoadFields
     auto const memory = WireFields::ToBigEndian<std::uint64_t>(load.availableMemoryBytes.value_or(0));
     auto const scratch = WireFields::ToBigEndian<std::uint64_t>(load.freeScratchBytes.value_or(0));
     auto const cache = EncodeCacheLoad(load.cache);
+    auto const history = EncodeHistoryBuckets(load.history);
     return WireFields::Encode(
         { load.cpuBusyPermille.has_value() ? std::span<std::byte const> { cpu } : std::span<std::byte const> {},
           load.availableMemoryBytes.has_value() ? std::span<std::byte const> { memory } : std::span<std::byte const> {},
           load.freeScratchBytes.has_value() ? std::span<std::byte const> { scratch } : std::span<std::byte const> {},
-          std::span<std::byte const> { cache } });
+          std::span<std::byte const> { cache },
+          std::span<std::byte const> { history } });
 }
 
 /// Read a live-load record back.
@@ -1794,6 +1955,13 @@ struct LoadFields
         out.cache = *cache;
     else
         return std::nullopt;
+    // Absent on every heartbeat from a peer older than this field, which `at()`
+    // already answers as an empty span -- and an empty span decodes to no buckets
+    // rather than to a refusal, which is what keeps this additive.
+    auto history = DecodeHistoryBuckets(at(4));
+    if (!history.has_value())
+        return std::nullopt;
+    out.history = std::move(*history);
     return out;
 }
 

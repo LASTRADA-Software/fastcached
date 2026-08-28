@@ -117,6 +117,20 @@ src/FastCache/
                 I/O for the reason the two above it are: collecting reads the
                 scheduler, rendering reads only the snapshot, so every "absent is
                 not zero" rule is a unit test over a literal.
+                FleetSample carries the slot vocabulary -- FleetMetric and its
+                table, FleetFold, FleetBucket -- plus IFleetHistorySink, so
+                SchedulerService's header reaches the seam without compiling
+                against a ring buffer, a std::map and <filesystem>.
+                FleetHistory keeps three rings (minute, hour, day) serving eight
+                views, behind one file envelope that carries magic, version,
+                CRC32C, temp-then-rename and the refusal to overwrite a file a
+                LATER build wrote. FleetNodeHistories is the leader's half of the
+                handover: one history per machine endpoint, a high-water mark per
+                endpoint so a redelivered heartbeat cannot count twice, and the
+                backfill that fills the windows this leader was not elected for.
+                FleetChart derives every series from those buckets -- a rate is a
+                delta between adjacent buckets that can both ANSWER for it -- and
+                renders them as standalone SVG.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,

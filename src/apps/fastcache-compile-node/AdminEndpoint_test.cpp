@@ -13,6 +13,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -22,10 +23,13 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <tests/FleetHistoryFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -51,6 +55,28 @@ AdminHttpServer::SnapshotProvider WorkerShapedSnapshot()
                                  .uptime = Uptime { 1s } };
     };
 }
+
+/// What a node reports about itself, so the node series has something to record.
+///
+/// The same shape `/metrics` scrapes, which is the point of reading the history's
+/// node half through that provider: a machine cannot describe itself two ways.
+///
+/// Cache figures are NOT here: those come from the metrics sink, which is where
+/// `CacheTier::Snapshot` reads them too, so one machine cannot be described twice.
+///
+/// @param busy Compiles running right now.
+/// @param slots Compiles this node advertises.
+/// @return A provider answering with exactly those.
+[[nodiscard]] AdminHttpServer::SnapshotProvider NodeFacts(std::size_t busy = 0, std::size_t slots = 8)
+{
+    return [busy, slots] {
+        return MetricsSnapshot { .storage = std::nullopt,
+                                 .storageTiers = {},
+                                 .host = HostCapacity { .configuredSlots = slots, .busySlots = busy },
+                                 .uptime = {} };
+    };
+}
+
 } // namespace
 
 TEST_CASE("An unparseable --admin-listen is refused, not guessed at", "[node][admin]")
@@ -386,7 +412,8 @@ TEST_CASE("An admin surface nobody asked for starts nothing at all", "[node][adm
     ScrapeHost const scrapeHost;
     NodeConfig cfg;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    auto surface =
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
     REQUIRE(surface.has_value());
     CHECK(surface->endpoint == nullptr);
 }
@@ -405,8 +432,8 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         NodeConfig cfg;
         cfg.adminListen = "not-a-port";
 
-        auto const surface =
-            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto const surface = Node::StartAdminSurfaceOrExplain(
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
         CHECK(surface.error().contains("not-a-port"));
@@ -420,8 +447,8 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         cfg.adminListen = "0"; // refused before the token is even reached
         cfg.dashboardTokenFile = (scratch.Path() / "absent").string();
 
-        auto const surface =
-            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto const surface = Node::StartAdminSurfaceOrExplain(
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
         REQUIRE_FALSE(surface.has_value());
     }
 }
@@ -452,8 +479,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
 
     SECTION("with no scheduler, /fleet is not a route")
     {
-        auto surface =
-            Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+        auto surface = Node::StartAdminSurfaceOrExplain(
+            cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
         CHECK(surface->endpoint->BoundEndpoint() == std::format("127.0.0.1:{}", port));
@@ -467,6 +494,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
             metrics,
             WorkerShapedSnapshot(),
             Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+            nullptr,
             logger);
         REQUIRE(surface.has_value());
         REQUIRE(surface->endpoint != nullptr);
@@ -493,7 +521,8 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     cfg.adminListen = std::format("127.0.0.1:{}", port);
     cfg.tlsSelfSigned = true;
 
-    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    auto surface =
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
     REQUIRE(surface->tls != nullptr);
@@ -522,7 +551,8 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     NodeConfig cfg;
     cfg.adminListen = std::format("127.0.0.1:{}", port);
 
-    auto surface = Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, logger);
+    auto surface =
+        Node::StartAdminSurfaceOrExplain(cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
     REQUIRE(surface.has_value());
     REQUIRE(surface->endpoint != nullptr);
 #if defined(FC_TLS_ENABLED)
@@ -547,9 +577,6 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
     snapshot.nodes[0].load.cache.hits = 70;
     snapshot.nodes[0].load.cache.misses = 30;
     snapshot.nodes[1].load.cache.hits = 5;
-    // Node b reports no miss count. Absent is not zero for a *tier*, but a sum over
-    // machines has to choose, and choosing zero is what keeps the fleet total from
-    // vanishing because one machine was quiet about half of it.
     auto const values = SampleFrom(snapshot);
     auto const slot = [&values](Distributed::FleetMetric metric) {
         return values[static_cast<std::size_t>(metric)];
@@ -558,9 +585,74 @@ TEST_CASE("A sample records what the fleet is, in the slots the table names", "[
     CHECK(slot(Distributed::FleetMetric::DispatchGranted) == 11);
     CHECK(slot(Distributed::FleetMetric::DispatchNoWorker) == 2);
     CHECK(slot(Distributed::FleetMetric::DispatchDuplicate) == 5);
+
+    // EVERY slot, including the four a machine can also answer for itself. This is
+    // the fleet series, a leader can answer for all nine, and these are fleet-wide
+    // sums -- a different number from any one machine's, and the one this page draws.
+    // Filling only the fleet-scoped half here would have flattened the capacity and
+    // hit-rate charts to zero, with an existing install's restored history plotting a
+    // cliff to 0 at the upgrade.
     CHECK(slot(Distributed::FleetMetric::CacheHits) == 75);
     CHECK(slot(Distributed::FleetMetric::CacheMisses) == 30);
     CHECK(slot(Distributed::FleetMetric::JobsInFlight) == 4);
+}
+
+TEST_CASE("A node's own sample carries its cache and its slots, and no dispatch", "[node][admin][fleethistory]")
+{
+    // Read through the provider `/metrics` scrapes, so a machine cannot describe
+    // itself two ways -- the same argument `NodeScrapeSources::host` already makes
+    // about a scrape and a registration disagreeing.
+    AtomicMetricsSink metrics;
+    for ([[maybe_unused]] auto const hit: std::views::iota(0, 70))
+        metrics.Increment(IMetricsSink::Counter::NodeCacheHits);
+    for ([[maybe_unused]] auto const miss: std::views::iota(0, 30))
+        metrics.Increment(IMetricsSink::Counter::NodeCacheMisses);
+    MetricsSnapshot const snapshot { .storage = std::nullopt,
+                                     .storageTiers = {},
+                                     .host = HostCapacity { .configuredSlots = 8, .busySlots = 3 },
+                                     .uptime = {} };
+
+    auto const values = NodeSampleFrom(metrics, snapshot);
+    auto const slot = [&values](Distributed::FleetMetric metric) {
+        return values[static_cast<std::size_t>(metric)];
+    };
+
+    CHECK(slot(Distributed::FleetMetric::CacheHits) == 70);
+    CHECK(slot(Distributed::FleetMetric::CacheMisses) == 30);
+    // FREE slots, not configured ones: the series is about what a compile could have
+    // started on, and a machine with every slot busy offers nothing however many it
+    // advertises.
+    CHECK(slot(Distributed::FleetMetric::OfferableSlots) == 5);
+    CHECK(slot(Distributed::FleetMetric::JobsInFlight) == 3);
+
+    // A node that is not scheduling has not refused anything, and must not report
+    // that it refused nothing -- a zero here would be indistinguishable from a
+    // leader that genuinely refused none.
+    for (auto const& row: Distributed::FleetMetricTable)
+    {
+        INFO("slot " << row.key);
+        if (row.scope == Distributed::FleetMetricScope::Fleet)
+            CHECK(slot(row.metric) == 0);
+    }
+}
+
+TEST_CASE("A node with nothing to report is not described as a busy one", "[node][admin][fleethistory]")
+{
+    // No cache and no host capacity: a process that is not a worker. Zero offered and
+    // zero running IS the truth about it, and there is no per-slot way to say absent.
+    AtomicMetricsSink metrics;
+    auto const values = NodeSampleFrom(metrics, MetricsSnapshot {});
+    CHECK(std::ranges::all_of(values, [](std::uint64_t v) { return v == 0; }));
+
+    // Every slot busy offers nothing, and the subtraction saturates rather than
+    // wrapping when a scrape lands between the two figures moving.
+    MetricsSnapshot const saturated { .storage = std::nullopt,
+                                      .storageTiers = {},
+                                      .host = HostCapacity { .configuredSlots = 2, .busySlots = 9 },
+                                      .uptime = {} };
+    auto const busy = NodeSampleFrom(metrics, saturated);
+    CHECK(busy[static_cast<std::size_t>(Distributed::FleetMetric::OfferableSlots)] == 0);
+    CHECK(busy[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] == 9);
 }
 
 TEST_CASE("The sampler records only while this node leads", "[node][admin][fleethistory]")
@@ -572,7 +664,7 @@ TEST_CASE("The sampler records only while this node leads", "[node][admin][fleet
     Distributed::SchedulerService scheduler { clock, metrics };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
-    FleetSampler sampler { sources, wall, {}, logger };
+    FleetSampler sampler { sources, metrics, NodeFacts(), wall, {}, logger };
 
     scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
     // A follower's registry holds whatever registered against *it*, so a sample
@@ -594,6 +686,9 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
 {
     Testing::ScratchDirectory const scratch { "fleet-sampler-durable" };
     auto const file = scratch.Path() / "history.bin";
+    auto const nodeFile = scratch.Path() / "node-history.bin";
+    auto const receivedFile = scratch.Path() / "received-history.bin";
+    HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
 
     ManualClock clock;
     AtomicMetricsSink metrics;
@@ -604,16 +699,119 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     {
-        FleetSampler sampler { sources, wall, file, logger };
+        FleetSampler sampler { sources, metrics, NodeFacts(), wall, paths, logger };
         CHECK(sampler.Durable());
+        CHECK_FALSE(sampler.History().ReadOnly());
         REQUIRE(sampler.SampleOnce());
         // Written by the destructor, so a clean shutdown does not throw away what
         // the page will be asked about the moment the node comes back.
     }
     REQUIRE(std::filesystem::exists(file));
 
-    FleetSampler restored { sources, wall, file, logger };
+    FleetSampler restored { sources, metrics, NodeFacts(), wall, paths, logger };
     CHECK_FALSE(restored.History().Empty());
+}
+
+TEST_CASE("What the other machines handed over survives a leader restart", "[node][admin][fleethistory]")
+{
+    // A node advances its own watermark once a heartbeat is accepted and never
+    // resends, so a leader that forgot this would leave those windows a gap for as
+    // long as the rings hold them -- the failure the handover exists to remove,
+    // reintroduced by a restart.
+    Testing::ScratchDirectory const scratch { "fleet-sampler-received" };
+    auto const file = scratch.Path() / "history.bin";
+    auto const nodeFile = scratch.Path() / "node-history.bin";
+    auto const receivedFile = scratch.Path() / "received-history.bin";
+    HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
+
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    // One closed bucket, as a heartbeat would carry it -- in a window this leader
+    // cannot itself have sampled. The sampler's own thread records the CURRENT
+    // minute the moment it starts, and a window the leader sampled is deliberately
+    // left alone by the backfill, so placing this one there made the assertion a
+    // race against that thread rather than a test of the handover.
+    auto const minute = Testing::MinuteBucketStart(wall.Now()) - (3 * 60'000);
+    auto bucket = Testing::ClosedBucket(minute);
+    bucket.values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] = 7;
+
+    {
+        FleetSampler sampler { sources, metrics, NodeFacts(), wall, paths, logger };
+        CHECK(sampler.Received().AcceptHistory("10.0.0.4:6676", std::span { &bucket, 1 }) == 1);
+    }
+    REQUIRE(std::filesystem::exists(receivedFile));
+
+    FleetSampler restored { sources, metrics, NodeFacts(), wall, paths, logger };
+    CHECK(restored.Received().Count() == 1);
+    // The mark as well as the readings: without it the batch a node resends after a
+    // reply it never saw would be counted a second time.
+    CHECK(restored.Received().HighWaterFor("10.0.0.4:6676") == minute);
+    CHECK(restored.Received().AcceptHistory("10.0.0.4:6676", std::span { &bucket, 1 }) == 0);
+
+    // And it reaches the view the page draws, which is the only reason it is kept.
+    auto const merged = restored.Buckets(Distributed::FleetRange::OneHour);
+    auto const filled =
+        std::ranges::find_if(merged, [](Distributed::FleetBucket const& each) { return each.present && each.backfilled; });
+    REQUIRE(filled != merged.end());
+    CHECK(filled->values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] == 7);
+}
+
+TEST_CASE("A node with no scheduler still records itself", "[node][admin][fleethistory]")
+{
+    // A pure worker runs no dashboard and often no admin endpoint at all, and it is
+    // exactly the machine doing the compiles. A sampler that existed only alongside a
+    // page would leave the fleet's year with a hole where its busiest members should
+    // be -- and the hole would be invisible, because the leader's own series would
+    // still be complete for every window it was elected for.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock const wall;
+
+    FleetSampler sampler { std::nullopt, metrics, NodeFacts(3, 8), wall, HistoryPaths {}, logger };
+
+    // False, because there is no fleet to answer for -- and the node series is
+    // recorded anyway, which is the whole distinction.
+    CHECK_FALSE(sampler.SampleOnce());
+    CHECK_FALSE(sampler.NodeHistory().Empty());
+    CHECK(sampler.History().Empty());
+
+    // And it has something to hand over, which is the point of recording it.
+    CHECK(sampler.NextHistoryBatch(8).empty()); // nothing has closed yet
+}
+
+TEST_CASE("A batch is offered again until a heartbeat takes it", "[node][admin][fleethistory]")
+{
+    // The cursor sits on the sampler rather than in the heartbeat loop, so this is
+    // a case rather than something only running the program could show.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    Testing::PlacedWallClock wall;
+
+    FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
+
+    // Recorded the way the node does it, then a minute on so the window has closed.
+    // Only a closed bucket may travel: an open one is a partial window the leader
+    // could never be told to correct.
+    REQUIRE_FALSE(sampler.SampleOnce());
+    wall.Advance(std::chrono::minutes { 1 });
+    REQUIRE_FALSE(sampler.SampleOnce());
+
+    auto const offered = sampler.NextHistoryBatch(8);
+    REQUIRE(offered.size() == 1);
+    // Offered again: nothing has taken it, and a round where every heartbeat failed
+    // must not step over a batch that was never sent.
+    CHECK(sampler.NextHistoryBatch(8).size() == 1);
+
+    sampler.HistoryHandedThrough(offered.back().startMillis);
+    CHECK(sampler.NextHistoryBatch(8).empty());
 }
 
 TEST_CASE("The history path follows the directories a node already has", "[node][admin][fleethistory]")
@@ -625,6 +823,12 @@ TEST_CASE("The history path follows the directories a node already has", "[node]
 
     cfg.cacheDir = "/var/lib/fastcache";
     CHECK(FleetHistoryPath(cfg) == std::filesystem::path { "/var/lib/fastcache" } / "fleet-history.bin");
+    // Every file the node keeps comes out of the one table, so a third of them
+    // cannot end up derived by string surgery on a second's answer.
+    auto const paths = HistoryPaths::For(cfg);
+    CHECK(paths.fleet == std::filesystem::path { "/var/lib/fastcache" } / "fleet-history.bin");
+    CHECK(paths.node == std::filesystem::path { "/var/lib/fastcache" } / "node-history.bin");
+    CHECK(paths.received == std::filesystem::path { "/var/lib/fastcache" } / "received-history.bin");
 
     // The cluster directory wins: the history is a leader's record, and a leader is
     // a cluster member.
@@ -650,12 +854,11 @@ struct ChartFixture
     {
         scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
         Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
-        sampler = std::make_unique<FleetSampler>(sources, wall, std::filesystem::path {}, logger);
+        sampler = std::make_unique<FleetSampler>(sources, metrics, NodeFacts(), wall, HistoryPaths {}, logger);
         REQUIRE(sampler->SampleOnce());
-        routes = MakeFleetRoutes(sources,
-                                 AdminCredential {},
-                                 DashboardRefreshSeconds,
-                                 FleetHistorySource { .history = &sampler->History(), .durable = false });
+        // Through the view the production wiring uses, so a route drawing the raw
+        // series would fail here rather than on the leader that lost an election.
+        routes = MakeFleetRoutes(sources, AdminCredential {}, DashboardRefreshSeconds, sampler.get());
     }
 
     [[nodiscard]] AdminResponse Get(std::string_view path, std::string_view query = {}, std::string_view etag = {}) const
@@ -728,6 +931,26 @@ TEST_CASE("A chart revalidates with If-None-Match and is told 304", "[node][admi
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=24h&theme=dark", tag).status == "200 OK");
 }
 
+TEST_CASE("The page draws what the other machines handed over", "[node][admin][chart][fleethistory]")
+{
+    // The assertion the whole handover exists for, taken through a ROUTE rather than
+    // through the sampler. Filled, persisted and restored, this was still invisible
+    // while the routes were handed the raw fleet series -- so the wiring is what has
+    // to be asserted, not the merge.
+    ChartFixture fixture;
+
+    // A window this leader has no reading for: it sampled once, at "now".
+    auto const missed = Testing::MinuteBucketStart(fixture.wall.Now()) - (3 * 60'000);
+    auto bucket = Testing::ClosedBucket(missed);
+    bucket.values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] = 4242;
+    REQUIRE(fixture.sampler->Received().AcceptHistory("10.0.0.7:6676", std::span { &bucket, 1 }) == 1);
+
+    auto const response = fixture.Get("/fleet/series.json", "range=1h");
+    CHECK(response.status == "200 OK");
+    // The number one machine reported for a window this leader was not elected for.
+    CHECK(response.body.contains("4242"));
+}
+
 TEST_CASE("An unknown range is refused rather than quietly served as another", "[node][admin][chart]")
 {
     ChartFixture const fixture;
@@ -739,6 +962,44 @@ TEST_CASE("An unknown range is refused rather than quietly served as another", "
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").status == "400 Bad Request");
 
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "theme=solarized").status == "200 OK");
+
+    // And the refusal NAMES what it would accept, off the table rather than out of a
+    // sentence: two windows were hand-listed here while eight were served, so the one
+    // message a reader who just guessed wrong actually reads was the stalest thing on
+    // the surface.
+    for (auto const& row: Distributed::FleetRangeTable)
+    {
+        INFO("range " << row.key);
+        CHECK(fixture.Get("/fleet", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet/series.json", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").body.contains(row.key));
+        // ...and each of them is genuinely served, or naming it is worse than not.
+        CHECK(fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key)).status == "200 OK");
+    }
+}
+
+TEST_CASE("A long range is not cached past its next sample", "[node][admin][chart]")
+{
+    ChartFixture const fixture;
+
+    // `max-age` used to be "until this bucket closes", which is how long the chart's
+    // SHAPE is settled rather than how long it is current: the newest bucket is
+    // always still open and gains a reading every sample. On a five-minute bucket
+    // that was four minutes of staleness; on the twelve-month view, whose buckets are
+    // a day wide, it was a chart frozen in the browser for twenty-four hours while
+    // the fleet moved underneath it.
+    constexpr std::int64_t SampleSeconds = 60;
+    for (auto const& row: Distributed::FleetRangeTable)
+    {
+        INFO("range " << row.key);
+        auto const response = fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key));
+        REQUIRE(response.status == "200 OK");
+        auto const control = std::string { ChartFixture::HeaderValue(response, "Cache-Control: ") };
+        REQUIRE(control.starts_with("max-age="));
+        auto const seconds = std::stoll(control.substr(std::string_view { "max-age=" }.size()));
+        CHECK(seconds >= 1);
+        CHECK(seconds <= SampleSeconds);
+    }
 }
 
 TEST_CASE("The series behind the charts are served as JSON", "[node][admin][chart]")
@@ -776,4 +1037,97 @@ TEST_CASE("The page carries the range control and one image per chart", "[node][
     CHECK_FALSE(page.body.contains(R"(src="http)"));
     CHECK_FALSE(page.body.contains(R"(href="http)"));
     CHECK_FALSE(page.body.contains("@import"));
+}
+
+TEST_CASE("A history a newer build wrote stops the sampler promising durability", "[node][admin][fleethistory]")
+{
+    // The page says a durable history is "written to disk, so it survives a restart".
+    // A node holding a file a LATER build wrote persists nothing at all, so saying
+    // that would contradict the warning printed beside it at startup -- and an
+    // operator reading the page would have no reason to go looking for the warning.
+    Testing::ScratchDirectory const scratch { "fleet-sampler-readonly" };
+    auto const file = scratch.Path() / "history.bin";
+    auto const nodeFile = scratch.Path() / "node-history.bin";
+    auto const receivedFile = scratch.Path() / "received-history.bin";
+    HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
+
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    {
+        FleetSampler writer { sources, metrics, NodeFacts(), wall, paths, logger };
+        REQUIRE(writer.SampleOnce());
+    }
+    REQUIRE(std::filesystem::exists(file));
+
+    // Raise the version byte to something no reader claims; everything else stays
+    // valid, so nothing but the version can be what refuses it.
+    {
+        std::fstream patch { file, std::ios::binary | std::ios::in | std::ios::out };
+        patch.seekp(4);
+        patch.put(static_cast<char>(200));
+    }
+    auto const before = [&] {
+        std::ifstream in { file, std::ios::binary };
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        return buffer.str();
+    }();
+
+    {
+        FleetSampler sampler { sources, metrics, NodeFacts(), wall, paths, logger };
+        CHECK(sampler.History().ReadOnly());
+        CHECK_FALSE(sampler.Durable());
+        // Sampling continues -- the page is live either way, and only persistence
+        // stops.
+        CHECK(sampler.SampleOnce());
+        CHECK_FALSE(sampler.History().Empty());
+    }
+
+    // Left byte-identical, including by the destructor's own save.
+    std::ifstream in { file, std::ios::binary };
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    CHECK(buffer.str() == before);
+}
+
+TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
+{
+    // The point of the split. Sampling used to stop entirely the moment a node lost
+    // an election, so a machine's year of history belonged to whichever peer happened
+    // to be leading -- and one election left the page showing a different machine's
+    // partial record with nothing saying so.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    SystemWallClock const wall;
+    Distributed::SchedulerService scheduler { clock, metrics };
+    Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
+
+    for ([[maybe_unused]] auto const hit: std::views::iota(0, 70))
+        metrics.Increment(IMetricsSink::Counter::NodeCacheHits);
+    FleetSampler sampler { sources, metrics, NodeFacts(3, 8), wall, {}, logger };
+
+    // A follower: no fleet sample, and `SampleOnce` says so.
+    CHECK_FALSE(sampler.SampleOnce());
+    CHECK(sampler.History().Empty());
+    // ...but its own contribution is recorded regardless, because what this
+    // machine's cache did is a fact about this machine whoever leads.
+    CHECK_FALSE(sampler.NodeHistory().Empty());
+
+    auto const own = sampler.NodeHistory().Buckets(Distributed::FleetRange::Day);
+    REQUIRE_FALSE(own.empty());
+    CHECK(own.back().values[static_cast<std::size_t>(Distributed::FleetMetric::CacheHits)] == 70);
+    CHECK(own.back().values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] == 3);
+
+    // Becoming leader adds the fleet series without disturbing the node one.
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    CHECK(sampler.SampleOnce());
+    CHECK_FALSE(sampler.History().Empty());
+    CHECK_FALSE(sampler.NodeHistory().Empty());
 }

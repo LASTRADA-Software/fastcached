@@ -3,6 +3,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -14,8 +15,10 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <tests/FleetHistoryFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -358,7 +361,8 @@ TEST_CASE("A heartbeat's load reaches the registry and changes what is picked", 
     auto const beat = Wire::EncodeHeartbeat(
         live[0].id,
         0,
-        Wire::LoadFields { .cpuBusyPermille = std::nullopt, .availableMemoryBytes = std::nullopt, .freeScratchBytes = 0 });
+        Wire::LoadFields {
+            .cpuBusyPermille = std::nullopt, .availableMemoryBytes = std::nullopt, .freeScratchBytes = 0, .history = {} });
     REQUIRE(StatusOf(fixture.protocol.Answer(beat, Insider)) == Wire::Status::Ok);
 
     // `Withdrawn`, not `NoCapacity`: the worker has seven of its eight slots free and
@@ -574,11 +578,13 @@ TEST_CASE("The cache facts cross the wire inside REGISTER and HEARTBEAT", "[dist
     usage.hits = 4000;
     usage.misses = 100;
 
-    auto const heartbeat = Wire::EncodeHeartbeat(
-        std::string { registered[0].id },
-        0,
-        Wire::LoadFields {
-            .cpuBusyPermille = 100, .availableMemoryBytes = 1, .freeScratchBytes = 2, .cache = CacheLoadToWire(usage) });
+    auto const heartbeat = Wire::EncodeHeartbeat(std::string { registered[0].id },
+                                                 0,
+                                                 Wire::LoadFields { .cpuBusyPermille = 100,
+                                                                    .availableMemoryBytes = 1,
+                                                                    .freeScratchBytes = 2,
+                                                                    .cache = CacheLoadToWire(usage),
+                                                                    .history = {} });
     REQUIRE(StatusOf(fixture.protocol.Answer(heartbeat, Insider)) == Wire::Status::Ok);
 
     auto const beating = fixture.service.Workers().LiveWorkers();
@@ -591,6 +597,52 @@ TEST_CASE("The cache facts cross the wire inside REGISTER and HEARTBEAT", "[dist
     // The budget is a REGISTRATION fact and survives a heartbeat that says nothing
     // about it, which is the reason it does not travel on every one.
     CHECK(beating[0].capacity.cache.tierBytesLimit == budget.tierBytesLimit);
+}
+
+TEST_CASE("A heartbeat's history reaches the sink across the wire", "[distributed][scheduler][protocol][fleethistory]")
+{
+    // The last unproven link. Encoding and decoding are tested against each other in
+    // `CompileCacheWire_test`, and the routing in `SchedulerService_test`; this is
+    // the one case where a node's buckets travel as bytes and come out somewhere a
+    // dashboard could draw them.
+    Fixture fixture;
+    Testing::RecordingHistorySink sink;
+    fixture.service.SetHistorySink(&sink);
+
+    auto const registration = Wire::EncodeRegister(
+        Wire::RegisterRequest { .fingerprint = "gcc-14", .endpoint = "10.0.0.2:7100", .slots = 1, .acceptedCodecs = {} });
+    REQUIRE(StatusOf(fixture.protocol.Answer(registration, Insider)) == Wire::Status::Ok);
+    auto const live = fixture.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+
+    auto bucket = Testing::ClosedBucket(1'767'225'600'000);
+    // A sample instant that is NOT the window's start, which is the whole reason it
+    // travels: a rate is divided by the distance between two samples.
+    bucket.sampleMillis = bucket.startMillis + 421;
+    bucket.values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] = 5;
+
+    auto const beat = Wire::EncodeHeartbeat(std::string { live[0].id },
+                                            0,
+                                            Wire::LoadFields { .cpuBusyPermille = std::nullopt,
+                                                               .availableMemoryBytes = std::nullopt,
+                                                               .freeScratchBytes = std::nullopt,
+                                                               .history = HistoryToWire(std::span { &bucket, 1 }) });
+    REQUIRE(StatusOf(fixture.protocol.Answer(beat, Insider)) == Wire::Status::Ok);
+
+    REQUIRE(sink.calls.size() == 1);
+    auto const& [endpoint, arrived] = sink.calls.front();
+    CHECK(endpoint == "10.0.0.2:7100");
+    REQUIRE(arrived.size() == 1);
+    CHECK(arrived[0].startMillis == bucket.startMillis);
+    // The instant as well as the window: a rate is divided by the distance between
+    // two SAMPLES, and a bucket that lost it would report a nominal width instead.
+    CHECK(arrived[0].sampleMillis == bucket.sampleMillis);
+    CHECK(arrived[0].values[static_cast<std::size_t>(FleetMetric::JobsInFlight)] == 5);
+    // Nothing a receiver can recompute travels: the fold and the coverage are both
+    // rebuilt by replaying these readings at these instants, which is what
+    // `FleetNodeHistories::Accept` does with them.
+    CHECK(arrived[0].coverage == 0);
+    CHECK(arrived[0].fold[static_cast<std::size_t>(FleetMetric::JobsInFlight)].high == 0);
 }
 
 TEST_CASE("A peer that predates the cache record still registers", "[distributed][scheduler][protocol][cache]")

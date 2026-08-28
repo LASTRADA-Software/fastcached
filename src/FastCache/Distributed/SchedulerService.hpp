@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
@@ -151,6 +152,16 @@ class SchedulerService
     /// @param metrics Counts the outcomes below; must outlive the service.
     SchedulerService(IClock& clock, IMetricsSink& metrics) noexcept;
 
+    /// Where a node's handed-over history goes, or null to discard it.
+    ///
+    /// A setter rather than a constructor parameter for the reason `SetRole` is one:
+    /// the sink lives in the admin surface, which is built after the scheduler it
+    /// reads from. Null is the ordinary state for a node with no dashboard, and
+    /// discarding is then correct rather than a failure -- nothing would ever read
+    /// what was kept.
+    /// @param sink Where to route it; must outlive this service.
+    void SetHistorySink(IFleetHistorySink* sink) noexcept;
+
     /// Publish this node's current standing in the cluster.
     ///
     /// Called by the consensus driver whenever leadership moves. Kept as a setter
@@ -195,7 +206,13 @@ class SchedulerService
     /// @param workerId The id handed back by `Register`.
     /// @param load The worker's own account of its job count and its machine.
     /// @return `Ok`, or a refusal.
-    [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller, std::string_view workerId, NodeLoad const& load);
+    /// @param history Closed buckets this node is handing over, oldest first. Routed
+    ///                 to the sink under the worker's ENDPOINT, and dropped when
+    ///                 there is no sink.
+    [[nodiscard]] SchedulerReply Heartbeat(CallerContext const& caller,
+                                           std::string_view workerId,
+                                           NodeLoad const& load,
+                                           std::span<FleetBucket const> history = {});
 
     /// Pick a worker and authorize one job on it.
     /// @param caller Who is asking.
@@ -332,6 +349,9 @@ class SchedulerService
     }
 
   private:
+    /// Where handed-over history goes; null until the admin surface sets one.
+    IFleetHistorySink* _history { nullptr };
+
     /// The two gates every verb passes, in the order that costs least to answer.
     ///
     /// One function rather than a pair of checks repeated three times: these are the

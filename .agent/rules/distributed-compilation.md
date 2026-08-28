@@ -592,6 +592,42 @@ registry means the answer comes from the clock it was injected with; it clamps a
 zero, because a manual clock can legitimately be set backwards and an unsigned
 duration would otherwise read as several hundred million years.
 
+**Nothing a receiver can RECOMPUTE travels on the wire.** A node hands its closed
+buckets over on the heartbeat it already sends, and the record carries two instants
+and the readings -- no fold and no coverage. The leader replays those readings at
+those instants to fold them into its own rings, so it rebuilds both anyway; carrying
+either would be a second answer to a question already answered, and the one a decoder
+trusted would be the one nothing kept correct. A counter's peak is a RATE and cannot
+be recovered from a single reading, which is the tempting reason to send it -- but it
+*can* be recovered from the SEQUENCE, and the sequence is what travels.
+
+**Handed-over history is filed under the MACHINE, never the worker id.** A host with
+two `--toolchain` flags registers twice and heartbeats the same figures twice, so
+keying per registry entry holds one machine's series once per toolchain and sums it
+that many times -- the rule `WorkerRegistry::NodeCaches()` already exists to enforce
+on the neighbouring number. `Heartbeat` therefore returns the endpoint rather than a
+bool, which also removes the second lookup and the expiry gap in the middle of it.
+A heartbeat from a worker the scheduler does not know is refused and routes nothing:
+the refusal is what tells the node to register again, and the endpoint it would be
+filed under comes from the very entry that is missing.
+
+**The wire carries no acknowledgement, and needs none.** The leader keeps a
+high-water mark per endpoint, so a batch redelivered after a reply the node never saw
+is ignored there rather than counted twice. The node's own cursor is the other half:
+it advances **only when the verb that carried the batch succeeded**. `accepted` also
+counts a *registration*, which carries no history at all, so a round where every
+heartbeat failed and one re-register succeeded stepped the cursor over a batch that
+was never sent. The cursor lives on the sampler beside the series it indexes, not as
+a bare integer in `main()` that only running the program could exercise.
+
+**A leader persists what it was handed, and that is not an optimisation.** A node
+advances its watermark once and never resends, so a leader that forgot what it had
+been handed leaves those windows a gap for as long as the rings hold them -- the
+exact failure the handover exists to remove, reintroduced by a restart. The store
+nests one `FleetHistory` body per machine, written by the code that reads it back: a
+second copy of the ring encoding drifts the first time a bucket grows a field, and
+drifts *silently*, because both halves still round-trip against themselves.
+
 **A worker discovers the machine's compilers; `--toolchain` narrows that, and does
 not supply it.** `--toolchain` was required and had no default, which meant
 `packaging/` shipped a worker that could not start: the Linux unit reads an env file

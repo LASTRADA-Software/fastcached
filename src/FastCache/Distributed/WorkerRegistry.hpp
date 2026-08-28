@@ -299,10 +299,18 @@ class WorkerRegistry
     /// the registry's counter drifts whenever a client dies between leasing and
     /// compiling, and only the worker knows what it is actually running. A
     /// heartbeat is therefore also a correction.
+    /// The ENDPOINT comes back rather than a bare yes, because a heartbeat may carry
+    /// history and a history is kept per machine, never per registry entry -- a
+    /// worker with two `--toolchain` flags is two ids against one endpoint. Looking
+    /// it up again afterwards would be a second lookup with a gap in the middle, and
+    /// a worker expiring in that gap would drop a batch the node has already stopped
+    /// resending.
+    ///
     /// @param workerId The id from `Register`.
     /// @param load What the worker reports about itself, its job count included.
-    /// @return False when the id is unknown (the worker should re-register).
-    [[nodiscard]] bool Heartbeat(std::string_view workerId, NodeLoad const& load);
+    /// @return Its endpoint, or nullopt when the id is unknown (the worker should
+    ///         re-register).
+    [[nodiscard]] std::optional<std::string> Heartbeat(std::string_view workerId, NodeLoad const& load);
 
     /// Pick the least-loaded live worker whose fingerprint matches exactly.
     ///

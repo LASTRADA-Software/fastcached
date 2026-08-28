@@ -13,6 +13,9 @@
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -26,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 // Under TLS the surface below OWNS a context, so the complete type is needed for
 // its deleter; without it the class is only ever a pointer that is always null,
@@ -125,18 +129,73 @@ struct NodeScrapeSources
 /// point of view: what to read, and what the page should tell an operator about how
 /// long it will last. `history` is null on a build that keeps none, and the page
 /// then simply has no charts -- which is a legitimate way to run and not a failure.
-struct FleetHistorySource
+/// Which of a node's history files.
+///
+/// Its own enum rather than `FleetMetricScope`: a scope answers "can a machine claim
+/// this about itself", and the received store is not a scope at all. Three files
+/// against two scopes is how a third path came to be spelled outside the table that
+/// exists to hold every one of them.
+enum class HistoryFile : std::uint8_t
 {
-    /// Where samples are kept. Null when nothing samples.
-    Distributed::FleetHistory const* history {};
-    /// Whether that record is written to disk and so survives a restart.
-    bool durable { false };
+    Node = 0, ///< This machine's own series.
+    Fleet,    ///< The fleet-wide series, recorded while leading.
+    Received, ///< What every other machine handed over.
+    Last
+};
+
+/// Where one of a node's history files lives.
+///
+/// One row per file, so a fourth is a row here rather than a path spelled somewhere
+/// nobody looks.
+/// @param cfg The parsed configuration.
+/// @param which Which file.
+/// @return The path, or empty when this node keeps no state directory.
+[[nodiscard]] std::filesystem::path HistoryPathFor(NodeConfig const& cfg, HistoryFile which);
+
+/// Every history path a node keeps, so the sampler takes one argument rather than three.
+struct HistoryPaths
+{
+    std::filesystem::path fleet;    ///< The fleet-wide series.
+    std::filesystem::path node;     ///< This machine's own series.
+    std::filesystem::path received; ///< What the other machines handed over.
+
+    /// Every path this configuration names.
+    /// @param cfg The parsed configuration.
+    /// @return The three, each empty when this node keeps no state directory.
+    [[nodiscard]] static HistoryPaths For(NodeConfig const& cfg);
+};
+
+class IFleetHistoryView
+{
+  public:
+    IFleetHistoryView() = default;
+    virtual ~IFleetHistoryView() = default;
+    IFleetHistoryView(IFleetHistoryView const&) = delete;
+    IFleetHistoryView& operator=(IFleetHistoryView const&) = delete;
+    IFleetHistoryView(IFleetHistoryView&&) = delete;
+    IFleetHistoryView& operator=(IFleetHistoryView&&) = delete;
+
+    /// The buckets a view renders, with the windows this leader missed filled in.
+    /// @param range Which window.
+    /// @return The buckets, oldest first.
+    [[nodiscard]] virtual std::vector<Distributed::FleetBucket> Buckets(Distributed::FleetRange range) const = 0;
+
+    /// How many buckets have closed, which is what an `ETag` is made of.
+    [[nodiscard]] virtual std::uint64_t Generation() const = 0;
+
+    /// How long the newest bucket of a view stays open, which bounds `max-age`.
+    /// @param range Which window.
+    /// @return The time until its shape is settled.
+    [[nodiscard]] virtual std::chrono::seconds UntilBucketCloses(Distributed::FleetRange range) const = 0;
+
+    /// Whether this record is written to disk and so survives a restart.
+    [[nodiscard]] virtual bool Durable() const = 0;
 };
 
 [[nodiscard]] std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                                       AdminCredential const& credential,
                                                       unsigned refreshSeconds,
-                                                      FleetHistorySource history = {});
+                                                      IFleetHistoryView const* history = nullptr);
 
 /// Samples the fleet on a timer, for as long as this node LEADS it.
 ///
@@ -149,7 +208,7 @@ struct FleetHistorySource
 /// The loop is interruptible. A stop that waits out a full interval makes teardown
 /// look hung, which this repository has already paid for once as a `systemctl stop`
 /// escalating to SIGKILL.
-class FleetSampler
+class FleetSampler final: public IFleetHistoryView
 {
   public:
     /// How often the ring is written back, while sampling.
@@ -159,30 +218,123 @@ class FleetSampler
     static constexpr auto SaveInterval = std::chrono::minutes { 5 };
 
     /// Start sampling.
-    /// @param sources What to read; the same bundle the routes collect from.
+    ///
+    /// THREE stores, because they answer different questions and only one of them
+    /// has a leader. The fleet series is the scheduler's own -- dispatch outcomes
+    /// nobody but a leader produces. The node series is this machine's cache and
+    /// slots, which are facts about it whoever leads; sampling only while leading is
+    /// why the record used to change machine under an election. The received store
+    /// holds what every OTHER machine handed over, which is what fills the windows
+    /// this leader was not elected for.
+    ///
+    /// @param sources What the fleet series reads, or nullopt on a node with no
+    ///                scheduler -- it then records itself and nothing else.
+    /// @param metrics Where the node series reads its counters.
+    /// @param node What the node series reads: the same provider `/metrics` scrapes,
+    ///             so the two cannot disagree about the machine they describe.
     /// @param wall Where a bucket's timestamp comes from.
-    /// @param path Where to keep the history, or empty for memory-only.
+    /// @param paths Where each store is kept; any of them empty is memory-only.
     /// @param logger Shared logger.
-    FleetSampler(Distributed::FleetSources sources, IWallClock const& wall, std::filesystem::path path, ILogger& logger);
+    FleetSampler(std::optional<Distributed::FleetSources> sources,
+                 IMetricsSink const& metrics,
+                 AdminHttpServer::SnapshotProvider node,
+                 IWallClock const& wall,
+                 HistoryPaths paths,
+                 ILogger& logger);
 
-    /// Stops the thread and writes the ring out one last time.
-    ~FleetSampler();
+    /// Stops the thread and writes every store out one last time.
+    ~FleetSampler() override;
 
     FleetSampler(FleetSampler const&) = delete;
     FleetSampler& operator=(FleetSampler const&) = delete;
     FleetSampler(FleetSampler&&) = delete;
     FleetSampler& operator=(FleetSampler&&) = delete;
 
-    /// What the routes read.
+    /// What the routes read: the fleet-wide series.
+    ///
+    /// The dashboard is the leader's page and shows the fleet, so this is the one the
+    /// charts draw. A follower's copy stays empty, which is the truth about what it
+    /// can see.
     [[nodiscard]] Distributed::FleetHistory const& History() const noexcept
     {
-        return _history;
+        return _fleet;
     }
 
-    /// Whether the ring is written to disk.
-    [[nodiscard]] bool Durable() const noexcept
+    /// What the other machines handed over.
+    ///
+    /// The leader's half of the handover, and what makes a fleet's record survive an
+    /// election: its own fleet series covers only the windows it was leading for,
+    /// and these cover the rest.
+    [[nodiscard]] Distributed::FleetNodeHistories& Received() noexcept
     {
-        return !_path.empty();
+        return _received;
+    }
+
+    /// The next batch of this machine's closed buckets to hand over.
+    ///
+    /// The cursor lives HERE rather than in the heartbeat loop, beside the series it
+    /// indexes: a bare `std::int64_t` in `main()` is owned by nothing, cannot be
+    /// tested without running the program, and is the same shape as the expiry
+    /// sweep's resume cursor, which sits on the thing being swept for the same
+    /// reason.
+    /// @param limit The most buckets one heartbeat may carry.
+    /// @return The oldest unsent closed buckets, oldest first.
+    [[nodiscard]] std::vector<Distributed::FleetBucket> NextHistoryBatch(std::size_t limit) const;
+
+    /// Move the cursor past what a scheduler took.
+    ///
+    /// Called ONLY when a heartbeat carrying the batch was accepted. A round where
+    /// every heartbeat failed leaves the mark where it was, so the next round offers
+    /// the same buckets rather than stepping over them -- and a registration that
+    /// succeeded in the same round is not an acceptance of anything, because a
+    /// REGISTER carries no history.
+    /// @param startMillis The newest bucket start that was handed over.
+    void HistoryHandedThrough(std::int64_t startMillis) noexcept;
+
+    /// `IFleetHistoryView`: the fleet view, with the windows this leader missed
+    /// filled in from what the other machines handed over.
+    ///
+    /// The one place the two halves meet, and the ONLY way a route reaches either --
+    /// which is the point of the interface. Given the raw series a route would
+    /// quietly draw a gap that has been recoverable all along, and the whole
+    /// handover would be filled, persisted, restored and never seen.
+    /// @param range Which view.
+    /// @return The buckets, backfilled where this leader has no reading.
+    [[nodiscard]] std::vector<Distributed::FleetBucket> Buckets(Distributed::FleetRange range) const override;
+
+    /// `IFleetHistoryView`: the fleet series' generation.
+    [[nodiscard]] std::uint64_t Generation() const override
+    {
+        return _fleet.Generation();
+    }
+
+    /// `IFleetHistoryView`: how long the newest bucket of a view stays open.
+    /// @param range Which view.
+    /// @return The time until its shape is settled.
+    [[nodiscard]] std::chrono::seconds UntilBucketCloses(Distributed::FleetRange range) const override
+    {
+        return _fleet.UntilBucketCloses(range);
+    }
+
+    /// This machine's own series, recorded whether or not it leads.
+    ///
+    /// What a node contributes rather than what the fleet did, and the half that
+    /// survives an election -- the leader's view of the fleet is rebuilt from these.
+    [[nodiscard]] Distributed::FleetHistory const& NodeHistory() const noexcept
+    {
+        return _node;
+    }
+
+    /// `IFleetHistoryView`: whether EVERY store is written to disk.
+    ///
+    /// Every one of them, because the page says "written to disk, so it survives a
+    /// restart" and a store holding a file a NEWER build wrote persists nothing at
+    /// all. A path alone would have the page contradicting the startup warning
+    /// beside it, and one store persisting while the others do not is not "durable"
+    /// either.
+    [[nodiscard]] bool Durable() const override
+    {
+        return std::ranges::all_of(_stores, [](Store const& each) { return !each.path.empty() && !each.readOnly(); });
     }
 
     /// Take one sample now, whatever the timer is doing.
@@ -190,22 +342,54 @@ class FleetSampler
     /// The seam a test drives instead of waiting a minute for the thread: every
     /// rule about *what* a sample holds is then a case over a scripted registry
     /// rather than a sleep.
-    /// @return True when a sample was taken; false when this node does not lead.
+    /// The NODE series is recorded either way; the return value is about the fleet
+    /// one, which only a leader can answer for.
+    /// @return True when a fleet sample was taken; false when this node does not lead.
     bool SampleOnce();
 
   private:
+    /// One persisted store: where it is written, what to call it, how to move it.
+    ///
+    /// Behaviour by function rather than by pointer-to-history, because the third
+    /// store is a MAP of histories rather than one. The alternative was a hand
+    /// written arm beside the loop, which is how a store comes to be restored and
+    /// never saved -- discovered a year later, at a restart. Restoring at
+    /// construction and saving on the timer walk exactly this list, so a fourth
+    /// store is a row.
+    struct Store
+    {
+        std::filesystem::path path;                             ///< Empty means memory-only.
+        std::string_view what;                                  ///< What a log line calls it.
+        std::function<bool(std::filesystem::path const&)> load; ///< Restore it.
+        std::function<bool(std::filesystem::path const&)> save; ///< Write it out.
+        std::function<bool()> readOnly;                         ///< A later build wrote the file.
+        std::function<bool()> worthWriting;                     ///< There is something to write.
+    };
+
     void Persist();
 
-    Distributed::FleetSources _sources;
-    Distributed::FleetHistory _history;
-    std::filesystem::path _path;
+    /// What the fleet series reads, or nullopt on a node with no scheduler.
+    std::optional<Distributed::FleetSources> _sources;
+    IMetricsSink const& _metrics;
+    /// This machine's own facts, read the same way `/metrics` reads them.
+    AdminHttpServer::SnapshotProvider _nodeFacts;
+    Distributed::FleetHistory _fleet;
+    Distributed::FleetHistory _node;
+    Distributed::FleetNodeHistories _received;
+    /// The three, fleet first. Declared AFTER everything they reach into.
+    std::array<Store, 3> _stores;
+    /// How far this machine has handed its own series over; -1 before anything has.
+    ///
+    /// Atomic because the heartbeat thread moves it while the sampler thread writes
+    /// the series it indexes.
+    std::atomic<std::int64_t> _handedThrough { -1 };
     ILogger& _logger;
     std::mutex _wakeMutex;
     std::condition_variable_any _wake;
     std::jthread _thread;
 };
 
-/// Turn one fleet snapshot into the nine readings a sample holds.
+/// Turn one fleet snapshot into the FLEET-scoped readings a sample holds.
 ///
 /// Separate from the sampler so it is a pure function of a snapshot: which slot
 /// each number lands in is the part worth a unit test, and it needs no thread, no
@@ -213,6 +397,21 @@ class FleetSampler
 /// @param snapshot What `CollectFleet` returned.
 /// @return The readings, counters cumulative.
 [[nodiscard]] EnumTable<Distributed::FleetMetric, std::uint64_t> SampleFrom(Distributed::FleetSnapshot const& snapshot);
+
+/// Turn one metrics scrape into the NODE-scoped readings a sample holds.
+///
+/// From the same provider `/metrics` reads, so a machine cannot describe itself two
+/// ways -- the argument `NodeScrapeSources::host` already makes about a scrape and a
+/// registration. Node-scoped slots only; the rest stay zero, because a node that is
+/// not scheduling has not refused anything and must not say it refused nothing.
+///
+/// @param metrics Where this node's own cache counters are read -- the same ones
+///                `CacheTier::Snapshot` reports to the fleet, so one machine cannot
+///                be described two ways on one page.
+/// @param snapshot What this node reports about itself.
+/// @return The readings, node-scoped slots filled.
+[[nodiscard]] EnumTable<Distributed::FleetMetric, std::uint64_t> NodeSampleFrom(IMetricsSink const& metrics,
+                                                                                MetricsSnapshot const& snapshot);
 
 /// Where a node keeps its fleet history.
 ///
@@ -336,13 +535,6 @@ struct AdminSurface
     /// Server TLS context when a certificate was named, else null.
     std::unique_ptr<TlsContext> tls;
 #endif
-    /// The sampler, when this node serves a dashboard over a fleet.
-    ///
-    /// **Declared before `endpoint`, and that ordering is load-bearing**: the routes
-    /// hold a pointer into this history, and members are destroyed in reverse
-    /// declaration order -- so the endpoint (and the thread serving requests
-    /// through those routes) is torn down first.
-    std::unique_ptr<FleetSampler> sampler;
     /// The running endpoint. Null when the operator asked for no admin surface.
     std::unique_ptr<AdminEndpoint> endpoint;
 };
@@ -359,12 +551,19 @@ struct AdminSurface
 /// Fleet routes are contributed only when `fleet` is present. A node with no
 /// scheduler passes nullopt and `/fleet` is then a plain 404: a process with no
 /// fleet view offers no fleet route, rather than one answering with an empty fleet.
+///
+/// The sampler is NOT owned here, and that is the point: every node records its own
+/// series whether or not it serves a page, because a machine that records nothing is
+/// a machine the fleet's year has a hole for -- and a pure worker, which serves no
+/// admin surface at all, is exactly the machine doing the compiles.
 /// @param cfg The parsed configuration.
 /// @param host Where the machine's own facts come from, for a generated
 ///        certificate's subject names.
 /// @param metrics The sink `/metrics` renders.
 /// @param snapshot What to report per scrape.
 /// @param fleet What the dashboard reads, or nullopt to serve none.
+/// @param sampler Where the charts read their history, or null to draw none; must
+///        outlive the returned surface.
 /// @param logger Where to announce the bound address.
 /// @return The surface (whose endpoint is null when none was asked for), or why
 ///         it could not be served.
@@ -374,6 +573,7 @@ struct AdminSurface
     IMetricsSink& metrics,
     AdminHttpServer::SnapshotProvider snapshot,
     std::optional<Distributed::FleetSources> fleet,
+    FleetSampler const* sampler,
     ILogger& logger);
 
 } // namespace FastCache::Node

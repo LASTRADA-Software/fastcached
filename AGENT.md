@@ -45,8 +45,12 @@ src/FastCache/
                 MembershipPolicy — who is a member, WHERE they answer, and the
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
-                capacity decisions, all pure with respect to I/O; plus FleetView,
-                which renders what the leader can see as a page and as JSON
+                capacity decisions, all pure with respect to I/O; FleetSample
+                (the slot vocabulary and IFleetHistorySink, so the scheduler's
+                header carries no file format), FleetHistory (three rings, eight
+                views, one file envelope) and FleetNodeHistories (what every other
+                machine handed over); plus FleetView and FleetChart, which render
+                what the leader can see as a page, as SVG and as JSON
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
                 CompileCacheHandler (the 0xFC executor) and CompileCacheWire
@@ -364,13 +368,28 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
   gets no column.
 - A fleet total is computed over `NodeReports()`, never over registry entries.
+- Nothing a receiver can **recompute** travels: a handed-over bucket carries two
+  instants and the readings, and the leader rebuilds the fold and the coverage by
+  replaying them. History is filed under the **machine**, never the worker id.
+- A handover cursor advances only on the verb that carried the batch — `accepted`
+  also counts a registration, which carries no history at all.
 - A node's version is compiled in, rides REGISTER's *nested* capacity record (whose
   arity is variable) rather than its top level (whose arity is exact), and is
   refreshed on re-registration — a restart is what an upgrade looks like.
 - A history stores a counter **raw**; a rate is the delta at render, taken only
   between adjacent *present* buckets. A restart is then a gap, not a spike.
-- Sampling runs only while this node **leads**, and no state of the history file
-  may keep a node from starting.
+- A node records **itself** always; only the fleet-wide slots are leader-only, and
+  which is which is `FleetMetricTable`'s `scope` column. Every node samples whatever
+  surfaces it serves — a sampler owned by the admin surface left a pure worker, the
+  machine doing the compiles, recording nothing.
+- A **backfilled** window answers for a machine, never for the scheduler: its
+  fleet-scoped zeroes are not readings, and drawn as such they are a rate running
+  backwards and then a spike, neither of which happened.
+- The routes reach a history through **one** door (`IFleetHistoryView`), or the
+  backfill is filled, persisted, restored and never drawn. Assert the wiring.
+- No state of a history file may keep a node from starting — and a file a **later**
+  build wrote is kept and never written over, which is a property of the shared
+  envelope rather than of each store that remembers to copy it.
 - A chart served as its own resource inherits nothing from the page, so it carries
   its own palette and theme is part of its URL — and that URL carries no
   cache-buster, or the `304` never fires.

@@ -904,6 +904,10 @@ namespace
         FleetBucket bucket {};
         bucket.startMillis = index * 300'000;
         bucket.present = true;
+        // Fully observed, which is what a present bucket looks like on a node that
+        // was up for the whole window: `AccumulateInto` counts every sample folded
+        // in, so a present bucket always carries at least one.
+        bucket.coverage = FullCoverageOf(range);
         auto const set = [&bucket](FleetMetric metric, std::uint64_t value) {
             bucket.values[static_cast<std::size_t>(metric)] = value;
         };
@@ -1001,6 +1005,35 @@ TEST_CASE("Every chart the table names becomes a panel and its own image", "[dis
             CHECK(html.contains(std::format(R"(class="tone tone--{}")", series.colour)));
         }
     }
+}
+
+TEST_CASE("A window the fleet was only partly watched for is said so", "[distributed][fleetview][charts]")
+{
+    // A bucket observed for one minute of five is drawn exactly like one observed
+    // for all five -- the chart has no way to show the difference, so the page says
+    // it in words rather than leaving a reader to compare them like for like.
+    auto history = SomeHistory();
+    REQUIRE(history.buckets.size() > 2);
+    history.buckets[1].coverage = 1;
+
+    auto const html = RenderFleetHtml(LeadingSnapshot(), history, 0);
+    CHECK(html.contains("1 of 7 windows partly observed"));
+
+    // The NEWEST window is excluded, always. It is still filling and is partly
+    // covered by definition, so counting it would put a number on every live page
+    // that means nothing at all.
+    auto settled = SomeHistory();
+    settled.buckets.back().coverage = 1;
+    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), settled, 0).contains("partly observed"));
+
+    // A window this leader did not sample is excluded too, and for a sharper reason
+    // than the newest one: its coverage is the best contributing machine's sample
+    // count measured against a fleet denominator, so counting it would report a
+    // year of backfilled days as partly observed, permanently.
+    auto backfilled = SomeHistory();
+    backfilled.buckets[2].backfilled = true;
+    backfilled.buckets[2].coverage = 1;
+    CHECK_FALSE(RenderFleetHtml(LeadingSnapshot(), backfilled, 0).contains("partly observed"));
 }
 
 TEST_CASE("The page says whether the history it draws will survive a restart", "[distributed][fleetview][charts]")
