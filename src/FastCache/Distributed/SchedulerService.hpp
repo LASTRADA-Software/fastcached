@@ -331,6 +331,21 @@ class SchedulerService
     /// @return A refusal, or nullopt when the caller may proceed.
     [[nodiscard]] std::optional<SchedulerReply> Gate(CallerContext const& caller) const;
 
+    /// Drop workers that stopped heartbeating, and free what they were holding.
+    ///
+    /// The registry and the lease table are siblings and neither may reach the
+    /// other, so the pairing lives here -- which is also the only place that knows
+    /// a dropped worker's leases were about a machine that is gone rather than a
+    /// job that finished.
+    ///
+    /// Run from `Lease` and nowhere else, because that is the one decision a stale
+    /// worker's leftover leases corrupt: duplicate suppression asks about the key
+    /// first, so a machine that vanished mid-job made every later client miss on
+    /// one of its keys fall back to a local compile until the lease timed out. On
+    /// a live fleet it walks the registry and drops nothing, which is the same
+    /// walk `Pick` does immediately afterwards.
+    void ReapExpiredWorkers();
+
     /// Build a refusal, counting it when the table names a counter.
     /// @param code Why.
     /// @param message Overrides the table default when non-empty.

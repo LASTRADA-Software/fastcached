@@ -248,10 +248,27 @@ void WorkerRegistry::JobFinished(std::string_view workerId)
     AdjustMachineInFlight(workerId, JobTransition::Finished);
 }
 
-void WorkerRegistry::Remove(std::string_view workerId)
+std::vector<std::string> WorkerRegistry::ExpireStale()
 {
     std::scoped_lock const guard { _mutex };
-    _workers.erase(std::string { workerId });
+    auto const now = _clock.Now();
+
+    // Collected first, then erased -- the idiom `LeaseTable::ReleaseWorker` uses and
+    // for the same reason: erasing while iterating invalidates the iterator, and the
+    // ids have to be gathered for the caller anyway.
+    std::vector<std::string> dropped;
+    for (auto const& [id, entry]: _workers)
+        if (!IsLive(entry, now))
+            dropped.push_back(id);
+
+    for (auto const& id: dropped)
+        _workers.erase(id);
+
+    // Sorted for the reason every snapshot here is: an unordered_map's iteration
+    // order is neither stable nor meaningful, and this list drives a caller's own
+    // bookkeeping.
+    std::ranges::sort(dropped);
+    return dropped;
 }
 
 std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const

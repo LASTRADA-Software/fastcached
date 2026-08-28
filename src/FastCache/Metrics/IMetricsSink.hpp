@@ -104,6 +104,24 @@ class IMetricsSink
         /// leaves on the leader -- a node whose `--toolchain` override carries a
         /// stray byte otherwise vanishes from the fleet with nothing saying why.
         DispatchWorkerRegistrationsMalformed,
+        /// Workers dropped for having stopped heartbeating.
+        ///
+        /// The counterpart of `DispatchWorkerRegistrations`, and the fleet's only
+        /// trace of a machine going away: expiry used to be a filter that hid a
+        /// worker from `Pick` while leaving its entry in place, so losing a machine
+        /// was invisible from every direction. Rising steadily beside a rising
+        /// registration count is a fleet whose heartbeats are not arriving rather
+        /// than one that is growing.
+        DispatchWorkersExpired,
+        /// Leases freed because the worker holding them was dropped.
+        ///
+        /// Distinct from `DispatchLeasesReleased`, which is a client reporting its
+        /// own job done. This is work nobody will ever report: the machine went
+        /// away mid-job, and every one of these keys was being refused
+        /// `AlreadyInFlight` until it was reclaimed. Rising here says a build lost
+        /// part of its distribution, which is a different thing to fix from a fleet
+        /// that is merely full.
+        DispatchLeasesReclaimed,
 
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this

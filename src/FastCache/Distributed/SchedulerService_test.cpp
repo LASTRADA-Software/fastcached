@@ -466,6 +466,64 @@ TEST_CASE("A lease that is already gone is refused, not waved through", "[distri
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
 }
 
+TEST_CASE("A machine that goes away takes its leases with it", "[distributed][scheduler]")
+{
+    // The case `LeaseTable::ReleaseWorker` was written for and had no caller: a
+    // worker dying mid-job left its keys marked in-flight, so every client that
+    // later missed on one was refused `AlreadyInFlight` and compiled locally until
+    // the lease timed out ten minutes later -- the fleet losing a machine quietly
+    // stopping distributing part of the build, with nothing anywhere saying so.
+    //
+    // The second worker is what makes this an assertion about the LEASE rather than
+    // about capacity: the fleet still has somewhere to send the job.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "orphaned")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "orphaned")).error == Wire::ErrorCode::AlreadyInFlight);
+
+    // Past the heartbeat timeout but well inside the lease's own: expiry must not be
+    // what frees this key, or the case is proving nothing.
+    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
+
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100")).status == Wire::Status::Ok);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "orphaned")).status == Wire::Status::Ok);
+
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersExpired) == 1);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 1);
+
+    // And the dead machine is gone from the fleet rather than merely hidden.
+    auto const live = fleet.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    CHECK(live.front().endpoint == "10.0.0.3:7100");
+}
+
+TEST_CASE("A worker that restarts does not keep the leases it lost", "[distributed][scheduler]")
+{
+    // The route reaping cannot see. A node that crashes and comes back inside the
+    // heartbeat window re-registers onto its existing entry, keeping its id and
+    // refreshing `lastSeen` -- so `ExpireStale` never names it, and its keys would
+    // stay marked in-flight for the full lease timeout even though the jobs behind
+    // them died with the process.
+    //
+    // The clock does not move at all here, which is what makes this a statement
+    // about re-registration rather than about expiry.
+    Leading fleet;
+    auto twoSlots = OneSlot("gcc-14", "10.0.0.2:7100");
+    twoSlots.slots = 2;
+    REQUIRE(fleet.service.Register(Insider, twoSlots).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).error == Wire::ErrorCode::AlreadyInFlight);
+
+    REQUIRE(fleet.service.Register(Insider, twoSlots).status == Wire::Status::Ok);
+
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "in-flight-when-it-died")).status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 1);
+    // Nothing was dropped from the fleet -- the machine is the same one, and it is
+    // back.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersExpired) == 0);
+}
+
 TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]")
 {
     // The reason that refusal is worth having at all, and the case a key-index check

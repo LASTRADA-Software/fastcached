@@ -124,6 +124,18 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "toolchain, endpoint or version in UTF-8. Any rise names a peer that "
               "is not in the fleet and cannot say so itself.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkersExpired,
+      .prometheusName = "fastcached_dispatch_workers_expired_total",
+      .help = "Workers dropped for having stopped heartbeating. Rising beside a "
+              "rising registration count is a fleet whose heartbeats are not "
+              "arriving, not one that is growing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesReclaimed,
+      .prometheusName = "fastcached_dispatch_leases_reclaimed_total",
+      .help = "Leases freed because the worker holding them was dropped. Work "
+              "nobody will report done; every one of these keys was being refused "
+              "as in-flight until it was reclaimed.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
       .help = "Compiles this worker began. Minus jobs_completed_total, the number "

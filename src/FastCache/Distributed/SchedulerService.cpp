@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <span>
@@ -367,6 +368,21 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // never picked.
 
     auto const id = _workers.Register(registration);
+
+    // Whatever it was compiling is gone, so whatever it held is too. `Register`'s
+    // re-registration path already resets `inFlight` and `load` on exactly this
+    // reasoning, and a lease is the same fact one layer up: a node that restarts
+    // inside the heartbeat window keeps its entry, so `ExpireStale` never names it
+    // and its keys would otherwise stay marked in-flight for the full lease
+    // timeout -- the same ten-minute pin, reached by the one route reaping cannot
+    // see.
+    //
+    // A no-op for a worker registering for the first time, which is why it needs no
+    // "was this a re-registration" flag: nothing is held against an id that has just
+    // been issued.
+    if (auto const reclaimed = _leases.ReleaseWorker(id); reclaimed != 0)
+        _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
+
     // Counted as an event, not as fleet size. This interface is counter-only, so it
     // cannot express a gauge -- and the event turns out to be the more useful
     // number anyway: a rate that stays high means workers keep re-registering,
@@ -393,10 +409,42 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller, std::str
     return SchedulerReply::Success();
 }
 
+void SchedulerService::ReapExpiredWorkers()
+{
+    // Two locks, taken one after the other rather than one spanning both, and the
+    // gap is deliberate: the registry and the lease table each guard their own, and
+    // a lock covering the pair would put every reader of either behind the other.
+    // What fits in the gap is a concurrent `Lease` that picked this worker just
+    // before it was erased, whose lease is then held against a worker no later reap
+    // can name. It is not stranded: the client that took it resolves it when its
+    // job ends, and expiry is behind that -- which is exactly the pair of
+    // guarantees every lease already has.
+    auto const dropped = _workers.ExpireStale();
+    if (dropped.empty())
+        // The ordinary case on a live fleet, and this is a hot path -- every lease
+        // request runs it.
+        return;
+
+    std::size_t reclaimed = 0;
+    for (auto const& workerId: dropped)
+        reclaimed += _leases.ReleaseWorker(workerId);
+
+    _metrics.Increment(IMetricsSink::Counter::DispatchWorkersExpired, static_cast<std::uint64_t>(dropped.size()));
+    if (reclaimed != 0)
+        _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
+}
+
 SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseRequest const& request)
 {
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
+
+    // Before the key is asked about, not after: a worker that vanished mid-job left
+    // its leases behind, and duplicate suppression consults the key first -- so
+    // every client that later missed on one of those keys was refused
+    // `AlreadyInFlight` and compiled locally until the lease timed out. Losing one
+    // machine quietly stopped distributing part of the build.
+    ReapExpiredWorkers();
 
     // Duplicate suppression is asked BEFORE capacity, and the order is the
     // diagnostic. `Acquire` needs a worker id, so the code this was lifted from had
