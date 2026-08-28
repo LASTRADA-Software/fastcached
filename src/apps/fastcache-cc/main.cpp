@@ -836,16 +836,17 @@ struct SourceProbe
     std::cout << identity.fingerprint << '\n';
 
     // Said out loud, on stderr so it cannot corrupt a digest somebody is piping.
-    // This command exists to answer "why did no worker match", and a degenerate
+    // This command exists to answer "why did no worker match", and a defective
     // identity is the one answer the digest itself cannot give: it is a well-formed
-    // hex string that every install of this compiler would also print. Without this
-    // line an operator compares two identical-looking values and concludes the two
-    // machines agree.
-    if (identity.degenerate)
-        std::cerr << "warning: " << compiler
-                  << " could not be asked its version and no include roots were found, so this "
-                     "fingerprint says nothing about which compiler it is -- every install of it "
-                     "digests the same\n";
+    // hex string either way. Without this line an operator compares two
+    // identical-looking values and concludes the two machines agree -- or compares
+    // two different ones and goes looking for a toolchain difference that is really
+    // a probe that did not run.
+    if (!identity.Usable())
+    {
+        auto const& explanation = Cc::ExplainDefect(identity.defect);
+        std::cerr << "warning: " << compiler << ": " << explanation.reason << ". " << explanation.remedy << '\n';
+    }
     return 0;
 }
 
@@ -1358,14 +1359,24 @@ void RecordManifest(Config const& cfg,
     // dispatch-configured path only: it is a cache read in the steady state, but
     // several seconds the first time a machine sees a toolchain, and a build that
     // never dispatches must not pay that at all.
-    auto const fingerprint = Cc::CachedToolchainFingerprint(
-                                 ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor))
-                                 .fingerprint;
+    auto const identity = Cc::CachedToolchainFingerprint(
+        ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor));
+
+    // A digest that does not identify this toolchain is not dispatched with. The
+    // outcome either way is a local compile -- a scheduler cannot match a value no
+    // worker computes -- but sending it costs a round trip and, far worse, reports
+    // as `NoWorker`, which reads as "the fleet has nobody on your toolchain" and
+    // sends an operator to look at the fleet. This says which end is wrong.
+    if (!identity.Usable())
+    {
+        Note(std::format("not dispatched ({}); compiling locally", Cc::ExplainDefect(identity.defect).reason));
+        return std::nullopt;
+    }
 
     auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
     auto const outcome = Cc::Dispatch(*dialer,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
-                                                            .fingerprint = fingerprint,
+                                                            .fingerprint = identity.fingerprint,
                                                             .objectKey = key,
                                                             .args = *args,
                                                             .preprocessed = preprocessRun.out,

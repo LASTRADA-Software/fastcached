@@ -1074,11 +1074,21 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const discovered = DiscoverIncludePaths(runner, host, compiler, spec);
     auto const& roots = discovered.roots;
 
-    // Decided here, where the banner and the roots are both in hand, rather than
-    // left for a caller to reconstruct -- see `ToolchainIdentity::degenerate` for
-    // why all three conditions are needed and what the value means without them.
-    auto const degenerate =
-        spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler);
+    // Decided here, where the banner and the roots are both in hand, rather than left
+    // for a caller to reconstruct -- see `IdentityDefect` for what each one means.
+    //
+    // An unrun probe is asked FIRST, and the order is load-bearing rather than
+    // stylistic. It implies the other test's roots half, and on a driver that could
+    // not be run the banner has usually fallen back too -- so both would hold, and
+    // only one of them names the cause. Reporting "no include roots were found" for
+    // a probe that was never run sends an operator looking for a broken install.
+    auto const defect = [&] {
+        if (!discovered.answered)
+            return IdentityDefect::UnrunProbe;
+        if (spec.includeDiscovery != IncludeDiscovery::None && roots.empty() && banner == NormalizedCompilerName(compiler))
+            return IdentityDefect::NoEvidence;
+        return IdentityDefect::None;
+    }();
 
     // Resolved for the STAMP and the CACHE FILE, which is what makes the cache work
     // at all for a compiler invoked by bare name. `ComputeToolchainStamp` stats the
@@ -1096,20 +1106,38 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const stamp = ComputeToolchainStamp(banner, resolved, roots);
     auto const cachePath = CacheFilePath(resolved);
 
-    if (!forceRefresh && !stamp.empty() && !cachePath.empty())
+    // A probe that never ran touches the cache in NEITHER direction, and both halves
+    // are needed (issue #225).
+    //
+    // Not WRITTEN, because the value describes no toolchain and the cache is what
+    // makes it outlive the moment that produced it. The roots feed the stamp as well
+    // as the digest, so a failure stamps differently -- which sounds self-correcting
+    // and is not: a machine whose probe fails repeatedly stamps that failure
+    // CONSISTENTLY, hits its own entry, and settles on the wrong fingerprint
+    // permanently, with no walk to notice.
+    //
+    // Not READ, for the same reason from the other end: an earlier failure may
+    // already have written one, and the stamp cannot tell it from a good entry.
+    //
+    // `NoEvidence` is deliberately still cached. It is a stable property of the
+    // machine rather than an accident of one moment, and re-walking a toolchain that
+    // will reach the same answer buys nothing.
+    auto const cacheable = discovered.answered;
+
+    if (!forceRefresh && cacheable && !stamp.empty() && !cachePath.empty())
     {
         auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
         if (!cachedStamp.empty() && cachedStamp == stamp)
-            return ToolchainIdentity { .fingerprint = cachedFingerprint, .degenerate = degenerate };
+            return ToolchainIdentity { .fingerprint = cachedFingerprint, .defect = defect };
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
     auto const fingerprint = ComputeToolchainFingerprint(banner, ProbeToolchainFiles(roots));
 
-    if (!stamp.empty() && !cachePath.empty())
+    if (cacheable && !stamp.empty() && !cachePath.empty())
         WriteCacheAtomically(cachePath, stamp, fingerprint);
 
-    return ToolchainIdentity { .fingerprint = fingerprint, .degenerate = degenerate };
+    return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect };
 }
 
 } // namespace FastCache::Cc

@@ -112,7 +112,7 @@ namespace
                     // is the honest answer -- and is why the fingerprint column stays
                     // beside the label rather than being replaced by it.
                     fingerprints[index].identity =
-                        Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .degenerate = false };
+                        Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .defect = Cc::IdentityDefect::None };
                     continue;
                 }
 
@@ -269,18 +269,18 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
         auto const& identity = fingerprints[index].identity;
 
         // Refused rather than registered, and this is the backstop that survives the
-        // next layout nobody anticipated. A worker whose digest carries no
-        // information about which compiler it is registers cleanly, heartbeats
-        // happily, and is matched by every client on a different toolchain -- or by
-        // none at all. Both directions are silent from both ends.
-        if (identity.degenerate)
+        // next layout nobody anticipated. A worker whose digest does not identify its
+        // toolchain registers cleanly, heartbeats happily, and is matched by every
+        // client on a different toolchain -- or by none at all. Both directions are
+        // silent from both ends, which is why the refusal has to be loud.
+        //
+        // The reason and the remedy come from `IdentityDefectTable` rather than being
+        // written out here: `--print-toolchain-fingerprint` reports the same defects
+        // to the same operator, and the two were already two spellings of one fact.
+        if (!identity.Usable())
         {
-            logger.Logf(LogLevel::Error,
-                        "refusing {}: it could not be asked its version and no include roots were found, so its "
-                        "fingerprint would carry nothing about which compiler it is. Pin one with "
-                        "--toolchain=<fingerprint>={} if that is deliberate",
-                        entry.compiler,
-                        entry.compiler);
+            auto const& explanation = Cc::ExplainDefect(identity.defect);
+            logger.Logf(LogLevel::Error, "refusing {}: {}. {}", entry.compiler, explanation.reason, explanation.remedy);
             continue;
         }
 

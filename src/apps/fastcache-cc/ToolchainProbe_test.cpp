@@ -924,7 +924,7 @@ TEST_CASE("An undiscoverable clang-cl layout does not fall back to INCLUDE", "[t
 {
     // Where this mechanism deliberately parts company with `MsvcLayout`. That one
     // falls back to `INCLUDE` because a `cl` outside the VC layout would otherwise
-    // be left with a degenerate identity -- its banner is the constant `cl`, so the
+    // be left with a `NoEvidence` identity -- its banner is the constant `cl`, so the
     // headers are the only identity it has. `clang-cl` announces a genuine version,
     // so a driver that cannot answer degrades to a banner-only fingerprint, which is
     // weaker but still tells one clang from another. Reading `INCLUDE` here would
@@ -1078,6 +1078,19 @@ class CountingRunner final: public IProcessRunner
 {
     return "#include <...> search starts here:\n " + root + "\nEnd of search list.\n";
 }
+
+/// Where `CacheFilePath` puts fingerprint entries under a scripted state directory.
+///
+/// Named once because it is a layout contract two cases assert against, and a
+/// second spelling of it would go stale silently -- as a test looking in an empty
+/// directory and concluding nothing was written.
+///
+/// @param state The scratch state directory the launcher was pointed at.
+/// @return The directory holding `*.fingerprint` entries.
+[[nodiscard]] std::filesystem::path CacheDirectory(FastCache::Testing::ScratchDirectory const& state)
+{
+    return std::filesystem::path { state.Path().string() } / "fastcache-cc" / "toolchains";
+}
 } // namespace
 
 TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-probe]")
@@ -1147,7 +1160,7 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // path used to key different entries that each missed the other.
     std::error_code ec;
     std::size_t entries = 0;
-    auto const cacheDirectory = std::filesystem::path { state.Path().string() } / "fastcache-cc" / "toolchains";
+    auto const cacheDirectory = CacheDirectory(state);
     for (auto const& entry: std::filesystem::directory_iterator { cacheDirectory, ec })
         if (entry.path().extension() == ".fingerprint")
             ++entries;
@@ -1227,6 +1240,168 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
     CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint.empty());
+}
+
+// --- an identity that must not be served --------------------------------------
+
+namespace
+{
+/// Answers a scripted sequence, one entry per spawn, then refuses to spawn.
+///
+/// A sequence rather than a constant, because the defect this pins is a probe that
+/// works, then does not, then works again -- which is what issue #225 actually
+/// observed and which no single-answer runner can express.
+class SequencedRunner final: public IProcessRunner
+{
+  public:
+    explicit SequencedRunner(std::vector<CompileRun> script):
+        _script { std::move(script) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> /*argv*/) override
+    {
+        if (_next >= _script.size())
+            return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
+        return _script[_next++];
+    }
+
+  private:
+    std::vector<CompileRun> _script;
+    std::size_t _next { 0 };
+};
+
+/// The fingerprint the one cache entry under @p state holds.
+///
+/// Read from the file rather than inferred from a later call's answer, because
+/// "was it written" is the actual question and a hit is only its shadow.
+///
+/// @param state The scratch state directory the launcher was pointed at.
+/// @return The stored fingerprint, or empty when no entry exists.
+[[nodiscard]] std::string StoredFingerprint(FastCache::Testing::ScratchDirectory const& state)
+{
+    auto const directory = CacheDirectory(state);
+    std::error_code ec;
+    for (auto const& entry: std::filesystem::directory_iterator { directory, ec })
+    {
+        if (entry.path().extension() != ".fingerprint")
+            continue;
+        std::ifstream in { entry.path(), std::ios::binary };
+        std::string stamp;
+        std::string fingerprint;
+        if (std::getline(in, stamp) && std::getline(in, fingerprint))
+        {
+            if (!fingerprint.empty() && fingerprint.back() == '\r')
+                fingerprint.pop_back();
+            return fingerprint;
+        }
+    }
+    return {};
+}
+
+/// A run in which the include probe could not be started.
+[[nodiscard]] CompileRun NeverSpawned()
+{
+    return CompileRun { .exitCode = NotSpawned, .out = {}, .err = {} };
+}
+} // namespace
+
+TEST_CASE("A fingerprint from a probe that never ran is refused, not returned as an identity", "[toolchain-probe]")
+{
+    // Issue #225, as reported: `clang++` digested one value, then another, then the
+    // first again across five node startups, with nothing at either end saying so.
+    // The include probe is the unstable half -- it spawns a process, and a spawn can
+    // fail for reasons that have nothing to do with the toolchain.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-unrun" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-unrun-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    auto const good = CompileRun { .exitCode = 0, .out = {}, .err = VerboseNaming(root) };
+    SequencedRunner runner { { good, NeverSpawned(), NeverSpawned(), good } };
+    ScriptedToolchainHost host;
+
+    // A REAL version line throughout, which is what took this past the existing
+    // guard: `NoEvidence` needs the banner to be the fallback name, and it is not.
+    constexpr std::string_view banner = "clang version 20.1.8";
+    auto const first = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    CHECK(first.Usable());
+    CHECK_FALSE(first.fingerprint.empty());
+
+    auto const failed = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const failedAgain = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+
+    // Named, so both surfaces can say WHICH way the identity is unusable.
+    CHECK_FALSE(failed.Usable());
+    CHECK(failed.defect == IdentityDefect::UnrunProbe);
+
+    // The second consecutive failure is the half a stamp cannot fix on its own. The
+    // roots feed the stamp too, so a failure stamps CONSISTENTLY -- before this, the
+    // first failure's value was written and the second one hit it, and a machine
+    // whose probe kept failing settled on the wrong fingerprint permanently.
+    CHECK_FALSE(failedAgain.Usable());
+    CHECK(failedAgain.defect == IdentityDefect::UnrunProbe);
+
+    // Read BEFORE the recovering call, which is the whole point of reading it: a
+    // later success rewrites the entry, so an assertion made after one cannot tell a
+    // cache that was never polluted from one that was and got overwritten.
+    CHECK(StoredFingerprint(state) == first.fingerprint);
+
+    // And a probe that works again is the same toolchain it always was.
+    auto const recovered = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    CHECK(recovered.Usable());
+    CHECK(recovered.fingerprint == first.fingerprint);
+}
+
+TEST_CASE("A driver that answered with no roots is still cached", "[toolchain-probe]")
+{
+    // The over-correction guard. `NoEvidence` is a stable property of the machine --
+    // a compiler that cannot be asked its version and has no derivable include tree
+    // is that on every run -- so re-walking it buys nothing, and only the probe that
+    // did NOT RUN is excluded from the cache.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-noevidence" };
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-noevidence-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    // Exit 0 with no search list: the driver ANSWERED, and listed nothing.
+    CountingRunner runner { "" };
+    ScriptedToolchainHost host;
+
+    // The banner is the fallback name, which is the third condition.
+    auto const identity = CachedToolchainFingerprint(runner, host, compiler, "cc", DriverOf(Flavor::Clang));
+
+    CHECK(identity.defect == IdentityDefect::NoEvidence);
+    CHECK(StoredFingerprint(state) == identity.fingerprint);
+}
+
+TEST_CASE("Every defect can be explained to an operator", "[toolchain-probe]")
+{
+    // The `RowsInEnumeratorOrder` assert checks that a row SITS at its enumerator,
+    // not that anyone filled it in -- so a defect added with an empty row would
+    // compile and then refuse a toolchain with a blank sentence after the colon.
+    CHECK(ExplainDefect(IdentityDefect::None).reason.empty());
+    CHECK(ExplainDefect(IdentityDefect::None).remedy.empty());
+
+    for (auto const& row: IdentityDefectTable)
+    {
+        if (row.defect == IdentityDefect::None)
+            continue;
+        INFO("defect " << static_cast<int>(row.defect));
+        CHECK_FALSE(row.reason.empty());
+        CHECK_FALSE(row.remedy.empty());
+    }
 }
 
 // --- the compiler banner ------------------------------------------------------

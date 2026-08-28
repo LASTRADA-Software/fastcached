@@ -6,6 +6,10 @@
 #include "ToolchainFingerprint.hpp"
 #include "ToolchainHost.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+
+#include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -110,7 +114,7 @@ namespace FastCache::Cc
 /// Falls back to `NormalizedCompilerName` (in `CmdLine.hpp`) when the compiler
 /// cannot be run or says nothing. A weak identity beats an empty one: an empty
 /// banner would make every unrunnable compiler look like every other. Where that
-/// fallback is ALSO the whole identity, `ToolchainIdentity::degenerate` says so.
+/// fallback is ALSO the whole identity, `IdentityDefect::NoEvidence` says so.
 ///
 /// @param runner Process-spawning seam.
 /// @param compiler The compiler to ask.
@@ -406,27 +410,32 @@ struct IncludeSearchRoots
                                                 std::string const& compiler,
                                                 std::span<std::string const> roots);
 
-/// A toolchain fingerprint, and whether it says anything about WHICH compiler it is.
-struct ToolchainIdentity
+/// Why a computed fingerprint must not be served as a toolchain's identity.
+///
+/// Both members name a digest that is a perfectly well-formed hex string and means
+/// nothing -- which is why neither can be spotted by looking at the value, and why
+/// this travels beside it.
+enum class IdentityDefect : std::uint8_t
 {
-    std::string fingerprint; ///< The digest a client must match. Never empty.
+    /// Usable: the digest tells this toolchain from a different one.
+    None,
 
-    /// True when the digest carries no information about which compiler this is.
+    /// The digest carries no information about WHICH compiler this is.
     ///
-    /// Reported HERE because this is the only place both halves are known, and
-    /// reconstructing it outside meant guessing which branch `CompilerBanner` took
-    /// and deriving the include roots a second time. The condition: the driver has
-    /// a way to find its include roots, that way found none, AND the banner is
-    /// itself the fallback name. All three, because each alone is ordinary --
-    /// `IncludeDiscovery::None` has no roots by construction, a real version banner
-    /// is an identity whatever its roots, and a fallback banner over a located
-    /// include tree is exactly the MSVC case that works.
+    /// Decided where both halves are known, because reconstructing it outside meant
+    /// guessing which branch `CompilerBanner` took and deriving the include roots a
+    /// second time. The condition: the driver has a way to find its include roots,
+    /// that way found none, AND the banner is itself the fallback name. All three,
+    /// because each alone is ordinary -- `IncludeDiscovery::None` has no roots by
+    /// construction, a real version banner is an identity whatever its roots, and a
+    /// fallback banner over a located include tree is exactly the MSVC case that
+    /// works.
     ///
     /// Together they are not a weak identity but no identity:
     /// `KeyDigest("toolchain-v1").Field("cl")` is a value this repository could
-    /// print with no compiler installed. The "weaker but still correct" argument
-    /// above for a banner-only fingerprint has an unstated precondition -- that the
-    /// banner is a real version string -- and this is that precondition, checked.
+    /// print with no compiler installed. The "weaker but still correct" argument for
+    /// a banner-only fingerprint has an unstated precondition -- that the banner is
+    /// a real version string -- and this is that precondition, checked.
     ///
     /// `cl` used to fail it on every machine, which is what made a digest of the
     /// string `cl` the identity of every MSVC toolset in existence (issue #195). It
@@ -434,7 +443,81 @@ struct ToolchainIdentity
     /// on a banner-only fingerprint rather than refused -- correctly, and on the same
     /// argument `ClangResourceLayout` already rests on: a worker compiles text the
     /// client preprocessed, so it opens no header from the roots that are missing.
-    bool degenerate { false };
+    NoEvidence,
+
+    /// The include probe could not be RUN, so nothing about the tree was measured.
+    ///
+    /// Distinct from `NoEvidence` in the direction that matters: the banner here is
+    /// usually a real version line, so the digest looks like a strong identity and
+    /// is simply a different one from what every machine that probed successfully
+    /// computes. Issue #225 -- observed as a `clang++` that fingerprinted one value,
+    /// then another, then the first again across five node startups.
+    ///
+    /// Transient by nature, which is exactly why it must be reported rather than
+    /// absorbed: the cheap remedy is to probe again, and nothing can choose that
+    /// remedy if the failure is indistinguishable from success.
+    UnrunProbe,
+
+    Last, ///< Not a defect, and has no row: the table's length.
+};
+
+/// One row per defect: the enumerator, what an operator is told, and what to do.
+///
+/// A table rather than prose at each surface, because there are two surfaces --
+/// `NodeToolchains`' refusal and `--print-toolchain-fingerprint`'s warning -- and
+/// they were already spelling one defect's reason two ways by hand. One fact, two
+/// audiences.
+struct IdentityDefectRow
+{
+    IdentityDefect defect;   ///< The defect this row names.
+    std::string_view reason; ///< Why the fingerprint cannot be trusted, as a clause.
+    std::string_view remedy; ///< What the operator can do about it, as a sentence.
+};
+
+/// The defect table, in enumerator order so a defect indexes its own row.
+inline constexpr EnumTable<IdentityDefect, IdentityDefectRow> IdentityDefectTable { {
+    { .defect = IdentityDefect::None, .reason = {}, .remedy = {} },
+    { .defect = IdentityDefect::NoEvidence,
+      .reason = "it could not be asked its version and no include roots were found, so its fingerprint carries "
+                "nothing about which compiler it is -- every install of it digests the same",
+      .remedy = "Pin one with --toolchain=<fingerprint>=<compiler> if that is deliberate." },
+    { .defect = IdentityDefect::UnrunProbe,
+      .reason = "its include search paths could not be discovered, because the driver could not be run at all -- so "
+                "its fingerprint describes an empty include tree instead of this toolchain's, and no machine that "
+                "probed it successfully computes the same value",
+      .remedy = "Nothing was cached, so probing again is the remedy; a spawn that fails only sometimes is usually "
+                "a scanner or a resource limit rather than the toolchain." },
+} };
+
+static_assert(RowsInEnumeratorOrder(IdentityDefectTable, &IdentityDefectRow::defect),
+              "IdentityDefectTable must hold one row per IdentityDefect, in enumerator order -- the order is what "
+              "lets a defect index its own row");
+
+/// The row describing @p defect.
+/// @param defect The defect to explain.
+/// @return Its row; `IdentityDefect::None`'s carries empty text.
+[[nodiscard]] constexpr IdentityDefectRow const& ExplainDefect(IdentityDefect defect) noexcept
+{
+    return IdentityDefectTable[static_cast<std::size_t>(defect)];
+}
+
+/// A toolchain fingerprint, and whether it says anything about WHICH compiler it is.
+struct ToolchainIdentity
+{
+    std::string fingerprint; ///< The digest a client must match. Never empty.
+
+    /// Why this digest must not be served, or `None` when it may be.
+    IdentityDefect defect { IdentityDefect::None };
+
+    /// Whether this identity may be registered, matched on, or dispatched with.
+    ///
+    /// Asked rather than compared, so the two consumers cannot drift on what counts
+    /// as usable the day a third defect is added.
+    /// @return True when the digest identifies a toolchain.
+    [[nodiscard]] constexpr bool Usable() const noexcept
+    {
+        return defect == IdentityDefect::None;
+    }
 };
 
 /// A toolchain fingerprint, computed once per machine and remembered.
