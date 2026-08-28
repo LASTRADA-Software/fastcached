@@ -62,6 +62,7 @@ Which statuses an op may be answered with is table data, not convention:
 | REGISTER | Ok, Error |
 | HEARTBEAT | Ok, Error |
 | LEASE | Ok, Error |
+| RELEASE | Ok, Error |
 | COMPILE | Ok, Error |
 
 A miss and a refusal being distinct is the point. When both were the byte `0x00`,
@@ -134,7 +135,7 @@ arity does not depend on which credential style a client uses.
 
 ## Distributed execution
 
-Four more verbs turn the same wire into a scheduler and a worker protocol. None
+Five more verbs turn the same wire into a scheduler and a worker protocol. None
 of them is served by `fastcached`: the scheduler is `fastcache-compile-node
 --listen-scheduler` and the worker is the same binary's own port.
 
@@ -151,8 +152,8 @@ registers once per toolchain. The scheduler keys a worker on
 heartbeats the same machine-wide in-flight count, so the entries fill up together
 and the pool behaves as one rather than advertising N times the machine.
 
-`REGISTER`, `HEARTBEAT` and `LEASE` go to the scheduler, along with the four
-cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
+`REGISTER`, `HEARTBEAT`, `LEASE` and `RELEASE` go to the scheduler, along with the
+four cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
 `CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
 only to a member. `COMPILE` goes to a worker on its own port and is the only verb
 a worker answers at all — everything else, the scheduler's verbs included, is
@@ -166,6 +167,7 @@ HEARTBEAT  [workerId][inFlight][load]                       -> Ok
 LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
                                                             -> [exitCode][object][stdout][stderr]
+RELEASE    [leaseToken]                                     -> Ok
 ```
 
 `capacity` and `load` are **nested** records rather than fields of their own, and
@@ -200,6 +202,27 @@ check, so a second client asking for a key already in flight at a busy fleet is
 told `already-in-flight` rather than `no-capacity`: both are true, but only one of
 them is something an operator can act on.
 
+### A lease has three transitions, and only two of them are automatic
+
+`LEASE` takes one, `RELEASE` resolves it, and the scheduler expires whatever is
+left. The client sends `RELEASE` on **every** way its job can end — an object
+built, a worker that refused it, a worker that could not be reached — because the
+client is who the lease was issued to and the only party that sees all three.
+
+Expiry is the safety net for a client that **died**, `Ctrl-C` on a build being the
+ordinary case, and is not the ordinary path. It used to be: there was no `RELEASE`,
+so every key stayed suppressed for the full lease lifetime — ten minutes — and
+recompiling the same translation unit inside that window fell back to a local
+compile. The same applies to a machine leaving the fleet: dropping a worker
+releases the leases held against it, rather than leaving its keys pinned until each
+one times out.
+
+A `RELEASE` naming a token the scheduler does not have is refused
+`unknown-lease` rather than accepted quietly. That is the diagnostic for a job
+that outlived its lease, which means the fleet's lease timeout is shorter than its
+slowest translation unit — and there is nowhere else that fact could be observed.
+The client does nothing about it either way: it has its object already.
+
 ### Bulk fields carry a codec envelope
 
 A preprocessed translation unit and an object file are both large, so those
@@ -213,8 +236,8 @@ its cache because two peers were compiled with different codec sets.
 
 ### Control verbs have a lower ceiling
 
-`REGISTER`, `HEARTBEAT` and `LEASE` are capped at 64 KiB rather than the session
-cap. That listener is meant to be reachable by a whole fleet, and a scheduler
+`REGISTER`, `HEARTBEAT`, `LEASE` and `RELEASE` are capped at 64 KiB rather than the
+session cap. That listener is meant to be reachable by a whole fleet, and a scheduler
 that can be made to allocate 256 MiB per frame by anything that authenticated
 once is a scheduler that stops scheduling. `COMPILE` is the deliberate exception,
 since it carries a whole translation unit.

@@ -180,6 +180,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   included.
 - Duplicate suppression is asked **before** capacity, or a busy fleet reports
   `NoCapacity` for a key it is already building.
+- A lease has three transitions and expiry is the third: the **client** resolves it,
+  on every path out of the compile, over a fresh connection. Expiry is the safety net
+  for a client that died.
+- A resolve answers on liveness, not presence — an unknown token is refused, because
+  that is the only place "this job outlived its lease" can be observed.
+- A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
+  was held against it. A node that restarts inside the heartbeat window is the second
+  route to the same pin, and `Register` closes it.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - What a node holds back from compiles is what its tier **built**, never what a flag
