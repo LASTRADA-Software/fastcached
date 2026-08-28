@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace FastCache::Distributed
 {
@@ -20,6 +21,25 @@ struct Lease
     std::string token;    ///< Presented by the client to the worker.
     std::string workerId; ///< The worker the job was assigned to.
     std::string key;      ///< The object key being compiled.
+};
+
+/// One outstanding lease, as a diagnostic rather than as an authorization.
+///
+/// Deliberately not a `Lease`: that type carries the **token**, which is what a
+/// client presents to a worker, and a report of it is read back out by an
+/// operator, printed on a page and served as JSON. The two facts an operator acts
+/// on are which key is held and by whom, and the token is neither.
+///
+/// The age is a duration rather than the `TimePoint` it came from, and that is the
+/// injected clock defending itself -- the same rule `WorkerReport` states. Handed
+/// an instant, the obvious thing for a consumer to do is subtract
+/// `steady_clock::now()` from it, which is right in production and silently wrong
+/// under every `ManualClock` test, because the two clocks agree about nothing.
+struct LeaseReport
+{
+    std::string key;                  ///< The object key being compiled.
+    std::string workerId;             ///< The worker it was leased to.
+    std::chrono::milliseconds age {}; ///< Since the lease was taken.
 };
 
 /// The set of leases the scheduler has issued and not yet seen resolved.
@@ -141,6 +161,26 @@ class LeaseTable
     /// @param key The object key.
     /// @return True when a live lease is outstanding for it.
     [[nodiscard]] bool IsInFlight(std::string_view key) const;
+
+    /// The live leases, oldest first, at most `limit` of them.
+    ///
+    /// The counterpart of `LiveCount()`, and the grain that number cannot answer
+    /// at: a fleet that has stopped making progress shows a count, and what an
+    /// operator needs is *which* keys are held and by whom. Since a lease is
+    /// resolved by the client that took it, one that is still outstanding after
+    /// minutes is a client that died mid-build whose worker is still heartbeating
+    /// -- a specific machine to go and look at, rather than "something is
+    /// happening".
+    ///
+    /// **Oldest first, and that is the diagnostic rather than an ordering
+    /// preference.** A fleet at full tilt holds thousands, so any listing is
+    /// bounded; the newest fifty of three thousand would answer nothing, while the
+    /// oldest are the ones that have stopped moving. The total stays available
+    /// through `LiveCount()` so the truncation is visible rather than silent.
+    /// @param limit How many to return at most; zero returns none.
+    /// @return The oldest live leases, ordered by descending age. Expired entries
+    ///         are excluded even while they are still present in the table.
+    [[nodiscard]] std::vector<LeaseReport> LiveLeases(std::size_t limit) const;
 
     /// Number of live (unexpired) leases. For diagnostics and tests.
     [[nodiscard]] std::size_t LiveCount() const;
