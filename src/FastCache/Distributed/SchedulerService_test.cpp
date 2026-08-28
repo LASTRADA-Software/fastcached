@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -54,6 +55,36 @@ struct Leading
     SchedulerService service { clock, metrics };
 };
 } // namespace
+
+TEST_CASE("A granted lease reaches the fleet page's compiling figure", "[distributed][scheduler][fleetview]")
+{
+    // A WIRING assertion, in the sense `.agent/rules/wire-and-protocol.md` means it,
+    // and it is here because its absence is what let #215 stand.
+    //
+    // Every capacity case in `FleetView_test.cpp` assigns `fleetJobsInFlight` onto a
+    // snapshot literal, and every registry case calls `JobStarted` by hand. Neither
+    // can fail for a `compiling` figure that production never increments: nothing
+    // anywhere ran `Lease -> WorkerRegistry -> NodeReports -> TotalsFor`, so a
+    // counter that had come unwired from either end would have stayed green.
+    //
+    // Asserted through `CollectFleet` rather than on the registry, because the page
+    // is the consumer that was wrong -- and on the rendered HTML too, since a total
+    // that never reaches the markup is a total nobody reads.
+    Leading fleet;
+    (void) fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100"));
+
+    auto const before =
+        CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
+    CHECK(TotalsFor(before).inFlight == 0);
+
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+
+    auto const after =
+        CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
+    CHECK(TotalsFor(after).inFlight == 1);
+    CHECK(RenderFleetHtml(after, FleetHistoryView {}, 0).contains("<b>1</b> <span>compiling"));
+}
 
 TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
 {

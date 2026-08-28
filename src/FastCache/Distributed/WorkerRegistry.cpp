@@ -207,26 +207,45 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
     return std::unexpected(sawWithdrawn ? PickError::Withdrawn : PickError::NoCapacity);
 }
 
+void WorkerRegistry::AdjustMachineInFlight(std::string_view workerId, JobTransition transition)
+{
+    auto const it = _workers.find(std::string { workerId });
+    if (it == _workers.end())
+        return;
+
+    // Every entry at that endpoint, not just the leased one. A job occupies the
+    // machine's cores, and a node runs one `WorkerServer` for all its toolchains --
+    // so counting it against one entry left the host's other toolchain advertising
+    // slots it was already using, and made the speculative count disagree with the
+    // machine-wide one the next heartbeat overwrites it with.
+    auto const endpoint = it->second.info.endpoint;
+    for (auto& [id, entry]: _workers)
+    {
+        if (entry.info.endpoint != endpoint)
+            continue;
+
+        // Saturating, not wrapping. `inFlight` is unsigned, and a decrement at zero
+        // would make a worker look like it had four billion jobs outstanding —
+        // which takes it out of rotation permanently and silently. Reaching zero
+        // here is not even a bug: a heartbeat can correct the count downwards
+        // between a job starting and finishing.
+        if (transition == JobTransition::Started)
+            ++entry.info.inFlight;
+        else if (entry.info.inFlight > 0)
+            --entry.info.inFlight;
+    }
+}
+
 void WorkerRegistry::JobStarted(std::string_view workerId)
 {
     std::scoped_lock const guard { _mutex };
-    if (auto const it = _workers.find(std::string { workerId }); it != _workers.end())
-        ++it->second.info.inFlight;
+    AdjustMachineInFlight(workerId, JobTransition::Started);
 }
 
 void WorkerRegistry::JobFinished(std::string_view workerId)
 {
     std::scoped_lock const guard { _mutex };
-    auto const it = _workers.find(std::string { workerId });
-    if (it == _workers.end())
-        return;
-    // Saturating, not wrapping. `inFlight` is unsigned, and a decrement at zero
-    // would make a worker look like it had four billion jobs outstanding — which
-    // takes it out of rotation permanently and silently. Reaching zero here is not
-    // even a bug: a heartbeat can correct the count downwards between a job
-    // starting and finishing.
-    if (it->second.info.inFlight > 0)
-        --it->second.info.inFlight;
+    AdjustMachineInFlight(workerId, JobTransition::Finished);
 }
 
 void WorkerRegistry::Remove(std::string_view workerId)
@@ -340,12 +359,20 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
 
         auto& held = slot->second;
 
-        // The fields that ADD across a machine's sibling entries. These are the
-        // only two: everything else describes the machine and would be counted
-        // once per toolchain by a sum.
+        // The only field that ADDS across a machine's sibling entries is the list
+        // of toolchains, because that is the one thing the entries genuinely differ
+        // in. Everything else describes the machine and would be counted once per
+        // toolchain by a sum.
+        //
+        // `fleetJobsInFlight` folds with `max` beside `registeredSlots` and for the
+        // same reason: both are machine-wide by the time they get here. A node's
+        // heartbeat samples one `WorkerServer::InFlight()` per round and sends that
+        // number to every registrar, so summing it reported a machine running four
+        // jobs as running eight -- and `TotalsFor` then had four slots of real work
+        // it could not account for and rendered them as withheld by somebody else.
         held.report.fingerprints.push_back(entry.info.fingerprint);
         held.report.registeredSlots = std::max(held.report.registeredSlots, entry.info.slots);
-        held.report.fleetJobsInFlight += entry.info.inFlight;
+        held.report.fleetJobsInFlight = std::max(held.report.fleetJobsInFlight, entry.info.inFlight);
 
         // And the machine-wide half, where only ONE entry contributes -- adding
         // them is the double count this whole function exists to prevent -- so
