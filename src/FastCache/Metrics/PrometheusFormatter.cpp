@@ -318,6 +318,17 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     if (snapshot.host.has_value())
         AppendHostMetrics(out, *snapshot.host);
 
+    // And whether this node reads through to a shared cache. Only a process that
+    // has an answer says anything: the daemon is the shared cache and has none.
+    if (snapshot.upstreamConfigured.has_value())
+        Append(out,
+               Metric { .name = "fastcache_node_upstream_configured",
+                        .help = "1 when this node has a shared cache to read through to, 0 when it does not. Read "
+                                "it beside the upstream store counters: those are cumulative, so a node with no "
+                                "upstream and one that has stored nothing yet both report zero.",
+                        .type = MetricType::Gauge,
+                        .value = *snapshot.upstreamConfigured ? 1U : 0U });
+
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the nine
     // live counters used to be absent here, including all five the distributed-

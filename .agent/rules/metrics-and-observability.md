@@ -165,6 +165,33 @@ fault.
   as a number, so a threshold cannot silently stop tracking the timeout it is about.
   Both draw through one helper, because two near-identical `case` bodies is how a
   pair comes to differ for no reason anybody intended.
+- **An outcome that can be "not attempted" is not a `bool`, and the converse of
+  absent-is-not-zero is that an absence gets counted as an event.**
+  `ICacheUpstream::Store` returned `bool`, and `NoUpstream` -- the honest, named
+  shape for a machine with no shared cache -- returned an honest `false`.
+  `LocalCache` read that as *the shared cache declined this* and incremented
+  `NodeCacheUpstreamStoreFailures` on **every local store**, so a single-machine
+  install reported a 100 % upstream store failure rate: 1800 failures against 1800
+  sets, indistinguishable from a fleet whose cache is down. An operator alerting on
+  that counter alerts permanently on every laptop, which is how a counter stops
+  being read at all. The fix is at the seam -- `UpstreamStore { Stored, Declined,
+  NotConfigured }` -- because a `false` meaning two things is a defect wherever it is
+  read, and telling the one caller which it was would leave the next one to make the
+  same mistake. Which counter each outcome moves is then a table with
+  `NotConfigured` naming **none**, a legitimate row the way `RefusalTable` already
+  has rows that move nothing.
+- **A cumulative counter is not where an absence is modelled; the snapshot is.**
+  The temptation on the above is to render no upstream lines at all, the way
+  `SnapshotTiers()` omits a tier the cache does not have. Every counter is exported,
+  without exception, and a per-counter "does this apply?" predicate is precisely the
+  mechanism that once left seven of nine live counters unexported. The distinction:
+  a *snapshot* value is a reading, so a zero is a claim about the world and absence
+  must be spellable -- a *counter* is a tally of events, and zero is the truth about
+  events that never happened. What the counters genuinely cannot answer, because
+  they are cumulative, is whether there is an upstream at all: a node with none and
+  a node with one it has not written to both read zero. So that is named, as
+  `MetricsSnapshot::upstreamConfigured` beside `host` and `storage`, and rendered
+  only by a process the question applies to.
 - **Absent is not zero, one level further in than a series: at the cell.** Every
   `optional` in `NodeLoad`, `NodeCacheLoad` and `NodeCacheCapacity` reaches a cell
   unflattened -- `null` in JSON, a dash on the page, the spelling `--cluster-status`

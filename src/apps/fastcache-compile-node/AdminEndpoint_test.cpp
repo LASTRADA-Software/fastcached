@@ -73,6 +73,7 @@ AdminHttpServer::SnapshotProvider WorkerShapedSnapshot()
         return MetricsSnapshot { .storage = std::nullopt,
                                  .storageTiers = {},
                                  .host = HostCapacity { .configuredSlots = slots, .busySlots = busy },
+                                 .upstreamConfigured = std::nullopt,
                                  .uptime = {} };
     };
 }
@@ -231,6 +232,7 @@ TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
 
     auto const snapshot = provider();
     CHECK_FALSE(snapshot.storage.has_value());
+    CHECK_FALSE(snapshot.upstreamConfigured.has_value());
     for (auto const& tier: snapshot.storageTiers)
         CHECK_FALSE(tier.has_value());
 
@@ -261,6 +263,9 @@ TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node]
     CHECK_FALSE(body.contains("fastcached_items"));
     CHECK_FALSE(body.contains("fastcached_bytes_limit"));
     CHECK_FALSE(body.contains("fastcached_tier_"));
+    // Including the upstream question, which a node with no cache does not have:
+    // a `0` here would claim it looked and found none.
+    CHECK_FALSE(body.contains("# TYPE fastcache_node_upstream_configured"));
     // And the machine is still there, so this is an absence rather than an empty
     // scrape that would pass the checks above for the wrong reason.
     CHECK(body.contains("fastcache_node_logical_cores 4\n"));
@@ -610,6 +615,7 @@ TEST_CASE("A node's own sample carries its cache and its slots, and no dispatch"
     MetricsSnapshot const snapshot { .storage = std::nullopt,
                                      .storageTiers = {},
                                      .host = HostCapacity { .configuredSlots = 8, .busySlots = 3 },
+                                     .upstreamConfigured = std::nullopt,
                                      .uptime = {} };
 
     auto const values = NodeSampleFrom(metrics, snapshot);
@@ -649,6 +655,7 @@ TEST_CASE("A node with nothing to report is not described as a busy one", "[node
     MetricsSnapshot const saturated { .storage = std::nullopt,
                                       .storageTiers = {},
                                       .host = HostCapacity { .configuredSlots = 2, .busySlots = 9 },
+                                      .upstreamConfigured = std::nullopt,
                                       .uptime = {} };
     auto const busy = NodeSampleFrom(metrics, saturated);
     CHECK(busy[static_cast<std::size_t>(Distributed::FleetMetric::OfferableSlots)] == 0);

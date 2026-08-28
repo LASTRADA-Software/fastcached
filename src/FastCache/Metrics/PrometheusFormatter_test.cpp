@@ -254,3 +254,35 @@ TEST_CASE("A process with no cache renders no tier series", "[metrics][prometheu
 
     CHECK_FALSE(body.contains("fastcached_tier_"));
 }
+
+TEST_CASE("Whether a node has a shared cache is named, not inferred from a counter", "[metrics][prometheus]")
+{
+    // #214's operator-facing half. The upstream store counters are cumulative, so a
+    // node with no shared cache and a node with one it has not written to yet both
+    // report zero -- neither counter can answer "is there an upstream at all".
+    //
+    // A gauge rather than omitting the counter rows: the counters are exported in
+    // full on purpose, and a per-counter "does this apply?" predicate is the
+    // mechanism that once left seven of nine live counters unexported.
+    AtomicMetricsSink metrics;
+
+    // Matched on the TYPE line rather than the bare name: the failure counter's own
+    // help text names this gauge, so a substring check finds it in a scrape that
+    // never rendered it.
+    auto const absent = RenderPrometheus(metrics, MetricsSnapshot {});
+    CHECK_FALSE(absent.contains("# TYPE fastcache_node_upstream_configured"));
+
+    auto const without = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .upstreamConfigured = false });
+    CHECK(without.contains("# TYPE fastcache_node_upstream_configured gauge"));
+    CHECK(without.contains("fastcache_node_upstream_configured 0"));
+
+    auto const with = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .upstreamConfigured = true });
+    CHECK(with.contains("fastcache_node_upstream_configured 1"));
+
+    // The counters stay exported either way -- absent is modelled in the snapshot,
+    // never by dropping a counter row.
+    CHECK(absent.contains("fastcache_node_cache_upstream_store_failures_total"));
+    CHECK(without.contains("fastcache_node_cache_upstream_store_failures_total"));
+}

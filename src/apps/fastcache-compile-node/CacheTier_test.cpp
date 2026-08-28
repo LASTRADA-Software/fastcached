@@ -270,3 +270,41 @@ TEST_CASE("A cache directory that cannot be opened is fatal when it was named", 
     CHECK(started.error().contains("--cache-dir"));
     CHECK_FALSE(started.error().contains("--listen-cache"));
 }
+
+TEST_CASE("A tier says whether it has a shared cache behind it", "[node][cache-tier]")
+{
+    // #214's wiring, asserted rather than assumed. The scrape's
+    // `upstream_configured` gauge is read off the upstream that was BUILT, so this
+    // is the join between the configuration and what a scrape reports -- and a
+    // field nothing populates renders a confident `0` for every node, which is the
+    // failure mode the gauge exists to prevent.
+    Fixture fixture;
+
+    SECTION("none configured")
+    {
+        auto cfg = Fixture::BaseConfig();
+        cfg.upstream.clear();
+
+        auto started = fixture.Start(cfg);
+        REQUIRE(started.has_value());
+        auto const tier = std::move(*started);
+        REQUIRE(tier != nullptr);
+        CHECK_FALSE(tier->HasUpstream());
+    }
+
+    SECTION("one configured")
+    {
+        // Named, not reachable -- and that is the distinction. `Configured()` says an
+        // operator asked for a shared cache; whether it answers is what the store
+        // counters report, and conflating the two is how a laptop came to look like
+        // a fleet whose cache is down.
+        auto cfg = Fixture::BaseConfig();
+        cfg.upstream = "127.0.0.1:1";
+
+        auto started = fixture.Start(cfg);
+        REQUIRE(started.has_value());
+        auto const tier = std::move(*started);
+        REQUIRE(tier != nullptr);
+        CHECK(tier->HasUpstream());
+    }
+}

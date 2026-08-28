@@ -8,7 +8,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <format>
 #include <map>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -51,13 +53,21 @@ class ScriptedUpstream final: public ICacheUpstream
         co_return it == entries.end() ? std::nullopt : std::optional { it->second };
     }
 
-    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value) override
+    [[nodiscard]] Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override
     {
         ++stores;
         if (!reachable)
-            co_return false;
+            // `Declined`, never `NotConfigured`: this double stands for an upstream
+            // that EXISTS and is unreachable, which is the case the failure counter
+            // is for.
+            co_return UpstreamStore::Declined;
         entries[std::string { key }] = std::vector<std::byte> { value.begin(), value.end() };
-        co_return true;
+        co_return UpstreamStore::Stored;
+    }
+
+    [[nodiscard]] bool Configured() const noexcept override
+    {
+        return true;
     }
 };
 
@@ -193,4 +203,57 @@ TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
 
     // A key nobody stored is simply a miss -- not an error, and not a hang.
     CHECK_FALSE(SyncRun(cache.Fetch("never-stored")).has_value());
+}
+
+TEST_CASE("A node with no shared cache reports no upstream stores and no failures", "[node][cache]")
+{
+    // #214. `NoUpstream::Store` answered `false` by contract and `LocalCache` read
+    // that as "the shared cache declined it", so EVERY local store incremented the
+    // failure counter. The reported install read 1800 -- exactly its
+    // `cmd_set_total` -- which is a 100 % upstream store failure rate on a machine
+    // that has no upstream to fail.
+    //
+    // An operator alerting on that counter alerts permanently on every
+    // single-machine install, which is how a counter stops being read at all.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    InMemoryLruStorage local { 64 * 1024 };
+    NoUpstream none;
+    LocalCache cache { local, none, clock, metrics };
+
+    for (auto const index: std::views::iota(0, 5))
+        CHECK(SyncRun(cache.Store(std::format("k{}", index), Bytes("object"))));
+
+    // Neither counter moves. Not "failures is zero" alone: the way to get this
+    // wrong in the other direction is to count the non-event as a success.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 0);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheUpstreamStores) == 0);
+
+    // And the local writes -- the ones that must not be lost -- all happened.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheStoreFailures) == 0);
+    CHECK(none.Configured() == false);
+}
+
+TEST_CASE("A shared cache that declines is still counted as a failure", "[node][cache]")
+{
+    // The half that must NOT change. Silencing the non-event by not counting at all
+    // would take the real failure with it, and an unreachable shared cache would
+    // then look exactly like a healthy one -- the same defect #214 describes,
+    // pointing the other way.
+    Fixture fix;
+    fix.upstream.reachable = false;
+
+    CHECK(SyncRun(fix.cache.Store("k7", Bytes("object-seven"))));
+    CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 1);
+    CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 0);
+    CHECK(fix.upstream.Configured());
+}
+
+TEST_CASE("A shared cache that takes the object is counted as a store", "[node][cache]")
+{
+    Fixture fix;
+
+    CHECK(SyncRun(fix.cache.Store("k8", Bytes("object-eight"))));
+    CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 1);
+    CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 0);
 }

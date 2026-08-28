@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LocalCache.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+
+#include <cstddef>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Node
@@ -21,6 +25,29 @@ namespace
 
     /// Compile values carry no memcached flags word; the framing is the wire's.
     constexpr std::uint32_t NoFlags = 0;
+
+    /// One outcome of offering an object upstream, and the counter it moves.
+    struct UpstreamStoreRow
+    {
+        UpstreamStore outcome {};                        ///< The outcome this row describes.
+        std::optional<IMetricsSink::Counter> counter {}; ///< What it increments, if anything.
+    };
+
+    /// Which counter each outcome moves -- a table, so a fourth outcome is a row.
+    ///
+    /// `NotConfigured` naming **no** counter is the fix for #214 and a legitimate
+    /// row rather than a gap, the same way `RefusalTable` has rows that move
+    /// nothing: a node with no shared cache did not attempt a store, so it neither
+    /// succeeded nor failed at one. Counting it as a failure made every
+    /// single-machine install report a saturated failure rate, which is the
+    /// reliable way to make an operator stop reading that counter at all.
+    constexpr auto UpstreamStoreCounters = EnumTable<UpstreamStore, UpstreamStoreRow> {
+        UpstreamStoreRow { .outcome = UpstreamStore::Stored, .counter = IMetricsSink::Counter::NodeCacheUpstreamStores },
+        UpstreamStoreRow { .outcome = UpstreamStore::Declined,
+                           .counter = IMetricsSink::Counter::NodeCacheUpstreamStoreFailures },
+        UpstreamStoreRow { .outcome = UpstreamStore::NotConfigured, .counter = std::nullopt },
+    };
+    static_assert(RowsInEnumeratorOrder(UpstreamStoreCounters, &UpstreamStoreRow::outcome));
 } // namespace
 
 LocalCache::LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock, IMetricsSink& metrics) noexcept:
@@ -84,10 +111,13 @@ Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> va
     // be reached costs the fleet one entry and costs this machine nothing -- so the
     // answer is counted rather than returned, because a client that retried on it
     // would be retrying something already durable where it matters.
-    if (co_await _upstream.Store(key, value))
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamStores);
-    else
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures);
+    //
+    // Counted through the table, which is what keeps "there is no upstream" from
+    // being counted as "the upstream refused": the row for that outcome names no
+    // counter at all.
+    auto const& row = UpstreamStoreCounters.at(static_cast<std::size_t>(co_await _upstream.Store(key, value)));
+    if (row.counter.has_value())
+        _metrics.Increment(*row.counter);
 
     co_return true;
 }

@@ -74,7 +74,17 @@ class RemoteUpstream final: public ICacheUpstream
                    std::chrono::milliseconds ioTimeout) noexcept;
 
     [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override;
-    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value) override;
+    [[nodiscard]] Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override;
+
+    /// @copydoc ICacheUpstream::Configured
+    ///
+    /// True unconditionally: this type exists only because an operator named an
+    /// endpoint. Whether that endpoint is currently *reachable* is a different
+    /// question, and it is the store counters that answer it.
+    [[nodiscard]] bool Configured() const noexcept override
+    {
+        return true;
+    }
 
   private:
     std::string _endpoint;

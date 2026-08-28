@@ -421,7 +421,21 @@ Seven counters on `/metrics`, and the splits are the point:
 | `fastcache_node_cache_fill_failures_total` | The upstream supplied it and the local tier refused. |
 | `fastcache_node_cache_store_failures_total` | A local write failed — this one is reported to the client. |
 | `fastcache_node_cache_upstream_stores_total` | The fleet accepted an object this node offered. |
-| `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. |
+| `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. Zero on a node with no shared cache — see below. |
+| `fastcache_node_upstream_configured` | `1` when this node has a shared cache to read through to, `0` when it does not. Absent on a node running no cache at all. |
+
+Read the two upstream counters beside the gauge, never on their own. They are
+cumulative, so a node with **no** shared cache and a node with one it has not yet
+written to both report zero — the counters cannot tell those apart and the gauge is
+what does. Until
+[#214](https://github.com/LASTRADA-Software/fastcached/issues/214) the failure
+counter answered the question the wrong way round: a node with no upstream counted
+every local store as an upstream failure, so a single-machine install reported a
+100 % failure rate against a shared cache it never had.
+
+The alert worth writing is `fastcache_node_upstream_configured == 1` **and** a
+rising failure counter. That is a fleet whose shared cache is unreachable. Without
+the first clause it fires on every laptop.
 
 A high **upstream**-hit rate against a low **local**-hit rate means the tier is too
 small for this machine's working set — a different problem from a fleet that is
