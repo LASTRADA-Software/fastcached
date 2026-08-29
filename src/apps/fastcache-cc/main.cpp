@@ -373,27 +373,33 @@ enum class Fallback : std::uint8_t
 };
 
 /// How one fall-back kind is reported and recorded.
+///
+/// The two byte-wide members sit together at the end rather than reading in the
+/// order the sentence does, because one of them between two 8-aligned views costs
+/// seven bytes of padding -- the rule the build enforces on config structs, kept
+/// here because the shape is the same and the reason for it does not depend on
+/// which struct it is.
 struct FallbackRow
 {
-    Fallback kind {};              ///< Which case this row describes.
     std::string_view leadIn;       ///< What kind of non-answer this is.
-    Cc::Outcome outcome {};        ///< How `--show-stats` buckets it.
     std::string_view continuation; ///< What happens next, ending the same line.
+    Fallback kind {};              ///< Which case this row describes.
+    Cc::Outcome outcome {};        ///< How `--show-stats` buckets it.
 };
 
 constexpr EnumTable<Fallback, FallbackRow> FallbackTable { {
-    FallbackRow { .kind = Fallback::Unavailable,
-                  .leadIn = "cache unavailable",
-                  .outcome = Cc::Outcome::Unavailable,
-                  .continuation = "running real compiler" },
-    FallbackRow { .kind = Fallback::UnavailableCarryOn,
-                  .leadIn = "cache unavailable",
-                  .outcome = Cc::Outcome::Unavailable,
-                  .continuation = "compiling this translation unit anyway" },
-    FallbackRow { .kind = Fallback::Uncacheable,
-                  .leadIn = "not caching",
-                  .outcome = Cc::Outcome::Uncacheable,
-                  .continuation = "running real compiler" },
+    FallbackRow { .leadIn = "cache unavailable",
+                  .continuation = "running real compiler",
+                  .kind = Fallback::Unavailable,
+                  .outcome = Cc::Outcome::Unavailable },
+    FallbackRow { .leadIn = "cache unavailable",
+                  .continuation = "compiling this translation unit anyway",
+                  .kind = Fallback::UnavailableCarryOn,
+                  .outcome = Cc::Outcome::Unavailable },
+    FallbackRow { .leadIn = "not caching",
+                  .continuation = "running real compiler",
+                  .kind = Fallback::Uncacheable,
+                  .outcome = Cc::Outcome::Uncacheable },
 } };
 static_assert(RowsInEnumeratorOrder(FallbackTable, &FallbackRow::kind),
               "FallbackTable must hold exactly one row per Fallback kind, in enumerator order");
@@ -1778,12 +1784,13 @@ void RecordManifest(Config const& cfg,
                            "(neither keyed nor guarded) -- try a UTF-8 console code page");
         }
 
-        // Non-const so the preprocessed text can be MOVED out below rather than
-        // copied. It was const, and `std::move` on a const member is a silent copy
-        // -- of several megabytes, on the hot path of a parallel build, while the
-        // comment below claimed the opposite. clang-tidy's performance-move-const-arg
-        // is what caught it.
-        Cc::KeyInputs inputs {
+        // The preprocessed text is MOVED in, not copied: it runs to several
+        // megabytes on a real translation unit, on the hot path of a parallel
+        // build. Nothing moves back out again -- a worker preprocesses a second
+        // time, with the `#line` markers this copy deliberately suppresses -- so
+        // `inputs` dies with the block and the text with it, which is the whole
+        // point of the block.
+        Cc::KeyInputs const inputs {
             .compilerId = toolchainStamp,
             .preprocessed = std::move(probe->preprocessed),
             .relativizedArgs = relativizedArgs,
@@ -1791,8 +1798,10 @@ void RecordManifest(Config const& cfg,
         };
         key = Cc::ComputeKey(inputs);
 
-        // Moved out AFTER the key is computed, so the key path pays nothing: by
-        // here ComputeKey has finished with them and would otherwise drop them.
+        // Moved out AFTER the key is computed, so the key path pays nothing: the
+        // KEYED subset went into `inputs` above as its own copy, and what is left on
+        // the probe is the full list, which only a dispatch reads and which would
+        // otherwise be dropped with the block.
         if (dispatchConfigured)
             dispatchDependencies = std::move(probe->dependencyPaths);
     }
@@ -1932,7 +1941,12 @@ void RecordManifest(Config const& cfg,
     // is `TryDirectMode` that would have to change for it to be one.
     if (!Cc::CacheIsServing(fetchKind))
     {
-        Note("the cache did not answer the fetch; not offering this object to it");
+        // Worded so it is true of BOTH kinds. A refusal *is* an answer -- the daemon
+        // spoke and declined -- and saying it "did not answer" would send an
+        // operator to look for an unreachable daemon that is in fact running and
+        // rejecting, which is the rule this tree records about reporting a refusal
+        // under the wrong reason. The fall-back reason above already names which.
+        Note("the cache did not serve the fetch; not offering this object to it");
         return code;
     }
 

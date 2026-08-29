@@ -391,21 +391,28 @@ rejected STORE call for very different responses.
 
 Every reason that appears under `fall-back reasons`, and what to do about it:
 
-Every one of them still produces a correct object, and — per the note at the top
-of this page — every one that is about the **cache** leaves distribution running.
-The ones marked *uncacheable* are the launcher's own refusals and are not about
-the daemon at all.
+Every one of them still produces a correct object. Which of them leave
+distribution running is a narrower claim than that, and worth reading precisely:
+the two that describe a daemon **failing to serve the lookup** — an unreachable
+one (`fetch exchange failed`) and one that answered and refused (`rejected (…)`)
+— carry on and dispatch, which is the note at the top of this page. The rest end
+the invocation at a local compile, because each of them is a reason there is
+nothing to dispatch *with*: the key is not computed yet (the configuration and
+path reasons), the preprocess itself failed, the translation unit is one the
+launcher deliberately steps over, or the object could not be written on this
+machine. The ones marked *uncacheable* are the launcher's own refusals and are
+not about the daemon at all.
 
 | Reason | Meaning |
 |--------|---------|
-| `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted, and neither was a scheduler. This is the one fall-back that also switches distribution off, deliberately: `FASTCACHE_ADDR=` (set but empty) is how a build opts out of the launcher altogether, and without the two roots there is no portable key for a scheduler to suppress duplicates on. Set all three to use either. |
+| `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted, and neither was a scheduler. Distribution is off here deliberately, and not merely for want of a key: `FASTCACHE_ADDR=` (set but empty) is how a build opts out of the launcher altogether, and without the two roots there is no portable key for a scheduler to suppress duplicates on. Set all three to use either. |
 | `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
 | `a command-line path is drive-relative under no root`, `a reported dependency path is drive-relative under no root` | Deliberate, and Windows-only. A path like `C:foo\bar.hpp` resolves against drive `C:`'s **own** current directory, which no cache entry records — so the launcher can neither key it (a header moved inside it would not re-key) nor check it on replay (there is no directory to `stat` it against). Caching such a compile could serve a stale dependency record under a zero exit code, so it is not cached at all. Reported as *uncacheable*, not as an error. Spell the path absolutely (`C:\foo\bar.hpp`), make it relative, or bring it under `FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR`. The first is the rule applied to the command line, the second to what the compiler reported; `FASTCACHE_VERBOSE` names the offending path itself. |
 | `daemon does not support authentication; the configured credential was ignored` | `FASTCACHE_TOKEN` is set but the daemon predates the AUTH verb. Caching works normally — the daemon steps over the verb it does not know and serves the command — but this traffic is **not** authenticated. Said once per invocation rather than per exchange. Upgrade the daemon, or unset the token if it was not meant to apply here. |
-| `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the compile still runs locally and the build succeeds; only the caching is lost. |
-| `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. `fetch exchange failed` is also what a plainly wrong `FASTCACHE_ADDR` looks like — every compile, at once, with the fleet still doing the work. |
+| `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the build succeeds and only the caching is lost — the compile is still dispatched if `FASTCACHE_SCHEDULER` names a scheduler, and runs locally otherwise. |
+| `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. `fetch exchange failed` is also what a plainly wrong `FASTCACHE_ADDR` looks like — every compile, at once, with the fleet still doing the work. The two differ in what happens next: `fetch exchange failed` carries on and dispatches, while `fetch decoded malformed` — a daemon that answered with a value this launcher cannot read, which in practice means a mixed install — ends the invocation at a local compile. |
 | `rejected (unsupported-version): …` | The daemon answered and declined: it does not speak this launcher's wire version. **The two binaries ship together, so this means a mixed install** — an old daemon still running against a new `fastcache-cc`, or vice versa. The message names the range the daemon does support. Restart the daemon from the same package as the launcher. |
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |
 | `rejected (…)` (other codes) | The daemon refused the command and said why; see [the error-code table](../protocols/compile-cache.md#error-codes). |
