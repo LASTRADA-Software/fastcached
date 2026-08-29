@@ -199,6 +199,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   for a client that died.
 - A resolve answers on liveness, not presence — an unknown token is refused, because
   that is the only place "this job outlived its lease" can be observed.
+- A lease token is a credential, and its MAC covers the granted **endpoint** or it is
+  a credential for every worker that trusts the key. Fields length-prefixed, never
+  joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
+  proofs.
+- The MAC is checked before any other claim is reported on, or a named refusal is an
+  oracle. The expiry bounds how long a *captured* token is useful and is **not** a
+  capacity bound — slots are.
+- No key means unsigned grants and one bounded warning, never a silent fallback and
+  never a startup refusal that would break every single-machine install.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.

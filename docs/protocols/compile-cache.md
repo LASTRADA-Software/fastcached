@@ -97,6 +97,9 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x16` | invalid-cluster-change | The cluster cannot accept that change — a setting nobody has heard of, a member named with no address, a field a verb ignores. The message says which. |
 | `0x17` | endpoint-busy | This endpoint has reached its own concurrent-request cap or in-flight byte budget. A statement about one node's front door, never about the fleet. |
 | `0x18` | malformed-registration | A REGISTER named its toolchain, its endpoint or its version in bytes that are not valid UTF-8. The message says which field. Refused rather than repaired: a fingerprint is matched byte for byte, so a worker admitted under a cleaned-up name would match nothing and never be picked. |
+| `0x19` | lease-unauthorized | The lease token is not one this cluster issued: its MAC does not verify under the shared key, or it is not a lease token at all. Deliberately one code for both — a receiver cannot tell a forgery from a random string. Distinct from `unknown-lease`, which names a lease the scheduler *did* issue and has since forgotten. Nothing the token claimed is echoed back. |
+| `0x1a` | lease-endpoint-mismatch | An authentic lease, presented to a worker it was not issued for. Only ever reported once the MAC has verified, so it is a diagnostic rather than a hint: the message names both endpoints, because the common cause is a worker registered under an address clients do not dial, not a replay. |
+| `0x1b` | lease-expired | An authentic lease, presented past its expiry and the clock-skew slack. Not a capacity statement — a worker's slots bound what it runs, the expiry bounds how long a *captured* token is worth replaying. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
