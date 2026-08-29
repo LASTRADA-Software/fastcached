@@ -35,9 +35,25 @@
 # text that actually reaches Catch2, and a `TARGETS` table this cannot parse is a
 # FATAL_ERROR rather than an empty scope.
 #
-# What this deliberately does NOT check: that the tags appear only in these
-# directories. A handful of files elsewhere carry them and are swept in as a
-# result. Running MORE than the scope is harmless; running less is the defect.
+# ## What this does NOT check, stated so nobody reads more into a green run
+#
+# - **That the tags appear only in these directories.** A handful of files
+#   elsewhere carry them and are swept in as a result. Running MORE than the
+#   scope is harmless; running less is the defect.
+# - **Per test CASE.** The unit here is the FILE: one selected tag anywhere in it
+#   and the file counts as covered, so a new case added to a covered file with an
+#   unselected tag leaves the sanitized scope unnoticed. That is the same shape
+#   as the bug above, one level down, and closing it means parsing each case's
+#   tag string. Tracked in .agent/rules/build-and-toolchain.md's Open work.
+# - **That the scope directories are the right ones.** `Net/` and `Cache/` also
+#   spawn threads, and the one race this gate suppresses (#260) is a `Net/`
+#   class, reached only because the node binary is run whole. Also tracked there.
+#
+# A tag is matched where Catch2 would see one: directly after the opening `"` of
+# the tag string, or after a preceding `]`. Catch2 also accepts space-separated
+# tags (`"[slow] [async]"`); nothing in this tree writes them that way, and the
+# failure if something does is a loud false refusal naming the file, never a
+# silent pass.
 #
 # Runs as `cmake -P`, for the reason check-repository-hygiene.cmake gives at
 # length: this reads files, compares strings and reports, so a .sh + .ps1 pair
@@ -82,19 +98,40 @@ if(NOT EXISTS "${FastCachedTsanGate}")
         "table; it cannot substitute a list of its own.")
 endif()
 
-file(READ "${FastCachedTsanGate}" gateSource)
-if(NOT gateSource MATCHES "TARGETS=\\(([^)]*)\\)")
+# Read the table LINE BY LINE, between `TARGETS=(` and the `)` that closes it in
+# column zero -- not with a `[^)]*` block match. A Catch2 tag expression may
+# legally contain parentheses (`[a]&&([b]||[c])`), which is exactly the edit the
+# messages below invite; a block match would stop at the first of those, silently
+# drop every row after it, and then fail on unrelated files for "carrying no tag".
+file(STRINGS "${FastCachedTsanGate}" gateLines)
+set(inTable FALSE)
+set(targetRows "")
+set(sawTable FALSE)
+foreach(line IN LISTS gateLines)
+    if(inTable)
+        if(line MATCHES "^\\)")
+            set(inTable FALSE)
+        else()
+            string(REGEX MATCHALL "\"[^\"]*\"" lineRows "${line}")
+            list(APPEND targetRows ${lineRows})
+        endif()
+    elseif(line MATCHES "^TARGETS=\\(")
+        set(inTable TRUE)
+        set(sawTable TRUE)
+    endif()
+endforeach()
+
+if(NOT sawTable OR inTable)
     message(FATAL_ERROR
-        "check-tsan-scope: could not find the TARGETS=( ... ) table in "
+        "check-tsan-scope: could not read the TARGETS=( ... ) table in "
         "${FastCachedTsanGate}.\n"
-        "If that table changed shape, this parser changes with it -- do not "
-        "restore a copy of the tag list here. The rule lives in "
+        "It must open with `TARGETS=(` and close with `)` in column zero. If "
+        "that table changed shape, this parser changes with it -- do not restore "
+        "a copy of the tag list here. The rule lives in "
         "${CMAKE_CURRENT_LIST_FILE}.")
 endif()
-set(targetsBlock "${CMAKE_MATCH_1}")
 
 set(FastCachedTsanScopeTags "")
-string(REGEX MATCHALL "\"[^\"]*\"" targetRows "${targetsBlock}")
 foreach(row IN LISTS targetRows)
     # "name|[a],[b]" -> [a],[b] -> a;b
     string(REGEX REPLACE "^\"[^|]*\\|" "" rowTags "${row}")

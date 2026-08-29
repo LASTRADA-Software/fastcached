@@ -403,9 +403,14 @@ jobs:
   # (#260) — which is the argument for this job, and also why the job is not
   # simply "run everything under TSan".
   #
-  # SCOPE. `Async`, `Consensus`, `Distributed` and the node are where the threads
-  # are; the rest of the suite is single-threaded by construction and would pay
-  # sanitizer cost to prove it. Those four map onto five Catch2 tags —
+  # SCOPE, and what it is not. `Async`, `Consensus`, `Distributed` and the node
+  # are where most of the threads are — but not all of them: `Net/` and `Cache/`
+  # spawn threads too, and the one race this gate suppresses (#260) is a `Net/`
+  # class, reached only because the node binary is run whole. This is a first
+  # scope, not a complete one, and saying otherwise is how a job goes green over
+  # code nobody sanitized; widening it is tracked in
+  # `.agent/rules/build-and-toolchain.md` under Open work. Those four map onto
+  # five Catch2 tags —
   # `[async]`, `[consensus]`, `[distributed]`, `[reactor]`, `[task]` — plus one
   # binary run whole. The tags are not claimed to be confined to those three
   # directories: three test files elsewhere carry one and are swept in, which is
@@ -436,6 +441,10 @@ jobs:
   clang-tsan:
     name: "clang-tsan"
     runs-on: ubuntu-24.04
+    # The gate bounds each test binary itself, which names the target that stalled;
+    # this bounds the build as well, so a hang anywhere in the job stops in an hour
+    # rather than at GitHub's six-hour default. Every wait is bounded.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -496,6 +505,19 @@ jobs:
           sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
           sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+          # This job's green depends on a suppression MATCHING, and `race_top:`
+          # matches a function name — which needs symbolization. Without a pinned
+          # llvm-symbolizer the runtime falls back to whatever the image happens
+          # to carry, and a #260 report that fails to symbolize arrives as a NEW
+          # unsuppressed race, sending the reader to file an issue that exists.
+          #
+          # `test -x` before the link, and that is the point rather than caution:
+          # `ln -sf` onto a missing target succeeds and leaves a DANGLING link,
+          # which is worse than no link at all — the runtime then execs something
+          # that is not there. Fail here, where the message is the package name.
+          sudo apt-get install -y llvm-${{ env.CLANG_TOOLS_VERSION }}
+          test -x /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }}
+          sudo ln -sf /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/llvm-symbolizer
 
       - name: "Configure"
         run: >-

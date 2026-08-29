@@ -810,6 +810,23 @@ measured from a red build is published.
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
+- **To file** — the TSan scope is three directories (`Async`, `Consensus`,
+  `Distributed`) and it is not where all the threads are. `Net/` and `Cache/`
+  spawn threads in `ThreadedAddressResolver_test.cpp`, `HealthProbe_test.cpp`,
+  `EpollSocket_test.cpp`, `ShardedStorage_test.cpp` (`[sharded][concurrency]
+  [stress]`, the tree's one explicit concurrency stress case) and
+  `Core/Clock_test.cpp` — none selected by the gate's tags, none in
+  `FastCachedTsanScopeDirs`, so `check-tsan-scope` does not flag them either. The
+  single race the gate suppresses, #260, is a `Net/` class, reached only because
+  the node binary happens to be run whole.
+- **To file** — `scripts/check-tsan-scope.cmake` enforces per FILE, not per test
+  CASE: one selected tag anywhere in a file covers it, so a case added to
+  `Distributed/FleetHistory_test.cpp` tagged only `[fleethistory]` leaves the
+  sanitized scope while the check reports covered. Same shape as the bug the file
+  exists for, one level down. Closing it means matching each
+  `TEST_CASE`/`TEST_CASE_METHOD`/`SCENARIO` tag string, which `check-test-names
+  .cmake` already has the macro pattern for — with the wrinkle that the tag
+  string is often on the line after the macro.
 - **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
   scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
   `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this

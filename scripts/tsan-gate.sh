@@ -36,7 +36,9 @@
 #
 #   the build directory does not exist    -> "build directory not found"
 #   the suppressions file does not exist  -> "suppressions file not found"
+#   a path here contains a space          -> "cannot carry a path with a space"
 #   `nm` is unavailable                   -> "nm is required"
+#   no COMPILE line carried -fsanitize    -> "instrumented nothing"
 #   a target is not built                 -> "not built"
 #   a target's symbols cannot be read     -> "no symbol table"
 #   a target has no __tsan_init           -> "built WITHOUT instrumentation"
@@ -44,6 +46,7 @@
 #   the canary dies of something else     -> "reported no data race"
 #   a tag expression matches nothing      -> "tested NOTHING"
 #   a target exits 0 with no assertions   -> "refusing to call that clean"
+#   a target runs past its deadline       -> "did not finish within"
 #   an unsuppressed race                  -> "reported an unsuppressed data race"
 #
 # The list is enumerated HERE and nowhere else. An earlier version of it said
@@ -104,6 +107,25 @@ TARGETS=(
 # written for is at least visible rather than silent -- `.tsan-suppressions` says
 # that happens on every run, and it only does if it is set in one place.
 TsanOptions="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}"
+
+# Every wait is bounded, which is this repository's oldest testing rule. Running
+# the binaries directly rather than through `ctest` loses ctest's own per-test
+# TIMEOUT, and TSan changes timing enough that a deadlock is a real outcome: the
+# consensus and node tests do real socket and thread work. Unbounded, a hung case
+# runs to GitHub's six-hour job limit with nothing saying which target stalled.
+# Generous, because the honest measurements are 1.2s and 17.6s -- this is a
+# deadlock detector, not a performance budget. `timeout` reports 124.
+#
+# macOS has no `timeout(1)` -- coreutils installs it as `gtimeout` -- and this
+# preset runs there, so look for both rather than refusing a whole platform.
+TargetTimeoutSeconds="${FASTCACHE_TSAN_TIMEOUT:-900}"
+TimeoutCommand=""
+for candidate in timeout gtimeout; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        TimeoutCommand="$candidate"
+        break
+    fi
+done
 
 # Annotate only where a workflow will render it. Every other script in this repo
 # prints a plain prefixed failure (`cluster-e2e.sh`, `compile-cache-e2e.sh`,
@@ -192,7 +214,7 @@ AssertCanaryFires() {
     local path canary_out canary_rc
     path="$(BinaryPath tsan-canary)"
 
-    canary_out="$(TSAN_OPTIONS="${TsanOptions}" "$path" 2>&1)" && canary_rc=0 || canary_rc=$?
+    canary_out="$(TSAN_OPTIONS="${TsanOptions}" "${TimeoutCommand}" 60 "$path" 2>&1)" && canary_rc=0 || canary_rc=$?
 
     if [[ "$canary_rc" -eq 0 ]]; then
         fatal "the deliberate race in src/tests/TsanCanary.cpp was NOT reported.
@@ -229,7 +251,19 @@ RunTarget() {
 
     log="${SCRATCH}/${name}.log"
     note "running ${name} ${tags:+(${tags})}"
-    TSAN_OPTIONS="${TsanOptions}" "$path" ${args[@]+"${args[@]}"} >"$log" 2>&1 || rc=$?
+    TSAN_OPTIONS="${TsanOptions}" "${TimeoutCommand}" "${TargetTimeoutSeconds}" \
+        "$path" ${args[@]+"${args[@]}"} >"$log" 2>&1 || rc=$?
+
+    # Named before anything else reads the log: a killed process leaves a partial
+    # Catch2 summary, which the checks below would diagnose as "reported no
+    # assertions" and send the reader to the tag expression.
+    if [[ "$rc" -eq 124 ]]; then
+        cat "$log"
+        fatal "${name} did not finish within ${TargetTimeoutSeconds}s and was killed.
+    Under ThreadSanitizer that is a deadlock until proven otherwise, and the last
+    case in the log above is where to start. FASTCACHE_TSAN_TIMEOUT raises the
+    bound if the suite has simply grown."
+    fi
 
     # A filter that matches nothing is the quietest way for this gate to test
     # nothing and say "clean" -- a typo in the TARGETS table above would do it.
@@ -274,8 +308,35 @@ RunTarget() {
 [[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
 [[ -f "$SUPPRESSIONS" ]] || fatal "suppressions file not found: ${SUPPRESSIONS}"
 command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
+[[ -n "$TimeoutCommand" ]] || fatal "timeout(1) is required; this gate does not run an unbounded wait. On macOS it is gtimeout, from coreutils."
+
+# `TSAN_OPTIONS` is a space-separated list with no quoting mechanism at all, so a
+# checkout under `~/My Projects` truncates `suppressions=` at the space and the
+# runtime dies before main. That surfaces as "the canary exited N but reported no
+# data race" -- a correct refusal naming the wrong cause, which is the one thing
+# every message in this script is written to avoid. Say it here instead.
+[[ "$SUPPRESSIONS" != *" "* ]] \
+    || fatal "TSAN_OPTIONS cannot carry a path with a space in it, and this checkout has one:
+    ${SUPPRESSIONS}
+    Move the checkout, or set TSAN_OPTIONS yourself and run the binaries by hand."
 
 note "build directory: ${BUILD_DIR}"
+
+# `__tsan_init` is defined by the sanitizer RUNTIME, which the link line pulls in
+# whole -- so it answers "was this artefact linked against TSan" and, on its own,
+# would still say yes for a build that dropped `add_compile_options` and kept
+# `add_link_options`. That asymmetry is precisely the shape of the defect
+# `cmake/portable/Sanitizers.cmake` records. The compile line is the other half of
+# the answer, and the rulebook already names where to read it: `build.ninja`, not
+# the cache and not the configure log, which are the two places that lied.
+NINJA_FILE="${BUILD_DIR}/build.ninja"
+[[ -f "$NINJA_FILE" ]] || fatal "no ${NINJA_FILE}: this gate reads the COMPILE line from the generator's own file, and only the Ninja generator writes one. Configure with the clang-tsan preset."
+if ! grep -q -- '-fsanitize=thread' "$NINJA_FILE"; then
+    fatal "the build in ${BUILD_DIR} instrumented nothing: no compile line in build.ninja carries -fsanitize=thread.
+    The cache and the configure log are not evidence here -- they are the two that
+    lied in cmake/portable/Sanitizers.cmake. Reconfigure with the clang-tsan preset."
+fi
+note "compile lines carrying -fsanitize=thread: $(grep -c -- '-fsanitize=thread' "$NINJA_FILE")"
 
 # Every instrumentation question first, then the runs. An uninstrumented second
 # binary is a one-second answer, and diagnosing it only after the first target's
