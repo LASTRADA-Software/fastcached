@@ -202,22 +202,40 @@ TEST_CASE("A worker with no toolchains serves nothing", "[compile-job]")
     CHECK(jobs.Fingerprints().empty());
 }
 
-TEST_CASE("An argument that could name a file is refused by the worker too", "[compile-job]")
+TEST_CASE("An argument the worker's allowlist does not admit is refused", "[compile-job]")
 {
-    // Checked again on the receiving side. The client's filter protects an honest
-    // client from dispatching something that would not work; this one protects the
-    // worker from a client that is not honest. Trusting the client's check would
-    // mean the worker is secured by code running on the caller's machine.
+    // Checked again on the receiving side, against an allowlist. The client's filter
+    // protects an honest client from dispatching something that would not work; this
+    // one protects the worker from a client that is not honest. Trusting the client's
+    // check would mean the worker is secured by code running on the caller's machine.
+    //
+    // The program-invoking options are the reason the check is an allowlist and not a
+    // denylist (issue #240): `-wrapper` runs an arbitrary program, `-fplugin=` and
+    // `-Xclang -load` load code, and NONE carries a path separator, so the old shape
+    // filter admitted every one. `-fplugin=/tmp/evil.so` and `-IC:\x` are the
+    // path-shaped classics the denylist did catch, kept here so the allowlist is shown
+    // to be a superset rather than a replacement that lost ground.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
 
-    for (auto const& hostile: { "-fplugin=/tmp/evil.so", "@/tmp/args.rsp", "--sysroot=/", R"(-IC:\x)" })
+    for (auto const& hostile: { "-wrapper",
+                                "-fplugin=evil",
+                                "-fplugin=/tmp/evil.so",
+                                "-Xclang",
+                                "-Wa,--defsym,x=1",
+                                "-specs=evil",
+                                "@/tmp/args.rsp",
+                                "--sysroot=/",
+                                R"(-IC:\x)" })
     {
         INFO("argument " << hostile);
         auto const result = jobs.Run(Job({ std::string { hostile } }));
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error() == JobRefusal::RejectedArgument);
+        // The refusal names the offending flag, so a client's local fallback can say
+        // which argument the fleet would not take rather than only that one existed.
+        CHECK(result.error().detail.contains(hostile));
     }
     CHECK(runner.Argv().empty()); // nothing was ever spawned
 }
@@ -382,26 +400,105 @@ TEST_CASE("SafeSourceName keeps a name that is one, and replaces every name that
     CHECK(SafeSourceName("console.cpp") == "console.cpp");
 }
 
-TEST_CASE("IsAcceptableJobArgument applies the strictest reading", "[compile-job]")
+TEST_CASE("IsAcceptableJobArgument admits the code-generation flags a compile carries", "[compile-job]")
 {
-    // Stricter than the client's filter, and deliberately: a worker is told a
-    // fingerprint rather than a command line, so it has no driver to ask which
-    // characters introduce an option. A job it refuses is compiled locally.
-    CHECK(IsAcceptableJobArgument("-O2"));
-    CHECK(IsAcceptableJobArgument("-std=c++23"));
-    CHECK(IsAcceptableJobArgument("/O2"));
-    // The target the CLIENT states so this worker cannot pick its own. The client's
-    // filter protects an honest client; this one protects the worker from a client
-    // that is not. They have to agree about this argument specifically, or every
-    // dispatched clang compile becomes a RejectedArgument the moment the pin lands.
-    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-windows-msvc19.51.36252"));
-    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu"));
-    CHECK(IsAcceptableJobArgument(""));
+    // The accepted set is an allowlist keyed on the worker's own driver family. These
+    // are the ordinary code-generation, language and diagnostic options a distributed
+    // compile carries once the headers are inlined -- everything that changes the
+    // object and nothing that reaches a file or a program.
+    CHECK(IsAcceptableJobArgument("-O2", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-std=c++23", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-g", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Wall", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Werror", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Wno-unused", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-fPIC", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-fno-exceptions", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-DNDEBUG", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-march=native", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-pthread", DriverFamily::Gnu));
+    // The language the client states for a preprocessed input -- `-x` and its value,
+    // which arrive as two separate arguments.
+    CHECK(IsAcceptableJobArgument("-x", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("c++-cpp-output", DriverFamily::Gnu));
 
-    CHECK_FALSE(IsAcceptableJobArgument("@rsp"));
-    CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include"));
-    CHECK_FALSE(IsAcceptableJobArgument(R"(-IC:\x)"));
-    CHECK_FALSE(IsAcceptableJobArgument("/some/path"));
+    CHECK(IsAcceptableJobArgument("/O2", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/std:c++20", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/W4", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/WX", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/EHsc", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/MD", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/Z7", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/DNDEBUG", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/permissive-", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/utf-8", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/TP", DriverFamily::Msvc));
+
+    // The target the CLIENT states so this worker cannot pick its own, on BOTH
+    // families: clang-cl (MSVC) is pinned exactly as a GNU clang is. They have to
+    // agree about this argument, or every dispatched clang compile becomes a
+    // RejectedArgument the moment the pin lands.
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-windows-msvc19.51.36252", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu", DriverFamily::Gnu));
+
+    // An empty argument names nothing and reaches nothing.
+    CHECK(IsAcceptableJobArgument("", DriverFamily::Gnu));
+}
+
+TEST_CASE("IsAcceptableJobArgument refuses everything the allowlist does not name", "[compile-job]")
+{
+    // The default is refusal. A path-shaped argument is refused as before, but so is
+    // any flag the table does not list -- which is the property the old denylist did
+    // not have, and the whole point of the inversion.
+    CHECK_FALSE(IsAcceptableJobArgument("@rsp", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument(R"(-IC:\x)", DriverFamily::Msvc));
+    CHECK_FALSE(IsAcceptableJobArgument("/some/path", DriverFamily::Msvc));
+    // Not path-shaped, but not a code-generation flag either -- refused because it is
+    // not on the list, not because it looks like a file.
+    CHECK_FALSE(IsAcceptableJobArgument("-isystem", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-nonsense-option", DriverFamily::Gnu));
+    // A worker whose compiler classifies to no family accepts no non-empty argument,
+    // which fails safe.
+    CHECK_FALSE(IsAcceptableJobArgument("-O2", DriverFamily::None));
+}
+
+TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denylist admitted", "[compile-job]")
+{
+    // The vulnerability this fix closes (issue #240). Every one of these makes the
+    // driver run another program or load code into itself, and NONE carries a path
+    // separator, so the old shape-based filter accepted them all -- a local process,
+    // which loopback admits unconditionally, could reach the credential-free compile
+    // port and run arbitrary code as the node's service account.
+    //
+    // `-wrapper prog,args` was proven against a real gcc to run `prog` around every
+    // subprocess; the value below carries no separator, so a shape filter waves it
+    // through.
+    CHECK_FALSE(IsAcceptableJobArgument("-wrapper", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("env,sh,-c,touch pwned", DriverFamily::Gnu));
+    // `-fplugin=` loads a shared object into the driver. Denied under the `-f` prefix
+    // that admits ordinary feature flags -- with a bare name that a separator filter
+    // would not catch, and with `-arg-` too.
+    CHECK_FALSE(IsAcceptableJobArgument("-fplugin=evil", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-fplugin-arg-evil-x", DriverFamily::Gnu));
+    // `-Wa,`/`-Wl,`/`-Wp,` hand a comma-separated option list to a sub-tool. Denied
+    // under the `-W` prefix that admits warnings.
+    CHECK_FALSE(IsAcceptableJobArgument("-Wa,--defsym,x=1", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wl,-rpath,x", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wp,-D,x", DriverFamily::Gnu));
+    // The clang plugin loader and the sub-tool option passers -- none is a prefix in
+    // the table, so all are refused by default.
+    CHECK_FALSE(IsAcceptableJobArgument("-Xclang", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-load", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Xassembler", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-specs=evil", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-B", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Bstage", DriverFamily::Gnu));
+    // The warnings that only LOOK like the sub-tool passers stay accepted, so the
+    // Deny rows have not swallowed a real warning.
+    CHECK(IsAcceptableJobArgument("-Wall", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Wattributes", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Wpedantic", DriverFamily::Gnu));
 }
 
 TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")
@@ -493,7 +590,7 @@ TEST_CASE("Concurrent jobs each get their OWN object rather than a sibling's", "
     for (auto const round: std::views::iota(std::size_t { 0 }, Rounds))
     {
         INFO("round " << round);
-        std::array<std::expected<CompileOutcome, JobRefusal>, OverlappingEchoRunner::Overlap> results {};
+        std::array<std::expected<CompileOutcome, JobError>, OverlappingEchoRunner::Overlap> results {};
 
         // Both threads enter Run() together rather than whenever they happen to be
         // scheduled. Without this the first job can finish before the second starts,
@@ -630,7 +727,7 @@ TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[co
     ScratchDirectory const scratch { "fc-jobtest" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/before/g++" } } };
 
-    std::expected<CompileOutcome, JobRefusal> outcome;
+    std::expected<CompileOutcome, JobError> outcome;
     std::thread worker { [&] { outcome = jobs.Run(Job()); } };
 
     // The replacement lands while the job is provably inside the compile, which is

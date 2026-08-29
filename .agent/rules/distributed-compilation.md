@@ -78,6 +78,37 @@ is the reproducible lesson, since no unit test can reach either:
     ordinary source promoted by a flag (`cl /interface`, `-fmodule-output`,
     `--precompile`, and `/Yc` for the precompiled-header case).
 
+- **The worker's argument filter is an ALLOWLIST, not a shape-based denylist**
+  (`IsAcceptableJobArgument`, `CompileJob.cpp`). The client's arguments are spliced
+  into the compiler's command line verbatim, and the compile port carries no
+  credential while loopback is admitted unconditionally — so any local process can
+  reach it. Naming the compiler is refused (the fingerprint rule above), but several
+  driver options *run a program or load code* without ever naming one: `-wrapper
+  prog,args`, `-fplugin=`, `-Xclang -load`, `-specs=`, `-B`. None carries a path
+  separator, so the old "could this name a file?" filter admitted every one — a
+  proven RCE as the node's service account
+  ([#240](https://github.com/LASTRADA-Software/fastcached/issues/240)). The flag
+  space belongs to GCC, Clang and Microsoft and grows every release, so a denylist
+  we audit against upstream forever **fails open** the day we miss one; the allowlist
+  **fails safe** — an unrecognised flag costs one local compile, visible as
+  `fastcache_worker_jobs_refused_rejected_argument_total`, where a missed denylist
+  entry was code execution. The accepted set (`AllowedArgs`) is per driver family —
+  the worker knows its own compiler's family, never the client's — and refusal names
+  the offending flag in `JobError::detail`, which rides the reply message to the
+  client's fallback log.
+  - **No blanket prefix admits a program, and every prefix carve-out is a table
+    row.** A naive `-f*` re-admits `-fplugin=`; a naive `-W*` re-admits
+    `-Wa,`/`-Wl,`/`-Wp,` (options handed to the assembler, linker, preprocessor); a
+    naive `-X*` re-admits `-Xclang -load`. So `-X` is not a prefix at all (nothing
+    under it is code generation — refused by default), and the `-f`/`-W` prefixes each
+    carry an explicit `Deny` row for their program-invoking member, checked before any
+    `Allow`. Those `Deny` rows are the only place a denylist survives, bounded to the
+    prefixes with a dangerous member — **audit them against upstream** when a new
+    code-loading `-f` or a fourth sub-tool pass-through appears. Adding a plain `-f`
+    prefix to make a test for `-fexceptions` pass is the hole reopening inside the fix.
+  - **Operator extension of the allowlist is a follow-up, not this rule.** The table
+    is built-in; there is deliberately no config hook.
+
 Three more come from running the worker as a *service* rather than in a
 terminal, and each has already been a bug:
 
