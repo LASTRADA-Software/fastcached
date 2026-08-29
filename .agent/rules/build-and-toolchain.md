@@ -836,6 +836,23 @@ and every heavy job is gated on it.
   forces a rebase and a full re-run. The matrix is therefore paid once per pull
   request *per merge that lands while it is open*, and that multiplier is the
   larger half of the argument.
+- **A skipped MATRIX job never expands, so its per-leg contexts never exist.**
+  This is the trap inside the fix, and it was found by probing rather than by
+  reading: with a job-level `if:` on `linux` and `windows`, a docs-only run
+  reported one context literally named `Linux-${{ matrix.preset }}` and another
+  named `Windows-${{ matrix.preset }}` — while the four names the ruleset actually
+  requires (`Linux-clang-release`, `Linux-gcc-release`, `Windows-cl-release`,
+  `Windows-clangcl-release`) reported nothing at all. That is the same
+  never-arrives failure as `paths-ignore`, reintroduced one level down, and every
+  non-matrix job skipping correctly is what makes it easy to miss. So a matrix job
+  is gated on its **steps**: the job starts, the matrix expands, each leg reports
+  under its real name, and no step does any work. It costs one runner start per
+  leg and buys the only thing that matters.
+- **Inserting a step-level `if:` above a step that already had one is a silent
+  no-op.** YAML keeps the last of two duplicate keys, so the gate vanished on
+  exactly the three steps carrying their own `startsWith(matrix.preset, ...)`
+  condition — and nothing warns. Merge into one expression
+  (`gate && (original)`), and scan for adjacent `if:` lines afterwards.
 - **A gated job must still gate the release.** `check-release-gate` asserts
   statically, with `yq`, that every job key appears in `release.needs`; it never
   asks whether a job ran, so a job that no-ops on a docs change still counts. The
