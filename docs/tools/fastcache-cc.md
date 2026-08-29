@@ -17,6 +17,13 @@ lost. The reason is still reported and still counted under `unavailable`, and
 nothing further is offered to that daemon for the rest of the invocation — there
 is no point spending an object-sized transfer to be refused twice.
 
+What a build against a broken cache *does* pay is the dispatch itself: a
+translation unit that would have been a hit is now preprocessed a second time --
+dispatch sends `#line` markers, which the cache key deliberately suppresses -- and
+sent to a worker. That is the trade the fleet exists to make and it is still the
+right one, but it is not free, and it is the reason a wrong `FASTCACHE_ADDR` is
+worth fixing rather than living with.
+
 This page is the reference: every flag, every environment variable, every
 fall-back reason by name. For the story of what happens between your build system
 and your compiler — direct mode, the key, the lookup, the dispatch — read

@@ -345,9 +345,11 @@ void Note(std::string_view reason)
 /// The ways the cache can fail to serve a compile, as far as anybody outside this
 /// file can tell them apart.
 ///
-/// A row per kind rather than three near-identical reporting functions, because
-/// the three facts each one carries have to move together and used to be paired by
-/// hand. A fall-back reason distinguishes "deliberately not cacheable" from "the
+/// A row per kind BESIDE the three reporting functions, not instead of them, and
+/// the split is deliberate: the row carries the three facts that have to move
+/// together and used to be paired by hand, while the wrapper carries the one thing
+/// a table cannot -- its RETURN TYPE, which is what stops a call site announcing
+/// one continuation and taking the other. A fall-back reason distinguishes "deliberately not cacheable" from "the
 /// cache let us down" — an operator acts on the second and cannot act on the first,
 /// so `--show-stats` separates them — and the sentence has to say the same thing
 /// the outcome does at both ends of it. "cache unavailable" is a claim about the
@@ -1801,9 +1803,10 @@ void RecordManifest(Config const& cfg,
     // traced, and whether the STORE is worth the transfer. Carried out of the block
     // rather than a `bool` derived from it, so both put the same question to
     // `Cc::CacheIsServing` instead of reading a summary somebody has to keep in
-    // step with it. `Transport` is what `CacheOutcome` itself starts on, and means
-    // "we never got an answer" -- the fail-safe reading of a path that leaves this
-    // untouched.
+    // step with it. `Transport` is what `CacheOutcome` itself starts on and means
+    // "we never got an answer", so it is the safe thing to hold for the two
+    // statements before the exchange overwrites it -- not a guard for a path that
+    // skips the assignment, because there is none.
     auto fetchKind = Cc::CacheOutcomeKind::Transport;
 
     // FETCH.
