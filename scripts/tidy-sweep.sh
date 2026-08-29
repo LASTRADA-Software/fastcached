@@ -81,6 +81,7 @@ SweepEverythingWhen=(
     "CMakePresets.json"            # the flags the database is generated from
     "*CMakeLists.txt"              # ditto
     "*.cmake"                      # ditto
+    "*.hpp.in"                     # generates a header the include graph cannot see
     "scripts/tidy-sweep.sh"        # this file: prove the new scope logic works
     ".github/workflows/build.yml"  # the job that runs it
 )
@@ -227,6 +228,7 @@ SelfTest() {
     ExpectForce "cmake/portable/CompileCache.cmake" yes
     ExpectForce "src/FastCache/CMakeLists.txt" yes
     ExpectForce "scripts/tidy-sweep.sh" yes
+    ExpectForce "src/FastCache/Core/Version.hpp.in" yes
     ExpectForce "src/FastCache/Core/Logger.hpp" no
     ExpectForce "src/FastCache/Core/Logger.cpp" no
     ExpectForce "README.md" no
@@ -259,18 +261,82 @@ command -v "$TIDY" >/dev/null 2>&1 || fatal "$TIDY is not on PATH"
 "$TIDY" --version >/dev/null 2>&1 || fatal "$TIDY will not run"
 [[ -f "${DB}/compile_commands.json" ]] || fatal "no compile database at ${DB}"
 
-# What this platform actually compiles, which is not what `git ls-files` says:
-# IocpReactor.cpp is a translation unit on Windows and a file on Linux. The
-# database is the only honest answer, and taking the list from it is also what
-# keeps a full sweep from failing on a source no target here builds. Third-party
-# sources under _deps/ are somebody else's to fix.
-mapfile -t db_files < <(
-    grep -oE '"file"[[:space:]]*:[[:space:]]*"[^"]*"' "${DB}/compile_commands.json" \
-        | sed -E 's/.*:[[:space:]]*"//; s/"$//' \
-        | sed "s|^${repo_root}/||" \
-        | grep -vE '^/|/_deps/' \
-        | sort -u)
-[[ "${#db_files[@]}" -gt 0 ]] || fatal "no first-party translation units in ${DB}/compile_commands.json"
+PYTHON="$(command -v python3 || command -v python)" \
+    || fatal "python3 is needed to read the compile database"
+
+scratch="$(mktemp -d)" || fatal "cannot create a scratch directory"
+# shellcheck disable=SC2064  # expand $scratch now, not at trap time
+trap "rm -rf '$scratch'" EXIT
+
+# The unit of work is a COMPILE COMMAND, not a file, and that is what keeps this
+# equivalent to the build-driven tidy it replaced. A source compiled into two
+# targets is two translation units with two preprocessor states -- `Stats.cpp`
+# builds into `fastcache-cc`, `fastcache-cc-tests` and `fastcache-compile-node`,
+# and those targets do not agree about `FC_COMPRESSION_ENABLED` -- so one
+# invocation per file would silently stop checking the other configurations.
+# `clang-tidy -p <dir> <file>` always takes the FIRST matching entry, so the
+# second and later commands for a file each get a one-entry database of their own.
+#
+# Reading the database is also the only honest answer to what this platform
+# compiles: `IocpReactor.cpp` is a translation unit on Windows and a file on
+# Linux, so a list taken from `git ls-files` would fail a full sweep on sources no
+# target here builds. Third-party sources under `_deps/` are somebody else's.
+cat > "${scratch}/plan.py" <<'PLAN'
+"""Emit one `<database dir>\t<file>` line per distinct compile command."""
+import json, os, sys
+
+db_path, root, outdir, selection_path = sys.argv[1:5]
+selection = None
+if selection_path != "--all":
+    with open(selection_path, encoding="utf-8") as handle:
+        selection = {line.strip() for line in handle if line.strip()}
+
+with open(db_path, encoding="utf-8") as handle:
+    entries = json.load(handle)
+
+prefix = root.replace("\\", "/").rstrip("/") + "/"
+byFile = {}
+order = []
+for entry in entries:
+    path = entry.get("file", "").replace("\\", "/")
+    if path.startswith(prefix):
+        path = path[len(prefix):]
+    if path.startswith("/") or "/_deps/" in path or ":" in path.split("/")[0]:
+        continue
+    if selection is not None and path not in selection:
+        continue
+    command = entry.get("command") or " ".join(entry.get("arguments", []))
+    if path not in byFile:
+        byFile[path] = {}
+        order.append(path)
+    byFile[path].setdefault(command, entry)
+
+if selection is not None:
+    missing = sorted(selection - set(order))
+    for path in missing:
+        print("not a translation unit here: " + path, file=sys.stderr)
+
+slot = 0
+for path in order:
+    for index, entry in enumerate(byFile[path].values()):
+        if index == 0:
+            print(os.path.dirname(db_path) + "\t" + path)
+            continue
+        slot += 1
+        directory = os.path.join(outdir, str(slot))
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "compile_commands.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([entry], handle)
+        print(directory + "\t" + path)
+PLAN
+
+# @param 1 A file of repo-relative paths to keep, or "--all" for every unit.
+# Prints the plan; the caller checks that it is not empty.
+PlanUnits() {
+    "$PYTHON" "${scratch}/plan.py" "${DB}/compile_commands.json" \
+              "$repo_root" "${scratch}/db" "$1"
+}
 
 # A canary against a real file. Anything that stops clang-tidy from parsing shows
 # up here rather than as an entire branch reported clean.
@@ -284,11 +350,8 @@ case "$probe" in
         fatal "$TIDY is not parsing: ${probe}" ;;
 esac
 
-declare -a files=()
-if [[ "$mode" == all ]]; then
-    files=("${db_files[@]}")
-    echo "TIDY SWEEP: every translation unit (${#files[@]})"
-else
+selection="--all"
+if [[ "$mode" != all ]]; then
     # Committed changes, everything different from HEAD, and files not yet added.
     #
     # The last two are not a nicety, and the middle one is easy to get wrong: a new
@@ -301,71 +364,71 @@ else
     #
     # A base that does not resolve escalates to the full sweep rather than to an
     # empty diff: "we could not tell what changed" must never read as "nothing did".
-    git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null \
-        || { echo "TIDY SWEEP: ${BASE} does not resolve; sweeping everything"; mode=all; }
-
-    if [[ "$mode" == all ]]; then
-        files=("${db_files[@]}")
-    else
-        mapfile -t changed < <({ git diff --name-only "${BASE}...HEAD"
-                                 git diff --name-only HEAD
-                                 git ls-files --others --exclude-standard; } | sort -u)
-
-        for path in "${changed[@]}"; do
-            if ForcesFullSweep "$path"; then
-                echo "TIDY SWEEP: ${path} changed; sweeping everything"
-                mode=all
-                break
-            fi
-        done
-    fi
-
-    if [[ "$mode" == all ]]; then
-        files=("${db_files[@]}")
-        echo "TIDY SWEEP: every translation unit (${#files[@]})"
-    else
-        declare -a sources=()
-        declare -a touched=()
-        mapfile -t sources < <(git ls-files '*.c' '*.h' '*.hpp' '*.cpp' '*.ipp' '*.hxx' '*.inl')
-        for path in "${changed[@]}"; do
-            case "$path" in
-                *.c|*.h|*.hpp|*.cpp|*.ipp|*.hxx|*.inl) touched+=("$path") ;;
-            esac
-        done
-        if [[ "${#touched[@]}" -eq 0 ]]; then
-            echo "TIDY SWEEP: no source changed against ${BASE}"
-            exit 0
-        fi
-
-        BuildIncludeGraph "${sources[@]}"
-        declare -A inDatabase=()
-        for path in "${db_files[@]}"; do inDatabase["$path"]=1; done
-        while IFS= read -r path; do
-            [[ -n "${inDatabase["$path"]:-}" ]] && files+=("$path")
-        done < <(AffectedTranslationUnits "${touched[@]}")
-
-        if [[ "${#files[@]}" -eq 0 ]]; then
-            echo "TIDY SWEEP: ${#touched[@]} source(s) changed, none of them reaches a"
-            echo "            translation unit this platform compiles; nothing to sweep"
-            exit 0
-        fi
-        echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach ${#files[@]} translation unit(s)"
+    #
+    # `--exclude-standard` is what keeps a derived tree out of this. CI's CPM cache
+    # lives at `.cache/CPM` inside the workspace and is only invisible here because
+    # `.gitignore` says `.cache/`; a build or dependency tree that is NOT ignored
+    # puts its own `.cmake` files in front of the escalation table and every sweep
+    # becomes a full one. That is the safe direction — slow, never wrong — but it
+    # is also why an unignored build directory is worth noticing.
+    if ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+        echo "TIDY SWEEP: ${BASE} does not resolve; sweeping everything"
+        mode=all
     fi
 fi
 
-scratch="$(mktemp -d)" || fatal "cannot create a scratch directory"
-# shellcheck disable=SC2064  # expand $scratch now, not at trap time
-trap "rm -rf '$scratch'" EXIT
+if [[ "$mode" != all ]]; then
+    mapfile -t changed < <({ git diff --name-only "${BASE}...HEAD"
+                             git diff --name-only HEAD
+                             git ls-files --others --exclude-standard; } | sort -u)
+    for path in "${changed[@]}"; do
+        if ForcesFullSweep "$path"; then
+            echo "TIDY SWEEP: ${path} changed; sweeping everything"
+            mode=all
+            break
+        fi
+    done
+fi
 
-# One file, into numbered files so the report below is in a stable order however
-# the pool interleaves. A refusal to EXECUTE is recorded apart from a finding:
-# every way of getting clang-tidy wrong produces silence, and silence must not be
-# summed into a clean verdict.
-# @param 1 The file to check.
-# @param 2 Slot prefix under $scratch.
+if [[ "$mode" != all ]]; then
+    declare -a sources=() touched=()
+    mapfile -t sources < <(git ls-files '*.c' '*.h' '*.hpp' '*.cpp' '*.ipp' '*.hxx' '*.inl')
+    for path in "${changed[@]}"; do
+        case "$path" in
+            *.c|*.h|*.hpp|*.cpp|*.ipp|*.hxx|*.inl) touched+=("$path") ;;
+        esac
+    done
+    if [[ "${#touched[@]}" -eq 0 ]]; then
+        echo "TIDY SWEEP: no source changed against ${BASE}"
+        exit 0
+    fi
+    BuildIncludeGraph "${sources[@]}"
+    AffectedTranslationUnits "${touched[@]}" > "${scratch}/selection"
+    selection="${scratch}/selection"
+    echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection") candidate file(s)"
+fi
+
+mapfile -t plan < <(PlanUnits "$selection")
+if [[ "${#plan[@]}" -eq 0 ]]; then
+    if [[ "$mode" == all ]]; then
+        fatal "no first-party translation units in ${DB}/compile_commands.json"
+    fi
+    echo "TIDY SWEEP: nothing changed here reaches a translation unit this platform"
+    echo "            compiles; nothing to sweep"
+    exit 0
+fi
+echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
+
+# One translation unit, into numbered files so the report below is in a stable
+# order however the pool interleaves. A refusal to EXECUTE is recorded apart from
+# a finding: every way of getting clang-tidy wrong produces silence, and silence
+# must not be summed into a clean verdict.
+# @param 1 The database directory holding this unit's compile command.
+# @param 2 The file to check.
+# @param 3 Slot prefix under $scratch.
 TidyOne() {
-    local file="$1" slot="$2" out rc hits
-    out="$("$TIDY" -p "$DB" --quiet "$file" 2>&1)"
+    local database="$1" file="$2" slot="$3" out rc hits
+    out="$("$TIDY" -p "$database" --quiet "$file" 2>&1)"
     rc=$?
     if [[ "$rc" -ge 126 ]]; then
         printf '%s (exit %s)\n' "$file" "$rc" > "${slot}.fatal"
@@ -379,10 +442,12 @@ TidyOne() {
 }
 
 index=0
-for file in "${files[@]}"; do
+for unit in "${plan[@]}"; do
+    database="${unit%%$'\t'*}"
+    file="${unit#*$'\t'}"
     [[ -f "$file" ]] || continue
     index=$((index + 1))
-    TidyOne "$file" "$(printf '%s/%05d' "$scratch" "$index")" &
+    TidyOne "$database" "$file" "$(printf '%s/%05d' "$scratch" "$index")" &
     while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do wait -n; done
 done
 wait
@@ -397,5 +462,5 @@ for report in "$scratch"/*.out; do
     status=1
 done
 
-[[ "$status" -eq 0 ]] && echo "TIDY SWEEP CLEAN (${index} file(s), ${TIDY}, ${JOBS} at a time)"
+[[ "$status" -eq 0 ]] && echo "TIDY SWEEP CLEAN (${index} translation unit(s), ${TIDY})"
 exit "$status"
