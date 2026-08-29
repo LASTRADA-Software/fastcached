@@ -3,9 +3,10 @@
 #
 # Sweep this branch's changed translation units with the PINNED clang-tidy.
 #
-# This is what the `clang-tidy` CI job runs, and what `scripts/local-gate.sh`
-# asks for where the `clang-debug` preset cannot be built. It needs a compile
-# database and nothing else -- no objects, no link.
+# This is what the `clang-tidy` CI job runs. `scripts/local-gate.sh` gets the
+# same checks the other way, through the `clang-debug` preset's build; this is
+# for where that preset cannot be built, and for reproducing what CI will say.
+# It needs a compile database and nothing else -- no objects, no link.
 #
 # **It verifies the tool actually RUNS before believing a clean result.** That is
 # the whole reason this is a script rather than a one-line loop: a wrapper that
@@ -60,7 +61,9 @@ fi
 TIDY="${TIDY:-clang-tidy-${CLANG_TOOLS_VERSION:-22}}"
 DB="${DB:-out/build/tidy22}"
 BASE="${BASE:-origin/master}"
-JOBS="${JOBS:-$( { nproc 2>/dev/null || echo 4; } )}"
+# getconf rather than nproc alone: this runs on macOS too, where nproc does not
+# exist and a bare fallback would quietly use four cores of twelve.
+JOBS="${JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
 fatal() { echo "TIDY SWEEP FATAL: $*" >&2; exit 2; }
 
@@ -76,15 +79,22 @@ fatal() { echo "TIDY SWEEP FATAL: $*" >&2; exit 2; }
 # Deliberately NOT here: documentation, `.agent/`, `packaging/` assets and the
 # sources themselves. A README typo must not cost a full sweep.
 SweepEverythingWhen=(
-    ".clang-tidy"                  # the check list and every check's options
-    ".clang-format"                # a reformat can move a finding's line
+    "*.clang-tidy"                 # the check list and every check's options
+    "*.clang-format"               # a reformat can move a finding's line
     "CMakePresets.json"            # the flags the database is generated from
     "*CMakeLists.txt"              # ditto
     "*.cmake"                      # ditto
+    "vcpkg.json"                   # the third-party headers every TU parses
     "*.hpp.in"                     # generates a header the include graph cannot see
     "scripts/tidy-sweep.sh"        # this file: prove the new scope logic works
     ".github/workflows/build.yml"  # the job that runs it
 )
+
+# What counts as a first-party source, spelled once. Written twice -- as
+# `git ls-files` globs and as a `case` pattern -- it is a two-site edit for a
+# one-fact change, in a script whose whole thesis is that a wrong scope is
+# invisible.
+SourceExtensions=(c h hpp cpp ipp hxx inl)
 
 # True when a changed path forces the full sweep.
 # @param 1 Repo-relative path.
@@ -150,10 +160,12 @@ BuildIncludeGraph() {
 AffectedTranslationUnits() {
     local -A seen=()
     local -a queue=("$@")
-    local current includer
-    while [[ "${#queue[@]}" -gt 0 ]]; do
-        current="${queue[0]}"
-        queue=("${queue[@]:1}")
+    local current includer head=0
+    # A cursor rather than `queue=("${queue[@]:1}")`, which rebuilds the whole
+    # array on every pop and is quadratic over a tree this size.
+    while [[ "$head" -lt "${#queue[@]}" ]]; do
+        current="${queue[head]}"
+        head=$((head + 1))
         [[ -n "${seen["$current"]:-}" ]] && continue
         seen["$current"]=1
         for includer in ${includers["$current"]:-}; do
@@ -229,6 +241,7 @@ SelfTest() {
     ExpectForce "src/FastCache/CMakeLists.txt" yes
     ExpectForce "scripts/tidy-sweep.sh" yes
     ExpectForce "src/FastCache/Core/Version.hpp.in" yes
+    ExpectForce "vcpkg.json" yes
     ExpectForce "src/FastCache/Core/Logger.hpp" no
     ExpectForce "src/FastCache/Core/Logger.cpp" no
     ExpectForce "README.md" no
@@ -261,7 +274,10 @@ command -v "$TIDY" >/dev/null 2>&1 || fatal "$TIDY is not on PATH"
 "$TIDY" --version >/dev/null 2>&1 || fatal "$TIDY will not run"
 [[ -f "${DB}/compile_commands.json" ]] || fatal "no compile database at ${DB}"
 
-PYTHON="$(command -v python3 || command -v python)" \
+# python3 by name, as `scripts/coverage.sh` already needs it. Never a bare
+# `python` fallback: on an old host that finds a Python 2 and the plan below
+# fails in a way that reads like an empty database.
+command -v python3 >/dev/null 2>&1 \
     || fatal "python3 is needed to read the compile database"
 
 scratch="$(mktemp -d)" || fatal "cannot create a scratch directory"
@@ -279,76 +295,93 @@ trap "rm -rf '$scratch'" EXIT
 #
 # Reading the database is also the only honest answer to what this platform
 # compiles: `IocpReactor.cpp` is a translation unit on Windows and a file on
-# Linux, so a list taken from `git ls-files` would fail a full sweep on sources no
-# target here builds. Third-party sources under `_deps/` are somebody else's.
-cat > "${scratch}/plan.py" <<'PLAN'
-"""Emit one `<database dir>\t<file>` line per distinct compile command."""
+# Linux, so a list taken from `git ls-files` alone would fail a full sweep on
+# sources no target here builds.
+#
+# **First-party means git knows about the file**, and that is the definition
+# rather than an exclusion list of directories. A fetched dependency's sources
+# are compile-database entries like any other -- Catch2, yaml-cpp and lz4 are
+# ~150 of the 594 here -- and where they LAND is configuration: `_deps/` under
+# the build tree by default, but `$CPM_SOURCE_CACHE` anywhere, which in CI is
+# `.cache/CPM` INSIDE the workspace. A path-shaped exclusion gets that wrong the
+# moment somebody moves the cache, and gets it wrong in the direction that makes
+# a full sweep fail on somebody else's code. The intersection with what git
+# tracks also subsumes the absolute-path and out-of-tree cases for free.
+#
+# @param 1 A file of repo-relative paths to keep, or "--all" for every unit.
+# @param 2 A file of the repo-relative paths git knows about.
+# Prints one tab-separated `<database dir> <file>` row per distinct compile
+# command; the caller checks that the result is not empty.
+PlanUnits() {
+    python3 - "${DB}/compile_commands.json" "$repo_root" "$DB" "${scratch}/db" "$1" "$2" <<'PLAN'
 import json, os, sys
 
-db_path, root, outdir, selection_path = sys.argv[1:5]
-selection = None
-if selection_path != "--all":
-    with open(selection_path, encoding="utf-8") as handle:
-        selection = {line.strip() for line in handle if line.strip()}
+dbPath, root, dbDir, outDir, selectionPath, firstPartyPath = sys.argv[1:7]
 
-with open(db_path, encoding="utf-8") as handle:
+def readSet(path):
+    with open(path, encoding="utf-8") as handle:
+        return {line.strip() for line in handle if line.strip()}
+
+selection = None if selectionPath == "--all" else readSet(selectionPath)
+firstParty = readSet(firstPartyPath)
+
+with open(dbPath, encoding="utf-8") as handle:
     entries = json.load(handle)
 
 prefix = root.replace("\\", "/").rstrip("/") + "/"
 byFile = {}
-order = []
 for entry in entries:
     path = entry.get("file", "").replace("\\", "/")
     if path.startswith(prefix):
         path = path[len(prefix):]
-    if path.startswith("/") or "/_deps/" in path or ":" in path.split("/")[0]:
+    if path not in firstParty:
         continue
     if selection is not None and path not in selection:
         continue
     command = entry.get("command") or " ".join(entry.get("arguments", []))
-    if path not in byFile:
-        byFile[path] = {}
-        order.append(path)
-    byFile[path].setdefault(command, entry)
+    byFile.setdefault(path, {}).setdefault(command, entry)
 
 if selection is not None:
-    missing = sorted(selection - set(order))
-    for path in missing:
+    for path in sorted(selection - byFile.keys()):
         print("not a translation unit here: " + path, file=sys.stderr)
 
+# The first command for a file is served by the real database; every later one
+# gets a single-entry database of its own.
 slot = 0
-for path in order:
-    for index, entry in enumerate(byFile[path].values()):
+for path, commands in byFile.items():
+    for index, entry in enumerate(commands.values()):
         if index == 0:
-            print(os.path.dirname(db_path) + "\t" + path)
+            print(dbDir + "\t" + path)
             continue
         slot += 1
-        directory = os.path.join(outdir, str(slot))
+        directory = os.path.join(outDir, str(slot))
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, "compile_commands.json"), "w",
                   encoding="utf-8") as handle:
             json.dump([entry], handle)
         print(directory + "\t" + path)
 PLAN
-
-# @param 1 A file of repo-relative paths to keep, or "--all" for every unit.
-# Prints the plan; the caller checks that it is not empty.
-PlanUnits() {
-    "$PYTHON" "${scratch}/plan.py" "${DB}/compile_commands.json" \
-              "$repo_root" "${scratch}/db" "$1"
 }
 
 # A canary against a real file. Anything that stops clang-tidy from parsing shows
 # up here rather than as an entire branch reported clean.
-probe_file="$(git ls-files 'src/FastCache/Core/*.cpp' | head -1)"
-[[ -n "$probe_file" ]] || fatal "no probe file to canary against"
-probe="$("$TIDY" -p "$DB" --quiet "$probe_file" 2>&1)"
-probe_rc=$?
-[[ "$probe_rc" -ge 126 ]] && fatal "$TIDY could not be executed (exit ${probe_rc})"
-case "$probe" in
-    *"Permission denied"*|*"error: no such file or directory: '@"*|*"'stddef.h' file not found"*)
-        fatal "$TIDY is not parsing: ${probe}" ;;
-esac
+#
+# Called only once there is something to sweep. It costs a full translation unit
+# with the analyzer on, and a documentation-only pull request must not pay that
+# to be told it has nothing to do -- the canary exists to stop a CLEAN VERDICT
+# being believed, and a sweep with no units earns no verdict.
+Canary() {
+    local probe_file probe probe_rc
+    probe_file="$(git ls-files 'src/FastCache/Core/*.cpp' | head -1)"
+    [[ -n "$probe_file" ]] || fatal "no probe file to canary against"
+    probe="$("$TIDY" -p "$DB" --quiet "$probe_file" 2>&1)"
+    probe_rc=$?
+    [[ "$probe_rc" -ge 126 ]] && fatal "$TIDY could not be executed (exit ${probe_rc})"
+    case "$probe" in
+        *"Permission denied"*|*"error: no such file or directory: '@"*|*"'stddef.h' file not found"*)
+            fatal "$TIDY is not parsing: ${probe}" ;;
+    esac
+}
 
 selection="--all"
 if [[ "$mode" != all ]]; then
@@ -391,12 +424,13 @@ if [[ "$mode" != all ]]; then
 fi
 
 if [[ "$mode" != all ]]; then
-    declare -a sources=() touched=()
-    mapfile -t sources < <(git ls-files '*.c' '*.h' '*.hpp' '*.cpp' '*.ipp' '*.hxx' '*.inl')
+    declare -a sources=() touched=() globs=()
+    for extension in "${SourceExtensions[@]}"; do globs+=("*.${extension}"); done
+    mapfile -t sources < <(git ls-files "${globs[@]}")
     for path in "${changed[@]}"; do
-        case "$path" in
-            *.c|*.h|*.hpp|*.cpp|*.ipp|*.hxx|*.inl) touched+=("$path") ;;
-        esac
+        for extension in "${SourceExtensions[@]}"; do
+            [[ "$path" == *".${extension}" ]] && { touched+=("$path"); break; }
+        done
     done
     if [[ "${#touched[@]}" -eq 0 ]]; then
         echo "TIDY SWEEP: no source changed against ${BASE}"
@@ -408,7 +442,11 @@ if [[ "$mode" != all ]]; then
     echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection") candidate file(s)"
 fi
 
-mapfile -t plan < <(PlanUnits "$selection")
+# `--cached --others --exclude-standard` rather than plain `git ls-files`: a new
+# source that has been created but not added yet is exactly the code nothing has
+# ever checked, and dropping it here would drop it silently.
+git ls-files --cached --others --exclude-standard > "${scratch}/first-party"
+mapfile -t plan < <(PlanUnits "$selection" "${scratch}/first-party")
 if [[ "${#plan[@]}" -eq 0 ]]; then
     if [[ "$mode" == all ]]; then
         fatal "no first-party translation units in ${DB}/compile_commands.json"
@@ -418,6 +456,7 @@ if [[ "${#plan[@]}" -eq 0 ]]; then
     exit 0
 fi
 echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
+Canary
 
 # One translation unit, into numbered files so the report below is in a stable
 # order however the pool interleaves. A refusal to EXECUTE is recorded apart from
@@ -437,20 +476,41 @@ TidyOne() {
     # Unknown *warning options* are the GCC-only flags a clang build has no use
     # for; everything else is a finding.
     hits="$(printf '%s\n' "$out" | grep -E 'error:|warning:' | grep -v 'unknown-warning-option')"
-    [[ -n "$hits" ]] && { printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out"; }
-    return 0
+    if [[ -n "$hits" ]]; then
+        printf '=== %s\n%s\n' "$file" "$hits" > "${slot}.out"
+    fi
 }
 
 index=0
+running=0
+declare -a skipped=()
 for unit in "${plan[@]}"; do
     database="${unit%%$'\t'*}"
     file="${unit#*$'\t'}"
-    [[ -f "$file" ]] || continue
+    # A unit the database names and the tree does not have -- a source deleted
+    # since the database was generated. Recorded rather than passed over: a count
+    # that silently disagrees with the plan is the one thing this script must not
+    # print.
+    if [[ ! -f "$file" ]]; then
+        skipped+=("$file")
+        continue
+    fi
     index=$((index + 1))
     TidyOne "$database" "$file" "$(printf '%s/%05d' "$scratch" "$index")" &
-    while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do wait -n; done
+    # A counter rather than `jobs -rp | wc -l`, which forks twice per unit just
+    # to count children.
+    running=$((running + 1))
+    if [[ "$running" -ge "$JOBS" ]]; then
+        wait -n
+        running=$((running - 1))
+    fi
 done
 wait
+
+if [[ "${#skipped[@]}" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${#skipped[@]} unit(s) in the database are not in the tree and were"
+    echo "            not swept: ${skipped[*]}"
+fi
 
 shopt -s nullglob
 fatals=("$scratch"/*.fatal)

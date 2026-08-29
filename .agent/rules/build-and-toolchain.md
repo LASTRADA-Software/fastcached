@@ -154,15 +154,42 @@ numbers are kept because each one is the reason a knob is where it is.
 
 - **A change that decides how EVERY translation unit is read escalates to the full
   sweep, and that is a table** (`SweepEverythingWhen`): `.clang-tidy`, any
-  `CMakeLists.txt`, any `.cmake`, `CMakePresets.json`, `*.hpp.in` (it generates a
-  header the include graph cannot see), the sweep script and the workflow. A
-  README typo is deliberately not on it.
+  `CMakeLists.txt`, any `.cmake`, `CMakePresets.json`, `vcpkg.json`, `*.hpp.in`
+  (it generates a header the include graph cannot see), the sweep script and the
+  workflow. A README typo is deliberately not on it.
+
+- **The unit of work is a compile command, not a file, and that is what makes the
+  swap lossless.** `Stats.cpp` builds into `fastcache-cc`, `fastcache-cc-tests`
+  and `fastcache-compile-node`, which do not agree about `FC_COMPRESSION_ENABLED`;
+  `clang-tidy -p <dir> <file>` always takes the *first* matching entry, so the
+  second and later commands for a file each get a one-entry database of their own.
+  Measured against a CI-shaped database: 594 entries, 445 of them first-party, and
+  329 distinct files — so a per-file sweep would have stopped checking a quarter of
+  what the build checked. 445 is also exactly what the old job tidied
+  (`include(ClangTidy)` runs *after* the `CPMAddPackage` calls, so a fetched
+  dependency's targets never carried `CMAKE_CXX_CLANG_TIDY`), which is the sense in
+  which this change costs no coverage. Measured scopes on that database: a leaf
+  `.cpp` 1 unit, `Distributed/SchedulerService.hpp` 29, `Core/Logger.hpp` 83,
+  `Stats.cpp` 4 (one file, four commands), a `.cmake` all 445, a README nothing.
 
 - **The translation units come from the compile database, never from
   `git ls-files`.** `IocpReactor.cpp` is a translation unit on Windows and a file
   on Linux, so a full sweep taken from the index would fail on sources no target
   here builds — and a diff-scoped one would report findings for a compile command
   that does not exist.
+
+- **But *first-party* means git tracks the file, and that is a definition rather
+  than a list of directories.** A fetched dependency's sources are compile-database
+  entries like any other — Catch2, yaml-cpp and lz4 are ~150 of the 594 entries here
+  — and **where they land is configuration**: `_deps/` under the build tree by
+  default, `$CPM_SOURCE_CACHE` anywhere, which in CI is `.cache/CPM` *inside* the
+  workspace. An exclusion written as a path (`/_deps/`) was measured to let all
+  ~150 of them through under CI's own layout, which turns a full sweep into a
+  failure inside lz4's `xxhash.h`. Intersecting with
+  `git ls-files --cached --others --exclude-standard` gets it right wherever the
+  cache is put, and subsumes the absolute-path and out-of-tree cases for free.
+  `--others` is in there deliberately: a source created and not yet added is
+  exactly the code nothing has ever checked.
 
 - **A database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF`
   named explicitly, even though `CompileCache.cmake` sets it.** That module turns

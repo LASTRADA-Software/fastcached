@@ -299,7 +299,10 @@ jobs:
         env:
           TIDY: clang-tidy-${{ env.CLANG_TOOLS_VERSION }}
           DB: out/build/clang-debug
-          BASE: origin/${{ github.base_ref }}
+          # `github.base_ref` is empty on a push, where `--all` is passed anyway
+          # and BASE is never read. Defaulted rather than left as `origin/` so
+          # the two expressions on this step do not have to agree to be correct.
+          BASE: origin/${{ github.base_ref || 'master' }}
         run: >-
           scripts/tidy-sweep.sh
           ${{ github.event_name != 'pull_request' && '--all' || '' }}
@@ -339,11 +342,21 @@ jobs:
       # than 2G because the whole repository shares a 10 GB Actions cache budget
       # with the CPM and sccache entries, and `Cleanups` in the step below is
       # what says whether it is enough.
+      #
+      # `save` only on a push, and that is what makes 1G affordable. The action
+      # appends a timestamp to the key, so every run writes a NEW entry rather
+      # than updating one — at 1G that is a gigabyte of the repository's shared
+      # 10 GB Actions budget per run, competing with the Windows sccache entries
+      # this workflow now also fills. A pull-request run's entry is scoped to its
+      # own ref and can never be read by master or by another pull request, so it
+      # only ever helps a repeat push to the same branch; restoring from master's
+      # entry, which is what actually gives the 90% hit rate, still works.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-debug
           max-size: 1G
+          save: ${{ github.event_name == 'push' }}
 
       - name: "Install build tools"
         run: |
@@ -359,9 +372,15 @@ jobs:
           sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
 
+      # CMAKE_CXX_SCAN_FOR_MODULES=OFF for the same reason the tidy job names it,
+      # and here it is insurance rather than necessity: CompileCache.cmake turns
+      # the scan off only inside the branch that picks a launcher, so a ccache
+      # this job fails to find silently buys a clang-scan-deps process per
+      # translation unit across ~590 units. This project has no module units.
       - name: "Configure"
         run: >-
-          cmake --preset clang-debug -DENABLE_TIDY=OFF -DFASTCACHED_ENABLE_TLS=ON
+          cmake --preset clang-debug -DENABLE_TIDY=OFF
+          -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 
       - name: "Build"
@@ -658,6 +677,11 @@ jobs:
       # mozilla-actions/sccache-action ships sccache >= 0.8, which uses
       # OpenDAL >= 0.45 and speaks the memcached BINARY protocol; the apt
       # sccache (0.7.7) on noble still speaks text.
+      #
+      # v0.0.6 while the Windows jobs are on v0.0.11, deliberately: this job uses
+      # the action purely to put an sccache BINARY on PATH and then points it at a
+      # fastcached daemon. It never touches the Actions-cache backend, which is
+      # the only thing the newer version is needed for.
       - name: "Install sccache (binary protocol via OpenDAL >= 0.45)"
         uses: mozilla-actions/sccache-action@v0.0.6
       - name: "Smoke"
@@ -798,7 +822,18 @@ jobs:
       # A compiler cache that handled nothing is worse than one that is off,
       # because it reads like success: the configure says "Enabling sccache", the
       # build is green, and the seventeen minutes look like the cost of compiling
-      # this project on Windows. So the number is asserted, not printed.
+      # this project on Windows. So both facts are asserted, not printed.
+      #
+      # `cache_location` is the one that matters, and asserting only
+      # `compile_requests` would have missed the entire regression: the broken
+      # configuration reported 231 requests and 2 hits, into a directory the
+      # runner deletes. A hit-rate floor is not usable — the first run after a
+      # cache key changes is legitimately cold — so what is checked is that the
+      # backend is not the ephemeral one, which is a fact about configuration and
+      # is true from the very first run. Stated as "not `Local disk`" rather than
+      # as "is the Actions cache": `Local disk` is the exact string sccache fell
+      # back to and the exact string this job must never see again, while what
+      # the GHA backend calls itself is sccache's to rename.
       #
       # Here, and NOT in the action's own post step, because sccache keeps its
       # counters in the server and this suite restarts that server: the
@@ -813,7 +848,11 @@ jobs:
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
           if ($stats.stats.compile_requests -eq 0) {
-            Write-Host "::error::sccache handled 0 compile requests; this job compiled everything from scratch"
+            Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
+            exit 1
+          }
+          if ($stats.cache_location -match 'Local disk') {
+            Write-Host "::error::sccache is caching into '$($stats.cache_location)', which is deleted with this runner; SCCACHE_GHA_ENABLED did not take effect"
             exit 1
           }
 
@@ -938,6 +977,23 @@ jobs:
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc
+
+      # Same assertion as the `windows` job, where the reasoning is written out.
+      # Repeated rather than pointed at, because a cache enabled in three jobs and
+      # proved in one is a cache two of them can lose in silence.
+      - name: "Assert sccache actually handled the build"
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+          $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($stats.stats.compile_requests -eq 0) {
+            Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
+            exit 1
+          }
+          if ($stats.cache_location -match 'Local disk') {
+            Write-Host "::error::sccache is caching into '$($stats.cache_location)', which is deleted with this runner; SCCACHE_GHA_ENABLED did not take effect"
+            exit 1
+          }
 
       # The harness exercises both cl and clang-cl when they are on PATH, and
       # exits 77 if neither is — which must not silently pass, so it is checked.
@@ -1594,6 +1650,21 @@ jobs:
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node
+
+      # Same assertion as the `windows` job, where the reasoning is written out.
+      - name: "Assert sccache actually handled the build"
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+          $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($stats.stats.compile_requests -eq 0) {
+            Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
+            exit 1
+          }
+          if ($stats.cache_location -match 'Local disk') {
+            Write-Host "::error::sccache is caching into '$($stats.cache_location)', which is deleted with this runner; SCCACHE_GHA_ENABLED did not take effect"
+            exit 1
+          }
 
       # On failure CPack only says "check wix.log", which lives in the build
       # tree and is otherwise discarded with the runner — so the actual WiX
