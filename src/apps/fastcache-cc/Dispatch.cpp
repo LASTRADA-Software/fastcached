@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Dispatch.hpp"
-#include "EndpointDial.hpp"
 
 #include <FastCache/Core/Compression.hpp>
 
@@ -131,6 +130,7 @@ namespace
         Wire::CodecList const& accepted; ///< What this client can decode.
         Credential const& credential;    ///< Presented to the worker.
         DispatchRequest const& request;  ///< The job itself.
+        ExchangeBudget budget;           ///< How long the compile may take.
     };
 
     /// Send one preprocessed translation unit to the worker a lease named.
@@ -139,15 +139,11 @@ namespace
     /// Every branch below is a way a job can end, and a release written per branch
     /// is a release somebody forgets on the branch added next -- which is how the
     /// key this lease pins comes to be pinned for the full lease timeout.
-    /// @param dialer How to reach the worker.
+    /// @param exchange How to reach the worker.
     /// @param job The lease and what to compile under it.
     /// @return What happened, as `Dispatch` will return it.
-    [[nodiscard]] DispatchResult CompileOnWorker(IEndpointDialer& dialer, LeasedJob const& job)
+    [[nodiscard]] DispatchResult CompileOnWorker(IEndpointExchange& exchange, LeasedJob const& job)
     {
-        auto worker = dialer.Dial(job.endpoint);
-        if (worker == nullptr)
-            return Refused(DispatchStatus::Unavailable, std::format("worker {} unreachable", job.endpoint));
-
         auto const argsField = EncodeArgs(job.request.args);
         // Compressed against the WORKER's codecs, which the grant relayed -- not
         // against this client's. The two need not agree, and guessing wrong would
@@ -155,15 +151,19 @@ namespace
         // network.
         auto const sourceField = Envelope(job.request.preprocessed, job.codecs);
 
-        auto const compileFrame =
-            Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = job.leaseToken,
-                                                       .fingerprint = job.request.fingerprint,
-                                                       .args = argsField,
-                                                       .source = sourceField,
-                                                       .acceptedCodecs = job.accepted,
-                                                       .sourceName = BaseName(job.request.sourceName) });
-        auto const compileOutcome = SyncRun(ExchangeFramed(worker.get(), compileFrame, job.credential));
+        // Not `const`: the frame carries a whole preprocessed translation unit, so it
+        // is MOVED into the exchange rather than copied on the hot path of a build.
+        auto compileFrame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = job.leaseToken,
+                                                                       .fingerprint = job.request.fingerprint,
+                                                                       .args = argsField,
+                                                                       .source = sourceField,
+                                                                       .acceptedCodecs = job.accepted,
+                                                                       .sourceName = BaseName(job.request.sourceName) });
+        auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
+            // Unreachable, broken mid-reply, or out of budget. The three are one
+            // answer here -- compile it locally -- and the endpoint is named because
+            // that is the part an operator can act on.
             return Refused(DispatchStatus::Unavailable, std::format("compile exchange with {} failed", job.endpoint));
         if (!compileOutcome.IsHit())
             // A refusal here is the worker declining the JOB -- an unknown lease, a
@@ -208,23 +208,23 @@ namespace
     /// scheduler restarted, leadership moved, the lease already expired -- is one
     /// the client can do nothing about and the fleet recovers from on its own, and
     /// there is no caller decision it could change.
-    /// @param dialer How to reach the scheduler.
+    /// @param exchange How to reach the scheduler.
     /// @param request The job, for the scheduler endpoint and the key.
     /// @param leaseToken The token that was granted.
     /// @param credential Presented to the scheduler.
-    void ReleaseLease(IEndpointDialer& dialer,
+    /// @param budget The control budget; a release is a short request/reply and
+    ///        must not inherit the compile's minutes.
+    void ReleaseLease(IEndpointExchange& exchange,
                       DispatchRequest const& request,
                       std::string_view leaseToken,
-                      Credential const& credential)
+                      Credential const& credential,
+                      ExchangeBudget budget)
     {
-        auto scheduler = dialer.Dial(request.schedulerEndpoint);
-        if (scheduler == nullptr)
-            return;
         // The key travels with the token: a token alone is a number a restarted
         // scheduler will have reissued, and resolving the wrong lease frees a key
         // somebody else is building.
-        auto const frame = Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = leaseToken, .key = request.objectKey });
-        (void) SyncRun(ExchangeFramed(scheduler.get(), frame, credential));
+        auto frame = Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = leaseToken, .key = request.objectKey });
+        (void) exchange.Exchange(request.schedulerEndpoint, std::move(frame), credential, budget);
     }
 
 } // namespace
@@ -245,27 +245,24 @@ std::vector<std::string> DecodeArgs(std::span<std::byte const> field)
     return offset == field.size() ? out : std::vector<std::string> {};
 }
 
-DispatchResult Dispatch(IEndpointDialer& dialer,
+DispatchResult Dispatch(IEndpointExchange& exchange,
                         DispatchRequest const& request,
+                        DispatchBudgets const& budgets,
                         Credential const& credential,
                         Wire::CodecList const& acceptedCodecs)
 {
     auto const accepted = acceptedCodecs.empty() ? AvailableCodecs() : acceptedCodecs;
 
     // --- ask the scheduler where to compile ---------------------------------
-    auto scheduler = dialer.Dial(request.schedulerEndpoint);
-    if (scheduler == nullptr)
-        return Refused(DispatchStatus::Unavailable, "scheduler unreachable");
-
-    auto const leaseFrame = Wire::EncodeLease(
+    auto leaseFrame = Wire::EncodeLease(
         Wire::LeaseRequest { .fingerprint = request.fingerprint, .key = request.objectKey, .acceptedCodecs = accepted });
-    // `SyncRun` because this path has no reactor: the dialer above hands back a
-    // blocking socket, whose awaitables resolve inline, so the task is never left
-    // suspended. That is the precondition `SyncRun` states, and it is why the
-    // dialer is typed on `BlockingConnector` rather than on `IConnector`.
-    auto const leaseOutcome = SyncRun(ExchangeFramed(scheduler.get(), leaseFrame, credential));
+    auto const leaseOutcome =
+        exchange.Exchange(request.schedulerEndpoint, std::move(leaseFrame), credential, budgets.control);
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
-        return Refused(DispatchStatus::Unavailable, "lease exchange failed");
+        // Unreachable or broken mid-reply. Nothing was leased, so there is nothing
+        // to release and the worker is never asked -- the client does not guess at
+        // an endpoint the scheduler did not name.
+        return Refused(DispatchStatus::Unavailable, "scheduler exchange failed");
     if (!leaseOutcome.IsHit())
         // NoWorker, NoCapacity, AlreadyInFlight, DispatchNotPermitted -- every one
         // of them ordinary, and every one answered by compiling locally. The
@@ -279,61 +276,28 @@ DispatchResult Dispatch(IEndpointDialer& dialer,
     auto const endpoint = std::string { Wire::AsStringView(grant->endpoint) };
     auto const token = std::string { Wire::AsStringView(grant->leaseToken) };
 
-    // The lease conversation is over, so the socket goes rather than being held for
-    // the length of a compile. The scheduler would sweep it anyway -- it is a
-    // fleet-facing port with a connection budget -- and holding it would spend one
-    // of those slots per parallel launcher on nothing.
-    scheduler.reset();
+    // The lease conversation is over and its connection is already gone: an exchange
+    // owns its socket for exactly one request/reply. Holding one for the length of a
+    // compile would spend a slot of the scheduler's connection budget per parallel
+    // launcher on nothing, and the scheduler would sweep it anyway.
 
     // --- have the worker compile it -----------------------------------------
-    auto result = CompileOnWorker(dialer,
+    auto result = CompileOnWorker(exchange,
                                   LeasedJob { .endpoint = endpoint,
                                               .leaseToken = token,
                                               .codecs = grant->workerCodecs,
                                               .accepted = accepted,
                                               .credential = credential,
-                                              .request = request });
+                                              .request = request,
+                                              .budget = budgets.compile });
 
     // --- and hand the lease back, however that went -------------------------
     // On every path out of the compile, which is why the compile is a function
     // rather than a run of early returns: an unreachable worker, a refused job and
     // a finished one all mean the same thing to the scheduler -- this key is no
     // longer being built here.
-    ReleaseLease(dialer, request, token, credential);
+    ReleaseLease(exchange, request, token, credential, budgets.control);
     return result;
-}
-
-namespace
-{
-    /// The dialer that opens real sockets.
-    class TcpDialer final: public IEndpointDialer
-    {
-      public:
-        TcpDialer(std::chrono::milliseconds connectTimeout, std::chrono::milliseconds ioTimeout) noexcept:
-            _connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = ioTimeout } },
-            _connectTimeout { connectTimeout }
-        {
-        }
-
-        [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
-        {
-            return DialEndpointBlocking(_connector, hostPort, _connectTimeout);
-        }
-
-      private:
-        /// A BLOCKING connector, and the type is the contract: this dialer is used
-        /// from the launcher's main thread, which has no reactor, and the socket it
-        /// hands back is driven with `SyncRun`. The per-call send/recv ceiling lives
-        /// on the connector now, because that is the only kind of socket it means
-        /// anything to.
-        BlockingConnector _connector;
-        std::chrono::milliseconds _connectTimeout;
-    };
-} // namespace
-
-std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds connectTimeout, std::chrono::milliseconds ioTimeout)
-{
-    return std::make_unique<TcpDialer>(connectTimeout, ioTimeout);
 }
 
 } // namespace FastCache::Cc

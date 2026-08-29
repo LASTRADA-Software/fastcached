@@ -335,6 +335,50 @@ the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out.
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
+`FASTCACHE_DISPATCH_TIMEOUT_MS` is how long the client will wait for one remote
+compile, measured from the request to the last byte of the reply — the dial has
+its own `FASTCACHE_CONNECT_TIMEOUT_MS`. It defaults to **600000** (ten minutes)
+and is deliberately not the cache's `FASTCACHE_TIMEOUT_MS`: a worker writes nothing
+until the compiler has finished, so the client waits out the whole compile in a
+single read, and while the two shared one number every translation unit taking
+longer than ten seconds was abandoned and rebuilt locally — precisely the ones
+worth distributing ([#223](https://github.com/LASTRADA-Software/fastcached/issues/223)).
+Ten minutes because that is `LeaseTable`'s own lease timeout: waiting longer
+means waiting on a lease the scheduler has already reclaimed.
+
+The launcher is one process per translation unit, so this is a **runtime**
+setting — export a new value and the next compile uses it. Nothing reloads and
+nothing restarts. Raise it if a single translation unit legitimately compiles for
+longer than ten minutes; lower it only knowing that it is a flat ceiling, so it is
+also how long a genuinely dead worker takes to be noticed.
+
+!!! warning "A dead worker is now noticed in ten minutes, not ten seconds"
+
+    This is the price of the fix above, and it is a real regression: the deadline
+    went up sixtyfold, and a flat deadline cannot tell a worker that is *still
+    compiling* from one that is *gone*. If a worker's machine vanishes mid-job —
+    powered off, cable pulled, VPN dropped, laptop suspended — the client blocks
+    that build slot for the full `FASTCACHE_DISPATCH_TIMEOUT_MS` before falling
+    back. On a `-j16` build a handful of those is a stalled build.
+
+    Nothing is lost and nothing hangs forever: the client hands the lease back and
+    compiles locally, so the build completes and the key is **not** pinned for the
+    scheduler's lease timeout. But it is slow, and it looks like the fleet made the
+    build hang.
+
+    Two things narrow it. Lower `FASTCACHE_DISPATCH_TIMEOUT_MS` if you know your
+    slowest translation unit — the floor is that unit, not this default. And
+    separating "still working" from "gone" properly needs the worker to say so
+    periodically, which is a wire change tracked as
+    [#245](https://github.com/LASTRADA-Software/fastcached/issues/245).
+
+!!! warning "What a client that runs out of budget costs the fleet"
+
+    The worker is never told. It finishes the compile and writes back an object
+    nobody reads, so that CPU is spent twice and `worker_jobs_completed_total`
+    still counts the job. That is also #245: a worker that learns its client is
+    gone can abandon the compile and free the slot.
+
 !!! danger "Do not set `FASTCACHE_TOKEN` on a client that dispatches"
 
     A node's scheduler, compile and cache ports serve no `AUTH` verb, so a

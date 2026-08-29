@@ -34,6 +34,8 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
+class ScriptedPeer;
+
 /// What a scripted peer did, kept where the TEST can still read it.
 ///
 /// Not fields on the peer, and that is the whole point: the socket a connector
@@ -50,6 +52,14 @@ struct PeerLog
     int reads { 0 };          ///< Reads the exchange issued, parked ones included.
     bool closed { false };    ///< Whether `Close()` was called.
     bool destroyed { false }; ///< Whether the peer was freed -- i.e. the dialling frame finished.
+
+    /// The peer while it is alive, and null the moment it is not.
+    ///
+    /// The one thing a case may hold across the dialling frame's end, for exactly
+    /// the reason the class note gives: a raw back-pointer to the socket outlives
+    /// nothing, and freed memory usually still answers. Cleared by the destructor,
+    /// so a driver running beside the exchange asks this before touching the peer.
+    ScriptedPeer* live { nullptr };
 };
 
 /// A socket that answers with scripted bytes, or never answers at all.
@@ -60,14 +70,17 @@ class ScriptedPeer final: public ISocket
     ///        peer accepts and then says nothing -- the case a dial timeout cannot
     ///        catch and only an exchange budget can.
     /// @param log Where to record what happened; must outlive this peer.
-    ScriptedPeer(std::vector<std::byte> reply, PeerLog& log) noexcept:
+    ScriptedPeer(std::vector<std::byte> reply, PeerLog& log, bool dribble) noexcept:
         _reply { std::move(reply) },
-        _log { &log }
+        _log { &log },
+        _dribble { dribble }
     {
+        _log->live = this;
     }
 
     ~ScriptedPeer() override
     {
+        _log->live = nullptr;
         _log->destroyed = true;
     }
 
@@ -76,12 +89,47 @@ class ScriptedPeer final: public ISocket
     ScriptedPeer& operator=(ScriptedPeer const&) = delete;
     ScriptedPeer& operator=(ScriptedPeer&&) = delete;
 
+    /// Hand a parked read exactly ONE byte of the scripted reply.
+    ///
+    /// Only meaningful on a dribbling peer, and only from the reactor's thread.
+    /// Completing the awaitable resumes the exchange inline, which parks the next
+    /// read before this returns -- so `_parked` is cleared first.
+    /// @return False when there is no parked read, nothing left to send, or the
+    ///         socket has been closed. A driver reads that as "stop".
+    bool DeliverOneByte()
+    {
+        if (_closed || _parked == nullptr || _pending.empty() || _offset >= _reply.size())
+            return false;
+        _pending[0] = _reply[_offset];
+        _offset += 1;
+        _pending = {};
+        auto* const parked = std::exchange(_parked, nullptr);
+        parked->Complete(IoResult { 1 });
+        return true;
+    }
+
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
         _log->reads += 1;
         if (_closed)
             return IoAwaitable { std::unexpected(
                 NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "closed" }) };
+
+        // A dribbler parks EVERY read, however much reply is left: it never says
+        // nothing and it never finishes, which is the shape no per-call ceiling
+        // catches. The buffer stays live until the awaitable resumes -- `ISocket`'s
+        // own contract -- so `DeliverOneByte` may write into it later.
+        if (_dribble && _offset < _reply.size())
+        {
+            _pending = buffer;
+            IoAwaitable parked;
+            parked.SetSuspendCallback(
+                [](IoAwaitable* self, std::coroutine_handle<>) {
+                    static_cast<ScriptedPeer*>(self->CallbackState())->_parked = self;
+                },
+                this);
+            return parked;
+        }
 
         if (_offset >= _reply.size())
         {
@@ -137,8 +185,11 @@ class ScriptedPeer final: public ISocket
   private:
     std::vector<std::byte> _reply;
     PeerLog* _log;
+    /// The buffer of the currently parked read, valid until it resumes.
+    std::span<std::byte> _pending;
     std::size_t _offset { 0 };
     IoAwaitable* _parked { nullptr };
+    bool _dribble { false };
     bool _closed { false };
 };
 
@@ -162,7 +213,7 @@ class ScriptedConnector final: public IConnector
             co_return std::unexpected(
                 NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
 
-        auto peer = std::make_unique<ScriptedPeer>(_reply, _log);
+        auto peer = std::make_unique<ScriptedPeer>(_reply, _log, _dribble);
         co_return peer;
     }
 
@@ -174,6 +225,12 @@ class ScriptedConnector final: public IConnector
     void Reply(std::vector<std::byte> bytes)
     {
         _reply = std::move(bytes);
+    }
+
+    /// Hand the reply over one byte per turn instead of in one go.
+    void DribbleReplies() noexcept
+    {
+        _dribble = true;
     }
 
     [[nodiscard]] int Dials() const noexcept
@@ -195,8 +252,12 @@ class ScriptedConnector final: public IConnector
     ///
     /// A log rather than the peer itself: the socket belongs to the frame that
     /// dialled it and is gone by the time a case asks. See `PeerLog`.
+    ///
+    /// Non-const, because a driver running beside the exchange reaches the live peer
+    /// through it. One accessor rather than a const one and a mutable twin: two names
+    /// for one member is two things a later case has to choose between.
     /// @return The record, valid for this connector's lifetime.
-    [[nodiscard]] PeerLog const& Log() const noexcept
+    [[nodiscard]] PeerLog& Log() noexcept
     {
         return _log;
     }
@@ -208,6 +269,7 @@ class ScriptedConnector final: public IConnector
     int _dials { 0 };
     std::uint16_t _lastPort { 0 };
     bool _refuse { false };
+    bool _dribble { false };
 };
 
 } // namespace
@@ -324,6 +386,121 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     // same claim: a budget that closed the socket but left the coroutine parked would
     // still leak, and the socket's own destructor is what says it did not.
     CHECK(log.destroyed);
+}
+
+TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget")
+{
+    // The case a per-call ceiling can NEVER catch, and the reason `total` is not a
+    // second spelling of `SO_RCVTIMEO`. This peer is never silent and never
+    // finished: every read is answered, so every per-call timer is reset, and the
+    // reply is perfectly well-formed. Only a bound on the whole exchange stops it.
+    ManualClock clock;
+    TestReactor reactor { clock };
+    ScriptedConnector connector;
+    connector.Reply(Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(4096, std::byte { 0x2A })));
+    connector.DribbleReplies();
+
+    constexpr Cc::ExchangeBudget Budget {};
+    constexpr auto PerByte = 100ms;
+    // More turns than the budget can survive, so the exchange stops because it ran
+    // out of time and not because the peer ran out of reply -- which would assert
+    // nothing at all.
+    constexpr int Turns = 4096;
+    static_assert(PerByte * Turns > Budget.total);
+
+    // One byte per turn, each costing `PerByte` on the reactor's clock. A task ON
+    // the reactor, for the reason the quiet-peer case gives: `TestReactor::Run`
+    // returns as soon as its queues drain, so nothing outside the loop gets to move
+    // the clock while an exchange is in flight.
+    auto dribble =
+        [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
+        for (int turn = 0; turn < turns; ++turn)
+        {
+            co_await ResumeOn { *loop };
+            c->Advance(perByte);
+            if (log->live == nullptr || !log->live->DeliverOneByte())
+                co_return;
+        }
+    };
+
+    Cc::ReactorExchange exchange { reactor, connector };
+    auto const start = clock.Now();
+    dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
+
+    auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
+
+    // Drained after the exchange stopped the reactor, so the driver reaches its own
+    // `co_return` and frees its frame. `Run()` breaks on `Stop()` and would leave a
+    // queued handle behind, which is a leak a sanitizer build reports and a plain
+    // one does not.
+    (void) reactor.Drain();
+
+    auto const& log = connector.Log();
+    INFO("reads=" << log.reads << " closed=" << log.closed << " destroyed=" << log.destroyed << " elapsed="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms");
+    CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
+    // It really was making progress, over and over: this is not the quiet peer
+    // wearing a different name.
+    CHECK(log.reads > 10);
+    // And it was abandoned at the budget rather than when the reply ran out.
+    CHECK(log.closed);
+    CHECK(log.destroyed);
+    CHECK(clock.Now() - start >= Budget.total);
+    CHECK(clock.Now() - start < PerByte * Turns);
+}
+
+TEST_CASE("A budget of zero arms no deadline at all")
+{
+    // What `FASTCACHE_TIMEOUT_MS=0` has always been documented to mean, and what the
+    // arithmetic alone would NOT do: a zero total puts the deadline at `Now()`, so
+    // every exchange would be closed on the reactor's next turn. A knob that reads
+    // as "turn the ceiling off" would have turned the cache off instead -- silently,
+    // because every caller answers a transport failure by compiling.
+    ManualClock clock;
+    TestReactor reactor { clock };
+    ScriptedConnector connector;
+    connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
+    // Dribbled, and that is what makes this case mean anything. A peer whose reads
+    // resolve INLINE finishes the whole exchange before `Run()` is ever called, so
+    // the reactor never takes a turn, so a deadline armed at `Now()` never gets to
+    // fire -- and the case would pass against the very code it exists to reject.
+    // Handing the reply over one byte per reactor turn, with the clock moving each
+    // time, is what puts the exchange on the far side of a turn the timer would
+    // have used.
+    connector.DribbleReplies();
+
+    // Comfortably more turns than `ReplyHeaderSize`, so the exchange stops because
+    // it read a whole reply and not because the driver ran out of turns.
+    constexpr int Turns = 32;
+    auto dribble = [](TestReactor* loop, ManualClock* c, PeerLog* log, int turns) -> DetachedTask {
+        for (int turn = 0; turn < turns; ++turn)
+        {
+            co_await ResumeOn { *loop };
+            c->Advance(1s);
+            if (log->live == nullptr || !log->live->DeliverOneByte())
+                co_return;
+        }
+    };
+
+    Cc::ReactorExchange exchange { reactor, connector };
+    auto const start = clock.Now();
+    dribble(&reactor, &clock, &connector.Log(), Turns);
+
+    auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Cc::ExchangeBudget { .total = 0ms });
+
+    // Drained so the driver reaches its own `co_return` and frees its frame; see the
+    // dribbling case above for why `Run()` cannot be relied on to do it.
+    (void) reactor.Drain();
+
+    auto const& log = connector.Log();
+    INFO("reads=" << log.reads << " advanced="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms");
+    // The reactor really did turn, and the clock really did move past where a
+    // `Now() + 0` deadline would have sat -- which is the whole discriminator.
+    CHECK(clock.Now() > start);
+    CHECK(log.reads > 1);
+    // The daemon's own answer, not the transport failure a fired deadline produces.
+    CHECK(outcome.kind == Cc::CacheOutcomeKind::Miss);
 }
 
 TEST_CASE("A reactor exchange runs once")

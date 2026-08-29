@@ -21,7 +21,13 @@
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
 //   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
-//   FASTCACHE_TIMEOUT_MS per-call socket deadline in ms (default 10000; 0 = none)
+//   FASTCACHE_TIMEOUT_MS deadline in ms for one WHOLE cache exchange, request to
+//                        last byte of the reply (default 10000; 0 = unbounded)
+//   FASTCACHE_DISPATCH_TIMEOUT_MS
+//                        deadline in ms for one whole COMPILE exchange with a
+//                        worker (default 600000; 0 = unbounded). Separate from the
+//                        one above because a compile is bounded by how long a
+//                        compiler runs, not by a round trip (#223).
 //
 // The statistics log is located from the usual per-user state variables rather
 // than one of our own: LOCALAPPDATA on Windows, else XDG_STATE_HOME or HOME.
@@ -39,7 +45,6 @@
 #include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "Dispatch.hpp"
-#include "EndpointDial.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
 #include "PathResolve.hpp"
@@ -104,8 +109,19 @@ namespace Wire = FastCache::CompileCacheWire;
 
 // --- config ----------------------------------------------------------------
 
-/// Default per-call socket deadline, overridable with FASTCACHE_TIMEOUT_MS.
-constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
+/// Default deadline for one whole CACHE exchange, overridable with
+/// FASTCACHE_TIMEOUT_MS.
+///
+/// Impatient on purpose: a daemon answers a FETCH or a STORE out of memory, so one
+/// that has not finished in ten seconds is one this build is better off without.
+/// That is what keeps a miss cheap. It is deliberately NOT what bounds a remote
+/// compile -- see `Cc::DefaultDispatchTotal` and issue #223.
+///
+/// Taken FROM `ExchangeBudget`'s own default rather than restated beside it: that
+/// default is what `DispatchBudgets::control` and every test that constructs a
+/// budget run under, so a number changed here and not there would leave the whole
+/// suite asserting the old policy with nothing failing.
+constexpr std::chrono::milliseconds DefaultIoTimeout = Cc::ExchangeBudget {}.total;
 
 /// Default ceiling on OPENING a connection, name resolution included.
 ///
@@ -114,7 +130,8 @@ constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
 /// better off without, and a name lookup that hangs would otherwise stall every
 /// translation unit with nothing to say why. They used to be one value passed
 /// twice.
-constexpr std::chrono::milliseconds DefaultConnectTimeout { 1000 };
+/// Taken from `ExchangeBudget`'s own default, for the reason above.
+constexpr std::chrono::milliseconds DefaultConnectTimeout = Cc::ExchangeBudget {}.connect;
 
 struct Config
 {
@@ -138,10 +155,15 @@ struct Config
     /// invocation presents the same thing — and so there is exactly one place
     /// that decides whether this build authenticates at all.
     Cc::Credential credential;
-    /// Per-call deadline for every blocking send/recv against the daemon. The
-    /// default keeps a wedged daemon from hanging a build while staying far
+    /// Deadline for one whole exchange with the daemon or the scheduler. The
+    /// default keeps a wedged peer from hanging a build while staying far
     /// above any healthy round-trip, including multi-megabyte objects.
     std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
+    /// Deadline for one whole COMPILE exchange with a worker, which is bounded by
+    /// how long a compiler runs rather than by a round trip. Separate from
+    /// `ioTimeout` because the two are different shapes of conversation and one
+    /// number served neither (#223).
+    std::chrono::milliseconds dispatchTimeout { Cc::DefaultDispatchTotal };
     std::chrono::milliseconds connectTimeout { DefaultConnectTimeout };
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
@@ -245,6 +267,7 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
+    c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
     c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
@@ -571,6 +594,29 @@ void ReplayStreams(std::string_view out, std::string_view err)
 [[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
 {
     return Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.ioTimeout };
+}
+
+/// The deadlines this invocation runs a dispatch under.
+///
+/// The scheduler's control verbs take the cache's budget, because they are the same
+/// shape of conversation -- a short reply out of the scheduler's own tables. The
+/// worker's COMPILE takes its own, because the worker writes nothing until the
+/// compiler has finished, so the client sits in one read for the whole compile and
+/// the cache's ten seconds abandoned every translation unit worth distributing
+/// (#223).
+/// @param cfg The launcher's configuration.
+/// @return The budgets.
+[[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
+{
+    // The compile budget is the ordinary one with its TOTAL replaced, rather than a
+    // second field-by-field construction: only the total differs, so a third field
+    // on `ExchangeBudget` must not need wiring into two places to reach dispatch.
+    // Derived from the SAME value the control leg gets, not from a second call, so
+    // the two cannot drift apart in anything but the total.
+    auto const control = BudgetOf(cfg);
+    auto compile = control;
+    compile.total = cfg.dispatchTimeout;
+    return Cc::DispatchBudgets { .control = control, .compile = compile };
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
@@ -1373,14 +1419,15 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
-    auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
-    auto const outcome = Cc::Dispatch(*dialer,
+    auto const exchange = Cc::MakeTcpExchange();
+    auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = identity.fingerprint,
                                                             .objectKey = key,
                                                             .args = *args,
                                                             .preprocessed = preprocessRun.out,
                                                             .sourceName = cmd.source },
+                                      DispatchBudgetsOf(cfg),
                                       cfg.credential);
     if (!outcome.Ran())
     {

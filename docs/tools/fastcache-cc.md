@@ -131,10 +131,10 @@ launchers that have no hazard.
 --8<-- "sccache-backend-caveat.md"
 
 The probe carries its own ten-second cap, which is what bounds a remote address
-that drops packets rather than refusing them: `FASTCACHE_TIMEOUT_MS` bounds each
-send and receive, not the TCP `connect()`, so a firewalled or vanished host
-otherwise takes the kernel's connect timeout to fail (measured at 2m30s on
-macOS) — once per configure here, but once per translation unit in a build.
+that drops packets rather than refusing them: `FASTCACHE_TIMEOUT_MS` bounds the
+exchange, not the TCP `connect()`, so a firewalled or vanished host otherwise
+takes the kernel's connect timeout to fail (measured at 2m30s on macOS) — once
+per configure here, but once per translation unit in a build.
 
 ### Installing it automatically
 
@@ -193,7 +193,8 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_NO_STATS` | Do not record invocations to the statistics log. | unset (recording on) |
 | `FASTCACHE_NO_DIRECT` | Disable direct mode, always preprocessing to derive the key. | unset (direct on) |
 | `FASTCACHE_CONNECT_TIMEOUT_MS` | Deadline, in milliseconds, for *opening* a connection — name resolution included. `0` leaves the platform's own, which runs to minutes. Short on purpose: a cache that has not accepted within a second is one the build is better off without, and a wedged resolver would otherwise stall every translation unit. | `1000` |
-| `FASTCACHE_TIMEOUT_MS` | Per-call deadline, in milliseconds, for every send/recv to the daemon. `0` disables it. A daemon that accepts and then stalls mid-reply would otherwise block the compile forever. Bounds each call, not the whole invocation — see below. | `10000` |
+| `FASTCACHE_TIMEOUT_MS` | Deadline, in milliseconds, for one **whole** exchange with the daemon — or with a scheduler's `LEASE`/`RELEASE` — from the request to the last byte of the reply. `0` removes the bound. A daemon that accepts and then stalls, or dribbles one byte at a time, would otherwise block the compile forever. Bounds one exchange, not the whole invocation — see below — and **not** a remote compile. | `10000` |
+| `FASTCACHE_DISPATCH_TIMEOUT_MS` | Deadline, in milliseconds, for one whole **`COMPILE`** exchange with a worker. `0` removes the bound. Far larger than `FASTCACHE_TIMEOUT_MS` because it bounds a different shape of conversation: a worker writes nothing until the compiler has finished, so the client waits out the entire remote compile in one read. Ten minutes because that is the scheduler's own lease timeout — waiting longer means waiting on a lease it has already reclaimed. See [Distributed compilation](../getting-started/distributed-compilation.md). | `600000` (10 min) |
 | `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
 | `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — some `fastcache-compile-node`'s `--listen-scheduler` port, never a cache port. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
@@ -428,12 +429,22 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   matches dependencies separator-insensitively, so this is cosmetic.
 - Non-C/C++ inputs (for example Windows `.rc` resource files) are correctly
   classified as non-cacheable and passed through.
-- `FASTCACHE_TIMEOUT_MS` bounds each individual send/recv, not a whole
-  invocation. Direct mode makes a separate manifest round-trip before the object
-  fetch, so a compile against a daemon that accepts and then goes silent can wait
-  up to twice the timeout before falling back. It is also not a total-transfer
-  deadline: a peer dribbling bytes slower than the timeout can still take longer.
-  It bounds the failure mode that matters — a peer that stops entirely.
+- `FASTCACHE_TIMEOUT_MS` bounds one exchange, not a whole invocation. Direct mode
+  makes a separate manifest round-trip before the object fetch, so a compile
+  against a daemon that accepts and then goes silent can wait up to twice the
+  timeout before falling back.
+- A dispatched compile exceeding `FASTCACHE_DISPATCH_TIMEOUT_MS` is abandoned by
+  the client, which hands the lease back and compiles locally — so the build still
+  succeeds and the key is not pinned for the scheduler's lease timeout. The
+  **worker** does not learn about it: it runs the compile to completion and writes
+  back an object nobody reads, so that CPU is spent twice.
+- **That deadline is also how long a genuinely dead worker goes unnoticed**, and it
+  is ten minutes rather than the ten seconds a dispatch used to get. A flat ceiling
+  cannot separate a worker that is still compiling from one whose machine has
+  vanished, so sizing it for the slowest legitimate translation unit — which is the
+  only safe choice — makes hard-failure detection sixty times slower. Both halves
+  are what a periodic progress frame from the worker would close
+  ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
 
 ## Measured behaviour
 

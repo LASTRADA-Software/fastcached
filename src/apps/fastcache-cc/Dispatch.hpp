@@ -3,13 +3,11 @@
 
 #include "CacheProtocol.hpp"
 
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -18,27 +16,97 @@
 namespace FastCache::Cc
 {
 
-/// Opens connections to endpoints named at runtime.
+/// Runs one framed request/reply against an endpoint named at runtime.
 ///
 /// The library's `ISocket` is one *connected* peer, which was enough
 /// while there was only ever one address to reach. Distribution talks to two —
-/// the scheduler, and then whichever worker the scheduler names — so the act of
-/// connecting becomes the thing that has to be injected. Tests hand out scripted
-/// clients per endpoint and never open a socket.
-class IEndpointDialer
+/// the scheduler, and then whichever worker the scheduler names — so reaching an
+/// endpoint becomes the thing that has to be injected. Tests answer with scripted
+/// bytes per endpoint and never open a socket.
+///
+/// **The seam is the whole exchange rather than the dial, and that is what makes a
+/// deadline expressible.** A dialer can only hand back a socket, so the only
+/// ceiling it can arm is `SO_RCVTIMEO`, which bounds a single `recv`; a worker
+/// dribbling one byte before each expiry holds the build forever without ever
+/// exceeding it. Bounding the *exchange* is `DeadlineTimer`'s job and needs the
+/// reactor the exchange runs on, which is `ReactorExchange` — so the caller asks
+/// for an exchange and hands over the budget it must finish inside.
+class IEndpointExchange
 {
   public:
-    IEndpointDialer() = default;
-    virtual ~IEndpointDialer() = default;
-    IEndpointDialer(IEndpointDialer const&) = delete;
-    IEndpointDialer& operator=(IEndpointDialer const&) = delete;
-    IEndpointDialer(IEndpointDialer&&) = delete;
-    IEndpointDialer& operator=(IEndpointDialer&&) = delete;
+    IEndpointExchange() = default;
+    virtual ~IEndpointExchange() = default;
+    IEndpointExchange(IEndpointExchange const&) = delete;
+    IEndpointExchange& operator=(IEndpointExchange const&) = delete;
+    IEndpointExchange(IEndpointExchange&&) = delete;
+    IEndpointExchange& operator=(IEndpointExchange&&) = delete;
 
-    /// Connect to `hostPort`.
+    /// Send `frame` to `hostPort` and read its reply.
     /// @param hostPort The endpoint, e.g. "10.0.0.7:6676".
-    /// @return A connected client, or nullptr when it could not be reached.
-    [[nodiscard]] virtual std::unique_ptr<ISocket> Dial(std::string_view hostPort) = 0;
+    /// @param frame A complete framed request.
+    /// @param credential Presented with the request; default-constructed sends none.
+    /// @param budget The deadlines this exchange must finish inside.
+    /// @return The outcome. `Transport` covers every way it did not complete — an
+    ///         endpoint that could not be reached, a peer that broke mid-reply, and
+    ///         a budget that ran out — because the caller answers all three by
+    ///         compiling locally.
+    [[nodiscard]] virtual CacheOutcome Exchange(std::string_view hostPort,
+                                                std::vector<std::byte> frame,
+                                                Credential const& credential,
+                                                ExchangeBudget budget) = 0;
+};
+
+/// How long a remote compile may take, once the connection is open.
+///
+/// Ten minutes, and NOT the cache's ten seconds. A cache exchange is answered from
+/// memory, so ten seconds is generous there and being impatient is what makes a
+/// miss cheap. A compile exchange is bounded by how long a compiler runs, and the
+/// worker writes nothing until it has finished — so the client sits in one read for
+/// the whole compile. Sharing the cache's number meant every translation unit
+/// taking more than ten seconds was abandoned mid-compile and rebuilt locally,
+/// which is precisely the set of translation units distribution exists for: the
+/// work was done twice, the object crossed the network to nobody, and the fleet's
+/// counters went up (#223).
+///
+/// **Ten minutes because that is `LeaseTable::DefaultLeaseTimeout`, not because it
+/// is a comfortable round number.** A client waiting past its lease is waiting on
+/// one the scheduler has already reclaimed and may have re-granted for the same
+/// key, so nothing above that value can be honoured and everything below it throws
+/// away a compile the fleet is still holding capacity for. The two are coupled and
+/// cannot be `static_assert`ed together — this launcher deliberately does not link
+/// the library the scheduler lives in — so moving either means moving both.
+///
+/// Deliberately generous rather than tight, because a *flat* deadline has to cover
+/// the slowest translation unit anybody legitimately compiles: real ones here run
+/// well past a minute, and a ceiling sized for the average reintroduces exactly the
+/// defect above, further out.
+///
+/// **The cost is stated rather than absorbed.** This is also how long a genuinely
+/// dead worker goes unnoticed — a machine powered off, unplugged or suspended
+/// mid-compile — and against the ten seconds a dispatch used to get that is sixty
+/// times slower, which on a parallel build is a handful of stalled slots. A flat
+/// ceiling cannot separate that from a slow compile; splitting them needs the worker
+/// to say it is still there, so the idle bound can be seconds while the total stays
+/// long. That is a wire change tracked as #245.
+///
+/// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
+/// process per translation unit, so the variable IS the runtime knob: the next
+/// compile reads it. Nothing has to be reloaded, and nothing has to be restarted.
+constexpr std::chrono::milliseconds DefaultDispatchTotal { 600'000 };
+
+/// The deadlines a dispatch's exchanges run under.
+///
+/// Two, because a dispatch is two shapes of conversation and one number cannot
+/// serve both — the defect above, stated as a type so a caller cannot pass the
+/// cache's budget where the compile's belongs.
+struct DispatchBudgets
+{
+    /// The scheduler's LEASE and RELEASE: short request/reply, answered from the
+    /// scheduler's own tables. The launcher's ordinary exchange budget.
+    ExchangeBudget control {};
+
+    /// The worker's COMPILE: as long as a compiler runs.
+    ExchangeBudget compile { .total = DefaultDispatchTotal };
 };
 
 /// How a dispatch attempt ended.
@@ -92,12 +160,13 @@ struct DispatchRequest
 
 /// Ask the scheduler for a worker and have it compile this translation unit.
 ///
-/// Three exchanges, each a short request/reply on a fresh connection: a `Lease` to
-/// the scheduler, a `Compile` to whichever worker it named, and a `Release` back to
-/// the scheduler saying the job is over. The client never waits in a queue — a
-/// scheduler with nothing free refuses immediately, and the caller compiles
-/// locally. That is not a fallback bolted on afterwards; it is why the scheduler is
-/// allowed to refuse at all.
+/// Three exchanges, each a request/reply on a fresh connection: a `Lease` to the
+/// scheduler, a `Compile` to whichever worker it named, and a `Release` back to the
+/// scheduler saying the job is over. Two of the three are short and one is as long
+/// as a compile, which is why `DispatchBudgets` carries two deadlines rather than
+/// one. The client never waits in a queue — a scheduler with nothing free refuses
+/// immediately, and the caller compiles locally. That is not a fallback bolted on
+/// afterwards; it is why the scheduler is allowed to refuse at all.
 ///
 /// **The release is not optional and not the caller's to remember.** A lease
 /// suppresses every other client's attempt at the same key, so one that is never
@@ -125,13 +194,15 @@ struct DispatchRequest
 /// through the client keeps that trust model exactly as it is, and needs no new
 /// authorization anywhere.
 ///
-/// @param dialer How to reach the scheduler and the worker.
+/// @param exchange How to reach the scheduler and the worker.
 /// @param request The job.
+/// @param budgets The deadlines each leg runs under.
 /// @param credential Presented to both peers; default-constructed sends none.
 /// @param acceptedCodecs What this client can decode, most-preferred first.
 /// @return What happened. Never throws; every failure is a status.
-[[nodiscard]] DispatchResult Dispatch(IEndpointDialer& dialer,
+[[nodiscard]] DispatchResult Dispatch(IEndpointExchange& exchange,
                                       DispatchRequest const& request,
+                                      DispatchBudgets const& budgets = {},
                                       Credential const& credential = {},
                                       CompileCacheWire::CodecList const& acceptedCodecs = {});
 
@@ -149,11 +220,11 @@ struct DispatchRequest
 /// @return The arguments, or an empty list when the field is malformed.
 [[nodiscard]] std::vector<std::string> DecodeArgs(std::span<std::byte const> field);
 
-/// Create the dialer that opens real TCP connections.
-/// @param connectTimeout Deadline for opening a connection, resolution included.
-/// @param ioTimeout Per-call send/recv deadline, armed on the connector.
-/// @return A dialer; never null.
-[[nodiscard]] std::unique_ptr<IEndpointDialer> MakeTcpDialer(std::chrono::milliseconds connectTimeout,
-                                                             std::chrono::milliseconds ioTimeout);
+// The exchange that talks over real TCP connections is `MakeTcpExchange()` in
+// `ReactorExchange.hpp`, deliberately not here. It needs a reactor, and this header
+// is compiled into the compile NODE as well -- which wants `DecodeArgs` and the
+// request types and has no use for a client's dialling machinery. Declaring the
+// factory beside the reactor keeps that link honest instead of costing the node a
+// translation unit it never calls.
 
 } // namespace FastCache::Cc

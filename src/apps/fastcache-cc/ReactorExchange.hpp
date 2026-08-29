@@ -2,38 +2,19 @@
 #pragma once
 
 #include "CacheProtocol.hpp"
+#include "Dispatch.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Net/IConnector.hpp>
 
-#include <chrono>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
 
 namespace FastCache::Cc
 {
-
-/// The two deadlines one cache exchange runs under.
-///
-/// Two rather than one, because they bound different things and neither implies the
-/// other -- the collapse `DialEndpoint` used to make. They are also a named struct
-/// rather than two adjacent `milliseconds` parameters, for the reason
-/// `PeerTransportOptions` gives: a reader at the call site cannot transpose
-/// `.connect` with `.total`, which two bare durations invite.
-struct ExchangeBudget
-{
-    /// Ceiling on opening the connection, name resolution included.
-    std::chrono::milliseconds connect { 1'000 };
-
-    /// Ceiling on the whole exchange, dial to last byte.
-    ///
-    /// The launcher's first real end-to-end bound. `SO_RCVTIMEO` bounded a single
-    /// call, so a daemon dribbling a byte at a time could hold a compile forever
-    /// while never once exceeding it.
-    std::chrono::milliseconds total { 10'000 };
-};
 
 /// Drive one framed request/reply exchange on a reactor.
 ///
@@ -101,5 +82,19 @@ class ReactorExchange
                                           std::vector<std::byte> frame,
                                           Credential credential,
                                           ExchangeBudget budget);
+
+/// The `IEndpointExchange` a dispatch uses in production: `RunOneExchange`, once
+/// per verb.
+///
+/// It lives here rather than in `Dispatch.cpp` because it needs a reactor, and
+/// `Dispatch.cpp` is compiled into the compile NODE as well -- which wants
+/// `DecodeArgs` and the request types and never dials anybody. Declaring the
+/// factory beside the machinery it needs keeps that link honest.
+///
+/// It carries no deadline of its own: every budget arrives with the call, so the
+/// one object serves a lease, a compile and a release without a caller having to
+/// remember which of them it was built for.
+/// @return An exchange; never null.
+[[nodiscard]] std::unique_ptr<IEndpointExchange> MakeTcpExchange();
 
 } // namespace FastCache::Cc

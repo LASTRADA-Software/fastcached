@@ -223,6 +223,57 @@ Consequences that are each load-bearing:
     and one of the documented carve-outs to configuration-at-construction: membership
     is precisely what changes while the object lives, and rebuilding the oracle per
     join would mean handing a new one to a running server.
+- **A dispatched compile is bounded by how long a COMPILER runs; a cache exchange
+  by a round trip. One number cannot be both.** The launcher armed a single deadline
+  on every exchange it made and handed the dispatch dialler the cache's -- ten
+  seconds, which is right for a `FETCH` answered out of memory and is the wrong
+  question entirely for a `COMPILE`. A worker writes nothing until the compiler has
+  finished, so the client sits in **one read** for the whole remote compile, and every
+  translation unit slower than ten seconds was abandoned mid-compile and rebuilt
+  locally — precisely the set distribution exists for. The worker meanwhile ran the
+  job to completion and wrote back an object nobody read, so the CPU was spent twice,
+  the network carried a wasted object, and `leases_granted` kept rising: this file's
+  own headline failure, distribution appearing to work while never once helping.
+  Measured at 23.5 s of worker CPU and 84 MB returned to a client that had already
+  given up (#223). `DispatchBudgets` is the split — `control` for the scheduler's
+  `LEASE`/`RELEASE`, `compile` for the worker — and the two knobs are
+  `FASTCACHE_TIMEOUT_MS` and `FASTCACHE_DISPATCH_TIMEOUT_MS`. Four things about the
+  shape are load-bearing:
+  - **A per-call socket ceiling is not a bound, and the seam is where that becomes
+    sayable.** `SO_RCVTIMEO` bounds one `recv`, so a peer dribbling a byte before each
+    expiry holds a build forever without ever exceeding it — and a *dialler* seam can
+    arm nothing else, because all it hands back is a socket. Bounding the exchange
+    needs a `DeadlineTimer` that CLOSES the socket, which needs the reactor the
+    exchange runs on. So dispatch asks for an **exchange** (`IEndpointExchange`) and
+    hands over the budget it must finish inside, which is `ReactorExchange` — the one
+    the cache path already used. A second mechanism here would have been a second
+    thing to get wrong.
+  - **A bigger constant only moves the cliff, so the default is anchored on something
+    real.** Ten minutes, because that is `LeaseTable::DefaultLeaseTimeout`: above it a
+    client is waiting on a lease the scheduler has already reclaimed and may have
+    re-granted for the same key, and below it a compile the fleet is still holding
+    capacity for is thrown away. The two cannot be `static_assert`ed together — the
+    launcher deliberately does not link the library the scheduler lives in — so moving
+    either means moving both.
+  - **A flat deadline cannot tell "still working" from "gone", so raising it is a
+    REGRESSION as well as a fix, and it is stated rather than absorbed.** The same
+    number is how long a legitimate compile may take and how long a genuinely dead
+    worker goes unnoticed, and it went from ten seconds to ten minutes -- sixty times
+    slower to notice a machine that was powered off, unplugged or suspended
+    mid-compile, which on a `-j16` build is a handful of slots and a build that looks
+    hung. Sizing for the slow compile is nonetheless the only choice available while
+    the worker sends nothing mid-compile: sizing for the dead worker is the defect
+    above, reintroduced. Splitting the two needs a periodic progress frame from the
+    worker so the IDLE bound can be seconds while the TOTAL stays long, which is a
+    wire change (#245). A cheaper partial mitigation exists and is not in the
+    launcher's reach: TCP keepalive with real intervals on the dispatch socket
+    detects a dead HOST in under a minute, but the option has to be armed where the
+    native handle is (`Net/`), not where the budget is chosen.
+  - **Zero means UNBOUNDED, and the arithmetic alone says the opposite.** A zero total
+    puts the deadline at `Now()`, so every exchange dies on the reactor's next turn —
+    a knob documented as "turn the ceiling off" that turns the *cache* off instead,
+    silently, because every caller answers a transport failure by compiling. The
+    timer is not armed at all below one millisecond.
 - **Duplicate suppression is asked BEFORE capacity, and the order is the whole
   point.** `LeaseTable::Acquire` needs a worker id, so the code this was lifted from
   had to `Pick` first — which meant a second client missing the same key at a busy

@@ -182,6 +182,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   preprocesses a second time, with `#line` markers.
 - A worker is told its input is preprocessed *and* what language it is in; the
   file extension is the last of three answers, never the first.
+- A cache exchange is bounded by a round trip, a dispatched compile by how long a
+  COMPILER runs; sharing one deadline abandoned every TU worth distributing while the
+  worker finished the job anyway. And a per-call `SO_RCVTIMEO` is not a bound at all.
 - That language is stated by the flags dispatch APPENDS, so a build that named one
   itself (`/TP`, which CMake emits for every MSVC C++ source) is folded into the
   language and dropped — never refused, which made the whole fleet cache and
