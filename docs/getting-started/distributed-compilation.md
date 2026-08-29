@@ -610,10 +610,12 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
 **Membership is what protects a fleet today, and it is the only thing that does.**
 A node is closed by default: its compile port, its scheduler and its own cache tier
 all admit **this machine and `--fleet-member` peers only** (or every caller, once
-you say `--fleet-open`). Once a cluster exists, the agreed member set replaces that
-list and all three surfaces follow it. That matters most for the compile port,
-which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
-would otherwise have your machine run their compiler on source they chose.
+you say `--fleet-open`). Once a cluster exists, the agreed member set is **added** to
+that list rather than replacing it, and all three surfaces follow the union — so a
+host stops being admitted only when the operator stops listing it. That matters most
+for the compile port, which binds `0.0.0.0` because peers have to dial it — anybody
+who could route to it would otherwise have your machine run their compiler on source
+they chose.
 
 --8<-- "node-credential-gap.md"
 

@@ -821,6 +821,13 @@ and the quorum goes on counting it. Taking a *typed* member out of the quorum me
 dropping it from `--raft-peer` on the machines that name it and restarting them —
 a leader never proposes removing a member its own bootstrap list asserts.
 
+**It withdraws the admission consensus granted, and only that.** A host that a node
+also lists in its own `--fleet-member` stays admitted to that node's three surfaces
+after the forget, because the two are separate routes and forgetting speaks for one
+of them — see [who a node
+admits](../operations/cluster-communication.md#who-a-node-admits). Revoking such a
+host means dropping it from `--fleet-member` on the machines that list it.
+
 ### Finding peers instead of typing them
 
 `--raft-peer` works and needs no network magic, but it means editing a file on every

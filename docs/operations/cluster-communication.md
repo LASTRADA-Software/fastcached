@@ -398,7 +398,8 @@ Two rules that have not moved:
   refused its own operator's builds would be a fleet that looks configured and
   serves nobody locally.
 - **An empty policy refuses the network.** A node given neither flag admits itself
-  and nothing else, rather than becoming an open scheduler by omission.
+  and whatever its cluster has agreed — on a node running no consensus, that is
+  itself and nothing else — rather than becoming an open scheduler by omission.
   `--fleet-open` admits every caller and is a decision somebody makes, never what
   an unset field decays to.
 
