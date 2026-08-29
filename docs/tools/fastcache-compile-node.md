@@ -903,7 +903,8 @@ These are specific to registering:
 | `--cluster-dir` *(only with `--listen-raft`)* | Consensus state would otherwise land in `fastcache-cluster/<node-id>` relative to the working directory, and a service does not inherit the installing shell's — it resolves under `C:\Windows\System32` for the SCM and under `/` for launchd, writable only by the privileges a worker is deliberately not given. |
 
 Everything else the worker refuses at startup — `--tls-cert` without `--tls-key`,
-`--listen-scheduler` without `--fleet-member` or `--fleet-open`, `--dashboard`
+`--listen-scheduler` without `--fleet-member` or `--fleet-open`, a membership flag
+on a `--scheduler` worker whose `--advertise` is still the wildcard, `--dashboard`
 without `--admin-listen`, and the rest — is refused here too. Each is decided by
 the command line alone, and a registration replays that command line forever, so
 there is nothing to gain by waiting for the first boot to say so.

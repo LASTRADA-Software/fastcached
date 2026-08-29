@@ -193,6 +193,19 @@ Consequences that are each load-bearing:
     rule stating what a flag is *for* is a rule that has to be re-derived when a
     second surface starts reading it — so check which tiers reach the value, not
     which flag it reads like.
+  - **Admitting peers and advertising an address are two halves of one decision.**
+    Peers are admitted so that they can *dial* this worker, and `--advertise` falls
+    back to `{--bind}:{--port}` whose bind is the wildcard — which the scheduler
+    hands to clients verbatim, so a client on another machine dials `0.0.0.0` and
+    reaches itself. `NodeServiceRejection` had always refused that for an *install*;
+    letting a worker carry a membership flag at all is what made it reachable from a
+    hand-started one, so the startup table gained the row in the same change.
+    Deliberately scoped: a node that registers **nowhere** and admits peers to its
+    cache tier is reached at `--listen-cache` and needs no advertise, and a node with
+    no membership flags is the one-machine deployment and is correct as it stands.
+    Only the wildcard is refused, never an address that might not resolve — a host
+    that is down today can be right at the next boot (#208), while the wildcard is
+    wrong on every machine and forever.
   - **A refusal one hop past the lease is invisible from the side anybody watches.**
     The lease **was** granted, so every scheduler counter is correct and unmoved; the
     only signal is the *worker's* `WorkerJobsRefusedNotAMember`, on a machine whose

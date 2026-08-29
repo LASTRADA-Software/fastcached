@@ -2,7 +2,6 @@
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
-#include <format>
 #include <utility>
 
 namespace FastCache::Node

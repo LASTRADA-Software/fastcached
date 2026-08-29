@@ -247,14 +247,16 @@ fastcache-compile-node \
     --fleet-open
 ```
 
-That is the whole of it — but **`--fleet-open` is not optional**, and it is the
-line people leave off. Membership gates this node's *compile port*, so a worker
-without it admits its own machine and nothing else: the scheduler leases it out,
+That is the whole of it — but **a membership flag is not optional**, and it is
+the line people leave off. (`--fleet-open` is the one a build network that is
+already your boundary wants; `--fleet-member` is the narrower alternative,
+below.) Membership gates this node's *compile port*, so a worker with neither
+admits its own machine and nothing else: the scheduler leases it out,
 the client dials it, and the compile is refused `not-a-member` and run locally
 instead. The scheduler's counters stay flat and correct while that happens,
 because the lease *was* granted
 ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235); before it
-was fixed, the flag could not be given to a worker at all). The worker says which
+was fixed, neither flag could be given to a worker at all). The worker says which
 it is in its own startup line:
 
 ```

@@ -614,11 +614,17 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 ///
 /// It says "this machine" out loud, because that admission is unconditional and an
 /// operator reading "2 member host(s)" would otherwise not know their own builds
-/// were covered. And it names the two flags when there is no policy at all, which is
-/// the whole of #235's second half: such a worker starts, logs a healthy line and
-/// refuses every dispatched compile, so the one line an operator reads has to say
-/// that the port is closed. A scheduler cannot reach that case -- `--listen-scheduler`
-/// with no policy is refused at startup -- so it costs its line nothing.
+/// were covered. And it names the flag that would fix it when there is no policy at
+/// all, which is the whole of #235's second half: such a worker starts, logs a
+/// healthy line and refuses every dispatched compile, so the one line an operator
+/// reads has to say that the port is closed. A scheduler cannot reach that case --
+/// `--listen-scheduler` with no policy is refused at startup -- so it costs its line
+/// nothing.
+///
+/// *Which* flag it names depends on whether `--node-id` turned consensus on, because
+/// there `--fleet-member` is the bootstrap answer only and the agreed member set
+/// replaces it; what consensus never supplies is a client machine, which is not a
+/// cluster peer, so `--fleet-open` is the remedy that survives on such a node.
 /// @param cfg The parsed configuration.
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
