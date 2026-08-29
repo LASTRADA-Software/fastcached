@@ -429,10 +429,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains) };
 
     // Every lease is accepted, and that is stated rather than hidden. The boundary
-    // today is reachability of this port plus the shared credential -- the same
-    // boundary the cache itself has. Validating a token against the scheduler is the
-    // seam's other implementation and belongs with mTLS rather than bolted on here;
-    // LeaseValidator exists so that is a substitution, not a rewrite.
+    // today is reachability of this port plus membership -- the same boundary the
+    // cache itself has. The grant a client presents is now a signed credential
+    // (#281), so the other implementation of this seam is a local check of that
+    // signature rather than anything reaching the scheduler; `LeaseValidator` exists
+    // so #282 is a substitution and not a rewrite.
     AtomicMetricsSink metrics;
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
@@ -445,16 +446,23 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
 
     // No lease validation, and it is recorded here rather than left looking like a
     // stub. `WorkerServer` gates the port on membership, so what reaches this
-    // protocol is already this machine or a peer the operator admitted -- and a
-    // worker cannot check a token it did not issue without a round trip to the
-    // scheduler per job, or a signing key the two would have to share.
+    // protocol is already this machine or a peer the operator admitted.
+    //
+    // This used to add "and a worker cannot check a token it did not issue without a
+    // round trip to the scheduler per job, or a signing key the two would have to
+    // share". Both halves of that are now false: a grant carries an HMAC over this
+    // worker's endpoint, the toolchain, the key and an expiry, and the key it is
+    // signed with is `--cluster-key-file`, which this node already reads for
+    // discovery (#281, `Distributed/LeaseToken.hpp`). So the check is a local
+    // `VerifyLeaseToken` call with no round trip -- it is simply not written yet, and
+    // that is #282. Leaving the obsolete reason in place would be worse than saying
+    // nothing: it tells the next reader the thing is impossible.
     //
     // The residual, deliberately: an admitted member can compile here without taking
     // a lease first, bypassing the scheduler's slot accounting. Inside a trusted
     // fleet that is a fairness question rather than a security one -- the machine
     // would be busier than the scheduler believes, which the heartbeat corrects
-    // within one interval. Closing it properly means signing lease tokens, which is
-    // its own change.
+    // within one interval.
     //
     // The envelope ceiling is THIS surface's request cap, named rather than left to
     // the decoder's default: `WorkerProtocol` never sees the listener that enforced
