@@ -192,19 +192,21 @@ namespace detail
         return cursor.ReadU64(out.ms) && cursor.ReadU64(out.seq);
     }
 
-    /// The fewest blob bytes one element of each counted run can occupy, read off
-    /// `Encode` below -- which is what fixes them -- and pinned to it by tests that
-    /// encode one empty element and measure the difference.
-    ///
-    /// **Security bounds, not sizing hints.** Each must be a true LOWER bound on its
-    /// element's wire cost, because `ByteCursor::ReadCount` refuses a count the
-    /// remaining bytes cannot supply and an over-estimate would refuse honest data.
-    /// They therefore under-estimate for typical data -- that is what makes them
-    /// correct. Nothing here sizes an allocation from them.
-    ///
-    /// `BoundedReserve` used to assume ONE byte per element for all five, which made
-    /// its bound around twenty times too loose for an entry and nine times for a
-    /// group, on top of clamping where it should have refused (issue #269).
+    // The five constants below are the fewest blob bytes one element of each counted
+    // run can occupy, read off `Encode` below -- which is what fixes them -- and pinned
+    // to it by tests that encode one empty element and measure the difference. Spelled
+    // as a plain comment rather than `///` because it belongs to the group and not to
+    // whichever constant happens to come first.
+    //
+    // **Security bounds, not sizing hints.** Each must be a true LOWER bound on its
+    // element's wire cost, because `ByteCursor::ReadCount` refuses a count the
+    // remaining bytes cannot supply and an over-estimate would refuse honest data.
+    // They therefore under-estimate for typical data -- that is what makes them
+    // correct. Nothing here sizes an allocation from them.
+    //
+    // `BoundedReserve` used to assume ONE byte per element for all five, which made
+    // its bound around twenty times too loose for an entry and nine times for a
+    // group, on top of clamping where it should have refused (issue #269).
 
     /// The bytes a stream id occupies: `AppendId` writes two `u64`s.
     constexpr std::size_t IdBytes = 2 * sizeof(std::uint64_t);

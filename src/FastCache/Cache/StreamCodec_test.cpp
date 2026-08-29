@@ -287,7 +287,20 @@ TEST_CASE("StreamCodec: every declared count is refused when the blob cannot sup
 
     SECTION("a group's consumer count")
     {
-        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(1).EmptyField().Id().U64(0).U32(Impossible);
+        // The trailing padding is what makes this section reach the site it names, and
+        // it is exactly the pel-count field this blob stops short of: a group's minimum
+        // counts BOTH of its counts, so without those four bytes the GROUP count is
+        // refused first and the consumer-count guard is never consulted -- delete that
+        // guard and the case still goes green.
+        auto const blob = BlobBuilder {}
+                              .StreamHeader()
+                              .U32(0)
+                              .U32(1)
+                              .EmptyField()
+                              .Id()
+                              .U64(0)
+                              .U32(Impossible)
+                              .Pad(StreamCodec::detail::CountBytes);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
     }
 
