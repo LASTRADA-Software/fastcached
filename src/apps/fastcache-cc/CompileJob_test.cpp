@@ -417,6 +417,13 @@ TEST_CASE("IsAcceptableJobArgument admits the code-generation flags a compile ca
     CHECK(IsAcceptableJobArgument("-DNDEBUG", DriverOf(Flavor::Gcc)));
     CHECK(IsAcceptableJobArgument("-march=native", DriverOf(Flavor::Gcc)));
     CHECK(IsAcceptableJobArgument("-pthread", DriverOf(Flavor::Gcc)));
+    // THIS project's own `PEDANTIC_COMPILER` presets add `-Qunused-arguments` to
+    // every clang build, and the client forwards it (it names no file). A table that
+    // does not carry it makes the fleet refuse every job it dispatches to itself --
+    // the "distributes nothing and goes green anyway" failure, visible only as a
+    // counter -- so the row is asserted rather than assumed.
+    CHECK(IsAcceptableJobArgument("-Qunused-arguments", DriverOf(Flavor::Clang)));
+    CHECK(IsAcceptableJobArgument("-Qunused-arguments", DriverOf(Flavor::ClangCl)));
     // The language the client states for a preprocessed input -- `-x` and its value,
     // which arrive as two separate arguments.
     CHECK(IsAcceptableJobArgument("-x", DriverOf(Flavor::Gcc)));
@@ -515,6 +522,13 @@ TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denyli
     // `-gsplit-dwarf` writes a `.dwo` beside the object and only the object comes
     // back, which is why the debug flags are enumerated rather than prefixed on `-g`.
     CHECK_FALSE(IsAcceptableJobArgument("-gsplit-dwarf", DriverOf(Flavor::Gcc)));
+    // The MSVC half of that same rule. `/Zi` and `/ZI` write a PDB beside the object,
+    // which nothing on the wire carries -- `RemoteCompileArgs` refuses the command
+    // line outright for them (`MsvcSharedPdb`), and admitting them here would hand a
+    // client that skipped that check an object naming a PDB it never receives.
+    CHECK_FALSE(IsAcceptableJobArgument("/Zi", DriverOf(Flavor::Cl)));
+    CHECK_FALSE(IsAcceptableJobArgument("/ZI", DriverOf(Flavor::Cl)));
+    CHECK_FALSE(IsAcceptableJobArgument("-Zi", DriverOf(Flavor::ClangCl)));
     // `-Wa,`/`-Wl,`/`-Wp,` hand a comma-separated option list to a sub-tool. Denied
     // under the `-W` prefix that admits warnings.
     CHECK_FALSE(IsAcceptableJobArgument("-Wa,--defsym,x=1", DriverOf(Flavor::Gcc)));
@@ -542,6 +556,81 @@ TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denyli
     CHECK(IsAcceptableJobArgument("-Wall", DriverOf(Flavor::Gcc)));
     CHECK(IsAcceptableJobArgument("-Wattributes", DriverOf(Flavor::Gcc)));
     CHECK(IsAcceptableJobArgument("-Wpedantic", DriverOf(Flavor::Gcc)));
+}
+
+TEST_CASE("The allowlist admits the flags this repository's own builds dispatch with", "[compile-job]")
+{
+    // Too narrow an allowlist is a SILENT local fallback -- the fleet distributes
+    // nothing and every build still goes green, which is the failure shape this
+    // repository keeps rediscovering. These are taken from the real command lines the
+    // presets produce, so a row deleted in a future edit fails here rather than in a
+    // hit-rate graph a month later.
+    //
+    // `-Qunused-arguments` is the one that proves the point: `PedanticCompiler.cmake`
+    // adds it to EVERY Clang build, the client forwards it, and it matched nothing --
+    // so every job from a `clang-debug` build came back RejectedArgument.
+    for (auto const& flag: { "-O2",
+                             "-g",
+                             "-std=c++23",
+                             "-Wall",
+                             "-Wextra",
+                             "-Werror",
+                             "-pedantic",
+                             "-Qunused-arguments",
+                             "-fsanitize=address",
+                             "-fno-omit-frame-pointer",
+                             "-pthread",
+                             "-DNDEBUG",
+                             "-fPIC",
+                             "-fno-rtti",
+                             "-march=native" })
+    {
+        INFO("clang flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::Clang)));
+    }
+
+    for (auto const& flag: { "/O2",
+                             "/W4",
+                             "/WX",
+                             "/EHsc",
+                             "/MD",
+                             "/MDd",
+                             "/Z7",
+                             "/utf-8",
+                             "/permissive-",
+                             "/bigobj",
+                             "/nologo",
+                             "/DWIN32",
+                             "/Zc:__cplusplus",
+                             "/wd4996",
+                             "/GR-",
+                             "/TP",
+                             "/std:c++20" })
+    {
+        INFO("cl flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::Cl)));
+    }
+
+    // clang-cl is family Msvc and takes the GNU spellings too. Scoping those rows to
+    // the Gnu family refused them on the ONE driver that accepts them -- silently, and
+    // only for clang-cl workers. `DriverFamily` cannot tell `cl` from `clang-cl`, so
+    // a GNU-spelled row is `Any`; the fingerprint is what keeps both ends honest.
+    for (auto const& flag: { "-O0",
+                             "-O3",
+                             "-g",
+                             "-std=c++23",
+                             "-march=native",
+                             "-m64",
+                             "-flto",
+                             "-fstrict-aliasing",
+                             "-fdiagnostics-color=always",
+                             "-Wall",
+                             "-fno-exceptions",
+                             "-Qunused-arguments" })
+    {
+        INFO("clang-cl flag " << flag);
+        CHECK(IsAcceptableJobArgument(flag, DriverOf(Flavor::ClangCl)));
+    }
 }
 
 TEST_CASE("A compiler this worker cannot classify refuses the JOB, not its arguments", "[compile-job]")

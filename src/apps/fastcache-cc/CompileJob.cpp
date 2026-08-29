@@ -139,6 +139,17 @@ namespace
     /// handed GNU spellings (`-Wall`, `-fno-exceptions`, `-O2`). Storing `/O2` and
     /// `-O2` as two rows would have refused half of those and turned every such build
     /// into a silent local fallback; one introducer-less row covers both.
+    ///
+    /// **A GNU-spelled row is `Any`, and that is not sloppiness.** `DriverFamily`
+    /// cannot tell `cl` from `clang-cl` -- both are `Msvc` -- while `clang-cl` accepts
+    /// essentially every GNU-spelled clang option (`-march=`, `-std=c++23`, `-g`,
+    /// `-flto`, `-fstrict-aliasing`). Scoping those rows `Gnu` therefore refuses them
+    /// on the one driver that does take them, silently, which is the failure this
+    /// table must not add. Widening them costs nothing, because a client and a worker
+    /// are bound to the same compiler by the FINGERPRINT: a line `cl` would merely
+    /// warn about and ignore is one the client's own `cl` also ignored, so both ends
+    /// still produce the same object. Rows spelled only by MSVC stay `Msvc`, because
+    /// no GNU driver has them at all.
     struct AllowedArg
     {
         std::string_view spelling;                    ///< The flag, without its leading `-` or `/`.
@@ -184,18 +195,20 @@ namespace
     /// `-fpass-plugin=`, `/analyze:plugin`).
     /// The extent is spelled out rather than deduced: `std::array`'s deduction guide
     /// folds a `is_same_v` pack over every element, and at this many rows that fold
-    /// exceeds Clang's 256-deep expression nesting limit and fails to compile.
-    constexpr std::array<AllowedArg, 345> AllowedArgs {
+    /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
+    /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
+    /// the table closes the other direction.
+    constexpr std::array<AllowedArg, 344> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "O0", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O1", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O2", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "O3", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "Ofast", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "O3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Ofast", .families = DriverFamily::Any },
         AllowedArg { .spelling = "Og", .families = DriverFamily::Any },
         AllowedArg { .spelling = "Os", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "Oz", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "Oz", .families = DriverFamily::Any },
         AllowedArg { .spelling = "Od", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Oi", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Oi-", .families = DriverFamily::Msvc },
@@ -209,11 +222,11 @@ namespace
         AllowedArg { .spelling = "Ob3", .families = DriverFamily::Msvc },
 
         // -- language standard -------------------------------------------------
-        AllowedArg { .spelling = "std=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "std=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "std:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "ansi", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "pedantic", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "pedantic-errors", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "ansi", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pedantic", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pedantic-errors", .families = DriverFamily::Any },
         AllowedArg { .spelling = "permissive", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "permissive-", .families = DriverFamily::Msvc },
 
@@ -221,7 +234,7 @@ namespace
         // anything but a path, which the shape rule enforces.
         AllowedArg { .spelling = "D", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "U", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "undef", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "undef", .families = DriverFamily::Any },
         AllowedArg { .spelling = "u", .families = DriverFamily::Msvc },
 
         // -- warnings. `-W`/`/W` is a prefix because the warning namespace is
@@ -253,36 +266,36 @@ namespace
         // is unbounded and grows every release; its only pass-through is `-mllvm`,
         // denied below. `-mllvm` takes its value as a SEPARATE argument, which must
         // itself survive this table, and no LLVM option spelling appears in it.
-        AllowedArg { .spelling = "m", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "m", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
-            .spelling = "mllvm", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+            .spelling = "mllvm", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
         AllowedArg { .spelling = "arch:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "favor:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
 
         // -- debug information. Enumerated rather than prefixed: `-gsplit-dwarf`
         // writes a `.dwo` beside the object, and only the object comes back.
-        AllowedArg { .spelling = "g", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "g0", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "g1", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "g2", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "g3", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ggdb", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ggdb3", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gdwarf-2", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gdwarf-3", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gdwarf-4", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gdwarf-5", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gline-tables-only", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gline-directives-only", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gcolumn-info", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gno-column-info", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gstrict-dwarf", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gno-strict-dwarf", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gpubnames", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ggnu-pubnames", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "gcodeview", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "p", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "pg", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "g", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g0", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g1", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g2", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggdb", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggdb3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-2", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-4", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-5", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gline-tables-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gline-directives-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gcolumn-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gno-column-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gstrict-dwarf", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gno-strict-dwarf", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gpubnames", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggnu-pubnames", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gcodeview", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "p", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pg", .families = DriverFamily::Any },
 
         // -- GNU feature flags, ENUMERATED. See the note above: `-f` is never a
         // prefix, because a new code-loading `-f*` must fail closed.
@@ -294,89 +307,89 @@ namespace
         AllowedArg { .spelling = "fno-pie", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fexceptions", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-exceptions", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fnon-call-exceptions", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fnon-call-exceptions", .families = DriverFamily::Any },
         AllowedArg { .spelling = "frtti", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-rtti", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fthreadsafe-statics", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-threadsafe-statics", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fstrict-aliasing", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-strict-aliasing", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstrict-overflow", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-strict-overflow", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstrict-enums", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-strict-enums", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fstrict-aliasing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-aliasing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-overflow", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-overflow", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-enums", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fomit-frame-pointer", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-omit-frame-pointer", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "finline-functions", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-inline-functions", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-inline", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fkeep-inline-functions", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "funroll-loops", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-unroll-loops", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ffast-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-fast-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fmath-errno", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-math-errno", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ffinite-math-only", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-finite-math-only", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fsigned-zeros", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-signed-zeros", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ftrapping-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-trapping-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "frounding-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-rounding-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "freciprocal-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-reciprocal-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fassociative-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-associative-math", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fwrapv", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-wrapv", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ftrapv", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstack-protector", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstack-protector-all", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstack-protector-strong", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-stack-protector", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstack-clash-protection", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-stack-clash-protection", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "finline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-inline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-inline", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fkeep-inline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funroll-loops", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-unroll-loops", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffast-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-fast-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fmath-errno", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-math-errno", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffinite-math-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-finite-math-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsigned-zeros", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-signed-zeros", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftrapping-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-trapping-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "frounding-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-rounding-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "freciprocal-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-reciprocal-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fassociative-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-associative-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fwrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-wrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector-all", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector-strong", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-stack-protector", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-clash-protection", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-stack-clash-protection", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fvisibility-inlines-hidden", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-visibility-inlines-hidden", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fdata-sections", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-data-sections", .families = DriverFamily::Any },
         AllowedArg { .spelling = "ffunction-sections", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-function-sections", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fcommon", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-common", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fshort-enums", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-short-enums", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fshort-wchar", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fsigned-char", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "funsigned-char", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fcommon", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-common", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fshort-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-short-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fshort-wchar", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsigned-char", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funsigned-char", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fchar8_t", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-char8_t", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fconcepts", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fcoroutines", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-coroutines", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fopenmp", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-openmp", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fopenmp-simd", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fsemantic-interposition", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-semantic-interposition", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "flto", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-lto", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ffat-lto-objects", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-fat-lto-objects", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fuse-cxa-atexit", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-use-cxa-atexit", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fconcepts", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcoroutines", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-coroutines", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fopenmp", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-openmp", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fopenmp-simd", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsemantic-interposition", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-semantic-interposition", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "flto", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-lto", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffat-lto-objects", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-fat-lto-objects", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fuse-cxa-atexit", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-use-cxa-atexit", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fsized-deallocation", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-sized-deallocation", .families = DriverFamily::Any },
         AllowedArg { .spelling = "faligned-allocation", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-aligned-allocation", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fasynchronous-unwind-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-asynchronous-unwind-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "funwind-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-unwind-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fdelete-null-pointer-checks", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-delete-null-pointer-checks", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fasynchronous-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-asynchronous-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdelete-null-pointer-checks", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-delete-null-pointer-checks", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fms-extensions", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-ms-extensions", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fms-compatibility", .families = DriverFamily::Any },
@@ -385,74 +398,74 @@ namespace
         AllowedArg { .spelling = "fno-delayed-template-parsing", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fdeclspec", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-declspec", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "felide-constructors", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-elide-constructors", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-implicit-templates", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fgnu-unique", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-gnu-unique", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fplt", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-plt", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fident", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-ident", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fverbose-asm", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-verbose-asm", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fbuiltin", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-builtin", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-builtin-", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fpermissive", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fhosted", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ffreestanding", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "foperator-names", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-operator-names", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-access-control", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fnew-ttp-matching", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fexperimental-library", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fmerge-all-constants", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-merge-all-constants", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fjump-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-jump-tables", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "ftree-vectorize", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-tree-vectorize", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "foptimize-sibling-calls", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-optimize-sibling-calls", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-lifetime-dse", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstrict-vtable-pointers", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-strict-vtable-pointers", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-devirtualize", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fdollars-in-identifiers", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-dollars-in-identifiers", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-assume-sane-operator-new", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "felide-constructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-elide-constructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-implicit-templates", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fgnu-unique", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-gnu-unique", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fplt", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-plt", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fident", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-ident", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fverbose-asm", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-verbose-asm", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fbuiltin", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-builtin", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-builtin-", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fpermissive", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fhosted", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffreestanding", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "foperator-names", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-operator-names", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-access-control", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fnew-ttp-matching", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fexperimental-library", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fmerge-all-constants", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-merge-all-constants", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fjump-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-jump-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftree-vectorize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-tree-vectorize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "foptimize-sibling-calls", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-optimize-sibling-calls", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-lifetime-dse", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-vtable-pointers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-vtable-pointers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-devirtualize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdollars-in-identifiers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-dollars-in-identifiers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-assume-sane-operator-new", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-autolink", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-rtti-data", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-c++-static-destructors", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fc++-static-destructors", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fno-stack-check", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fstack-check", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fno-stack-check", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-check", .families = DriverFamily::Any },
         // Diagnostics rendering. Cosmetic, and none names a file.
-        AllowedArg { .spelling = "fdiagnostics-color", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-diagnostics-color", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fdiagnostics-color", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-color", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fdiagnostics-absolute-paths", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fdiagnostics-show-option", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-diagnostics-show-option", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fdiagnostics-show-template-tree", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-diagnostics-fixit-info", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fdiagnostics-plain-output", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fcaret-diagnostics", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-caret-diagnostics", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fdiagnostics-show-option", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-show-option", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-show-template-tree", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-fixit-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-plain-output", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcaret-diagnostics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-caret-diagnostics", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fcolor-diagnostics", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fno-color-diagnostics", .families = DriverFamily::Any },
         AllowedArg { .spelling = "fansi-escape-codes", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "fshow-column", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-show-column", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "fno-canonical-system-headers", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "fshow-column", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-show-column", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-canonical-system-headers", .families = DriverFamily::Any },
         // Valued `-f` options. Each row's spelling ends at the option's own `=`, so
         // the row names exactly one option and only its value is open.
         AllowedArg { .spelling = "fvisibility=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
             .spelling = "fvisibility-inlines-hidden=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "ffp-contract=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "ffp-model=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fcf-protection=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ffp-contract=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ffp-model=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fcf-protection=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fsanitize=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fno-sanitize=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fsanitize-recover=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
@@ -460,13 +473,13 @@ namespace
             .spelling = "fno-sanitize-recover=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fsanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "fno-sanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fexcess-precision=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fabi-version=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fabi-compat-version=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fexcess-precision=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fabi-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fabi-compat-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
             .spelling = "fms-compatibility-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fmessage-length=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fmax-errors=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fmessage-length=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fmax-errors=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "ferror-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "ftemplate-depth=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
@@ -478,21 +491,21 @@ namespace
         AllowedArg { .spelling = "fbracket-depth=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
             .spelling = "fmacro-backtrace-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fdiagnostics-color=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fdiagnostics-format=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fexec-charset=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "finput-charset=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fwide-exec-charset=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fstrict-flex-arrays=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "falign-functions=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "falign-loops=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fdiagnostics-color=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fdiagnostics-format=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fexec-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "finput-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fwide-exec-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fstrict-flex-arrays=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "falign-functions=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "falign-loops=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
-            .spelling = "fpatchable-function-entry=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fopenmp-version=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "flto=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
-        AllowedArg { .spelling = "fvect-cost-model=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+            .spelling = "fpatchable-function-entry=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fopenmp-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "flto=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fvect-cost-model=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
-            .spelling = "fstack-protector-guard=", .families = DriverFamily::Gnu, .value = ArgValue::NoPathSeparator },
+            .spelling = "fstack-protector-guard=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
 
         // -- MSVC code generation ----------------------------------------------
         AllowedArg { .spelling = "EH", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
@@ -523,9 +536,15 @@ namespace
         AllowedArg { .spelling = "GL", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "GL-", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Gm-", .families = DriverFamily::Msvc },
+        // `/Z7` and no other debug-info selector. `/Zi` and `/ZI` make MSVC write a
+        // PDB BESIDE the object, and only the object comes back -- the same rule that
+        // keeps `-gsplit-dwarf` out of the GNU debug rows above, and the same one
+        // `RemoteCompileArgs` applies at the other end (`MsvcSharedPdb`), which
+        // refuses the whole command line rather than dispatching it. Admitting them
+        // here would let a client that skipped that check receive an object whose
+        // debug info names a PDB nothing hands back: wrong output rather than a
+        // visible fallback, which is the worse of the two answers.
         AllowedArg { .spelling = "Z7", .families = DriverFamily::Msvc },
-        AllowedArg { .spelling = "Zi", .families = DriverFamily::Msvc },
-        AllowedArg { .spelling = "ZI", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Za", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Ze", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "Zl", .families = DriverFamily::Msvc },
@@ -570,15 +589,30 @@ namespace
         AllowedArg { .spelling = "FC", .families = DriverFamily::Msvc },
         AllowedArg { .spelling = "FS", .families = DriverFamily::Msvc },
 
+        // Clang's "do not warn about arguments this compile did not use", which is a
+        // DIAGNOSTIC switch and reaches nothing. `Any` rather than `Gnu` because
+        // clang-cl is family `Msvc` and takes it too, and because this project's own
+        // `PEDANTIC_COMPILER` presets add it to every clang build -- so a `Gnu`-only
+        // row would make the fleet refuse every job it dispatches to itself, visibly
+        // in a counter and nowhere else.
+        AllowedArg { .spelling = "Qunused-arguments", .families = DriverFamily::Any },
+
         // -- the compile-only marker. The worker appends its own, but a client that
         // also sent one costs nothing and refusing it would be a pure fallback.
         AllowedArg { .spelling = "c", .families = DriverFamily::Any },
-        AllowedArg { .spelling = "pthread", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "pipe", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "trigraphs", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "nostdinc", .families = DriverFamily::Gnu },
-        AllowedArg { .spelling = "nostdinc++", .families = DriverFamily::Gnu },
+        AllowedArg { .spelling = "pthread", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pipe", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "trigraphs", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "nostdinc", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "nostdinc++", .families = DriverFamily::Any },
     };
+
+    // The other half of the stated extent. Adding a row past it is a compile error
+    // already; REMOVING one is not -- the array pads itself with value-initialized
+    // rows whose `families` is `None`, which match nothing and shrink the accepted
+    // set without a diagnostic. An empty spelling is exactly what such a row has.
+    static_assert(std::ranges::none_of(AllowedArgs, [](AllowedArg const& row) { return row.spelling.empty(); }),
+                  "AllowedArgs' stated extent must equal its row count -- an empty row is a padded one");
 
     /// Whether an allowlist row matches an argument.
     /// @param row The row.
@@ -660,14 +694,20 @@ bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver)
         return false;
     auto const body = arg.substr(1);
 
-    // Carve-outs first, so row order never decides an answer.
+    // One pass, with a matching `Deny` answering immediately: a carve-out cannot be
+    // out-voted by an `Allow` prefix it also matches, and row order never decides an
+    // answer. The shape test is the expensive half, so it is asked once per row
+    // rather than once per rule.
+    bool allowed = false;
     for (AllowedArg const& row: AllowedArgs)
-        if (row.rule == ArgRule::Deny && ArgRowMatches(row, body, driver.family))
+    {
+        if (!ArgRowMatches(row, body, driver.family))
+            continue;
+        if (row.rule == ArgRule::Deny)
             return false;
-
-    return std::ranges::any_of(AllowedArgs, [&](AllowedArg const& row) {
-        return row.rule == ArgRule::Allow && ArgRowMatches(row, body, driver.family);
-    });
+        allowed = true;
+    }
+    return allowed;
 }
 
 std::string SafeSourceName(std::string_view sourceName)
