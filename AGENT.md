@@ -520,10 +520,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   of SIGPIPE, and `pipefail` reports the producer's status. `nm "$b" | grep -q
   __tsan_init` therefore says "absent" precisely *because* the symbol is there.
   Capture into a variable and match afterwards.
-- The TSan scope is one Catch2 tag expression written in two files, and
-  `ctest -R tsan-scope-hygiene` — in the **default** set — is what keeps them
-  agreeing. A test file added to `Async`, `Consensus` or `Distributed` with no
-  selected tag fails the build rather than quietly leaving the sanitized scope.
+- The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS`
+  table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
+  restating it — a second copy is not a cross-check, it is a second thing to be
+  wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
+  test file in `Async`, `Consensus` or `Distributed` carries no tag that
+  expression selects.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the

@@ -24,9 +24,12 @@
 # line on every run, so a suppression that starts matching more than it did is at
 # least visible rather than silent.
 #
-# The gate additionally proves this file is not swallowing everything: the
-# canary's race is checked WITH these suppressions active, so a pattern broad
-# enough to silence the canary fails the gate.
+# The gate additionally proves this file is not swallowing EVERYTHING: the
+# canary's race is checked with these suppressions active, so a wildcard broad
+# enough to silence it fails the gate rather than quietly disarming it. Claim no
+# more than that. The canary races on its own global in a binary that links no
+# FastCache frame, so a narrow `race_top:` naming a real function here could
+# never have silenced it, and the canary is no evidence about one.
 #
 # Format: https://clang.llvm.org/docs/ThreadSanitizerFlags.html
 

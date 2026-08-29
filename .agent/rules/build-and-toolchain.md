@@ -128,11 +128,13 @@ determinism rests on.
     deliberate data race, built by the same `add_compile_options` as everything else
     -- says the runtime still detects and reports. A `TSAN_OPTIONS`, a suppressions
     pattern or a stripped runtime can break the second while the first still holds.
-    The canary is run **with the suppressions file active**, so a pattern broad
+    The canary is run **with the suppressions file active**, so a wildcard broad
     enough to swallow an obvious race fails the gate instead of silently disarming
-    it. All five refusals -- missing binary, uninstrumented binary, silent runtime,
-    a tag expression matching no cases, and an unsuppressed race -- were verified by
-    making each one happen.
+    it. Every refusal has a message of its own, because each is fixed somewhere
+    different, and each was verified by making it happen -- the list lives in that
+    script's header and deliberately nowhere else. It said "five refusals" in three
+    files, in three orders, having dropped the two hardest to reason about: a hard
+    count restated beside the thing it counts is a fact with no owner.
   - **A filter that matches nothing is a suite that tested nothing**, and every
     other signal in that run reads clean. The gate names it, and separately refuses
     an exit of 0 that reported no assertions. This is the same shape as a sweep that
@@ -156,14 +158,27 @@ determinism rests on.
     counts zero -- character-for-character identical to a binary that was built
     without instrumentation, and fixed somewhere else entirely. Test existence first
     and say which of the two it was; a single message covering both sends the reader
-    to the wrong place. Same shape as a `-header-filter` that matches no path and a
-    sweep that skips files: the tool ran, the artefact was fine, and nothing was
-    examined.
+    to the wrong place.
+  - **A second copy of a list is not a cross-check; it is a second thing to be
+    wrong.** The scope check shipped in this branch first kept its own copy of the
+    gate's Catch2 tags and its header claimed the two "are checked against each
+    other". Nothing checked them: delete `[task]` from the gate's `TARGETS` row and
+    `Async/Task_test.cpp` still matches the surviving copy, still reports covered,
+    and six coroutine cases leave the sanitized scope with every signal green --
+    the branch's own bug, one level up, asserted to be impossible. It parses the
+    expression out of `scripts/tsan-gate.sh` now, and a `TARGETS` table it cannot
+    parse is a hard failure rather than an empty scope. Duplicate-and-verify is a
+    real pattern here (`check-service-accounts.cmake` reads three files to prove
+    they agree), but the verify half has to actually be written.
   - **A known race lives in `.tsan-suppressions` with its issue number, never in a
     deleted check.** Every entry is an open bug; removing it is part of closing that
-    bug. `race:` matches a function name anywhere in a stack, so an entry is always
-    broader than the report it was written for -- which is why the gate prints
-    ThreadSanitizer's own `Matched N suppressions` line on every run.
+    bug. Write it `race_top:`, never `race:` — `race:` matches a function name
+    anywhere in *either* stack, so it also silences a future, unrelated race that
+    merely passes through that frame, and a teardown path like `Close()` is
+    traversed by a great many stacks. `race_top:` matches only the frame the racy
+    access is in. Either way an entry outlives the report it was written for, which
+    is why the gate sets `print_suppressions=1` on **every** run, canary included,
+    and prints ThreadSanitizer's own `Matched N suppressions` line.
 
 ## What CI costs
 
@@ -781,3 +796,22 @@ is >90% and raising it is separate work — a threshold added before anyone has 
 chance to move the number only teaches everyone to ignore the signal. A failing suite
 still gets its report rendered, to read while debugging, and then re-raises so no number
 measured from a red build is published.
+
+## Open work
+
+- **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
+  entry in `.tsan-suppressions`: `AdminEndpoint` closes its listener from the main
+  thread while its own accept thread is still inside `Accept()`. Removing the entry
+  is part of closing the issue — with it gone the gate goes red on the real report,
+  which is what makes it a suppression rather than a hole.
+- **[#311](https://github.com/LASTRADA-Software/fastcached/issues/311)** — nothing in
+  CI catches an uninitialised read, and no sanitizer that runs today can: ASan does
+  not, UBSan does not, and neither does ThreadSanitizer. That is MemorySanitizer,
+  which needs an instrumented standard library, or valgrind memcheck over the
+  existing release test binaries. It is the other half of #132, deliberately left
+  out of the TSan job rather than folded into it.
+- **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
+  scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
+  `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
+  project's Catch2 (3.6) predates `ADD_TAGS_AS_LABELS` and so exports no tag to
+  CTest. When Catch2 moves, both collapse into a label filter.

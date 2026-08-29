@@ -23,9 +23,21 @@
 # ENFORCED, so that a new test file in one of these directories either joins the
 # sanitized scope or fails the build.
 #
+# ## The tag list is READ from the gate, never restated here
+#
+# An earlier draft of this file kept its own copy of the tags and claimed the two
+# "are checked against each other". They were not, and the hole was the same
+# shape as the bug above: delete `[task]` from the gate's `TARGETS` row and leave
+# a copy here alone, and `Async/Task_test.cpp` still matches the copy, still
+# reports covered, and six coroutine cases leave the sanitized scope with every
+# signal green. A second list is not a cross-check; it is a second thing to be
+# wrong. So the expression is parsed out of `scripts/tsan-gate.sh`, which is the
+# text that actually reaches Catch2, and a `TARGETS` table this cannot parse is a
+# FATAL_ERROR rather than an empty scope.
+#
 # What this deliberately does NOT check: that the tags appear only in these
-# directories. Three files elsewhere carry them and are swept in as a result.
-# Running MORE than the scope is harmless; running less is the defect.
+# directories. A handful of files elsewhere carry them and are swept in as a
+# result. Running MORE than the scope is harmless; running less is the defect.
 #
 # Runs as `cmake -P`, for the reason check-repository-hygiene.cmake gives at
 # length: this reads files, compares strings and reports, so a .sh + .ps1 pair
@@ -42,34 +54,80 @@ endif()
 
 # ---------------------------------------------------------------------------
 # The directories whose tests must be reachable by the gate. One row per
-# directory; adding a concurrency-bearing directory is adding a row here AND a
-# tag to the list below, which is the point -- the two facts are checked against
-# each other rather than each being trusted.
+# directory. This list is the one thing stated here rather than derived: it is
+# the claim "this is where the threads are", and widening it is a deliberate act.
 set(FastCachedTsanScopeDirs
     "src/FastCache/Async"
     "src/FastCache/Consensus"
     "src/FastCache/Distributed"
 )
 
+# The gate whose scope this enforces. Its `TARGETS` table is the source of truth
+# for which tags are selected; see the header for why nothing is copied out of it.
+set(FastCachedTsanGate "${FASTCACHED_SOURCE_DIR}/scripts/tsan-gate.sh")
+
 # ---------------------------------------------------------------------------
-# The tags `scripts/tsan-gate.sh` selects on. This list and the tag expression in
-# that script's TARGETS table are the same fact written twice, and this check is
-# what keeps them honest: a tag added here and not there widens nothing, and a
-# tag removed there and not here fails this check on the next file that uses it.
+# Parse the tag expressions out of the gate's TARGETS table.
 #
-# Kept as bare names without brackets so the message below can print them the way
-# a Catch2 tag is spelled.
-set(FastCachedTsanScopeTags
-    async
-    consensus
-    distributed
-    reactor
-    task
-)
+# A row is "name|tagExpression"; an empty expression means the binary is run
+# whole, which selects everything and so contributes no constraint. Every failure
+# to parse is fatal, because a scope this cannot read must not read as an empty
+# scope -- the whole file exists because "nothing was checked" and "everything is
+# fine" look identical otherwise.
+
+if(NOT EXISTS "${FastCachedTsanGate}")
+    message(FATAL_ERROR
+        "check-tsan-scope: ${FastCachedTsanGate} does not exist.\n"
+        "This check derives the sanitized scope from that script's TARGETS "
+        "table; it cannot substitute a list of its own.")
+endif()
+
+file(READ "${FastCachedTsanGate}" gateSource)
+if(NOT gateSource MATCHES "TARGETS=\\(([^)]*)\\)")
+    message(FATAL_ERROR
+        "check-tsan-scope: could not find the TARGETS=( ... ) table in "
+        "${FastCachedTsanGate}.\n"
+        "If that table changed shape, this parser changes with it -- do not "
+        "restore a copy of the tag list here. The rule lives in "
+        "${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+set(targetsBlock "${CMAKE_MATCH_1}")
+
+set(FastCachedTsanScopeTags "")
+string(REGEX MATCHALL "\"[^\"]*\"" targetRows "${targetsBlock}")
+foreach(row IN LISTS targetRows)
+    # "name|[a],[b]" -> [a],[b] -> a;b
+    string(REGEX REPLACE "^\"[^|]*\\|" "" rowTags "${row}")
+    string(REGEX REPLACE "\"$" "" rowTags "${rowTags}")
+    string(REGEX MATCHALL "\\[([A-Za-z0-9_-]+)\\]" rowTagMatches "${rowTags}")
+    foreach(tagMatch IN LISTS rowTagMatches)
+        string(REGEX REPLACE "^\\[|\\]$" "" tag "${tagMatch}")
+        list(APPEND FastCachedTsanScopeTags "${tag}")
+    endforeach()
+endforeach()
+list(REMOVE_DUPLICATES FastCachedTsanScopeTags)
+
+if(NOT FastCachedTsanScopeTags)
+    message(FATAL_ERROR
+        "check-tsan-scope: the TARGETS table in ${FastCachedTsanGate} names no "
+        "Catch2 tags at all.\n"
+        "Either every target is now run whole -- in which case this check has "
+        "nothing to enforce and should be removed deliberately -- or the table "
+        "was mis-edited. It is not treated as an empty scope. The rule lives in "
+        "${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+
+# A tag counts only where Catch2 would see one: inside the quoted tag string of a
+# case, so immediately after the opening `"` or after a preceding `]`. A bare
+# `[reactor]` in a comment -- or in a test NAME -- is prose, and matching it would
+# let a file talk its way into the scope without joining it.
+string(REPLACE ";" "|" tagAlternation "${FastCachedTsanScopeTags}")
+set(tagPattern "[\"]\\[(${tagAlternation})\\]|\\]\\[(${tagAlternation})\\]")
 
 # ---------------------------------------------------------------------------
 
 set(uncovered "")
+set(scannedCount 0)
 
 foreach(scopeDir IN LISTS FastCachedTsanScopeDirs)
     set(absoluteDir "${FASTCACHED_SOURCE_DIR}/${scopeDir}")
@@ -83,8 +141,11 @@ foreach(scopeDir IN LISTS FastCachedTsanScopeDirs)
             "table in scripts/tsan-gate.sh together.")
     endif()
 
-    file(GLOB testFiles "${absoluteDir}/*_test.cpp")
-    if(testFiles STREQUAL "")
+    # GLOB_RECURSE, for the reason check-net-boundary.cmake states: a file this
+    # does not scan is a hole that reports green. `Async/` is flat today and a
+    # subdirectory added tomorrow must not walk out of the scope unnoticed.
+    file(GLOB_RECURSE testFiles "${absoluteDir}/*_test.cpp")
+    if(NOT testFiles)
         message(FATAL_ERROR
             "check-tsan-scope: ${scopeDir} contains no *_test.cpp files.\n"
             "That is either a directory that lost its tests or a glob that "
@@ -93,39 +154,32 @@ foreach(scopeDir IN LISTS FastCachedTsanScopeDirs)
     endif()
 
     foreach(testFile IN LISTS testFiles)
+        math(EXPR scannedCount "${scannedCount} + 1")
         file(READ "${testFile}" contents)
-        set(covered FALSE)
-        foreach(tag IN LISTS FastCachedTsanScopeTags)
-            string(FIND "${contents}" "[${tag}]" tagPosition)
-            if(NOT tagPosition EQUAL -1)
-                set(covered TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT covered)
+        if(NOT contents MATCHES "${tagPattern}")
             file(RELATIVE_PATH relativeFile "${FASTCACHED_SOURCE_DIR}" "${testFile}")
-            list(APPEND uncovered "${relativeFile}")
+            list(APPEND uncovered "    ${relativeFile}")
         endif()
     endforeach()
 endforeach()
 
-if(NOT uncovered STREQUAL "")
+if(uncovered)
+    list(JOIN uncovered "\n" uncoveredReport)
     string(REPLACE ";" "]\n    [" printableTags "[${FastCachedTsanScopeTags}]")
-    message("")
-    message("These test files sit in a concurrency-bearing directory but carry no tag")
-    message("the ThreadSanitizer gate selects on, so they are NOT run under TSan:")
-    message("")
-    foreach(file IN LISTS uncovered)
-        message("    ${file}")
-    endforeach()
-    message("")
-    message("Give each case one of these tags:")
-    message("    ${printableTags}")
-    message("")
-    message("or, if it genuinely does not belong in the sanitized scope, widen")
-    message("FastCachedTsanScopeTags here and the TARGETS table in")
-    message("scripts/tsan-gate.sh together -- they are one fact written twice and")
-    message("this check is what keeps them agreeing.")
-    message("")
-    message(FATAL_ERROR "check-tsan-scope: ${uncovered} not reachable by the TSan gate")
+    message(FATAL_ERROR
+        "These test files sit in a concurrency-bearing directory but carry no "
+        "tag the ThreadSanitizer gate selects on, so they are NOT run under "
+        "TSan:\n${uncoveredReport}\n\n"
+        "Give each case one of these tags:\n    ${printableTags}\n\n"
+        "If a file genuinely does not belong in the sanitized scope, the fix is "
+        "to narrow FastCachedTsanScopeDirs here -- widening the tag list would "
+        "pull the file IN, not let it out. To widen the scope instead, edit the "
+        "TARGETS table in scripts/tsan-gate.sh; this check reads its tags from "
+        "there and needs no edit of its own.\n"
+        "The rule lives in ${CMAKE_CURRENT_LIST_FILE}.")
 endif()
+
+string(REPLACE ";" "],[" renderedTags "[${FastCachedTsanScopeTags}]")
+list(LENGTH FastCachedTsanScopeDirs scopeDirCount)
+message("tsan scope: ${scannedCount} test file(s) across ${scopeDirCount} "
+        "directory/directories are selected by ${renderedTags}")

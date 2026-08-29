@@ -55,9 +55,12 @@ catch_discover_tests(FastCacheTest)
 # which is precisely the case the gate is looking for.
 if(ENABLE_SANITIZER_THREAD)
     add_executable(tsan-canary TsanCanary.cpp)
-    # No Catch2 and no catch_discover_tests: a test that must fail is not a test,
-    # and registering it would make `ctest` red by design. Its verdict is read by
-    # scripts/tsan-gate.sh, which is the only thing that should run it.
+    # No Catch2 and no catch_discover_tests. CTest could express "this must fail"
+    # -- `WILL_FAIL`, or `PASS_REGULAR_EXPRESSION "data race"` -- so that is not
+    # the reason; the reason is that the canary's verdict has to be read BEFORE
+    # the suite is believed, and a sibling ctest case that merely also passes
+    # proves nothing about the run that reported clean. scripts/tsan-gate.sh
+    # sequences the two, and is the only thing that should run this.
     find_package(Threads REQUIRED)
     target_link_libraries(tsan-canary PRIVATE Threads::Threads)
 endif()
@@ -159,14 +162,16 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 #
 # It is registered here, in the DEFAULT set, and deliberately not under
 # `if(ENABLE_SANITIZER_THREAD)`. The scope rots in ordinary builds -- somebody adds
-# `Async/Foo_test.cpp` tagged `[reactor]` and nothing says otherwise -- so a check
-# that only runs in the sanitizer preset would report the drift to the one
-# configuration nobody runs locally. This costs milliseconds and reads source
-# files, so it survives `ctest -LE smoke` like the checks above.
+# `Async/Foo_test.cpp` tagged `[queue][mpsc]`, which no row of the gate's table
+# selects, and nothing says otherwise -- so a check that only runs in the
+# sanitizer preset would report the drift to the one configuration nobody runs
+# locally. This costs milliseconds and reads source files, so it survives
+# `ctest -LE smoke` like the checks above.
 #
-# The failure it exists for has already happened once, before the gate merged: the
-# first tag expression excluded six of ten `Async/` test files and every signal in
-# the run still said clean. See the header of scripts/check-tsan-scope.cmake.
+# The failure it exists for has already happened once, before the gate merged.
+# The reasoning, and why the check reads its tags out of the gate rather than
+# keeping a second copy of them, is in the header of
+# scripts/check-tsan-scope.cmake.
 add_test(
     NAME "tsan-scope-hygiene"
     COMMAND ${CMAKE_COMMAND}

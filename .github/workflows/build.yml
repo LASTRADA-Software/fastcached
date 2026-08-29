@@ -446,8 +446,14 @@ jobs:
       # the build then applies. A third entry would spend the repository's shared
       # 10 GB budget again and make this job's first run a cold download of every
       # CPM package.
+      #
+      # `cache/restore` and not `cache`, which is the difference from those two:
+      # they already both WRITE this key, so on a CMakeLists.txt change each
+      # uploads the same archive and the losers discard theirs after paying for
+      # it. A third writer makes that worse and buys nothing — the entry is
+      # identical whoever saves it, so this job reads and lets clang-tidy save.
       - name: "Cache CPM packages"
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
           key: cpm-${{ runner.os }}-clang-debug-${{ hashFiles('CMakeLists.txt') }}
@@ -459,15 +465,17 @@ jobs:
       # cross-job hits at all while forcing two working sets into one cap. That is
       # thrashing, not sharing.
       #
-      # 512M rather than the 1G clang-asan-ubsan measured for itself, because this
-      # job builds a strict SUBSET of that one -- no daemon, no launcher, no
-      # benchmarks, no testclient -- and the rule for this knob is that a cap is
-      # judged by `Cleanups` rather than copied from a neighbour: raising a cap
-      # that is not full spends a shared budget on nothing, and that budget also
-      # carries the Windows sccache entries. The `--show-stats` step below is what
-      # says whether 512M is enough; raise it when `Cleanups` is non-zero, not
-      # before. `save` only on a push, so pull-request runs read master's entry
-      # without each writing their own.
+      # 512M rather than the 1G clang-asan-ubsan measured for itself, and the
+      # number comes from a measurement rather than from the target list looking
+      # smaller: one clean build of exactly these three targets produces 439
+      # object files totalling 417 MB uncompressed, which ccache stores
+      # compressed. The rule for this knob is that a cap is judged by `Cleanups`
+      # rather than copied from a neighbour — raising a cap that is not full
+      # spends a shared budget on nothing, and that budget also carries the
+      # Windows sccache entries. The `--show-stats` step below is what says
+      # whether 512M is enough; raise it when `Cleanups` is non-zero, not before.
+      # `save` only on a push, so pull-request runs read master's entry without
+      # each writing their own.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -494,8 +502,14 @@ jobs:
           cmake --preset clang-tsan
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
 
-      # Only what the gate runs. The whole tree under TSan would be a much longer
-      # job to instrument code the scope deliberately excludes.
+      # Only the targets the gate runs — but do not read that as "the scope makes
+      # this job cheap". `FastCacheTest` is one binary carrying every library
+      # `*_test.cpp`, so these three targets are 439 of the 552 configured compile
+      # edges: ~79% of a full Debug build. The tag scope buys RUNTIME (18.8s
+      # against minutes of per-process sanitized startup) and almost nothing at
+      # build time. This job's cost is its compile, and naming the four targets it
+      # does skip — daemon, launcher, benchmarks, testclient — is worth about 50
+      # translation units.
       - name: "Build"
         run: >-
           cmake --build --preset clang-tsan --target
@@ -504,10 +518,12 @@ jobs:
       - name: "Report ccache effectiveness"
         run: ccache --show-stats --verbose
 
-      # Five refusals, five distinct messages, because they are fixed in five
-      # different places: an unsuppressed race, an uninstrumented binary, a
-      # missing binary, a canary that does not go red, and a tag expression that
-      # matches no test cases at all. Each was verified by making it happen.
+      # Every refusal has a message of its own, because each is fixed somewhere
+      # different, and each was verified by making it happen. The list is in the
+      # header of `scripts/tsan-gate.sh` and deliberately only there — an earlier
+      # version of this comment enumerated "five", in a different order from the
+      # two other places that also enumerated them, having dropped the two
+      # refusals that are hardest to reason about.
       - name: "ThreadSanitizer gate"
         run: scripts/tsan-gate.sh out/build/clang-tsan
 

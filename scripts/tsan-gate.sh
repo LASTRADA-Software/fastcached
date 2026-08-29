@@ -30,38 +30,50 @@
 # stripped runtime can each break while leaving the instrumentation intact.
 # Neither substitutes for the other.
 #
-# Five ways this refuses, each with its own message because each is fixed
-# somewhere different, and each verified by making it happen rather than reasoned
-# about:
+# Every way this refuses has a message of its own, because each is fixed
+# somewhere different, and each was verified by making it happen rather than
+# reasoned about:
 #
-#   1. a target is not built            -> "not built"
-#   2. a target carries no __tsan_init  -> "built WITHOUT instrumentation"
-#   3. the canary does not go red       -> "the deliberate race was NOT reported"
-#   4. a tag expression matches nothing -> "tested NOTHING"
-#   5. an unsuppressed race             -> "reported an unsuppressed data race"
+#   the build directory does not exist    -> "build directory not found"
+#   the suppressions file does not exist  -> "suppressions file not found"
+#   `nm` is unavailable                   -> "nm is required"
+#   a target is not built                 -> "not built"
+#   a target's symbols cannot be read     -> "no symbol table"
+#   a target has no __tsan_init           -> "built WITHOUT instrumentation"
+#   the canary does not go red            -> "the deliberate race was NOT reported"
+#   the canary dies of something else     -> "reported no data race"
+#   a tag expression matches nothing      -> "tested NOTHING"
+#   a target exits 0 with no assertions   -> "refusing to call that clean"
+#   an unsuppressed race                  -> "reported an unsuppressed data race"
 #
-# (4) is the one that looks like paranoia and is not: a typo in the TARGETS table
-# below runs zero cases, and every other signal in the run says clean.
+# The list is enumerated HERE and nowhere else. An earlier version of it said
+# "five refusals" in three files, in three different orders, having silently
+# dropped the two that are hardest to reason about -- which is the same shape as
+# every other defect this gate is about, in the prose describing it.
+#
+# The "tested NOTHING" one is what looks like paranoia and is not: a typo in the
+# TARGETS table below runs zero cases, and every other signal in the run says
+# clean.
 #
 # **The suite is scoped, and `ctest` has no vocabulary for the scope.** The
 # concurrency in this tree is in `Async`, `Consensus`, `Distributed` and the node.
 # `catch_discover_tests` registers cases by NAME and this project's Catch2 (3.6)
 # predates `ADD_TAGS_AS_LABELS`, so there is no ctest label to select on and the
-# scope has to be a Catch2 tag expression. Running the two binaries directly also
-# collapses ~700 sanitized processes into two: measured at 1.2s and 17.6s against
-# several minutes of per-process runtime startup.
+# scope has to be a Catch2 tag expression (issue #312). Running the two binaries
+# directly also collapses ~700 sanitized processes into two: measured at 1.2s and
+# 17.6s against several minutes of per-process runtime startup.
 #
 # The tag list is NOT self-evidently the right one, and an earlier version of it
 # was wrong: `[async],[consensus],[distributed]` looks complete and silently
 # excluded six of ten `Async/` test files, because the reactor and coroutine tests
 # are tagged `[reactor]` and `[task]` and carry no `[async]`. It matched 511 cases
-# and they passed. Nothing in the run could have said otherwise -- which is
-# refusal (4) failing at one level up from where it can see.
+# and they passed. Nothing in the run could have said otherwise.
 #
 # So the tag list is not trusted here. `scripts/check-tsan-scope.cmake` runs in the
 # default ctest set and fails when a test file in one of those directories carries
-# no tag this expression selects, which is what makes the convention load-bearing
-# rather than aspirational. Change one and it will tell you about the other.
+# no tag this expression selects. It reads the expression out of the TARGETS table
+# below rather than restating it, so the two cannot drift apart: a tag removed
+# from that table is a tag that check stops accepting, on its next run.
 #
 # **Known-open races need somewhere to live.** `.tsan-suppressions` is that place
 # and every entry names an issue; see the header of that file for why an entry is
@@ -76,13 +88,33 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # The scope. One row per binary: the executable, and the Catch2 tag expression it
 # is run with (empty means the whole binary). Adding a concurrency-bearing target
 # is adding a row.
+#
+# `scripts/check-tsan-scope.cmake` PARSES this table -- keep the
+# `"name|tagExpression"` shape, or that check fails by name rather than silently
+# enforcing an empty scope.
 TARGETS=(
     "FastCacheTest|[async],[consensus],[distributed],[reactor],[task]"
     "fastcache-compile-node-tests|"
 )
 
+# `exitcode=66` is TSan's default and is named rather than assumed: this gate
+# decides on the exit code, so it must not be something a stray TSAN_OPTIONS in
+# the environment can change to 0. `print_suppressions=1` is on for EVERY run,
+# canary included, so a suppression that has started matching more than it was
+# written for is at least visible rather than silent -- `.tsan-suppressions` says
+# that happens on every run, and it only does if it is set in one place.
+TsanOptions="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}"
+
+# Annotate only where a workflow will render it. Every other script in this repo
+# prints a plain prefixed failure (`cluster-e2e.sh`, `compile-cache-e2e.sh`,
+# `local-gate.sh`, `tidy-sweep.sh`), and a developer running this by hand should
+# not get `::error::` noise for the privilege.
 fatal() {
-    echo "::error::tsan-gate: $*" >&2
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        echo "::error::tsan-gate: $*" >&2
+    else
+        echo "TSAN GATE FAILED: $*" >&2
+    fi
     exit 1
 }
 
@@ -98,25 +130,6 @@ cleanup() { rm -rf "${SCRATCH}"; }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Locate the binaries.
-# ---------------------------------------------------------------------------
-
-[[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
-
-BinaryPath() {
-    # `target/` is where this project's CMake puts executables
-    # (CMAKE_RUNTIME_OUTPUT_DIRECTORY, set in the top-level CMakeLists).
-    #
-    # No `find` fallback, on purpose. Searching the build tree and taking the
-    # first match is a GUESS, and a guess that silently picks some other build's
-    # binary is the failure this whole script exists to refuse -- it would happily
-    # verify and run an artefact nobody asked about. A layout change should stop
-    # the gate with a path in the message, which is a one-line fix, rather than
-    # quietly test the wrong file.
-    printf '%s' "${BUILD_DIR}/target/$1"
-}
-
-# ---------------------------------------------------------------------------
 # Question one: is the artefact under test instrumented?
 #
 # Spelled with an explicit existence check FIRST, and that is not defensive
@@ -124,12 +137,22 @@ BinaryPath() {
 # `__tsan_init` counts zero -- which is character-for-character what an
 # uninstrumented binary looks like. A missing file must not be reportable as a
 # missing sanitizer; they need different fixes.
+#
+# `target/` is where this project's CMake puts executables
+# (CMAKE_RUNTIME_OUTPUT_DIRECTORY, set in the top-level CMakeLists). No `find`
+# fallback, on purpose. Searching the build tree and taking the first match is a
+# GUESS, and a guess that silently picks some other build's binary is the failure
+# this whole script exists to refuse -- it would happily verify and run an
+# artefact nobody asked about. A layout change should stop the gate with a path in
+# the message, which is a one-line fix, rather than quietly test the wrong file.
 # ---------------------------------------------------------------------------
 
+BinaryPath() { printf '%s' "${BUILD_DIR}/target/$1"; }
+
 AssertInstrumented() {
-    local path="$1" label="$2"
-    [[ -n "$path" && -f "$path" ]] || fatal "${label}: not built (looked in ${BUILD_DIR}/target). Build it before running this gate."
-    command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
+    local name="$1" path
+    path="$(BinaryPath "$name")"
+    [[ -f "$path" ]] || fatal "${name}: not built (looked in ${BUILD_DIR}/target). Build it before running this gate."
     # `nm` into a variable and match afterwards, never `nm | grep -q`: under
     # `set -o pipefail` a `grep -q` that matches EARLY closes the pipe, `nm` dies
     # of SIGPIPE, and the pipeline reports failure -- so a correctly instrumented
@@ -137,20 +160,21 @@ AssertInstrumented() {
     # that is exactly how this function first behaved.
     #
     # `--no-demangle`, and only the defined global symbols: `__tsan_init` is a C
-    # symbol that is never mangled, so demangling a Debug+TSan symbol table of
-    # several hundred thousand entries -- into a bash variable, three times a run
-    # -- buys nothing at all.
+    # symbol that is never mangled, so demangling buys nothing at all. Measured on
+    # this tree, `FastCacheTest` has ~81k symbol table entries and ~42k defined
+    # globals -- a few MB into a bash variable, three times a run, well under a
+    # second in total.
     local symbols
     symbols="$(nm -g --defined-only --no-demangle "$path" 2>/dev/null || true)"
-    [[ -n "$symbols" ]] || fatal "${label}: nm produced no symbol table for ${path}; cannot verify instrumentation (stripped binary, or the wrong nm for this object format)."
+    [[ -n "$symbols" ]] || fatal "${name}: nm produced no symbol table for ${path}; cannot verify instrumentation (stripped binary, or the wrong nm for this object format)."
     if [[ "$symbols" != *__tsan_init* ]]; then
-        fatal "${label}: built WITHOUT ThreadSanitizer instrumentation (no __tsan_init).
+        fatal "${name}: built WITHOUT ThreadSanitizer instrumentation (no __tsan_init).
     The build carries no -fsanitize=thread even though this gate was invoked.
     Check ENABLE_SANITIZER_THREAD reached the compile line, not just the cache:
         grep -c fsanitize=thread ${BUILD_DIR}/build.ninja
     See cmake/portable/Sanitizers.cmake for the precedent."
     fi
-    note "${label}: instrumented"
+    note "${name}: instrumented"
 }
 
 # ---------------------------------------------------------------------------
@@ -158,16 +182,17 @@ AssertInstrumented() {
 #
 # Run WITH the suppressions file, deliberately. That proves in the same breath
 # that `.tsan-suppressions` is not broad enough to swallow an obvious race -- a
-# pattern that silences the canary fails here rather than quietly disarming the
-# whole gate.
+# wildcard pattern that silences the canary fails here rather than quietly
+# disarming the whole gate. It is not a proof about narrow entries: the canary
+# races on its own global, in a binary that links no FastCache frame, so a
+# `race_top:` naming a real function here could never have silenced it.
 # ---------------------------------------------------------------------------
 
 AssertCanaryFires() {
     local path canary_out canary_rc
     path="$(BinaryPath tsan-canary)"
-    AssertInstrumented "$path" "tsan-canary"
 
-    canary_out="$(TSAN_OPTIONS="halt_on_error=0 exitcode=66 suppressions=${SUPPRESSIONS}" "$path" 2>&1)" && canary_rc=0 || canary_rc=$?
+    canary_out="$(TSAN_OPTIONS="${TsanOptions}" "$path" 2>&1)" && canary_rc=0 || canary_rc=$?
 
     if [[ "$canary_rc" -eq 0 ]]; then
         fatal "the deliberate race in src/tests/TsanCanary.cpp was NOT reported.
@@ -188,21 +213,33 @@ ${canary_out}"
 # ---------------------------------------------------------------------------
 
 RunTarget() {
-    local name="$1" tags="$2" path rc=0 log
+    local name="$1" tags="$2" path rc=0 log summary
     path="$(BinaryPath "$name")"
-    AssertInstrumented "$path" "$name"
+
+    # An empty tag expression means "run the whole binary", which is not the same
+    # argument as an empty string -- Catch2 would read `""` as a filter matching
+    # nothing. An array is how bash spells "this argument is sometimes absent";
+    # `${args[@]+...}` rather than a bare `"${args[@]}"`, because an empty array
+    # under `set -u` is an unbound variable in bash 3.2, which is what macOS
+    # ships and where this preset is also meant to run.
+    local args=()
+    if [[ -n "$tags" ]]; then
+        args=("$tags")
+    fi
 
     log="${SCRATCH}/${name}.log"
     note "running ${name} ${tags:+(${tags})}"
-    # `exitcode=66` is TSan's default and is named rather than assumed: this gate
-    # decides on the exit code, so it must not be something a stray TSAN_OPTIONS
-    # in the environment can change to 0.
-    if [[ -n "$tags" ]]; then
-        TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}" \
-            "$path" "$tags" >"$log" 2>&1 || rc=$?
-    else
-        TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}" \
-            "$path" >"$log" 2>&1 || rc=$?
+    TSAN_OPTIONS="${TsanOptions}" "$path" ${args[@]+"${args[@]}"} >"$log" 2>&1 || rc=$?
+
+    # A filter that matches nothing is the quietest way for this gate to test
+    # nothing and say "clean" -- a typo in the TARGETS table above would do it.
+    # Catch2 exits 2 and says so, which would land in the failure branch below,
+    # but it would be diagnosed there as a mysterious non-race failure. Name it
+    # instead, and assert positively that cases ran rather than trusting the exit
+    # code.
+    if grep -q 'No test cases matched' "$log"; then
+        fatal "${name}: the filter '${tags}' matched no test cases, so this target tested NOTHING.
+    Fix the tag expression in the TARGETS table in $(basename "${BASH_SOURCE[0]}")."
     fi
 
     # On success, the interesting lines only: a passing sanitizer run is hundreds
@@ -211,46 +248,43 @@ RunTarget() {
     # written for goes unnoticed. On failure, everything -- that is when the whole
     # log is the evidence.
     if [[ "$rc" -eq 0 ]]; then
-        grep -E 'assertions in|Matched [0-9]+ suppressions|No tests ran' "$log" || true
-    else
-        cat "$log"
+        summary="$(grep -E 'assertions in|Matched [0-9]+ suppressions' "$log" || true)"
+        [[ -n "$summary" ]] \
+            || fatal "${name}: exited 0 but reported no assertions; refusing to call that clean."
+        echo "$summary"
+        note "${name}: clean"
+        return
     fi
 
-    # A filter that matches nothing is the quietest way for this gate to test
-    # nothing and say "clean" -- a typo in the TARGETS table above would do it.
-    # Catch2 exits 2 and says so, which lands in the failure branch below, but it
-    # would be diagnosed there as a mysterious non-race failure. Name it instead,
-    # and assert positively that cases ran rather than trusting the exit code.
-    if grep -q 'No test cases matched' "$log"; then
-        fatal "${name}: the filter '${tags}' matched no test cases, so this target tested NOTHING.
-    Fix the tag expression in the TARGETS table in $(basename "${BASH_SOURCE[0]}")."
+    cat "$log"
+    # Distinguish a race from an ordinary test failure, because they are read by
+    # different people and fixed in different places. Catch2 prints "All tests
+    # passed" even when the process exits 66, so the exit code is what decides and
+    # the output is only ever an explanation.
+    if grep -q 'WARNING: ThreadSanitizer' "$log"; then
+        fatal "${name} reported an unsuppressed data race (exit ${rc}).
+    If this is a NEW race, it is its own issue -- file it. If it is a known one,
+    it belongs in .tsan-suppressions with its issue number, not deleted from here."
     fi
-    if [[ "$rc" -eq 0 ]] && ! grep -q 'assertions in' "$log"; then
-        fatal "${name}: exited 0 but reported no assertions; refusing to call that clean."
-    fi
-
-    if [[ "$rc" -ne 0 ]]; then
-        # Distinguish a race from an ordinary test failure, because they are read
-        # by different people and fixed in different places. Catch2 prints "All
-        # tests passed" even when the process exits 66, so the exit code is what
-        # decides and the output is only ever an explanation.
-        if grep -q 'WARNING: ThreadSanitizer' "$log"; then
-            echo "::error::tsan-gate: ${name} reported an unsuppressed data race (exit ${rc})" >&2
-            echo "If this is a NEW race, it is its own issue -- file it. If it is a known one," >&2
-            echo "it belongs in .tsan-suppressions with its issue number, not deleted from here." >&2
-        else
-            echo "::error::tsan-gate: ${name} failed (exit ${rc}) without a ThreadSanitizer report" >&2
-        fi
-        exit 1
-    fi
-    note "${name}: clean"
+    fatal "${name} failed (exit ${rc}) without a ThreadSanitizer report."
 }
 
 # ---------------------------------------------------------------------------
 
+[[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
 [[ -f "$SUPPRESSIONS" ]] || fatal "suppressions file not found: ${SUPPRESSIONS}"
+command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
 
 note "build directory: ${BUILD_DIR}"
+
+# Every instrumentation question first, then the runs. An uninstrumented second
+# binary is a one-second answer, and diagnosing it only after the first target's
+# full sanitized run wastes the whole of that run.
+AssertInstrumented tsan-canary
+for row in "${TARGETS[@]}"; do
+    AssertInstrumented "${row%%|*}"
+done
+
 AssertCanaryFires
 
 for row in "${TARGETS[@]}"; do
