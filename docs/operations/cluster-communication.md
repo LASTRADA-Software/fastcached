@@ -262,6 +262,28 @@ Neither is queued, and that is deliberate: the client has a local compile waitin
 either way, while queueing would hide the overload from the scheduler that is
 trying to route around it.
 
+Four more are decided **before** the compile, opening the codec envelope the
+translation unit arrived in — the check the note in step 4 describes. They are
+counted apart for the same reason the scheduler's four are: each names a different
+thing to go and do, and the sum of them names none.
+
+| Refusal | Counter | What it means | What to do |
+|---|---|---|---|
+| `payload-too-large` | `fastcache_worker_jobs_refused_envelope_declared_too_large_total` | The envelope declared it expands past this worker's request ceiling | Nothing honest declares that by accident. Read it as a probe of the port, or as a client configured with a larger ceiling than the worker |
+| `unsupported-codec` | `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | The payload is in a codec this build cannot decode | A packaging difference between two honest machines — a client built with zstd talking to a worker that was not. Every one of these cost a local compile |
+| `malformed-frame` | `fastcache_worker_jobs_refused_envelope_malformed_total` | The envelope did not parse, or an uncompressed one disagreed with the bytes beside it | A version skew, or something on the port that is not this protocol at all |
+| `malformed-frame` | `fastcache_worker_jobs_refused_envelope_corrupt_total` | The bytes parsed and then did not expand to their declared size | The only one of the four that implicates the transport: a codec version skew, or a link damaging payloads |
+
+The last two share a wire code and do not share a counter, which is the split
+working rather than an inconsistency. `malformed-frame` is all the *client* can act
+on — it compiles locally either way — while "your framing did not parse" and "your
+bytes did not expand" send an *operator* to two different places.
+
+Only the worker counts these. The launcher opens an envelope too, on the reply a
+worker sends back, and refuses it by the same rules — but it has no metrics sink,
+a local compile to fall back on, and its own log to say so. The worker is the
+machine an operator scrapes.
+
 ### 7. The client hands the lease back
 
 On **every** path out of the compile: an object built, a worker that refused the

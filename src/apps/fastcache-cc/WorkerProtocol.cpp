@@ -186,11 +186,20 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // compression-less build's path, which can least afford the spare copy.
     auto source = UnenvelopeText(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
-        // Code and text come from ONE row rather than a ternary beside a lookup: a
-        // malformed frame answered `UnsupportedCodec` while its message said
-        // "malformed" would send an operator hunting a codec mismatch that never
-        // happened.
-        return Wire::EncodeErrorReply(WireCodeFor(source.error()), DescribeEnvelopeError(source.error()));
+    {
+        // Code, text and counter come from ONE row rather than a ternary beside a
+        // lookup: a malformed frame answered `UnsupportedCodec` while its message
+        // said "malformed" would send an operator hunting a codec mismatch that
+        // never happened.
+        //
+        // Counted here and not inside `Unenvelope`, because the launcher calls that
+        // too and has no sink -- and a refusal answered on the wire while nothing
+        // rises is how a port being probed with envelope bombs looked, on
+        // `/metrics`, exactly like a port nobody was talking to.
+        auto const reason = source.error();
+        _metrics.Increment(CounterFor(reason));
+        return Wire::EncodeErrorReply(WireCodeFor(reason), DescribeEnvelopeError(reason));
+    }
 
     // Counted around the runner rather than inside it: the runner is a seam with
     // its own fakes, and a fake that forgot to count would make every test agree

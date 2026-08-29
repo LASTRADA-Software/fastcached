@@ -14,37 +14,53 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// What one envelope refusal means on the wire and to a person.
+    /// What one envelope refusal means on the wire, to a person, and in the metrics.
     ///
-    /// Both in one row, deliberately, exactly as `WorkerProtocol`'s `RefusalTable`
-    /// pairs a code with its counter and for the same reason: they answer the same
-    /// question asked by two audiences, and a refusal reported under one code while
-    /// being described as another sends an operator to look for something that did
-    /// not happen.
+    /// All three in one row, deliberately, exactly as `WorkerProtocol`'s
+    /// `RefusalTable` pairs a code with its counter and for the same reason: they
+    /// answer the same question asked by three audiences -- the peer deciding
+    /// whether to retry, the person reading the message, and the operator watching
+    /// a fleet -- and a refusal reported under one code while being described as
+    /// another sends an operator to look for something that did not happen.
     ///
-    /// No member carries a default. A row answering only two of the three questions
+    /// The counter arrived last and is the reason this comment mentions it: the
+    /// first two columns shipped without it, so a worker being probed with envelope
+    /// bombs answered every one of them correctly and `/metrics` stayed flat.
+    ///
+    /// Two rows share a wire **code** and none shares a counter, which is the split
+    /// working rather than an inconsistency. `MalformedFrame` is all a peer can act
+    /// on -- it retries nothing either way -- while "your framing did not parse" and
+    /// "your bytes did not expand" send an operator to different places, the second
+    /// of them to the transport.
+    ///
+    /// No member carries a default. A row answering only some of the three questions
     /// is not a row, and `ErrorCode` has no zero enumerator to default to anyway.
     struct EnvelopeErrorRow
     {
-        EnvelopeError error;   ///< The reason this row describes.
-        Wire::ErrorCode code;  ///< What the peer is told.
-        std::string_view text; ///< What a person reads.
+        EnvelopeError error;           ///< The reason this row describes.
+        Wire::ErrorCode code;          ///< What the peer is told.
+        std::string_view text;         ///< What a person reads.
+        IMetricsSink::Counter counter; ///< What the operator sees rise.
     };
 
     /// One row per `EnvelopeError`, in enumerator order.
     constexpr EnumTable<EnvelopeError, EnvelopeErrorRow> ErrorTable { {
         { .error = EnvelopeError::Malformed,
           .code = Wire::ErrorCode::MalformedFrame,
-          .text = "the codec envelope is malformed" },
+          .text = "the codec envelope is malformed",
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed },
         { .error = EnvelopeError::UnsupportedCodec,
           .code = Wire::ErrorCode::UnsupportedCodec,
-          .text = "the payload is in a codec this build cannot decode" },
+          .text = "the payload is in a codec this build cannot decode",
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec },
         { .error = EnvelopeError::DeclaredTooLarge,
           .code = Wire::ErrorCode::PayloadTooLarge,
-          .text = "the declared decompressed size exceeds this endpoint's ceiling" },
+          .text = "the declared decompressed size exceeds this endpoint's ceiling",
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge },
         { .error = EnvelopeError::Corrupt,
           .code = Wire::ErrorCode::MalformedFrame,
-          .text = "the payload does not expand to its declared size" },
+          .text = "the payload does not expand to its declared size",
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeCorrupt },
     } };
 
     static_assert(RowsInEnumeratorOrder(ErrorTable, &EnvelopeErrorRow::error),
@@ -100,7 +116,9 @@ namespace
                 return std::unexpected(EnvelopeError::Malformed);
             // Straight out of the frame. An intermediate `std::vector<std::byte>` here
             // would be a second full copy of a preprocessed translation unit, on the
-            // one codec a node actually negotiates.
+            // path a build with compression configured out takes for every payload --
+            // the one least able to afford it. (It used to be EVERY payload's path,
+            // because the node negotiated no codec but `Identity`; #265.)
             return materialize(envelope->bytes);
         }
 
@@ -195,6 +213,11 @@ Wire::ErrorCode WireCodeFor(EnvelopeError error) noexcept
 std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept
 {
     return RowFor(error).text;
+}
+
+IMetricsSink::Counter CounterFor(EnvelopeError error) noexcept
+{
+    return RowFor(error).counter;
 }
 
 std::expected<std::vector<std::byte>, EnvelopeError> Unenvelope(std::span<std::byte const> field, std::size_t maxRawBytes)
