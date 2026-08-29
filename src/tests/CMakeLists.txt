@@ -33,6 +33,36 @@ include(Catch)
 catch_discover_tests(FastCacheTest)
 
 # ---------------------------------------------------------------------------
+# The ThreadSanitizer canary: a program that MUST fail, so that a green sanitizer
+# job means something. See src/tests/TsanCanary.cpp for why it contains a
+# deliberate data race, and scripts/tsan-gate.sh for what refuses to run without
+# it.
+#
+# Built here, by the same CMake that instruments everything else, rather than
+# compiled by the gate script with flags of its own. That is the entire point: it
+# inherits `-fsanitize=thread` from the same `add_compile_options` the real
+# targets get, so it detects a Sanitizers.cmake that has stopped applying them --
+# the defect that module's own comment records. A canary built with hand-written
+# flags would keep passing through exactly that failure.
+#
+# Deliberately NOT linked against FastCache: it answers "is the toolchain
+# instrumenting and reporting", which has to stay answerable even when the
+# library does not build.
+#
+# Guarded, so no other configuration builds a knowingly-racy binary. The guard
+# does not weaken the check -- when the option is ON but the flags never reach the
+# compile line, this target still exists and still comes out uninstrumented,
+# which is precisely the case the gate is looking for.
+if(ENABLE_SANITIZER_THREAD)
+    add_executable(tsan-canary TsanCanary.cpp)
+    # No Catch2 and no catch_discover_tests: a test that must fail is not a test,
+    # and registering it would make `ctest` red by design. Its verdict is read by
+    # scripts/tsan-gate.sh, which is the only thing that should run it.
+    find_package(Threads REQUIRED)
+    target_link_libraries(tsan-canary PRIVATE Threads::Threads)
+endif()
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it

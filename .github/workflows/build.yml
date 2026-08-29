@@ -396,6 +396,96 @@ jobs:
       - name: "Test"
         run: ctest --preset clang-debug
 
+  # ThreadSanitizer, over the concurrency-bearing tests only.
+  #
+  # The `clang-tsan` preset existed for a long time and nothing invoked it. The
+  # first time anyone ran it by hand it found a real race in `AdminEndpoint`
+  # (#260) — which is the argument for this job, and also why the job is not
+  # simply "run everything under TSan".
+  #
+  # SCOPE. `Async`, `Consensus`, `Distributed` and the node are where the threads
+  # are; the rest of the suite is single-threaded by construction and would pay
+  # sanitizer cost to prove it. Those four map onto three Catch2 tags plus one
+  # binary, and the tags were checked to appear in those three directories and
+  # nowhere else. Widening the scope is editing the `TARGETS` table in
+  # `scripts/tsan-gate.sh`.
+  #
+  # WHY A SCRIPT AND NOT `ctest`. Because a clean sanitizer run is not evidence.
+  # `cmake/portable/Sanitizers.cmake` records a defect on this repository where
+  # the option read ON, the configure log printed "Enabling", and no
+  # `-fsanitize=` reached the compile line at all — so the sanitizer presets had
+  # never once run a sanitizer, and every signal an author would check said yes.
+  # `scripts/tsan-gate.sh` refuses to report clean until it has proved both that
+  # the test binaries carry `__tsan_init` and that a deliberately racy canary
+  # still goes red. `ctest` cannot tell "no races" from "no sanitizer"; this can.
+  #
+  # It is a full job because TSan needs its own build of the tree. The tests
+  # themselves are cheap — measured at 1.2s and 17.6s — so this job is its build,
+  # and it is on every push for the same reason the ASan job is: a race found a
+  # week later has a week of commits to bisect through.
+  clang-tsan:
+    name: "clang-tsan"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-clang-tsan-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-tsan-
+
+      # 1G for the same measured reason the clang-asan-ubsan job gives: a
+      # sanitized Debug build produces far larger objects than the Release jobs,
+      # and a 256M cache evicts its own objects inside a single build. `save` only
+      # on a push, so pull-request runs read master's entry without each writing a
+      # gigabyte of the repository's shared 10 GB budget.
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-clang-tsan
+          max-size: 1G
+          save: ${{ github.event_name == 'push' }}
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
+
+      - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-tsan
+          -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
+
+      # Only what the gate runs. The whole tree under TSan would be a much longer
+      # job to instrument code the scope deliberately excludes.
+      - name: "Build"
+        run: >-
+          cmake --build --preset clang-tsan --target
+          FastCacheTest fastcache-compile-node-tests tsan-canary
+
+      - name: "Report ccache effectiveness"
+        run: ccache --show-stats --verbose
+
+      # Five refusals, five distinct messages, because they are fixed in five
+      # different places: an unsuppressed race, an uninstrumented binary, a
+      # missing binary, a canary that does not go red, and a tag expression that
+      # matches no test cases at all. Each was verified by making it happen.
+      - name: "ThreadSanitizer gate"
+        run: scripts/tsan-gate.sh out/build/clang-tsan
+
   # Coverage, measured once, on Linux, with Clang. One configuration and not a
   # matrix, because coverage answers "which lines did the tests reach", and that
   # does not vary by compiler or platform — where they genuinely differ is
@@ -1978,6 +2068,7 @@ jobs:
       - linux
       - clang-tidy
       - clang-asan-ubsan
+      - clang-tsan
       - coverage
       - macos
       - docker

@@ -121,6 +121,36 @@ determinism rests on.
   and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
   that silently does nothing is worse than one that is off, because the second is
   visible.
+  - **So a sanitizer job proves the tree only once something proves the sanitizer.**
+    `scripts/tsan-gate.sh` will not report clean until it has answered two separate
+    questions, because they fail separately: `__tsan_init` in the **test binaries**
+    says *this artefact* was instrumented, and `src/tests/TsanCanary.cpp` -- a
+    deliberate data race, built by the same `add_compile_options` as everything else
+    -- says the runtime still detects and reports. A `TSAN_OPTIONS`, a suppressions
+    pattern or a stripped runtime can break the second while the first still holds.
+    The canary is run **with the suppressions file active**, so a pattern broad
+    enough to swallow an obvious race fails the gate instead of silently disarming
+    it. All five refusals -- missing binary, uninstrumented binary, silent runtime,
+    a tag expression matching no cases, and an unsuppressed race -- were verified by
+    making each one happen.
+  - **A filter that matches nothing is a suite that tested nothing**, and every
+    other signal in that run reads clean. The gate names it, and separately refuses
+    an exit of 0 that reported no assertions. This is the same shape as a sweep that
+    skips files and a `-header-filter` that matches no path: the tool ran, the
+    artefact was fine, and *nothing was examined*.
+  - **`nm | grep -q` is a false negative under `set -o pipefail`.** A `grep -q` that
+    matches closes the pipe early, `nm` dies of SIGPIPE, and the pipeline reports
+    failure -- so a correctly instrumented binary is diagnosed as an uninstrumented
+    one. Capture the symbols into a variable and match afterwards. This bit the gate
+    that exists to catch exactly this class of thing.
+  - **`nm` on a path that does not exist prints nothing**, and a grep for a symbol in
+    nothing counts zero -- identical to an uninstrumented binary and fixed somewhere
+    completely different. Check existence first, and say which one it was.
+  - **A known race lives in `.tsan-suppressions` with its issue number, never in a
+    deleted check.** Every entry is an open bug; removing it is part of closing that
+    bug. `race:` matches a function name anywhere in a stack, so an entry is always
+    broader than the report it was written for -- which is why the gate prints
+    ThreadSanitizer's own `Matched N suppressions` line on every run.
 
 ## What CI costs
 

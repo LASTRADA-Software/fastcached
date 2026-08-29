@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ThreadSanitizer suppressions, read by `scripts/tsan-gate.sh`.
+#
+# EVERY ENTRY IS A KNOWN BUG THAT IS STILL OPEN, and must name the issue that
+# tracks it. This file is not a place to make a report go away; it is the list of
+# races the gate already knows about, so that the gate can be red for a NEW one.
+# An entry with no issue number is a defect in this file.
+#
+# Removing an entry is part of fixing its issue. If a fix lands and the entry
+# stays, the next regression of that exact race is invisible -- which is the
+# failure mode this whole gate exists to prevent, reintroduced one layer up.
+#
+# ## Scope, and why it is worth stating
+#
+# `race:` matches a FUNCTION NAME anywhere in the stack, so an entry is broader
+# than the one race it was written for: it also silences a future, unrelated race
+# reported through the same function. That is a real cost and the reason to keep
+# this file short and to name the narrowest frame that identifies the report.
+# `scripts/tsan-gate.sh` prints ThreadSanitizer's own "Matched N suppressions"
+# line on every run, so a suppression that starts matching more than it did is at
+# least visible rather than silent.
+#
+# The gate additionally proves this file is not swallowing everything: the
+# canary's race is checked WITH these suppressions active, so a pattern broad
+# enough to silence the canary fails the gate.
+#
+# Format: https://clang.llvm.org/docs/ThreadSanitizerFlags.html
+
+# https://github.com/LASTRADA-Software/fastcached/issues/260
+#
+# `AdminEndpoint` closes its listener from the main thread while its own accept
+# thread is still inside `Accept()`. Reported 6 times from one underlying race,
+# entirely within `AdminEndpoint` construction and teardown. This is the shape the
+# rulebook already records for sockets -- "Close() can be the last thing that runs
+# on a socket, so it must touch no member after it completes an awaitable" --
+# arriving from the thread side rather than the coroutine side.
+#
+# Found by the first ThreadSanitizer run ever done on this tree, which is the
+# argument for this gate existing at all.
+race:FastCache::BlockingListener::Close
