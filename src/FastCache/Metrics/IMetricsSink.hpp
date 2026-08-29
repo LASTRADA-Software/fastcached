@@ -194,6 +194,37 @@ class IMetricsSink
         WorkerJobsRefusedNotAMember,
         WorkerJobsRefusedEndpointBusy,
 
+        /// Jobs refused while opening the request's codec envelope, one counter per
+        /// reason — the same split, and for the same argument, that `EnvelopeError`
+        /// makes one layer down.
+        ///
+        /// These used to be answered on the wire and counted nowhere, so a fleet
+        /// being probed with envelope bombs (issue #241, the reason the ceiling
+        /// exists) emitted `payload-too-large` replies while `/metrics` stayed
+        /// perfectly flat. A refusal a worker returns and does not count is a
+        /// refusal an operator can only find by reading a client's log.
+        ///
+        /// Split rather than summed into one `..._bad_envelope_total`, because the
+        /// four name four different things to go and do, and a sum is exactly what
+        /// hides the one that matters:
+        ///
+        /// - `DeclaredTooLarge` is somebody attacking this port, or a client
+        ///   configured with a request ceiling larger than this worker's. Nothing
+        ///   honest declares an expansion above the cap by accident.
+        /// - `UnsupportedCodec` is two honest processes built differently — a
+        ///   client compiled with zstd talking to a worker that was not. It is a
+        ///   packaging problem, and every one of these cost a local compile.
+        /// - `Malformed` is a peer whose framing this build cannot parse: a version
+        ///   skew, or something that is not this protocol at all.
+        /// - `Corrupt` is framing this build parsed and bytes that then did not
+        ///   expand to their declared length — a codec version skew or a link
+        ///   damaging payloads, which is a different investigation from all three
+        ///   above and the only one that implicates the transport.
+        WorkerJobsRefusedEnvelopeMalformed,
+        WorkerJobsRefusedEnvelopeUnsupportedCodec,
+        WorkerJobsRefusedEnvelopeDeclaredTooLarge,
+        WorkerJobsRefusedEnvelopeCorrupt,
+
         /// Bytes of request payload read from clients, and of reply written back.
         /// The pair is what says whether a codec negotiation is doing anything:
         /// preprocessed text in against object bytes out.

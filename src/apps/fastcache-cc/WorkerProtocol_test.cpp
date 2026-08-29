@@ -4,6 +4,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -258,6 +259,17 @@ TEST_CASE("A codec envelope declaring more than the cap is refused before it is 
 
     // Nothing downstream ever saw the frame.
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+
+    // And something DID rise. A refusal the worker answers on the wire and counts
+    // nowhere is one an operator can only find in a client's log: a port being
+    // probed with these looked, on `/metrics`, exactly like a port nobody was
+    // talking to. Counted under its own reason, not a shared `bad_envelope`, because
+    // "somebody is declaring 4 GiB at my compile port" is not the same page as "two
+    // of my machines were packaged with different codecs".
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeCorrupt) == 0);
 }
 
 TEST_CASE("An Identity envelope may not lie about the size of the bytes beside it", "[worker-protocol]")
@@ -295,6 +307,14 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
     auto const modestAnswer = fix.worker.Answer(modestFrame);
     REQUIRE(modestAnswer.has_value());
     CHECK(ErrorOf(Unwrap(modestAnswer)) == Wire::ErrorCode::MalformedFrame);
+
+    // Two frames, two codes, two counters -- and the counters split where the codes
+    // do not. `MalformedFrame` is all the peer can act on either way, while an
+    // operator seeing the second rise is looking at a version skew and the first at
+    // somebody sizing a request past the cap.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
 }
 
 TEST_CASE("An envelope refusal's wire code and its message are one fact", "[worker-protocol]")
@@ -321,6 +341,36 @@ TEST_CASE("An envelope refusal's wire code and its message are one fact", "[work
         CHECK_FALSE(text.empty());
         CHECK(std::ranges::find(seen, text) == seen.end());
         seen.push_back(text);
+    }
+
+    // The third column, and the one that shipped late: for a while these refusals
+    // had a code and a message and incremented nothing at all. No two reasons share
+    // a counter -- deliberately, even where two share a wire code -- because summing
+    // them would hide the one that is somebody probing the port behind the one that
+    // is a packaging mistake.
+    std::vector<IMetricsSink::Counter> counters;
+    for (auto const reason: { EnvelopeError::Malformed,
+                              EnvelopeError::UnsupportedCodec,
+                              EnvelopeError::DeclaredTooLarge,
+                              EnvelopeError::Corrupt })
+    {
+        auto const counter = CounterFor(reason);
+        CHECK(counter != IMetricsSink::Counter::Last);
+        CHECK(std::ranges::find(counters, counter) == counters.end());
+        counters.push_back(counter);
+    }
+
+    // And each row names an *envelope* counter rather than a neighbour's. That every
+    // counter has a catalog row is a `static_assert`'s job, not a test's; what no
+    // compile-time check can see is a row built by copying the one above it and
+    // leaving `WorkerJobsRefusedNoSlot` in place -- which would export a plausible
+    // series under a reason that never happened.
+    for (auto const counter: counters)
+    {
+        auto const* const row = DescriptorOf(counter);
+        REQUIRE(row != nullptr);
+        INFO("counter " << row->prometheusName);
+        CHECK(row->prometheusName.starts_with("fastcache_worker_jobs_refused_envelope_"));
     }
 }
 
@@ -393,6 +443,13 @@ TEST_CASE("A source in an undecodable codec is refused, not compiled as garbage"
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::UnsupportedCodec);
+
+    // Its own counter, and the only envelope refusal that is nobody's fault: two
+    // honest processes packaged differently. An operator reading a rise here goes to
+    // the build of the two binaries, not to the network and not to the firewall.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
 }
 
 TEST_CASE("A frame shorter than its declared payload is refused", "[worker-protocol]")

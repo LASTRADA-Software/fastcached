@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -70,6 +71,24 @@ enum class EnvelopeError : std::uint8_t
 /// @param error The reason.
 /// @return Its description.
 [[nodiscard]] std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept;
+
+/// What an operator watching this fleet sees rise.
+///
+/// The third column of the same row, for the reason the rulebook states as "a
+/// refusal's wire code and its counter are one row — one fact, two audiences".
+/// These refusals had the first two columns and no third: the worker answered
+/// `payload-too-large` to an envelope bomb and incremented nothing, so a port
+/// being probed looked, on `/metrics`, exactly like a port nobody was talking to.
+///
+/// Reached through this accessor rather than by exporting the table, so the row
+/// stays the one place a reason is described. Note that only the **worker** side
+/// counts: the launcher opening a worker's reply calls `Unenvelope` too, and has
+/// no sink to count into — it has a local compile to fall back on and a client's
+/// own log to say so, while the worker is the machine an operator scrapes.
+///
+/// @param error The reason.
+/// @return The counter this refusal belongs to.
+[[nodiscard]] IMetricsSink::Counter CounterFor(EnvelopeError error) noexcept;
 
 /// The codec ids this build can actually produce and consume, most-preferred first.
 ///

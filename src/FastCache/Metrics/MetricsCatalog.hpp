@@ -195,6 +195,30 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "worker's in-flight byte budget. Distinct from no_slot: slots were "
               "free and memory was not, so more slots would not have helped.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
+      .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",
+      .help = "Jobs refused because the request's codec envelope could not be "
+              "parsed, or an uncompressed one disagreed with the bytes beside it: "
+              "a version skew, or a peer not speaking this protocol.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec,
+      .prometheusName = "fastcache_worker_jobs_refused_envelope_unsupported_codec_total",
+      .help = "Jobs refused because the payload is in a codec this build cannot "
+              "decode: two honest processes packaged differently. Every one cost a "
+              "local compile.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge,
+      .prometheusName = "fastcache_worker_jobs_refused_envelope_declared_too_large_total",
+      .help = "Jobs refused because the envelope declared it expands past this "
+              "endpoint's ceiling, before a byte was decompressed. Nothing honest "
+              "declares that by accident: read it as a probe or a mis-set client.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeCorrupt,
+      .prometheusName = "fastcache_worker_jobs_refused_envelope_corrupt_total",
+      .help = "Jobs refused because the payload did not expand to its declared "
+              "size. The only envelope refusal that implicates the transport: a "
+              "codec version skew, or a link damaging payloads.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerBytesReceived,
       .prometheusName = "fastcache_worker_bytes_received_total",
       .help = "Request payload bytes read from clients.",
