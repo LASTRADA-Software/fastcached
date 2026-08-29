@@ -125,6 +125,23 @@ namespace
 
 Wire::CodecList AvailableCodecs()
 {
+    // Hand-written, and it should not be. `Core/Compression` owns a descriptor table
+    // whose own comment calls itself the single source of truth, but it exposes no way
+    // to enumerate it -- `NameList()` is the only function that iterates it for an
+    // outside caller, and it returns a joined string. So this list is a second
+    // inventory of the same enum, and a codec added to `Compression` and forgotten
+    // here is never advertised and never negotiated, on either direction, with every
+    // test still passing. That is exactly #265's failure shape.
+    //
+    // `AvailableCodecsCoverEveryCodec` in `WorkerProtocol_test.cpp` is what makes that
+    // omission loud rather than silent, by reading the inventory back out through
+    // `NameList()`. The real fix is a public enumeration on `Compression` plus a
+    // preference column -- the table is in id order because ids are an on-disk
+    // contract, while the wire wants preference order -- and is tracked separately.
+    // Deliberately not `reserve`d: there is no public codec count to size it from, and
+    // introducing a third hand-maintained number to save two reallocations of a
+    // three-byte vector, in a change whose point is removing duplicated inventories,
+    // is the wrong trade.
     Wire::CodecList out;
     for (auto const codec: { CompressionCodec::Zstd, CompressionCodec::Lz4 })
         if (Compression::IsAvailable(codec))
@@ -138,9 +155,29 @@ std::vector<std::byte> Envelope(std::span<std::byte const> payload,
                                 Wire::CodecList const& ownCodecs)
 {
     auto const chosen = Wire::ChooseCodec(peerCodecs, ownCodecs);
-    // `ownCodecs` is what this end SAID it can produce, which need not be what it
-    // can: a worker's list reaches its caller through a registration and a grant, so
-    // asking `Compression` itself is the only check that cannot be stale.
+
+    // Neither half implies the other, and both are about COST rather than
+    // correctness -- stated plainly, because a guard mistaken for a correctness check
+    // is one a later reader will not dare simplify and cannot test.
+    //
+    // `chosen != IdentityCodec`: `IsAvailable(Identity)` is documented as always true,
+    // so the second half alone would run `Compress(Identity, ...)` -- a full copy of
+    // every payload that ends up uncompressed anyway.
+    //
+    // `IsAvailable`: `ChooseCodec` guarantees only that `chosen` is in `ownCodecs`, and
+    // `ownCodecs` is INJECTED -- `WorkerProtocol`'s constructor argument, or a client's
+    // own list -- so nothing in these arguments establishes that this build can encode
+    // it. (About the injection seam, not about travel: it is the PEER's list that
+    // arrives via a registration and a grant, and it needs no such check because a
+    // codec we cannot produce simply loses the vote in `ChooseCodec`.)
+    //
+    // Removing this half changes no output: `Compression::Compress` returns a verbatim
+    // copy for a codec it cannot find, the shrink check then rejects it, and the
+    // envelope is `Identity` either way. Verified by deleting it and watching the
+    // suite stay green. What it saves is that copy -- megabytes, on a build's hot
+    // path. So do not expect a test to hold this branch in place; the contract it
+    // serves (`WorkerProtocol.hpp`'s "a wider list falls back to Identity") is what is
+    // tested, and that contract survives the guard's removal.
     if (chosen != Wire::IdentityCodec && Compression::IsAvailable(static_cast<CompressionCodec>(chosen)))
     {
         auto const compressed = Compression::Compress(static_cast<CompressionCodec>(chosen), payload, /*level=*/1);

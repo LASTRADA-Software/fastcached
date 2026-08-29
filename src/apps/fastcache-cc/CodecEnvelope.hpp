@@ -102,7 +102,12 @@ enum class EnvelopeError : std::uint8_t
 /// allocation by before it decompresses a byte.
 ///
 /// @param payload The bytes to send.
-/// @param peerCodecs What the receiving end said it can decode.
+/// @param peerCodecs What the receiving end said it can decode. An **empty** list is
+///        ordinary and yields `Identity` — not a defect to be repaired here.
+///        `CompileCacheWire`'s `CodecList` states the contract: "Identity is always
+///        implicitly acceptable and need not be listed", because a peer that can speak
+///        this protocol at all can read uncompressed bytes. A build with compression
+///        configured out sends exactly this.
 /// @param ownCodecs What this end can produce -- `AvailableCodecs()` for a client,
 ///        and for a worker the list it registered with the scheduler, which is what
 ///        the grant relayed to the client in the first place. A list WIDER than the

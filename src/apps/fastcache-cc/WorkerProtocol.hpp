@@ -143,7 +143,13 @@ class WorkerRegistrar
     ///        derive one from `capacity`. Zero is what a node should normally send:
     ///        deriving it here would put a workstation's core reserve in every
     ///        worker rather than in the one place that can be checked.
-    /// @param acceptedCodecs What this worker can decode.
+    /// @param acceptedCodecs What this worker can produce and decode — the SAME list
+    ///        its `WorkerProtocol` is constructed with, normally `AvailableCodecs()`.
+    ///        One list, one negotiation: the scheduler files this against the worker
+    ///        and the grant relays it to clients, so it governs what a client
+    ///        compresses its source with just as the protocol's copy governs what the
+    ///        object comes back in. Two spellings here is how a node comes to advertise
+    ///        something it does not answer in.
     /// @param capacity What this machine is, for the scheduler to size it by.
     WorkerRegistrar(std::string fingerprint,
                     std::string endpoint,

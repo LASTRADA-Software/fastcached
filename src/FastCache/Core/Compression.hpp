@@ -21,6 +21,14 @@ namespace FastCache
 /// the on-disk contract: **never renumber or reuse an id**. Adding a codec
 /// means appending a new id and a matching descriptor row in Compression.cpp.
 ///
+/// **And one place outside this file**: `Cc::AvailableCodecs` in
+/// `apps/fastcache-cc/CodecEnvelope.cpp` keeps its own list of the non-Identity
+/// codecs, because this class exposes no way to enumerate the table — a codec
+/// missing from it is never advertised and never negotiated by the compile fleet,
+/// with the build green and every test passing. `AvailableCodecsCoverEveryCodec`
+/// in `WorkerProtocol_test.cpp` fails when that happens; a public enumeration here
+/// would remove the need for it.
+///
 /// `Identity` is always available — even in a build configured with
 /// `FASTCACHED_ENABLE_COMPRESSION=OFF` — and stores the value verbatim. It is
 /// also the shrink-check fallback: a value that does not get smaller when

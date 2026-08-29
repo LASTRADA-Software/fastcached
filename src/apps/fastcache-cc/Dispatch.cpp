@@ -68,9 +68,17 @@ namespace
         std::string_view leaseToken;     ///< What authorizes the job there.
         Wire::CodecList const& codecs;   ///< What that worker can decode.
         Wire::CodecList const& accepted; ///< What this client can decode.
-        Credential const& credential;    ///< Presented to the worker.
-        DispatchRequest const& request;  ///< The job itself.
-        ExchangeBudget budget;           ///< How long the compile may take.
+        /// What this client can PRODUCE — what the source is compressed with.
+        ///
+        /// Deliberately not `accepted`, though the two hold the same value today.
+        /// `accepted` is a decode capability and a caller may legitimately narrow it;
+        /// narrowing what this client can *read* must not narrow what it can *write*,
+        /// because the client never decodes its own source — the worker does. Folding
+        /// the two together is the same conflation of two codec lists that #265 was.
+        Wire::CodecList const& own;
+        Credential const& credential;   ///< Presented to the worker.
+        DispatchRequest const& request; ///< The job itself.
+        ExchangeBudget budget;          ///< How long the compile may take.
         /// Ceiling on the object the worker may declare it is sending back.
         ///
         /// The launcher dialled a worker the SCHEDULER named, which is not the same
@@ -95,7 +103,7 @@ namespace
         // against this client's. The two need not agree, and guessing wrong would
         // only be discovered after the whole preprocessed payload had crossed the
         // network.
-        auto const sourceField = Envelope(Wire::AsBytes(job.request.preprocessed), job.codecs, AvailableCodecs());
+        auto const sourceField = Envelope(Wire::AsBytes(job.request.preprocessed), job.codecs, job.own);
 
         // Not `const`: the frame carries a whole preprocessed translation unit, so it
         // is MOVED into the exchange rather than copied on the hot path of a build.
@@ -203,7 +211,11 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                         Credential const& credential,
                         Wire::CodecList const& acceptedCodecs)
 {
-    auto const accepted = acceptedCodecs.empty() ? AvailableCodecs() : acceptedCodecs;
+    // Derived ONCE. `available` is what this build can produce; `accepted` is what
+    // this client will read back, which a caller may narrow and which therefore is
+    // not the same question -- see `LeasedJob::own`.
+    auto const available = AvailableCodecs();
+    auto const& accepted = acceptedCodecs.empty() ? available : acceptedCodecs;
 
     // --- ask the scheduler where to compile ---------------------------------
     auto leaseFrame = Wire::EncodeLease(
@@ -239,6 +251,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                                               .leaseToken = token,
                                               .codecs = grant->workerCodecs,
                                               .accepted = accepted,
+                                              .own = available,
                                               .credential = credential,
                                               .request = request,
                                               .budget = budgets.compile,

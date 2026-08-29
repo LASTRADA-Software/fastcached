@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
+#include "CodecEnvelope.hpp"
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
@@ -232,14 +233,8 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // the same function the client wrapped its source with: the two directions are one
     // negotiation, and a second implementation of the choice is how they come to
     // disagree.
-    //
-    // That second implementation was here, and was wrong in both halves at once (#265).
-    // `ChooseCodec` was handed `_acceptedCodecs` on BOTH sides -- this worker's list
-    // against itself, so the client's was never consulted -- and the answer was then
-    // discarded and the envelope hard-coded to `Identity`. Each defect hid the other,
-    // and the node's own literal `{ IdentityCodec }` hid both: every dispatched object
-    // crossed the network uncompressed, on the hot path of a parallel build, and
-    // nothing reported it, because an uncompressed envelope is a CORRECT envelope.
+    // (This call site was that second implementation; #265 and `Envelope`'s own doc
+    // carry the history.)
     auto const enveloped = Envelope(outcome->object, fields->acceptedCodecs, _acceptedCodecs);
 
     return Wire::EncodeReply(

@@ -3,6 +3,8 @@
 #include "StubObjectTestSupport.hpp"
 #include "WorkerProtocol.hpp"
 
+#include <FastCache/Core/Compression.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <format>
 #include <fstream>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -148,16 +151,30 @@ struct ObjectField
     std::vector<std::byte> bytes;               ///< The object as it travelled.
 };
 
-/// Decode the object field of a reply that must be a successful compile.
+/// The still-enveloped object field of a reply that must be a successful compile.
+///
+/// The shared prefix of every codec assertion below, so the `Ok`-status +
+/// `DecodeCompileResult` chain exists once. A case that hand-rolled it dropped the
+/// status check and would have passed against an error reply.
 /// @param frame The whole reply frame.
-/// @return Its object field.
-[[nodiscard]] ObjectField ObjectOf(std::vector<std::byte> const& frame)
+/// @return The object field, owned, exactly as it travelled.
+[[nodiscard]] std::vector<std::byte> FieldOf(std::vector<std::byte> const& frame)
 {
     auto const reply = Decode(frame);
     REQUIRE(reply.status == Wire::Status::Ok);
     auto const result = Wire::DecodeCompileResult(reply.payload);
     REQUIRE(result.has_value());
-    auto const envelope = Wire::DecodeCodecEnvelope(Unwrap(result).object);
+    auto const field = Unwrap(result).object;
+    return { field.begin(), field.end() };
+}
+
+/// Decode the object field of a reply that must be a successful compile.
+/// @param frame The whole reply frame.
+/// @return Its object field.
+[[nodiscard]] ObjectField ObjectOf(std::vector<std::byte> const& frame)
+{
+    auto const field = FieldOf(frame);
+    auto const envelope = Wire::DecodeCodecEnvelope(field);
     REQUIRE(envelope.has_value());
     return ObjectField { .codec = Unwrap(envelope).codec,
                          .rawLength = Unwrap(envelope).rawLength,
@@ -558,6 +575,18 @@ namespace
     return object;
 }
 
+/// A well-formed COMPILE frame that varies only in what the client accepts.
+///
+/// Every case below cares about the third parameter and nothing else, and spelling
+/// the first two positionally made `CompileFrame`'s own defaults dead for this whole
+/// block -- changing them would reach the older cases and not these.
+/// @param accepted What the client says it can decode.
+/// @return The frame.
+[[nodiscard]] std::vector<std::byte> FrameAccepting(Wire::CodecList accepted)
+{
+    return CompileFrame("gcc-13", "int main(){return 0;}", std::move(accepted));
+}
+
 /// Whether this build has any codec at all beyond Identity.
 [[nodiscard]] bool CompressionCompiledIn()
 {
@@ -586,7 +615,7 @@ TEST_CASE("A compiled object comes back in a codec the client accepts", "[worker
     Fixture fix;
     fix.runner.object = CompressibleObject();
 
-    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}", AvailableCodecs()));
+    auto const answer = fix.worker.Answer(FrameAccepting(AvailableCodecs()));
     REQUIRE(answer.has_value());
     auto const object = ObjectOf(Unwrap(answer));
 
@@ -609,13 +638,10 @@ TEST_CASE("A compressed reply is what the launcher already decodes", "[worker-pr
     Fixture fix;
     fix.runner.object = CompressibleObject();
 
-    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}", AvailableCodecs()));
+    auto const answer = fix.worker.Answer(FrameAccepting(AvailableCodecs()));
     REQUIRE(answer.has_value());
 
-    auto const reply = Decode(Unwrap(answer));
-    auto const result = Wire::DecodeCompileResult(reply.payload);
-    REQUIRE(result.has_value());
-    auto const decoded = Unenvelope(Unwrap(result).object, DefaultMaxDecompressedBytes);
+    auto const decoded = Unenvelope(FieldOf(Unwrap(answer)), DefaultMaxDecompressedBytes);
     REQUIRE(decoded.has_value());
     bool const identical = Wire::AsStringView(decoded.value()) == fix.runner.object;
     CHECK(identical);
@@ -629,7 +655,7 @@ TEST_CASE("A client that accepts only Identity is answered in Identity", "[worke
     Fixture fix;
     fix.runner.object = CompressibleObject();
 
-    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}", { Wire::IdentityCodec }));
+    auto const answer = fix.worker.Answer(FrameAccepting({ Wire::IdentityCodec }));
     REQUIRE(answer.has_value());
     auto const object = ObjectOf(Unwrap(answer));
 
@@ -646,7 +672,7 @@ TEST_CASE("A worker offering no codec answers in Identity however the client ask
     Fixture fix { Wire::CodecList { Wire::IdentityCodec } };
     fix.runner.object = CompressibleObject();
 
-    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}", AvailableCodecs()));
+    auto const answer = fix.worker.Answer(FrameAccepting(AvailableCodecs()));
     REQUIRE(answer.has_value());
     auto const object = ObjectOf(Unwrap(answer));
 
@@ -660,10 +686,63 @@ TEST_CASE("An object compression does not shrink is sent verbatim", "[worker-pro
     // object gets no smaller, and a client should not pay a decompress to learn it.
     Fixture fix;
 
-    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}", AvailableCodecs()));
+    auto const answer = fix.worker.Answer(FrameAccepting(AvailableCodecs()));
     REQUIRE(answer.has_value());
     auto const object = ObjectOf(Unwrap(answer));
 
     CHECK(object.codec == Wire::IdentityCodec);
-    CHECK(Wire::AsStringView(object.bytes) == "OBJECT");
+    CHECK(CarriesVerbatim(object, "OBJECT"));
+}
+
+TEST_CASE("A codec both ends name but this build cannot produce falls back to Identity", "[worker-protocol][codec]")
+{
+    // `WorkerProtocol.hpp`'s stated contract: a worker built with a list WIDER than
+    // this build can encode answers Identity rather than a codec it cannot produce.
+    // `ChooseCodec` promises only that the choice is in the sender's own list, and
+    // that list is injected, so the two can legitimately diverge.
+    //
+    // What this does NOT do, said plainly because the obvious reading is wrong: it
+    // does not hold `Envelope`'s `IsAvailable` guard in place. Delete that guard and
+    // this case still passes -- `Compression::Compress` hands back a verbatim copy for
+    // a codec it cannot find, the shrink check rejects it, and the answer is Identity
+    // by a longer route. The guard is there to skip that copy, and the copy is not
+    // observable from here. Checked by deleting it rather than assumed.
+    constexpr std::uint8_t noSuchCodec = 200;
+    Fixture fix { Wire::CodecList { noSuchCodec, Wire::IdentityCodec } };
+    fix.runner.object = CompressibleObject();
+
+    auto const answer = fix.worker.Answer(FrameAccepting({ noSuchCodec, Wire::IdentityCodec }));
+    REQUIRE(answer.has_value());
+    auto const object = ObjectOf(Unwrap(answer));
+
+    CHECK(object.codec == Wire::IdentityCodec);
+    CHECK(CarriesVerbatim(object, fix.runner.object));
+}
+
+TEST_CASE("AvailableCodecsCoverEveryCodec", "[worker-protocol][codec]")
+{
+    // `AvailableCodecs` keeps a hand-written list of the non-Identity codecs, because
+    // `Compression` exposes no way to enumerate its descriptor table. A codec added
+    // there and forgotten here is never advertised and never negotiated -- in either
+    // direction, by either end -- while the build stays green and every other case
+    // here passes, since they assert `codec != Identity` rather than which codec.
+    // That is #265's failure shape exactly, so it gets a test rather than a comment.
+    //
+    // `NameList()` is the one public door onto that table: it iterates the same rows
+    // and joins their names. Reading the inventory back out through it is what makes
+    // the omission loud.
+    auto const advertised = AvailableCodecs();
+    auto const names = Compression::NameList();
+
+    for (auto const name: std::views::split(names, std::string_view { ", " }))
+    {
+        auto const codec = Compression::CodecFromName(std::string_view { name.begin(), name.end() });
+        REQUIRE(codec.has_value());
+        if (!Compression::IsAvailable(Unwrap(codec)))
+            continue; // compiled out of this build; correctly absent from the wire list
+
+        auto const id = static_cast<std::uint8_t>(Unwrap(codec));
+        INFO("codec " << Compression::NameOf(Unwrap(codec)) << " is compiled in but not advertised");
+        CHECK(std::ranges::find(advertised, id) != advertised.end());
+    }
 }
