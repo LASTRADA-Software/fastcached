@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
-#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -182,74 +183,55 @@ namespace detail
         AppendU64(out, id.seq);
     }
 
-    /// Cursor over a byte span with bounds-checked big-endian reads. Each read
-    /// returns false and leaves `ok` false once the buffer is exhausted, so the
-    /// decoder can bail on a single truncation check at the end.
-    struct Reader
+    /// Read a stream id: two big-endian `u64`s, as `AppendId` writes them.
+    /// @param cursor The cursor to read from.
+    /// @param out Receives the id.
+    /// @return True on success; false leaves the cursor failed.
+    [[nodiscard]] inline bool ReadId(ByteCursor& cursor, StreamId& out)
     {
-        std::span<std::byte const> blob;
-        std::size_t offset { 0 };
-        bool ok { true };
-
-        /// Bytes still unread. Used to clamp count-driven `reserve()` calls so a
-        /// corrupt blob claiming a huge element count cannot trigger a giant
-        /// allocation before the per-element reads fail on the missing bytes.
-        /// @return Number of remaining bytes (0 once exhausted).
-        [[nodiscard]] std::size_t Remaining() const noexcept
-        {
-            return offset < blob.size() ? blob.size() - offset : 0;
-        }
-
-        [[nodiscard]] bool ReadU32(std::uint32_t& out)
-        {
-            if (!ok || offset + 4 > blob.size())
-                return ok = false;
-            out = ReadBigEndian<std::uint32_t>(blob.subspan(offset));
-            offset += 4;
-            return true;
-        }
-
-        [[nodiscard]] bool ReadU64(std::uint64_t& out)
-        {
-            if (!ok || offset + 8 > blob.size())
-                return ok = false;
-            out = ReadBigEndian<std::uint64_t>(blob.subspan(offset));
-            offset += 8;
-            return true;
-        }
-
-        [[nodiscard]] bool ReadId(StreamId& out)
-        {
-            return ReadU64(out.ms) && ReadU64(out.seq);
-        }
-
-        [[nodiscard]] bool ReadString(std::string& out)
-        {
-            std::uint32_t len = 0;
-            if (!ReadU32(len))
-                return false;
-            if (offset + len > blob.size())
-                return ok = false;
-            out.assign(reinterpret_cast<char const*>(blob.data() + offset), len);
-            offset += len;
-            return true;
-        }
-    };
-
-    /// Reserve capacity for `count` elements in `vec`, but never more than `cap`
-    /// (the bytes left in the blob — every element costs at least one byte, so a
-    /// count exceeding the remaining bytes is necessarily corrupt). This keeps a
-    /// truncated/corrupt blob with a huge count field from triggering a multi-GB
-    /// allocation; the per-element reads that follow then fail cleanly on the
-    /// missing bytes and `Decode` returns false.
-    /// @param vec   The vector to reserve into.
-    /// @param count The (untrusted) element count read from the blob.
-    /// @param cap   Upper bound on the reservation (remaining blob bytes).
-    template <typename T>
-    inline void BoundedReserve(std::vector<T>& vec, std::uint32_t count, std::size_t cap)
-    {
-        vec.reserve(std::min<std::size_t>(count, cap));
+        return cursor.ReadU64(out.ms) && cursor.ReadU64(out.seq);
     }
+
+    // The five constants below are the fewest blob bytes one element of each counted
+    // run can occupy, read off `Encode` below -- which is what fixes them -- and pinned
+    // to it by tests that encode one empty element and measure the difference. Spelled
+    // as a plain comment rather than `///` because it belongs to the group and not to
+    // whichever constant happens to come first.
+    //
+    // **Security bounds, not sizing hints.** Each must be a true LOWER bound on its
+    // element's wire cost, because `ByteCursor::ReadCount` refuses a count the
+    // remaining bytes cannot supply and an over-estimate would refuse honest data.
+    // They therefore under-estimate for typical data -- that is what makes them
+    // correct. Nothing here sizes an allocation from them.
+    //
+    // `BoundedReserve` used to assume ONE byte per element for all five, which made
+    // its bound around twenty times too loose for an entry and nine times for a
+    // group, on top of clamping where it should have refused (issue #269).
+
+    /// The bytes a stream id occupies: `AppendId` writes two `u64`s.
+    constexpr std::size_t IdBytes = 2 * sizeof(std::uint64_t);
+
+    /// The bytes a count field occupies. Distinct from `WireFields::FieldPrefixSize`
+    /// even though both are four: a count is not a length prefix, and spelling them
+    /// apart is what keeps each minimum readable against `Encode`.
+    constexpr std::size_t CountBytes = sizeof(std::uint32_t);
+
+    /// A stream entry: its id, then its field count.
+    constexpr std::size_t MinEntryBytes = IdBytes + CountBytes;
+
+    /// One field of an entry: two length-prefixed strings, both empty.
+    constexpr std::size_t MinFieldBytes = 2 * WireFields::FieldPrefixSize;
+
+    /// A consumer group: an empty name, its last-delivered id, its entries-read
+    /// counter, then the consumer and pending-entry counts.
+    constexpr std::size_t MinGroupBytes = WireFields::FieldPrefixSize + IdBytes + sizeof(std::uint64_t) + (2 * CountBytes);
+
+    /// A consumer: one length-prefixed name, empty.
+    constexpr std::size_t MinConsumerBytes = WireFields::FieldPrefixSize;
+
+    /// A pending entry: its id, delivery time and delivery count, then an empty
+    /// consumer name.
+    constexpr std::size_t MinPendingBytes = IdBytes + (2 * sizeof(std::uint64_t)) + WireFields::FieldPrefixSize;
 
 } // namespace detail
 
@@ -305,67 +287,62 @@ namespace detail
     out = Stream {};
     if (blob.size() < 2 || blob[0] != Magic || blob[1] != TypeStream)
         return false;
-    detail::Reader r { .blob = blob, .offset = 2 };
-    if (!r.ReadId(out.lastId) || !r.ReadId(out.maxDeletedId) || !r.ReadU64(out.entriesAdded))
+    ByteCursor r { blob, /*offset=*/2 };
+    if (!detail::ReadId(r, out.lastId) || !detail::ReadId(r, out.maxDeletedId) || !r.ReadU64(out.entriesAdded))
         return false;
     std::uint32_t entryCount = 0;
-    if (!r.ReadU32(entryCount))
+    if (!r.ReadCount(entryCount, detail::MinEntryBytes))
         return false;
-    detail::BoundedReserve(out.entries, entryCount, r.Remaining());
     for (auto i = std::uint32_t { 0 }; i < entryCount; ++i)
     {
         StreamEntry entry;
-        if (!r.ReadId(entry.id))
+        if (!detail::ReadId(r, entry.id))
             return false;
         std::uint32_t fieldCount = 0;
-        if (!r.ReadU32(fieldCount))
+        if (!r.ReadCount(fieldCount, detail::MinFieldBytes))
             return false;
-        detail::BoundedReserve(entry.fields, fieldCount, r.Remaining());
         for (auto f = std::uint32_t { 0 }; f < fieldCount; ++f)
         {
             std::string name;
             std::string value;
-            if (!r.ReadString(name) || !r.ReadString(value))
+            if (!r.ReadField(name) || !r.ReadField(value))
                 return false;
             entry.fields.emplace_back(std::move(name), std::move(value));
         }
         out.entries.push_back(std::move(entry));
     }
     std::uint32_t groupCount = 0;
-    if (!r.ReadU32(groupCount))
+    if (!r.ReadCount(groupCount, detail::MinGroupBytes))
         return false;
-    detail::BoundedReserve(out.groups, groupCount, r.Remaining());
     for (auto g = std::uint32_t { 0 }; g < groupCount; ++g)
     {
         ConsumerGroup group;
-        if (!r.ReadString(group.name) || !r.ReadId(group.lastDelivered) || !r.ReadU64(group.entriesRead))
+        if (!r.ReadField(group.name) || !detail::ReadId(r, group.lastDelivered) || !r.ReadU64(group.entriesRead))
             return false;
         std::uint32_t consumerCount = 0;
-        if (!r.ReadU32(consumerCount))
+        if (!r.ReadCount(consumerCount, detail::MinConsumerBytes))
             return false;
-        detail::BoundedReserve(group.consumers, consumerCount, r.Remaining());
         for (auto c = std::uint32_t { 0 }; c < consumerCount; ++c)
         {
             std::string consumer;
-            if (!r.ReadString(consumer))
+            if (!r.ReadField(consumer))
                 return false;
             group.consumers.push_back(std::move(consumer));
         }
         std::uint32_t pelCount = 0;
-        if (!r.ReadU32(pelCount))
+        if (!r.ReadCount(pelCount, detail::MinPendingBytes))
             return false;
-        detail::BoundedReserve(group.pel, pelCount, r.Remaining());
         for (auto p = std::uint32_t { 0 }; p < pelCount; ++p)
         {
             PendingEntry pending;
-            if (!r.ReadId(pending.id) || !r.ReadU64(pending.deliveryTimeMs) || !r.ReadU64(pending.deliveryCount)
-                || !r.ReadString(pending.consumer))
+            if (!detail::ReadId(r, pending.id) || !r.ReadU64(pending.deliveryTimeMs) || !r.ReadU64(pending.deliveryCount)
+                || !r.ReadField(pending.consumer))
                 return false;
             group.pel.push_back(std::move(pending));
         }
         out.groups.push_back(std::move(group));
     }
-    return r.ok;
+    return r.Ok();
 }
 
 /// Parse an unsigned 64-bit decimal from `text`.

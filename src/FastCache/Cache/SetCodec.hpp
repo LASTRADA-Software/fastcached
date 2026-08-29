@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -40,7 +41,9 @@ constexpr std::uint32_t FcTypeSet = 0x5E700001U; // "SET" + version nibble.
 
 constexpr std::byte Magic { 0xFC };
 constexpr std::byte TypeSet { 0x01 };
-constexpr std::size_t HeaderSize = 1 + 1 + WireFields::FieldPrefixSize; // magic, type, count.
+/// Magic and type bytes, before the count field.
+constexpr std::size_t TagBytes = 2;
+constexpr std::size_t HeaderSize = TagBytes + WireFields::FieldPrefixSize; // magic, type, count.
 
 /// The fewest blob bytes one encoded member can occupy: its length prefix, with an
 /// empty member.
@@ -103,19 +106,21 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     out.clear();
     if (blob.size() < HeaderSize || blob[0] != Magic || blob[1] != TypeSet)
         return false;
-    auto const count = ReadBigEndian<std::uint32_t>(blob.subspan(2));
-    auto const remaining = blob.size() - HeaderSize;
 
     // The count is a CLAIM about bytes this blob must already carry, checked before
-    // anything is sized from it -- `WireFields::DeclaredCountFits`, the guard issue
-    // #267 generalised. Unguarded, this reserved straight from the `u32`.
+    // anything is sized from it. `ByteCursor::ReadCount` is where that check lives now
+    // and it takes the bound as an argument with no default, so the guard cannot be
+    // skipped by a decoder that forgets it exists (#272). Unguarded, this reserved
+    // straight from the `u32`.
     //
     // These bytes are a CLIENT's, which is the part that is not obvious from here: a
     // set is an ordinary value distinguished only by its `flags` word, and the
     // memcached text verbs let a client choose that word. The worked attack -- plant
     // six bytes over memcached, read them back with SMEMBERS -- is spelled out and
     // executed by `SetCodec_test.cpp`, which is where it stays correct.
-    if (!WireFields::DeclaredCountFits(count, MinMemberBytes, remaining))
+    ByteCursor cursor { blob, TagBytes };
+    std::uint32_t count = 0;
+    if (!cursor.ReadCount(count, MinMemberBytes))
         return false;
 
     // NOT reserved, and that is deliberate -- but the reason is narrower than "it
@@ -124,29 +129,19 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     // first member's length swallows the rest, so the walk below fails on member one.
     // `reserve(count)` would have committed `count * sizeof(std::string)` -- 8x the
     // blob, since a member is 32 bytes in memory against 4 on the wire -- before
-    // discovering that. Growing through `emplace_back` commits only what the blob
+    // discovering that. Growing through `push_back` commits only what the blob
     // actually supplied, which is what a truncated claim deserves.
     //
     // It does NOT bound a WELL-FORMED blob of many empty members: that really does
     // decode to `count` strings and reach the same 8x, with or without a reserve. The
     // ceiling there is the value size the storage tier accepted, not this loop, and
     // capping the member count is a separate decision from validating the claim.
-    std::size_t offset = HeaderSize;
     for (auto i = std::uint32_t { 0 }; i < count; ++i)
     {
-        // Spelled as a subtraction from the size, never `offset + len > size`: `len`
-        // is a peer's `u32` and the additive form wraps wherever `std::size_t` is
-        // 32-bit, turning the bounds check into a pass on exactly the values it
-        // exists to refuse. This is `WireFields::Detail::SplitUpTo`'s spelling, which
-        // is the same walk over the same grammar.
-        if (blob.size() - offset < WireFields::FieldPrefixSize)
+        std::string member;
+        if (!cursor.ReadField(member))
             return false;
-        auto const len = ReadBigEndian<std::uint32_t>(blob.subspan(offset));
-        offset += WireFields::FieldPrefixSize;
-        if (blob.size() - offset < len)
-            return false;
-        out.emplace_back(reinterpret_cast<char const*>(blob.data() + offset), len);
-        offset += len;
+        out.push_back(std::move(member));
     }
     return true;
 }

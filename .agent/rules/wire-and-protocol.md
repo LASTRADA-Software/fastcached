@@ -152,14 +152,18 @@ Every rule below has already been a bug.
     **"Only we write these bytes" is a claim to check against every protocol the
     engine serves, never an assumption** — and a shared `CacheEngine` means every
     front end is every other front end's writer.
-    - **`Cache/StreamCodec` is the same door, still on the clamping shape.**
+    - **`Cache/StreamCodec` was the same door, on the clamping shape**
+      ([#269](https://github.com/LASTRADA-Software/fastcached/issues/269), fixed).
       `FcTypeStream` (`0x5E700002`) is the second tag a memcached `set` can choose, and
-      its six declared counts go through `detail::BoundedReserve`, which is
-      `reserve(min(count, remaining))` — the variant this rule's own header argues
+      its **five** declared counts went through `detail::BoundedReserve` —
+      `reserve(min(count, remaining))`, the variant this rule's own header argues
       against, because it keeps a provably malformed blob alive and still commits
-      `remaining * sizeof(element)`. Tracked by
-      [#269](https://github.com/LASTRADA-Software/fastcached/issues/269); the fix is
-      `DeclaredCountFits` at each of the six, not a tighter clamp.
+      `remaining * sizeof(element)`. It carried a second defect the clamp hid: it
+      assumed **one byte per element** for all five, where the format's true minimums
+      are 20, 8, 36, 4 and 36 — so forty trailing bytes bought forty reservations where
+      the grammar permits two and one. A clamp is not merely a weaker refusal; it
+      *disguises* a bound nobody checked. `BoundedReserve` was **deleted, not
+      tightened**.
   - **It lives in `Core/WireFields.hpp` beside `FieldPrefixSize`**, which is usually the
     answer to its `minBytesEach`, and which that header already argues must stay
     header-only and dependency-free because `fastcache-cc` compiles it in *without
@@ -168,9 +172,41 @@ Every rule below has already been a bug.
     grammar and will grow the next declared count.
   - **It refuses; it does not clamp.** `reserve(min(count, cap))` keeps a provably
     malformed frame alive and merely makes its allocation smaller, so the decode fails
-    later having already committed memory. `Cache/StreamCodec`'s `BoundedReserve` is
-    that weaker shape *and* assumes one byte per element, so at its five sites a blob
-    with ten bytes left and a `0xFFFFFFFF` count still reserves ten `StreamEntry`.
+    later having already committed memory. `Cache/StreamCodec`'s `BoundedReserve` was
+    that weaker shape *and* assumed one byte per element, at all five of its counts
+    ([#269](https://github.com/LASTRADA-Software/fastcached/issues/269)). Both halves
+    mattered: forty trailing bytes bought forty reserved elements where the format can
+    hold at most two, and the *entry* minimum is twenty. It is deleted, not tightened
+    — a second, weaker mechanism beside the guard is how a decoder ends up reaching for
+    the wrong one.
+  - **A test that only asserts the refusal does not test this.** All five StreamCodec
+    sites returned `false` before the fix too: the clamped reserve happened and *then*
+    the loop failed on bytes that were never there. What separates refusing from
+    reserving-then-failing is whether the reservation happened, so the case asserts
+    `capacity() == 0` on the vectors the caller owns — and it needs trailing bytes to
+    do it, because with none the old clamp bounded to zero and looked correct.
+  - **The bound is an argument you cannot omit, because remembering it does not scale.**
+    Three of these were counts read by hand in a decoder whose author had correctly
+    bounds-checked the *length* fields a few lines away — nothing about `ReadU32` says a
+    count is different. So `Core/ByteCursor::ReadCount(out, minBytesEach)` obtains a
+    count and takes the bound as an argument with no default, which it will never get
+    ([#272](https://github.com/LASTRADA-Software/fastcached/issues/272)). Same reasoning
+    as putting a payload ceiling in the verb table rather than at each consumer.
+    **It is not yet the only way to obtain a count, so do not read this as an
+    invariant.** `Cache/StreamCodec` and `Cache/SetCodec` go through it; `CompileValue`,
+    `PrefetchGroupManifest` and `DirectManifest` still hand-roll a cursor and guard the
+    count beside it. Those three carry the guard already, so the remaining conversion is
+    a refactor with no security delta and is tracked separately by
+    [#304](https://github.com/LASTRADA-Software/fastcached/issues/304) — deliberately
+    not ridden along with a security fix. Until it lands, a new decoder uses
+    `ByteCursor`; an old one is not evidence that hand-rolling is still sanctioned.
+  - **A per-element minimum is a security bound, not a sizing hint** — the distinction a
+    later caller will get wrong. It must be a true *lower* bound or honest data is
+    refused, so it always under-estimates the count for typical data; that is what makes
+    it correct, not what makes it improvable. Sizing an allocation from it is the mistake
+    it invites, and on `SetCodec` a clamp derived that way *raised* peak memory on real
+    input while claiming to bound it. Each minimum is pinned to its own encoder by a test
+    that encodes one empty element and subtracts.
   - **Divide, never multiply.** `count <= remaining / minBytesEach`, because
     `count * minBytesEach` is the overflowing spelling and wraps on exactly the values
     the check exists to refuse.

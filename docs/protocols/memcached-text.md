@@ -45,10 +45,13 @@ verbatim and returns on `get`.
 
     That is not a privilege boundary and never was one: it is the same key space,
     reached by two front ends. It is called out because the value under such a key is
-    parsed rather than echoed, so it is subject to the decoder's validation — for a
-    set, a blob declaring more members than its bytes can supply is refused, and the
-    set verb answers `-ERR storage failure` rather than the daemon attempting the
-    allocation ([#271](https://github.com/LASTRADA-Software/fastcached/issues/271)).
+    parsed rather than echoed, so it is subject to the decoder's validation. A blob
+    declaring more elements than its bytes can supply is refused, and the verb answers
+    `-ERR storage failure` rather than the daemon attempting the allocation — for a
+    set's member count
+    ([#271](https://github.com/LASTRADA-Software/fastcached/issues/271)) and for each of
+    a stream's five counts, which previously clamped the reservation instead of
+    refusing it ([#269](https://github.com/LASTRADA-Software/fastcached/issues/269)).
 
     Every other flags value is stored and returned untouched.
 
