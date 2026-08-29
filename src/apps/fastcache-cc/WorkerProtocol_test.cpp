@@ -183,6 +183,34 @@ struct ObjectField
                          .bytes = { Unwrap(envelope).bytes.begin(), Unwrap(envelope).bytes.end() } };
 }
 
+/// Every envelope-refusal counter, read back in `EnvelopeError` order.
+///
+/// Derived from the enum rather than listed, for the reason the table case below
+/// records: three cases here each spelled out "and the others are zero" by hand and
+/// each spelled a DIFFERENT subset, so between them they left two of the four
+/// unchecked on some paths. A fifth reason is now checked by every one of them the
+/// moment it exists.
+/// @param metrics The fixture's sink.
+/// @return One count per reason, in enumerator order.
+[[nodiscard]] std::vector<std::uint64_t> EnvelopeCounts(AtomicMetricsSink const& metrics)
+{
+    std::vector<std::uint64_t> counts;
+    for (auto const index: std::views::iota(std::size_t { 0 }, EnumeratorCount<EnvelopeError>))
+        counts.push_back(metrics.Read(CounterFor(static_cast<EnvelopeError>(index))));
+    return counts;
+}
+
+/// The counts a case expects: one for each reason named, zero for every other.
+/// @param raised The reasons this case expects to have fired exactly once.
+/// @return The expected vector, in enumerator order.
+[[nodiscard]] std::vector<std::uint64_t> OnlyRaised(std::initializer_list<EnvelopeError> raised)
+{
+    std::vector<std::uint64_t> expected(EnumeratorCount<EnvelopeError>, 0U);
+    for (auto const reason: raised)
+        expected[static_cast<std::size_t>(reason)] = 1U;
+    return expected;
+}
+
 } // namespace
 
 TEST_CASE("A worker compiles a well-formed job", "[worker-protocol]")
@@ -267,10 +295,7 @@ TEST_CASE("A codec envelope declaring more than the cap is refused before it is 
     // talking to. Counted under its own reason, not a shared `bad_envelope`, because
     // "somebody is declaring 4 GiB at my compile port" is not the same page as "two
     // of my machines were packaged with different codecs".
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 0);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec) == 0);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeCorrupt) == 0);
+    CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::DeclaredTooLarge }));
 }
 
 TEST_CASE("An Identity envelope may not lie about the size of the bytes beside it", "[worker-protocol]")
@@ -313,8 +338,7 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
     // do not. `MalformedFrame` is all the peer can act on either way, while an
     // operator seeing the second rise is looking at a version skew and the first at
     // somebody sizing a request past the cap.
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 1);
+    CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::DeclaredTooLarge, EnvelopeError::Malformed }));
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
 }
 
@@ -444,8 +468,7 @@ TEST_CASE("A source in an undecodable codec is refused, not compiled as garbage"
     // Its own counter, and the only envelope refusal that is nobody's fault: two
     // honest processes packaged differently. An operator reading a rise here goes to
     // the build of the two binaries, not to the network and not to the firewall.
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeUnsupportedCodec) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed) == 0);
+    CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::UnsupportedCodec }));
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
 }
 

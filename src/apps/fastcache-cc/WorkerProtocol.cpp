@@ -196,8 +196,9 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         // too and has no sink -- and a refusal answered on the wire while nothing
         // rises is how a port being probed with envelope bombs looked, on
         // `/metrics`, exactly like a port nobody was talking to.
-        _metrics.Increment(CounterFor(source.error()));
-        return Wire::EncodeErrorReply(WireCodeFor(source.error()), DescribeEnvelopeError(source.error()));
+        auto const reason = source.error();
+        _metrics.Increment(CounterFor(reason));
+        return Wire::EncodeErrorReply(WireCodeFor(reason), DescribeEnvelopeError(reason));
     }
 
     // Counted around the runner rather than inside it: the runner is a seam with
