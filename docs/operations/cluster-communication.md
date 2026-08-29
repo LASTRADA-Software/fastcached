@@ -182,13 +182,21 @@ port carries **no credential** and loopback is admitted unconditionally — that
 by design, so a single node can talk to itself over loopback — any local process
 could reach the port and, through such an argument, run code as the node's service
 account. The worker therefore vets each argument
-against a **per-driver-family allowlist** of accepted flag shapes — the
-code-generation, language and diagnostic options a distributed compile actually
-carries — and refuses anything else, naming the offending flag. An allowlist
-fails safe: a flag it does not yet recognise costs one local compile (visible as
+against an **allowlist** of accepted flag shapes — the code-generation, language
+and diagnostic options a distributed compile actually carries, per driver family —
+and refuses anything else, naming the offending flag. An allowlist fails safe: a
+flag it does not yet recognise costs one local compile (visible as
 `fastcache_worker_jobs_refused_rejected_argument_total`), where a denylist that
 missed one flag was code execution
 ([#240](https://github.com/LASTRADA-Software/fastcached/issues/240)).
+
+The `-f*` family is spelled out flag by flag rather than admitted as a prefix,
+which is what makes that guarantee hold for future compiler releases:
+`-fmodule-mapper=|program args` makes GCC spawn a subprocess and `-fpass-plugin=`
+is Clang's plugin loader, and neither would have been caught by excluding
+`-fplugin=` from an otherwise-open `-f` prefix. If a build of yours uses a
+code-generation flag the worker does not recognise, it compiles locally and that
+counter rises — report it and the flag gets a row; nothing silently degrades.
 
 It is equally trusted with nothing else. The scratch directory, the object path
 and the working directory are all the worker's own; it re-checks the arguments it

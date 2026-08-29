@@ -66,7 +66,28 @@ enum class JobRefusal : std::uint8_t
 struct JobError
 {
     JobRefusal reason { JobRefusal::UnknownFingerprint }; ///< The reason, as `RefusalTable` keys it.
-    std::string detail;                                   ///< Specifics for the wire; empty when there are none.
+    /// Specifics for the wire; empty when there are none.
+    ///
+    /// **Anything derived from what a client sent must be built by
+    /// `RejectedArgumentNaming`, never assigned here directly.** This string is
+    /// encoded into the reply message and lands in the client's fallback log, so
+    /// forwarding a peer's bytes verbatim would put unbounded, arbitrary content --
+    /// control characters, terminal escapes, megabytes of it -- onto the wire and
+    /// into a log. Detail set at the other refusal sites is this file's own literal
+    /// text and needs no such treatment.
+    std::string detail;
+
+    /// A `RejectedArgument` refusal naming the offending argument.
+    ///
+    /// The one producer of a detail carrying client bytes, so the cap and the
+    /// character rule live here rather than at each future call site that would have
+    /// to remember them. @p argument is truncated and reduced to printable ASCII: it
+    /// is enough to identify a flag, it cannot be a payload, and it is UTF-8 by
+    /// construction — which the fleet requires of text a peer sent, and which a
+    /// verbatim copy of an arbitrary byte string would not be.
+    /// @param argument The argument the allowlist refused, as it arrived.
+    /// @return The refusal.
+    [[nodiscard]] static JobError RejectedArgumentNaming(std::string_view argument);
 
     /// @param error The error.
     /// @param reason The reason to compare against.
@@ -199,7 +220,7 @@ class CompileJobRunner
     std::atomic<std::uint64_t> _nextJob { 1 };
 };
 
-/// Whether `arg` is one this worker will pass to a compiler of family @p family.
+/// Whether `arg` is one this worker will pass to @p driver.
 ///
 /// **An allowlist, not a denylist**, and that inversion is the whole point. The
 /// argument this worker splices into the argv is chosen by the client, the compile
@@ -215,13 +236,23 @@ class CompileJobRunner
 ///
 /// So the accepted set is small, closed and ours: `AllowedArgs` names the flag shapes
 /// a distributed compile legitimately carries — the code-generation, language and
-/// diagnostic options — per driver family, and everything else is refused. A refused
-/// argument costs one local compile; an admitted program-invoking one is code
-/// execution. The failure modes are not comparable, so the default is *refuse*.
+/// diagnostic options — and everything else is refused. A refused argument costs one
+/// local compile; an admitted program-invoking one is code execution. The failure
+/// modes are not comparable, so the default is *refuse*.
 ///
-/// The @p family comes from the worker's OWN configured compiler, never from anything
-/// the client sent — the same rule that decides which program runs at all. A worker
-/// whose compiler classifies to no family accepts no argument, which fails safe.
+/// The `-f` space is **enumerated rather than prefixed**, which is the load-bearing
+/// half: a blanket `-f` prefix with a carve-out for `-fplugin=` reads as an allowlist
+/// and behaves as a denylist, and both `-fmodule-mapper=|program args` (GCC spawns a
+/// subprocess) and `-fpass-plugin=` (Clang's pass-manager loader) escape such a
+/// carve-out. See `AllowedArgs` for which prefixes remain and why each is bounded.
+///
+/// The @p driver is this worker's OWN configured compiler, never anything the client
+/// sent — the same rule that decides which program runs at all. It is a `DriverSpec`
+/// rather than a bare family so the language spellings and the target-pin prefix come
+/// from the driver's own table (`preprocessedInput`, `TargetPinPrefixFor`) instead of
+/// being restated here, where they would drift and silently refuse every dispatched
+/// job. An unclassifiable driver accepts no argument, and `CompileJobRunner::Run`
+/// refuses such a job outright before this is ever asked.
 ///
 /// This is the receiving half of `RemoteCompileArgs`' rule and deliberately stricter:
 /// the client forwards anything without a path separator, the worker forwards only
@@ -229,9 +260,9 @@ class CompileJobRunner
 /// to a local compile — visibly, via `WorkerJobsRefusedRejectedArgument` — rather than
 /// exposing the port.
 /// @param arg One argument from a job.
-/// @param family The driver family of this worker's configured compiler.
+/// @param driver The descriptor for this worker's configured compiler.
 /// @return True when the worker will pass it on.
-[[nodiscard]] bool IsAcceptableJobArgument(std::string_view arg, DriverFamily family);
+[[nodiscard]] bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver);
 
 /// The file name a job's scratch source may be given, sanitized.
 ///

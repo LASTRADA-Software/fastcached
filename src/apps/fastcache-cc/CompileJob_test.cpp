@@ -406,43 +406,62 @@ TEST_CASE("IsAcceptableJobArgument admits the code-generation flags a compile ca
     // are the ordinary code-generation, language and diagnostic options a distributed
     // compile carries once the headers are inlined -- everything that changes the
     // object and nothing that reaches a file or a program.
-    CHECK(IsAcceptableJobArgument("-O2", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-std=c++23", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-g", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-Wall", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-Werror", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-Wno-unused", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-fPIC", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-fno-exceptions", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-DNDEBUG", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-march=native", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-pthread", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-O2", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-std=c++23", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-g", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-Wall", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-Werror", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-Wno-unused", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-fPIC", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-fno-exceptions", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-DNDEBUG", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-march=native", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-pthread", DriverOf(Flavor::Gcc)));
     // The language the client states for a preprocessed input -- `-x` and its value,
     // which arrive as two separate arguments.
-    CHECK(IsAcceptableJobArgument("-x", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("c++-cpp-output", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-x", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("c++-cpp-output", DriverOf(Flavor::Gcc)));
 
-    CHECK(IsAcceptableJobArgument("/O2", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/std:c++20", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/W4", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/WX", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/EHsc", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/MD", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/Z7", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/DNDEBUG", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/permissive-", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/utf-8", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("/TP", DriverFamily::Msvc));
+    CHECK(IsAcceptableJobArgument("/O2", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/std:c++20", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/W4", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/WX", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/EHsc", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/MD", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/Z7", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/DNDEBUG", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/permissive-", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/utf-8", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/TP", DriverOf(Flavor::Cl)));
 
-    // The target the CLIENT states so this worker cannot pick its own, on BOTH
-    // families: clang-cl (MSVC) is pinned exactly as a GNU clang is. They have to
+    // The target the CLIENT states so this worker cannot pick its own. Read out of
+    // `TargetPinPrefixFor` rather than restated, so it is accepted by exactly the
+    // drivers that are pinned -- both clang drivers -- and by no other. They have to
     // agree about this argument, or every dispatched clang compile becomes a
     // RejectedArgument the moment the pin lands.
-    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-windows-msvc19.51.36252", DriverFamily::Msvc));
-    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-windows-msvc19.51.36252", DriverOf(Flavor::ClangCl)));
+    CHECK(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu", DriverOf(Flavor::Clang)));
+    // `cl` and `gcc` state no target (`TargetPinPrefixFor` is empty for both), so the
+    // pin never reaches them and is not admitted if a client invents one.
+    CHECK_FALSE(IsAcceptableJobArgument("--target=x86_64-pc-linux-gnu", DriverOf(Flavor::Cl)));
+
+    // clang-cl is family Msvc and is routinely handed GNU spellings. Refusing them
+    // would turn every such build into a silent local fallback, which is why a row
+    // stores its spelling WITHOUT an introducer and is matched against the family's
+    // own introducer set -- one row covering `/O2` and `-O2` alike.
+    CHECK(IsAcceptableJobArgument("-O2", DriverOf(Flavor::ClangCl)));
+    CHECK(IsAcceptableJobArgument("-Wall", DriverOf(Flavor::ClangCl)));
+    CHECK(IsAcceptableJobArgument("-fno-exceptions", DriverOf(Flavor::ClangCl)));
+    // And an MSVC driver takes `-` for every option it spells with `/`.
+    CHECK(IsAcceptableJobArgument("-O2", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("-std:c++20", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("-EHsc", DriverOf(Flavor::Cl)));
+    // A GNU driver, by contrast, reads a leading `/` as a path and never as an
+    // option, so an MSVC spelling is not admitted there.
+    CHECK_FALSE(IsAcceptableJobArgument("/O2", DriverOf(Flavor::Gcc)));
 
     // An empty argument names nothing and reaches nothing.
-    CHECK(IsAcceptableJobArgument("", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("", DriverOf(Flavor::Gcc)));
 }
 
 TEST_CASE("IsAcceptableJobArgument refuses everything the allowlist does not name", "[compile-job]")
@@ -450,17 +469,17 @@ TEST_CASE("IsAcceptableJobArgument refuses everything the allowlist does not nam
     // The default is refusal. A path-shaped argument is refused as before, but so is
     // any flag the table does not list -- which is the property the old denylist did
     // not have, and the whole point of the inversion.
-    CHECK_FALSE(IsAcceptableJobArgument("@rsp", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument(R"(-IC:\x)", DriverFamily::Msvc));
-    CHECK_FALSE(IsAcceptableJobArgument("/some/path", DriverFamily::Msvc));
+    CHECK_FALSE(IsAcceptableJobArgument("@rsp", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument(R"(-IC:\x)", DriverOf(Flavor::Cl)));
+    CHECK_FALSE(IsAcceptableJobArgument("/some/path", DriverOf(Flavor::Cl)));
     // Not path-shaped, but not a code-generation flag either -- refused because it is
     // not on the list, not because it looks like a file.
-    CHECK_FALSE(IsAcceptableJobArgument("-isystem", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-nonsense-option", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-isystem", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-nonsense-option", DriverOf(Flavor::Gcc)));
     // A worker whose compiler classifies to no family accepts no non-empty argument,
     // which fails safe.
-    CHECK_FALSE(IsAcceptableJobArgument("-O2", DriverFamily::None));
+    CHECK_FALSE(IsAcceptableJobArgument("-O2", DriverOf(Flavor::Unknown)));
 }
 
 TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denylist admitted", "[compile-job]")
@@ -474,31 +493,103 @@ TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denyli
     // `-wrapper prog,args` was proven against a real gcc to run `prog` around every
     // subprocess; the value below carries no separator, so a shape filter waves it
     // through.
-    CHECK_FALSE(IsAcceptableJobArgument("-wrapper", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("env,sh,-c,touch pwned", DriverFamily::Gnu));
-    // `-fplugin=` loads a shared object into the driver. Denied under the `-f` prefix
-    // that admits ordinary feature flags -- with a bare name that a separator filter
-    // would not catch, and with `-arg-` too.
-    CHECK_FALSE(IsAcceptableJobArgument("-fplugin=evil", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-fplugin-arg-evil-x", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-wrapper", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("env,sh,-c,touch pwned", DriverOf(Flavor::Gcc)));
+    // The `-f` space is ENUMERATED, not prefixed, and these three are why. A blanket
+    // `-f` prefix with a carve-out for `-fplugin` would still admit the other two:
+    // `-fmodule-mapper=|prog` makes GCC spawn a subprocess and `-fpass-plugin=` is
+    // Clang's pass-manager loader, and neither begins with `-fplugin` nor carries a
+    // path separator. Enumeration is what makes the whole class fail closed.
+    CHECK_FALSE(IsAcceptableJobArgument("-fplugin=evil", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-fplugin-arg-evil-x", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-fpass-plugin=evil.so", DriverOf(Flavor::Clang)));
+    CHECK_FALSE(IsAcceptableJobArgument("-fmodule-mapper=|evil", DriverOf(Flavor::Gcc)));
+    // A side-artefact flag is refused off the maintained table rather than a copy of
+    // it, so only the object needing to come back stays one rule.
+    CHECK_FALSE(IsAcceptableJobArgument("-fmodule-output=x.pcm", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("/Ycpch.h", DriverOf(Flavor::Cl)));
+    // Profile options read and write files whose names the driver derives; not listed,
+    // so refused.
+    CHECK_FALSE(IsAcceptableJobArgument("-fprofile-generate", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-fprofile-use=x", DriverOf(Flavor::Gcc)));
+    // `-gsplit-dwarf` writes a `.dwo` beside the object and only the object comes
+    // back, which is why the debug flags are enumerated rather than prefixed on `-g`.
+    CHECK_FALSE(IsAcceptableJobArgument("-gsplit-dwarf", DriverOf(Flavor::Gcc)));
     // `-Wa,`/`-Wl,`/`-Wp,` hand a comma-separated option list to a sub-tool. Denied
     // under the `-W` prefix that admits warnings.
-    CHECK_FALSE(IsAcceptableJobArgument("-Wa,--defsym,x=1", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-Wl,-rpath,x", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-Wp,-D,x", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wa,--defsym,x=1", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wl,-rpath,x", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wp,-D,x", DriverOf(Flavor::Gcc)));
     // The clang plugin loader and the sub-tool option passers -- none is a prefix in
     // the table, so all are refused by default.
-    CHECK_FALSE(IsAcceptableJobArgument("-Xclang", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-load", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-Xassembler", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-specs=evil", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-B", DriverFamily::Gnu));
-    CHECK_FALSE(IsAcceptableJobArgument("-Bstage", DriverFamily::Gnu));
+    CHECK_FALSE(IsAcceptableJobArgument("-Xclang", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-load", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-Xassembler", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-specs=evil", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-B", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument("-Bstage", DriverOf(Flavor::Gcc)));
+    // `-mllvm` forwards its (separate) value into the backend's own option parser.
+    CHECK_FALSE(IsAcceptableJobArgument("-mllvm", DriverOf(Flavor::Clang)));
+    // MSVC's own plugin loader and linker pass-through, refused by absence.
+    CHECK_FALSE(IsAcceptableJobArgument("/analyze:plugin", DriverOf(Flavor::Cl)));
+    CHECK_FALSE(IsAcceptableJobArgument("/link", DriverOf(Flavor::Cl)));
+    // The value-shape rule beneath a prefix: `-W` and `-D` admit a value, and a value
+    // carrying a path separator is refused whatever prefix admitted the flag.
+    CHECK_FALSE(IsAcceptableJobArgument("-DFOO=/etc/passwd", DriverOf(Flavor::Gcc)));
+    CHECK_FALSE(IsAcceptableJobArgument(R"(/DFOO=C:\x)", DriverOf(Flavor::Cl)));
     // The warnings that only LOOK like the sub-tool passers stay accepted, so the
     // Deny rows have not swallowed a real warning.
-    CHECK(IsAcceptableJobArgument("-Wall", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-Wattributes", DriverFamily::Gnu));
-    CHECK(IsAcceptableJobArgument("-Wpedantic", DriverFamily::Gnu));
+    CHECK(IsAcceptableJobArgument("-Wall", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-Wattributes", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-Wpedantic", DriverOf(Flavor::Gcc)));
+}
+
+TEST_CASE("A compiler this worker cannot classify refuses the JOB, not its arguments", "[compile-job]")
+{
+    // Two things go wrong if the fail-safe only gates arguments. The refusal surfaces
+    // as `RejectedArgument`, so an operator watching that counter climb concludes the
+    // fleet's FLAGS are wrong when the answer is this node's `--toolchain` -- and a
+    // refusal's wire code and its counter are meant to be one fact. Worse, a job with
+    // an EMPTY argument list has nothing to refuse, so it would sail past the argument
+    // loop and spawn a driver whose command-line dialect this worker does not know.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "mystery", "/opt/weird/xlc" } } };
+
+    auto job = Job({});
+    job.fingerprint = "mystery";
+    auto const empty = jobs.Run(job);
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error() == JobRefusal::SpawnFailed);
+    CHECK(runner.Argv().empty()); // and nothing was spawned
+
+    // The same answer with arguments present, rather than the argument being blamed.
+    job.args = { "-O2" };
+    auto const withArgs = jobs.Run(job);
+    REQUIRE_FALSE(withArgs.has_value());
+    CHECK(withArgs.error() == JobRefusal::SpawnFailed);
+}
+
+TEST_CASE("A refusal names the offending argument without echoing arbitrary bytes", "[compile-job]")
+{
+    // `detail` is encoded into the reply message and lands in the client's fallback
+    // log, so client-supplied bytes are capped and reduced to printable ASCII where
+    // the refusal is built -- once, rather than at each future producer.
+    auto const control = JobError::RejectedArgumentNaming(std::string { "-W" } + '\x1b' + "[31mred" + '\n');
+    CHECK(control.reason == JobRefusal::RejectedArgument);
+    CHECK(control.detail.contains("-W?[31mred?"));
+    // No control byte survives, so no terminal escape reaches a log.
+    CHECK(std::ranges::none_of(control.detail, [](char c) { return c >= 0 && c < 0x20; }));
+
+    // A long argument is truncated rather than reflected whole.
+    auto const huge = JobError::RejectedArgumentNaming(std::string(4096, 'x'));
+    CHECK(huge.detail.size() < 200);
+    CHECK(huge.detail.contains("..."));
+
+    // A non-ASCII byte becomes `?`, so the message is valid UTF-8 whatever arrived --
+    // which the fleet requires of text a peer sent.
+    auto const invalid = JobError::RejectedArgumentNaming("-W\xff\xfe");
+    CHECK(invalid.detail.contains("-W??"));
 }
 
 TEST_CASE("The output flag follows the worker's own driver family", "[compile-job]")
