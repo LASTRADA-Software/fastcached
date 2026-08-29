@@ -404,13 +404,13 @@ jobs:
   # simply "run everything under TSan".
   #
   # SCOPE, and what it is not. `Async`, `Consensus`, `Distributed` and the node
-  # are where most of the threads are — but not all of them: `Net/` and `Cache/`
-  # spawn threads too, and the one race this gate suppresses (#260) is a `Net/`
-  # class, reached only because the node binary is run whole. This is a first
-  # scope, not a complete one, and saying otherwise is how a job goes green over
-  # code nobody sanitized; widening it is tracked in
-  # `.agent/rules/build-and-toolchain.md` under Open work. Those four map onto
-  # five Catch2 tags —
+  # are where most of the threads are — but not all of them, and the gap has a
+  # sharp edge: `Net/` and `Cache/` spawn threads too, and the one race this job
+  # suppresses (#260) is a `Net/` class. So this gate currently suppresses a known
+  # race in a module it does not scan, reaching it only because the node binary is
+  # run whole — issue #316. This is a first scope, not a complete one, and saying
+  # otherwise is how a job goes green over code nobody sanitized. Those four map
+  # onto five Catch2 tags —
   # `[async]`, `[consensus]`, `[distributed]`, `[reactor]`, `[task]` — plus one
   # binary run whole. The tags are not claimed to be confined to those three
   # directories: three test files elsewhere carry one and are swept in, which is
@@ -461,6 +461,7 @@ jobs:
       # uploads the same archive and the losers discard theirs after paying for
       # it. A third writer makes that worse and buys nothing — the entry is
       # identical whoever saves it, so this job reads and lets clang-tidy save.
+      # The pre-existing two-writer case is issue #318.
       - name: "Cache CPM packages"
         uses: actions/cache/restore@v4
         with:

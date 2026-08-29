@@ -44,10 +44,11 @@
 #   and the file counts as covered, so a new case added to a covered file with an
 #   unselected tag leaves the sanitized scope unnoticed. That is the same shape
 #   as the bug above, one level down, and closing it means parsing each case's
-#   tag string. Tracked in .agent/rules/build-and-toolchain.md's Open work.
+#   tag string -- issue #317.
 # - **That the scope directories are the right ones.** `Net/` and `Cache/` also
-#   spawn threads, and the one race this gate suppresses (#260) is a `Net/`
-#   class, reached only because the node binary is run whole. Also tracked there.
+#   spawn threads, and the one race the gate suppresses (#260) is a `Net/` class:
+#   the gate suppresses a known race in a module it does not scan, and reaches it
+#   only because the node binary is run whole -- issue #316.
 #
 # A tag is matched where Catch2 would see one: directly after the opening `"` of
 # the tag string, or after a preceding `]`. Catch2 also accepts space-separated
