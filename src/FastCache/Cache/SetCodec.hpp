@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,16 @@ constexpr std::uint32_t FcTypeSet = 0x5E700001U; // "SET" + version nibble.
 constexpr std::byte Magic { 0xFC };
 constexpr std::byte TypeSet { 0x01 };
 constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
+
+/// The fewest blob bytes one encoded member can occupy: its length prefix, with an
+/// empty member.
+///
+/// Read off `Encode`'s loop below, which is what fixes it, and pinned against that
+/// encoder by a test that encodes one empty member and measures the difference -- so a
+/// field added there fails a test rather than quietly leaving `Decode`'s guard weaker
+/// than the format it guards. Spelled with `FieldPrefixSize` rather than a literal 4,
+/// which would restate the framing contract beside the one place it is defined.
+constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
 
 /// @param flags The stored entry's flags word.
 /// @return True if the flags tag marks the entry as a set.
@@ -86,7 +97,26 @@ constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
         return false;
     auto const count = ReadBigEndian<std::uint32_t>(blob.subspan(2));
     std::size_t offset = HeaderSize;
-    out.reserve(count);
+
+    // The count is a CLAIM about bytes this blob must already carry, checked before
+    // anything is sized from it -- `WireFields::DeclaredCountFits`, the guard issue
+    // #267 generalised. Unguarded, this reserved straight from the `u32`.
+    //
+    // These bytes are a CLIENT's, which is the part that is not obvious from here. A
+    // set is an ordinary value blob distinguished only by the `flags` word, and the
+    // memcached text verbs let a client choose that word: `set k 1584562177 0 6`
+    // carrying `FC 01 FF FF FF FF` is a six-byte "set" declaring 0xFFFFFFFF members,
+    // and any redis set verb on the same engine then decodes it. That reserved
+    // 0xFFFFFFFF `std::string` -- about 137 GB -- for a plain client with no
+    // privilege, which is why this is the widest-reaching member of the family.
+    if (!WireFields::DeclaredCountFits(count, MinMemberBytes, blob.size() - HeaderSize))
+        return false;
+
+    // Reserved from what the BYTES IN HAND could hold rather than from the count
+    // alone: a validated count is still an amplifier, because a member is 32 bytes in
+    // memory against 4 on the wire. A real set of short members reserves exactly what
+    // it needs, and a minimum-size hostile blob is clamped to its own size.
+    out.reserve(std::min<std::size_t>(count, (blob.size() - HeaderSize) / sizeof(std::string)));
     for (auto i = std::uint32_t { 0 }; i < count; ++i)
     {
         if (offset + 4 > blob.size())

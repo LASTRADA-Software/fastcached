@@ -27,7 +27,24 @@ The 30-day threshold is the memcached convention.
 ## Flags
 
 The `flags` field is a 32-bit opaque integer that the server stores
-verbatim and returns on `get`. fastcached never interprets it.
+verbatim and returns on `get`.
+
+!!! warning "One flags value is not opaque, and a decoder reads the value under it"
+
+    `flags == 0x5E700001` (1584398337) is how a stored value is tagged as a **Redis
+    set** rather than a string — the two share one `CacheEngine`, so a value written
+    by a memcached client is a value a Redis set verb will decode. Setting that word
+    on a `set` means the next `SMEMBERS`, `SCARD` or `SADD` on the key parses your
+    bytes as a set blob.
+
+    That is not a privilege boundary and never was one: it is the same key space,
+    reached by two front ends. It is called out because the value under such a key is
+    parsed rather than echoed, so it is subject to the decoder's validation — a blob
+    declaring more members than its bytes can supply is refused, and the set verb
+    answers `-ERR storage failure` rather than the daemon attempting the allocation
+    ([#271](https://github.com/LASTRADA-Software/fastcached/issues/271)).
+
+    Every other flags value is stored and returned untouched.
 
 ## CAS
 
