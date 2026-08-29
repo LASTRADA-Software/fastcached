@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -282,17 +283,31 @@ struct Fixture
     ~Fixture() = default;
 };
 
+/// A COMPILE frame carrying `source` as its source field, already enveloped.
+///
+/// The envelope belongs to the caller because that is what the budget cases differ
+/// in -- an honest `Identity` one, or one declaring an expansion it does not carry.
+/// Everything around it is boilerplate no case varies.
+/// @param source The source field, exactly as it should travel.
+/// @param fingerprint The toolchain to claim.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> FrameWithSource(std::span<std::byte const> source,
+                                                     std::string_view fingerprint = "gcc-13")
+{
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                      .fingerprint = fingerprint,
+                                                      .args = {},
+                                                      .source = source,
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp" });
+}
+
 [[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13")
 {
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Source.size()), Wire::AsBytes(Source));
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
-                                                      .fingerprint = fingerprint,
-                                                      .args = {},
-                                                      .source = enveloped,
-                                                      .acceptedCodecs = { Wire::IdentityCodec },
-                                                      .sourceName = "a.cpp" });
+    return FrameWithSource(enveloped, fingerprint);
 }
 
 /// A COMPILE header that declares `declared` payload bytes and carries none.
@@ -310,6 +325,26 @@ struct Fixture
                          static_cast<std::uint8_t>(Wire::Op::Compile),
                          declared);
     return header;
+}
+
+/// A COMPILE frame whose source envelope DECLARES `rawLength` and carries a
+/// handful of bytes.
+///
+/// The attack #241 left reachable: the frame is about a hundred bytes, so the
+/// budget's frame-length reservation is almost free, while the field one layer in
+/// tells the decoder to size a buffer of `rawLength` and value-initialize it.
+///
+/// The codec is deliberately one no build has. What is under test is the price
+/// charged for what the envelope DECLARES, and a codec this build could decode
+/// would make an unfixed worker genuinely attempt the allocation the case is about
+/// -- turning a regression into a test host that swaps rather than one that fails.
+/// @param rawLength What the envelope claims it expands to.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> DeclaringEnvelopeFrame(std::uint32_t rawLength)
+{
+    constexpr std::uint8_t NoSuchCodec = 0xFE;
+    constexpr std::string_view Compressed = "a few dozen bytes, and no more";
+    return FrameWithSource(Wire::EncodeCodecEnvelope(NoSuchCodec, rawLength, Wire::AsBytes(Compressed)));
 }
 
 /// Read everything a server wrote back on one connection.
@@ -832,4 +867,105 @@ TEST_CASE("A zero bound waits forever, which is what this did before the bound",
 
     CHECK(NextDrainAction(1, 0s, 0s) == DrainAction::Report);
     CHECK(NextDrainAction(1, 24h, 0s) == DrainAction::Report);
+}
+
+TEST_CASE("A worker charges what an envelope declares it expands to, not the frame", "[worker-server]")
+{
+    // #241, one layer past the fix that named it. `Unenvelope` refuses a declared
+    // expansion above THIS request's ceiling, but that ceiling is per request and the
+    // in-flight budget never saw the number: `_bytesInFlight` reserved the COMPRESSED
+    // frame length. So a member could open `slots` connections, send `slots` frames of
+    // a hundred bytes each declaring a 256 MiB expansion, and drive `slots` x 256 MiB
+    // of value-initialized memory concurrently -- the "slots times it" shape the budget
+    // was introduced to close, reopened where it could not see it.
+    constexpr std::uint32_t WholeBudget = 256U * 1024U * 1024U;
+
+    Fixture fix;
+
+    // ONE BYTE of somebody else's traffic, which is the whole point of the case. A
+    // holder declaring a single payload byte and sending none parks inside the payload
+    // read holding a one-byte reservation; if the frames below are charged their frame
+    // length, all three fit beside it with 255 MiB to spare and every one is admitted.
+    // They are refused only if the number the ENVELOPE declares is what is charged.
+    auto holder = InMemorySocketPair::Create();
+    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+        co_return written.has_value();
+    }(holder.client.get(), DeclaringHeader(1))));
+
+    // Three complete requests, each declaring the per-request maximum expansion, each
+    // arriving while the others are outstanding.
+    std::vector<InMemorySocketPair> callers;
+    std::vector<std::unique_ptr<ISocket>> accepted;
+    accepted.push_back(std::move(holder.server));
+    for ([[maybe_unused]] auto const index: { 0, 1, 2 })
+    {
+        auto pair = InMemorySocketPair::Create();
+        REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+            auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+            co_return written.has_value();
+        }(pair.client.get(), DeclaringEnvelopeFrame(WholeBudget))));
+        pair.client->ShutdownWrite();
+        accepted.push_back(std::move(pair.server));
+        callers.push_back(std::move(pair));
+    }
+
+    ScriptedListener listener { std::move(accepted) };
+    {
+        // Four slots, so CPU is not what refuses anything here.
+        WorkerServer server { listener, fix.protocol, /*slots=*/4, fix.membership, fix.metrics, fix.logger, fix.executor };
+        SyncRun(server.Run());
+
+        for (auto& caller: callers)
+            CHECK(ErrorOf(ReadAll(*caller.client)) == Wire::ErrorCode::EndpointBusy);
+
+        // Refused for MEMORY with three slots free, which is why `EndpointBusy` is its
+        // own code and its own counter -- and refused BEFORE the decoder was asked, so
+        // nothing allocated and no compiler ran.
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 3);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+
+        // Let the holder go, or the destructor waits for a job nothing will finish.
+        holder.client->Close();
+    }
+}
+
+TEST_CASE("An expansion no worker could ever hold is the decoder's refusal, not a busy signal", "[worker-server]")
+{
+    // The other half of the rule, and the half that decides what an operator does
+    // next. `EndpointBusy` means "ask again shortly"; a frame declaring more than the
+    // whole budget can never fit, so answering it that way on a completely idle worker
+    // sends a client into a retry loop over something no amount of waiting fixes. An
+    // unpayable price is therefore not charged at all -- it is left to `Unenvelope`,
+    // which refuses it by name and without allocating.
+    constexpr std::uint32_t WholeBudget = 256U * 1024U * 1024U;
+
+    struct Row
+    {
+        std::string_view what;
+        std::uint32_t declared;
+        Wire::ErrorCode expected;
+    };
+
+    auto const rows = std::to_array<Row>({
+        // Exactly the ceiling is payable, so an idle worker admits it and the decoder
+        // gets its say -- here, that it has no such codec. Not a busy signal.
+        { .what = "exactly the per-request maximum",
+          .declared = WholeBudget,
+          .expected = Wire::ErrorCode::UnsupportedCodec },
+        // One byte past it is refused by the decoder that owns the per-request
+        // ceiling, under the name that says which field was too large.
+        { .what = "one byte past the per-request maximum",
+          .declared = WholeBudget + 1U,
+          .expected = Wire::ErrorCode::PayloadTooLarge },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Fixture fix;
+        CHECK(ErrorOf(ServeOne(fix, DeclaringEnvelopeFrame(row.declared), /*slots=*/2)) == row.expected);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 0);
+    }
 }

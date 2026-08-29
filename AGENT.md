@@ -244,6 +244,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Detaching the compiles made the per-request payload cap a per-connection one; the
   in-flight byte budget lands in the same change, refusing with `EndpointBusy` because
   a slot was free and memory was not.
+- That budget charges what a request **costs**, not what its frame is long: a codec
+  envelope's declared expansion is the larger number, and a ceiling on it is per
+  request while the budget is per surface. A price above the whole budget is left to
+  the decoder, because `EndpointBusy` on an idle worker is a retry loop.
 - Anything a worker derives per job is derived per THREAD: two compiles sharing a
   scratch number shared `tu.o`, and one answered with the other's object.
 - A child inherits what the PROCESS has, not what the call set up. Windows names the

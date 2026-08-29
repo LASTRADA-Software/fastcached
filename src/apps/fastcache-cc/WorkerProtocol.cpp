@@ -90,6 +90,44 @@ WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
 {
 }
 
+std::size_t DeclaredRequestFootprint(std::span<std::byte const> frame) noexcept
+{
+    auto const header = Wire::DecodeRequestHeader(frame);
+    if (!header.has_value())
+        return 0;
+
+    // What `Serve` already charged, and the floor for everything below: a frame this
+    // function cannot look inside still costs its own length.
+    auto const framed = static_cast<std::size_t>(header->payloadLength);
+
+    // Every one of these is a request `Answer` refuses on its own terms -- a foreign
+    // verb, a truncated frame, a payload that does not split. None of them reaches
+    // `Unenvelope`, so none of them declares a second buffer, and answering `framed`
+    // leaves the refusal where it belongs rather than turning a malformed frame into
+    // a busy signal.
+    //
+    // The length test subtracts rather than adds: `RequestHeaderSize + framed` wraps
+    // where `size_t` is 32 bits, and a wrapped sum turns "this frame is truncated"
+    // into "this frame is long enough" and hands `subspan` a count past the end.
+    // `DecodeRequestHeader` already refused a buffer shorter than the header, so the
+    // subtraction cannot underflow.
+    if (header->opRaw != static_cast<std::uint8_t>(Wire::Op::Compile) || frame.size() - Wire::RequestHeaderSize < framed)
+        return framed;
+
+    auto const fields = Wire::DecodeCompilePayload(frame.subspan(Wire::RequestHeaderSize, framed));
+    if (!fields.has_value())
+        return framed;
+
+    auto const envelope = Wire::DecodeCodecEnvelope(fields->source);
+    if (!envelope.has_value())
+        return framed;
+
+    // The declared expansion, believed only as a PRICE. Whether it is one this
+    // endpoint will pay at all is `Unenvelope`'s ceiling, checked where the
+    // allocation happens; this decides what it is charged for having asked.
+    return std::max(framed, static_cast<std::size_t>(envelope->rawLength));
+}
+
 std::optional<std::vector<std::byte>> WorkerProtocol::Answer(std::span<std::byte const> frame)
 {
     auto const header = Wire::DecodeRequestHeader(frame);

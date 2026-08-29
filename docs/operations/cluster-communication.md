@@ -182,6 +182,16 @@ on the worker.
     launcher opening a worker's reply: the launcher dialled a worker the scheduler
     named, which is not the same as one it trusts with its address space.
 
+    That ceiling is **per request**, and a worker serves `slots` of them at once, so
+    it is only half the answer: `slots` frames each declaring exactly the maximum are
+    `slots` times it. The worker's in-flight byte budget therefore charges a request
+    the larger of its frame length and its declared expansion, and a request that
+    does not fit is refused with `endpoint-busy` — the same code it answers when a
+    frame's own length does not fit, and still a reply rather than a close. A
+    declared expansion above the *whole* budget is left to the check above instead:
+    no amount of waiting would make it fit, and telling a client to come back
+    shortly would be an invitation to retry forever.
+
 ### 6. The worker compiles it, with a compiler it chose
 
 The job names a **fingerprint**, never a program. The worker maps that to a
