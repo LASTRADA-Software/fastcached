@@ -724,6 +724,27 @@ jobs:
   windows:
     name: "Windows-${{ matrix.preset }}"
     runs-on: windows-2025
+    # The Windows jobs were the second-biggest block in this workflow — 21.2 and
+    # 15.7 minutes, of which 17.2 and 11.8 were the build — and they were paying
+    # a full cold compile every single run. Measured on run 33243524509: sccache
+    # reported `Cache location  Local disk`, on an ephemeral runner. Nothing it
+    # stored ever survived the job that stored it, so the cache was installed,
+    # announced by the configure, genuinely used — and could not possibly hit. The
+    # E2E job's own statistics are the receipt: 231 compile requests, 2 hits.
+    #
+    # The action does not set this itself — its README tells you to — and without
+    # it sccache never looks at the Actions cache at all. Set at job level rather
+    # than per step because it has to be visible to the configure (which picks
+    # the launcher) and to the build (which runs it).
+    #
+    # Safe against the MSVC `/showIncludes` hazard that CompileCache.cmake warns
+    # about, and the reason is worth writing down rather than re-deriving: that
+    # hazard needs an INCREMENTAL build across checkouts at DIFFERENT absolute
+    # paths. Every runner builds from scratch at `D:\a\fastcached\fastcached`, so
+    # neither half holds, and sharing entries between runs is sharing them
+    # between builds that spell every path identically.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -740,8 +761,13 @@ jobs:
           key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
 
+      # v0.0.11 rather than v0.0.6: GitHub's cache service v1 is gone, and only
+      # the newer action exports the ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN
+      # pair that sccache's GHA backend reads. An older action with
+      # SCCACHE_GHA_ENABLED set is the failure this whole block exists to stop —
+      # a cache that is configured, announced, and inert.
       - name: "sccache"
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: "Install ninja"
         run: choco install ninja --no-progress
@@ -768,6 +794,28 @@ jobs:
 
       - name: "Build"
         run: cmake --build --preset ${{ matrix.preset }}
+
+      # A compiler cache that handled nothing is worse than one that is off,
+      # because it reads like success: the configure says "Enabling sccache", the
+      # build is green, and the seventeen minutes look like the cost of compiling
+      # this project on Windows. So the number is asserted, not printed.
+      #
+      # Here, and NOT in the action's own post step, because sccache keeps its
+      # counters in the server and this suite restarts that server: the
+      # `sccache-smoke-*` tests point sccache at a fastcached daemon through
+      # SCCACHE_MEMCACHED, which zeroes them. That is why the post step reported
+      # `Compile requests 0` on run 33243524509 for a build sccache had in fact
+      # handled — the E2E job, which runs no ctest, reported 231 requests from the
+      # same configuration. A number read after `Test` is somebody else's.
+      - name: "Assert sccache actually handled the build"
+        shell: pwsh
+        run: |
+          & $env:SCCACHE_PATH --show-stats
+          $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($stats.stats.compile_requests -eq 0) {
+            Write-Host "::error::sccache handled 0 compile requests; this job compiled everything from scratch"
+            exit 1
+          }
 
       - name: "Test"
         run: ctest --preset ${{ matrix.preset }}
@@ -856,6 +904,11 @@ jobs:
   compile-cache-e2e-windows:
     name: "compile-cache E2E (Windows)"
     runs-on: windows-2025
+    # Same backend, same version, same reasons as the `windows` job above, where
+    # they are written out. This job builds the same cl-release configuration, so
+    # it also hits entries that job stored.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -869,7 +922,7 @@ jobs:
           restore-keys: cpm-${{ runner.os }}-cc-e2e-
 
       - name: "sccache"
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: "Install ninja"
         run: choco install ninja --no-progress
@@ -1492,6 +1545,10 @@ jobs:
   package-windows:
     name: "Package (Windows .msi)"
     runs-on: windows-2025
+    # Same backend, same version, same reasons as the `windows` job above, where
+    # they are written out.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1505,7 +1562,7 @@ jobs:
           restore-keys: cpm-${{ runner.os }}-package-
 
       - name: "sccache"
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: "Install ninja"
         run: choco install ninja --no-progress
