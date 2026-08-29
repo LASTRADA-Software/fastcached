@@ -270,15 +270,15 @@ whose clients may dispatch here, and everyone else stays refused. The list is
 matched by **host**: a client dials from an ephemeral source port, so there is no
 port for an endpoint to be compared against.
 
-!!! warning "On a node running consensus, `--fleet-member` is the bootstrap answer only"
+!!! note "On a node running consensus, the cluster's members are admitted as well"
 
-    Once a cluster forms, the agreed member set **replaces** that list on every
-    node — see [membership at
-    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A client
-    machine is not a cluster peer, so a laptop admitted by `--fleet-member` stops
-    being admitted the moment the cluster agrees anything. On a clustered fleet,
-    admit clients with `--fleet-open` behind a firewalled build network, and keep
-    `--fleet-member` for the pre-cluster deployments it is the answer for.
+    The agreed member set **adds** to `--fleet-member` rather than replacing it —
+    see [membership at
+    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A cluster
+    member is a peer; a client machine is not and never will be, so
+    `--fleet-member` stays the way to admit a laptop or a CI runner on a clustered
+    fleet just as on a standalone node. `--fleet-open` remains the answer where the
+    build network is already your boundary.
 
 The worker then surveys the machine at startup and serves every compiler it
 finds, naming each one and the layout it came from:

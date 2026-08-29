@@ -367,6 +367,44 @@ membership: the leader still proposes, and admission is still a consensus
 decision. See [Cluster discovery](../getting-started/cluster-discovery.md) for the
 exchange and the key.
 
+## Who a node admits
+
+Every one of a node's three surfaces — the scheduler, the compile port and the
+cache tier — asks the same question of a caller, and the answer comes from two
+independent lists. A host on **either** is admitted:
+
+| List | Set by | Answers |
+|---|---|---|
+| What the operator listed | `--fleet-member`, repeatable | Who may spend this node's CPU and read its cache tier |
+| What the cluster agreed | consensus, on every committed membership change | Who is in the cluster |
+
+They are separate because they answer different questions. Cluster members are
+**peers**; the machines that spend a fleet's capacity are mostly not — a
+developer's laptop, a CI runner, anything running `fastcache-cc` against the
+fleet. Such a machine never joins consensus and never should, so `--fleet-member`
+is the only route by which it is admitted at all.
+
+Consensus therefore **adds** its member set rather than replacing what was listed.
+A `--fleet-member` host stays admitted across every membership commit, and a
+cluster peer is admitted without anybody listing it. This was not always so: until
+[#251](https://github.com/LASTRADA-Software/fastcached/issues/251) the first
+replicated commit — a node joining, a node being forgotten, a settings change —
+discarded the operator's list, so a client machine stopped being served with no
+configuration having changed anywhere.
+
+Two rules that have not moved:
+
+- **This machine is always admitted**, whatever either list says. A node that
+  refused its own operator's builds would be a fleet that looks configured and
+  serves nobody locally.
+- **An empty policy refuses the network.** A node given neither flag admits itself
+  and nothing else, rather than becoming an open scheduler by omission.
+  `--fleet-open` admits every caller and is a decision somebody makes, never what
+  an unset field decays to.
+
+The node's ready line states which of these it is, so an operator sees the policy
+at the one moment they are watching.
+
 ## The node's own cache, and the shared one
 
 A node's tier is two independent halves, and the flags are separate because the

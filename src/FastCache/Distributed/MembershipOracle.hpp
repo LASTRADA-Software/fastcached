@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Distributed
@@ -57,6 +58,54 @@ class OpenMembership final: public IMembershipOracle
     }
 };
 
+/// A member of any participant is a member.
+///
+/// Admission is a **union** of independent routes, and that is the shape the
+/// question has rather than a convenience. One list answering two questions is
+/// what #251 was: `--fleet-member` names who may spend this node's CPU and read
+/// its cache tier -- which is mostly *clients*, developer laptops and CI runners,
+/// machines that never join consensus and never should -- while the cluster's
+/// agreed member set names who is in the cluster, which is peers only. Publishing
+/// the second over the first revoked every listed host at the first replicated
+/// membership commit, and agreeing something is routine.
+///
+/// Composed through `IMembershipOracle` rather than by teaching one oracle to hold
+/// several lists, because the routes are not all lists of hosts. A signed lease
+/// token is an admission route for a peer holding a valid grant -- a credential
+/// check, with no host set to add a row to -- and it *adds* to an address policy
+/// rather than replacing it, since that policy is what still gates the cache tier
+/// and what an operator sets on a worker taking no leases at all. A design that
+/// enumerated sources inside one host-list type could not hold it; a participant
+/// list can, and the seam already exists.
+///
+/// Participants are borrowed and must outlive this object. That is safe by
+/// construction where it is used: `Node::NodeMembership` owns both the
+/// participants and the composite, and is neither copyable nor movable.
+class AnyOfMembership final: public IMembershipOracle
+{
+  public:
+    /// @param participants The routes to consult, in the order they are asked.
+    ///        Each must outlive this object. An empty list refuses everybody,
+    ///        which is the same direction every other default here fails in.
+    explicit AnyOfMembership(std::vector<IMembershipOracle const*> participants):
+        _participants { std::move(participants) }
+    {
+    }
+
+    /// @param peerAddress The connecting peer's **host**, as the participants take it.
+    /// @return `Member` when any participant says so, `Outsider` when none does.
+    [[nodiscard]] Membership Classify(std::string_view peerAddress) const override
+    {
+        auto const admits = [peerAddress](IMembershipOracle const* oracle) {
+            return oracle->Classify(peerAddress) == Membership::Member;
+        };
+        return std::ranges::any_of(_participants, admits) ? Membership::Member : Membership::Outsider;
+    }
+
+  private:
+    std::vector<IMembershipOracle const*> _participants;
+};
+
 /// Only hosts on an explicit list are members.
 ///
 /// The list is the cluster's *authenticated* peers, refreshed by whatever
@@ -103,6 +152,12 @@ class ClusterMembership final: public IMembershipOracle
     /// construction: membership is precisely the thing that changes while this
     /// object lives, and rebuilding the oracle on every join would mean handing a
     /// new one to a running server.
+    ///
+    /// Wholesale, which is right for the *one* question an owner gave this list --
+    /// whoever publishes it holds the whole truth about that question -- and wrong
+    /// for admission as a whole. A node with more than one admission route composes
+    /// one of these per route through `AnyOfMembership`; see #251, where a single
+    /// list took the second answer for the first.
     ///
     /// **Thread-safe against `Classify`**, which is not a nicety here: the natural
     /// caller is consensus, publishing what the cluster just agreed from its own

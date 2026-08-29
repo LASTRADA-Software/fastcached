@@ -222,6 +222,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   every machine without `/usr/local/include`.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- Cluster membership is one ROUTE to admission, never the whole policy. `--fleet-member`
+  admits *clients* — laptops, CI runners — which never join consensus, so what the
+  cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`
+  seam (`AnyOfMembership`), because the next route is a credential and not a host list.
+  The admission-layer reading of *absence from `ClusterState` is not removal*.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
   inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
   the cap it advertises was unreachable while every client still got a correct object.

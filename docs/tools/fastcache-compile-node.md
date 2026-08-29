@@ -696,10 +696,19 @@ configured did not happen.
 a replicated log entry, and that is what makes a node admitted at runtime survive a
 restart without anybody editing a config file on every other machine.
 
-The agreed member set becomes the fleet's admission policy directly, so a node the
+The agreed member set joins the fleet's admission policy directly, so a node the
 cluster admitted is served by all three surfaces at once — its compile port, the
-scheduler, and every member's cache tier. `--fleet-member` is the answer before a
-cluster exists; this is the answer once one does.
+scheduler, and every member's cache tier.
+
+It **adds** to `--fleet-member` and never replaces it. The two lists answer
+different questions: cluster members are peers, while most of the machines that
+spend a fleet's capacity are not — a laptop, a CI runner, anything running
+`fastcache-cc` against the fleet. Those never join consensus, so `--fleet-member` is
+the only route by which they are admitted at all, and it keeps working on a
+clustered node exactly as it does on a standalone one. Until
+[#251](https://github.com/LASTRADA-Software/fastcached/issues/251) it did not: the
+first committed membership change discarded the listed hosts, so a client machine
+stopped being served the moment the fleet agreed anything.
 
 **It reaches consensus too.** The leader moves the *quorum* to match the member set
 one machine at a time, so a node the cluster admitted votes, is counted, and is
