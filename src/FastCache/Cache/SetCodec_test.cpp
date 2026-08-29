@@ -203,6 +203,56 @@ TEST_CASE("SetCodec::Decode refuses a member count the blob cannot supply", "[ca
     CHECK(members.empty());
 }
 
+TEST_CASE("SetCodec::Decode refuses a member LENGTH the blob cannot supply", "[cache][setcodec]")
+{
+    // The count guard is necessary and not sufficient: a count that passes it says
+    // nothing about the individual lengths, and the per-member walk is the second
+    // bound. These are the inputs that reach it, which the count cases above cannot.
+    std::vector<std::string> members;
+    auto const decode = [&members](std::string const& blob) {
+        return SetCodec::Decode(AsBytes(blob), members);
+    };
+
+    // Append a big-endian u32 to `s`.
+    auto const appendU32 = [](std::string& s, std::uint32_t v) {
+        for (auto const shift: { 24, 16, 8, 0 })
+            s.push_back(static_cast<char>((v >> shift) & 0xFFU));
+    };
+
+    // One member declaring 0xFFFFFFFF bytes it does not carry. The count is a legal
+    // claim (one member fits in the four bytes present), so only the length check can
+    // refuse it -- and it must do so by subtracting from the size rather than adding
+    // to the offset, which wraps wherever `std::size_t` is 32-bit.
+    std::string overlong = SetBlob(1);
+    appendU32(overlong, 0xFFFFFFFFU);
+    CHECK_FALSE(decode(overlong));
+    CHECK(members.empty());
+
+    // A length prefix cut short, which only the SECOND member can reach: the count
+    // guard prices every member at four bytes, so a short prefix is possible only
+    // once an earlier member has spent more than its minimum. Two members against
+    // nine bytes passes the count check (9 / 4 == 2); the first then eats seven of
+    // them and leaves two for a four-byte prefix.
+    std::string shortPrefix = SetBlob(2);
+    appendU32(shortPrefix, 3);
+    shortPrefix.append("abc");
+    shortPrefix.append(2, '\0');
+    CHECK_FALSE(decode(shortPrefix));
+
+    // A member whose text is one byte short of its declared length -- the ordinary
+    // truncation, and the shape that commits nothing before it is discovered.
+    std::string truncated = SetBlob(1);
+    appendU32(truncated, 4);
+    truncated.append(3, 'x');
+    CHECK_FALSE(decode(truncated));
+
+    // One more byte and it is a well-formed set, so the refusals above are the length
+    // check firing rather than the blob being unreachable.
+    truncated.push_back('x');
+    REQUIRE(decode(truncated));
+    CHECK(members == std::vector<std::string> { "xxxx" });
+}
+
 TEST_CASE("SetCodec round-trips, and its per-member minimum tracks the encoder", "[cache][setcodec]")
 {
     std::vector<std::string> const members { "alpha", "beta", "gamma" };

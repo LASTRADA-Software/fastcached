@@ -118,25 +118,32 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     if (!WireFields::DeclaredCountFits(count, MinMemberBytes, remaining))
         return false;
 
-    // NOT reserved, and that is deliberate. Validating the count and pre-sizing the
-    // container are different decisions, and only the first is load-bearing: growth
-    // through `emplace_back` is amortised O(1) and moves 32-byte strings, while every
-    // way of pre-sizing from this count is either an amplifier or wrong.
+    // NOT reserved, and that is deliberate -- but the reason is narrower than "it
+    // would be an amplifier", so state it exactly. A blob whose count survives the
+    // guard above can still be TRUNCATED: `count` may be `remaining / 4` while the
+    // first member's length swallows the rest, so the walk below fails on member one.
+    // `reserve(count)` would have committed `count * sizeof(std::string)` -- 8x the
+    // blob, since a member is 32 bytes in memory against 4 on the wire -- before
+    // discovering that. Growing through `emplace_back` commits only what the blob
+    // actually supplied, which is what a truncated claim deserves.
     //
-    // Reserving the validated count is still 8x -- a member is 32 bytes in memory
-    // against 4 on the wire -- which on a 256 MiB value is 2 GiB, the same shape this
-    // guard exists to close. Clamping to `remaining / sizeof(std::string)` bounds the
-    // memory but under-reserves real sets by 2.7x for eight-byte members, because a
-    // member's true wire cost is `4 + len` and only the `4` is knowable up front.
-    // A reallocation is not what a critical unbounded-reserve ticket is about.
+    // It does NOT bound a WELL-FORMED blob of many empty members: that really does
+    // decode to `count` strings and reach the same 8x, with or without a reserve. The
+    // ceiling there is the value size the storage tier accepted, not this loop, and
+    // capping the member count is a separate decision from validating the claim.
     std::size_t offset = HeaderSize;
     for (auto i = std::uint32_t { 0 }; i < count; ++i)
     {
-        if (offset + WireFields::FieldPrefixSize > blob.size())
+        // Spelled as a subtraction from the size, never `offset + len > size`: `len`
+        // is a peer's `u32` and the additive form wraps wherever `std::size_t` is
+        // 32-bit, turning the bounds check into a pass on exactly the values it
+        // exists to refuse. This is `WireFields::Detail::SplitUpTo`'s spelling, which
+        // is the same walk over the same grammar.
+        if (blob.size() - offset < WireFields::FieldPrefixSize)
             return false;
         auto const len = ReadBigEndian<std::uint32_t>(blob.subspan(offset));
         offset += WireFields::FieldPrefixSize;
-        if (offset + len > blob.size())
+        if (blob.size() - offset < len)
             return false;
         out.emplace_back(reinterpret_cast<char const*>(blob.data() + offset), len);
         offset += len;

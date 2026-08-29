@@ -152,6 +152,14 @@ Every rule below has already been a bug.
     **"Only we write these bytes" is a claim to check against every protocol the
     engine serves, never an assumption** — and a shared `CacheEngine` means every
     front end is every other front end's writer.
+    - **`Cache/StreamCodec` is the same door, still on the clamping shape.**
+      `FcTypeStream` (`0x5E700002`) is the second tag a memcached `set` can choose, and
+      its six declared counts go through `detail::BoundedReserve`, which is
+      `reserve(min(count, remaining))` — the variant this rule's own header argues
+      against, because it keeps a provably malformed blob alive and still commits
+      `remaining * sizeof(element)`. Tracked by
+      [#269](https://github.com/LASTRADA-Software/fastcached/issues/269); the fix is
+      `DeclaredCountFits` at each of the six, not a tighter clamp.
   - **It lives in `Core/WireFields.hpp` beside `FieldPrefixSize`**, which is usually the
     answer to its `minBytesEach`, and which that header already argues must stay
     header-only and dependency-free because `fastcache-cc` compiles it in *without
