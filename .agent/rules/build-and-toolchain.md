@@ -797,6 +797,51 @@ chance to move the number only teaches everyone to ignore the signal. A failing 
 still gets its report rendered, to read while debugging, and then re-raises so no number
 measured from a red build is published.
 
+## Scoping the matrix to what a change can affect
+
+**A `paths-ignore` filter on a workflow whose checks are REQUIRED converts "slow"
+into "unmergeable".** Master here is protected by a ruleset (`default-master`,
+enforcement `active`), not by classic branch protection — so the
+`/branches/master/protection` endpoint answers `404 Branch not protected`, and
+anything reasoning from that endpoint is reading a lie. Its required contexts are
+`Windows-cl-release`, `Windows-clangcl-release`, `Linux-clang-release`,
+`Linux-gcc-release`, `macOS-clang-release`, `clang-tidy`, the three
+`sccache smoke (...)` jobs, `Check C++ style` and `Require a type label`. A
+workflow-level path filter stops the workflow from triggering, so no check run is
+ever created for any of those, and the pull request waits on a context that will
+never arrive.
+
+A **job-level** `if:` is a different mechanism: the job is created and reports a
+`skipped` conclusion, which a required check accepts. That is what
+`.github/workflows/build.yml` does — one `changes` job publishes `code=true|false`
+and every heavy job is gated on it.
+
+- **The classification is `scripts/ci-scope.sh`, not a YAML glob**, so it is
+  testable without a runner: `ctest -R ci-scope` runs its table against a
+  throwaway git repository, in both directions. A glob living only in workflow
+  YAML is a rule nobody can exercise until it is wrong in production.
+- **Every way of not knowing escalates to "build everything".** An unresolvable
+  ref, a failed diff, an empty diff, a path matching no row — all `code=true`,
+  for the reason `tidy-sweep.sh` states about its own base ref: *we could not tell
+  what changed* must never read as *nothing did*. The cost of being wrong that way
+  is a matrix run nobody needed; the cost of being wrong the other way is a merge
+  no job ever compiled, with every required check green.
+- **`mkdocs.yml` is code and `.agent/**` is not**, which is the kind of judgement
+  that has to be written down: the Documentation workflow builds the former
+  `--strict`, while the rulebook is read by people and sessions rather than by any
+  job. If a rule file ever generates something, it stops being documentation.
+- **The cost this removes is not one matrix run per pull request.** The ruleset
+  sets `strict_required_status_checks_policy: true` — branches must be up to date
+  before merging — so every merge puts every other open pull request behind and
+  forces a rebase and a full re-run. The matrix is therefore paid once per pull
+  request *per merge that lands while it is open*, and that multiplier is the
+  larger half of the argument.
+- **A gated job must still gate the release.** `check-release-gate` asserts
+  statically, with `yq`, that every job key appears in `release.needs`; it never
+  asks whether a job ran, so a job that no-ops on a docs change still counts. The
+  `changes` job is itself a row there. On a tag or a push the classifier answers
+  `code=true` unconditionally, so nothing is ever skipped underneath a release.
+
 ## Open work
 
 - **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
