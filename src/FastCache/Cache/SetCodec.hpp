@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
 #include <array>
@@ -39,7 +40,25 @@ constexpr std::uint32_t FcTypeSet = 0x5E700001U; // "SET" + version nibble.
 
 constexpr std::byte Magic { 0xFC };
 constexpr std::byte TypeSet { 0x01 };
-constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
+constexpr std::size_t HeaderSize = 1 + 1 + WireFields::FieldPrefixSize; // magic, type, count.
+
+/// The fewest blob bytes one encoded member can occupy: its length prefix, with an
+/// empty member.
+///
+/// **A security bound, not a sizing hint.** It must be a true LOWER bound on what a
+/// member costs, because `Decode` refuses any count the remaining bytes cannot supply
+/// and an over-estimate would refuse honest data. It will therefore always
+/// under-estimate the count for typical members, whose real cost is `4 + len` --
+/// that is what makes it correct, not what makes it improvable. Anyone "tightening"
+/// it toward a typical member size silently weakens the guard, which is why nothing
+/// here sizes an allocation from it.
+///
+/// Read off `Encode`'s loop below, which is what fixes it, and pinned against that
+/// encoder by a test that encodes one empty member and measures the difference -- so a
+/// field added there fails a test rather than quietly leaving `Decode`'s guard weaker
+/// than the format it guards. Spelled with `FieldPrefixSize` rather than a literal 4,
+/// which would restate the framing contract beside the one place it is defined.
+constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
 
 /// @param flags The stored entry's flags word.
 /// @return True if the flags tag marks the entry as a set.
@@ -55,13 +74,13 @@ constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
 {
     std::size_t total = HeaderSize;
     for (auto const& m: members)
-        total += 4 + m.size();
+        total += WireFields::FieldPrefixSize + m.size();
     std::vector<std::byte> out;
     out.reserve(total);
     out.push_back(Magic);
     out.push_back(TypeSet);
     auto const appendU32 = [&out](std::uint32_t v) {
-        std::array<std::byte, 4> bytes {};
+        std::array<std::byte, WireFields::FieldPrefixSize> bytes {};
         WriteBigEndian(std::span<std::byte> { bytes }, v);
         out.insert(out.end(), bytes.begin(), bytes.end());
     };
@@ -85,15 +104,46 @@ constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
     if (blob.size() < HeaderSize || blob[0] != Magic || blob[1] != TypeSet)
         return false;
     auto const count = ReadBigEndian<std::uint32_t>(blob.subspan(2));
+    auto const remaining = blob.size() - HeaderSize;
+
+    // The count is a CLAIM about bytes this blob must already carry, checked before
+    // anything is sized from it -- `WireFields::DeclaredCountFits`, the guard issue
+    // #267 generalised. Unguarded, this reserved straight from the `u32`.
+    //
+    // These bytes are a CLIENT's, which is the part that is not obvious from here: a
+    // set is an ordinary value distinguished only by its `flags` word, and the
+    // memcached text verbs let a client choose that word. The worked attack -- plant
+    // six bytes over memcached, read them back with SMEMBERS -- is spelled out and
+    // executed by `SetCodec_test.cpp`, which is where it stays correct.
+    if (!WireFields::DeclaredCountFits(count, MinMemberBytes, remaining))
+        return false;
+
+    // NOT reserved, and that is deliberate -- but the reason is narrower than "it
+    // would be an amplifier", so state it exactly. A blob whose count survives the
+    // guard above can still be TRUNCATED: `count` may be `remaining / 4` while the
+    // first member's length swallows the rest, so the walk below fails on member one.
+    // `reserve(count)` would have committed `count * sizeof(std::string)` -- 8x the
+    // blob, since a member is 32 bytes in memory against 4 on the wire -- before
+    // discovering that. Growing through `emplace_back` commits only what the blob
+    // actually supplied, which is what a truncated claim deserves.
+    //
+    // It does NOT bound a WELL-FORMED blob of many empty members: that really does
+    // decode to `count` strings and reach the same 8x, with or without a reserve. The
+    // ceiling there is the value size the storage tier accepted, not this loop, and
+    // capping the member count is a separate decision from validating the claim.
     std::size_t offset = HeaderSize;
-    out.reserve(count);
     for (auto i = std::uint32_t { 0 }; i < count; ++i)
     {
-        if (offset + 4 > blob.size())
+        // Spelled as a subtraction from the size, never `offset + len > size`: `len`
+        // is a peer's `u32` and the additive form wraps wherever `std::size_t` is
+        // 32-bit, turning the bounds check into a pass on exactly the values it
+        // exists to refuse. This is `WireFields::Detail::SplitUpTo`'s spelling, which
+        // is the same walk over the same grammar.
+        if (blob.size() - offset < WireFields::FieldPrefixSize)
             return false;
         auto const len = ReadBigEndian<std::uint32_t>(blob.subspan(offset));
-        offset += 4;
-        if (offset + len > blob.size())
+        offset += WireFields::FieldPrefixSize;
+        if (blob.size() - offset < len)
             return false;
         out.emplace_back(reinterpret_cast<char const*>(blob.data() + offset), len);
         offset += len;

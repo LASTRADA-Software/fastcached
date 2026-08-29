@@ -131,20 +131,35 @@ Every rule below has already been a bug.
   frame must already contain* — not a request, and not a size to allocate from. Every
   element costs some fixed minimum in the shared field grammar, so the claim is
   checkable, and `WireFields::DeclaredCountFits` is where that check lives
-  ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). Three decoders
-  in the compile-cache path reserved from a `u32` before reading a single element:
-  `DecodeCompileValue` (~172 GB from a **nine-byte** frame — measured,
-  `sizeof(TextRegion)` is 40, and under a 2 GiB address-space cap the pre-fix decoder
-  aborts on `std::bad_alloc`), `PrefetchGroupManifest`'s key list, and `DirectManifest`
-  (~274 GB from thirteen bytes).
-  - **A value blob is a peer's bytes too, and the sweep must go where that is not
-    obvious.** The daemon's own value codecs are the other half of this class and are
-    tracked separately (`Cache/SetCodec`, `Cache/StreamCodec`; see
-    [#269](https://github.com/LASTRADA-Software/fastcached/issues/269)). They look
-    internal — a set this daemon wrote — but what marks a value as a set is its
-    `flags` word, and the memcached verbs let a client choose it. "Only we write these
-    bytes" is a claim to check against every protocol the engine serves, never an
-    assumption.
+  ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). **This is a
+  class, not a list of sites** — it has now been found four times, in four unrelated
+  formats, and each was written by somebody who knew the rule for the *length* fields
+  in the same decoder. `DecodeCompileValue` (~172 GB from a **nine-byte** frame —
+  measured, `sizeof(TextRegion)` is 40, and under a 2 GiB address-space cap the
+  pre-fix decoder aborts on `std::bad_alloc`), `PrefetchGroupManifest`'s key list,
+  `DirectManifest` (~274 GB from thirteen bytes), and `SetCodec` (~137 GB from
+  **six**, [#271](https://github.com/LASTRADA-Software/fastcached/issues/271)).
+  **Grep for `reserve(`, `resize(` and `assign(` in any decoder you touch, and ask of
+  each one where its argument came from.**
+  - **A value blob is a peer's bytes too, and that is where the worst one hid.**
+    `SetCodec::Decode` reads a set *this daemon wrote* — except that what marks a value
+    as a set is its `flags` word, and the memcached text verbs let a client choose it.
+    So `set evil 1584398337 0 6` carrying `FC 01 FF FF FF FF`, then `SMEMBERS evil`,
+    reserved `0xFFFFFFFF` strings from **six** bytes: no privilege, no fleet
+    membership, two stock front ends over one engine, and the `std::bad_alloc` escaped
+    the RESP handler uncaught. It is the widest-reaching member of the family and the
+    least obvious, because nothing about the decoder says "network".
+    **"Only we write these bytes" is a claim to check against every protocol the
+    engine serves, never an assumption** — and a shared `CacheEngine` means every
+    front end is every other front end's writer.
+    - **`Cache/StreamCodec` is the same door, still on the clamping shape.**
+      `FcTypeStream` (`0x5E700002`) is the second tag a memcached `set` can choose, and
+      its six declared counts go through `detail::BoundedReserve`, which is
+      `reserve(min(count, remaining))` — the variant this rule's own header argues
+      against, because it keeps a provably malformed blob alive and still commits
+      `remaining * sizeof(element)`. Tracked by
+      [#269](https://github.com/LASTRADA-Software/fastcached/issues/269); the fix is
+      `DeclaredCountFits` at each of the six, not a tighter clamp.
   - **It lives in `Core/WireFields.hpp` beside `FieldPrefixSize`**, which is usually the
     answer to its `minBytesEach`, and which that header already argues must stay
     header-only and dependency-free because `fastcache-cc` compiles it in *without
