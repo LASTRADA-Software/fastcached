@@ -558,6 +558,12 @@ most of this repository's are, means setting the label by hand.
 Deferred work is a GitHub issue linked from the matching rulebook file's
 `## Open work` section, never a residual recorded only in prose.
 
+When several sessions work this repository in parallel — a manager plus two or three
+developers — the lane ownership, rebase and merge protocol, review gates and the
+type-label check's cancelled-versus-failed distinction are in
+[`.agent/guides/team-run.md`](.agent/guides/team-run.md). It carries no board state by
+design; what is done and what is left lives in the issues.
+
 ## Design Patterns & Principles
 
 ### Error handling: `std::expected<T, E>`
