@@ -374,11 +374,8 @@ enum class Fallback : std::uint8_t
 
 /// How one fall-back kind is reported and recorded.
 ///
-/// The two byte-wide members sit together at the end rather than reading in the
-/// order the sentence does, because one of them between two 8-aligned views costs
-/// seven bytes of padding -- the rule the build enforces on config structs, kept
-/// here because the shape is the same and the reason for it does not depend on
-/// which struct it is.
+/// The two byte-wide members sit together at the end rather than in reading order,
+/// which is this tree's layout rule wherever a struct mixes them with pointers.
 struct FallbackRow
 {
     std::string_view leadIn;       ///< What kind of non-answer this is.
@@ -1557,11 +1554,8 @@ void RecordManifest(Config const& cfg,
 /// (hit, or miss-then-compiled — locally or on a worker), or std::nullopt to
 /// signal "fall back to a plain real compile".
 ///
-/// A cache that refused or could not be reached is NOT one of those signals. It
-/// leaves this function with a key, a preprocessed translation unit and a fleet
-/// that knows nothing about either, so the compile is still dispatched and only
-/// the caching of it is lost — see the FETCH block, and issue #236 for what
-/// returning here cost.
+/// A cache that refused or could not be reached is NOT one of those signals — see
+/// `Cc::CacheIsServing`, and issue #236 for what returning here cost.
 /// @param cmd Taken BY VALUE so the driver flavour can be corrected in place once
 ///        the banner is known -- see `ClassifyCompilerFromBanner`. A copy of a few
 ///        strings, once per invocation, against a correction every consumer below
@@ -1803,17 +1797,13 @@ void RecordManifest(Config const& cfg,
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
-    // How the fetch ended, kept for the two questions the rest of this function
-    // asks of it: whether a MISS may be traced, and whether the STORE at the bottom
-    // is worth the transfer. It answers neither "does this invocation continue" --
-    // that is `Cc::CacheIsServing`'s doc comment, and issue #236.
-    //
-    // Carried out of the block below rather than a `bool` derived from it, so the
-    // two asks further down put the same question to the same predicate instead of
-    // reading a summary somebody has to keep in step with it. `Transport` is the
-    // right thing to start on and not merely a filler: it is what `CacheOutcome`
-    // itself defaults to, and it means "we never got an answer", which is the
-    // fail-safe reading of every path that could leave it untouched.
+    // How the fetch ended, for the two questions below: whether a MISS may be
+    // traced, and whether the STORE is worth the transfer. Carried out of the block
+    // rather than a `bool` derived from it, so both put the same question to
+    // `Cc::CacheIsServing` instead of reading a summary somebody has to keep in
+    // step with it. `Transport` is what `CacheOutcome` itself starts on, and means
+    // "we never got an answer" -- the fail-safe reading of a path that leaves this
+    // untouched.
     auto fetchKind = Cc::CacheOutcomeKind::Transport;
 
     // FETCH.
@@ -1830,8 +1820,10 @@ void RecordManifest(Config const& cfg,
             // answer to quote: an endpoint that refused the connection, a peer that
             // broke mid-reply, or the budget running out, all under one FIXED
             // string so the tally gets a row per cause rather than one per compile.
-            bool const refused = fetchKind == Cc::CacheOutcomeKind::Rejected;
-            WarnAndCarryOn(refused ? Cc::DescribeOutcome(outcome) : std::string { "fetch exchange failed" });
+            if (fetchKind == Cc::CacheOutcomeKind::Rejected)
+                WarnAndCarryOn(Cc::DescribeOutcome(outcome));
+            else
+                WarnAndCarryOn("fetch exchange failed");
         }
         else if (outcome.IsHit())
         {
@@ -1916,21 +1908,15 @@ void RecordManifest(Config const& cfg,
         return code; // do not cache a failed compile
 
     // Nothing more is offered to a daemon that refused this launcher, or that was
-    // never reached. The fetch above already established it, and everything below
-    // exists only to store: reading the object back, reconciling the captured
-    // regions, encoding the value and pushing it -- megabytes, per translation
-    // unit, spent to be told the same thing again. It is the argument
-    // `IsStorableSize` makes, reached from the other side.
+    // never reached: the fetch above established it, and everything below exists
+    // only to store -- reading the object back, reconciling the captured regions,
+    // encoding the value and pushing it, megabytes per translation unit, spent to
+    // be told the same thing again.
     //
-    // It is also what keeps the change above free of a cost an operator would
-    // notice. Before it a failed fetch returned here, so nothing was ever pushed at
-    // a daemon that had just failed to answer; carrying on must leave that true, or
-    // every translation unit in a build against a wrong address pays another
-    // connect -- a timeout rather than a refusal, whenever the address is remote
-    // enough to be worth pointing at. What it is NOT is a claim that one connect is
-    // all a dead cache costs: direct mode is on by default and asks for a manifest
-    // before the block above runs at all, so the ceiling is two either way, and it
-    // is `TryDirectMode` that would have to change for it to be one.
+    // It is also what keeps the fall-through above from costing an extra connect
+    // per translation unit against a wrong address. The connect BUDGET, and why
+    // this is not a claim that one connect is all a dead cache costs, are in
+    // .agent/rules/distributed-compilation.md.
     if (!Cc::CacheIsServing(fetchKind))
     {
         // Worded so it is true of BOTH kinds. A refusal *is* an answer -- the daemon
