@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -71,9 +72,14 @@ class ScriptedPeer final: public ISocket
     std::size_t _cursor { 0 };
 };
 
-/// A dialer that hands out a scripted peer per endpoint, and records which
-/// endpoints were dialled and in what order.
-class ScriptedDialer final: public IEndpointDialer
+/// An exchange that answers from a scripted peer per endpoint, and records which
+/// endpoints were reached, in what order, and under which budget.
+///
+/// The peer is driven with `SyncRun` because a `ScriptedPeer`'s awaitables resolve
+/// inline and so never leave the task suspended -- the precondition `SyncRun`
+/// states. That keeps the framing under test: these cases assert what went ON the
+/// wire, which an exchange double returning a hand-built `CacheOutcome` could not.
+class ScriptedFleet final: public IEndpointExchange
 {
   public:
     /// Register a peer for `endpoint`. An endpoint with no entry is unreachable,
@@ -94,20 +100,41 @@ class ScriptedDialer final: public IEndpointDialer
         _limits.insert_or_assign(std::move(endpoint), dials);
     }
 
-    std::unique_ptr<ISocket> Dial(std::string_view hostPort) override
+    /// Make `endpoint` take `duration` to answer.
+    ///
+    /// A worker writes nothing until the compiler has finished, so how long a
+    /// remote compile takes is the whole of what the budget has to cover. An
+    /// exchange given less than this gets what a real one would: the deadline
+    /// closes the socket, the reply never arrives, and the outcome is a transport
+    /// failure. No clock is advanced -- the duration is a property of the scripted
+    /// peer, and comparing it against the budget is the whole model.
+    void AnswersAfter(std::string endpoint, std::chrono::milliseconds duration)
+    {
+        _durations.insert_or_assign(std::move(endpoint), duration);
+    }
+
+    CacheOutcome Exchange(std::string_view hostPort,
+                          std::vector<std::byte> frame,
+                          Credential const& credential,
+                          ExchangeBudget budget) override
     {
         auto const key = std::string { hostPort };
         _dialled.push_back(key);
+        _budgets.push_back(budget);
         auto const it = _scripts.find(key);
         if (it == _scripts.end())
-            return nullptr;
+            return CacheOutcome {};
         if (auto const limit = _limits.find(key); limit != _limits.end())
         {
             if (limit->second == 0)
-                return nullptr;
+                return CacheOutcome {};
             --limit->second;
         }
-        return std::make_unique<ScriptedPeer>(it->second, &_sent[key]);
+        if (auto const slow = _durations.find(key); slow != _durations.end())
+            if (budget.total > std::chrono::milliseconds::zero() && budget.total < slow->second)
+                return CacheOutcome {};
+        ScriptedPeer peer { it->second, &_sent[key] };
+        return SyncRun(ExchangeFramed(&peer, std::move(frame), credential));
     }
 
     /// Endpoints dialled, in order. The ORDER is the assertion in several cases:
@@ -118,6 +145,12 @@ class ScriptedDialer final: public IEndpointDialer
         return _dialled;
     }
 
+    /// The budget each exchange ran under, in the same order as `Dialled()`.
+    [[nodiscard]] std::vector<ExchangeBudget> const& Budgets() const noexcept
+    {
+        return _budgets;
+    }
+
     /// Everything written to `endpoint`.
     [[nodiscard]] std::vector<std::byte> const& SentTo(std::string const& endpoint)
     {
@@ -126,9 +159,11 @@ class ScriptedDialer final: public IEndpointDialer
 
   private:
     std::vector<std::string> _dialled;
+    std::vector<ExchangeBudget> _budgets;
     std::map<std::string, std::vector<std::byte>> _sent;
     std::map<std::string, std::vector<std::byte>> _scripts;
     std::map<std::string, std::size_t> _limits;
+    std::map<std::string, std::chrono::milliseconds> _durations;
 };
 
 constexpr std::string_view Scheduler = "sched:6675";
@@ -160,12 +195,12 @@ constexpr std::string_view Worker = "worker:6676";
 /// A connection here carries more than one request now -- a LEASE and, later, the
 /// RELEASE that resolves it -- so a test that decoded the buffer from offset zero
 /// would only ever see the first.
-/// @param dialer The dialer that recorded them.
+/// @param fleet The scripted fleet that recorded them.
 /// @param endpoint Whose connection to read.
 /// @return One span per whole frame, in the order they were written.
-[[nodiscard]] std::vector<std::span<std::byte const>> FramesTo(ScriptedDialer& dialer, std::string_view endpoint)
+[[nodiscard]] std::vector<std::span<std::byte const>> FramesTo(ScriptedFleet& fleet, std::string_view endpoint)
 {
-    auto const& bytes = dialer.SentTo(std::string { endpoint });
+    auto const& bytes = fleet.SentTo(std::string { endpoint });
     std::vector<std::span<std::byte const>> frames;
     for (std::size_t offset = 0; offset + Wire::RequestHeaderSize <= bytes.size();)
     {
@@ -208,12 +243,12 @@ constexpr std::string_view Worker = "worker:6676";
 
 TEST_CASE("A dispatched compile reaches the worker the scheduler named", "[dispatch]")
 {
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
 
     std::vector<std::string> const args { "-O2", "-std=c++23" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.Ran());
     CHECK(result.exitCode == 0);
@@ -225,10 +260,86 @@ TEST_CASE("A dispatched compile reaches the worker the scheduler named", "[dispa
     // back. A FRESH connection for that, not the one the grant arrived on: the
     // scheduler sweeps a connection idle for five seconds and a compile takes
     // longer, so reusing it would fail exactly when there was something to release.
-    REQUIRE(dialer.Dialled().size() == 3);
-    CHECK(dialer.Dialled()[0] == Scheduler);
-    CHECK(dialer.Dialled()[1] == Worker);
-    CHECK(dialer.Dialled()[2] == Scheduler);
+    REQUIRE(fleet.Dialled().size() == 3);
+    CHECK(fleet.Dialled()[0] == Scheduler);
+    CHECK(fleet.Dialled()[1] == Worker);
+    CHECK(fleet.Dialled()[2] == Scheduler);
+}
+
+TEST_CASE("A compile longer than the cache deadline is still dispatched", "[dispatch]")
+{
+    // Issue #223. The launcher armed ONE deadline for every exchange it made, and
+    // the dispatch legs got the cache's. A cache exchange is answered out of memory,
+    // so ten seconds is right there; a worker writes nothing until the compiler has
+    // finished, so the client sits in one read for the whole compile. Every
+    // translation unit taking longer than ten seconds was therefore abandoned and
+    // rebuilt locally -- precisely the ones distribution exists for -- while the
+    // worker ran the job to completion and wrote back an object nobody read.
+    using namespace std::chrono_literals;
+
+    // Well over a minute, which is what the translation units this feature exists
+    // for actually cost here -- and what a ceiling merely bigger than the cache's
+    // would still have cut off. #223 measured 23.5 s on one; the slow ones are
+    // slower than that, and the default has to clear them by a wide margin rather
+    // than by an argument about averages.
+    constexpr auto RemoteCompileTime = 90s;
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    fleet.AnswersAfter(std::string { Worker }, RemoteCompileTime);
+    std::vector<std::string> const args { "-O2" };
+
+    SECTION("under the default budgets")
+    {
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.Ran());
+        CHECK(std::string(reinterpret_cast<char const*>(result.object.data()), result.object.size()) == "OBJECTBYTES");
+    }
+
+    SECTION("but not when the compile leg is handed the cache's budget")
+    {
+        // The defect itself, written as a configuration: one budget for all three
+        // legs. Without this the case above would still pass with the compile leg
+        // simply never bounded, and the assertion would be about nothing.
+        DispatchBudgets const shared { .control = ExchangeBudget {}, .compile = ExchangeBudget {} };
+        auto const result = Dispatch(fleet, Request(args), shared);
+
+        CHECK(result.status == DispatchStatus::Unavailable);
+        CHECK(result.detail.contains(Worker));
+        // And the lease was still handed back, so the key is not pinned for the
+        // scheduler's whole lease timeout on the way out (#212).
+        REQUIRE(fleet.Dialled().size() == 3);
+        CHECK(fleet.Dialled()[2] == Scheduler);
+    }
+}
+
+TEST_CASE("A slow cache does not get the compile's minutes", "[dispatch]")
+{
+    // The other half of the same rule. The scheduler's LEASE and RELEASE are short
+    // request/reply verbs answered from its own tables, so they keep the launcher's
+    // ordinary budget: raising the compile ceiling to two minutes must not make a
+    // wedged scheduler hold a build for two minutes as well.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
+
+    std::vector<std::string> const args { "-O2" };
+    REQUIRE(Dispatch(fleet, Request(args)).Ran());
+
+    // Lease, compile, release -- in that order, so the budgets line up with them.
+    REQUIRE(fleet.Budgets().size() == 3);
+    DispatchBudgets const defaults;
+    CHECK(fleet.Budgets()[0].total == defaults.control.total);
+    CHECK(fleet.Budgets()[1].total == defaults.compile.total);
+    CHECK(fleet.Budgets()[2].total == defaults.control.total);
+    // Not merely different: the compile's is the longer one, and both are bounded.
+    CHECK(defaults.control.total < defaults.compile.total);
+    CHECK(defaults.compile.total == DefaultDispatchTotal);
+    // And it clears a real slow translation unit by a wide margin rather than by a
+    // hair. A default sized just above the worst one anybody has measured is the
+    // same defect one release later, so the assertion is about the MARGIN.
+    CHECK(DefaultDispatchTotal >= std::chrono::minutes { 5 });
 }
 
 TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")
@@ -237,12 +348,12 @@ TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")
     // the code. That is not a dispatch failure, and reporting it as one would send
     // the caller down the "the cache let us down" path instead of showing the user
     // their own compile error.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("", 1, "error: no"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("", 1, "error: no"));
 
     std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.Ran());
     CHECK(result.exitCode == 1);
@@ -259,30 +370,30 @@ TEST_CASE("Every scheduler refusal is a decline, not a failure", "[dispatch]")
                             Wire::ErrorCode::AlreadyInFlight,
                             Wire::ErrorCode::DispatchNotPermitted })
     {
-        ScriptedDialer dialer;
-        dialer.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(code, {}));
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(code, {}));
 
         std::vector<std::string> const args { "-O2" };
-        auto const result = Dispatch(dialer, Request(args));
+        auto const result = Dispatch(fleet, Request(args));
 
         INFO("error code " << static_cast<unsigned>(code));
         CHECK(result.status == DispatchStatus::Declined);
         CHECK_FALSE(result.Ran());
         CHECK_FALSE(result.detail.empty());
         // The worker is never dialled when there is no grant.
-        CHECK(dialer.Dialled().size() == 1);
+        CHECK(fleet.Dialled().size() == 1);
     }
 }
 
 TEST_CASE("An unreachable scheduler is unavailable, and no worker is dialled", "[dispatch]")
 {
-    ScriptedDialer dialer; // nothing registered
+    ScriptedFleet fleet; // nothing registered
     std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     CHECK(result.status == DispatchStatus::Unavailable);
     CHECK(result.detail.contains("scheduler"));
-    CHECK(dialer.Dialled().size() == 1);
+    CHECK(fleet.Dialled().size() == 1);
 }
 
 TEST_CASE("An unreachable worker is unavailable and names the endpoint", "[dispatch]")
@@ -290,11 +401,11 @@ TEST_CASE("An unreachable worker is unavailable and names the endpoint", "[dispa
     // The scheduler granted a lease pointing at a machine that is not there. Naming
     // it is the difference between an operator finding a dead node and an operator
     // seeing "distribution stopped working".
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
 
     std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     CHECK(result.status == DispatchStatus::Unavailable);
     CHECK(result.detail.contains(Worker));
@@ -304,12 +415,12 @@ TEST_CASE("A worker refusing the job is a decline, not a compile", "[dispatch]")
 {
     // An unknown lease, a fingerprint it does not have, an argument it will not
     // accept. Distinct from the compiler running and rejecting the code.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
 
     std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     CHECK(result.status == DispatchStatus::Declined);
     CHECK_FALSE(result.Ran());
@@ -327,19 +438,19 @@ TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
     // Asserted per outcome rather than once, because "somebody added a branch and
     // forgot the release" is exactly the regression the shape of `Dispatch` was
     // changed to prevent.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
     std::vector<std::string> const args { "-O2" };
 
     SECTION("after a compile that ran")
     {
-        dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
-        REQUIRE(Dispatch(dialer, Request(args)).Ran());
+        fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
+        REQUIRE(Dispatch(fleet, Request(args)).Ran());
     }
     SECTION("after the worker refused the job")
     {
-        dialer.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
-        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Declined);
+        fleet.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}));
+        REQUIRE(Dispatch(fleet, Request(args)).status == DispatchStatus::Declined);
     }
     SECTION("after a worker that was not there at all")
     {
@@ -347,15 +458,15 @@ TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
         // cannot reach the worker is exactly the client least able to report
         // anything about it". It is holding the token, nothing was compiled, and
         // the key is pinned until it says so.
-        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+        REQUIRE(Dispatch(fleet, Request(args)).status == DispatchStatus::Unavailable);
     }
     SECTION("after a result it could not decode")
     {
-        dialer.Serve(std::string { Worker }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("junk")));
-        REQUIRE(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+        fleet.Serve(std::string { Worker }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("junk")));
+        REQUIRE(Dispatch(fleet, Request(args)).status == DispatchStatus::Unavailable);
     }
 
-    auto const frames = FramesTo(dialer, Scheduler);
+    auto const frames = FramesTo(fleet, Scheduler);
     REQUIRE(frames.size() == 2);
     CHECK(OpOf(frames[0]) == Wire::Op::Lease);
     REQUIRE(OpOf(frames[1]) == Wire::Op::Release);
@@ -377,38 +488,38 @@ TEST_CASE("A scheduler that has gone away by then changes nothing", "[dispatch]"
     // or losing leadership during a compile is ordinary, the lease expires on its
     // own, and a dispatch that had already succeeded must not be reported as a
     // failure because of what happened after it.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
-    dialer.ReachableFor(std::string { Scheduler }, 1);
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    fleet.ReachableFor(std::string { Scheduler }, 1);
 
     std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(dialer, Request(args));
+    auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.Ran());
     CHECK(std::string(reinterpret_cast<char const*>(result.object.data()), result.object.size()) == "OBJECTBYTES");
     CHECK(result.detail.empty());
     // It did try, which is the other half: a silent skip would look the same here.
-    REQUIRE(dialer.Dialled().size() == 3);
-    CHECK(dialer.Dialled()[2] == Scheduler);
+    REQUIRE(fleet.Dialled().size() == 3);
+    CHECK(fleet.Dialled()[2] == Scheduler);
 }
 
 TEST_CASE("A malformed grant or result is unavailable, never a silent success", "[dispatch]")
 {
     SECTION("grant")
     {
-        ScriptedDialer dialer;
-        dialer.Serve(std::string { Scheduler }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("not-a-grant")));
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("not-a-grant")));
         std::vector<std::string> const args { "-O2" };
-        CHECK(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+        CHECK(Dispatch(fleet, Request(args)).status == DispatchStatus::Unavailable);
     }
     SECTION("result")
     {
-        ScriptedDialer dialer;
-        dialer.Serve(std::string { Scheduler }, GrantReply());
-        dialer.Serve(std::string { Worker }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("junk")));
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes("junk")));
         std::vector<std::string> const args { "-O2" };
-        CHECK(Dispatch(dialer, Request(args)).status == DispatchStatus::Unavailable);
+        CHECK(Dispatch(fleet, Request(args)).status == DispatchStatus::Unavailable);
     }
 }
 
@@ -416,14 +527,14 @@ TEST_CASE("The arguments the worker receives are the ones it was given", "[dispa
 {
     // Round-tripped through the wire encoding, because an argument containing a
     // space is the case a joined-string encoding would silently split.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
 
     std::vector<std::string> const args { "-O2", "-DMSG=hello world", "-std=c++23" };
-    REQUIRE(Dispatch(dialer, Request(args)).Ran());
+    REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const header = Wire::DecodeRequestHeader(toWorker);
     REQUIRE(header.has_value());
     auto const payload = std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize);
@@ -441,16 +552,16 @@ TEST_CASE("The worker is told what to call its scratch file, and not where it ca
     // The DIRECTORY is deliberately not sent. The worker has no use for it and no
     // business learning where a client's checkout lives, and it could not honour it
     // if it wanted to: the file it creates is inside its own scratch directory.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
 
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.sourceName = "/home/dev/checkout/src/Widget.cpp";
-    REQUIRE(Dispatch(dialer, request).Ran());
+    REQUIRE(Dispatch(fleet, request).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
@@ -459,16 +570,16 @@ TEST_CASE("The worker is told what to call its scratch file, and not where it ca
 
 TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dispatch]")
 {
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
 
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.sourceName = R"(D:\checkout\src\Widget.cpp)";
-    REQUIRE(Dispatch(dialer, request).Ran());
+    REQUIRE(Dispatch(fleet, request).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
@@ -477,16 +588,16 @@ TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dis
 
 TEST_CASE("The preprocessed source reaches the worker intact", "[dispatch]")
 {
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
 
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.preprocessed = "int answer() { return 42; }";
-    REQUIRE(Dispatch(dialer, request).Ran());
+    REQUIRE(Dispatch(fleet, request).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
@@ -500,14 +611,14 @@ TEST_CASE("A worker that accepts no codec is sent Identity", "[dispatch]")
     // The grant relays what the worker can decode. A worker offering nothing must
     // still receive something it can read, or the payload crosses the network only
     // to be refused.
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply(/*codecs=*/ {}));
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply(/*codecs=*/ {}));
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
 
     std::vector<std::string> const args { "-O2" };
-    REQUIRE(Dispatch(dialer, Request(args)).Ran());
+    REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
@@ -529,13 +640,13 @@ TEST_CASE("DecodeArgs round-trips an empty list and an empty argument", "[dispat
 {
     CHECK(DecodeArgs({}).empty());
 
-    ScriptedDialer dialer;
-    dialer.Serve(std::string { Scheduler }, GrantReply());
-    dialer.Serve(std::string { Worker }, CompileReply("OBJ"));
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
     std::vector<std::string> const args { "", "-O2" };
-    REQUIRE(Dispatch(dialer, Request(args)).Ran());
+    REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
-    auto const& toWorker = dialer.SentTo(std::string { Worker });
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());

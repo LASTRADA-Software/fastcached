@@ -8,7 +8,9 @@
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Cc
@@ -51,10 +53,21 @@ namespace
             // reactor, and the difference is a leak. Stopping the reactor would leave
             // this coroutine parked on a read nobody will ever complete; closing
             // completes it, so the task reaches its own end and frees its own frame.
-            DeadlineTimer const bound { *reactor,
-                                        reactor->Clock().Now() + budget.total,
-                                        [](void* socket) { static_cast<ISocket*>(socket)->Close(); },
-                                        client.get() };
+            //
+            // A non-positive budget arms NOTHING, which is what `FASTCACHE_TIMEOUT_MS=0`
+            // has always been documented to mean. Left to the arithmetic it would put
+            // the deadline at `Now()` and abort every exchange on the reactor's next
+            // turn -- a knob that reads as "turn the ceiling off" and turns the cache
+            // off instead, silently, because every caller answers a Transport failure
+            // by compiling. `std::optional` rather than a sentinel deadline: a timer
+            // that is not armed is the honest spelling of no bound.
+            std::optional<DeadlineTimer> bound;
+            if (budget.total > std::chrono::milliseconds::zero())
+                bound.emplace(
+                    *reactor,
+                    reactor->Clock().Now() + budget.total,
+                    [](void* socket) { static_cast<ISocket*>(socket)->Close(); },
+                    client.get());
 
             *out = co_await ExchangeFramed(client.get(), std::move(frame), std::move(credential));
         }
@@ -120,6 +133,32 @@ CacheOutcome RunOneExchange(std::string_view hostPort,
     // nobody resumes, which is a leaked coroutine frame.
     resolver.Stop();
     return outcome;
+}
+
+namespace
+{
+    /// The exchange that talks over real sockets.
+    ///
+    /// A reactor per exchange, not a blocking socket, and that is what the budget
+    /// rests on: `SO_RCVTIMEO` bounds one `recv`, so a worker dribbling a byte
+    /// before each expiry could hold a build forever. `RunOneExchange` arms a
+    /// `DeadlineTimer` that CLOSES the socket, which bounds the whole conversation.
+    class TcpExchange final: public IEndpointExchange
+    {
+      public:
+        [[nodiscard]] CacheOutcome Exchange(std::string_view hostPort,
+                                            std::vector<std::byte> frame,
+                                            Credential const& credential,
+                                            ExchangeBudget budget) override
+        {
+            return RunOneExchange(hostPort, std::move(frame), credential, budget);
+        }
+    };
+} // namespace
+
+std::unique_ptr<IEndpointExchange> MakeTcpExchange()
+{
+    return std::make_unique<TcpExchange>();
 }
 
 } // namespace FastCache::Cc

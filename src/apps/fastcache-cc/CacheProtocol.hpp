@@ -5,6 +5,7 @@
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -78,6 +79,31 @@ struct Credential
     {
         return !secret.empty();
     }
+};
+
+/// The two deadlines one exchange runs under.
+///
+/// Two rather than one, because they bound different things and neither implies the
+/// other -- the collapse `DialEndpoint` used to make. They are also a named struct
+/// rather than two adjacent `milliseconds` parameters, for the reason
+/// `PeerTransportOptions` gives: a reader at the call site cannot transpose
+/// `.connect` with `.total`, which two bare durations invite.
+///
+/// It lives beside `CacheOutcome` rather than beside the reactor that enforces it,
+/// because a budget is a property of the exchange and not of the machinery: the
+/// dispatch verbs run under one too, and `Dispatch.hpp` must not have to include a
+/// reactor to say so.
+struct ExchangeBudget
+{
+    /// Ceiling on opening the connection, name resolution included.
+    std::chrono::milliseconds connect { 1'000 };
+
+    /// Ceiling on the whole exchange after the dial; non-positive means unbounded.
+    ///
+    /// The launcher's first real end-to-end bound. `SO_RCVTIMEO` bounded a single
+    /// call, so a daemon dribbling a byte at a time could hold a compile forever
+    /// while never once exceeding it.
+    std::chrono::milliseconds total { 10'000 };
 };
 
 /// Send one framed request and read its reply, presenting `credential` if

@@ -104,7 +104,13 @@ namespace Wire = FastCache::CompileCacheWire;
 
 // --- config ----------------------------------------------------------------
 
-/// Default per-call socket deadline, overridable with FASTCACHE_TIMEOUT_MS.
+/// Default deadline for one whole CACHE exchange, overridable with
+/// FASTCACHE_TIMEOUT_MS.
+///
+/// Impatient on purpose: a daemon answers a FETCH or a STORE out of memory, so one
+/// that has not finished in ten seconds is one this build is better off without.
+/// That is what keeps a miss cheap. It is deliberately NOT what bounds a remote
+/// compile -- see `Cc::DefaultDispatchTotal` and issue #223.
 constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
 
 /// Default ceiling on OPENING a connection, name resolution included.
@@ -138,10 +144,15 @@ struct Config
     /// invocation presents the same thing — and so there is exactly one place
     /// that decides whether this build authenticates at all.
     Cc::Credential credential;
-    /// Per-call deadline for every blocking send/recv against the daemon. The
-    /// default keeps a wedged daemon from hanging a build while staying far
+    /// Deadline for one whole exchange with the daemon or the scheduler. The
+    /// default keeps a wedged peer from hanging a build while staying far
     /// above any healthy round-trip, including multi-megabyte objects.
     std::chrono::milliseconds ioTimeout { DefaultIoTimeout };
+    /// Deadline for one whole COMPILE exchange with a worker, which is bounded by
+    /// how long a compiler runs rather than by a round trip. Separate from
+    /// `ioTimeout` because the two are different shapes of conversation and one
+    /// number served neither (#223).
+    std::chrono::milliseconds dispatchTimeout { Cc::DefaultDispatchTotal };
     std::chrono::milliseconds connectTimeout { DefaultConnectTimeout };
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
@@ -245,6 +256,7 @@ struct Config
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
+    c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
     c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
@@ -571,6 +583,23 @@ void ReplayStreams(std::string_view out, std::string_view err)
 [[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
 {
     return Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.ioTimeout };
+}
+
+/// The deadlines this invocation runs a dispatch under.
+///
+/// The scheduler's control verbs take the cache's budget, because they are the same
+/// shape of conversation -- a short reply out of the scheduler's own tables. The
+/// worker's COMPILE takes its own, because the worker writes nothing until the
+/// compiler has finished, so the client sits in one read for the whole compile and
+/// the cache's ten seconds abandoned every translation unit worth distributing
+/// (#223).
+/// @param cfg The launcher's configuration.
+/// @return The budgets.
+[[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
+{
+    return Cc::DispatchBudgets { .control = BudgetOf(cfg),
+                                 .compile =
+                                     Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.dispatchTimeout } };
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
@@ -1373,14 +1402,15 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
-    auto const dialer = Cc::MakeTcpDialer(cfg.connectTimeout, cfg.ioTimeout);
-    auto const outcome = Cc::Dispatch(*dialer,
+    auto const exchange = Cc::MakeTcpExchange();
+    auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = identity.fingerprint,
                                                             .objectKey = key,
                                                             .args = *args,
                                                             .preprocessed = preprocessRun.out,
                                                             .sourceName = cmd.source },
+                                      DispatchBudgetsOf(cfg),
                                       cfg.credential);
     if (!outcome.Ran())
     {

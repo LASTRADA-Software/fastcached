@@ -335,6 +335,33 @@ the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out.
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
+`FASTCACHE_DISPATCH_TIMEOUT_MS` is how long the client will wait for one remote
+compile, dial to last byte. It defaults to **600000** (ten minutes) and is
+deliberately not the cache's `FASTCACHE_TIMEOUT_MS`: a worker writes nothing
+until the compiler has finished, so the client waits out the whole compile in a
+single read, and while the two shared one number every translation unit taking
+longer than ten seconds was abandoned and rebuilt locally — precisely the ones
+worth distributing ([#223](https://github.com/LASTRADA-Software/fastcached/issues/223)).
+Ten minutes because that is `LeaseTable`'s own lease timeout: waiting longer
+means waiting on a lease the scheduler has already reclaimed.
+
+The launcher is one process per translation unit, so this is a **runtime**
+setting — export a new value and the next compile uses it. Nothing reloads and
+nothing restarts. Raise it if a single translation unit legitimately compiles for
+longer than ten minutes; lower it only knowing that it is a flat ceiling, so it is
+also how long a genuinely dead worker takes to be noticed.
+
+!!! warning "What a client that runs out of budget costs"
+
+    It hands the lease back and compiles locally, so the build succeeds and the key
+    is **not** pinned for the scheduler's lease timeout. But the worker is never
+    told: it finishes the compile and writes back an object nobody reads, so that
+    CPU is spent twice and the fleet's `worker_jobs_completed_total` still counts
+    the job. Telling *"still working"* from *"gone"* needs the worker to say so
+    periodically, which is a wire change tracked as
+    [#245](https://github.com/LASTRADA-Software/fastcached/issues/245); until then
+    the deadline is generous rather than tight, for exactly that reason.
+
 !!! danger "Do not set `FASTCACHE_TOKEN` on a client that dispatches"
 
     A node's scheduler, compile and cache ports serve no `AUTH` verb, so a
