@@ -1956,3 +1956,26 @@ TEST_CASE("A path-valued flag is deliberately not in that column", "[node][confi
     REQUIRE(utf8.has_value());
     CHECK_FALSE(utf8->cacheDir.empty());
 }
+
+TEST_CASE("The drain bound is an operator's to set, zero included", "[node][config]")
+{
+    // A flag rather than a constant, because the right value is how long THIS site's
+    // compiles legitimately run -- and a compile-time answer on a binary whose
+    // `--install-service` replays its command line forever is one nobody can move
+    // afterwards (#239).
+    CHECK(NodeConfig {}.drainTimeoutSeconds == 30);
+
+    auto const set = ParseNodeArgv({ "--drain-timeout=90" });
+    REQUIRE(set.has_value());
+    CHECK(set->drainTimeoutSeconds == 90);
+
+    // Zero is a real answer and a DIFFERENT one from omitting the flag: it is what
+    // this did before the bound existed, kept sayable for an operator who would
+    // rather have the supervisor decide.
+    auto const forever = ParseNodeArgv({ "--drain-timeout=0" });
+    REQUIRE(forever.has_value());
+    CHECK(forever->drainTimeoutSeconds == 0);
+
+    // Refused by the row's own grammar rather than clamped somewhere downstream.
+    CHECK_FALSE(ParseNodeArgv({ "--drain-timeout=soon" }).has_value());
+}
