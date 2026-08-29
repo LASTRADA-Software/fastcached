@@ -296,10 +296,16 @@ namespace
         "the launcher run the real compiler and report\n"
         "\"missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR\" under FASTCACHE_VERBOSE.";
 
-    /// The promise the whole launcher is built around.
+    /// The promise the whole launcher is built around, and the limit of it.
+    ///
+    /// The second sentence is here because the first one used to be read as
+    /// covering more than it says: a cache error fell back to a LOCAL compile,
+    /// dispatch included, so an unreachable cache silently switched a healthy
+    /// fleet off (issue #236).
     constexpr std::string_view FallbackNote =
-        "Any cache error falls back to a plain real compile: caching is an optimization\n"
-        "and never breaks a build.";
+        "Any cache error falls back to a real compile: caching is an optimization and\n"
+        "never breaks a build. It does not stop distribution -- a cache that is\n"
+        "unreachable or that refuses is reported, and the compile is still dispatched.";
 
 } // namespace
 

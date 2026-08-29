@@ -116,11 +116,15 @@ $scratch = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e
 
 # How many consecutive ports the run needs, counted from `$BasePort`.
 #
-# Eight, and the highest offset actually used is +7 (`$isoSchedWorker`). A block
-# rather than eight independent draws because every port below is spelled as an
+# Nine, and the highest offset actually used is +8 (`$deadCachePort`). A block
+# rather than nine independent draws because every port below is spelled as an
 # offset from the base, and that arithmetic is what a reader checks against this
 # number.
-$PortsNeeded = 8
+#
+# The last one is drawn precisely so nothing ever binds it: case 5 needs a cache
+# address that is refused rather than answered, and taking it from the block is
+# what stops it landing on a port this run is about to bind for something else.
+$PortsNeeded = 9
 
 # Find a block of `$count` consecutive ports nothing is answering on.
 #
@@ -1123,6 +1127,64 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             throw "the locally compiled fallback object does not match the reference"
         }
         Write-Host "   a mismatched worker was refused, and the build compiled locally"
+
+        # --- 5: an unreachable cache does not take the fleet with it ---------
+        #
+        # THE regression case for issue #236. `RunCached` returned on a fetch that
+        # failed at the transport, above the call site that would dispatch -- so a
+        # cache the launcher could not reach turned off distribution as well. The
+        # docs put the shared cache on a different machine from the scheduler,
+        # which makes those two independent failure domains, and the less important
+        # one was load-bearing for the more important one: a mistyped
+        # FASTCACHE_ADDR sent every build on the estate local while the fleet sat
+        # idle and healthy, with a green build throughout.
+        #
+        # `$deadCachePort` comes out of the port block and is never bound, so the
+        # connect is REFUSED rather than black-holed: what is under test is the
+        # control flow after a transport failure, not how long one takes to notice.
+        $deadCachePort = $BasePort + 8
+        $deadRoot = Join-Path $scratch "deadcache-proj"
+        $deadSrc  = New-Source $deadRoot "$cc-dist-case-deadcache"
+        $deadRef  = Join-Path $deadRoot "build\reference.obj"
+        $deadObj  = Join-Path $deadRoot "build\u.obj"
+        # Compiled to the launcher's own output path and moved aside, as the cases
+        # above do: `cl` records that path inside the object.
+        & $cc /nologo /c "/Fo$deadObj" $deadSrc | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "the case 5 reference compile failed" }
+        Move-Item -LiteralPath $deadObj -Destination $deadRef -Force
+
+        $r = Invoke-Dispatching $cc $deadRoot $deadObj "127.0.0.1:$dispatchPort" $deadCachePort
+        if ($r.code -ne 0) { Write-Host $r.stderr; throw "the build did not survive an unreachable cache" }
+        if ($r.stderr -notmatch "DISPATCHED to ") {
+            Write-Host $r.stderr
+            Write-Host "--- worker log ---"
+            Write-Host (Read-LiveText $workerLog)
+            throw "an unreachable cache stopped the compile from being dispatched"
+        }
+        # The cache failure is still SAID, and said as a cache failure. Reaching
+        # the dispatch path must not turn an unreachable daemon into something an
+        # operator cannot see -- `--show-stats` ranks this reason.
+        if ($r.stderr -notmatch [regex]::Escape("cache unavailable (fetch exchange failed)")) {
+            Write-Host $r.stderr
+            throw "an unreachable cache was not reported as one"
+        }
+        # And not as a miss, which would clear that reason and make a broken cache
+        # read as a cold one.
+        if ($r.stderr -match "fastcache-cc: MISS") {
+            Write-Host $r.stderr
+            throw "a cache that never answered was traced as a miss"
+        }
+        # Nothing is pushed at a daemon that did not answer the fetch: before this
+        # case a failed fetch returned, so the store was never reached, and
+        # carrying on must not turn one connect per invocation into two.
+        if ($r.stderr -match "STORED key=") {
+            Write-Host $r.stderr
+            throw "an object was offered to a cache that never answered"
+        }
+        if (-not (Test-EquivalentObject $deadRef $deadObj $rules)) {
+            throw "the object dispatched around an unreachable cache is wrong"
+        }
+        Write-Host "   the fleet compiled it with the cache unreachable, and said so"
 
         Stop-Spawned
     }

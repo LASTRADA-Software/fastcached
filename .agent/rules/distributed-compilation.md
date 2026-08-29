@@ -685,6 +685,36 @@ something an operator types it names no port anyone could dial. The two rules ar
 tension, and the node's tests find a free port by binding a probe and releasing it, the
 idiom `AdminEndpoint_test` already uses.
 
+**The cache and the fleet are two failure domains, and the client must not join
+them.** `RunCached` returned on a `FETCH` that failed at the transport, and that
+`return` sat above the call site that would dispatch — so a cache the launcher could
+not reach turned distribution off with it. Every property this repository cares
+about held while it did: the build succeeded, the object was correct, the exit code
+was zero, and one `FASTCACHE_VERBOSE` line said the cache was unavailable, which is
+true and is not the interesting half. On a forty-machine estate a mistyped
+`FASTCACHE_ADDR` made every build local while the fleet sat idle and healthy
+(issue #236). The rule is that **a fetch outcome decides one thing only: whether the
+daemon is worth sending a second command to** (`Cc::CacheIsServing`). It does not
+decide whether the invocation continues, because the docs put the shared cache on a
+different machine from the scheduler and an answer about one is not an answer about
+the other. Three parts of that are each load-bearing:
+
+- **A refusal and a transport failure stay distinguishable, and both carry on.** The
+  daemon's own code and words go in the fall-back reason for a refusal, `fetch
+  exchange failed` for a transport failure, because an operator fixes those in
+  different places. What they have in common is only that neither is an answer about
+  the fleet.
+- **The reason is still recorded, under `Outcome::Unavailable`.** Reaching the
+  dispatch path must not make a broken cache invisible — so the MISS trace is
+  *skipped* when the daemon did not answer, since tracing one clears the reason
+  `--show-stats` ranks and reports a broken cache as a cold one.
+- **The `STORE` is skipped when the fetch was not answered, and that is not an
+  optimisation but a restoration.** Before the fix a failed fetch returned and no
+  store was ever attempted, so a dead cache cost exactly one connect per invocation.
+  Carrying on must not quietly make that two — which on a remote address is two
+  connect *timeouts*, per translation unit, and on a refusing daemon is an
+  object-sized transfer paid to be told the same thing again.
+
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node
 looks redundant — it is not, because a developer who rebuilds one tree twenty times a

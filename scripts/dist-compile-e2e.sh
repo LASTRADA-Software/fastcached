@@ -946,5 +946,62 @@ if (( blackhole_elapsed > 60 )); then
 fi
 echo "   both clients were served behind an unreachable upstream (${blackhole_elapsed}s)"
 
+# --- case 12: an unreachable cache does not take the fleet with it -------------
+#
+# THE regression case for issue #236. `RunCached` returned on a fetch that failed
+# at the transport, above the call site that would dispatch -- so a cache the
+# launcher could not reach turned off distribution as well. The docs put the
+# shared cache on a different machine from the scheduler, which makes those two
+# independent failure domains, and the less important one was load-bearing for the
+# more important one: on an estate of forty machines a mistyped FASTCACHE_ADDR
+# sent every build local while the fleet sat idle and healthy, with a green build
+# and nothing in the log but one line about the cache.
+#
+# A port drawn and never bound, so the connect is REFUSED rather than black-holed:
+# what is under test is the control flow after a transport failure, not how long
+# one takes to notice. Case 11 above covers the black hole, on the node's side.
+echo "== case 12: an unreachable cache still dispatches"
+
+write_source "${proj}/twelve.cpp" "casetwelve"
+"$compiler" -std=c++17 -O1 -c "${proj}/twelve.cpp" -o "${proj}/build/twelve-ref.o" \
+    || fail "the case 12 reference compile failed"
+
+dead_cache_port="$(free_port)"
+(
+    export FASTCACHE_ADDR="127.0.0.1:${dead_cache_port}"
+    export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
+    run_launcher "${workdir}/case12.log" -std=c++17 -O1 -c "${proj}/twelve.cpp" -o "${proj}/build/twelve.o"
+) || { cat "${workdir}/case12.log" >&2; fail "the build did not survive an unreachable cache"; }
+
+grep -q "DISPATCHED to " "${workdir}/case12.log" \
+    || {
+        cat "${workdir}/case12.log" >&2
+        echo "--- worker log ---" >&2
+        cat "${workdir}/worker.log" >&2
+        fail "an unreachable cache stopped the compile from being dispatched"
+    }
+
+# The cache failure is still SAID, and said as a cache failure. Reaching the
+# dispatch path must not turn an unreachable daemon into something an operator
+# cannot see: `--show-stats` ranks this reason, and a build that quietly stopped
+# caching is the defect this line exists to prevent.
+grep -q "cache unavailable (fetch exchange failed)" "${workdir}/case12.log" \
+    || { cat "${workdir}/case12.log" >&2; fail "an unreachable cache was not reported as one"; }
+
+# And it is not reported as a miss. A MISS trace would clear the reason above and
+# make a broken cache read as a cold one.
+grep -q "fastcache-cc: MISS" "${workdir}/case12.log" \
+    && { cat "${workdir}/case12.log" >&2; fail "a cache that never answered was traced as a miss"; }
+
+# Nothing is pushed at a daemon that did not answer the fetch. Before this case a
+# failed fetch returned, so the store was never reached; carrying on must not turn
+# one connect per invocation into two.
+grep -q "STORED key=" "${workdir}/case12.log" \
+    && { cat "${workdir}/case12.log" >&2; fail "an object was offered to a cache that never answered"; }
+
+cmp -s "${proj}/build/twelve-ref.o" "${proj}/build/twelve.o" \
+    || fail "the object dispatched around an unreachable cache is wrong"
+echo "   the fleet compiled it with the cache unreachable, and said so"
+
 echo
 echo "dist-compile E2E PASSED"

@@ -270,6 +270,39 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
     }
 }
 
+TEST_CASE("Only a daemon that answered is one worth sending a second command to")
+{
+    // The two halves of issue #236's fix, stated as one predicate. A daemon that
+    // answered -- with the value or without it -- is serving; a daemon that
+    // refused the command or was never reached is not, and pushing an encoded
+    // object at it afterwards spends megabytes to be told the same thing again.
+    //
+    // What this must NOT be read as is "the invocation is over". Every one of
+    // these four leaves the launcher holding a key and a preprocessed translation
+    // unit, and the compile fleet is a different service on a different machine;
+    // `RunCached` returning on the last two is what let a mistyped FASTCACHE_ADDR
+    // turn a whole estate's builds local while the fleet sat idle and healthy.
+    SECTION("an answer about the key, with or without a value")
+    {
+        CHECK(CacheIsServing(CacheOutcomeKind::Hit));
+        CHECK(CacheIsServing(CacheOutcomeKind::Miss));
+    }
+
+    SECTION("no answer about the key at all")
+    {
+        CHECK_FALSE(CacheIsServing(CacheOutcomeKind::Rejected));
+        CHECK_FALSE(CacheIsServing(CacheOutcomeKind::Transport));
+    }
+
+    SECTION("the default-constructed outcome is not serving")
+    {
+        // `CacheOutcome` defaults to `Transport` precisely so a code path that
+        // forgot to fill one in fails safe. The predicate has to agree, or a
+        // never-completed exchange would be offered a store.
+        CHECK_FALSE(CacheIsServing(CacheOutcome {}.kind));
+    }
+}
+
 TEST_CASE("The store-size limit declines the pathological value and nothing else")
 {
     // A compiler cache must never fail a build, so the ceiling's job is to skip

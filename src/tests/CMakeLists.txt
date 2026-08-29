@@ -467,6 +467,14 @@ set_tests_properties("compile-cache-daemon-staging" PROPERTIES
 # driver's own language default, graceful stop -- is platform-neutral code already
 # pinned by unit tests.
 #
+# The one exception, and the reason that last clause is the load-bearing half: the
+# unreachable-cache case (issue #236) is asserted on BOTH platforms, because what
+# it pins is control flow in `RunCached`, and `main.cpp` is in no test target at
+# all. There is no unit test standing behind it, so a fixture that exists on one
+# platform pins nothing for somebody editing that function on the other. A case is
+# duplicated when the thing it guards has no other guard -- not when it is merely
+# convenient to repeat.
+#
 # "Equivalent" and not "byte-identical" on Windows, and that difference is
 # measured: both MSVC drivers stamp the clock into the COFF header, and `cl`
 # additionally records the absolute path of the OBJECT inside the object, so a
