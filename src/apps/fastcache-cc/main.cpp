@@ -1569,9 +1569,7 @@ void RecordManifest(Config const& cfg,
 [[nodiscard]] std::optional<int> RunCached(Config const& cfg, Cc::ParsedCommand cmd, std::span<std::string const> argv)
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
-    {
         return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
-    }
 
     // One layout, and it is the build system's own spelling — every consumer of it
     // below either tokenizes against it or emits from it, and both want that form.
@@ -1699,9 +1697,7 @@ void RecordManifest(Config const& cfg,
     {
         auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
-        {
             return Warn("preprocess failed");
-        }
 
         // Skip translation units that reference a time/date macro. `__TIME__` /
         // `__DATE__` / `__TIMESTAMP__` expand to a run-varying (second-granular)
@@ -1712,9 +1708,7 @@ void RecordManifest(Config const& cfg,
         // TU is the overwhelmingly common case; header-introduced use is rare and
         // its only cost is a permanent miss, never incorrectness.
         if (SourceReferencesVolatileMacro(cmd.source))
-        {
             return Decline("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
-        }
 
         // The dependency set is reduced to its portable form before it reaches the
         // key: canonical tokens only, sorted and deduplicated, with toolchain paths
@@ -1853,9 +1847,7 @@ void RecordManifest(Config const& cfg,
             // dependencies for this TU and stop rebuilding it when they change.
             auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory);
             if (materialized.disposition == HitDisposition::Unusable)
-            {
                 return Warn("could not write object on hit");
-            }
             if (materialized.disposition == HitDisposition::Served)
             {
                 invocation.valueBytes = decoded->objectBlob.size();
