@@ -996,17 +996,37 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
           .open = false,
           .nodeId = {},
           .says = "--fleet-member" },
-        // And on a node running consensus it must NOT name that flag: there the
-        // agreed member set replaces the listed one, so `--fleet-member` is the
-        // bootstrap answer alone and an operator sent to add it has been sent to add
-        // something the cluster is about to overwrite. What consensus never supplies
-        // is a client machine, which is no cluster peer -- hence `--fleet-open`.
-        { .what = "no policy, with consensus running",
+        // A node running consensus is about to admit hosts nobody typed, so a line
+        // reading as a final answer would mislead -- but both flags are still named,
+        // because the agreed member set ADDS to the listed one rather than replacing
+        // it (#251). `--fleet-member` therefore keeps working on such a node, and it
+        // is the only route by which a client machine, which is no cluster peer, is
+        // admitted at all.
+        { .what = "no policy, with consensus running, says the cluster will supply members",
           .members = {},
           .open = false,
           .nodeId = "n1",
-          .says = "--fleet-open",
-          .saysNot = "--fleet-member" },
+          .says = "the cluster's members",
+          // And never the unclustered phrase: "this machine only" is a final answer,
+          // and on a node whose cluster is about to agree a member set it is wrong.
+          .saysNot = "this machine only" },
+        { .what = "no policy, with consensus running, still names --fleet-member",
+          .members = {},
+          .open = false,
+          .nodeId = "n1",
+          .says = "--fleet-member" },
+        { .what = "no policy, with consensus running, still names --fleet-open",
+          .members = {},
+          .open = false,
+          .nodeId = "n1",
+          .says = "--fleet-open" },
+        // And a node that HAS a list says the cluster adds to it, so an operator
+        // reading a bare count does not conclude that is the whole policy.
+        { .what = "a member list, with consensus running",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .nodeId = "n1",
+          .says = "the cluster's members" },
         { .what = "a member list",
           .members = { "10.0.0.1:6676", "10.0.0.2:6676" },
           .open = false,

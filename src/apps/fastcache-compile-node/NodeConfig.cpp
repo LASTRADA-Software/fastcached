@@ -1032,18 +1032,23 @@ std::string AdmissionSummary(NodeConfig const& cfg)
     if (cfg.fleetOpen)
         return "every caller admitted";
     if (cfg.fleetMembers.empty())
-        // The remedy is split on whether consensus runs, because on a node that does
-        // `--fleet-member` is the BOOTSTRAP answer only: the agreed member set
-        // replaces the listed one the moment the cluster decides anything, so a line
-        // that named both flags unconditionally would send a clustered operator to
-        // add the one whose effect is about to be overwritten. What such a node
-        // still has to be told is the half consensus does NOT supply -- a client
-        // machine is not a cluster peer, so admitting one is `--fleet-open`'s job.
+        // Split on whether consensus runs, because a clustered node is about to
+        // admit hosts nobody typed and a line that ignored that would be read as a
+        // final answer. Both remedies are still named: the agreed member set ADDS to
+        // what an operator listed rather than replacing it (#251), so
+        // `--fleet-member` is worth giving on a clustered node too -- it is the only
+        // route by which a machine that is not a cluster peer is admitted at all.
         return cfg.nodeId.empty() ? std::string { "this machine only -- give --fleet-member or --fleet-open to "
                                                   "admit peers" }
-                                  : std::string { "this machine only until the cluster agrees a member set -- give "
+                                  : std::string { "this machine and the cluster's members -- give --fleet-member or "
                                                   "--fleet-open to admit callers that are not cluster peers" };
-    return std::format("this machine plus {} member host(s)", cfg.fleetMembers.size());
+
+    // One sentence with a conditional tail rather than two whole ones: written twice
+    // they drift, and a phrase an operator reads is exactly the thing nobody notices
+    // has drifted.
+    return std::format("this machine plus {} member host(s){}",
+                       cfg.fleetMembers.size(),
+                       cfg.nodeId.empty() ? "" : " and the cluster's members");
 }
 
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)

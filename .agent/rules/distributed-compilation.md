@@ -223,6 +223,46 @@ Consequences that are each load-bearing:
     and one of the documented carve-outs to configuration-at-construction: membership
     is precisely what changes while the object lives, and rebuilding the oracle per
     join would mean handing a new one to a running server.
+  - **Cluster membership is a SOURCE of admissions, never the whole policy — one
+    list answering two questions revoked an operator's by agreeing anything.**
+    `NodeMembership::Publish`, driven from `ConsensusTier`'s state observer, replaced
+    the `--fleet-member` hosts with the cluster's member set. The two answer different
+    questions: who may spend this node's CPU and read its cache tier — which is mostly
+    **clients**, developer laptops and CI runners, machines that never join consensus
+    and never should — and who is in the cluster, which is peers only. So on any node
+    running consensus the first replicated membership commit discarded every host an
+    operator listed, and agreeing something is *routine*: a node joining, a node being
+    forgotten, a settings change. A client machine admitted by name worked right up
+    until the fleet agreed anything at all and then stopped, with no configuration
+    having changed on either machine and nothing in the log tying the two events
+    together (#251). Four things about the shape that closes it:
+    - **It is the admission-layer reading of a rule consensus already has.** *Absence
+      from `ClusterState` is not removal* — a `--raft-peer` member is in the
+      configuration and in no state, and is never proposed for removal. An operator's
+      `--fleet-member` list is the same fact one layer up, and an empty agreed member
+      set — which is what every clustered node sees before the first entry naming
+      anybody commits — must therefore take nothing away.
+    - **The union is composed at the SEAM, not inside one oracle.**
+      `AnyOfMembership` holds participants and admits whoever any of them admits;
+      `ClusterMembership` keeps its single list and its wholesale `Publish`, which is
+      right for the one question its owner gave it. The obvious alternative — teaching
+      that class to hold a table of lists keyed by where each came from — cannot hold
+      the route that is coming: a signed lease token is a *credential check* with no
+      host set to add a row to, and it **adds** to an address policy rather than
+      replacing it, because that policy is what still gates the cache tier and what an
+      operator sets on a worker taking no leases at all. An enumeration of host lists
+      would have had to be taken apart again to admit it; a participant list does not.
+    - **Which list is written is decided by the owner, not passed in.**
+      `NodeMembership` holds one `ClusterMembership` per question and `Publish` writes
+      the cluster's, so the observer consensus installs cannot name the wrong one —
+      the same defence the host/endpoint collapse gets from being done in the
+      constructor, and for the same reason: the failure is silent. The participants are
+      borrowed, which is safe only because that type owns them, is declared before the
+      composite and is neither copyable nor movable.
+    - **`AdmissionSummary` had encoded the defect as advice.** It refused to name
+      `--fleet-member` on a clustered node, on the reasoning that the flag was about to
+      be overwritten — which was true and was the bug. A line that steers an operator
+      around a defect is one more thing to correct when the defect is fixed.
 - **A dispatched compile is bounded by how long a COMPILER runs; a cache exchange
   by a round trip. One number cannot be both.** The launcher armed a single deadline
   on every exchange it made and handed the dispatch dialler the cache's -- ten

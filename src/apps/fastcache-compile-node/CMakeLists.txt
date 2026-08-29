@@ -91,6 +91,7 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream.cpp
         NodeConfig.cpp
         NodeConfig_test.cpp
+        NodeMembership_test.cpp
         NodeToolchains.cpp
         NodeToolchains_test.cpp
         FrameEndpoint.cpp

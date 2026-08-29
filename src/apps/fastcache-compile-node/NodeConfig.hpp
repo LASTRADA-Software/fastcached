@@ -174,6 +174,11 @@ struct NodeConfig
     /// port, so an endpoint is not something a connection can be matched against. The
     /// endpoint form is accepted because it is what discovery produces and what an
     /// operator has written down.
+    ///
+    /// Kept for the process's life on a clustered node too: consensus ADDS its member
+    /// set to what is listed here rather than replacing it, because this list is how a
+    /// machine that never joins consensus -- a developer's laptop, a CI runner -- is
+    /// admitted at all (#251).
     std::vector<std::string> fleetMembers;
 
     /// Where this node keeps its own cache tier, or empty for memory only.
@@ -621,10 +626,12 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// `--listen-scheduler` with no policy is refused at startup -- so it costs its line
 /// nothing.
 ///
-/// *Which* flag it names depends on whether `--node-id` turned consensus on, because
-/// there `--fleet-member` is the bootstrap answer only and the agreed member set
-/// replaces it; what consensus never supplies is a client machine, which is not a
-/// cluster peer, so `--fleet-open` is the remedy that survives on such a node.
+/// *What* it says depends on whether `--node-id` turned consensus on, because such a
+/// node is about to admit hosts nobody typed and a line reading as a final answer
+/// would mislead. Both remedies are named either way: the agreed member set ADDS to
+/// what an operator listed rather than replacing it (#251), so `--fleet-member` is a
+/// working answer on a clustered node too -- and it is the only route by which a
+/// client machine, which is no cluster peer, is admitted at all.
 /// @param cfg The parsed configuration.
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);

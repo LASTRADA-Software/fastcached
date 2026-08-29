@@ -270,15 +270,15 @@ whose clients may dispatch here, and everyone else stays refused. The list is
 matched by **host**: a client dials from an ephemeral source port, so there is no
 port for an endpoint to be compared against.
 
-!!! warning "On a node running consensus, `--fleet-member` is the bootstrap answer only"
+!!! note "On a node running consensus, the cluster's members are admitted as well"
 
-    Once a cluster forms, the agreed member set **replaces** that list on every
-    node — see [membership at
-    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A client
-    machine is not a cluster peer, so a laptop admitted by `--fleet-member` stops
-    being admitted the moment the cluster agrees anything. On a clustered fleet,
-    admit clients with `--fleet-open` behind a firewalled build network, and keep
-    `--fleet-member` for the pre-cluster deployments it is the answer for.
+    The agreed member set **adds** to `--fleet-member` rather than replacing it —
+    see [membership at
+    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A cluster
+    member is a peer; a client machine is not and never will be, so
+    `--fleet-member` stays the way to admit a laptop or a CI runner on a clustered
+    fleet just as on a standalone node. `--fleet-open` remains the answer where the
+    build network is already your boundary.
 
 The worker then surveys the machine at startup and serves every compiler it
 finds, naming each one and the layout it came from:
@@ -610,10 +610,12 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
 **Membership is what protects a fleet today, and it is the only thing that does.**
 A node is closed by default: its compile port, its scheduler and its own cache tier
 all admit **this machine and `--fleet-member` peers only** (or every caller, once
-you say `--fleet-open`). Once a cluster exists, the agreed member set replaces that
-list and all three surfaces follow it. That matters most for the compile port,
-which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
-would otherwise have your machine run their compiler on source they chose.
+you say `--fleet-open`). Once a cluster exists, the agreed member set is **added** to
+that list rather than replacing it, and all three surfaces follow the union — so a
+host stops being admitted only when the operator stops listing it. That matters most
+for the compile port, which binds `0.0.0.0` because peers have to dial it — anybody
+who could route to it would otherwise have your machine run their compiler on source
+they chose.
 
 --8<-- "node-credential-gap.md"
 

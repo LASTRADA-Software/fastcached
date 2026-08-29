@@ -102,6 +102,54 @@ TEST_CASE("An open deployment admits everyone, and says so by name", "[distribut
     CHECK(open.Classify("") == Membership::Member);
 }
 
+TEST_CASE("Admission is a union, so one route publishing does not revoke another", "[distributed][membership]")
+{
+    // Issue #251. Two lists answering two different questions -- who may spend this
+    // node's CPU (clients included: a developer's laptop, a CI runner, machines that
+    // never join consensus and never should) and who is in the cluster (peers only)
+    // -- were one list, so the first replicated membership commit discarded
+    // everything an operator had listed. And agreeing something is routine.
+    ClusterMembership listed { { "10.0.0.1:7000" } };
+    ClusterMembership agreed;
+    AnyOfMembership const admitted { { &listed, &agreed } };
+
+    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
+    CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
+
+    agreed.Publish({ "10.0.0.2:7000" });
+
+    // Each route is still replaced wholesale by whoever owns it, and neither
+    // publisher speaks for the other.
+    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
+    CHECK(admitted.Classify("10.0.0.2") == Membership::Member);
+
+    // Adding a route must not add an admission.
+    CHECK(admitted.Classify("10.0.0.9") == Membership::Outsider);
+
+    // The same rule at its limit: a route that publishes an empty set -- which is
+    // what a clustered node sees before the first entry naming anybody commits --
+    // takes nothing away from the others. That is the admission-layer spelling of a
+    // rule consensus already applies: absence from `ClusterState` is not removal.
+    agreed.Publish({});
+    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
+    CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
+}
+
+TEST_CASE("A composite with no participants refuses everybody", "[distributed][membership]")
+{
+    // The direction this default has to fail in, and the same one every other default
+    // in this file takes: a node whose routes have not been wired must not become an
+    // open scheduler. `OpenMembership` is how "admit everybody" is said out loud.
+    AnyOfMembership const admitted { {} };
+
+    CHECK(admitted.Classify("10.0.0.1") == Membership::Outsider);
+
+    // Not even loopback, because a composite has no policy of its own -- the
+    // this-machine rule belongs to the participants that have one, and inventing it
+    // here would make an unwired composite quietly useful instead of visibly wrong.
+    CHECK(admitted.Classify("127.0.0.1") == Membership::Outsider);
+}
+
 TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][membership][scheduler]")
 {
     // The two halves joined: the oracle answers who, `SchedulerService` decides

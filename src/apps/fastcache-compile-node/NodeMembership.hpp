@@ -13,7 +13,7 @@ namespace FastCache::Node
 
 /// This node's one answer to "who is this caller to us".
 ///
-/// Owns both oracles and hands out whichever the operator chose, so that **every**
+/// Owns every oracle and hands out whichever the operator chose, so that **every**
 /// surface asks the same object. That is the whole point of the type existing rather
 /// than each tier building its own: the scheduler decides who may spend the fleet's
 /// CPU and the cache decides who may read this machine's objects, and a node that
@@ -24,6 +24,21 @@ namespace FastCache::Node
 /// a cache surface with no scheduler at all: the oracle used to live inside
 /// `SchedulerTier`, which made the cache's access policy depend on whether this node
 /// happened to be scheduling.
+///
+/// ## Two lists, because there are two questions
+///
+/// `--fleet-member` says who may spend this node's CPU and read its cache tier, and
+/// that includes machines which are not cluster peers and never will be: a
+/// developer's laptop, a CI runner, anything running `fastcache-cc` against the
+/// fleet. The cluster's agreed member set says who is in the cluster. Answering both
+/// with one list meant the first replicated membership commit discarded everything an
+/// operator had listed, and agreeing something is routine -- a node joining, a node
+/// being forgotten, a settings change (#251).
+///
+/// So this owns one `ClusterMembership` per question and composes them, rather than
+/// letting either publisher speak for the other. Each is still replaced wholesale by
+/// whoever owns it, which is right: a publisher holds the whole truth about *its*
+/// question.
 class NodeMembership
 {
   public:
@@ -31,6 +46,10 @@ class NodeMembership
     explicit NodeMembership(NodeConfig const& cfg):
         _open {},
         _listed { cfg.fleetMembers },
+        _cluster {},
+        // Pointers into this object's own members, which is safe because the type is
+        // neither copyable nor movable and the composite is declared after both.
+        _admitted { { &_listed, &_cluster } },
         _isOpen { cfg.fleetOpen }
     {
     }
@@ -41,29 +60,35 @@ class NodeMembership
     NodeMembership& operator=(NodeMembership&&) = delete;
     ~NodeMembership() = default;
 
-    /// Replace the listed member set with what the cluster agreed.
+    /// Record what the cluster agreed, alongside what the operator listed.
     ///
     /// The seam consensus drives, and it does nothing under `--fleet-open` -- which
     /// is right rather than an oversight: that flag says "admit everybody", and a
     /// replicated member set narrows nothing an operator has already opened.
     ///
-    /// `--fleet-member` is the BOOTSTRAP answer and this is the running one, so a
-    /// node admitted at runtime is served without anybody editing a config file on
-    /// every other machine. Safe to call from the consensus thread while surfaces
-    /// classify callers on theirs.
+    /// It writes the cluster's list and only that, so `--fleet-member` survives every
+    /// commit. Which list is written is decided here rather than passed in, so the
+    /// observer consensus installs cannot name the wrong one. A node admitted at
+    /// runtime is still served without anybody editing a config file on every other
+    /// machine, which is what this seam was for; it simply no longer costs the
+    /// operator's own answer to get that.
+    ///
+    /// Safe to call from the consensus thread while surfaces classify callers on
+    /// theirs.
     /// @param endpoints The cluster's members, as `host:port`.
     void Publish(std::vector<std::string> const& endpoints)
     {
-        _listed.Publish(endpoints);
+        _cluster.Publish(endpoints);
     }
 
     /// The oracle every surface on this node consults.
     ///
     /// The open one is only ever the operator's stated choice: `--fleet-open` is a
     /// flag rather than what an unset field decays to, so nothing here guesses its
-    /// way into serving strangers. Everything else is the listed one, which for a
-    /// node that named no members admits this machine and refuses the network --
-    /// the safe default rather than a misconfiguration.
+    /// way into serving strangers. Everything else is the union of the two lists,
+    /// which for a node that named no members and has agreed nothing admits this
+    /// machine and refuses the network -- the safe default rather than a
+    /// misconfiguration.
     ///
     /// That default is exactly what a WORKER must be able to leave behind. It could
     /// not until #235: the startup table refused `--fleet-member` on any node
@@ -73,12 +98,22 @@ class NodeMembership
     [[nodiscard]] Distributed::IMembershipOracle const& Oracle() const noexcept
     {
         return _isOpen ? static_cast<Distributed::IMembershipOracle const&>(_open)
-                       : static_cast<Distributed::IMembershipOracle const&>(_listed);
+                       : static_cast<Distributed::IMembershipOracle const&>(_admitted);
     }
 
   private:
     Distributed::OpenMembership _open;
+
+    /// What `--fleet-member` named. Fixed for this process's life, and the only
+    /// route by which a machine that is not a cluster peer is admitted at all.
     Distributed::ClusterMembership _listed;
+
+    /// What the cluster agreed, replaced on every committed membership change.
+    Distributed::ClusterMembership _cluster;
+
+    /// The union the surfaces actually consult. Declared after both participants,
+    /// which it borrows.
+    Distributed::AnyOfMembership _admitted;
 
     /// Whether `--fleet-open` was given.
     ///

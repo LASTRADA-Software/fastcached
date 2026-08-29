@@ -801,9 +801,11 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
                 schedulerTier->SetRole(role, leaderEndpoint);
         },
         [&membership](std::vector<std::string> const& endpoints) {
-            // The replicated member set becomes the fleet's admission policy, so a
-            // node the cluster agreed to admit is served by every surface at once.
-            // `--fleet-member` is the bootstrap answer; this is the running one.
+            // The replicated member set joins the fleet's admission policy, so a node
+            // the cluster agreed to admit is served by every surface at once. It does
+            // not *become* that policy: `--fleet-member` answers a different question
+            // -- who may spend this node's CPU, clients included -- and survives every
+            // commit (#251).
             membership.Publish(endpoints);
         },
         logger);
