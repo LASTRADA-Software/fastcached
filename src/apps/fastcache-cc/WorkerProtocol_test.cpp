@@ -4,6 +4,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -329,44 +330,40 @@ TEST_CASE("An envelope refusal's wire code and its message are one fact", "[work
     CHECK(WireCodeFor(EnvelopeError::DeclaredTooLarge) == Wire::ErrorCode::PayloadTooLarge);
     CHECK(WireCodeFor(EnvelopeError::Corrupt) == Wire::ErrorCode::MalformedFrame);
 
-    // Every reason says something, and no two say the same thing -- a description
-    // shared between reasons is one an operator cannot act on.
-    std::vector<std::string_view> seen;
-    for (auto const reason: { EnvelopeError::Malformed,
-                              EnvelopeError::UnsupportedCodec,
-                              EnvelopeError::DeclaredTooLarge,
-                              EnvelopeError::Corrupt })
+    // Everything below walks the enum's own count rather than a list written out
+    // here. A hand-written list is the guard shape `RowsInEnumeratorOrder` exists to
+    // reject: append a fifth `EnvelopeError` and a four-element list keeps checking
+    // four, so the case that proves every reason is distinguishable stops covering
+    // the new one and still passes. Derived from `Last`, a fifth reason is checked
+    // the moment it exists.
+    std::vector<std::string_view> texts;
+    std::vector<IMetricsSink::Counter> counters;
+    for (auto const index: std::views::iota(std::size_t { 0 }, EnumeratorCount<EnvelopeError>))
     {
+        auto const reason = static_cast<EnvelopeError>(index);
+
+        // Every reason says something, and no two say the same thing -- a description
+        // shared between reasons is one an operator cannot act on.
         auto const text = DescribeEnvelopeError(reason);
         CHECK_FALSE(text.empty());
-        CHECK(std::ranges::find(seen, text) == seen.end());
-        seen.push_back(text);
-    }
+        CHECK(std::ranges::find(texts, text) == texts.end());
+        texts.push_back(text);
 
-    // The third column, and the one that shipped late: for a while these refusals
-    // had a code and a message and incremented nothing at all. No two reasons share
-    // a counter -- deliberately, even where two share a wire code -- because summing
-    // them would hide the one that is somebody probing the port behind the one that
-    // is a packaging mistake.
-    std::vector<IMetricsSink::Counter> counters;
-    for (auto const reason: { EnvelopeError::Malformed,
-                              EnvelopeError::UnsupportedCodec,
-                              EnvelopeError::DeclaredTooLarge,
-                              EnvelopeError::Corrupt })
-    {
+        // The third column, and the one that shipped late: for a while these refusals
+        // had a code and a message and incremented nothing at all. No two reasons
+        // share a counter -- deliberately, even where two share a wire code -- because
+        // summing them would hide the one that is somebody probing the port behind the
+        // one that is a packaging mistake.
         auto const counter = CounterFor(reason);
-        CHECK(counter != IMetricsSink::Counter::Last);
         CHECK(std::ranges::find(counters, counter) == counters.end());
         counters.push_back(counter);
-    }
 
-    // And each row names an *envelope* counter rather than a neighbour's. That every
-    // counter has a catalog row is a `static_assert`'s job, not a test's; what no
-    // compile-time check can see is a row built by copying the one above it and
-    // leaving `WorkerJobsRefusedNoSlot` in place -- which would export a plausible
-    // series under a reason that never happened.
-    for (auto const counter: counters)
-    {
+        // And that row names an *envelope* counter rather than a neighbour's. That
+        // every counter has a catalog row is a `static_assert`'s job, not a test's;
+        // what no compile-time check can see is a row built by copying the one above
+        // it and leaving `WorkerJobsRefusedNoSlot` in place -- which would export a
+        // plausible series under a reason that never happened. `DescriptorOf` also
+        // answers nullptr for `Last`, so this covers a row that named the count.
         auto const* const row = DescriptorOf(counter);
         REQUIRE(row != nullptr);
         INFO("counter " << row->prometheusName);
