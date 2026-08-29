@@ -235,7 +235,20 @@ numbers are kept because each one is the reason a knob is where it is.
   jobs, which reads as "the launcher was never wired in" and is not what happened:
   sccache keeps its counters **in the server**, and this suite's
   `sccache-smoke-*` tests restart that server with `SCCACHE_MEMCACHED` pointed at
-  a fastcached daemon — zeroing them, minutes before the post step reads them. The
+  a fastcached daemon — zeroing them, minutes before the post step reads them.
+
+  That is the shared-cache configuration `docs/snippets/sccache-backend-caveat.md`
+  exists for, and naming it here without saying so is what
+  `ctest -R sccache-backend-caveat` refuses: under **MSVC** and **clang-cl**
+  sccache hashes `/EP` output, which carries no paths, and replays a hit's
+  `/showIncludes` with the absolute paths of the checkout that stored it, so two
+  checkouts record each other's headers; `fastcache-cc` is the remedy, because it
+  rewrites a hit's paths into the consuming checkout and refuses a hit whose
+  replayed dependency is not there. Those smoke jobs compile with `g++-14`, where
+  the hazard does not arise at all — which is the only reason a test in this suite
+  may point sccache at a daemon.
+
+  The
   job that does not run `ctest`, `compile-cache E2E (Windows)`, reported **231
   compile requests, 2 hits, 229 misses** from the same configuration, which is both
   the proof that the launcher works and the proof that the disk cache is cold every
