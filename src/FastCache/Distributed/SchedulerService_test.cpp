@@ -67,7 +67,11 @@ struct Leading
 
     ManualClock clock;
     AtomicMetricsSink metrics;
-    SchedulerService service { clock, metrics };
+
+    /// Capturing rather than null, so the one line this service writes is readable
+    /// from any case that cares and costs the rest nothing.
+    CapturingLogger logger;
+    SchedulerService service { clock, metrics, logger };
 };
 } // namespace
 
@@ -137,7 +141,8 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     // the caller can redirect instead.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    SchedulerService service { clock, metrics };
+    NullLogger schedulerLogger;
+    SchedulerService service { clock, metrics, schedulerLogger };
 
     SECTION("an undecided node refuses, and names nobody")
     {
@@ -203,7 +208,8 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     // was never consulted. Cheapest and most certain fact first.
     ManualClock clock;
     AtomicMetricsSink metrics;
-    SchedulerService service { clock, metrics };
+    NullLogger schedulerLogger;
+    SchedulerService service { clock, metrics, schedulerLogger };
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
 
     CHECK(service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
@@ -742,4 +748,134 @@ TEST_CASE("A toolchain named in multi-byte UTF-8 registers like any other", "[di
     REQUIRE(live.size() == 1);
     CHECK(live.front().fingerprint == "gcc-14-\xC3\xA9\xE2\x82\xAC");
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed) == 0);
+}
+
+TEST_CASE("An endpoint is measured against the caller's own address, not refused", "[distributed][scheduler]")
+{
+    // Issue #242, and what lands here is the MEASUREMENT rather than a refusal --
+    // `.agent/rules/distributed-compilation.md` carries why an address comparison is
+    // both too strict to deploy and too weak to be the control. So every row below
+    // asserts the registration is still ACCEPTED; only the counting varies.
+    struct Row
+    {
+        char const* what;            ///< The shape, for the failure message.
+        char const* peer;            ///< Where the registration arrived from.
+        char const* endpoint;        ///< What it advertised.
+        std::uint64_t mismatches {}; ///< 1 when this should be counted.
+    };
+
+    auto const rows = std::to_array<Row>({
+        { .what = "the same host, with a port the caller could not have shown",
+          .peer = "10.0.0.2",
+          .endpoint = "10.0.0.2:7100",
+          .mismatches = 0 },
+        // A bare host is a legitimate spelling that `HostOfEndpoint` keeps whole.
+        // Reporting a mismatch here would accuse a worker that named its host
+        // perfectly well.
+        { .what = "a bare host with no port at all", .peer = "10.0.0.2", .endpoint = "10.0.0.2", .mismatches = 0 },
+        // Bracketed on the wire, bare from the kernel. Splitting has to strip the
+        // brackets or every IPv6 worker reports a mismatch forever.
+        { .what = "an IPv6 endpoint against the bare host a kernel reports",
+          .peer = "2001:db8::1",
+          .endpoint = "[2001:db8::1]:7100",
+          .mismatches = 0 },
+        // The mapped form is a property of how the LISTENER was bound, not of the
+        // peer; `Core/HostPort` carries why that has to be folded.
+        { .what = "a dual-stack listener's mapped spelling of the same address",
+          .peer = "::ffff:10.0.0.2",
+          .endpoint = "10.0.0.2:7100",
+          .mismatches = 0 },
+        { .what = "a mapped endpoint against an unmapped caller",
+          .peer = "10.0.0.2",
+          .endpoint = "[::ffff:10.0.0.2]:7100",
+          .mismatches = 0 },
+
+        // And the mismatches. This is the one the ticket is about: a third host,
+        // named by a caller that is neither of them.
+        { .what = "a third host entirely", .peer = "10.0.0.2", .endpoint = "10.0.0.9:7100", .mismatches = 1 },
+        // Whole-string, never a prefix -- the rule `ClusterMembership` records for
+        // the same reason: `10.0.0.2` must not pass for `10.0.0.20`.
+        { .what = "a host the caller's is a prefix of", .peer = "10.0.0.2", .endpoint = "10.0.0.20:7100", .mismatches = 1 },
+        // The shape this project's own getting-started page builds: a node
+        // registering with its own scheduler over loopback while advertising a name
+        // clients can route to. Counted, and ADMITTED -- refusing it would refuse the
+        // first fleet in the documentation.
+        { .what = "the documented first node: loopback caller, DNS-named endpoint",
+          .peer = "127.0.0.1",
+          .endpoint = "scheduler.internal:6676",
+          .mismatches = 1 },
+        // A caller this machine cannot name has not shown that its endpoint names
+        // itself, so the empty host matches nothing rather than everything.
+        { .what = "a peer whose address the kernel would not give up",
+          .peer = "",
+          .endpoint = "10.0.0.2:7100",
+          .mismatches = 1 },
+        // And the case that makes the empty-host rule load-bearing rather than
+        // incidental: under a plain string compare these two are EQUAL, so an
+        // unnameable peer would be reported as having named itself.
+        { .what = "an unnameable peer advertising nothing at all", .peer = "", .endpoint = "", .mismatches = 1 },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        Leading fleet;
+
+        auto const caller = CallerContext { .membership = Membership::Member, .peerId = row.peer };
+        CHECK(fleet.service.Register(caller, OneSlot("gcc-14", row.endpoint)).status == Wire::Status::Ok);
+
+        // Accepted means IN the fleet, not merely answered `Ok`: a worker counted and
+        // then dropped would satisfy the status check and be a refusal in everything
+        // but name.
+        CHECK(fleet.service.Workers().LiveWorkers().size() == 1);
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 1);
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkerEndpointMismatch) == row.mismatches);
+    }
+}
+
+TEST_CASE("A mismatch names both addresses, because a counter cannot", "[distributed][scheduler]")
+{
+    // The counter says the condition is happening; deciding whether a strict rule is
+    // viable needs to know WHICH worker and against what, and only a line carries
+    // that. Asserted rather than assumed because the logger is an optional seam --
+    // one nothing set would leave the counter rising with nothing able to explain it,
+    // which is the defect the seam exists to prevent.
+    Leading fleet;
+
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.9:7100")).status == Wire::Status::Ok);
+
+    auto const records = fleet.logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    // `Info`, not a warning: on a fleet advertising DNS names this is every
+    // registration and nothing is wrong, and a signal that fires permanently on
+    // correct deployments is one operators learn to filter -- so it would not be
+    // there on the day it means something. Info is the default production level, so
+    // it is still read.
+    CHECK(records.front().level == LogLevel::Info);
+    CHECK(records.front().message.contains("peer-1"));
+    CHECK(records.front().message.contains("10.0.0.9:7100"));
+
+    // It says what it is. On a fleet using DNS names this line is every registration,
+    // so one that read as an accusation would train an operator to ignore it.
+    CHECK(records.front().message.contains("#242"));
+
+    // The unnameable-peer wording, which is a second branch inside the same line and
+    // was previously written by nothing any case read.
+    fleet.logger.Clear();
+    REQUIRE(
+        fleet.service
+            .Register(CallerContext { .membership = Membership::Member, .peerId = "" }, OneSlot("gcc-16", "10.0.0.4:7100"))
+            .status
+        == Wire::Status::Ok);
+    REQUIRE(fleet.logger.Snapshot().size() == 1);
+    CHECK(fleet.logger.Snapshot().front().message.contains("an unnameable peer"));
+
+    // And a matching registration is silent, or the line means nothing.
+    fleet.logger.Clear();
+    REQUIRE(fleet.service
+                .Register(CallerContext { .membership = Membership::Member, .peerId = "10.0.0.3" },
+                          OneSlot("gcc-15", "10.0.0.3:7100"))
+                .status
+            == Wire::Status::Ok);
+    CHECK(fleet.logger.Snapshot().empty());
 }

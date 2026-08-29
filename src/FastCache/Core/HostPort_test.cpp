@@ -89,3 +89,44 @@ TEST_CASE("A bare port binds the default host rather than the wildcard", "[core]
     CHECK_FALSE(ParseEndpoint("127.0.0.1:abc", "127.0.0.1").has_value());
     CHECK_FALSE(ParseEndpoint("", "127.0.0.1").has_value());
 }
+
+TEST_CASE("An IPv4-mapped host folds to the address it maps", "[core][hostport]")
+{
+    // One machine, two spellings, and which one a caller sees depends on how the
+    // listener was BOUND rather than on anything about the peer.
+    CHECK(UnmappedHost("::ffff:10.0.0.1") == "10.0.0.1");
+    CHECK(UnmappedHost("::ffff:127.0.0.1") == "127.0.0.1");
+
+    // Anything that is not mapped comes back unchanged, `::1` included — it is a
+    // genuine IPv6 address rather than a wrapper around a v4 one.
+    CHECK(UnmappedHost("10.0.0.1") == "10.0.0.1");
+    CHECK(UnmappedHost("::1") == "::1");
+    CHECK(UnmappedHost("2001:db8::1") == "2001:db8::1");
+    CHECK(UnmappedHost("worker-01.internal") == "worker-01.internal");
+    CHECK(UnmappedHost("").empty());
+
+    // The prefix is matched whole. `::ffff` without its colon is not the mapped
+    // form, and stripping a partial one would invent an address.
+    CHECK(UnmappedHost("::ffff") == "::ffff");
+}
+
+TEST_CASE("Loopback still answers for every spelling a kernel produces", "[core][hostport]")
+{
+    // `IsLoopbackHost` is expressed through `UnmappedHost` now, so this pins that the
+    // rewrite kept every answer. It is a security decision on two surfaces — the
+    // membership oracle and the cache — and a regression here admits or refuses the
+    // wrong machine silently.
+    CHECK(IsLoopbackHost("127.0.0.1"));
+    CHECK(IsLoopbackHost("127.0.0.53"));
+    CHECK(IsLoopbackHost("::1"));
+    CHECK(IsLoopbackHost("::ffff:127.0.0.1"));
+
+    CHECK_FALSE(IsLoopbackHost("10.0.0.1"));
+    CHECK_FALSE(IsLoopbackHost("::ffff:10.0.0.1"));
+    CHECK_FALSE(IsLoopbackHost("128.0.0.1"));
+    CHECK_FALSE(IsLoopbackHost(""));
+
+    // Whatever a resolver says it is, which is not something a security decision may
+    // depend on.
+    CHECK_FALSE(IsLoopbackHost("localhost"));
+}

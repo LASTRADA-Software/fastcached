@@ -104,6 +104,23 @@ class IMetricsSink
         /// leaves on the leader -- a node whose `--toolchain` override carries a
         /// stray byte otherwise vanishes from the fleet with nothing saying why.
         DispatchWorkerRegistrationsMalformed,
+        /// Registrations **accepted** whose endpoint names a host other than the
+        /// one the registration arrived from.
+        ///
+        /// Not a refusal, and the distinction is the whole point of the counter
+        /// (#242). A registration asserts, unchecked, where work for a toolchain
+        /// should be sent, and nothing today ties that claim to the connection
+        /// carrying it -- but an exact match refuses a great many legitimate
+        /// configurations, starting with the fleet this project's own
+        /// getting-started page builds. Whether a strict rule is viable depends on
+        /// how often real deployments mismatch, which nobody currently knows. This
+        /// is the number that answers it.
+        ///
+        /// A rise is therefore not a fault to be chased. A fleet whose workers
+        /// advertise DNS names, sit behind NAT, are multi-homed or reach the
+        /// scheduler over a VPN will report every registration here and be working
+        /// perfectly.
+        DispatchWorkerEndpointMismatch,
         /// Workers dropped for having stopped heartbeating.
         ///
         /// The counterpart of `DispatchWorkerRegistrations`, and the fleet's only

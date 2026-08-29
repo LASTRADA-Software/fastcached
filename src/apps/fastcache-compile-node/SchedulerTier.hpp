@@ -106,7 +106,7 @@ class SchedulerTier
     }
 
   private:
-    SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics);
+    SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics, ILogger& logger);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.

@@ -92,6 +92,81 @@ namespace FastCache
     return static_cast<std::uint16_t>(value);
 }
 
+/// A host with the IPv4-mapped IPv6 prefix taken off, if it had one.
+///
+/// A dual-stack listener reports an IPv4 client as `::ffff:10.0.0.1`, so one
+/// machine has two spellings and which one a caller sees depends on how the
+/// listener was bound rather than on anything about the peer. Every comparison
+/// against a peer's host therefore has to fold them together first, or the answer
+/// differs between two nodes that are configured identically.
+///
+/// Spelled here rather than at each comparison, on the header's own argument: a
+/// rule with two authors is a defect rather than a coincidence.
+///
+/// Returns a view **into** @p host, so the argument must outlive the result.
+/// @param host The peer's host, without a port or brackets.
+/// @return The unmapped host, or @p host unchanged when it was not mapped.
+[[nodiscard]] inline std::string_view UnmappedHost(std::string_view host) noexcept
+{
+    constexpr std::string_view MappedPrefix = "::ffff:";
+    return host.starts_with(MappedPrefix) ? host.substr(MappedPrefix.size()) : host;
+}
+
+/// The host part of an endpoint, keeping a bare host whole.
+///
+/// The other half of comparing an advertised endpoint against a peer, and the same
+/// argument puts it here: this rule already had three authors before it was named
+/// -- `ClusterMembership::Publish`, `AdvertisesWildcard`, and the scheduler's
+/// endpoint check (#242) -- each re-deriving that an endpoint which will not split
+/// is a legitimate bare host rather than a parse failure. Dropping such a host
+/// instead is how a member the set cannot represent silently stops being one.
+///
+/// A **view**, unlike `SplitHostPort`, which materialises two `std::string`s: a
+/// caller that only wants the host was allocating twice per call to read one of
+/// them back out, and the port it paid for is the one thing a peer's address never
+/// carries.
+///
+/// Returns a view **into** @p endpoint, so the argument must outlive the result.
+/// @param endpoint `host:port`, `[v6]:port`, or a bare host.
+/// @return The host, or the whole of @p endpoint when there is no port to split off.
+[[nodiscard]] inline std::string_view HostOfEndpoint(std::string_view endpoint) noexcept
+{
+    if (!endpoint.empty() && endpoint.front() == '[')
+    {
+        auto const close = endpoint.find(']');
+        if (close != std::string_view::npos)
+            return endpoint.substr(1, close - 1);
+        return endpoint;
+    }
+
+    auto const colon = endpoint.rfind(':');
+    // An IPv6 literal is all colons and no brackets, so a bare `2001:db8::1` must not
+    // be split at its last one -- that yields a "host" of `2001:db8:` and a "port" of
+    // `1`, which is a plausible-looking wrong answer rather than a failure.
+    if (colon == std::string_view::npos || endpoint.find(':') != colon)
+        return endpoint;
+    return endpoint.substr(0, colon);
+}
+
+/// Whether two hosts name the same machine.
+///
+/// One spelling, because the alternative is what this codebase keeps paying for: a
+/// comparison that folds the IPv4-mapped form beside one that does not answers
+/// differently about the same machine at the same instant, and which surface a peer
+/// meets then decides what it is.
+///
+/// An empty host matches **nothing**, the empty host included. That is the direction
+/// an unidentifiable peer has to fail in -- it is what `FormatPeerAddress` answers
+/// for a peer whose family is unknown or whose `getpeername` failed, and two
+/// unanswerable questions are not a match.
+/// @param left One host, without a port or brackets.
+/// @param right The other.
+/// @return True when they name the same machine.
+[[nodiscard]] inline bool SameHost(std::string_view left, std::string_view right) noexcept
+{
+    return !left.empty() && UnmappedHost(left) == UnmappedHost(right);
+}
+
 /// Whether a host names this machine over the loopback interface.
 ///
 /// The one test for "is this caller on the same machine as me", spelled once
@@ -121,15 +196,12 @@ namespace FastCache
     // Any 127.x.x.x, not 127.0.0.1 alone: the whole /8 is loopback, and a client
     // bound to 127.0.0.2 is no less local for it.
     constexpr std::string_view V4Prefix = "127.";
-    constexpr std::string_view MappedPrefix = "::ffff:";
 
-    if (host == "::1")
-        return true;
-    if (host.starts_with(V4Prefix))
-        return true;
-    if (host.starts_with(MappedPrefix))
-        return host.substr(MappedPrefix.size()).starts_with(V4Prefix);
-    return false;
+    // Unmapped first, so `::ffff:127.0.0.1` and `127.0.0.1` take the same branch
+    // rather than each needing one. `::1` is not a mapped form and survives it
+    // unchanged, which is why the equality still holds.
+    auto const bare = UnmappedHost(host);
+    return bare == "::1" || bare.starts_with(V4Prefix);
 }
 
 /// Split an endpoint that may name only a port.

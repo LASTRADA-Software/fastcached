@@ -158,7 +158,8 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
     ClusterMembership const cluster { { "10.0.0.1:7000" } };
     FastCache::ManualClock clock;
     FastCache::AtomicMetricsSink metrics;
-    SchedulerService service { clock, metrics };
+    FastCache::NullLogger schedulerLogger;
+    SchedulerService service { clock, metrics, schedulerLogger };
     service.SetRole(SchedulerRole::Leader, {});
 
     auto const ask = [&](std::string_view peer) {

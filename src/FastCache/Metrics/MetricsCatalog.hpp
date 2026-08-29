@@ -124,6 +124,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "toolchain, endpoint or version in UTF-8. Any rise names a peer that "
               "is not in the fleet and cannot say so itself.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkerEndpointMismatch,
+      .prometheusName = "fastcached_dispatch_worker_endpoint_mismatch_total",
+      .help = "Worker registrations accepted whose endpoint names a host other than "
+              "the one they connected from. Expected wherever workers advertise DNS "
+              "names, are multi-homed, or reach the scheduler over NAT or a VPN; a "
+              "rise is not by itself a fault.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchWorkersExpired,
       .prometheusName = "fastcached_dispatch_workers_expired_total",
       .help = "Workers dropped for having stopped heartbeating. Rising beside a "
