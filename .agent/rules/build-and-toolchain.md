@@ -121,6 +121,64 @@ determinism rests on.
   and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
   that silently does nothing is worse than one that is off, because the second is
   visible.
+  - **So a sanitizer job proves the tree only once something proves the sanitizer.**
+    `scripts/tsan-gate.sh` will not report clean until it has answered two separate
+    questions, because they fail separately: `__tsan_init` in the **test binaries**
+    says *this artefact* was instrumented, and `src/tests/TsanCanary.cpp` -- a
+    deliberate data race, built by the same `add_compile_options` as everything else
+    -- says the runtime still detects and reports. A `TSAN_OPTIONS`, a suppressions
+    pattern or a stripped runtime can break the second while the first still holds.
+    The canary is run **with the suppressions file active**, so a wildcard broad
+    enough to swallow an obvious race fails the gate instead of silently disarming
+    it. Every refusal has a message of its own, because each is fixed somewhere
+    different, and each was verified by making it happen -- the list lives in that
+    script's header and deliberately nowhere else. It said "five refusals" in three
+    files, in three orders, having dropped the two hardest to reason about: a hard
+    count restated beside the thing it counts is a fact with no owner.
+  - **A filter that matches nothing is a suite that tested nothing**, and every
+    other signal in that run reads clean. The gate names it, and separately refuses
+    an exit of 0 that reported no assertions. This is the same shape as a sweep that
+    skips files and a `-header-filter` that matches no path: the tool ran, the
+    artefact was fine, and *nothing was examined*.
+  - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
+    on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
+    pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
+    status and the pipeline reports failure. So `nm "$bin" | grep -q __tsan_init`
+    says "no such symbol" precisely *because* the symbol was there. Capture the
+    output into a variable and match afterwards
+    (`syms="$(nm "$bin")"; [[ "$syms" == *__tsan_init* ]]`), or drop `-q`. This is
+    not specific to `nm`: **every "does this artefact contain X" idiom in this tree
+    is exposed to it** -- symbol checks, `strings | grep -q`, `objdump | grep -q`,
+    any long producer feeding an early-exiting matcher. It bit `scripts/tsan-gate.sh`
+    itself, which is the script written to catch exactly this class of thing, and
+    that is the first time here that the *checking mechanism* produced the false
+    reading rather than the thing being checked.
+  - **A tool given a path that does not exist reports nothing, which is what "absent"
+    also looks like.** `nm` on a missing file prints no symbols, so a grep for one
+    counts zero -- character-for-character identical to a binary that was built
+    without instrumentation, and fixed somewhere else entirely. Test existence first
+    and say which of the two it was; a single message covering both sends the reader
+    to the wrong place.
+  - **A second copy of a list is not a cross-check; it is a second thing to be
+    wrong.** The scope check shipped in this branch first kept its own copy of the
+    gate's Catch2 tags and its header claimed the two "are checked against each
+    other". Nothing checked them: delete `[task]` from the gate's `TARGETS` row and
+    `Async/Task_test.cpp` still matches the surviving copy, still reports covered,
+    and six coroutine cases leave the sanitized scope with every signal green --
+    the branch's own bug, one level up, asserted to be impossible. It parses the
+    expression out of `scripts/tsan-gate.sh` now, and a `TARGETS` table it cannot
+    parse is a hard failure rather than an empty scope. Duplicate-and-verify is a
+    real pattern here (`check-service-accounts.cmake` reads three files to prove
+    they agree), but the verify half has to actually be written.
+  - **A known race lives in `.tsan-suppressions` with its issue number, never in a
+    deleted check.** Every entry is an open bug; removing it is part of closing that
+    bug. Write it `race_top:`, never `race:` — `race:` matches a function name
+    anywhere in *either* stack, so it also silences a future, unrelated race that
+    merely passes through that frame, and a teardown path like `Close()` is
+    traversed by a great many stacks. `race_top:` matches only the frame the racy
+    access is in. Either way an entry outlives the report it was written for, which
+    is why the gate sets `print_suppressions=1` on **every** run, canary included,
+    and prints ThreadSanitizer's own `Matched N suppressions` line.
 
 ## What CI costs
 
@@ -738,3 +796,49 @@ is >90% and raising it is separate work — a threshold added before anyone has 
 chance to move the number only teaches everyone to ignore the signal. A failing suite
 still gets its report rendered, to read while debugging, and then re-raises so no number
 measured from a red build is published.
+
+## Open work
+
+- **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
+  entry in `.tsan-suppressions`: `AdminEndpoint` closes its listener from the main
+  thread while its own accept thread is still inside `Accept()`. Removing the entry
+  is part of closing the issue — with it gone the gate goes red on the real report,
+  which is what makes it a suppression rather than a hole.
+- **[#311](https://github.com/LASTRADA-Software/fastcached/issues/311)** — nothing in
+  CI catches an uninitialised read, and no sanitizer that runs today can: ASan does
+  not, UBSan does not, and neither does ThreadSanitizer. That is MemorySanitizer,
+  which needs an instrumented standard library, or valgrind memcheck over the
+  existing release test binaries. It is the other half of #132, deliberately left
+  out of the TSan job rather than folded into it.
+- **[#316](https://github.com/LASTRADA-Software/fastcached/issues/316)** — the TSan
+  gate **suppresses a known race in a module it does not scan.** Its scope is
+  three directories (`Async`, `Consensus`, `Distributed`), and the one entry in
+  `.tsan-suppressions` is `race_top:FastCache::BlockingListener::Close` — a `Net/`
+  class. The report only reaches the gate at all because the node binary happens
+  to be run whole; a regression of that race reached through a `Net/` unit test
+  would leave the job green while it carries a suppression naming the very thing
+  that broke. That is the gate's own failure mode, inside the gate. `Net/` and
+  `Cache/` also spawn threads in `ThreadedAddressResolver_test.cpp`,
+  `HealthProbe_test.cpp`, `EpollSocket_test.cpp`, `ShardedStorage_test.cpp`
+  (`[sharded][concurrency][stress]`, the tree's one explicit concurrency stress
+  case) and `Core/Clock_test.cpp` — none selected by the gate's tags, none in
+  `FastCachedTsanScopeDirs`, so `check-tsan-scope` does not flag them either.
+- **[#317](https://github.com/LASTRADA-Software/fastcached/issues/317)** —
+  `scripts/check-tsan-scope.cmake` proves a FILE is in scope, not a test CASE: one
+  selected tag anywhere in a file covers it, so a case added to
+  `Distributed/FleetHistory_test.cpp` tagged only `[fleetchart]` leaves the
+  sanitized scope while the check reports covered. Same shape as the bug the file
+  exists for, one level down. Closing it means matching each
+  `TEST_CASE`/`TEST_CASE_METHOD`/`SCENARIO` tag string, which
+  `check-test-names.cmake` already has the macro pattern for — with the wrinkle
+  that the tag string is usually on the line *after* the macro.
+- **[#318](https://github.com/LASTRADA-Software/fastcached/issues/318)** —
+  `clang-tidy` and `clang-asan-ubsan` both `actions/cache@v4` the same
+  `cpm-Linux-clang-debug-*` key, so on a `CMakeLists.txt` change both upload the
+  same archive and the loser discards it after paying for it. `clang-tsan` uses
+  `actions/cache/restore@v4` rather than becoming a third writer.
+- **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
+  scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
+  `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
+  project's Catch2 (3.6) predates `ADD_TAGS_AS_LABELS` and so exports no tag to
+  CTest. When Catch2 moves, both collapse into a label filter.

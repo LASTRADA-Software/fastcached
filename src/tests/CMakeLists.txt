@@ -33,6 +33,39 @@ include(Catch)
 catch_discover_tests(FastCacheTest)
 
 # ---------------------------------------------------------------------------
+# The ThreadSanitizer canary: a program that MUST fail, so that a green sanitizer
+# job means something. See src/tests/TsanCanary.cpp for why it contains a
+# deliberate data race, and scripts/tsan-gate.sh for what refuses to run without
+# it.
+#
+# Built here, by the same CMake that instruments everything else, rather than
+# compiled by the gate script with flags of its own. That is the entire point: it
+# inherits `-fsanitize=thread` from the same `add_compile_options` the real
+# targets get, so it detects a Sanitizers.cmake that has stopped applying them --
+# the defect that module's own comment records. A canary built with hand-written
+# flags would keep passing through exactly that failure.
+#
+# Deliberately NOT linked against FastCache: it answers "is the toolchain
+# instrumenting and reporting", which has to stay answerable even when the
+# library does not build.
+#
+# Guarded, so no other configuration builds a knowingly-racy binary. The guard
+# does not weaken the check -- when the option is ON but the flags never reach the
+# compile line, this target still exists and still comes out uninstrumented,
+# which is precisely the case the gate is looking for.
+if(ENABLE_SANITIZER_THREAD)
+    add_executable(tsan-canary TsanCanary.cpp)
+    # No Catch2 and no catch_discover_tests. CTest could express "this must fail"
+    # -- `WILL_FAIL`, or `PASS_REGULAR_EXPRESSION "data race"` -- so that is not
+    # the reason; the reason is that the canary's verdict has to be read BEFORE
+    # the suite is believed, and a sibling ctest case that merely also passes
+    # proves nothing about the run that reported clean. scripts/tsan-gate.sh
+    # sequences the two, and is the only thing that should run this.
+    find_package(Threads REQUIRED)
+    target_link_libraries(tsan-canary PRIVATE Threads::Threads)
+endif()
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it
@@ -118,6 +151,34 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-test-names.cmake"
 )
 set_tests_properties("test-name-hygiene" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
+# directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
+# is enforced rather than merely asserted.
+#
+# It is registered here, in the DEFAULT set, and deliberately not under
+# `if(ENABLE_SANITIZER_THREAD)`. The scope rots in ordinary builds -- somebody adds
+# `Async/Foo_test.cpp` tagged `[queue][mpsc]`, which no row of the gate's table
+# selects, and nothing says otherwise -- so a check that only runs in the
+# sanitizer preset would report the drift to the one configuration nobody runs
+# locally. This costs milliseconds and reads source files, so it survives
+# `ctest -LE smoke` like the checks above.
+#
+# The failure it exists for has already happened once, before the gate merged.
+# The reasoning, and why the check reads its tags out of the gate rather than
+# keeping a second copy of them, is in the header of
+# scripts/check-tsan-scope.cmake.
+add_test(
+    NAME "tsan-scope-hygiene"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-scope.cmake"
+)
+set_tests_properties("tsan-scope-hygiene" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )

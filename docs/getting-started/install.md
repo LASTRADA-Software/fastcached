@@ -258,7 +258,15 @@ The repository includes presets for:
   and the percentage to `out/build/clang-coverage/coverage/`. Needs `llvm-profdata`
   and `llvm-cov` at the same major version as the `clang` building it.
 - `clang-asan-ubsan` — sanitizers without clang-tidy.
-- `clang-tsan` — thread sanitizer.
+- `clang-tsan` — ThreadSanitizer. Run it the way CI does, through the gate that
+  refuses to report clean unless the sanitizer is proven to be instrumenting and
+  reporting:
+
+  ```sh
+  cmake --preset clang-tsan
+  cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests tsan-canary
+  scripts/tsan-gate.sh out/build/clang-tsan
+  ```
 - `clangcl-debug` — clang-cl on Windows.
 
 See `CMakePresets.json` for the complete list.

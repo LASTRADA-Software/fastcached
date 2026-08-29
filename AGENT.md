@@ -507,6 +507,25 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- So a sanitizer job proves nothing until something proves the sanitizer.
+  `scripts/tsan-gate.sh` refuses to report clean until the test binaries show
+  `__tsan_init` **and** a deliberate race (`src/tests/TsanCanary.cpp`, built by the
+  same `add_compile_options`) has gone red — run **with** `.tsan-suppressions`
+  active, so no pattern broad enough to swallow an obvious race can disarm it. Do
+  not repair that file. A known race lives in `.tsan-suppressions` with its issue
+  number; deleting the entry is part of closing the issue, never part of going
+  green.
+- `producer | grep -q` is a false **negative** under `set -o pipefail`, and it
+  fails on the SUCCESS path: `grep -q` exits at the first match, the producer dies
+  of SIGPIPE, and `pipefail` reports the producer's status. `nm "$b" | grep -q
+  __tsan_init` therefore says "absent" precisely *because* the symbol is there.
+  Capture into a variable and match afterwards.
+- The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS`
+  table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
+  restating it — a second copy is not a cross-check, it is a second thing to be
+  wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
+  test file in `Async`, `Consensus` or `Distributed` carries no tag that
+  expression selects.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
@@ -715,6 +734,12 @@ cmake --build --preset clang-coverage --target coverage
 # Linux — sanitizer-only presets
 cmake --preset clang-asan-ubsan
 cmake --preset clang-tsan
+
+# ThreadSanitizer, the way CI runs it: the concurrency-bearing tests only
+# (Async / Consensus / Distributed / the node), behind a gate that refuses to
+# report clean unless the sanitizer is proven live. See scripts/tsan-gate.sh.
+cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests tsan-canary
+scripts/tsan-gate.sh out/build/clang-tsan
 
 # Linux/macOS — RelWithDebInfo + Tracy profiler (.agent/guides/profiling-tracy.md)
 cmake --preset clang-tracy

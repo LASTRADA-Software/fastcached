@@ -396,6 +396,160 @@ jobs:
       - name: "Test"
         run: ctest --preset clang-debug
 
+  # ThreadSanitizer, over the concurrency-bearing tests only.
+  #
+  # The `clang-tsan` preset existed for a long time and nothing invoked it. The
+  # first time anyone ran it by hand it found a real race in `AdminEndpoint`
+  # (#260) — which is the argument for this job, and also why the job is not
+  # simply "run everything under TSan".
+  #
+  # SCOPE, and what it is not. `Async`, `Consensus`, `Distributed` and the node
+  # are where most of the threads are — but not all of them, and the gap has a
+  # sharp edge: `Net/` and `Cache/` spawn threads too, and the one race this job
+  # suppresses (#260) is a `Net/` class. So this gate currently suppresses a known
+  # race in a module it does not scan, reaching it only because the node binary is
+  # run whole — issue #316. This is a first scope, not a complete one, and saying
+  # otherwise is how a job goes green over code nobody sanitized. Those four map
+  # onto five Catch2 tags —
+  # `[async]`, `[consensus]`, `[distributed]`, `[reactor]`, `[task]` — plus one
+  # binary run whole. The tags are not claimed to be confined to those three
+  # directories: three test files elsewhere carry one and are swept in, which is
+  # harmless, because running MORE than the scope is not the failure this guards.
+  # Running LESS is, and the first version of that list ran less — it named three
+  # tags and silently excluded six of ten `Async/` test files while every signal
+  # in the run said clean.
+  #
+  # So the scope is enforced rather than asserted: `ctest -R tsan-scope-hygiene`
+  # runs in the DEFAULT set and fails when a test file in one of those
+  # directories carries no selected tag. Widening the scope is therefore two
+  # edits that check each other — the `TARGETS` table in `scripts/tsan-gate.sh`
+  # and `FastCachedTsanScopeTags` in `scripts/check-tsan-scope.cmake`.
+  #
+  # WHY A SCRIPT AND NOT `ctest`. Because a clean sanitizer run is not evidence.
+  # `cmake/portable/Sanitizers.cmake` records a defect on this repository where
+  # the option read ON, the configure log printed "Enabling", and no
+  # `-fsanitize=` reached the compile line at all — so the sanitizer presets had
+  # never once run a sanitizer, and every signal an author would check said yes.
+  # `scripts/tsan-gate.sh` refuses to report clean until it has proved both that
+  # the test binaries carry `__tsan_init` and that a deliberately racy canary
+  # still goes red. `ctest` cannot tell "no races" from "no sanitizer"; this can.
+  #
+  # It is a full job because TSan needs its own build of the tree. The tests
+  # themselves are cheap — measured at 1.2s and 17.6s — so this job is its build,
+  # and it is on every push for the same reason the ASan job is: a race found a
+  # week later has a week of commits to bisect through.
+  clang-tsan:
+    name: "clang-tsan"
+    runs-on: ubuntu-24.04
+    # The gate bounds each test binary itself, which names the target that stalled;
+    # this bounds the build as well, so a hang anywhere in the job stops in an hour
+    # rather than at GitHub's six-hour default. Every wait is bounded.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same key as clang-tidy and clang-asan-ubsan, for the reason the first of
+      # them states: this cache holds SOURCE, which is identical whatever sanitizer
+      # the build then applies. A third entry would spend the repository's shared
+      # 10 GB budget again and make this job's first run a cold download of every
+      # CPM package.
+      #
+      # `cache/restore` and not `cache`, which is the difference from those two:
+      # they already both WRITE this key, so on a CMakeLists.txt change each
+      # uploads the same archive and the losers discard theirs after paying for
+      # it. A third writer makes that worse and buys nothing — the entry is
+      # identical whoever saves it, so this job reads and lets clang-tidy save.
+      # The pre-existing two-writer case is issue #318.
+      - name: "Cache CPM packages"
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CPM_SOURCE_CACHE }}
+          key: cpm-${{ runner.os }}-clang-debug-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-debug-
+
+      # A ccache key of its own, deliberately: `-fsanitize=thread` and
+      # `-fsanitize=address,undefined` give every translation unit a different
+      # compiler command line, so sharing clang-debug's key would produce no
+      # cross-job hits at all while forcing two working sets into one cap. That is
+      # thrashing, not sharing.
+      #
+      # 512M rather than the 1G clang-asan-ubsan measured for itself, and the
+      # number comes from a measurement rather than from the target list looking
+      # smaller: one clean build of exactly these three targets produces 439
+      # object files totalling 417 MB uncompressed, which ccache stores
+      # compressed. The rule for this knob is that a cap is judged by `Cleanups`
+      # rather than copied from a neighbour — raising a cap that is not full
+      # spends a shared budget on nothing, and that budget also carries the
+      # Windows sccache entries. The `--show-stats` step below is what says
+      # whether 512M is enough; raise it when `Cleanups` is non-zero, not before.
+      # `save` only on a push, so pull-request runs read master's entry without
+      # each writing their own.
+      - name: "ccache"
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-clang-tsan
+          max-size: 512M
+          save: ${{ github.event_name == 'push' }}
+
+      - name: "Install build tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
+
+      - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
+          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
+          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+          # This job's green depends on a suppression MATCHING, and `race_top:`
+          # matches a function name — which needs symbolization. Without a pinned
+          # llvm-symbolizer the runtime falls back to whatever the image happens
+          # to carry, and a #260 report that fails to symbolize arrives as a NEW
+          # unsuppressed race, sending the reader to file an issue that exists.
+          #
+          # `test -x` before the link, and that is the point rather than caution:
+          # `ln -sf` onto a missing target succeeds and leaves a DANGLING link,
+          # which is worse than no link at all — the runtime then execs something
+          # that is not there. Fail here, where the message is the package name.
+          sudo apt-get install -y llvm-${{ env.CLANG_TOOLS_VERSION }}
+          test -x /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }}
+          sudo ln -sf /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/llvm-symbolizer
+
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-tsan
+          -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
+
+      # Only the targets the gate runs — but do not read that as "the scope makes
+      # this job cheap". `FastCacheTest` is one binary carrying every library
+      # `*_test.cpp`, so these three targets are 439 of the 552 configured compile
+      # edges: ~79% of a full Debug build. The tag scope buys RUNTIME (18.8s
+      # against minutes of per-process sanitized startup) and almost nothing at
+      # build time. This job's cost is its compile, and naming the four targets it
+      # does skip — daemon, launcher, benchmarks, testclient — is worth about 50
+      # translation units.
+      - name: "Build"
+        run: >-
+          cmake --build --preset clang-tsan --target
+          FastCacheTest fastcache-compile-node-tests tsan-canary
+
+      - name: "Report ccache effectiveness"
+        run: ccache --show-stats --verbose
+
+      # Every refusal has a message of its own, because each is fixed somewhere
+      # different, and each was verified by making it happen. The list is in the
+      # header of `scripts/tsan-gate.sh` and deliberately only there — an earlier
+      # version of this comment enumerated "five", in a different order from the
+      # two other places that also enumerated them, having dropped the two
+      # refusals that are hardest to reason about.
+      - name: "ThreadSanitizer gate"
+        run: scripts/tsan-gate.sh out/build/clang-tsan
+
   # Coverage, measured once, on Linux, with Clang. One configuration and not a
   # matrix, because coverage answers "which lines did the tests reach", and that
   # does not vary by compiler or platform — where they genuinely differ is
@@ -1978,6 +2132,7 @@ jobs:
       - linux
       - clang-tidy
       - clang-asan-ubsan
+      - clang-tsan
       - coverage
       - macos
       - docker
