@@ -352,11 +352,13 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 10> PathValues { {
+    constexpr std::array<PathValueFlag, 12> PathValues { {
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "/Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
         { .spelling = "-Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
+        { .spelling = "/Fd", .role = PathValueRole::DebugOutput, .families = DriverFamily::Msvc },
+        { .spelling = "-Fd", .role = PathValueRole::DebugOutput, .families = DriverFamily::Msvc },
         { .spelling = "-MF", .role = PathValueRole::DepFile, .families = DriverFamily::Gnu },
         { .spelling = "-MT", .role = PathValueRole::DepTarget, .families = DriverFamily::Gnu },
         { .spelling = "-MQ", .role = PathValueRole::DepTarget, .families = DriverFamily::Gnu },
@@ -507,6 +509,19 @@ namespace
         { .spelling = "-Tp", .families = DriverFamily::Msvc, .language = std::nullopt, .namesAFile = true },
         { .spelling = "-x", .families = DriverFamily::Gnu, .language = std::nullopt },
     } };
+
+    /// Debug-info flags that make MSVC write a PDB BESIDE the object.
+    ///
+    /// `/Fd` only says WHERE one would go; these decide whether one is written at
+    /// all. With `/Z7` the debug info lives in the object itself and a dispatched
+    /// compile carries back everything the build asked for -- so `/Fd` names a file
+    /// nothing produces and is dropped. With these, a worker would have to send back
+    /// a second artefact nothing on the wire carries.
+    ///
+    /// `cmake/portable/CompileCache.cmake` rewrites `/Zi` to `/Z7` whenever a
+    /// launcher is active, for this same reason, so this fires only for a build that
+    /// reached the launcher another way.
+    constexpr std::array<std::string_view, 4> MsvcSharedPdb { "/Zi", "-Zi", "/ZI", "-ZI" };
 
     /// What a GNU `-x` value names. Only the four plain languages: anything else
     /// (`assembler`, `c-header`, a `-cpp-output` form) has no exact `SourceLanguage`
@@ -712,6 +727,9 @@ namespace
                 return &ParsedCommand::depPath;
             case PathValueRole::IncludeDir:
             case PathValueRole::DepTarget:
+            // Nothing captures it: the launcher never reads or writes the PDB, it
+            // only has to keep the path out of the key and off a worker's line.
+            case PathValueRole::DebugOutput:
                 break;
         }
         return nullptr;
@@ -1116,6 +1134,16 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
                             argv[i]));
         language = named;
     }
+
+    // A shared PDB is a second artefact, and only the object comes back. Refused
+    // before anything is sent, on the same reasoning as a module interface unit.
+    if (driver.family == DriverFamily::Msvc)
+        for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+            if (std::ranges::contains(MsvcSharedPdb, argv[i]))
+                return std::unexpected(
+                    std::format("{} writes debug info to a shared PDB, which a dispatched compile cannot bring back; "
+                                "build with /Z7 to distribute this",
+                                argv[i]));
 
     auto const preprocessedInput = PreprocessedInputFlagsFor(driver, *language);
     if (!preprocessedInput.has_value())

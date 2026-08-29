@@ -1081,7 +1081,10 @@ TEST_CASE("A CMake-shaped MSVC command line is dispatchable")
                                           "/O2",
                                           "/MD",
                                           "-std:c++23",
+                                          "/showIncludes",
                                           "/FoCMakeFiles\tgt.dir\a.cpp.obj",
+                                          "/FdCMakeFiles\tgt.dir\tgt.pdb",
+                                          "/FS",
                                           "/c",
                                           "a.cpp" };
 
@@ -1100,6 +1103,30 @@ TEST_CASE("A CMake-shaped MSVC command line is dispatchable")
     CHECK(std::ranges::count(out, "-std:c++23") == 1);
     CHECK(std::ranges::count(out, "a.cpp") == 0);
     CHECK(std::ranges::none_of(out, [](std::string const& a) { return a.starts_with("/Fo"); }));
+
+    // `/Fd` names a path on THIS machine, and under /Z7 nothing writes a PDB at
+    // all, so it is dropped rather than refused. It was the second of the two
+    // blockers: with `/TP` handled, this one alone still made every CMake + MSVC
+    // compile fall back to a local build.
+    CHECK(std::ranges::none_of(out, [](std::string const& a) { return a.starts_with("/Fd"); }));
+}
+
+TEST_CASE("A compile writing a shared PDB is not dispatched")
+{
+    // `/Fd` is dropped because with `/Z7` nothing writes a PDB. Say `/Zi` and one
+    // IS written -- a second artefact beside the object, and only the object comes
+    // back. `cmake/portable/CompileCache.cmake` rewrites `/Zi` to `/Z7` whenever a
+    // launcher is active for this very reason, so this guards the build that
+    // reached the launcher another way.
+    for (auto const& flag: { "/Zi", "/ZI", "-Zi" })
+    {
+        std::vector<std::string> const argv { "cl", "/nologo", "/TP", flag, "/FdX.pdb", "/c", "a.cpp" };
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        INFO("flag: " << flag);
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().contains("shared PDB"));
+    }
 }
 
 TEST_CASE("A module interface unit is never dispatched, whatever the driver")

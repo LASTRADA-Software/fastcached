@@ -201,6 +201,12 @@ enum class PathValueRole : std::uint8_t
     IncludeDir,   ///< A header search directory (`-I`, `/I`, `/external:I`).
     DepFile,      ///< The Makefile dependency file the compile writes (`-MF`).
     DepTarget,    ///< The rule target named inside that depfile (`-MT`, `-MQ`).
+    /// Where MSVC would put a PDB (`/Fd`). CMake emits it on every compile, and it
+    /// names a path on THIS machine, so it neither travels to a worker nor belongs
+    /// in a key. Whether a PDB is written at all is decided by `/Zi` / `/ZI`, which
+    /// dispatch refuses outright -- with `/Z7`, and with no debug flag, this names a
+    /// file nothing produces.
+    DebugOutput,
 };
 
 /// One spelling of a flag whose value is a filesystem path.
