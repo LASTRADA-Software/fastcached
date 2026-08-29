@@ -59,9 +59,16 @@ class NodeMembership
 
     /// The oracle every surface on this node consults.
     ///
-    /// Which one it is was the operator's stated choice and never a fall-back:
-    /// `SchedulerPolicyRejection` has already refused the case where neither
-    /// `--fleet-open` nor `--fleet-member` was given, so nothing here guesses.
+    /// The open one is only ever the operator's stated choice: `--fleet-open` is a
+    /// flag rather than what an unset field decays to, so nothing here guesses its
+    /// way into serving strangers. Everything else is the listed one, which for a
+    /// node that named no members admits this machine and refuses the network --
+    /// the safe default rather than a misconfiguration.
+    ///
+    /// That default is exactly what a WORKER must be able to leave behind. It could
+    /// not until #235: the startup table refused `--fleet-member` on any node
+    /// without `--listen-scheduler`, so a pure worker's oracle was an empty list by
+    /// construction and its compile port refused every dispatched job.
     /// @return The oracle; valid for this object's lifetime.
     [[nodiscard]] Distributed::IMembershipOracle const& Oracle() const noexcept
     {

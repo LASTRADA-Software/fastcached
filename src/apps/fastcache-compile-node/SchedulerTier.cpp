@@ -2,7 +2,6 @@
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
-#include <format>
 #include <utility>
 
 namespace FastCache::Node
@@ -51,17 +50,11 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
         return std::unexpected { started.error() };
 
     tier->_endpoint = std::move(*started);
-    logger.Logf(LogLevel::Info,
-                "scheduling for the fleet on {} ({})",
-                tier->BoundEndpoint(),
-                // Off the configuration rather than off the oracle: the count is a
-                // property of what the operator wrote, and the oracle is now shared
-                // with the cache surface and no longer this tier's to inspect. It
-                // also says "plus this machine" out loud, because that admission is
-                // unconditional and an operator reading "2 member host(s)" would
-                // otherwise not know their own builds were covered.
-                cfg.fleetOpen ? std::string { "every caller admitted" }
-                              : std::format("this machine plus {} member host(s)", cfg.fleetMembers.size()));
+    // The phrase is `AdmissionSummary`'s rather than this tier's, because the policy
+    // is the NODE's: the worker's own ready line reports the identical fact, and two
+    // surfaces spelling one policy differently is how an operator comes to believe
+    // their compile port is configured because their scheduler said so (#235).
+    logger.Logf(LogLevel::Info, "scheduling for the fleet on {} ({})", tier->BoundEndpoint(), AdmissionSummary(cfg));
     return tier;
 }
 

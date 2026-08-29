@@ -965,6 +965,79 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
     CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedPaths.empty());
 }
 
+TEST_CASE("A node says who it admits in the line an operator reads at startup", "[node][policy][membership]")
+{
+    // #235's second half. The first was that a worker could not be GIVEN a policy;
+    // this is that a worker given none said nothing about it -- it started, bound
+    // the wildcard, registered, was leased out and refused every dispatched compile,
+    // while the one line an operator reads to confirm it came up reported nothing
+    // but health. The scheduler tier had such a line; the worker, which is the
+    // surface that actually refuses, did not.
+    //
+    // One function rather than a phrase per surface, because a node running both
+    // must state one policy rather than two, and because `main.cpp` is in no test
+    // target -- a phrase built there could not be asserted on at all.
+    struct Row
+    {
+        char const* what;                 ///< The shape, for the failure message.
+        std::vector<std::string> members; ///< `--fleet-member`, if any.
+        bool open;                        ///< Whether `--fleet-open` was given.
+        std::string nodeId;               ///< `--node-id`, i.e. whether consensus runs.
+        char const* says;                 ///< What the line must contain.
+        char const* saysNot { nullptr };  ///< What it must NOT contain, if anything.
+    };
+
+    auto const rows = std::to_array<Row>({
+        { .what = "no policy at all", .members = {}, .open = false, .nodeId = {}, .says = "this machine only" },
+        // Naming the remedy is the point of that row: an operator who reads "this
+        // machine only" and is not told the two flags has been informed of a symptom.
+        { .what = "no policy names the flags that give one",
+          .members = {},
+          .open = false,
+          .nodeId = {},
+          .says = "--fleet-member" },
+        // And on a node running consensus it must NOT name that flag: there the
+        // agreed member set replaces the listed one, so `--fleet-member` is the
+        // bootstrap answer alone and an operator sent to add it has been sent to add
+        // something the cluster is about to overwrite. What consensus never supplies
+        // is a client machine, which is no cluster peer -- hence `--fleet-open`.
+        { .what = "no policy, with consensus running",
+          .members = {},
+          .open = false,
+          .nodeId = "n1",
+          .says = "--fleet-open",
+          .saysNot = "--fleet-member" },
+        { .what = "a member list",
+          .members = { "10.0.0.1:6676", "10.0.0.2:6676" },
+          .open = false,
+          .nodeId = {},
+          .says = "2 member" },
+        // "This machine" out loud even when a list exists: that admission is
+        // unconditional, and an operator reading a bare count would not know their
+        // own builds were covered.
+        { .what = "a member list still says this machine",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .nodeId = {},
+          .says = "this machine" },
+        { .what = "--fleet-open", .members = {}, .open = true, .nodeId = {}, .says = "every caller" },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        NodeConfig cfg;
+        cfg.fleetMembers = row.members;
+        cfg.fleetOpen = row.open;
+        cfg.nodeId = row.nodeId;
+
+        auto const summary = AdmissionSummary(cfg);
+        CHECK(summary.contains(row.says));
+        if (row.saysNot != nullptr)
+            CHECK_FALSE(summary.contains(row.saysNot));
+    }
+}
+
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")
 {
     // Every rule here describes a configuration that would START SUCCESSFULLY and
@@ -1009,19 +1082,86 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
         REQUIRE(StartupPolicyRejection(cfg).has_value());
+
+        // And on a node running no scheduler at all, which is where the rest of
+        // this group stopped applying (#235): this row never depended on one, and
+        // the permissive half is the one that would have won by accident.
+        NodeConfig worker;
+        worker.fleetMembers = { "10.0.0.1:6676" };
+        worker.fleetOpen = true;
+
+        // Named rather than merely counted: with the mirror row gone this shape is
+        // refused by exactly one rule, and a bare `has_value()` would stay green if
+        // some unrelated row started answering in its place.
+        auto const refusal = StartupPolicyRejection(worker);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("contradict"));
     }
 
-    SECTION("a policy with nothing to consult it")
+    SECTION("peers admitted to a worker that advertises the wildcard")
     {
-        // The mirror image: membership named on a node running no scheduler. Nothing
-        // reads it, so an operator who believes they have restricted the fleet has
-        // not, and no counter anywhere would say so.
-        NodeConfig cfg;
-        cfg.fleetMembers = { "10.0.0.1:6676" };
+        // The shape #235's removal newly made reachable, and the reason it needs a
+        // row rather than a doc line: admitting peers is only ever so they can dial
+        // this worker, and `--advertise` defaults to `{--bind}:{--port}` whose bind
+        // is `0.0.0.0`. The scheduler hands that string to clients verbatim, so a
+        // client on another machine dials the wildcard and reaches ITSELF. The
+        // worker registers, heartbeats, is leased out and is never reached.
+        struct Row
+        {
+            char const* what;      ///< The shape, for the failure message.
+            char const* advertise; ///< `--advertise`, or empty for the fallback.
+            char const* bind;      ///< `--bind`.
+        };
 
-        auto const refusal = StartupPolicyRejection(cfg);
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+        auto const refused = std::to_array<Row>({
+            { .what = "no --advertise at all", .advertise = "", .bind = "0.0.0.0" },
+            // Spelled out rather than defaulted: the endpoint is judged, never the
+            // question of which flag produced it.
+            { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .bind = "0.0.0.0" },
+            { .what = "the v6 wildcard", .advertise = "[::]:6676", .bind = "0.0.0.0" },
+            // An empty host is the wildcard too -- it reaches `getaddrinfo` as
+            // nullptr -- which is the third case `--listen-cache=:6674` is refused
+            // for and the one that reads like an address.
+            { .what = "a bare colon", .advertise = ":6676", .bind = "0.0.0.0" },
+        });
+
+        for (auto const& row: refused)
+        {
+            INFO(row.what);
+            NodeConfig cfg;
+            cfg.scheduler = "scheduler.internal:6675";
+            cfg.advertise = row.advertise;
+            cfg.bindAddress = row.bind;
+            cfg.fleetOpen = true;
+
+            auto const refusal = StartupPolicyRejection(cfg);
+            REQUIRE(refusal.has_value());
+            CHECK(Unwrap(refusal).contains("--advertise"));
+        }
+
+        // And the three shapes that must NOT be refused, each of which would be a
+        // working deployment this rule had broken.
+
+        // The one-machine deployment: no membership flags, so no peer is admitted,
+        // so nothing is told to dial anything. This is what an operator gets by
+        // installing the package and starting a node, and it is correct.
+        NodeConfig alone;
+        alone.scheduler = "127.0.0.1:6675";
+        CHECK_FALSE(StartupPolicyRejection(alone).has_value());
+
+        // A node sharing its CACHE tier with listed peers and registering nowhere.
+        // That surface is reached at `--listen-cache`, so its advertise is never
+        // sent to anybody and the wildcard costs it nothing.
+        NodeConfig cacheOnly;
+        cacheOnly.fleetMembers = { "10.0.0.1:6676" };
+        CHECK_FALSE(StartupPolicyRejection(cacheOnly).has_value());
+
+        // And the worker the getting-started page documents, which names both.
+        NodeConfig worker;
+        worker.scheduler = "scheduler.internal:6675";
+        worker.advertise = "worker-01.internal:6676";
+        worker.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(worker).has_value());
     }
 
     SECTION("a joiner with no identity")
@@ -1076,6 +1216,26 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // And a worker running no scheduler at all -- by far the common case -- is
         // untouched by any of this.
         CHECK_FALSE(StartupPolicyRejection(NodeConfig {}).has_value());
+
+        // Including one that names a membership policy, which is the whole of #235.
+        // A mirror row used to refuse exactly this, reasoning that "a policy nothing
+        // consults is a policy an operator believes is in force" -- and the premise
+        // was false: one `NodeMembership` serves the scheduler, the cache tier AND
+        // the compile port, and the compile port is built unconditionally. What the
+        // row achieved was pinning every worker to an empty member list, which
+        // admits loopback alone, so the worker the getting-started page documents
+        // refused every dispatched compile with `NotAMember`.
+        NodeConfig listedWorker;
+        listedWorker.scheduler = "scheduler.internal:6675";
+        listedWorker.advertise = "worker-01.internal:6676";
+        listedWorker.fleetMembers = { "10.0.0.1:6676" };
+        CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
+
+        NodeConfig openWorker;
+        openWorker.scheduler = "scheduler.internal:6675";
+        openWorker.advertise = "worker-01.internal:6676";
+        openWorker.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
     }
 }
 
@@ -1388,7 +1548,6 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         // dashboard right up until somebody reads it.
         auto cfg = servingNode();
         cfg.schedulerListen.clear();
-        cfg.fleetOpen = false;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());

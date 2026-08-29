@@ -71,8 +71,17 @@ A worker, on each machine that should take work:
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
     --advertise=worker-01.internal:6676 \
+    --fleet-open \
     --toolchain=/usr/bin/g++
 ```
+
+**A worker needs a membership flag too**, and that is the half most easily
+missed: the same `--fleet-member` / `--fleet-open` policy gates this node's
+*compile port*, not only a scheduler's. Without one the worker admits its own
+machine and refuses the network — it is leased out, dialled, and answers
+`not-a-member` — so every snippet below that omits it is showing you a narrower
+subject, not a complete command line
+([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)).
 
 And the client, which is the launcher you already use:
 
@@ -494,6 +503,13 @@ them a port of its own if you want the node's tier as well.
 | A `--fleet-member` peer | yes | yes | yes |
 | Anyone else | refused | refused | refused |
 
+The flags are the node's, not the scheduler's. `--fleet-member` and `--fleet-open`
+are accepted on **any** node and read by all three columns above, so a plain worker
+is configured with them exactly as a scheduler is. They were once refused on a node
+running no `--listen-scheduler`, which left every worker's compile port on the first
+row of that table and nothing else
+([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)).
+
 The **compile port** is the one that matters most. `--bind` defaults to `0.0.0.0`
 because peers have to dial it, so without a check anybody who could route to that
 port could have this machine run their compiler on source they chose. It is refused
@@ -645,7 +661,8 @@ fastcache-compile-node \
     --listen-raft=6680 \
     --raft-peer=n4=10.0.0.4:6680 \
     --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
-    --listen-scheduler=6675 --advertise=10.0.0.4:6676 \
+    --listen-scheduler=6675 --fleet-open \
+    --advertise=10.0.0.4:6676 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -886,7 +903,8 @@ These are specific to registering:
 | `--cluster-dir` *(only with `--listen-raft`)* | Consensus state would otherwise land in `fastcache-cluster/<node-id>` relative to the working directory, and a service does not inherit the installing shell's — it resolves under `C:\Windows\System32` for the SCM and under `/` for launchd, writable only by the privileges a worker is deliberately not given. |
 
 Everything else the worker refuses at startup — `--tls-cert` without `--tls-key`,
-`--listen-scheduler` without `--fleet-member` or `--fleet-open`, `--dashboard`
+`--listen-scheduler` without `--fleet-member` or `--fleet-open`, a membership flag
+on a `--scheduler` worker whose `--advertise` is still the wildcard, `--dashboard`
 without `--admin-listen`, and the rest — is refused here too. Each is decided by
 the command line alone, and a registration replays that command line forever, so
 there is nothing to gain by waiting for the first boot to say so.

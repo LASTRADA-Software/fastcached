@@ -781,13 +781,20 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // that is reported either way.
     auto const listeningOn = activated != nullptr ? std::string { "a socket-activated listener" }
                                                   : std::format("{}:{}", cfg.bindAddress, cfg.port);
+    // The admission policy is part of this line, and that is #235's second half: a
+    // worker given no policy starts, binds the wildcard, registers, is leased out
+    // and refuses every dispatched compile -- and until this said so, the one line
+    // an operator reads to confirm the worker came up reported nothing but health.
+    // The scheduler tier prints the same phrase from the same function, so a node
+    // running both says one thing rather than two.
     logger.Logf(LogLevel::Info,
-                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, {} toolchain(s)",
+                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, {} toolchain(s), {}",
                 listeningOn,
                 advertise,
                 slots,
                 Distributed::TraitsFor(cfg.nodeClass).name,
-                toolchains.size());
+                toolchains.size(),
+                Node::AdmissionSummary(cfg));
 
     SyncRun(server.Run());
 

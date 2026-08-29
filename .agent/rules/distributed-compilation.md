@@ -180,6 +180,42 @@ Consequences that are each load-bearing:
     recorded rather than hidden — two nodes behind one NAT are indistinguishable here,
     which is acceptable because this refuses *strangers* rather than co-located peers,
     and separating them needs a credential in the frame.
+  - **A membership flag is the NODE's, not the scheduler's, and a startup rule that
+    assumed otherwise closed every worker.** One `NodeMembership` serves all three
+    surfaces — the scheduler, the cache tier and the compile port — and `WorkerServer`
+    is constructed unconditionally, so `--fleet-member` / `--fleet-open` are consulted
+    on every node there is. `StartupPolicyRejection` nonetheless refused them without
+    `--listen-scheduler`, reasoning that "a policy nothing consults is a policy an
+    operator believes is in force" — and the premise was simply false. What the row
+    achieved was pinning every non-scheduler node's oracle to an *empty list*, which
+    admits loopback and nothing else, so the worker the getting-started page called
+    "the whole of it" refused every dispatched compile with `NotAMember` (#235). A
+    rule stating what a flag is *for* is a rule that has to be re-derived when a
+    second surface starts reading it — so check which tiers reach the value, not
+    which flag it reads like.
+  - **Admitting peers and advertising an address are two halves of one decision.**
+    Peers are admitted so that they can *dial* this worker, and `--advertise` falls
+    back to `{--bind}:{--port}` whose bind is the wildcard — which the scheduler
+    hands to clients verbatim, so a client on another machine dials `0.0.0.0` and
+    reaches itself. `NodeServiceRejection` had always refused that for an *install*;
+    letting a worker carry a membership flag at all is what made it reachable from a
+    hand-started one, so the startup table gained the row in the same change.
+    Deliberately scoped: a node that registers **nowhere** and admits peers to its
+    cache tier is reached at `--listen-cache` and needs no advertise, and a node with
+    no membership flags is the one-machine deployment and is correct as it stands.
+    Only the wildcard is refused, never an address that might not resolve — a host
+    that is down today can be right at the next boot (#208), while the wildcard is
+    wrong on every machine and forever.
+  - **A refusal one hop past the lease is invisible from the side anybody watches.**
+    The lease **was** granted, so every scheduler counter is correct and unmoved; the
+    only signal is the *worker's* `WorkerJobsRefusedNotAMember`, on a machine whose
+    operator has no reason to scrape it and which exports nothing at all without
+    `--admin-listen`. "No counter moves" is the tempting summary and it is wrong in a
+    way that matters — it sends a reader looking for a missing counter instead of at
+    the one that exists. What was actually missing is a line at **startup**:
+    `AdmissionSummary` is one phrase for the worker's ready line and the scheduler
+    tier's, so a node that admits nobody says so while an operator is watching, and a
+    node running both surfaces states one policy rather than two.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped

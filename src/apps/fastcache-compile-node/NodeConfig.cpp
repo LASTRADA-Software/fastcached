@@ -682,14 +682,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<host>[:<port>]",
           .apply = AppendFrom<&NodeConfig::fleetMembers, ParseText>(),
-          .description = "a peer this scheduler may hand work to; repeatable.\n"
-                         "Only the host is matched: a peer dials from an\n"
-                         "ephemeral port, so an endpoint is not something a\n"
-                         "connection can be compared against." },
+          .description = "a peer this node serves; repeatable. Gates all three\n"
+                         "surfaces -- the compile port, the cache tier and the\n"
+                         "scheduler -- so a WORKER needs it too, or it compiles\n"
+                         "for its own machine alone. Only the host is matched:\n"
+                         "a peer dials from an ephemeral port, so an endpoint\n"
+                         "is not something a connection can be compared to." },
         { .primary = "--fleet-open",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::fleetOpen>(),
-          .description = "admit every caller to the fleet, not only\n"
+          .description = "admit every caller to this node, not only\n"
                          "--fleet-member hosts. For one machine, or a network\n"
                          "that is already the boundary. Explicit because\n"
                          "'no policy' and 'admit everybody' must be the same\n"
@@ -998,6 +1000,52 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
 }
 
+/// Whether the endpoint this node would advertise names no host a client can dial.
+///
+/// `--advertise` falls back to `{--bind}:{--port}` and `--bind` defaults to the
+/// wildcard, so a worker that never names one registers `0.0.0.0:6676` -- which the
+/// scheduler hands to clients verbatim, and a client on another machine dialling the
+/// wildcard reaches **itself**. `NodeServiceRejection` has always said so for an
+/// install; this is the same fact for a hand-started worker.
+///
+/// Judged on the endpoint the node would actually advertise rather than on whether
+/// the flag was typed, so an operator who spells the default out is answered too.
+/// Only a wildcard is refused, never an address that merely might not resolve: a
+/// host that is down today can be the right one at the next boot (#208), while the
+/// wildcard is wrong by construction on every machine and forever.
+/// @param cfg The parsed configuration.
+/// @return Whether remote clients would be told to dial a wildcard.
+[[nodiscard]] bool AdvertisesWildcard(NodeConfig const& cfg)
+{
+    auto const advertised = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
+    auto const split = SplitHostPort(advertised);
+    auto const host = split.has_value() ? split->first : advertised;
+
+    // The two spellings of "every interface", plus the empty host -- which reaches
+    // `getaddrinfo` as nullptr under AI_PASSIVE and is therefore the wildcard as
+    // well, the same third case `--listen-cache=:6674` is refused for.
+    return host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]";
+}
+
+std::string AdmissionSummary(NodeConfig const& cfg)
+{
+    if (cfg.fleetOpen)
+        return "every caller admitted";
+    if (cfg.fleetMembers.empty())
+        // The remedy is split on whether consensus runs, because on a node that does
+        // `--fleet-member` is the BOOTSTRAP answer only: the agreed member set
+        // replaces the listed one the moment the cluster decides anything, so a line
+        // that named both flags unconditionally would send a clustered operator to
+        // add the one whose effect is about to be overwritten. What such a node
+        // still has to be told is the half consensus does NOT supply -- a client
+        // machine is not a cluster peer, so admitting one is `--fleet-open`'s job.
+        return cfg.nodeId.empty() ? std::string { "this machine only -- give --fleet-member or --fleet-open to "
+                                                  "admit peers" }
+                                  : std::string { "this machine only until the cluster agrees a member set -- give "
+                                                  "--fleet-open to admit callers that are not cluster peers" };
+    return std::format("this machine plus {} member host(s)", cfg.fleetMembers.size());
+}
+
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 {
     // A table, so a new rule is a new row rather than another `if` in main().
@@ -1129,11 +1177,41 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
                      "admits a list. Silently preferring either would make the narrower of the two a no-op an "
                      "operator believes is in force." },
+        // There is deliberately NO mirror of the row above -- membership WITHOUT a
+        // scheduler is the ordinary worker, not a mistake. This table used to refuse
+        // it, on the reasoning that "a policy nothing consults is a policy an
+        // operator believes is in force", and that premise was simply wrong: one
+        // `NodeMembership` serves all three surfaces, and `WorkerServer` is
+        // constructed unconditionally, so the policy is consulted on every node.
+        //
+        // What the row actually did was pin every non-scheduler node's oracle to an
+        // empty list, which admits loopback and nothing else -- so the worker the
+        // getting-started page documents refused every dispatched compile with
+        // `NotAMember` (#235). The refusal a rule exists to prevent was the rule's
+        // own doing, and it was invisible from the side anybody watches: the lease
+        // WAS granted, so no scheduler counter moves. The only signal is the
+        // worker's own `WorkerJobsRefusedNotAMember`, on a machine whose operator
+        // has no reason to scrape it and which exports nothing without
+        // `--admin-listen`. Hence `AdmissionSummary` in the ready line.
+        //
+        // What DOES need a row is the shape the row above newly makes reachable.
+        // Admitting peers is only ever so they can dial this worker, and a worker
+        // that registers a wildcard has told them to dial themselves -- so the two
+        // halves have to be typed together or neither is worth anything. Scoped to a
+        // node that registers with a scheduler, because that is what makes the
+        // advertised endpoint travel: a node admitting peers to its CACHE tier is
+        // reached at `--listen-cache` and needs no advertise at all. And a node with
+        // no membership flags is untouched, which is what keeps the one-machine
+        // deployment -- no advertise, loopback clients, and correct -- working.
         { .refuses =
-              [](NodeConfig const& c) { return c.schedulerListen.empty() && (c.fleetOpen || !c.fleetMembers.empty()); },
-          .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
-                     "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
-                     "operator believes is in force." },
+              [](NodeConfig const& c) {
+                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesWildcard(c);
+              },
+          .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
+                     "names no address they can dial: it defaults to {--bind}:{--port}, and the wildcard resolves to "
+                     "the CALLER's own machine. This worker would register, heartbeat, be leased out and never be "
+                     "reached, with no error at either end. Name --advertise, or drop the membership flags and serve "
+                     "this machine alone." },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeConfig.hpp"
+#include "NodeMembership.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
@@ -331,10 +333,25 @@ struct Fixture
     }(&client));
 }
 
-/// Drive one request through a server and return everything written back.
-[[nodiscard]] std::vector<std::byte> ServeOne(Fixture& fix, std::vector<std::byte> const& request, std::size_t slots)
+/// Drive one request through a server whose policy and caller are both given.
+///
+/// Both are parameters because "who is calling, and what was this node told about
+/// them" is the entire subject of the membership cases -- and a second copy of the
+/// write / serve / read dance is how two cases meaning the same thing drift apart.
+/// @param fix The protocol, metrics and executor to serve with.
+/// @param membership The policy this server consults.
+/// @param peer The address the connection appears to arrive from.
+/// @param request The frame the caller sends.
+/// @param slots The worker's concurrency cap; two, which admits every case here
+///        that is not about the cap itself.
+/// @return Everything the server wrote back, which may be empty.
+[[nodiscard]] std::vector<std::byte> ServeOneFrom(Fixture& fix,
+                                                  Distributed::IMembershipOracle const& membership,
+                                                  std::string peer,
+                                                  std::vector<std::byte> const& request,
+                                                  std::size_t slots = 2)
 {
-    auto pair = InMemorySocketPair::Create();
+    auto pair = InMemorySocketPair::Create(0, std::move(peer));
     REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
         auto const r = co_await s->Write(std::span<std::byte const> { bytes });
         co_return r.has_value();
@@ -342,10 +359,32 @@ struct Fixture
     pair.client->ShutdownWrite();
 
     OneShotListener listener { std::move(pair.server) };
-    WorkerServer server { listener, fix.protocol, slots, fix.membership, fix.metrics, fix.logger, fix.executor };
+    WorkerServer server { listener, fix.protocol, slots, membership, fix.metrics, fix.logger, fix.executor };
     SyncRun(server.Run());
 
     return ReadAll(*pair.client);
+}
+
+/// Drive one request through a server that admits everybody.
+///
+/// What the cases about the accept loop itself want: the caller's identity is not
+/// their subject, so they do not spell one out.
+[[nodiscard]] std::vector<std::byte> ServeOne(Fixture& fix, std::vector<std::byte> const& request, std::size_t slots)
+{
+    return ServeOneFrom(fix, fix.membership, {}, request, slots);
+}
+
+/// Whether a reply frame says the request was served.
+///
+/// `ErrorOf`'s sibling, and there for the same reason: every case asking "was this
+/// caller admitted" otherwise spells out the same decode, guard and member access.
+/// @param frame A reply frame.
+/// @return Its status.
+[[nodiscard]] Wire::Status StatusOf(std::vector<std::byte> const& frame)
+{
+    auto const header = Wire::DecodeReplyHeader(frame);
+    REQUIRE(header.has_value());
+    return Unwrap(header).status;
 }
 
 [[nodiscard]] Wire::ErrorCode ErrorOf(std::vector<std::byte> const& frame)
@@ -574,29 +613,7 @@ TEST_CASE("A stranger is refused this machine's CPU before it can send a payload
     auto const request = CompileFrame();
 
     auto refuse = [&](std::string peer) {
-        auto pair = InMemorySocketPair::Create(0, std::move(peer));
-        REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
-            auto const r = co_await s->Write(std::span<std::byte const> { bytes });
-            co_return r.has_value();
-        }(pair.client.get(), request)));
-        pair.client->ShutdownWrite();
-
-        OneShotListener listener { std::move(pair.server) };
-        WorkerServer server { listener, fix.protocol, 2, listed, fix.metrics, fix.logger, fix.executor };
-        SyncRun(server.Run());
-
-        return SyncRun([](ISocket* s) -> Task<std::vector<std::byte>> {
-            std::vector<std::byte> out;
-            while (true)
-            {
-                std::vector<std::byte> chunk(4096);
-                auto const r = co_await s->Read(std::span<std::byte> { chunk });
-                if (!r.has_value() || *r == 0)
-                    break;
-                out.insert(out.end(), chunk.begin(), std::next(chunk.begin(), static_cast<std::ptrdiff_t>(*r)));
-            }
-            co_return out;
-        }(pair.client.get()));
+        return ServeOneFrom(fix, listed, std::move(peer), request, 2);
     };
 
     SECTION("a machine nobody admitted")
@@ -632,6 +649,96 @@ TEST_CASE("A stranger is refused this machine's CPU before it can send a payload
         auto const header = Wire::DecodeReplyHeader(reply);
         REQUIRE(header.has_value());
         CHECK(Unwrap(header).status == Wire::Status::Ok);
+    }
+}
+
+TEST_CASE("A worker admits whoever its operator's policy names, scheduler or not", "[node][worker][membership]")
+{
+    // #235, and a WIRING case rather than an oracle one: `ClusterMembership` was
+    // always correct about a listed peer -- the case above proves that -- and a pure
+    // worker could nonetheless never be handed one. `StartupPolicyRejection` refused
+    // `--fleet-member` on any node without `--listen-scheduler`, so the only oracle
+    // such a node could construct was an empty list, which admits loopback and
+    // nothing else. Every dispatched compile was refused `NotAMember` one hop after
+    // the lease was granted, so no counter on either side moved.
+    //
+    // So every row drives the whole chain a `main()` walks below its parser -- the
+    // configuration, the startup rules, `NodeMembership`, the oracle it hands out
+    // and `WorkerServer` -- rather than the oracle alone. Substituting a hand-built
+    // oracle is exactly what let the defect live behind a passing suite.
+    struct Row
+    {
+        char const* what;                 ///< The shape, for the failure message.
+        std::vector<std::string> members; ///< `--fleet-member`, if any.
+        bool open;                        ///< Whether `--fleet-open` was given.
+        char const* peer;                 ///< Where the connection appears to arrive from.
+        Wire::Status expected;            ///< `Ok`, or `Error` meaning `NotAMember`.
+    };
+
+    auto const rows = std::to_array<Row>({
+        { .what = "a listed peer, on a worker that schedules nothing",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .peer = "10.0.0.1",
+          .expected = Wire::Status::Ok },
+        // Admitting a listed peer is not opening the port: a worker serving whoever
+        // could route to it would run a stranger's compiler on source they chose,
+        // and `--bind` defaults to the wildcard.
+        { .what = "a stranger, against that same list",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .peer = "10.9.9.9",
+          .expected = Wire::Status::Error },
+        // The other half of the remedy, and the one a build LAN reaches for.
+        // `OpenMembership` is only ever arrived at by an operator saying so.
+        { .what = "a stranger, under --fleet-open",
+          .members = {},
+          .open = true,
+          .peer = "10.9.9.9",
+          .expected = Wire::Status::Ok },
+        // The default #235 must not have moved: a node given neither flag is closed
+        // to the network and useful to the machine it runs on, which is what makes
+        // "off by default" safe and what an operator who types nothing gets.
+        { .what = "this machine, with no policy at all",
+          .members = {},
+          .open = false,
+          .peer = "127.0.0.1",
+          .expected = Wire::Status::Ok },
+        { .what = "the network, with no policy at all",
+          .members = {},
+          .open = false,
+          .peer = "10.0.0.1",
+          .expected = Wire::Status::Error },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+
+        // The command line the getting-started page documents, plus whatever policy
+        // this row names. `--scheduler` and `--advertise` are read by neither the
+        // rules nor the oracle; they are here because they are what makes this a
+        // worker rather than a bare struct, and a worker is the shape under test.
+        NodeConfig cfg;
+        cfg.scheduler = "scheduler.internal:6675";
+        cfg.advertise = "worker-01.internal:6676";
+        cfg.fleetMembers = row.members;
+        cfg.fleetOpen = row.open;
+
+        // The link that was broken: a worker naming who may spend its CPU, and
+        // naming no scheduler of its own, is a configuration that has to START.
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        NodeMembership const membership { cfg };
+        Fixture fix;
+
+        CHECK(StatusOf(ServeOneFrom(fix, membership.Oracle(), row.peer, CompileFrame())) == row.expected);
+
+        // A refusal costs nothing, which is the property that matters: it happens
+        // before the payload is read, so nothing was buffered and no compiler ran.
+        auto const refused = row.expected == Wire::Status::Error ? 1U : 0U;
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == refused);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1U - refused);
     }
 }
 

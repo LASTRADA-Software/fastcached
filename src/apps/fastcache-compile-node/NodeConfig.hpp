@@ -161,12 +161,19 @@ struct NodeConfig
     /// exactly the shape `--advertise` is refused for.
     std::string schedulerListen;
 
-    /// Peers this node will schedule work onto, as `host:port`; repeatable.
+    /// Peers this node serves, as `host:port`; repeatable.
     ///
-    /// Only the host part is used -- a peer connecting to the scheduler comes from an
-    /// ephemeral source port, so an endpoint is not something a connection can be
-    /// matched against. The endpoint form is accepted because it is what discovery
-    /// produces and what an operator has written down.
+    /// Gates **all three** of this node's surfaces through one `NodeMembership`: the
+    /// scheduler decides who may spend the fleet's CPU, the compile port decides who
+    /// may spend *this machine's*, and the cache tier decides who may read what those
+    /// compiles produced. So a plain worker running no scheduler needs this exactly
+    /// as much as a scheduler does -- without it, its compile port admits its own
+    /// machine and refuses every dispatched job (#235).
+    ///
+    /// Only the host part is used -- a peer connecting comes from an ephemeral source
+    /// port, so an endpoint is not something a connection can be matched against. The
+    /// endpoint form is accepted because it is what discovery produces and what an
+    /// operator has written down.
     std::vector<std::string> fleetMembers;
 
     /// Where this node keeps its own cache tier, or empty for memory only.
@@ -402,14 +409,15 @@ struct NodeConfig
     /// off loopback for exactly that reason.
     bool tlsSelfSigned { false };
 
-    /// Admit every caller to the fleet, rather than only `--fleet-member` hosts.
+    /// Admit every caller to this node, rather than only `--fleet-member` hosts.
     ///
-    /// The right answer for one machine, or a fleet whose network reachability is
-    /// already its boundary. It is a *flag* rather than the behaviour you get by
-    /// listing no members, because "no policy" and "a policy that admits everybody"
-    /// have to be the same explicit decision -- listing nobody refuses everybody, and
-    /// a scheduler that quietly served strangers would look identical to a healthy one
-    /// from both ends.
+    /// The right answer for a fleet whose network reachability is already its
+    /// boundary. Like `--fleet-member` it governs every surface this node serves,
+    /// worker included. It is a *flag* rather than the behaviour you get by listing
+    /// no members, because "no policy" and "a policy that admits everybody" have to
+    /// be the same explicit decision -- listing nobody refuses everybody, and a node
+    /// that quietly served strangers would look identical to a healthy one from both
+    /// ends.
     bool fleetOpen { false };
 
     /// Start with no cluster and wait to be admitted to one.
@@ -594,6 +602,32 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// @param cfg The parsed configuration.
 /// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
 [[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
+
+/// Who this node admits, as one line an operator reads at startup.
+///
+/// One spelling for two callers -- the scheduler tier's ready line and the worker's
+/// -- because the policy is the **node's** rather than any one surface's, and a
+/// phrase each of them built separately is one that drifts. Read off the
+/// configuration rather than off the oracle: the count is a property of what the
+/// operator wrote, and the oracle is shared by three surfaces and no longer any one
+/// tier's to inspect.
+///
+/// It says "this machine" out loud, because that admission is unconditional and an
+/// operator reading "2 member host(s)" would otherwise not know their own builds
+/// were covered. And it names the flag that would fix it when there is no policy at
+/// all, which is the whole of #235's second half: such a worker starts, logs a
+/// healthy line and refuses every dispatched compile, so the one line an operator
+/// reads has to say that the port is closed. A scheduler cannot reach that case --
+/// `--listen-scheduler` with no policy is refused at startup -- so it costs its line
+/// nothing.
+///
+/// *Which* flag it names depends on whether `--node-id` turned consensus on, because
+/// there `--fleet-member` is the bootstrap answer only and the agreed member set
+/// replaces it; what consensus never supplies is a client machine, which is not a
+/// cluster peer, so `--fleet-open` is the remedy that survives on such a node.
+/// @param cfg The parsed configuration.
+/// @return A phrase naming who this node admits.
+[[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
 
 /// Why this worker's configuration cannot work, if it cannot.
 ///
