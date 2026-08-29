@@ -489,6 +489,19 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A clang-tidy sweep that cannot prove the tool ran is worth nothing and reads like
   success — `scripts/tidy-sweep.sh` canaries it first and treats a failure to
   execute as fatal, never as "no findings".
+- A ccache hit does NOT skip clang-tidy: the launcher and the analyser are two
+  independent commands under `cmake -E __run_co_compile`. On a pull request CI
+  therefore tidies the diff plus every translation unit that includes a changed
+  header, and anything that changes how EVERY unit is read gets a row in
+  `SweepEverythingWhen` — a missing row is a sweep that checks the wrong set and
+  prints a confident count.
+- A compile database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF`
+  named explicitly. `CompileCache.cmake` sets it only when it picks a launcher, and
+  without it every unit fails to parse and the sweep reports clean.
+- A compiler cache that reads like success is worse than none: the Windows sccache
+  was running into a directory the runner deletes, so the jobs are asserted to be
+  backed by the Actions cache — before `ctest`, which restarts the sccache server
+  and zeroes its counters.
 - Every `bool` and byte-wide enum in a config struct lives in one run: one between two
   8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
 - A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.

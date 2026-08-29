@@ -121,6 +121,186 @@ determinism rests on.
   and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
   that silently does nothing is worse than one that is off, because the second is
   visible.
+
+## What CI costs
+
+The workflow's *critical path* is the longest single job, and for a long time that
+was one job: `clang-tidy`, at 28.6 minutes out of a 28.6-minute workflow (run
+`33243524509`, master, green). Everything here was measured on that run, and the
+numbers are kept because each one is the reason a knob is where it is.
+
+- **A ccache hit does not skip clang-tidy, so caching harder was never the fix.**
+  That job reported **535 hits out of 592 cacheable calls (90.4%)** and its build
+  step still took **23.8 minutes**. CMake wires the analyser in through
+  `cmake -E __run_co_compile`, which runs the compiler behind its launcher and the
+  analyser as two independent commands: a replayed object buys the compile back and
+  not one second of the analysis. The only way to pay less clang-tidy is to run it
+  over fewer translation units, which is why the job stopped building at all and
+  became `scripts/tidy-sweep.sh` over a compile database.
+
+- **The sweep's scope is the diff plus everything the diff can break, and every
+  way it can be wrong errs towards sweeping more.** A changed header is not a
+  translation unit: tidying only the changed `.cpp` files would let one edit to
+  `Logger.hpp` land findings in seventy files nobody checked, and the sweep would
+  print a confident count while doing it. So the scope is the changed `.cpp` files
+  **union** every `.cpp` that transitively includes a changed header — resolved by
+  longest path suffix, so an ambiguous spelling reaches every candidate and an
+  unresolvable one is dropped as a system header. An over-approximation costs
+  minutes; an under-approximation costs a red master for code a pull request was
+  told was clean. A base ref that does not resolve escalates to the full sweep for
+  the same reason: "we could not tell what changed" must never read as "nothing
+  did". Measured on this tree: a leaf `.cpp` sweeps 1 unit, a mid-level header 23,
+  `Core/Logger.hpp` 71, and a `.cmake` all 329.
+
+- **A change that decides how EVERY translation unit is read escalates to the full
+  sweep, and that is a table** (`SweepEverythingWhen`): `.clang-tidy`, any
+  `CMakeLists.txt`, any `.cmake`, `CMakePresets.json`, `vcpkg.json`, `*.hpp.in`
+  (it generates a header the include graph cannot see), the sweep script and the
+  workflow. A README typo is deliberately not on it.
+
+- **The unit of work is a compile command, not a file, and that is what makes the
+  swap lossless.** `Stats.cpp` builds into `fastcache-cc`, `fastcache-cc-tests`
+  and `fastcache-compile-node`, which do not agree about `FC_COMPRESSION_ENABLED`.
+  `clang-tidy -p <dir> <file>` does **not** take the first matching entry:
+  libTooling's `ClangTool::run` loops over *every* command the database returns for
+  that file. So a file with one command needs nothing special, and a file with
+  several is served **only** by one single-entry database per command — handing it
+  to the shared database *as well* analyses each of its commands twice.
+  Measured against a CI-shaped database: 594 entries, 445 of them first-party, and
+  329 distinct files — so a per-file sweep would have stopped checking a quarter of
+  what the build checked. 445 is also exactly what the old job tidied
+  (`include(ClangTidy)` runs *after* the `CPMAddPackage` calls, so a fetched
+  dependency's targets never carried `CMAKE_CXX_CLANG_TIDY`), which is the sense in
+  which this change costs no coverage. Measured scopes on that database: a leaf
+  `.cpp` 1 unit, `Distributed/SchedulerService.hpp` 29, `Core/Logger.hpp` 83,
+  `Stats.cpp` 4 (one file, four commands), a `.cmake` all 445, a README nothing.
+
+- **The translation units come from the compile database, never from
+  `git ls-files`.** `IocpReactor.cpp` is a translation unit on Windows and a file
+  on Linux, so a full sweep taken from the index would fail on sources no target
+  here builds — and a diff-scoped one would report findings for a compile command
+  that does not exist.
+
+- **But *first-party* means git tracks the file, and that is a definition rather
+  than a list of directories.** A fetched dependency's sources are compile-database
+  entries like any other — Catch2, yaml-cpp and lz4 are ~150 of the 594 entries here
+  — and **where they land is configuration**: `_deps/` under the build tree by
+  default, `$CPM_SOURCE_CACHE` anywhere, which in CI is `.cache/CPM` *inside* the
+  workspace. An exclusion written as a path (`/_deps/`) was measured to let all
+  ~150 of them through under CI's own layout, which turns a full sweep into a
+  failure inside lz4's `xxhash.h`. Intersecting with
+  `git ls-files --cached --others --exclude-standard` gets it right wherever the
+  cache is put, and subsumes the absolute-path and out-of-tree cases for free.
+  `--others` is in there deliberately: a source created and not yet added is
+  exactly the code nothing has ever checked.
+
+- **A database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF`
+  named explicitly, even though `CompileCache.cmake` sets it.** That module turns
+  the scan off only when it *picks a launcher*, and the tidy job installs no ccache
+  for it to pick. Without the flag every compile command carries `@…modmap`
+  arguments that do not exist until the target is built, every translation unit
+  fails to parse, and the sweep reports clean having checked nothing — which is the
+  exact failure `scripts/tidy-sweep.sh` canaries against, so it is caught rather
+  than believed.
+
+- **The sanitizer test run moved to `clang-asan-ubsan`; it did not go.** The
+  `clang-debug` preset is the only configuration in the workflow with ASan and
+  UBSan on, so that job's `ctest` is the project's entire sanitizer coverage in CI.
+  It keeps the `clang-debug` preset with `-DENABLE_TIDY=OFF` rather than switching
+  to the identically named `clang-asan-ubsan` preset, which does not set
+  `PEDANTIC_COMPILER_WERROR` — a tidier preset name is not worth the sanitizer
+  job's warnings-as-errors.
+
+- **A ccache cap is judged by `Cleanups`, not by the hit rate.** The Debug + ASan +
+  UBSan job finished at **99.76% of a 256M cache having run 44 cleanups** — it was
+  evicting its own objects inside a single build, while reporting a 90% hit rate
+  that looked healthy. It is 1G now. The Release jobs finished at 69.7% full with
+  zero cleanups and are deliberately left at 256M: the whole repository shares a
+  10 GB Actions cache budget, and raising a cap that is not full spends it on
+  nothing.
+
+- **`sccache` on the Windows jobs was running, and caching into a directory that
+  is deleted with the runner.** Its statistics said `Cache location  Local disk:
+  "C:\Users\runneradmin\AppData\Local\Mozilla\sccache\cache"` — so nothing it
+  stored ever survived the job that stored it, and the two Windows build jobs paid
+  a full cold compile every run: 17.2 and 11.8 minutes of build, the second-biggest
+  block in the workflow. `mozilla-actions/sccache-action` does **not** set
+  `SCCACHE_GHA_ENABLED` for you — its README tells you to — and without it sccache
+  never looks at the Actions cache at all. The action must also be **v0.0.11 or
+  newer**: GitHub's cache service v1 is gone, and only the newer action exports the
+  `ACTIONS_RESULTS_URL` / `ACTIONS_RUNTIME_TOKEN` pair the backend reads.
+
+- **Read those statistics before `ctest`, or they are somebody else's.** The
+  action's own post step reported `Compile requests 0` for both Windows build
+  jobs, which reads as "the launcher was never wired in" and is not what happened:
+  sccache keeps its counters **in the server**, and this suite's
+  `sccache-smoke-*` tests restart that server with `SCCACHE_MEMCACHED` pointed at
+  a fastcached daemon — zeroing them, minutes before the post step reads them.
+
+  That is the shared-cache configuration `docs/snippets/sccache-backend-caveat.md`
+  exists for, and naming it here without saying so is what
+  `ctest -R sccache-backend-caveat` refuses: under **MSVC** and **clang-cl**
+  sccache hashes `/EP` output, which carries no paths, and replays a hit's
+  `/showIncludes` with the absolute paths of the checkout that stored it, so two
+  checkouts record each other's headers; `fastcache-cc` is the remedy, because it
+  rewrites a hit's paths into the consuming checkout and refuses a hit whose
+  replayed dependency is not there. Those smoke jobs compile with `g++-14`, where
+  the hazard does not arise at all — which is the only reason a test in this suite
+  may point sccache at a daemon.
+
+  The
+  job that does not run `ctest`, `compile-cache E2E (Windows)`, reported **231
+  compile requests, 2 hits, 229 misses** from the same configuration, which is both
+  the proof that the launcher works and the proof that the disk cache is cold every
+  run. So the assertion that sccache handled the build runs **immediately after the
+  build step and before the test step**, and a number read anywhere else in a job
+  that runs the suite means nothing.
+
+- **Sharing sccache entries across Windows CI runs is safe, and the reason is not
+  "it seems fine".** The `/showIncludes` hazard `CompileCache.cmake` warns about
+  needs an *incremental* build across checkouts at *different* absolute paths.
+  Every runner builds from scratch at `D:\a\fastcached\fastcached`, so neither half
+  holds. Change either — a persistent Windows runner, or a checkout somewhere else
+  — and this stops being true.
+
+- **Packaging and coverage stay on pull requests, and `package-macos` is why.** It
+  is the only job that compiles with `/usr/bin/clang` and Apple's own libc++; the
+  `macos` job uses Homebrew LLVM's much newer one. That is two standard libraries,
+  and it is precisely the split that let `std::views::enumerate` build clean
+  everywhere and break the package job. Moving it off pull requests would move that
+  class of failure from the pull request to master. `package-windows` is the only
+  place the MSI and the service registration are exercised at all — which is what a
+  `packaging/` change breaks — and `coverage` is not on the critical path. The
+  ~17 runner-minutes are real; buying them with a break that reaches master is not
+  a trade. `check-release-gate` would not have objected: it asserts the *list* in
+  `release.needs`, not that each job runs, so a skipped job still gates. The refusal
+  is on the merits, not on the guard.
+
+- **A WSL build belongs under `~`, not under `/mnt/d`, and the cost of getting it
+  wrong is threefold.** DrvFs is a 9p bridge to the Windows filesystem, and a build
+  is almost entirely small-file I/O. Measured on this machine — same commit, clang
+  20, Debug, `USE_COMPILER_CACHE=OFF`, `-j8`, target `fastcached`, a warm configure
+  so only the compile is timed:
+
+  | | ext4 (`~`) | DrvFs (`/mnt/d`) | |
+  |---|---|---|---|
+  | build, wall | **19.6 s** | **60.5 s** | 3.1× |
+  | build, user CPU | 125.2 s | 127.0 s | 1.01× |
+  | build, sys CPU | 6.9 s | 19.6 s | 2.8× |
+  | open+read every `*.hpp` | 0.11 s | 1.02 s | 9.3× |
+
+  The user time is the number that settles it: the two builds did **the same
+  compute**, to within 1.5%. Everything DrvFs costs is spent waiting on the
+  filesystem, which is also why the header walk — pure I/O, no compute — is the
+  worst ratio of the four, and why `sccache-backend-caveat` times out on `/mnt/d`
+  without anything being broken.
+
+  This is not a preference, because there is a second, harder reason: a
+  **Windows-created worktree is unreadable by WSL git at all** — its `.git` file
+  holds a drive-lettered path, so `scripts/local-gate.sh` dies and
+  `repository-hygiene` silently skips inside one. A WSL build needs a WSL-created
+  checkout, and the moment you are making one anyway, make it under `~`.
+
 ## Language and ABI pitfalls
 
 - **A return type is not part of a function's name on Linux, and MSVC's mangling
@@ -234,6 +414,19 @@ determinism rests on.
   against a real source file first, treats exit codes ≥ 126 as fatal rather than as
   findings, and refuses to print a clean verdict it did not earn. Use it, and if you
   write a one-off loop instead, make it fail loudly the same way.
+
+  "Refuses a verdict it did not earn" is four separate refusals, and each one closes
+  a path that ends in `CLEAN` over nothing: the plan's exit status is *observed*
+  (`mapfile < <(plan)` throws it away, and every way a compile database can fail to
+  parse then yields zero rows, which reads as "nothing to sweep"); the include scan
+  is fatal when `grep` **fails** rather than merely matching nothing (an empty graph
+  silently narrows the scope to the changed `.cpp` files); a plan with units in it
+  and none of them present in the tree is fatal, not `CLEAN (0 translation
+  unit(s))`; and the extension table that decides what may be handed to clang-tidy
+  is a table, so a `.c` unit cannot be walked into the graph and dropped on the way
+  out. The self-test also pins `LC_ALL=C` on its ordering — under `en_US.UTF-8`
+  `sort` collates case-insensitively and the assertions fail on a developer's
+  machine while passing on a runner's `C.UTF-8`.
 
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
