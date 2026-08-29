@@ -3,8 +3,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -521,6 +523,64 @@ TEST_CASE("A malformed grant or result is unavailable, never a silent success", 
         std::vector<std::string> const args { "-O2" };
         CHECK(Dispatch(fleet, Request(args)).status == DispatchStatus::Unavailable);
     }
+}
+
+TEST_CASE("A worker's reply may not declare an expansion above the launcher's ceiling", "[dispatch]")
+{
+    // The other half of issue #241, and the reason the guard is ONE function: this
+    // path and the worker's were copies of each other, so a guard added to one would
+    // have been half a fix and the two would have had to agree forever after.
+    //
+    // The launcher dialled a worker the SCHEDULER named, which is not the same as a
+    // worker this process trusts with its address space: a rogue or compromised fleet
+    // member answers this exchange too, and `Decompress` value-initializes whatever
+    // the reply declares.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+
+    constexpr std::uint32_t FourGiB = 0xFFFFFFFFU;
+    std::array<std::byte, 16> const payload { std::byte { 0x41 } };
+    auto const bomb = Wire::EncodeCodecEnvelope(/*codec=*/1, FourGiB, payload);
+    fleet.Serve(std::string { Worker },
+                Wire::EncodeReply(Wire::Status::Ok,
+                                  Wire::EncodeCompileResult(Wire::CompileResult {
+                                      .exitCode = 0, .object = bomb, .stdoutText = {}, .stderrText = {} })));
+
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    // Unavailable, never Compiled: a reply this process refused to open is not an
+    // object, and the launcher answers it the way it answers every dispatch failure --
+    // by compiling locally.
+    CHECK(result.status == DispatchStatus::Unavailable);
+    CHECK(result.object.empty());
+    // The reason travels and names the endpoint, because "distribution stopped
+    // helping" is otherwise a whole investigation.
+    CHECK(result.detail.contains(Worker));
+    CHECK(result.detail.contains("declared decompressed size"));
+}
+
+TEST_CASE("The launcher's envelope ceiling is a budget the caller can set", "[dispatch]")
+{
+    // A byte budget beside the two time budgets, bounding the same thing they do:
+    // what one exchange may cost this process.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJECT"));
+
+    std::vector<std::string> const args { "-O2" };
+
+    // Default ceiling: an ordinary object comes back.
+    CHECK(Dispatch(fleet, Request(args)).status == DispatchStatus::Compiled);
+
+    // A ceiling below this object's size refuses it, so the figure is genuinely the
+    // caller's rather than a constant baked into the decoder.
+    ScriptedFleet tight;
+    tight.Serve(std::string { Scheduler }, GrantReply());
+    tight.Serve(std::string { Worker }, CompileReply("OBJECT"));
+    DispatchBudgets budgets;
+    budgets.maxDecompressedBytes = 2;
+    CHECK(Dispatch(tight, Request(args), budgets).status == DispatchStatus::Unavailable);
 }
 
 TEST_CASE("The arguments the worker receives are the ones it was given", "[dispatch]")

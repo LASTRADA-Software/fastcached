@@ -67,27 +67,6 @@ namespace
         return Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(raw.size()), raw);
     }
 
-    /// Undo a codec envelope.
-    /// @param field The enveloped field.
-    /// @return The original bytes, or nullopt when the envelope is malformed or its
-    ///         codec is one this build cannot decode.
-    [[nodiscard]] std::optional<std::vector<std::byte>> Unenvelope(std::span<std::byte const> field)
-    {
-        auto const envelope = Wire::DecodeCodecEnvelope(field);
-        if (!envelope.has_value())
-            return std::nullopt;
-        if (envelope->codec == Wire::IdentityCodec)
-            return std::vector<std::byte> { envelope->bytes.begin(), envelope->bytes.end() };
-
-        auto const codec = static_cast<CompressionCodec>(envelope->codec);
-        if (!Compression::IsAvailable(codec))
-            return std::nullopt;
-        auto decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
-        if (!decoded.has_value())
-            return std::nullopt;
-        return std::move(*decoded);
-    }
-
     /// Build a `DispatchResult` that carries only a reason.
     [[nodiscard]] DispatchResult Refused(DispatchStatus status, std::string detail)
     {
@@ -131,6 +110,12 @@ namespace
         Credential const& credential;    ///< Presented to the worker.
         DispatchRequest const& request;  ///< The job itself.
         ExchangeBudget budget;           ///< How long the compile may take.
+        /// Ceiling on the object the worker may declare it is sending back.
+        ///
+        /// The launcher dialled a worker the SCHEDULER named, which is not the same
+        /// as a worker this process trusts with its address space: a rogue or
+        /// compromised fleet member answers this exchange too.
+        std::size_t maxObjectBytes { DefaultMaxDecompressedBytes };
     };
 
     /// Send one preprocessed translation unit to the worker a lease named.
@@ -177,9 +162,16 @@ namespace
         if (!result.has_value())
             return Refused(DispatchStatus::Unavailable, "malformed compile result");
 
-        auto object = Unenvelope(result->object);
+        // The worker's declared decompressed size is checked before a byte of it is
+        // expanded -- see `Unenvelope`. The reason travels, because "distribution
+        // stopped helping" is otherwise a whole investigation, and because a worker
+        // declaring an absurd expansion is a fact an operator wants to read.
+        auto object = Unenvelope<std::vector<std::byte>>(result->object, job.maxObjectBytes);
         if (!object.has_value())
-            return Refused(DispatchStatus::Unavailable, "compile result object could not be decoded");
+            return Refused(DispatchStatus::Unavailable,
+                           std::format("compile result object from {} could not be decoded: {}",
+                                       job.endpoint,
+                                       DescribeEnvelopeError(object.error())));
 
         return DispatchResult { .status = DispatchStatus::Compiled,
                                 .exitCode = static_cast<int>(result->exitCode),
@@ -289,7 +281,8 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                                               .accepted = accepted,
                                               .credential = credential,
                                               .request = request,
-                                              .budget = budgets.compile });
+                                              .budget = budgets.compile,
+                                              .maxObjectBytes = budgets.maxDecompressedBytes });
 
     // --- and hand the lease back, however that went -------------------------
     // On every path out of the compile, which is why the compile is a function
@@ -298,6 +291,25 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // longer being built here.
     ReleaseLease(exchange, request, token, credential, budgets.control);
     return result;
+}
+
+std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept
+{
+    // No `default:`, so a reason added to the enum fails to compile here rather than
+    // silently rendering as the catch-all -- which is the one string an operator
+    // cannot act on.
+    switch (error)
+    {
+        case EnvelopeError::Malformed:
+            return "the codec envelope is malformed";
+        case EnvelopeError::UnsupportedCodec:
+            return "the payload is in a codec this build cannot decode";
+        case EnvelopeError::DeclaredTooLarge:
+            return "the declared decompressed size exceeds this endpoint's ceiling";
+        case EnvelopeError::Corrupt:
+            return "the payload does not expand to its declared size";
+    }
+    return "the codec envelope could not be opened";
 }
 
 } // namespace FastCache::Cc

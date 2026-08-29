@@ -57,6 +57,43 @@ Every rule below has already been a bug.
   lives in `apps/fastcache-cc/CacheProtocol.cpp` rather than `main.cpp` for a
   related reason: `main.cpp` is in no test target, so while the framing sat there
   it had *no* unit coverage at all.
+- **A length a PEER declares sizes nothing until it has been checked against this
+  side's own cap — and a codec envelope's `rawLen` is such a length.** The frame
+  header's `payloadLength` was checked; the envelope's declared *decompressed*
+  size, one layer in, was passed straight to `Compression::Decompress`, which
+  **value-initializes** a buffer of exactly that size. So the pages are touched
+  rather than lazily reserved, and a `u32` chosen by the sender with no enforced
+  relation to the compressed bytes beside it turned a thirty-byte frame into a
+  4 GiB allocation. The surface's in-flight byte budget charged only the *frame*
+  length, so it passed admission having reserved nothing like what it cost
+  ([#241](https://github.com/LASTRADA-Software/fastcached/issues/241)).
+  - **Both headers already said so, and neither was implemented.**
+    `Core/Compression.hpp` states the precondition — `originalLen` is "the trusted
+    expected size taken from the record header", which off a socket it is neither —
+    and `Protocol/CompileCacheWire.hpp` goes further: carrying `rawLen` "is what
+    lets a decoder reject a payload whose declared expansion exceeds its cap before
+    decompressing a byte". A guard a header *promises* is not a guard; grep for the
+    decoders before believing the comment.
+  - **The cap is the SURFACE's, injected rather than assumed.** A decoder does not
+    see the listener that enforced the frame length, so a surface with a smaller
+    request cap has to say so or the two disagree about what one request may cost.
+    `WorkerProtocol` takes it as a constructor argument, the launcher as a
+    `DispatchBudgets` field — a byte budget beside the two time budgets, bounding
+    the same thing they do.
+  - **Both ends of a payload need the guard, so there is ONE decoder.** The worker
+    opening a request and the launcher opening a worker's reply were copies of one
+    function; a guard added to either is half a fix, and two guards must then agree
+    forever. The launcher is not the safe half: it dialled a worker the *scheduler*
+    named, which is not a worker it trusts with its address space.
+  - **An `Identity` envelope is checked too.** It takes no decompression path, so it
+    never reached `Decompress`'s own length check and could declare any size beside
+    any payload. Not an allocation — but a field describing bytes it does not
+    describe, and the next receiver to believe it is the next defect.
+  - Refusal is `payload-too-large` and a **reply**, never a close: the frame declared
+    its own length, so the link is still synchronised and the peer learns which of
+    its fields was refused. That is the framing rule at the top of this section,
+    applied one layer in.
+
 ## Authentication on the compile-cache port
 
 - **Every protocol checks the configured credential, and the compile cache was the

@@ -3,7 +3,6 @@
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
-#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
@@ -20,24 +19,6 @@ namespace FastCache::Cc
 namespace
 {
     namespace Wire = CompileCacheWire;
-
-    /// Undo a codec envelope, refusing anything this worker cannot decode.
-    [[nodiscard]] std::optional<std::string> Unenvelope(std::span<std::byte const> field)
-    {
-        auto const envelope = Wire::DecodeCodecEnvelope(field);
-        if (!envelope.has_value())
-            return std::nullopt;
-        if (envelope->codec == Wire::IdentityCodec)
-            return std::string { Wire::AsStringView(envelope->bytes) };
-
-        auto const codec = static_cast<CompressionCodec>(envelope->codec);
-        if (!Compression::IsAvailable(codec))
-            return std::nullopt;
-        auto const decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
-        if (!decoded.has_value())
-            return std::nullopt;
-        return std::string { Wire::AsStringView(*decoded) };
-    }
 
     /// What one refusal means on the wire and in the metrics.
     ///
@@ -99,11 +80,13 @@ namespace
 WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
-                               IMetricsSink& metrics):
+                               IMetricsSink& metrics,
+                               std::size_t maxDecompressedBytes):
     _jobs { jobs },
     _validator { std::move(validator) },
     _acceptedCodecs { std::move(acceptedCodecs) },
-    _metrics { metrics }
+    _metrics { metrics },
+    _maxDecompressedBytes { maxDecompressedBytes }
 {
 }
 
@@ -150,10 +133,22 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     if (_validator && !_validator(token, fingerprint))
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {});
 
-    auto source = Unenvelope(fields->source);
+    // Opened AFTER the lease check and BEFORE any expensive work, and it is the
+    // declared decompressed length that decides which happens. An envelope declaring
+    // more than this surface caps a request at is refused without a byte being
+    // expanded -- `Decompress` value-initializes its output, so believing a `u32`
+    // off a socket turns a thirty-byte frame into a multi-gigabyte allocation that
+    // the listener's byte budget charged nobody for.
+    //
+    // A REPLY, never a close: the frame declared its own length, so the connection is
+    // still synchronised and a peer that guessed wrong learns which. `PayloadTooLarge`
+    // already means "declared payload exceeds the session's cap", which is exactly
+    // this fact about a field one layer in.
+    auto source = Unenvelope<std::string>(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedCodec,
-                                      "the preprocessed source is in a codec this worker cannot decode");
+        return Wire::EncodeErrorReply(source.error() == EnvelopeError::DeclaredTooLarge ? Wire::ErrorCode::PayloadTooLarge
+                                                                                        : Wire::ErrorCode::UnsupportedCodec,
+                                      DescribeEnvelopeError(source.error()));
 
     // Counted around the runner rather than inside it: the runner is a seam with
     // its own fakes, and a fake that forgot to count would make every test agree

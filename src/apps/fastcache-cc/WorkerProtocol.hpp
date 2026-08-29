@@ -3,6 +3,7 @@
 
 #include "CacheProtocol.hpp"
 #include "CompileJob.hpp"
+#include "Dispatch.hpp"
 
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
@@ -58,10 +59,17 @@ class WorkerProtocol
     /// interface is header-only and depends on nothing but the standard library,
     /// so including it costs `fastcache-cc` — which compiles this file in without
     /// linking `FastCache` — nothing at link time.
+    /// @param maxDecompressedBytes Ceiling on what a request's codec envelope may
+    ///        declare it expands to. **The surface's own request cap**, passed in
+    ///        rather than assumed: this class never sees the listener that enforced
+    ///        the frame length, so a listener with a smaller cap has to say so or the
+    ///        two disagree about how much memory one request may cost. The default is
+    ///        the figure every framed surface here uses.
     WorkerProtocol(CompileJobRunner& jobs,
                    LeaseValidator validator,
                    CompileCacheWire::CodecList acceptedCodecs,
-                   IMetricsSink& metrics);
+                   IMetricsSink& metrics,
+                   std::size_t maxDecompressedBytes = DefaultMaxDecompressedBytes);
 
     /// Answer one complete request frame.
     /// @param frame A whole request, header included.
@@ -78,6 +86,8 @@ class WorkerProtocol
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
     IMetricsSink& _metrics;
+    /// What a request's envelope may declare it expands to; see the constructor.
+    std::size_t _maxDecompressedBytes;
 };
 
 /// Register this worker with a scheduler, and keep it registered.
