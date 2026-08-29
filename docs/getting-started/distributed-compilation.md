@@ -336,8 +336,9 @@ locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
 `FASTCACHE_DISPATCH_TIMEOUT_MS` is how long the client will wait for one remote
-compile, dial to last byte. It defaults to **600000** (ten minutes) and is
-deliberately not the cache's `FASTCACHE_TIMEOUT_MS`: a worker writes nothing
+compile, measured from the request to the last byte of the reply — the dial has
+its own `FASTCACHE_CONNECT_TIMEOUT_MS`. It defaults to **600000** (ten minutes)
+and is deliberately not the cache's `FASTCACHE_TIMEOUT_MS`: a worker writes nothing
 until the compiler has finished, so the client waits out the whole compile in a
 single read, and while the two shared one number every translation unit taking
 longer than ten seconds was abandoned and rebuilt locally — precisely the ones

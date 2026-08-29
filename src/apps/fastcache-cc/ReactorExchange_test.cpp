@@ -460,10 +460,45 @@ TEST_CASE("A budget of zero arms no deadline at all")
     TestReactor reactor { clock };
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
+    // Dribbled, and that is what makes this case mean anything. A peer whose reads
+    // resolve INLINE finishes the whole exchange before `Run()` is ever called, so
+    // the reactor never takes a turn, so a deadline armed at `Now()` never gets to
+    // fire -- and the case would pass against the very code it exists to reject.
+    // Handing the reply over one byte per reactor turn, with the clock moving each
+    // time, is what puts the exchange on the far side of a turn the timer would
+    // have used.
+    connector.DribbleReplies();
+
+    // Comfortably more turns than `ReplyHeaderSize`, so the exchange stops because
+    // it read a whole reply and not because the driver ran out of turns.
+    constexpr int Turns = 32;
+    auto dribble = [](TestReactor* loop, ManualClock* c, PeerLog* log, int turns) -> DetachedTask {
+        for (int turn = 0; turn < turns; ++turn)
+        {
+            co_await ResumeOn { *loop };
+            c->Advance(1s);
+            if (log->live == nullptr || !log->live->DeliverOneByte())
+                co_return;
+        }
+    };
 
     Cc::ReactorExchange exchange { reactor, connector };
+    auto const start = clock.Now();
+    dribble(&reactor, &clock, &connector.Log(), Turns);
+
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Cc::ExchangeBudget { .total = 0ms });
 
+    // Drained so the driver reaches its own `co_return` and frees its frame; see the
+    // dribbling case above for why `Run()` cannot be relied on to do it.
+    (void) reactor.Drain();
+
+    auto const& log = connector.Log();
+    INFO("reads=" << log.reads << " advanced="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms");
+    // The reactor really did turn, and the clock really did move past where a
+    // `Now() + 0` deadline would have sat -- which is the whole discriminator.
+    CHECK(clock.Now() > start);
+    CHECK(log.reads > 1);
     // The daemon's own answer, not the transport failure a fired deadline produces.
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Miss);
 }

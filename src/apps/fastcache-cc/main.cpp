@@ -21,7 +21,13 @@
 //   FASTCACHE_VERBOSE    if set, print fall-back diagnostics to stderr
 //   FASTCACHE_NO_STATS   if set, do not record invocations to the statistics log
 //   FASTCACHE_NO_DIRECT  if set, disable direct mode (always preprocess)
-//   FASTCACHE_TIMEOUT_MS per-call socket deadline in ms (default 10000; 0 = none)
+//   FASTCACHE_TIMEOUT_MS deadline in ms for one WHOLE cache exchange, request to
+//                        last byte of the reply (default 10000; 0 = unbounded)
+//   FASTCACHE_DISPATCH_TIMEOUT_MS
+//                        deadline in ms for one whole COMPILE exchange with a
+//                        worker (default 600000; 0 = unbounded). Separate from the
+//                        one above because a compile is bounded by how long a
+//                        compiler runs, not by a round trip (#223).
 //
 // The statistics log is located from the usual per-user state variables rather
 // than one of our own: LOCALAPPDATA on Windows, else XDG_STATE_HOME or HOME.
@@ -39,7 +45,6 @@
 #include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "Dispatch.hpp"
-#include "EndpointDial.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
 #include "PathResolve.hpp"
@@ -606,9 +611,12 @@ void ReplayStreams(std::string_view out, std::string_view err)
     // The compile budget is the ordinary one with its TOTAL replaced, rather than a
     // second field-by-field construction: only the total differs, so a third field
     // on `ExchangeBudget` must not need wiring into two places to reach dispatch.
-    auto compile = BudgetOf(cfg);
+    // Derived from the SAME value the control leg gets, not from a second call, so
+    // the two cannot drift apart in anything but the total.
+    auto const control = BudgetOf(cfg);
+    auto compile = control;
     compile.total = cfg.dispatchTimeout;
-    return Cc::DispatchBudgets { .control = BudgetOf(cfg), .compile = compile };
+    return Cc::DispatchBudgets { .control = control, .compile = compile };
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
