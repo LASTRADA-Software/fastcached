@@ -793,3 +793,43 @@ TEST_CASE("A worker bounds the payload bytes it reads at once, not just the jobs
         holder.client->Close();
     }
 }
+
+TEST_CASE("A stop that has nothing left to wait for is clean, however long it took", "[node][worker][drain]")
+{
+    // `Finished` outranks an expired bound, and that ordering is the one an operator
+    // notices: reporting an abandonment for a stop that had already finished would
+    // put a false alarm in the log at exactly the moment the thing worked.
+    using namespace std::chrono_literals;
+
+    CHECK(NextDrainAction(0, 0s, 30s) == DrainAction::Finished);
+    CHECK(NextDrainAction(0, 60s, 30s) == DrainAction::Finished);
+    CHECK(NextDrainAction(0, 60s, 0s) == DrainAction::Finished);
+}
+
+TEST_CASE("A stop reports while it waits and abandons only once the bound is spent", "[node][worker][drain]")
+{
+    // The decision `~WorkerServer` carries out, tested here because the branch that
+    // matters ENDS THE PROCESS (#239) -- a side effect no in-process case can survive
+    // is one no case would otherwise check. So the arithmetic lives in a pure
+    // function and the destructor is left with nothing but obeying it.
+    using namespace std::chrono_literals;
+
+    CHECK(NextDrainAction(1, 0s, 30s) == DrainAction::Report);
+    CHECK(NextDrainAction(4, 29s, 30s) == DrainAction::Report);
+
+    // At the bound, not past it: a stop that waited exactly its timeout has spent it.
+    CHECK(NextDrainAction(1, 30s, 30s) == DrainAction::Abandon);
+    CHECK(NextDrainAction(1, 31s, 30s) == DrainAction::Abandon);
+}
+
+TEST_CASE("A zero bound waits forever, which is what this did before the bound", "[node][worker][drain]")
+{
+    // Kept sayable rather than removed. An operator who would rather have the
+    // supervisor's timeout than this one has to be able to ask for that -- and a
+    // behaviour change nobody can turn off is how a stop-policy change becomes an
+    // incident on somebody else's fleet.
+    using namespace std::chrono_literals;
+
+    CHECK(NextDrainAction(1, 0s, 0s) == DrainAction::Report);
+    CHECK(NextDrainAction(1, 24h, 0s) == DrainAction::Report);
+}

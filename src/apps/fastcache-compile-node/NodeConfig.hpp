@@ -110,6 +110,26 @@ struct NodeConfig
     /// somebody's desktop becoming unusable.
     std::optional<std::uint32_t> reservedCores;
 
+    /// Seconds a stop waits for compiles still running, or 0 to wait forever.
+    ///
+    /// A stopping worker has to wait for something: a compile legitimately holds its
+    /// slot for seconds, and abandoning one loses work a client is still waiting on.
+    /// But an unbounded wait hands the decision to the supervisor, which answers it
+    /// with `SIGKILL` and no diagnostic -- on Windows an SCM stop timeout an operator
+    /// reads as "the service is hung" rather than "a compile is still running"
+    /// (#239).
+    ///
+    /// A flag rather than a constant because the right value is how long *this*
+    /// site's compiles legitimately run, which nothing in this process can know --
+    /// and a compile-time answer on a binary whose `--install-service` replays its
+    /// command line forever is a value nobody can move afterwards.
+    ///
+    /// Zero is "wait forever", which is what this did before the flag existed. It
+    /// stays reachable so an operator who prefers the supervisor's timeout to this
+    /// one can say so, rather than discovering the change as a behaviour they cannot
+    /// turn off.
+    std::uint32_t drainTimeoutSeconds { 30 };
+
     /// How hard this machine may be driven. See `Distributed::NodeClass`.
     ///
     /// Defaults to `Workstation`, which is the safe answer rather than the common

@@ -128,6 +128,25 @@ namespace
         return std::optional<std::uint32_t> { value };
     }
 
+    /// Parse `--drain-timeout`, in seconds.
+    ///
+    /// Zero is accepted and means "wait forever", which is a different answer from
+    /// not passing the flag -- and is what this program did before the flag existed,
+    /// so it has to stay sayable.
+    /// @param sv Text to parse.
+    /// @return The seconds, or why it is not a count of them.
+    [[nodiscard]] std::expected<std::uint32_t, ConfigError> ParseDrainTimeout(std::string_view sv)
+    {
+        auto value = 0U;
+        auto const* const begin = sv.data();
+        auto const* const end = std::next(begin, static_cast<std::ptrdiff_t>(sv.size()));
+        auto const [ptr, ec] = std::from_chars(begin, end, value);
+        if (ec != std::errc {} || ptr != end)
+            return std::unexpected(
+                ArgvError(ConfigErrorCode::OutOfRange, "drain-timeout", std::format("not a number of seconds: {}", sv)));
+        return value;
+    }
+
     /// An applier for a flag that names a cluster action AND carries its operand.
     ///
     /// Neither `SelectOutcome` nor `AssignFrom` covers this on its own: one sets
@@ -509,6 +528,15 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "person using it; a dedicated node may be driven to its\n"
                          "slot limit. The default is the safe answer rather than\n"
                          "the common one." },
+        { .primary = "--drain-timeout",
+          .arity = Arity::Value,
+          .operand = "=<seconds>",
+          .apply = AssignFrom<&NodeConfig::drainTimeoutSeconds, ParseDrainTimeout>(),
+          .description = "seconds a stop waits for compiles still running\n"
+                         "before giving up and saying what it abandoned;\n"
+                         "0 waits forever. Unbounded, the supervisor\n"
+                         "decides instead and answers with SIGKILL and no\n"
+                         "diagnostic." },
         { .primary = "--reserve-cores",
           .arity = Arity::Value,
           .operand = "=<n>",
@@ -919,6 +947,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
         argv.push_back(std::format("--fleet-member={}", member));
+    emitIfSet("drain-timeout", cfg.drainTimeoutSeconds, defaults.drainTimeoutSeconds);
     emitIfSet("log-level", LogLevelName(cfg.logLevel), LogLevelName(defaults.logLevel));
     emitPathIfSet("pidfile", cfg.pidfile);
 

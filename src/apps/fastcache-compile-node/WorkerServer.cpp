@@ -5,7 +5,10 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -16,6 +19,23 @@ namespace FastCache::Node
 namespace
 {
     namespace Wire = CompileCacheWire;
+
+    /// How often a stop says what it is still waiting for.
+    ///
+    /// A stop that says nothing for the whole timeout is indistinguishable from one
+    /// that has hung, which is the reading this whole change exists to prevent -- so
+    /// the interval is short enough that an operator watching `systemctl stop` sees
+    /// the count fall rather than a pause.
+    constexpr std::chrono::seconds DrainReportInterval { 2 };
+
+    /// What this process exits with when it abandons compiles to stop.
+    ///
+    /// Distinct from every ordinary failure, so a supervisor's log tells "stopped
+    /// with compiles still running" from a crash. 75 is `EX_TEMPFAIL` from
+    /// `sysexits.h` -- not a standard this project otherwise uses, but the closest
+    /// thing to a shared vocabulary for "this was not clean, and retrying is
+    /// reasonable", and unambiguous beside a compiler's own exit codes.
+    constexpr int DrainAbandonedExitCode = 75;
 
     /// Largest request a worker will buffer; declared in the header because
     /// `WorkerProtocol` is handed the same figure. See `WorkerMaxRequestBytes`.
@@ -90,14 +110,16 @@ WorkerServer::WorkerServer(IListener& listener,
                            Distributed::IMembershipOracle const& membership,
                            IMetricsSink& metrics,
                            ILogger& logger,
-                           IExecutor& jobs) noexcept:
+                           IExecutor& jobs,
+                           std::chrono::seconds drainTimeout) noexcept:
     _listener { listener },
     _jobs { jobs },
     _protocol { protocol },
     _slots { slots },
     _membership { membership },
     _metrics { metrics },
-    _logger { logger }
+    _logger { logger },
+    _drainTimeout { drainTimeout }
 {
 }
 
@@ -110,8 +132,66 @@ WorkerServer::~WorkerServer()
 
     // Every job holds a slot until it ends, so zero means nothing is still running
     // on the executor with a pointer into this object.
+    auto const idle = [this] {
+        return _inFlight.load(std::memory_order_acquire) == 0;
+    };
+
+    auto const started = std::chrono::steady_clock::now();
     auto guard = std::unique_lock { _drainMutex };
-    _drained.wait(guard, [this] { return _inFlight.load(std::memory_order_acquire) == 0; });
+    while (true)
+    {
+        // Woken on a cadence rather than once, because a stop that says nothing for
+        // the whole bound is indistinguishable from one that has hung -- which is the
+        // reading this exists to prevent. Under the lock throughout, so the count a
+        // line reports and the count the decision was made on are the same one.
+        (void) _drained.wait_for(guard, DrainReportInterval, idle);
+
+        switch (NextDrainAction(
+            _inFlight.load(std::memory_order_acquire), std::chrono::steady_clock::now() - started, _drainTimeout))
+        {
+            case DrainAction::Finished:
+                return;
+
+            case DrainAction::Report:
+                _logger.Logf(LogLevel::Info,
+                             "worker: waiting for {} compile(s) to finish before stopping",
+                             _inFlight.load(std::memory_order_acquire));
+                break;
+
+            case DrainAction::Abandon:
+                _logger.Logf(LogLevel::Error,
+                             "worker: giving up after {}s with {} compile(s) still running; ending now rather than "
+                             "waiting for the supervisor to kill this process without saying why (#239)",
+                             _drainTimeout.count(),
+                             _inFlight.load(std::memory_order_acquire));
+
+                // NOT a return. A running compile holds a pointer into this object --
+                // the counter, the protocol, the metrics sink, the logger, the byte
+                // budget -- so unwinding out of here would free all of them underneath
+                // it, trading a stop that waits for a crash on the way out. Ending the
+                // process is the one exit that abandons those jobs without touching
+                // what they are still using, and each one's client resolves its own
+                // lease on every path out of a compile (#212).
+                //
+                // `_Exit`, not `exit`: static destructors would run the same teardown
+                // this is avoiding.
+                std::_Exit(DrainAbandonedExitCode);
+
+            case DrainAction::Last:
+                break;
+        }
+    }
+}
+
+DrainAction NextDrainAction(std::size_t outstanding,
+                            std::chrono::steady_clock::duration waited,
+                            std::chrono::seconds timeout) noexcept
+{
+    if (outstanding == 0)
+        return DrainAction::Finished;
+    if (timeout == std::chrono::seconds::zero())
+        return DrainAction::Report;
+    return waited >= timeout ? DrainAction::Abandon : DrainAction::Report;
 }
 
 void WorkerServer::Shutdown() noexcept

@@ -946,6 +946,50 @@ compromised compile rewrite every cached object.
 `systemctl edit fastcache-compile-node` for local overrides; the shipped unit is
 replaced on upgrade.
 
+### Stopping one, and what a stop waits for
+
+A stopping worker has to wait for something: a compile legitimately holds its slot
+for seconds, and abandoning one loses work a client is still waiting on. So a stop
+closes the port first, then waits for the compiles already running.
+
+That wait is bounded by **`--drain-timeout`**, 30 seconds by default, and the node
+says what it is waiting for while it waits:
+
+```
+[INFO] worker: waiting for 3 compile(s) to finish before stopping
+[INFO] worker: waiting for 1 compile(s) to finish before stopping
+```
+
+If the bound is spent, it names what it is abandoning and ends the process itself,
+exiting **75**:
+
+```
+[ERROR] worker: giving up after 30s with 1 compile(s) still running; ending now
+        rather than waiting for the supervisor to kill this process without
+        saying why (#239)
+```
+
+**That is a deliberate ending, not a crash.** Left unbounded, the wait does not
+avoid that ending — it only hands the choice to `systemd` or the Windows SCM, which
+answer it with a `SIGKILL` and no diagnostic at all. On Windows that surfaces as an
+SCM stop timeout, which reads as *"the service is hung"* rather than *"a compile is
+still running"*. Exiting on our own terms puts the count and the bound in the log
+instead.
+
+`--drain-timeout=0` waits forever, which is what the node did before the bound
+existed. Use it if you would rather your supervisor's own timeout be the one that
+decides.
+
+!!! note "A wedged compiler is a separate gap"
+
+    Nothing yet bounds an individual compile
+    ([#239](https://github.com/LASTRADA-Software/fastcached/issues/239) is only
+    half closed). A compiler that never exits holds its slot for the life of the
+    process, so the machine's advertised capacity drifts above its real capacity
+    and the scheduler keeps routing there — free slots is exactly what it ranks
+    on. Until that lands, a drain bound converts the resulting hang into a stated
+    abandonment; it does not prevent the wedge.
+
 ### macOS and Windows
 
 ```sh

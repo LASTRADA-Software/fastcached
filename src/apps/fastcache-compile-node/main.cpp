@@ -602,7 +602,8 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // jobs in its destructor -- is torn down first and never outlived by the pool
     // it was handing work to.
     ThreadPoolExecutor compilePool { slots };
-    Node::WorkerServer server { listenerRef, protocol, slots, membership.Oracle(), metrics, logger, compilePool };
+    Node::WorkerServer server { listenerRef, protocol, slots,       membership.Oracle(),
+                                metrics,     logger,   compilePool, std::chrono::seconds { cfg.drainTimeoutSeconds } };
 
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a

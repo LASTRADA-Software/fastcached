@@ -379,6 +379,48 @@ Consequences that are each load-bearing:
       `--fleet-member` on a clustered node, on the reasoning that the flag was about to
       be overwritten — which was true and was the bug. A line that steers an operator
       around a defect is one more thing to correct when the defect is fixed.
+- **An unbounded wait does not avoid an ending, it only chooses who picks it — and
+  the supervisor picks `SIGKILL` with no diagnostic.** `~WorkerServer` drained on an
+  unbounded condition variable, and the comment defending that was right about its
+  premise and wrong about its conclusion. The premise: a job on the executor holds a
+  pointer into the server — the counter, the protocol, the metrics sink, the logger,
+  the byte budget — so *returning* from the drain while one is still running frees
+  all of them underneath it. Bounding the wait does not make that safe. The
+  conclusion it drew, that the wait therefore had to be unbounded, bought nothing: a
+  single wedged compiler turned `systemctl stop` into a supervisor timeout and a
+  kill, and on Windows into an SCM stop timeout an operator reads as "the service is
+  hung" (#239). Observed, not theorised — `dist-compile-e2e` case 8 failed on a
+  loaded macOS runner with the worker not exiting in 15s while cases 1–7 passed, so
+  the fleet worked and only the *stop* did not.
+  - **So on expiry it states what it is abandoning and ends the process.** That is
+    the one exit which abandons those jobs without touching what they are still
+    inside, and each one's client resolves its own lease on every path out of a
+    compile (#212). `_Exit`, never `exit`: static destructors would run the very
+    teardown being avoided.
+  - **The decision is a pure function because the interesting arm cannot be
+    tested.** A branch that calls `_Exit` is a side effect no in-process case
+    survives, and a side effect no test can survive is one no test will check. So
+    `NextDrainAction` is arithmetic over (outstanding, waited, timeout), exhaustively
+    unit-tested, and the destructor is left with nothing but carrying it out.
+    `Finished` outranks an expired bound, or a stop that had already finished would
+    log a false abandonment at exactly the moment the thing worked.
+  - **The bound is a flag, and zero still means forever.** How long a compile
+    legitimately runs is a property of the site, not of this program, and a
+    compile-time answer on a binary whose `--install-service` replays its command
+    line forever is one nobody can move afterwards. Zero is what the node did before
+    the bound existed and stays sayable, so a behaviour change is not one an operator
+    is unable to turn off.
+  - **A silent bounded wait is barely better than an unbounded one.** It reports the
+    outstanding count on a cadence, because a stop that says nothing for thirty
+    seconds is indistinguishable from one that has hung — which is the reading the
+    whole change exists to prevent.
+  - **It does not close the ticket, and the other half is where the real subtlety
+    is.** Killing a wedged compile's *direct child* would not even unblock the drain:
+    `posix_spawn` dup2s the pipe write ends onto the child's stdout/stderr, so every
+    grandchild inherits them and EOF arrives only when the last holder exits. The
+    drain blocks on the pipes, not on the wait. So the process-**group** kill (a job
+    object on Windows) is load-bearing rather than a refinement, and the naive fix —
+    kill the child, wait for EOF — looks correct and hangs forever.
 - **A dispatched compile is bounded by how long a COMPILER runs; a cache exchange
   by a round trip. One number cannot be both.** The launcher armed a single deadline
   on every exchange it made and handed the dispatch dialler the cache's -- ten

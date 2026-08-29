@@ -222,6 +222,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   every machine without `/usr/local/include`.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- An unbounded drain does not avoid an ending, it hands the choice to the supervisor,
+  which answers `SIGKILL` with no diagnostic. `~WorkerServer` bounds it, says what it
+  abandons and ends the process itself — returning would free members a running job is
+  still inside. Killing a wedged compile's direct child would not even unblock it: the
+  grandchildren hold the pipe write ends, and the drain blocks on the pipes (#239).
 - A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch`
   only counts it (#242). Comparing hosts refuses the documented setup (DNS names, a node
   dialling itself, NAT, VPN, multi-homing) and stops only a *third* host, since membership
@@ -699,7 +704,7 @@ cmake --preset clang-tsan
 cmake --preset clang-tracy
 cmake --build --preset clang-tracy
 
-# Windows — MSVC CL Debug (requires VCPKG_ROOT in env)
+# Windows — MSVC CL Debug (no VCPKG_ROOT needed; run from a VS dev shell)
 cmake --preset cl-debug
 cmake --build --preset cl-debug
 

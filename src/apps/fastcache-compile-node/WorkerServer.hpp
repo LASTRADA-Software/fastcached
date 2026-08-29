@@ -10,8 +10,10 @@
 #include <FastCache/Net/ISocket.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -19,6 +21,41 @@
 
 namespace FastCache::Node
 {
+
+/// What a stop should do next about the compiles still running.
+///
+/// Split out of `~WorkerServer` because the interesting branch **ends the process**,
+/// and a side effect no test can survive is one no test will check. The decision is
+/// arithmetic over three values and is exhaustively unit-tested here; the destructor
+/// is left with nothing but carrying it out.
+enum class DrainAction : std::uint8_t
+{
+    /// Nothing is running. Stop cleanly.
+    Finished = 0,
+    /// Still inside the bound. Say what is outstanding and keep waiting.
+    Report,
+    /// The bound is spent. Say what is being abandoned and end the process.
+    Abandon,
+    Last, ///< Not an action; `EnumTable`'s length.
+};
+
+/// Decide what a stop does next.
+///
+/// `Finished` outranks everything, including an expired bound: a stop that has
+/// nothing left to wait for is clean however long it took to get there, and
+/// reporting it as an abandonment would put a false alarm in the operator's log at
+/// exactly the moment the thing worked.
+///
+/// A zero @p timeout never expires. That is the behaviour this had before the bound
+/// existed, kept sayable so an operator who prefers the supervisor's timeout to this
+/// one can ask for it.
+/// @param outstanding Compiles still holding a slot.
+/// @param waited How long the stop has been waiting.
+/// @param timeout The bound, or zero to wait forever.
+/// @return What to do next.
+[[nodiscard]] DrainAction NextDrainAction(std::size_t outstanding,
+                                          std::chrono::steady_clock::duration waited,
+                                          std::chrono::seconds timeout) noexcept;
 
 /// Largest request this worker surface will buffer.
 ///
@@ -99,7 +136,8 @@ class WorkerServer
                  Distributed::IMembershipOracle const& membership,
                  IMetricsSink& metrics,
                  ILogger& logger,
-                 IExecutor& jobs) noexcept;
+                 IExecutor& jobs,
+                 std::chrono::seconds drainTimeout = std::chrono::seconds { 30 }) noexcept;
 
     /// Stops admitting, then waits for every compile still running to finish.
     ///
@@ -114,9 +152,30 @@ class WorkerServer
     /// door can be overtaken by the accept loop admitting one more job, and would
     /// then return having waited for a count that went back up behind it.
     ///
-    /// The wait is deliberately unbounded. A deadline here would mean freeing the
-    /// counter while a job still holds a pointer to it -- trading a shutdown that
-    /// waits for a compile it can see for a crash it cannot.
+    /// The wait is bounded by `drainTimeout`, and what it does on expiry is a
+    /// decision rather than an omission (#239).
+    ///
+    /// This used to be unbounded, on reasoning that was **correct and is still
+    /// correct**: a job on the executor holds a pointer into this object -- the
+    /// counter, the protocol, the metrics sink, the logger, the byte budget -- so
+    /// returning from here while one is still running frees every one of them under
+    /// it. Bounding the wait does not make that safe, and nothing here pretends it
+    /// does.
+    ///
+    /// What was wrong was the conclusion that the wait therefore had to be
+    /// unbounded. That does not avoid the ending, it only chooses who picks it: the
+    /// supervisor's own timeout, answered with `SIGKILL` and no diagnostic -- on
+    /// Windows an SCM stop timeout an operator reads as "the service is hung". One
+    /// wedged compiler is enough, and nothing bounds a compile today.
+    ///
+    /// So on expiry this **says what it is abandoning and ends the process**, rather
+    /// than returning into a teardown that would free members a running compile is
+    /// still inside. That is the same ending, taken deliberately, at a moment this
+    /// process chooses, with the count and the timeout on the record.
+    ///
+    /// It is strictly better once a compile is bounded too: with #239's other half
+    /// the wedge is killed, the slot comes back, and this returns normally. Until
+    /// then this converts a silent kill into a stated one.
     ~WorkerServer();
 
     WorkerServer(WorkerServer const&) = delete;
@@ -192,6 +251,10 @@ class WorkerServer
     /// means the notifier is provably past its critical section first.
     std::mutex _drainMutex;
     std::condition_variable _drained;
+
+    /// How long a stop waits before it abandons what is still running. Zero waits
+    /// forever, which is what this did before the bound existed.
+    std::chrono::seconds _drainTimeout { 30 };
 };
 
 } // namespace FastCache::Node
