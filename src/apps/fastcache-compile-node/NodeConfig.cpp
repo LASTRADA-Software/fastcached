@@ -682,14 +682,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<host>[:<port>]",
           .apply = AppendFrom<&NodeConfig::fleetMembers, ParseText>(),
-          .description = "a peer this scheduler may hand work to; repeatable.\n"
-                         "Only the host is matched: a peer dials from an\n"
-                         "ephemeral port, so an endpoint is not something a\n"
-                         "connection can be compared against." },
+          .description = "a peer this node serves; repeatable. Gates all three\n"
+                         "surfaces -- the compile port, the cache tier and the\n"
+                         "scheduler -- so a WORKER needs it too, or it compiles\n"
+                         "for its own machine alone. Only the host is matched:\n"
+                         "a peer dials from an ephemeral port, so an endpoint\n"
+                         "is not something a connection can be compared to." },
         { .primary = "--fleet-open",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::fleetOpen>(),
-          .description = "admit every caller to the fleet, not only\n"
+          .description = "admit every caller to this node, not only\n"
                          "--fleet-member hosts. For one machine, or a network\n"
                          "that is already the boundary. Explicit because\n"
                          "'no policy' and 'admit everybody' must be the same\n"
@@ -1129,11 +1131,19 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
                      "admits a list. Silently preferring either would make the narrower of the two a no-op an "
                      "operator believes is in force." },
-        { .refuses =
-              [](NodeConfig const& c) { return c.schedulerListen.empty() && (c.fleetOpen || !c.fleetMembers.empty()); },
-          .message = "--fleet-member and --fleet-open describe who this node's scheduler admits, and it is not "
-                     "running one: add --listen-scheduler, or drop them. A policy nothing consults is a policy an "
-                     "operator believes is in force." },
+        // There is deliberately NO mirror of the row above -- membership WITHOUT a
+        // scheduler is the ordinary worker, not a mistake. This table used to refuse
+        // it, on the reasoning that "a policy nothing consults is a policy an
+        // operator believes is in force", and that premise was simply wrong: one
+        // `NodeMembership` serves all three surfaces, and `WorkerServer` is
+        // constructed unconditionally, so the policy is consulted on every node.
+        //
+        // What the row actually did was pin every non-scheduler node's oracle to an
+        // empty list, which admits loopback and nothing else -- so the worker the
+        // getting-started page documents refused every dispatched compile with
+        // `NotAMember`, one hop after the lease was granted and therefore without
+        // moving a single counter (#235). The refusal a rule exists to prevent was
+        // the rule's own doing.
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "

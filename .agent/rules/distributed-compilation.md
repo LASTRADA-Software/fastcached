@@ -180,6 +180,20 @@ Consequences that are each load-bearing:
     recorded rather than hidden — two nodes behind one NAT are indistinguishable here,
     which is acceptable because this refuses *strangers* rather than co-located peers,
     and separating them needs a credential in the frame.
+  - **A membership flag is the NODE's, not the scheduler's, and a startup rule that
+    assumed otherwise closed every worker.** One `NodeMembership` serves all three
+    surfaces — the scheduler, the cache tier and the compile port — and `WorkerServer`
+    is constructed unconditionally, so `--fleet-member` / `--fleet-open` are consulted
+    on every node there is. `StartupPolicyRejection` nonetheless refused them without
+    `--listen-scheduler`, reasoning that "a policy nothing consults is a policy an
+    operator believes is in force" — and the premise was simply false. What the row
+    achieved was pinning every non-scheduler node's oracle to an *empty list*, which
+    admits loopback and nothing else, so the worker the getting-started page called
+    "the whole of it" refused every dispatched compile with `NotAMember` (#235). It
+    was invisible in the way this file keeps naming: the lease **was** granted, the
+    refusal is one hop later, and no counter at either end moves. A rule stating what
+    a flag is *for* is a rule that has to be re-derived when a second surface starts
+    reading it — so check which tiers reach the value, not which flag it reads like.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped

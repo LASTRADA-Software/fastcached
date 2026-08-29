@@ -175,6 +175,7 @@ fastcache-compile-node \
     --listen-scheduler=0.0.0.0:6675 \
     --fleet-member=worker-01.internal \
     --fleet-member=worker-02.internal \
+    --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6676
 ```
@@ -210,9 +211,12 @@ what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`. See
 
 #### Who may use the fleet
 
-`--fleet-member` lists the hosts that may be scheduled onto it, and it is matched
-by **host**: a peer dials from an ephemeral source port, so an endpoint is not
-something a connection can be compared against.
+`--fleet-member` lists the hosts this node answers at all, and it is matched by
+**host**: a peer dials from an ephemeral source port, so an endpoint is not
+something a connection can be compared against. It is **not** only the worker
+list — every scheduler verb is gated, `LEASE` included, so a client machine that
+is not on it is refused a lease and compiles locally. List the machines that
+*ask* as well as the machines that *answer*.
 
 `--fleet-open` admits everybody, for one machine or a network that is already
 your boundary. One of the two is **required** — a scheduler with no member list
@@ -227,6 +231,11 @@ non-member reads and writes objects there exactly as before, because that is
 infrastructure somebody operates while a node's tier is a developer's own build
 output. What membership pays for on a node is CPU time.
 
+Because it gates all three, **every node needs one of the two flags, not only the
+scheduler.** A worker without one admits its own machine and refuses the network,
+which is the right default for a developer's laptop and cannot receive a
+dispatched compile.
+
 ### The workers
 
 On each machine that should take work:
@@ -234,11 +243,26 @@ On each machine that should take work:
 ```sh
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
-    --advertise=worker-01.internal:6676
+    --advertise=worker-01.internal:6676 \
+    --fleet-open
 ```
 
-That is the whole of it. The worker surveys the machine at startup and serves
-every compiler it finds, naming each one and the layout it came from:
+That is the whole of it — but **`--fleet-open` is not optional**, and it is the
+line people leave off. Membership gates this node's *compile port*, so a worker
+without it admits its own machine and nothing else: the scheduler leases it out,
+the client dials it, and the compile is refused `not-a-member` and run locally
+instead. Nothing on the scheduler counts that, because the lease *was* granted
+([#235](https://github.com/LASTRADA-Software/fastcached/issues/235); before it
+was fixed, the flag could not be given to a worker at all).
+
+Use `--fleet-open` where the build network is already your boundary. Where it is
+not, swap it for a repeated `--fleet-member=dev-01.internal` naming the machines
+whose clients may dispatch here, and everyone else stays refused. The list is
+matched by **host**: a client dials from an ephemeral source port, so there is no
+port for an endpoint to be compared against.
+
+The worker then surveys the machine at startup and serves every compiler it
+finds, naming each one and the layout it came from:
 
 ```
 [INFO] found /usr/bin/g++ (usr)
@@ -350,7 +374,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |
 | `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
 | `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
-| `fastcache_worker_jobs_refused_not_a_member_total` | Something with no claim on this machine tried to compile on it. Not a fault of yours; check who can reach `--port`. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | A caller this worker does not admit tried to compile on it. **Check your own fleet first**: if this worker has no `--fleet-member` / `--fleet-open`, it admits its own machine and nothing else, and this counter is your clients being turned away one hop after a lease was granted. Once it names a policy, a rise here is somebody with no claim on the machine — check who can reach `--port`. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
 The refusals are split by reason for the same reason the scheduler's two are:

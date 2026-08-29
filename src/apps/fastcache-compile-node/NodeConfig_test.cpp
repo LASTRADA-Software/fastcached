@@ -1011,17 +1011,37 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         REQUIRE(StartupPolicyRejection(cfg).has_value());
     }
 
-    SECTION("a policy with nothing to consult it")
+    SECTION("a policy on a node that schedules nothing is the ordinary worker")
     {
-        // The mirror image: membership named on a node running no scheduler. Nothing
-        // reads it, so an operator who believes they have restricted the fleet has
-        // not, and no counter anywhere would say so.
-        NodeConfig cfg;
-        cfg.fleetMembers = { "10.0.0.1:6676" };
+        // There used to be a mirror row here, refusing membership on a node running
+        // no scheduler because "a policy nothing consults is a policy an operator
+        // believes is in force". The premise was false: one `NodeMembership` serves
+        // the scheduler, the cache tier AND the compile port, and the compile port
+        // is built unconditionally.
+        //
+        // What the row did instead was pin every worker to an empty member list,
+        // which admits loopback alone -- so the worker the getting-started page
+        // documents refused every dispatched compile with `NotAMember`, one hop
+        // past the lease and therefore without moving a counter anywhere (#235).
+        NodeConfig listed;
+        listed.scheduler = "scheduler.internal:6675";
+        listed.advertise = "worker-01.internal:6676";
+        listed.fleetMembers = { "10.0.0.1:6676" };
+        CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
-        auto const refusal = StartupPolicyRejection(cfg);
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+        NodeConfig open;
+        open.scheduler = "scheduler.internal:6675";
+        open.advertise = "worker-01.internal:6676";
+        open.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(open).has_value());
+
+        // And the contradiction is still refused on such a node: that row never
+        // depended on a scheduler, and the permissive half is the one that would
+        // have won by accident.
+        NodeConfig both;
+        both.fleetMembers = { "10.0.0.1:6676" };
+        both.fleetOpen = true;
+        REQUIRE(StartupPolicyRejection(both).has_value());
     }
 
     SECTION("a joiner with no identity")
@@ -1388,7 +1408,6 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         // dashboard right up until somebody reads it.
         auto cfg = servingNode();
         cfg.schedulerListen.clear();
-        cfg.fleetOpen = false;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
