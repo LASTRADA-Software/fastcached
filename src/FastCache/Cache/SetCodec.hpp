@@ -40,10 +40,18 @@ constexpr std::uint32_t FcTypeSet = 0x5E700001U; // "SET" + version nibble.
 
 constexpr std::byte Magic { 0xFC };
 constexpr std::byte TypeSet { 0x01 };
-constexpr std::size_t HeaderSize = 6; // magic(1) + type(1) + count(4).
+constexpr std::size_t HeaderSize = 1 + 1 + WireFields::FieldPrefixSize; // magic, type, count.
 
 /// The fewest blob bytes one encoded member can occupy: its length prefix, with an
 /// empty member.
+///
+/// **A security bound, not a sizing hint.** It must be a true LOWER bound on what a
+/// member costs, because `Decode` refuses any count the remaining bytes cannot supply
+/// and an over-estimate would refuse honest data. It will therefore always
+/// under-estimate the count for typical members, whose real cost is `4 + len` --
+/// that is what makes it correct, not what makes it improvable. Anyone "tightening"
+/// it toward a typical member size silently weakens the guard, which is why nothing
+/// here sizes an allocation from it.
 ///
 /// Read off `Encode`'s loop below, which is what fixes it, and pinned against that
 /// encoder by a test that encodes one empty member and measures the difference -- so a
@@ -66,13 +74,13 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
 {
     std::size_t total = HeaderSize;
     for (auto const& m: members)
-        total += 4 + m.size();
+        total += WireFields::FieldPrefixSize + m.size();
     std::vector<std::byte> out;
     out.reserve(total);
     out.push_back(Magic);
     out.push_back(TypeSet);
     auto const appendU32 = [&out](std::uint32_t v) {
-        std::array<std::byte, 4> bytes {};
+        std::array<std::byte, WireFields::FieldPrefixSize> bytes {};
         WriteBigEndian(std::span<std::byte> { bytes }, v);
         out.insert(out.end(), bytes.begin(), bytes.end());
     };
@@ -96,33 +104,38 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     if (blob.size() < HeaderSize || blob[0] != Magic || blob[1] != TypeSet)
         return false;
     auto const count = ReadBigEndian<std::uint32_t>(blob.subspan(2));
-    std::size_t offset = HeaderSize;
+    auto const remaining = blob.size() - HeaderSize;
 
     // The count is a CLAIM about bytes this blob must already carry, checked before
     // anything is sized from it -- `WireFields::DeclaredCountFits`, the guard issue
     // #267 generalised. Unguarded, this reserved straight from the `u32`.
     //
-    // These bytes are a CLIENT's, which is the part that is not obvious from here. A
-    // set is an ordinary value blob distinguished only by the `flags` word, and the
-    // memcached text verbs let a client choose that word: `set k 1584562177 0 6`
-    // carrying `FC 01 FF FF FF FF` is a six-byte "set" declaring 0xFFFFFFFF members,
-    // and any redis set verb on the same engine then decodes it. That reserved
-    // 0xFFFFFFFF `std::string` -- about 137 GB -- for a plain client with no
-    // privilege, which is why this is the widest-reaching member of the family.
-    if (!WireFields::DeclaredCountFits(count, MinMemberBytes, blob.size() - HeaderSize))
+    // These bytes are a CLIENT's, which is the part that is not obvious from here: a
+    // set is an ordinary value distinguished only by its `flags` word, and the
+    // memcached text verbs let a client choose that word. The worked attack -- plant
+    // six bytes over memcached, read them back with SMEMBERS -- is spelled out and
+    // executed by `SetCodec_test.cpp`, which is where it stays correct.
+    if (!WireFields::DeclaredCountFits(count, MinMemberBytes, remaining))
         return false;
 
-    // Reserved from what the BYTES IN HAND could hold rather than from the count
-    // alone: a validated count is still an amplifier, because a member is 32 bytes in
-    // memory against 4 on the wire. A real set of short members reserves exactly what
-    // it needs, and a minimum-size hostile blob is clamped to its own size.
-    out.reserve(std::min<std::size_t>(count, (blob.size() - HeaderSize) / sizeof(std::string)));
+    // NOT reserved, and that is deliberate. Validating the count and pre-sizing the
+    // container are different decisions, and only the first is load-bearing: growth
+    // through `emplace_back` is amortised O(1) and moves 32-byte strings, while every
+    // way of pre-sizing from this count is either an amplifier or wrong.
+    //
+    // Reserving the validated count is still 8x -- a member is 32 bytes in memory
+    // against 4 on the wire -- which on a 256 MiB value is 2 GiB, the same shape this
+    // guard exists to close. Clamping to `remaining / sizeof(std::string)` bounds the
+    // memory but under-reserves real sets by 2.7x for eight-byte members, because a
+    // member's true wire cost is `4 + len` and only the `4` is knowable up front.
+    // A reallocation is not what a critical unbounded-reserve ticket is about.
+    std::size_t offset = HeaderSize;
     for (auto i = std::uint32_t { 0 }; i < count; ++i)
     {
-        if (offset + 4 > blob.size())
+        if (offset + WireFields::FieldPrefixSize > blob.size())
             return false;
         auto const len = ReadBigEndian<std::uint32_t>(blob.subspan(offset));
-        offset += 4;
+        offset += WireFields::FieldPrefixSize;
         if (offset + len > blob.size())
             return false;
         out.emplace_back(reinterpret_cast<char const*>(blob.data() + offset), len);

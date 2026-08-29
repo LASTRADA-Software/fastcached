@@ -24,21 +24,6 @@ using namespace FastCache;
 namespace
 {
 
-/// One engine, reached through BOTH protocols.
-///
-/// The point of the fixture: a memcached client and a redis client are two front
-/// ends over one `CacheEngine`, so bytes a memcached `set` planted are bytes a redis
-/// set verb decodes. That is the reachability this file exists to demonstrate, and it
-/// is invisible from either protocol's own test file.
-struct BothProtocols
-{
-    ManualClock clock;
-    InMemoryLruStorage storage;
-    CacheEngine engine { storage, clock };
-    MemcachedTextHandler text;
-    RedisRespHandler resp;
-};
-
 [[nodiscard]] Task<bool> WriteString(ISocket* socket, std::string_view payload)
 {
     auto const result = co_await socket->Write(AsBytes(payload));
@@ -62,28 +47,78 @@ struct BothProtocols
     co_return out;
 }
 
-/// Run one request through `handler` against the shared engine and return the reply.
+/// One engine, reached through BOTH front ends.
 ///
-/// The half-close and the server-side `Close()` are the pattern every other protocol
-/// test here uses, and for the reason they record: the handlers do not close their own
-/// write side when their loop ends, so without it the drain relies on a partial-read
-/// heuristic that parks forever on a reply whose length is an exact multiple of the
-/// chunk size.
-[[nodiscard]] std::string Exchange(BothProtocols& fix, IProtocolHandler& handler, std::string_view request)
+/// The point of the fixture: a memcached client and a redis client are two protocols
+/// over one `CacheEngine`, so bytes a memcached `set` planted are bytes a redis set
+/// verb decodes. That sharing is the reachability this file exists to demonstrate, and
+/// it is invisible from either protocol's own test file.
+struct BothProtocols
 {
-    auto pair = InMemorySocketPair::Create();
-    REQUIRE(SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
-    SyncRun(handler.Run(pair.server.get(), &fix.engine, /*primingBytes=*/ {}, SessionContext {}));
-    pair.server->Close();
-    return SyncRun(ReadAvailable(pair.client.get()));
+    ManualClock clock;
+    InMemoryLruStorage storage;
+    CacheEngine engine { storage, clock };
+    MemcachedTextHandler text;
+    RedisRespHandler resp;
+
+    /// Run one request through the memcached front end.
+    [[nodiscard]] std::string Memcached(std::string_view request)
+    {
+        return Run(text, request);
+    }
+
+    /// Run one request through the redis front end, against the same engine.
+    [[nodiscard]] std::string Redis(std::string_view request)
+    {
+        return Run(resp, request);
+    }
+
+  private:
+    /// Drive one request/reply cycle on a connection of its own.
+    ///
+    /// A fresh socket pair per exchange rather than one on the fixture, because each
+    /// cycle half-closes and then closes its pair -- the sequence every protocol test
+    /// here uses, and for the reason they record: the handlers do not close their own
+    /// write side when their loop ends, so without it the drain relies on a
+    /// partial-read heuristic that parks on a reply that is an exact multiple of the
+    /// chunk size.
+    [[nodiscard]] std::string Run(IProtocolHandler& handler, std::string_view request)
+    {
+        auto pair = InMemorySocketPair::Create();
+        REQUIRE(SyncRun(WriteString(pair.client.get(), request)));
+        pair.client->ShutdownWrite();
+        SyncRun(handler.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
+        pair.server->Close();
+        return SyncRun(ReadAvailable(pair.client.get()));
+    }
+};
+
+/// A set blob declaring `count` members and carrying `trailing` bytes for them.
+///
+/// Built from the codec's own `Magic`/`TypeSet` rather than a hex literal, so it
+/// cannot drift from the format it exercises.
+[[nodiscard]] std::string SetBlob(std::uint32_t count, std::size_t trailing = 0)
+{
+    std::string out;
+    out.push_back(static_cast<char>(SetCodec::Magic));
+    out.push_back(static_cast<char>(SetCodec::TypeSet));
+    for (auto const shift: { 24, 16, 8, 0 })
+        out.push_back(static_cast<char>((count >> shift) & 0xFFU));
+    out.append(trailing, '\0');
+    return out;
 }
 
-/// The six bytes a hostile client stores: a set header declaring 0xFFFFFFFF members
-/// and carrying none of them.
-[[nodiscard]] std::string HostileSetBlob()
+/// Store `blob` under `key` as a SET, exactly the way an ordinary memcached client
+/// would -- which is the whole point: no privilege, no special verb.
+///
+/// The flags word is rendered from `SetCodec::FcTypeSet` rather than typed out. A
+/// hand-written decimal drifted once already, and a wrong one would store a plain
+/// string and make every assertion below pass for the wrong reason.
+void PlantSet(BothProtocols& fix, std::string_view key, std::string_view blob)
 {
-    return std::string { "\xFC\x01\xFF\xFF\xFF\xFF", 6 };
+    auto const command = "set " + std::string { key } + " " + std::to_string(SetCodec::FcTypeSet) + " 0 "
+                         + std::to_string(blob.size()) + "\r\n" + std::string { blob } + "\r\n";
+    REQUIRE(fix.Memcached(command) == "STORED\r\n");
 }
 
 } // namespace
@@ -93,27 +128,18 @@ TEST_CASE("A plain memcached client can plant a set blob a redis verb then decod
     // Issue #271, and the reachability IS the finding -- so this drives the real path
     // rather than calling the decoder. What tags a value as a set is its `flags` word,
     // and `set <key> <flags> <exptime> <bytes>` lets an ordinary memcached client
-    // choose it. 1584398337 is `SetCodec::FcTypeSet` in decimal.
+    // choose it.
     //
     // No privilege, no fleet membership, no special client: two stock front ends over
     // one engine. Before the guard, the SMEMBERS below reserved 0xFFFFFFFF
-    // `std::string` -- roughly 137 GB -- and the `std::bad_alloc` was caught by nobody.
-    static_assert(SetCodec::FcTypeSet == 1584398337U, "the memcached flags word below must name a set");
-
+    // `std::string` -- roughly 137 GB -- and the `std::bad_alloc` escaped the RESP
+    // handler uncaught, which under a 2 GiB address-space cap aborts the process.
     BothProtocols fix;
-    auto const blob = HostileSetBlob();
+    PlantSet(fix, "evil", SetBlob(0xFFFFFFFFU));
 
-    // 1. Plant it as an ordinary memcached value, choosing the flags word.
-    auto const stored = Exchange(fix, fix.text, "set evil 1584398337 0 6\r\n" + blob + "\r\n");
-    REQUIRE(stored == "STORED\r\n");
-
-    // 2. Read it back through a redis set verb, which routes it to `SetCodec::Decode`.
-    auto const members = Exchange(fix, fix.resp, "*2\r\n$8\r\nSMEMBERS\r\n$4\r\nevil\r\n");
-
-    // Refused, and refused as a REPLY: the connection carries an error the client can
-    // read rather than being reset, which is what `Corrupt` maps to for a set command.
-    CHECK(members == "-ERR storage failure\r\n");
-    CHECK_FALSE(members.empty());
+    // Refused, and refused as a REPLY: the client reads an error on a live connection
+    // rather than seeing a reset, which is what `Corrupt` maps to for a set command.
+    CHECK(fix.Redis("*2\r\n$8\r\nSMEMBERS\r\n$4\r\nevil\r\n") == "-ERR storage failure\r\n");
 }
 
 TEST_CASE("Every redis set verb refuses the planted blob, not just the read ones", "[cache][setcodec][security]")
@@ -121,94 +147,73 @@ TEST_CASE("Every redis set verb refuses the planted blob, not just the read ones
     // `Decode` is reached from the read path (`WithSet`, used by SMEMBERS/SCARD) and
     // from the read-modify-write path (`LoadSet`, used by SADD/SREM). A guard on one
     // would leave the other reserving, so both are asserted.
-    auto const blob = HostileSetBlob();
-
-    auto planted = [&blob](BothProtocols& fix) {
-        REQUIRE(Exchange(fix, fix.text, "set evil 1584398337 0 6\r\n" + blob + "\r\n") == "STORED\r\n");
-    };
-
     SECTION("SCARD, through the read path")
     {
         BothProtocols fix;
-        planted(fix);
-        CHECK(Exchange(fix, fix.resp, "*2\r\n$5\r\nSCARD\r\n$4\r\nevil\r\n") == "-ERR storage failure\r\n");
+        PlantSet(fix, "evil", SetBlob(0xFFFFFFFFU));
+        CHECK(fix.Redis("*2\r\n$5\r\nSCARD\r\n$4\r\nevil\r\n") == "-ERR storage failure\r\n");
     }
 
     SECTION("SADD, through the read-modify-write path")
     {
         BothProtocols fix;
-        planted(fix);
-        CHECK(Exchange(fix, fix.resp, "*3\r\n$4\r\nSADD\r\n$4\r\nevil\r\n$1\r\nx\r\n") == "-ERR storage failure\r\n");
+        PlantSet(fix, "evil", SetBlob(0xFFFFFFFFU));
+        CHECK(fix.Redis("*3\r\n$4\r\nSADD\r\n$4\r\nevil\r\n$1\r\nx\r\n") == "-ERR storage failure\r\n");
     }
 }
 
 TEST_CASE("A set planted through memcached and well-formed still works", "[cache][setcodec]")
 {
     // The guard must refuse impossible claims, not sets that merely arrived by an
-    // unusual route -- otherwise this test would pass for the wrong reason and prove
-    // only that the path was broken.
+    // unusual route -- otherwise the cases above would pass for the wrong reason and
+    // prove only that the path was broken.
     BothProtocols fix;
 
     std::vector<std::string> const members { "a", "bb" };
-    auto const encoded = SetCodec::Encode(members);
-    std::string blob;
-    for (auto const byte: encoded)
-        blob.push_back(static_cast<char>(byte));
-
-    REQUIRE(Exchange(fix, fix.text, "set good 1584398337 0 " + std::to_string(blob.size()) + "\r\n" + blob + "\r\n")
-            == "STORED\r\n");
-    CHECK(Exchange(fix, fix.resp, "*2\r\n$5\r\nSCARD\r\n$4\r\ngood\r\n") == ":2\r\n");
+    PlantSet(fix, "good", AsStringView(SetCodec::Encode(members)));
+    CHECK(fix.Redis("*2\r\n$5\r\nSCARD\r\n$4\r\ngood\r\n") == ":2\r\n");
 }
 
 TEST_CASE("SetCodec::Decode refuses a member count the blob cannot supply", "[cache][setcodec]")
 {
     // The decoder's own boundary, from both sides, so the guard is neither off by one
     // nor a number somebody picked. A member costs its four-byte length prefix at
-    // minimum, so `n` bytes after the header can carry at most `n / 4` members.
-    auto const blobDeclaring = [](std::uint32_t count, std::size_t trailing) {
-        std::vector<std::byte> out { SetCodec::Magic, SetCodec::TypeSet };
-        for (auto const shift: { 24, 16, 8, 0 })
-            out.push_back(static_cast<std::byte>((count >> shift) & 0xFFU));
-        out.insert(out.end(), trailing, std::byte { 0 });
-        return out;
+    // minimum, so `n` bytes after the header can carry at most `n / 4` members. No
+    // protocol path can express this, which is why it is a case of its own.
+    std::vector<std::string> members;
+    auto const decode = [&members](std::string const& blob) {
+        return SetCodec::Decode(AsBytes(blob), members);
     };
 
-    std::vector<std::string> members;
-
     // The shape that mattered: a huge count against no bytes at all.
-    CHECK_FALSE(SetCodec::Decode(blobDeclaring(0xFFFFFFFFU, 0), members));
+    CHECK_FALSE(decode(SetBlob(0xFFFFFFFFU)));
 
     // Three members cannot fit in eight bytes, and that is decided on the count alone.
-    CHECK_FALSE(SetCodec::Decode(blobDeclaring(3, 8), members));
+    CHECK_FALSE(decode(SetBlob(3, 8)));
 
     // Two can, and those eight zero bytes really are two members: each a zero length
     // and no text. So the guard admits exactly what the blob can carry rather than
     // capping it at something smaller.
-    REQUIRE(SetCodec::Decode(blobDeclaring(2, 8), members));
+    REQUIRE(decode(SetBlob(2, 8)));
     CHECK(members.size() == 2);
     CHECK(members[0].empty());
 
     // And an empty set is ordinary.
-    REQUIRE(SetCodec::Decode(blobDeclaring(0, 0), members));
+    REQUIRE(decode(SetBlob(0)));
     CHECK(members.empty());
 }
 
-TEST_CASE("MinMemberBytes tracks the encoder rather than a comment", "[cache][setcodec]")
-{
-    // The guard's per-element minimum is derived by hand from `Encode`'s loop, which is
-    // comment discipline. This pins it structurally: the cost of one EMPTY member is
-    // measured from the encoder itself, so a field added to that loop fails here rather
-    // than quietly leaving the guard weaker than the format it guards.
-    std::vector<std::string> const none {};
-    std::vector<std::string> const one { "" };
-
-    CHECK(SetCodec::Encode(one).size() - SetCodec::Encode(none).size() == SetCodec::MinMemberBytes);
-}
-
-TEST_CASE("A set round-trips through its own codec", "[cache][setcodec]")
+TEST_CASE("SetCodec round-trips, and its per-member minimum tracks the encoder", "[cache][setcodec]")
 {
     std::vector<std::string> const members { "alpha", "beta", "gamma" };
     std::vector<std::string> back;
     REQUIRE(SetCodec::Decode(SetCodec::Encode(members), back));
     CHECK(back == members);
+
+    // `MinMemberBytes` is a security bound derived by hand from `Encode`'s loop. This
+    // pins it to that encoder: a field added there fails here rather than silently
+    // leaving `Decode`'s guard weaker than the format it guards.
+    std::vector<std::string> const none {};
+    std::vector<std::string> const one { "" };
+    CHECK(SetCodec::Encode(one).size() - SetCodec::Encode(none).size() == SetCodec::MinMemberBytes);
 }
