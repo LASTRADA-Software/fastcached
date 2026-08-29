@@ -78,6 +78,75 @@ is the reproducible lesson, since no unit test can reach either:
     ordinary source promoted by a flag (`cl /interface`, `-fmodule-output`,
     `--precompile`, and `/Yc` for the precompiled-header case).
 
+- **The worker's argument filter is an ALLOWLIST, not a shape-based denylist**
+  (`IsAcceptableJobArgument`, `CompileJob.cpp`). The client's arguments are spliced
+  into the compiler's command line verbatim, and the compile port carries no
+  credential while loopback is admitted unconditionally — so any local process can
+  reach it. Naming the compiler is refused (the fingerprint rule above), but several
+  driver options *run a program or load code* without ever naming one: `-wrapper
+  prog,args`, `-fplugin=`, `-Xclang -load`, `-specs=`, `-B`. None carries a path
+  separator, so the old "could this name a file?" filter admitted every one — a
+  proven RCE as the node's service account
+  ([#240](https://github.com/LASTRADA-Software/fastcached/issues/240)). The flag
+  space belongs to GCC, Clang and Microsoft and grows every release, so a denylist
+  we audit against upstream forever **fails open** the day we miss one; the allowlist
+  **fails safe** — an unrecognised flag costs one local compile, visible as
+  `fastcache_worker_jobs_refused_rejected_argument_total`, where a missed denylist
+  entry was code execution. The accepted set (`AllowedArgs`) is per driver family —
+  the worker knows its own compiler's family, never the client's — and refusal names
+  the offending flag in `JobError::detail`, which rides the reply message to the
+  client's fallback log.
+  - **The `-f` space is ENUMERATED, never prefixed, and that is the load-bearing
+    half.** A blanket `-f` prefix with a `Deny` row for `-fplugin` reads as an
+    allowlist and behaves as a denylist over the largest and most volatile flag family
+    GCC and Clang have: a new code-loading `-f*` is admitted *by default* until
+    somebody adds a row. That is not hypothetical. `-fmodule-mapper=|program args`
+    makes GCC **spawn a subprocess** — this tree already declares it path-valued and
+    lists it in `SideArtefacts` — and `-fpass-plugin=x.so` is Clang's pass-manager
+    plugin loader. Neither begins with `-fplugin`, and neither carries a path
+    separator, so neither a carve-out on that spelling nor the shape rule beneath it
+    stops them. Enumeration is what makes the class fail closed.
+  - **A prefix row is legitimate only where its non-listed members are a CLOSED set,
+    named as `Deny` rows beside it.** Two qualify: `-W` (whose only non-warning
+    members are the three sub-tool passers `-Wa,`/`-Wl,`/`-Wp,` — there is no fourth
+    sub-tool a GNU driver forwards to) and `-m` (whose only pass-through is `-mllvm`,
+    which takes its value as a *separate* argument that must itself survive the
+    table). Every other prefix row's spelling ends at the option's own `=` or `:`, so
+    it names exactly one option and only its value is open. `-X` is not a prefix at
+    all — nothing under it is code generation, so `-Xclang -load` is refused by
+    absence.
+  - **A prefix on one family's spelling reaches the other family's flags.** `/w`
+    needs a prefix for `/wd4996`; written as `DriverFamily::Any` it admitted GNU
+    `-wrapper` — the exact flag this ticket is about, let back in by a one-letter
+    prefix. Caught by the regression case, not by review. A prefix row is scoped to
+    the family that actually spells it that way.
+  - **Every row carries a value shape (`Bare` / `NoPathSeparator`), so the old shape
+    rule composes INSIDE a prefix rather than being deleted with it.** A row-level
+    constraint kills a class of value; a `Deny` row kills one member per incident. It
+    is defence in depth beneath the allowlist and never a substitute — `-fpass-plugin=`
+    carries no separator either.
+  - **The maintained tables are asked, not restated.** `ProducesSideArtefact` answers
+    "does this write something besides the object" (`-fmodule-mapper=`,
+    `-fmodule-output=`, `/Yc`); `DriverSpec::preprocessedInput` spells the language
+    tokens the client sends; `TargetPinPrefixFor` spells `--target=`. Copying any of
+    the three into rows here means a spelling added upstream turns every such job into
+    a silent `RejectedArgument`.
+  - **An unclassifiable compiler refuses the JOB, not its arguments.** With
+    `DriverFamily::None` the allowlist refuses everything, which reports a *worker*
+    misconfiguration as `RejectedArgument` and sends an operator to look at the
+    fleet's flags — and a job with an **empty** argument list has nothing to refuse,
+    so it sails past the loop and spawns a driver whose dialect this worker does not
+    know. Checked once where the family is derived, answered `SpawnFailed` ("this
+    worker is broken, compile elsewhere"), which already owns the right wire code and
+    counter.
+  - **`JobError::detail` carries client bytes onto the wire, so it is built by
+    `RejectedArgumentNaming` and never assigned directly.** It is encoded into the
+    reply and lands in the client's fallback log, so the argument is capped and
+    reduced to printable ASCII at the one producer — which also makes it valid UTF-8
+    whatever arrived, as the fleet requires of text a peer sent.
+  - **Operator extension of the allowlist is a follow-up, not this rule.** The table
+    is built-in; there is deliberately no config hook.
+
 Three more come from running the worker as a *service* rather than in a
 terminal, and each has already been a bug:
 

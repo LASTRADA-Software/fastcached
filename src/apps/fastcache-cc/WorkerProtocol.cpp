@@ -171,9 +171,13 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                 .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
     if (!outcome.has_value())
     {
-        auto const& descriptor = DescriptorFor(outcome.error());
+        auto const& descriptor = DescriptorFor(outcome.error().reason);
         _metrics.Increment(descriptor.counter);
-        return Wire::EncodeErrorReply(descriptor.code, {});
+        // The refusal's detail rides the reply message, so a client's local fallback
+        // can name the offending flag rather than only report that one existed. Empty
+        // for every refusal that has nothing to add, which reproduces the previous
+        // empty-message wire exactly.
+        return Wire::EncodeErrorReply(descriptor.code, outcome.error().detail);
     }
 
     // A compiler that ran and rejected the code did its job — that is the client's

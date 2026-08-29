@@ -99,29 +99,615 @@ namespace
     }
 } // namespace
 
-bool IsAcceptableJobArgument(std::string_view arg)
+namespace
+{
+    /// What may follow an allowlist row's spelling inside the same argument.
+    enum class ArgValue : std::uint8_t
+    {
+        /// Nothing: the argument is the spelling and no more. Every bare switch.
+        Bare,
+        /// A longer flag name or a fused value may follow, and whatever follows must
+        /// carry no path separator.
+        ///
+        /// This is the OLD shape rule, kept and composed *inside* a row rather than
+        /// deleted wholesale. It is what makes a prefix row safe to write at all: a
+        /// row-level constraint kills a whole class of value, where a carve-out per
+        /// dangerous spelling kills one member per incident. It is not sufficient on
+        /// its own -- `-fpass-plugin=x.so` carries no separator either, which is why
+        /// the `-f` space is enumerated rather than prefixed -- so it is defence in
+        /// depth beneath the allowlist, never a substitute for it.
+        NoPathSeparator,
+    };
+
+    /// Whether a row admits an argument or carves one back out of a prefix that
+    /// admits it.
+    enum class ArgRule : std::uint8_t
+    {
+        Allow, ///< Accept the argument.
+        /// Refuse it, overriding any `Allow` prefix it also matches. Checked before
+        /// every `Allow`, so a carve-out cannot be out-voted and row order never
+        /// decides an answer.
+        Deny,
+    };
+
+    /// One entry in the allowlist of accepted argument shapes.
+    ///
+    /// The spelling is stored **without its introducer**, and matched against the
+    /// argument with one introducer stripped -- the same thing `MatchPathValueFlag`
+    /// does, and for the same reason. Every MSVC driver accepts `-` for every option
+    /// it spells with `/`, and `clang-cl` is family `Msvc` while routinely being
+    /// handed GNU spellings (`-Wall`, `-fno-exceptions`, `-O2`). Storing `/O2` and
+    /// `-O2` as two rows would have refused half of those and turned every such build
+    /// into a silent local fallback; one introducer-less row covers both.
+    ///
+    /// **A GNU-spelled row is `Any`, and that is not sloppiness.** `DriverFamily`
+    /// cannot tell `cl` from `clang-cl` -- both are `Msvc` -- while `clang-cl` accepts
+    /// essentially every GNU-spelled clang option (`-march=`, `-std=c++23`, `-g`,
+    /// `-flto`, `-fstrict-aliasing`). Scoping those rows `Gnu` therefore refuses them
+    /// on the one driver that does take them, silently, which is the failure this
+    /// table must not add. Widening them costs nothing, because a client and a worker
+    /// are bound to the same compiler by the FINGERPRINT: a line `cl` would merely
+    /// warn about and ignore is one the client's own `cl` also ignored, so both ends
+    /// still produce the same object. Rows spelled only by MSVC stay `Msvc`, because
+    /// no GNU driver has them at all.
+    struct AllowedArg
+    {
+        std::string_view spelling;                    ///< The flag, without its leading `-` or `/`.
+        DriverFamily families { DriverFamily::None }; ///< Which driver families accept this spelling.
+        ArgValue value { ArgValue::Bare };            ///< What may follow it.
+        ArgRule rule { ArgRule::Allow };              ///< Whether the row admits or carves out.
+    };
+
+    /// The flag shapes a distributed compile legitimately carries.
+    ///
+    /// The accepted set `IsAcceptableJobArgument` describes: code generation,
+    /// language, preprocessor-define and diagnostic options -- everything that still
+    /// means something once the headers are inlined and the macros expanded. It is
+    /// deliberately broader than what `RemoteCompileArgs` emits today, because too
+    /// narrow a table is a silent local fallback while too broad a one is the hole
+    /// this file exists to close.
+    ///
+    /// **The `-f` space is enumerated, never prefixed, and that is the load-bearing
+    /// decision here.** A blanket `-f` prefix with a carve-out for `-fplugin=` looks
+    /// like an allowlist and behaves like a denylist over the largest and most
+    /// volatile flag family GCC and Clang have: a new code-loading `-f*` in a future
+    /// release would be admitted *by default* until somebody noticed. That is not
+    /// hypothetical -- `-fmodule-mapper=|program args` makes GCC spawn a subprocess
+    /// (this tree already declares it a side-artefact flag), and `-fpass-plugin=x.so`
+    /// is Clang's new pass-manager plugin loader. Neither begins with `-fplugin`, and
+    /// neither carries a path separator, so neither a carve-out on that spelling nor
+    /// the shape rule beneath it would have stopped them. Enumeration makes the whole
+    /// class fail *closed*: an `-f` flag not listed below is refused, and the cost is
+    /// one local compile.
+    ///
+    /// The prefixes that remain are ones whose non-listed members are a **closed**
+    /// set, named as `Deny` rows beside them: `-W` (whose only non-warning members
+    /// are the three sub-tool passers `-Wa,`/`-Wl,`/`-Wp,`) and `-m` (whose only
+    /// pass-through is `-mllvm`, which takes its value as a separate argument that
+    /// must itself survive this table). Every other prefix row's spelling ends at the
+    /// option's own value separator, so the row names exactly one option and only its
+    /// value is open.
+    ///
+    /// Absent by construction, and therefore refused: anything path-valued (`-I`,
+    /// `-isystem`, `-include`, `-B`, `--sysroot`, `-specs=`, MSVC `/Fo`, `/FI`,
+    /// `@response`), every sub-tool pass-through (`-Xclang`, `-Xassembler`,
+    /// `-Xlinker`, MSVC `/link`), and every plugin loader (`-fplugin=`,
+    /// `-fpass-plugin=`, `/analyze:plugin`).
+    /// The extent is spelled out rather than deduced: `std::array`'s deduction guide
+    /// folds a `is_same_v` pack over every element, and at this many rows that fold
+    /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
+    /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
+    /// the table closes the other direction.
+    constexpr std::array<AllowedArg, 344> AllowedArgs {
+        // -- optimization ------------------------------------------------------
+        AllowedArg { .spelling = "O", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "O1", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "O2", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "O3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Ofast", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Og", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Os", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Oz", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "Od", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Oi", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Oi-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ot", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ox", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Oy", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Oy-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ob0", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ob1", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ob2", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ob3", .families = DriverFamily::Msvc },
+
+        // -- language standard -------------------------------------------------
+        AllowedArg { .spelling = "std=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "std:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ansi", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pedantic", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pedantic-errors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "permissive", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "permissive-", .families = DriverFamily::Msvc },
+
+        // -- preprocessor defines. The value is a macro definition and may be
+        // anything but a path, which the shape rule enforces.
+        AllowedArg { .spelling = "D", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "U", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "undef", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "u", .families = DriverFamily::Msvc },
+
+        // -- warnings. `-W`/`/W` is a prefix because the warning namespace is
+        // unbounded; its only non-warning members are the three sub-tool passers
+        // denied below, which is a closed set -- there is no fourth sub-tool a GNU
+        // driver forwards options to.
+        AllowedArg { .spelling = "W", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "Wa,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "Wl,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "Wp,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+        // `-w`/`/w` suppresses warnings and is BARE on both families. It was briefly a
+        // prefix here so `/wd4996` would match, and that admitted GNU `-wrapper` --
+        // the very flag this ticket is about, let back in by a one-letter prefix on
+        // the other family's spelling. The MSVC warning-selector prefixes below are
+        // therefore MSVC-only and spelled out.
+        AllowedArg { .spelling = "w", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "wd", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "we", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "wo", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "w1", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "w2", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "w3", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "w4", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+
+        // -- machine / architecture. `-m` is a prefix because the ISA feature space
+        // is unbounded and grows every release; its only pass-through is `-mllvm`,
+        // denied below. `-mllvm` takes its value as a SEPARATE argument, which must
+        // itself survive this table, and no LLVM option spelling appears in it.
+        AllowedArg { .spelling = "m", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "mllvm", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "arch:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "favor:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+
+        // -- debug information. Enumerated rather than prefixed: `-gsplit-dwarf`
+        // writes a `.dwo` beside the object, and only the object comes back.
+        AllowedArg { .spelling = "g", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g0", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g1", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g2", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "g3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggdb", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggdb3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-2", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-3", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-4", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gdwarf-5", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gline-tables-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gline-directives-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gcolumn-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gno-column-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gstrict-dwarf", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gno-strict-dwarf", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gpubnames", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ggnu-pubnames", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "gcodeview", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "p", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pg", .families = DriverFamily::Any },
+
+        // -- GNU feature flags, ENUMERATED. See the note above: `-f` is never a
+        // prefix, because a new code-loading `-f*` must fail closed.
+        AllowedArg { .spelling = "fPIC", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fpic", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fPIE", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fpie", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-pic", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-pie", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fexceptions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-exceptions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fnon-call-exceptions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "frtti", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-rtti", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fthreadsafe-statics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-threadsafe-statics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-aliasing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-aliasing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-overflow", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-overflow", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fomit-frame-pointer", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-omit-frame-pointer", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "finline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-inline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-inline", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fkeep-inline-functions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funroll-loops", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-unroll-loops", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffast-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-fast-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fmath-errno", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-math-errno", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffinite-math-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-finite-math-only", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsigned-zeros", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-signed-zeros", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftrapping-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-trapping-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "frounding-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-rounding-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "freciprocal-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-reciprocal-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fassociative-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-associative-math", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fwrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-wrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftrapv", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector-all", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-protector-strong", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-stack-protector", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-clash-protection", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-stack-clash-protection", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fvisibility-inlines-hidden", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-visibility-inlines-hidden", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdata-sections", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-data-sections", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffunction-sections", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-function-sections", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcommon", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-common", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fshort-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-short-enums", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fshort-wchar", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsigned-char", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funsigned-char", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fchar8_t", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-char8_t", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fconcepts", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcoroutines", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-coroutines", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fopenmp", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-openmp", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fopenmp-simd", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsemantic-interposition", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-semantic-interposition", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "flto", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-lto", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffat-lto-objects", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-fat-lto-objects", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fuse-cxa-atexit", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-use-cxa-atexit", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fsized-deallocation", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-sized-deallocation", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "faligned-allocation", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-aligned-allocation", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fasynchronous-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-asynchronous-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "funwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-unwind-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdelete-null-pointer-checks", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-delete-null-pointer-checks", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fms-extensions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-ms-extensions", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fms-compatibility", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-ms-compatibility", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdelayed-template-parsing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-delayed-template-parsing", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdeclspec", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-declspec", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "felide-constructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-elide-constructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-implicit-templates", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fgnu-unique", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-gnu-unique", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fplt", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-plt", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fident", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-ident", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fverbose-asm", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-verbose-asm", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fbuiltin", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-builtin", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-builtin-", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fpermissive", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fhosted", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ffreestanding", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "foperator-names", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-operator-names", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-access-control", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fnew-ttp-matching", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fexperimental-library", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fmerge-all-constants", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-merge-all-constants", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fjump-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-jump-tables", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "ftree-vectorize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-tree-vectorize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "foptimize-sibling-calls", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-optimize-sibling-calls", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-lifetime-dse", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstrict-vtable-pointers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-strict-vtable-pointers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-devirtualize", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdollars-in-identifiers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-dollars-in-identifiers", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-assume-sane-operator-new", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-autolink", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-rtti-data", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-c++-static-destructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fc++-static-destructors", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-stack-check", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fstack-check", .families = DriverFamily::Any },
+        // Diagnostics rendering. Cosmetic, and none names a file.
+        AllowedArg { .spelling = "fdiagnostics-color", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-color", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-absolute-paths", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-show-option", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-show-option", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-show-template-tree", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-diagnostics-fixit-info", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fdiagnostics-plain-output", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcaret-diagnostics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-caret-diagnostics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fcolor-diagnostics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-color-diagnostics", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fansi-escape-codes", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fshow-column", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-show-column", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "fno-canonical-system-headers", .families = DriverFamily::Any },
+        // Valued `-f` options. Each row's spelling ends at the option's own `=`, so
+        // the row names exactly one option and only its value is open.
+        AllowedArg { .spelling = "fvisibility=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fvisibility-inlines-hidden=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ffp-contract=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ffp-model=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fcf-protection=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fsanitize=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fno-sanitize=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fsanitize-recover=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fno-sanitize-recover=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fsanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fno-sanitize-trap=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fexcess-precision=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fabi-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fabi-compat-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fms-compatibility-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fmessage-length=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fmax-errors=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ferror-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "ftemplate-depth=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "ftemplate-backtrace-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fconstexpr-depth=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fconstexpr-steps=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fconstexpr-backtrace-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fbracket-depth=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fmacro-backtrace-limit=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fdiagnostics-color=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fdiagnostics-format=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fexec-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "finput-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fwide-exec-charset=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fstrict-flex-arrays=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "falign-functions=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "falign-loops=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fpatchable-function-entry=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fopenmp-version=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "flto=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fvect-cost-model=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+        AllowedArg {
+            .spelling = "fstack-protector-guard=", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
+
+        // -- MSVC code generation ----------------------------------------------
+        AllowedArg { .spelling = "EH", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "MD", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "MDd", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "MT", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "MTd", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "MP", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "LD", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "LDd", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GR", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GR-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GS", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GS-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gs", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "Gy", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gy-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gw", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gw-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GF", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GF-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GA", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gd", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gr", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gv", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gz", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GT", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GL", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "GL-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Gm-", .families = DriverFamily::Msvc },
+        // `/Z7` and no other debug-info selector. `/Zi` and `/ZI` make MSVC write a
+        // PDB BESIDE the object, and only the object comes back -- the same rule that
+        // keeps `-gsplit-dwarf` out of the GNU debug rows above, and the same one
+        // `RemoteCompileArgs` applies at the other end (`MsvcSharedPdb`), which
+        // refuses the whole command line rather than dispatching it. Admitting them
+        // here would let a client that skipped that check receive an object whose
+        // debug info names a PDB nothing hands back: wrong output rather than a
+        // visible fallback, which is the worse of the two answers.
+        AllowedArg { .spelling = "Z7", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Za", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Ze", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zl", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zg", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zo", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zo-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zs", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Zp", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "Zc:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "RTC", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "fp:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "guard:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "diagnostics:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "errorReport:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "openmp", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "openmp-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "openmp:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "source-charset:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "execution-charset:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "constexpr:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "vd", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "vm", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
+        AllowedArg { .spelling = "Qspectre", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Qspectre-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Qpar", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Qpar-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Qfast_transcendentals", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "Qimprecise_fwaits", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "QIntel-jcc-erratum", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "utf-8", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "validate-charset", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "validate-charset-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "nologo", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "bigobj", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "sdl", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "sdl-", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "homeparams", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "hotpatch", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "await", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "J", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "X", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "FC", .families = DriverFamily::Msvc },
+        AllowedArg { .spelling = "FS", .families = DriverFamily::Msvc },
+
+        // Clang's "do not warn about arguments this compile did not use", which is a
+        // DIAGNOSTIC switch and reaches nothing. `Any` rather than `Gnu` because
+        // clang-cl is family `Msvc` and takes it too, and because this project's own
+        // `PEDANTIC_COMPILER` presets add it to every clang build -- so a `Gnu`-only
+        // row would make the fleet refuse every job it dispatches to itself, visibly
+        // in a counter and nowhere else.
+        AllowedArg { .spelling = "Qunused-arguments", .families = DriverFamily::Any },
+
+        // -- the compile-only marker. The worker appends its own, but a client that
+        // also sent one costs nothing and refusing it would be a pure fallback.
+        AllowedArg { .spelling = "c", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pthread", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "pipe", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "trigraphs", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "nostdinc", .families = DriverFamily::Any },
+        AllowedArg { .spelling = "nostdinc++", .families = DriverFamily::Any },
+    };
+
+    // The other half of the stated extent. Adding a row past it is a compile error
+    // already; REMOVING one is not -- the array pads itself with value-initialized
+    // rows whose `families` is `None`, which match nothing and shrink the accepted
+    // set without a diagnostic. An empty spelling is exactly what such a row has.
+    static_assert(std::ranges::none_of(AllowedArgs, [](AllowedArg const& row) { return row.spelling.empty(); }),
+                  "AllowedArgs' stated extent must equal its row count -- an empty row is a padded one");
+
+    /// Whether an allowlist row matches an argument.
+    /// @param row The row.
+    /// @param body The argument with one introducer stripped, known non-empty.
+    /// @param family The worker's driver family.
+    /// @return True when the row applies and its shape matches.
+    [[nodiscard]] bool ArgRowMatches(AllowedArg const& row, std::string_view body, DriverFamily family)
+    {
+        if (!Overlaps(row.families, family))
+            return false;
+        if (row.value == ArgValue::Bare)
+            return body == row.spelling;
+        if (!body.starts_with(row.spelling))
+            return false;
+        // The shape rule, composed inside the prefix rather than deleted with it.
+        return !body.contains('/') && !body.contains('\\');
+    }
+} // namespace
+
+JobError JobError::RejectedArgumentNaming(std::string_view argument)
+{
+    // Long enough to identify any real flag and far too short to be a payload. A
+    // refused argument is a flag, and a client that sent a megabyte of them does not
+    // get a megabyte back through this worker's reply.
+    constexpr std::size_t MaxNamedArgument = 96;
+
+    std::string named;
+    named.reserve(std::min(argument.size(), MaxNamedArgument));
+    for (auto const byte: argument.substr(0, MaxNamedArgument))
+        // Printable ASCII only. Everything else -- control characters, terminal
+        // escapes, and every non-ASCII byte -- becomes one `?`, which makes the result
+        // valid UTF-8 whatever arrived and keeps an escape sequence out of the log
+        // this lands in.
+        named.push_back(byte >= 0x20 && byte <= 0x7E ? byte : '?');
+    if (argument.size() > MaxNamedArgument)
+        named += "...";
+
+    return JobError { .reason = JobRefusal::RejectedArgument,
+                      .detail = std::format("argument {} is not on this worker's accepted-flag list for its "
+                                            "driver family",
+                                            named) };
+}
+
+bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver)
 {
     if (arg.empty())
         return true; // an empty argument names nothing and reaches no file
     if (arg.starts_with('@'))
+        return false; // a response file names a path with no separator in it
+
+    // Asked of the MAINTAINED table rather than restated as rows here: a flag that
+    // makes the compile write a second artefact is refused, because only the object
+    // comes back. `-fmodule-mapper=|program args` is on it and makes GCC spawn a
+    // subprocess, so this check is load-bearing rather than tidy.
+    if (ProducesSideArtefact(arg, driver.family))
         return false;
 
-    // One introducer is skipped before the separator is looked for, exactly as
-    // `CouldNameAFile` does on the client -- and for the reason
-    // .agent/rules/compile-cache.md records: `/`
-    // starts an option for an MSVC driver and an absolute path everywhere else.
-    // Testing the raw argument refuses `/O2` and therefore every MSVC job, which the
-    // test asserting `/O2` is acceptable is what caught.
-    //
-    // Both introducers are accepted here rather than the driver's own set, because a
-    // worker is told a FINGERPRINT rather than a command line and has no driver to
-    // ask. That is marginally more permissive than the client's per-family rule --
-    // `/x` is treated as an option here where a GNU client would call it a path --
-    // and it does not matter: the check that carries the weight is the one below,
-    // and a bare `/x` still has to survive it.
-    constexpr std::string_view Introducers = "-/";
-    auto const body = Introducers.contains(arg.front()) ? arg.substr(1) : arg;
-    return !body.contains('/') && !body.contains('\\');
+    // The language the client states for a preprocessed input, read out of the
+    // driver's OWN table rather than copied. A language added to `preprocessedInput`
+    // upstream would otherwise make every such job a silent `RejectedArgument`. These
+    // spellings include bare value tokens (`c++-cpp-output`) that carry no introducer,
+    // so they are matched before the introducer rule below.
+    for (auto const& spelling: driver.preprocessedInput)
+        if (std::ranges::contains(spelling.flags, arg))
+            return true;
+
+    // The target pin, from the one seam that spells it. Restating `--target=` here
+    // would drift from `TargetPinPrefixFor` and refuse every dispatched clang job.
+    if (auto const prefix = TargetPinPrefixFor(driver.targetDiscovery); !prefix.empty() && arg.size() > prefix.size()
+                                                                        && arg.starts_with(prefix) && !arg.contains('/')
+                                                                        && !arg.contains('\\'))
+        return true;
+
+    // One introducer is stripped before the table is consulted, so a row covers `/O2`
+    // and `-O2` alike. An argument that introduces no option at all matches nothing:
+    // it is a bare word, which on a compiler's command line is an input file.
+    auto const introducers = IntroducersOf(driver.family);
+    if (introducers.empty() || !introducers.contains(arg.front()))
+        return false;
+    auto const body = arg.substr(1);
+
+    // One pass, with a matching `Deny` answering immediately: a carve-out cannot be
+    // out-voted by an `Allow` prefix it also matches, and row order never decides an
+    // answer. The shape test is the expensive half, so it is asked once per row
+    // rather than once per rule.
+    bool allowed = false;
+    for (AllowedArg const& row: AllowedArgs)
+    {
+        if (!ArgRowMatches(row, body, driver.family))
+            continue;
+        if (row.rule == ArgRule::Deny)
+            return false;
+        allowed = true;
+    }
+    return allowed;
 }
 
 std::string SafeSourceName(std::string_view sourceName)
@@ -169,7 +755,7 @@ void CompileJobRunner::ReplaceToolchains(std::map<std::string, std::string> tool
     _toolchains = std::move(toolchains);
 }
 
-std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const& job)
+std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& job)
 {
     // The compiler comes from THIS worker's configuration, keyed by the fingerprint
     // the client named. The client never names a program. A fingerprint this worker
@@ -190,16 +776,42 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
         std::shared_lock const guard { _toolchainsMutex };
         auto const found = _toolchains.find(job.fingerprint);
         if (found == _toolchains.end())
-            return std::unexpected(JobRefusal::UnknownFingerprint);
+            return std::unexpected(JobError { .reason = JobRefusal::UnknownFingerprint, .detail = {} });
         compiler = found->second;
     }
 
-    // Checked again here, on the receiving side. The client's filter protects an
-    // honest client from dispatching something that would not work; this one
-    // protects the worker from a client that is not honest. Trusting the client's
-    // check would mean the worker is secured by code running on the caller's machine.
-    if (!std::ranges::all_of(job.args, IsAcceptableJobArgument))
-        return std::unexpected(JobRefusal::RejectedArgument);
+    // Derived from the worker's OWN configured compiler, never from anything the
+    // client sent -- the same rule that governs which program runs. Used both to vet
+    // the client's arguments against this family's allowlist and to spell the output
+    // flag far below, so it is derived once here.
+    auto const& driver = DriverOf(ClassifyCompiler(compiler));
+    auto const family = driver.family;
+
+    // A compiler this worker cannot classify is a WORKER fault, and it is refused as
+    // the job rather than per argument. Two things go wrong otherwise. The allowlist
+    // consults `IntroducersOf(None)`, which is empty, so every argument is refused --
+    // reported as `RejectedArgument` and counted under it, sending an operator to look
+    // at the fleet's *flags* when the answer is this node's `--toolchain`. And a job
+    // with an EMPTY argument list has nothing to refuse, so it would sail past the
+    // loop and spawn a driver whose command-line dialect this worker does not know.
+    // `SpawnFailed` is the honest existing answer -- "this worker is broken, compile
+    // it elsewhere" -- and it carries the wire code and the counter that say so.
+    if (family == DriverFamily::None)
+        return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed,
+                                          .detail = "this worker's configured compiler matches no known driver "
+                                                    "family, so its command line cannot be built safely" });
+
+    // Checked again here, on the receiving side, and against an ALLOWLIST -- see
+    // `IsAcceptableJobArgument`. The client's filter protects an honest client from
+    // dispatching something that would not work; this one protects the worker from a
+    // client that is not honest. Trusting the client's check would mean the worker is
+    // secured by code running on the caller's machine -- and the client's check is a
+    // shape rule that admits every program-invoking option carrying no path
+    // separator, which is exactly the surface this must not expose.
+    if (auto const offender =
+            std::ranges::find_if(job.args, [&](std::string const& arg) { return !IsAcceptableJobArgument(arg, driver); });
+        offender != job.args.end())
+        return std::unexpected(JobError::RejectedArgumentNaming(*offender));
 
     // Every path below is the worker's. Nothing the client sent decides where a byte
     // lands -- not the source name, not the object name, not the directory.
@@ -207,7 +819,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     auto const scratch = _scratchRoot / std::format("job-{}", _nextJob.fetch_add(1, std::memory_order_relaxed));
     std::filesystem::create_directories(scratch, ec);
     if (ec)
-        return std::unexpected(JobRefusal::ScratchUnavailable);
+        return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {} });
 
     // Removed however this returns, including on a refusal below: a worker that
     // leaked a directory per job would fill its disk in a long-running build.
@@ -238,10 +850,10 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     {
         std::ofstream out { source, std::ios::binary };
         if (!out)
-            return std::unexpected(JobRefusal::ScratchUnavailable);
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {} });
         out.write(job.preprocessed.data(), static_cast<std::streamsize>(job.preprocessed.size()));
         if (!out.good())
-            return std::unexpected(JobRefusal::ScratchUnavailable);
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {} });
     }
 
     std::vector<std::string> argv;
@@ -259,9 +871,9 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     // it. `-c` needs no such treatment: MSVC drivers accept `-` for every option,
     // so it means the same to both families.
     //
-    // The family is derived from the worker's OWN configured compiler, never from
-    // anything the client sent -- the same rule that governs which program runs.
-    auto const family = DriverOf(ClassifyCompiler(compiler)).family;
+    // `family` was derived once at lookup from the worker's OWN configured compiler,
+    // never from anything the client sent -- the same rule that governs which program
+    // runs, and which vetted the arguments above.
     argv.emplace_back("-c");
     argv.push_back(source.string());
     // Fused, which both families accept and which is the only form MSVC documents
@@ -273,7 +885,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
         // The compiler could not be spawned at all. Deliberately NOT reported as a
         // failed compile: the client must be able to tell "this worker is broken"
         // from "your code does not compile", because only the second is its answer.
-        return std::unexpected(JobRefusal::SpawnFailed);
+        return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed, .detail = {} });
 
     CompileOutcome outcome {
         .exitCode = run.exitCode, .object = {}, .stdoutText = std::move(run.out), .stderrText = std::move(run.err)
@@ -285,7 +897,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
             // The compiler said it succeeded and produced nothing readable. Refused
             // rather than returned as an empty object, which the client would write
             // to disk and cache.
-            return std::unexpected(JobRefusal::ScratchUnavailable);
+            return std::unexpected(JobError { .reason = JobRefusal::ScratchUnavailable, .detail = {} });
         outcome.object = *std::move(bytes);
     }
     return outcome;
