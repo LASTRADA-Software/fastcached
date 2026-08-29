@@ -104,6 +104,20 @@ struct ExchangeBudget
     /// call, so a daemon dribbling a byte at a time could hold a compile forever
     /// while never once exceeding it.
     std::chrono::milliseconds total { 10'000 };
+
+    /// @return True when `total` bounds this exchange.
+    ///
+    /// The rule lives on the type rather than at each consumer, because the
+    /// arithmetic alone says the OPPOSITE of what the value means: a zero total put
+    /// the deadline at `Now()`, so every exchange died on the reactor's next turn --
+    /// a knob documented as "turn the ceiling off" that turned the cache off
+    /// instead, silently, since every caller answers a transport failure by
+    /// compiling. A consumer that re-derives the comparison is a consumer that can
+    /// omit it.
+    [[nodiscard]] bool BoundsTotal() const noexcept
+    {
+        return total > std::chrono::milliseconds::zero();
+    }
 };
 
 /// Send one framed request and read its reply, presenting `credential` if

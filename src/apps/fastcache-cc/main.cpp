@@ -111,7 +111,12 @@ namespace Wire = FastCache::CompileCacheWire;
 /// that has not finished in ten seconds is one this build is better off without.
 /// That is what keeps a miss cheap. It is deliberately NOT what bounds a remote
 /// compile -- see `Cc::DefaultDispatchTotal` and issue #223.
-constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
+///
+/// Taken FROM `ExchangeBudget`'s own default rather than restated beside it: that
+/// default is what `DispatchBudgets::control` and every test that constructs a
+/// budget run under, so a number changed here and not there would leave the whole
+/// suite asserting the old policy with nothing failing.
+constexpr std::chrono::milliseconds DefaultIoTimeout = Cc::ExchangeBudget {}.total;
 
 /// Default ceiling on OPENING a connection, name resolution included.
 ///
@@ -120,7 +125,8 @@ constexpr std::chrono::milliseconds DefaultIoTimeout { 10000 };
 /// better off without, and a name lookup that hangs would otherwise stall every
 /// translation unit with nothing to say why. They used to be one value passed
 /// twice.
-constexpr std::chrono::milliseconds DefaultConnectTimeout { 1000 };
+/// Taken from `ExchangeBudget`'s own default, for the reason above.
+constexpr std::chrono::milliseconds DefaultConnectTimeout = Cc::ExchangeBudget {}.connect;
 
 struct Config
 {
@@ -597,9 +603,12 @@ void ReplayStreams(std::string_view out, std::string_view err)
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    return Cc::DispatchBudgets { .control = BudgetOf(cfg),
-                                 .compile =
-                                     Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.dispatchTimeout } };
+    // The compile budget is the ordinary one with its TOTAL replaced, rather than a
+    // second field-by-field construction: only the total differs, so a third field
+    // on `ExchangeBudget` must not need wiring into two places to reach dispatch.
+    auto compile = BudgetOf(cfg);
+    compile.total = cfg.dispatchTimeout;
+    return Cc::DispatchBudgets { .control = BudgetOf(cfg), .compile = compile };
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.

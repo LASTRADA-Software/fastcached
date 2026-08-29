@@ -233,13 +233,6 @@ class ScriptedConnector final: public IConnector
         _dribble = true;
     }
 
-    /// The record, writable, for a driver that has to reach the live peer.
-    /// @return The log; valid for this connector's lifetime.
-    [[nodiscard]] PeerLog& MutableLog() noexcept
-    {
-        return _log;
-    }
-
     [[nodiscard]] int Dials() const noexcept
     {
         return _dials;
@@ -259,8 +252,12 @@ class ScriptedConnector final: public IConnector
     ///
     /// A log rather than the peer itself: the socket belongs to the frame that
     /// dialled it and is gone by the time a case asks. See `PeerLog`.
+    ///
+    /// Non-const, because a driver running beside the exchange reaches the live peer
+    /// through it. One accessor rather than a const one and a mutable twin: two names
+    /// for one member is two things a later case has to choose between.
     /// @return The record, valid for this connector's lifetime.
-    [[nodiscard]] PeerLog const& Log() const noexcept
+    [[nodiscard]] PeerLog& Log() noexcept
     {
         return _log;
     }
@@ -428,7 +425,7 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
 
     Cc::ReactorExchange exchange { reactor, connector };
     auto const start = clock.Now();
-    dribble(&reactor, &clock, &connector.MutableLog(), PerByte, Turns);
+    dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
 
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
 

@@ -8,7 +8,6 @@
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <cassert>
-#include <chrono>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -54,15 +53,13 @@ namespace
             // this coroutine parked on a read nobody will ever complete; closing
             // completes it, so the task reaches its own end and frees its own frame.
             //
-            // A non-positive budget arms NOTHING, which is what `FASTCACHE_TIMEOUT_MS=0`
-            // has always been documented to mean. Left to the arithmetic it would put
-            // the deadline at `Now()` and abort every exchange on the reactor's next
-            // turn -- a knob that reads as "turn the ceiling off" and turns the cache
-            // off instead, silently, because every caller answers a Transport failure
-            // by compiling. `std::optional` rather than a sentinel deadline: a timer
-            // that is not armed is the honest spelling of no bound.
+            // An unbounded budget arms NOTHING, which is what `FASTCACHE_TIMEOUT_MS=0`
+            // has always been documented to mean -- `ExchangeBudget::BoundsTotal` is
+            // where that rule lives, and why it is not spelled out again here.
+            // `std::optional` rather than a sentinel deadline: a timer that is not
+            // armed is the honest spelling of no bound.
             std::optional<DeadlineTimer> bound;
-            if (budget.total > std::chrono::milliseconds::zero())
+            if (budget.BoundsTotal())
                 bound.emplace(
                     *reactor,
                     reactor->Clock().Now() + budget.total,
@@ -143,6 +140,15 @@ namespace
     /// rests on: `SO_RCVTIMEO` bounds one `recv`, so a worker dribbling a byte
     /// before each expiry could hold a build forever. `RunOneExchange` arms a
     /// `DeadlineTimer` that CLOSES the socket, which bounds the whole conversation.
+    ///
+    /// Stateless, so a dispatch builds and tears down a reactor and a resolver three
+    /// times rather than reusing one connector, as the blocking dialler this replaced
+    /// did. That is a deliberate consequence rather than an oversight: a
+    /// `ReactorExchange` runs exactly once (its reactor's stop flag is never
+    /// cleared), so a shared one would perform the LEASE and silently skip the
+    /// compile. The cost is an `epoll_create1`/`eventfd` pair per verb -- microseconds
+    /// against the 45 ms preprocess this path has already paid, and against the
+    /// seconds of remote compile it exists to buy.
     class TcpExchange final: public IEndpointExchange
     {
       public:

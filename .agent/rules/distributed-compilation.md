@@ -255,11 +255,20 @@ Consequences that are each load-bearing:
     capacity for is thrown away. The two cannot be `static_assert`ed together — the
     launcher deliberately does not link the library the scheduler lives in — so moving
     either means moving both.
-  - **A flat deadline cannot tell "still working" from "gone", and that is a residual
-    rather than a fix.** The same number is how long a legitimate compile may take and
-    how long a genuinely dead worker goes unnoticed; sizing it for the first is the
-    only choice available while the worker sends nothing mid-compile. Splitting them
-    needs a periodic progress frame from the worker, which is a wire change (#245).
+  - **A flat deadline cannot tell "still working" from "gone", so raising it is a
+    REGRESSION as well as a fix, and it is stated rather than absorbed.** The same
+    number is how long a legitimate compile may take and how long a genuinely dead
+    worker goes unnoticed, and it went from ten seconds to ten minutes -- sixty times
+    slower to notice a machine that was powered off, unplugged or suspended
+    mid-compile, which on a `-j16` build is a handful of slots and a build that looks
+    hung. Sizing for the slow compile is nonetheless the only choice available while
+    the worker sends nothing mid-compile: sizing for the dead worker is the defect
+    above, reintroduced. Splitting the two needs a periodic progress frame from the
+    worker so the IDLE bound can be seconds while the TOTAL stays long, which is a
+    wire change (#245). A cheaper partial mitigation exists and is not in the
+    launcher's reach: TCP keepalive with real intervals on the dispatch socket
+    detects a dead HOST in under a minute, but the option has to be armed where the
+    native handle is (`Net/`), not where the budget is chosen.
   - **Zero means UNBOUNDED, and the arithmetic alone says the opposite.** A zero total
     puts the deadline at `Now()`, so every exchange dies on the reactor's next turn —
     a knob documented as "turn the ceiling off" that turns the *cache* off instead,

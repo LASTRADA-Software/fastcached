@@ -437,9 +437,14 @@ Every reason that appears under `fall-back reasons`, and what to do about it:
   the client, which hands the lease back and compiles locally — so the build still
   succeeds and the key is not pinned for the scheduler's lease timeout. The
   **worker** does not learn about it: it runs the compile to completion and writes
-  back an object nobody reads, so that CPU is spent twice. That is why the default
-  is generous rather than tight, and it is the residual a periodic progress frame
-  from the worker would close ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+  back an object nobody reads, so that CPU is spent twice.
+- **That deadline is also how long a genuinely dead worker goes unnoticed**, and it
+  is ten minutes rather than the ten seconds a dispatch used to get. A flat ceiling
+  cannot separate a worker that is still compiling from one whose machine has
+  vanished, so sizing it for the slowest legitimate translation unit — which is the
+  only safe choice — makes hard-failure detection sixty times slower. Both halves
+  are what a periodic progress frame from the worker would close
+  ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
 
 ## Measured behaviour
 

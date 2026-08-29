@@ -131,7 +131,7 @@ class ScriptedFleet final: public IEndpointExchange
             --limit->second;
         }
         if (auto const slow = _durations.find(key); slow != _durations.end())
-            if (budget.total > std::chrono::milliseconds::zero() && budget.total < slow->second)
+            if (budget.BoundsTotal() && budget.total < slow->second)
                 return CacheOutcome {};
         ScriptedPeer peer { it->second, &_sent[key] };
         return SyncRun(ExchangeFramed(&peer, std::move(frame), credential));

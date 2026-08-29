@@ -8,7 +8,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -80,10 +79,15 @@ class IEndpointExchange
 /// Deliberately generous rather than tight, because a *flat* deadline has to cover
 /// the slowest translation unit anybody legitimately compiles: real ones here run
 /// well past a minute, and a ceiling sized for the average reintroduces exactly the
-/// defect above, further out. The cost is that a genuinely dead worker is only
-/// noticed after the same interval, which a flat deadline cannot separate from a
-/// slow one — telling "still working" from "gone" needs the worker to say so, and
-/// that is a wire change tracked as #245.
+/// defect above, further out.
+///
+/// **The cost is stated rather than absorbed.** This is also how long a genuinely
+/// dead worker goes unnoticed — a machine powered off, unplugged or suspended
+/// mid-compile — and against the ten seconds a dispatch used to get that is sixty
+/// times slower, which on a parallel build is a handful of stalled slots. A flat
+/// ceiling cannot separate that from a slow compile; splitting them needs the worker
+/// to say it is still there, so the idle bound can be seconds while the total stays
+/// long. That is a wire change tracked as #245.
 ///
 /// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
 /// process per translation unit, so the variable IS the runtime knob: the next
@@ -102,7 +106,7 @@ struct DispatchBudgets
     ExchangeBudget control {};
 
     /// The worker's COMPILE: as long as a compiler runs.
-    ExchangeBudget compile { .connect = ExchangeBudget {}.connect, .total = DefaultDispatchTotal };
+    ExchangeBudget compile { .total = DefaultDispatchTotal };
 };
 
 /// How a dispatch attempt ended.

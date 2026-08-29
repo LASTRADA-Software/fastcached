@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "Dispatch.hpp"
 #include "LauncherCli.hpp"
 
 #include <FastCache/Cli/UsageTestUtils.hpp>
@@ -337,7 +338,15 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_VERBOSE",
                              "FASTCACHE_NO_STATS",
                              "FASTCACHE_NO_DIRECT",
+                             "FASTCACHE_CONNECT_TIMEOUT_MS",
                              "FASTCACHE_TIMEOUT_MS",
+                             // Not a spelling variant of the row above it: a cache
+                             // exchange and a remote compile are bounded by
+                             // different things, and one knob moving both is the
+                             // defect #223 records. A `contains` for the shorter
+                             // name does not match the longer one, so dropping
+                             // either row is caught here.
+                             "FASTCACHE_DISPATCH_TIMEOUT_MS",
                              "FASTCACHE_MAX_STORE_BYTES",
                              "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
@@ -349,4 +358,16 @@ TEST_CASE("the help text documents every environment variable the launcher reads
         INFO("variable " << name);
         CHECK(help.contains(name));
     }
+}
+
+TEST_CASE("the help text states the dispatch deadline the launcher actually uses")
+{
+    // The number in an `EnvVarSpec` summary is prose in a `constexpr` table, so it
+    // cannot be formatted from the constant -- which makes it exactly the kind of
+    // second statement that drifts. An operator who reads "600000" and gets ten
+    // seconds has been told something false about a knob whose whole purpose is
+    // that one deadline could not serve two conversations (#223).
+    auto const help = HelpText();
+    INFO(help);
+    CHECK(help.contains(std::to_string(DefaultDispatchTotal.count())));
 }
