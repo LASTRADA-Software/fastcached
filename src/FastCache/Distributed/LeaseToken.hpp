@@ -430,10 +430,21 @@ struct LeaseExpectation
     if (authentic->fingerprint != expected.fingerprint)
         return std::unexpected { LeaseRefusal { .reason = LeaseRefusalReason::FingerprintMismatch, .detail = {} } };
 
-    // `now - expiresAt > slack` rather than `now > expiresAt + slack`, which is the
-    // spelling that overflows: the sum pushes an already-large instant past the tick
-    // count's ceiling, while the difference of two representable instants is always
-    // representable.
+    // Not `now > expiresAt + slack`: that sum pushes an already-large instant past
+    // the tick count's ceiling, and `expiresAt` is attacker-chosen up to
+    // `MaxExpiryMillis`.
+    //
+    // The difference is not unconditionally safe either, which is what the earlier
+    // spelling of this comment claimed. `max - min` overflows like any other, and
+    // `expiresAt` is non-negative by construction (it decodes from an unsigned
+    // millisecond count) while `now` is whatever this host's wall clock says --
+    // including a pre-epoch instant on a machine with a dead RTC. So the ordering is
+    // established with a COMPARISON first, which cannot overflow, and the subtraction
+    // only ever runs on `now > expiresAt >= epoch`, where the result is bounded by
+    // `now` and therefore representable.
+    if (now <= authentic->expiresAt)
+        return std::move(*authentic);
+
     auto const age = now - authentic->expiresAt;
     if (age > slack)
         return std::unexpected { LeaseRefusal {

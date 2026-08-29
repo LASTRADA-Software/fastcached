@@ -311,6 +311,24 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
     {
         CHECK_FALSE(VerifyLeaseToken(key, token, Worker(), expiry + 1s, 0s).has_value());
     }
+
+    SECTION("a verifier whose own clock reads before the epoch does not overflow")
+    {
+        // `now - expiresAt` is only representable once the two are known to be
+        // ordered. `expiresAt` is non-negative by construction -- it decodes from an
+        // unsigned millisecond count -- while `now` is whatever this host's wall
+        // clock says, and a machine with a dead RTC reads 1970 or earlier. With an
+        // expiry near the tick count's ceiling, the subtraction is then a signed
+        // overflow: undefined, invisible on MSVC, and a UBSan report on the Linux
+        // legs. Ordered by a comparison first, it cannot happen, and the answer is
+        // the correct one -- a clock this far behind has not reached any expiry.
+        auto const farFuture =
+            std::chrono::system_clock::time_point { std::chrono::milliseconds { Detail::MaxExpiryMillis } };
+        auto const distant = MintLeaseToken(key, LeaseClaims { .serial = "17", .expiresAt = farFuture });
+
+        auto const preEpoch = std::chrono::system_clock::time_point {} - 24h;
+        CHECK(VerifyLeaseToken(key, distant, LeaseExpectation {}, preEpoch).has_value());
+    }
 }
 
 TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token]")
