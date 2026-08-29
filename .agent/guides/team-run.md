@@ -88,10 +88,13 @@ show red while a queued run is already on its way to fixing it.
 gh pr checks <n> --json name,state
 ```
 
-- Type-label row `CANCELLED` **and** anything `QUEUED` → **wait**. Firing another label
-  cancels the survivor.
-- Type-label row `FAILURE` with nothing queued → re-apply **one** accurate missing `area/*`
-  label to fire a fresh event.
+The decisive signal is **why** it cancelled, not that it cancelled:
+
+- Red **immediately after a multi-label create or edit** — self-inflicted by the
+  concurrency group, and a queued run is already on its way to clearing it. **Wait.**
+  Firing another label event cancels the survivor and starts the cycle over.
+- Red on a PR whose **labels have been stable for minutes**, nothing queued — genuinely
+  stuck. Re-apply **one** accurate missing `area/*` label to fire a fresh event.
 - Never `gh run rerun` — it races the concurrency group and makes it worse.
 
 ## Review gates
