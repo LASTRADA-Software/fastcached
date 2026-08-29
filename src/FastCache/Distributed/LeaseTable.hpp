@@ -101,6 +101,19 @@ class LeaseTable
     /// while the cost of it being too long is one key not being distributed.
     static constexpr std::chrono::milliseconds DefaultLeaseTimeout { 600'000 };
 
+    /// How long a lease this table issues stays live.
+    ///
+    /// Exposed so a signed grant's expiry can be derived from it rather than
+    /// written beside it. The two would otherwise be a pair of literals that have
+    /// to agree forever, and the way they fail to is silent: a token outliving its
+    /// lease is a capability nothing has any record of, and one dying first is a
+    /// worker refusing work the scheduler is still suppressing the key for.
+    /// @return The lifetime this table was constructed with.
+    [[nodiscard]] std::chrono::milliseconds Timeout() const noexcept
+    {
+        return _leaseTimeout;
+    }
+
     /// Result of asking for a lease.
     enum class Outcome : std::uint8_t
     {

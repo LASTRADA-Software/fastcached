@@ -75,6 +75,31 @@ struct Leading
     SchedulerService service { clock, wallClock, metrics, logger, {} };
 };
 
+/// A fixed wall-clock instant, so a grant's expiry is a value a test can name.
+constexpr std::chrono::system_clock::time_point Noon { 1'767'225'600s };
+
+/// The same, with a cluster key, so its grants are signed.
+///
+/// A separate fixture rather than a parameter on `Leading`, because unsigned is not
+/// a variation of signed: it is the boundary this surface had before, kept working
+/// for the single machine that runs no cluster, and the cases about it assert a
+/// warning that a signing fleet must never write.
+struct Signing
+{
+    Signing()
+    {
+        service.SetRole(SchedulerRole::Leader, {});
+    }
+
+    /// Thirty-two bytes, as `--cluster-key-file` would supply them.
+    std::vector<std::byte> key = std::vector<std::byte>(32, std::byte { 0x5A });
+
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    CapturingLogger logger;
+    ManualWallClock wallClock;
+    SchedulerService service { clock, wallClock, metrics, logger, key };
+};
 } // namespace
 
 TEST_CASE("A granted lease reaches the fleet page's compiling figure", "[distributed][scheduler][fleetview]")
@@ -881,5 +906,142 @@ TEST_CASE("A mismatch names both addresses, because a counter cannot", "[distrib
                           OneSlot("gcc-15", "10.0.0.3:7100"))
                 .status
             == Wire::Status::Ok);
+    CHECK(fleet.logger.Snapshot().empty());
+}
+
+TEST_CASE("A grant is signed for exactly one worker, and only that worker's is valid", "[distributed][scheduler][lease]")
+{
+    // The hole this closes: a lease used to be a small decimal serial, and the
+    // worker's validator was `[](...){ return true; }`. Anyone who could reach a
+    // compile port and present any string got a compile.
+    Signing fleet;
+    fleet.wallClock.SetNow(Noon);
+
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+    auto const token = TokenOf(granted);
+
+    // The grant is no longer the lease table's handle -- it WRAPS one. Asserted
+    // directly, because everything below would also pass for a token that merely
+    // happened to verify while carrying no binding at all.
+    auto const wrapped = AuthenticateLeaseToken(fleet.key, token);
+    REQUIRE(wrapped.has_value());
+    CHECK(wrapped->serial != token);
+
+    SECTION("the worker it names accepts it")
+    {
+        auto const verified = VerifyLeaseToken(
+            fleet.key, token, LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14" }, Noon);
+        REQUIRE(verified.has_value());
+        CHECK(verified->key == "obj-1");
+
+        // Derived from the lease table's own lifetime rather than written beside it.
+        // A token outliving its lease would be a capability nothing has a record of;
+        // one dying first would refuse work whose key is still being suppressed.
+        CHECK(verified->expiresAt == Noon + LeaseTable::DefaultLeaseTimeout);
+    }
+
+    SECTION("a second worker does not")
+    {
+        // The replay the endpoint is inside the MAC for. Without it, one grant is a
+        // grant on every machine that trusts the key -- which is every machine in
+        // the fleet.
+        auto const refusal = VerifyLeaseToken(
+            fleet.key, token, LeaseExpectation { .endpoint = "peer-2:7100", .fingerprint = "gcc-14" }, Noon);
+        REQUIRE_FALSE(refusal.has_value());
+        CHECK(refusal.error().reason == LeaseRefusalReason::EndpointMismatch);
+    }
+
+    SECTION("and it stops being good once it has expired")
+    {
+        auto const refusal = VerifyLeaseToken(fleet.key,
+                                              token,
+                                              LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14" },
+                                              Noon + LeaseTable::DefaultLeaseTimeout + LeaseTokenClockSkewSlack + 1s);
+        REQUIRE_FALSE(refusal.has_value());
+        CHECK(refusal.error().reason == LeaseRefusalReason::Expired);
+    }
+}
+
+TEST_CASE("A release names a lease this scheduler actually signed", "[distributed][scheduler][lease]")
+{
+    Signing fleet;
+    fleet.wallClock.SetNow(Noon);
+
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+    auto const token = TokenOf(granted);
+
+    SECTION("the signed token resolves it")
+    {
+        CHECK(fleet.service.Release(Insider, token, "obj-1").status == Wire::Status::Ok);
+        CHECK_FALSE(fleet.service.Leases().IsInFlight("obj-1"));
+    }
+
+    SECTION("a bare serial does not")
+    {
+        // What a member could once do by guessing: a small integer, plus a key it can
+        // see in its own build, was enough to free somebody else's lease.
+        auto const refused = fleet.service.Release(Insider, "1", "obj-1");
+        CHECK(refused.status == Wire::Status::Error);
+        CHECK(refused.error == Wire::ErrorCode::LeaseUnauthorized);
+        CHECK(fleet.service.Leases().IsInFlight("obj-1"));
+
+        // Counted apart from `UnknownLease`, which names a lease this scheduler DID
+        // issue and has since forgotten. This one was never issued at all.
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesUnauthorized) == 1);
+        CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
+    }
+
+    SECTION("nor does one signed with another cluster's key")
+    {
+        auto const foreign = MintLeaseToken(std::vector<std::byte>(32, std::byte { 0x11 }),
+                                            LeaseClaims { .serial = "1",
+                                                          .endpoint = "peer-1:7100",
+                                                          .fingerprint = "gcc-14",
+                                                          .key = "obj-1",
+                                                          .expiresAt = Noon + 10min });
+        CHECK(fleet.service.Release(Insider, foreign, "obj-1").error == Wire::ErrorCode::LeaseUnauthorized);
+        CHECK(fleet.service.Leases().IsInFlight("obj-1"));
+    }
+}
+
+TEST_CASE("A scheduler with no cluster key says so, once", "[distributed][scheduler][lease]")
+{
+    // Unsigned grants stay a working configuration -- a single machine with no
+    // `--cluster-key-file` is what most people run, and refusing to schedule would
+    // break every one of those installs. What is not acceptable is doing it quietly:
+    // a fleet that is green and is not doing the thing it claims is the failure this
+    // repository keeps rediscovering.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
+    fleet.logger.Clear();
+
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+
+    // Unsigned means the lease table's own handle, unchanged -- so an old launcher
+    // and an old worker go on working exactly as they did. Spelled as the literal
+    // `LeaseTable` mints, on purpose: if that format moves, the thing this case is
+    // about has moved with it.
+    CHECK(TokenOf(granted) == "l1");
+
+    auto const records = fleet.logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().level == LogLevel::Warn);
+    CHECK(records.front().message.contains("UNSIGNED"));
+    CHECK(records.front().message.contains("--cluster-key-file"));
+
+    // Once for the life of the process, not once per grant: the fact is about the
+    // configuration and does not change, and a line per lease would bury it under
+    // itself on the first parallel build.
+    fleet.logger.Clear();
+    // Released first: the worker offers one slot, so a second lease taken while the
+    // first is outstanding would be refused for capacity and never reach the mint.
+    REQUIRE(fleet.service.Release(Insider, TokenOf(granted), "obj-1").status == Wire::Status::Ok);
+    auto const second = fleet.service.Lease(Insider, Ask("gcc-14", "obj-2"));
+    REQUIRE(second.status == Wire::Status::Ok);
     CHECK(fleet.logger.Snapshot().empty());
 }

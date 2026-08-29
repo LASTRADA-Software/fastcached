@@ -6,6 +6,7 @@
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -173,8 +174,7 @@ class SchedulerService
     /// @param wallClock Where a grant's absolute expiry comes from; must outlive the
     ///        service. Separate from @p clock because a steady instant means nothing
     ///        on the machine that has to check it, and a lease is checked on another
-    ///        machine by definition. Read by nothing yet; the signing it exists for
-    ///        arrives in the next commit.
+    ///        machine by definition.
     /// @param metrics Counts the outcomes below; must outlive the service.
     /// @param logger Where the one observation this service reports goes; must
     ///        outlive the service. `NullLogger` where a caller does not want it.
@@ -252,6 +252,13 @@ class SchedulerService
                                            std::span<FleetBucket const> history = {});
 
     /// Pick a worker and authorize one job on it.
+    ///
+    /// The grant's token is a **credential**, not merely bookkeeping: it carries a
+    /// MAC over the worker's endpoint, the toolchain, the object key and an expiry,
+    /// so the worker can refuse a client that never came through here. Without the
+    /// endpoint inside that MAC a grant issued for one machine would be a grant on
+    /// every machine sharing the key -- the same failure `Cluster::DiscoveryWire`
+    /// closes by covering the `(node, endpoint)` pair. See `LeaseToken.hpp`.
     /// @param caller Who is asking.
     /// @param request The toolchain, the object key and the client's codecs.
     /// @return `Ok` carrying an encoded `LeaseGrant`, or a refusal.
@@ -280,14 +287,16 @@ class SchedulerService
     /// caller's own lease rather than whichever the number happens to land on --
     /// after a scheduler restart, or from a member guessing.
     ///
-    /// The residual, stated rather than left looking like an oversight: a member
-    /// that knows both a key and its token can still resolve somebody else's lease
-    /// on it, and inside one build that pair is not secret. What it costs is one
-    /// duplicated compile and one premature decrement the next heartbeat corrects
-    /// -- a fairness question in a trusted fleet, not a security one, and strictly
-    /// smaller than what the same member could do by taking leases on keys it has
-    /// no intention of compiling. Unforgeable tokens belong with the surface's
-    /// authentication as a whole (#180), not bolted onto one verb.
+    /// The token is the SIGNED grant, so it is authenticated here and the serial the
+    /// lease table knows is unwrapped out of it. That closes the guessing half of the
+    /// residual this used to record: a member could once resolve somebody else's
+    /// lease by naming a key and a small integer, and a small integer is not a
+    /// secret. It does not close replay by whoever legitimately holds the grant --
+    /// nothing short of per-client identity could -- and what that still costs is one
+    /// duplicated compile and one premature decrement the next heartbeat corrects.
+    ///
+    /// A scheduler with no `--cluster-key-file` signs nothing, so there is nothing to
+    /// unwrap and the token is the serial, exactly as before.
     /// @param caller Who is asking.
     /// @param leaseToken The token this client was granted.
     /// @param key The object key it was granted on.
@@ -427,6 +436,20 @@ class SchedulerService
     /// @return `Ok`, or the refusal with its reason.
     [[nodiscard]] SchedulerReply Offer(Cluster::Command const& command);
 
+    /// Mint the token a grant hands back.
+    ///
+    /// A function rather than an expression inside `Lease`, because it is where the
+    /// unsigned fallback lives and that decision deserves a name. Without a key it
+    /// returns the bare `LeaseTable` serial -- exactly what this surface handed out
+    /// before signed leases -- and says so in the log the first time.
+    /// @param lease The lease just acquired.
+    /// @param endpoint The worker it was granted on.
+    /// @param fingerprint The toolchain it was granted against.
+    /// @return What the client presents to that worker.
+    [[nodiscard]] std::string MintGrantToken(Distributed::Lease const& lease,
+                                             std::string_view endpoint,
+                                             std::string_view fingerprint);
+
     IWallClock const& _wallClock;
     IMetricsSink& _metrics;
     /// Where the endpoint-mismatch observation goes (#242).
@@ -447,6 +470,15 @@ class SchedulerService
     /// field. Relaxed because nothing is ordered against it: an exact cut-off is not
     /// the point, and the counter beside it is what carries the rate anyway.
     std::atomic<std::uint64_t> _mismatchLines { 0 };
+
+    /// Whether the "these grants are unsigned" line has already been written.
+    ///
+    /// One line for the life of the process, not one per grant: the fact is about
+    /// the configuration and does not change, and a per-grant line would bury it
+    /// under itself on the first parallel build. Atomic for the reason
+    /// `_mismatchLines` is -- defensively, against a second thread ever answering
+    /// this surface.
+    std::atomic<bool> _warnedUnsigned { false };
 
     /// The cluster's pre-shared key, or empty for unsigned grants.
     ///
