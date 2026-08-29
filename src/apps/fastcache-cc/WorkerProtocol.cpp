@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
+#include "CodecEnvelope.hpp"
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
@@ -178,9 +179,11 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // A REPLY, never a close: the frame declared its own length, so the connection is
     // still synchronised and a peer that guessed wrong learns which.
     //
-    // `UnenvelopeText`, not `Unenvelope`: the runner wants a `std::string`, and the
-    // `Identity` path -- the only codec a node negotiates -- would otherwise copy a
-    // whole preprocessed translation unit into a `std::vector<std::byte>` on the way.
+    // `UnenvelopeText`, not `Unenvelope`: the runner wants a `std::string`, and an
+    // `Identity` source would otherwise copy a whole preprocessed translation unit
+    // into a `std::vector<std::byte>` on the way. That used to be every source --
+    // a node negotiated no codec but `Identity` (#265) -- and is now the
+    // compression-less build's path, which can least afford the spare copy.
     auto source = UnenvelopeText(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
         // Code and text come from ONE row rather than a ternary beside a lookup: a
@@ -226,11 +229,13 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     _metrics.Increment(IMetricsSink::Counter::WorkerCompileMillisTotal, static_cast<std::uint64_t>(elapsed.count()));
 
     // The object goes back in an envelope chosen from what the CLIENT said it
-    // accepts -- carried in its own request, so no negotiation round trip.
-    auto const chosen = Wire::ChooseCodec(_acceptedCodecs, _acceptedCodecs);
-    auto enveloped =
-        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(outcome->object.size()), outcome->object);
-    (void) chosen;
+    // accepts -- carried in its own request, so no negotiation round trip. `Envelope`,
+    // the same function the client wrapped its source with: the two directions are one
+    // negotiation, and a second implementation of the choice is how they come to
+    // disagree.
+    // (This call site was that second implementation; #265 and `Envelope`'s own doc
+    // carry the history.)
+    auto const enveloped = Envelope(outcome->object, fields->acceptedCodecs, _acceptedCodecs);
 
     return Wire::EncodeReply(
         Wire::Status::Ok,

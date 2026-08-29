@@ -220,6 +220,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   about, so an absent root, a dangling symlink and an undecodable root name are none —
   and keying the first on `error_code` rather than on the resolved `file_type` refuses
   every machine without `/usr/local/include`.
+- A reply's codec is chosen from what the OTHER end said it accepts, never from this
+  end's list against itself — and a codec list is `AvailableCodecs()`, never a literal.
+  A hard-coded `{ Identity }` on the node made every dispatched object *and* every
+  preprocessed TU cross the network uncompressed while every object arrived intact and
+  every counter read normally. What a test must separate is the two ends **disagreeing**;
+  "it round-trips" passes under the bug.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - An unbounded drain does not avoid an ending, it hands the choice to the supervisor,
