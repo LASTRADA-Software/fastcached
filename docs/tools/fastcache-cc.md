@@ -362,7 +362,7 @@ all prefetch groups
   misses       : 1
   unavailable  : 1  (25.0% of all compiles -- CACHE NOT REACHED)
   fall-back reasons
-    1x  connect failed
+    1x  fetch exchange failed
 
   hit latency    2 samples  p50 12ms  p95 70ms  max 70ms
     preprocess   1 samples  all 65ms
@@ -413,7 +413,6 @@ not about the daemon at all.
 | Reason | Meaning |
 |--------|---------|
 | `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted, and neither was a scheduler. Distribution is off here deliberately, and not merely for want of a key: `FASTCACHE_ADDR=` (set but empty) is how a build opts out of the launcher altogether, and without the two roots there is no portable key for a scheduler to suppress duplicates on. Set all three to use either. |
-| `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
 | `a command-line path is drive-relative under no root`, `a reported dependency path is drive-relative under no root` | Deliberate, and Windows-only. A path like `C:foo\bar.hpp` resolves against drive `C:`'s **own** current directory, which no cache entry records — so the launcher can neither key it (a header moved inside it would not re-key) nor check it on replay (there is no directory to `stat` it against). Caching such a compile could serve a stale dependency record under a zero exit code, so it is not cached at all. Reported as *uncacheable*, not as an error. Spell the path absolutely (`C:\foo\bar.hpp`), make it relative, or bring it under `FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR`. The first is the rule applied to the command line, the second to what the compiler reported; `FASTCACHE_VERBOSE` names the offending path itself. |

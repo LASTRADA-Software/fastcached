@@ -331,7 +331,7 @@ Start with `fastcache-cc --show-stats`, which is a per-machine tally:
   uncacheable  : 8
   unavailable  : 100  (5% of all compiles -- CACHE NOT REACHED)
   fall-back reasons
-    100x  connect failed
+    100x  fetch exchange failed
 ```
 
 ### 1. Was the cache reached at all?
@@ -343,8 +343,10 @@ rate is meaningless. The reasons under it name the cause. The two usual ones:
   non-empty. `FASTCACHE_ADDR` has a default (`127.0.0.1:6674`), so in practice it
   is the two roots that are missing — and if you are using this project's own
   CMake module, it sets them for you.
-- **`connect failed`.** Nothing is listening at that address. Start the daemon or
-  the node.
+- **`fetch exchange failed`.** Nothing answered at that address — usually nothing
+  is listening. Start the daemon or the node. Note that this is a report about the
+  *cache*: the compiles themselves were still dispatched if `FASTCACHE_SCHEDULER`
+  names a fleet, so a build can show 100% `unavailable` and still have been fast.
 
 ### 2. The cache is reached, but everything is a miss
 
@@ -554,9 +556,12 @@ the launcher must state the language of the preprocessed text it sends and would
 otherwise silently override yours.
 
 **Caching never breaks a build.** Every error path — an unreachable daemon, a
-refused lease, a malformed value, a stale dependency record — ends in the real
-compiler running. Run with `FASTCACHE_VERBOSE=1` to see which path a translation
-unit took.
+refused lease, a malformed value, a stale dependency record — ends in the
+translation unit being compiled anyway. A refused lease or an absent fleet makes
+that the real compiler here; a daemon that could not be reached or that refused
+does **not**, and the compile is still dispatched — see
+[the two edges out of step 5](#one-compile-start-to-finish). Run with
+`FASTCACHE_VERBOSE=1` to see which path a translation unit took.
 
 ---
 
