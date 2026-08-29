@@ -610,7 +610,13 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     // ONE worker rather than on the fleet: without the endpoint inside the MAC, a
     // lease minted for this machine replays against every other machine that trusts
     // the same key.
-    auto const token = MintGrantToken(*lease, picked->endpoint, request.fingerprint);
+    //
+    // The PICKED worker's fingerprint, not the request's, though `Pick` matches the
+    // two byte for byte and they are equal today. What the worker will compare the
+    // claim against is its own registered fingerprint, so taking it from the same
+    // record the endpoint comes from keeps both halves of the binding local to this
+    // registry entry -- rather than resting on `Pick`'s comparison staying exact.
+    auto const token = MintGrantToken(*lease, picked->endpoint, picked->fingerprint);
 
     // The worker's codecs travel with the grant so the client can choose one for the
     // preprocessed payload it is about to send -- without a negotiation round trip,
