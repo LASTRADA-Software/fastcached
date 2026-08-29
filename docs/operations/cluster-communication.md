@@ -143,25 +143,6 @@ worker can decompress. The last one saves a round trip — the client is about t
 send a multi-megabyte payload and would otherwise have to guess or give up
 compressing it.
 
-!!! note "A compressed payload declares how big it will get, and that figure is not believed"
-
-    Every bulk payload travels in a **codec envelope** — a codec byte, the size
-    before compression, and the bytes. The receiver sizes its output buffer from
-    that declared size, which is exactly why it may not be trusted: it is a 32-bit
-    number chosen by the sender, with no enforced relation to the compressed bytes
-    beside it, and the buffer is *value-initialized*, so the pages are really
-    touched rather than lazily reserved. A frame of a few dozen bytes could
-    therefore ask a worker for a 4 GiB allocation, and the surface's in-flight byte
-    budget charged only the frame length, so it sailed through admission
-    ([#241](https://github.com/LASTRADA-Software/fastcached/issues/241)).
-
-    Both ends now refuse a declared expansion above their own request ceiling
-    **before decompressing a byte**, answering `payload-too-large` — a reply, not a
-    dropped connection, because the frame declared its own length and the link is
-    still synchronised. This applies to the worker opening a request *and* to the
-    launcher opening a worker's reply: the launcher dialled a worker the scheduler
-    named, which is not the same as one it trusts with its address space.
-
 A refusal is one of four, and they are counted apart on purpose:
 
 | Refusal | What it means | What to do |
@@ -181,6 +162,25 @@ address and went back to answering other clients.
 
 The client sends preprocessed text — no headers to ship, no sysroot to replicate
 on the worker.
+
+!!! note "A compressed payload declares how big it will get, and that figure is not believed"
+
+    Every bulk payload on this leg travels in a **codec envelope** — a codec byte,
+    the size before compression, and the bytes. The receiver sizes its output buffer
+    from that declared size, which is exactly why it may not be trusted: it is a
+    32-bit number chosen by the sender, with no enforced relation to the compressed
+    bytes beside it, and the buffer is *value-initialized*, so the pages are really
+    touched rather than lazily reserved. A frame of a few dozen bytes could therefore
+    ask a worker for a 4 GiB allocation, and the surface's in-flight byte budget
+    charged only the frame length, so it sailed through admission
+    ([#241](https://github.com/LASTRADA-Software/fastcached/issues/241)).
+
+    Both ends now refuse a declared expansion above their own request ceiling
+    **before decompressing a byte**, answering `payload-too-large` — a reply, not a
+    dropped connection, because the frame declared its own length and the link is
+    still synchronised. This applies to the worker opening a request *and* to the
+    launcher opening a worker's reply: the launcher dialled a worker the scheduler
+    named, which is not the same as one it trusts with its address space.
 
 ### 6. The worker compiles it, with a compiler it chose
 

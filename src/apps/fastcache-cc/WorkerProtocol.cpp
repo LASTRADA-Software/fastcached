@@ -139,7 +139,11 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     //
     // A REPLY, never a close: the frame declared its own length, so the connection is
     // still synchronised and a peer that guessed wrong learns which.
-    auto const source = Unenvelope(fields->source, _maxDecompressedBytes);
+    //
+    // `UnenvelopeText`, not `Unenvelope`: the runner wants a `std::string`, and the
+    // `Identity` path -- the only codec a node negotiates -- would otherwise copy a
+    // whole preprocessed translation unit into a `std::vector<std::byte>` on the way.
+    auto source = UnenvelopeText(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
         // Code and text come from ONE row rather than a ternary beside a lookup: a
         // malformed frame answered `UnsupportedCodec` while its message said
@@ -155,7 +159,11 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 
     auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
                                                 .args = DecodeArgs(fields->args),
-                                                .preprocessed = std::string { Wire::AsStringView(*source) },
+                                                // NOT `auto const source` above, for the reason
+                                                // `CodecEnvelope` records: `*std::move(x)` on a
+                                                // `const expected` is a `T const&&`, which binds
+                                                // to the COPY constructor with no diagnostic.
+                                                .preprocessed = *std::move(source),
                                                 // Sanitized where it becomes a path, not here: the
                                                 // runner is what creates the file, so the check
                                                 // belongs beside the creation rather than at each

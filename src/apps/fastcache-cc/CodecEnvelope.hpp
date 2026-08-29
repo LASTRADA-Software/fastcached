@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -96,18 +97,35 @@ enum class EnvelopeError : std::uint8_t
 /// not an allocation, but it is a field describing bytes it does not describe, and
 /// a receiver that believes it later is the next defect.
 ///
-/// Returns bytes rather than being templated on the container. A template was tried
-/// and inverted its own justification: `Compression::Decompress` already returns a
-/// `std::vector<std::byte>` sized exactly `rawLength`, so returning that type moves
-/// it straight through, while a generic version had to range-construct the result
-/// and cost the object path a second full allocation and copy of a multi-megabyte
-/// payload. The one caller wanting text converts at its call site, which is what it
-/// did before.
+/// Two entry points rather than one, because the two callers want different
+/// containers and neither may pay a copy for the other's. A single public function
+/// returning `std::vector<std::byte>` was tried and cost the *text* caller a copy it
+/// never used to pay: the worker's source arrives `Identity` — the only codec a node
+/// negotiates — and built its `std::string` straight out of the frame, so routing it
+/// through a `vector` first is a second full allocation and memcpy of a preprocessed
+/// translation unit, on the path a developer's build is waiting on. A *generic*
+/// public function inverts the same argument the other way: `Decompress` already
+/// returns a `vector<std::byte>` sized exactly `rawLength`, which `Unenvelope` moves
+/// straight through, while a range-constructing generic result would copy that.
+///
+/// So the ceiling, the framing check and the `Identity` length check — everything a
+/// second implementation could disagree about — live once, in one internal helper,
+/// and only the container each caller ends up holding differs.
 ///
 /// @param field The enveloped field, exactly as it arrived.
 /// @param maxRawBytes The caller's own ceiling on the decompressed size.
 /// @return The original bytes, or why they could not be produced.
 [[nodiscard]] std::expected<std::vector<std::byte>, EnvelopeError> Unenvelope(std::span<std::byte const> field,
                                                                               std::size_t maxRawBytes);
+
+/// `Unenvelope`, for a payload the caller will read as text.
+///
+/// Same guard, same refusals; it differs only in copying the payload once into a
+/// `std::string` instead of once into a `std::vector<std::byte>`.
+/// @param field The enveloped field, exactly as it arrived.
+/// @param maxRawBytes The caller's own ceiling on the decompressed size.
+/// @return The original text, or why it could not be produced.
+[[nodiscard]] std::expected<std::string, EnvelopeError> UnenvelopeText(std::span<std::byte const> field,
+                                                                       std::size_t maxRawBytes);
 
 } // namespace FastCache::Cc

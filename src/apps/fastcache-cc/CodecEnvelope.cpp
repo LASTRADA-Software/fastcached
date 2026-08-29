@@ -4,6 +4,7 @@
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
+#include <concepts>
 #include <utility>
 
 namespace FastCache::Cc
@@ -56,6 +57,70 @@ namespace
     {
         return ErrorTable[static_cast<std::size_t>(error)];
     }
+
+    /// Undo a codec envelope into @p Out, which is the ONLY thing the two callers
+    /// disagree about.
+    ///
+    /// Internal and `if constexpr`-shaped rather than a templated public API, which is
+    /// the distinction that matters: a generic public `Unenvelope` had to
+    /// range-construct its result, so the object path paid a second full allocation and
+    /// memcpy of a multi-megabyte payload that `Compression::Decompress` had already
+    /// sized exactly. Here each output type gets the one cheapest spelling -- the
+    /// decompressed buffer is MOVED into a `std::vector<std::byte>`, and an `Identity`
+    /// payload is copied straight out of the frame into whichever container asked for
+    /// it -- while the guard above them exists exactly once, which is the whole reason
+    /// this file exists.
+    /// @tparam Out `std::vector<std::byte>` or `std::string`.
+    /// @param field The enveloped field, exactly as it arrived.
+    /// @param maxRawBytes The caller's own ceiling on the decompressed size.
+    /// @return The original bytes as an @p Out, or why they could not be produced.
+    template <typename Out>
+    [[nodiscard]] std::expected<Out, EnvelopeError> OpenAs(std::span<std::byte const> field, std::size_t maxRawBytes)
+    {
+        auto const envelope = Wire::DecodeCodecEnvelope(field);
+        if (!envelope.has_value())
+            return std::unexpected(EnvelopeError::Malformed);
+
+        // FIRST, before the codec is even looked up, and certainly before any byte is
+        // decompressed. Everything below this line can allocate what the field says.
+        if (envelope->rawLength > maxRawBytes)
+            return std::unexpected(EnvelopeError::DeclaredTooLarge);
+
+        // Copy bytes into whichever container this caller wanted, exactly once.
+        auto const materialize = [](std::span<std::byte const> bytes) -> Out {
+            if constexpr (std::same_as<Out, std::string>)
+                return std::string { Wire::AsStringView(bytes) };
+            else
+                return Out(bytes.begin(), bytes.end());
+        };
+
+        if (envelope->codec == Wire::IdentityCodec)
+        {
+            if (envelope->rawLength != envelope->bytes.size())
+                return std::unexpected(EnvelopeError::Malformed);
+            // Straight out of the frame. An intermediate `std::vector<std::byte>` here
+            // would be a second full copy of a preprocessed translation unit, on the
+            // one codec a node actually negotiates.
+            return materialize(envelope->bytes);
+        }
+
+        auto const codec = static_cast<CompressionCodec>(envelope->codec);
+        if (!Compression::IsAvailable(codec))
+            return std::unexpected(EnvelopeError::UnsupportedCodec);
+
+        // NOT `auto const`. `Decompress` already produced a buffer of exactly the right
+        // size, and moving it out is what keeps this path to one allocation end to end.
+        // On a `const` object `*std::move(decoded)` is a `vector const&&`, which binds to
+        // the COPY constructor with no diagnostic at all -- a move that reads as applied
+        // and is not.
+        auto decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
+        if (!decoded.has_value())
+            return std::unexpected(EnvelopeError::Corrupt);
+        if constexpr (std::same_as<Out, std::vector<std::byte>>)
+            return std::move(*decoded);
+        else
+            return materialize(*decoded);
+    }
 } // namespace
 
 Wire::ErrorCode WireCodeFor(EnvelopeError error) noexcept
@@ -70,35 +135,12 @@ std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept
 
 std::expected<std::vector<std::byte>, EnvelopeError> Unenvelope(std::span<std::byte const> field, std::size_t maxRawBytes)
 {
-    auto const envelope = Wire::DecodeCodecEnvelope(field);
-    if (!envelope.has_value())
-        return std::unexpected(EnvelopeError::Malformed);
+    return OpenAs<std::vector<std::byte>>(field, maxRawBytes);
+}
 
-    // FIRST, before the codec is even looked up, and certainly before any byte is
-    // decompressed. Everything below this line can allocate what the field says.
-    if (envelope->rawLength > maxRawBytes)
-        return std::unexpected(EnvelopeError::DeclaredTooLarge);
-
-    if (envelope->codec == Wire::IdentityCodec)
-    {
-        if (envelope->rawLength != envelope->bytes.size())
-            return std::unexpected(EnvelopeError::Malformed);
-        return std::vector<std::byte> { envelope->bytes.begin(), envelope->bytes.end() };
-    }
-
-    auto const codec = static_cast<CompressionCodec>(envelope->codec);
-    if (!Compression::IsAvailable(codec))
-        return std::unexpected(EnvelopeError::UnsupportedCodec);
-
-    // NOT `auto const`. `Decompress` already produced a buffer of exactly the right
-    // size, and moving it out is what keeps this path to one allocation end to end.
-    // On a `const` object `*std::move(decoded)` is a `vector const&&`, which binds to
-    // the COPY constructor with no diagnostic at all -- a move that reads as applied
-    // and is not.
-    auto decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
-    if (!decoded.has_value())
-        return std::unexpected(EnvelopeError::Corrupt);
-    return std::move(*decoded);
+std::expected<std::string, EnvelopeError> UnenvelopeText(std::span<std::byte const> field, std::size_t maxRawBytes)
+{
+    return OpenAs<std::string>(field, maxRawBytes);
 }
 
 } // namespace FastCache::Cc

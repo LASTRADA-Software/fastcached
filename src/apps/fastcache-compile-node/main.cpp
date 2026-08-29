@@ -455,9 +455,16 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // would be busier than the scheduler believes, which the heartbeat corrects
     // within one interval. Closing it properly means signing lease tokens, which is
     // its own change.
-    Cc::WorkerProtocol protocol {
-        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
-    };
+    //
+    // The envelope ceiling is THIS surface's request cap, named rather than left to
+    // the decoder's default: `WorkerProtocol` never sees the listener that enforced
+    // the frame length, so a copy of the figure on each side is two literals that
+    // have to agree forever, and lowering one would silently stop bounding the other.
+    Cc::WorkerProtocol protocol { jobs,
+                                  [](std::string_view, std::string_view) { return true; },
+                                  { Wire::IdentityCodec },
+                                  metrics,
+                                  WorkerMaxRequestBytes };
 
     // The worker server and the admin endpoint are both built BELOW the cache tier,
     // and in both cases moving them down was the fix rather than tidying: one takes

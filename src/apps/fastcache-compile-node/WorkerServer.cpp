@@ -17,13 +17,9 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// Largest request a worker will buffer.
-    ///
-    /// A COMPILE carries a preprocessed translation unit, which for real C++ runs to
-    /// several megabytes; 256 MiB is far above any of them and matches the daemon's
-    /// own default value ceiling. It exists so a peer cannot declare a length this
-    /// worker would try to allocate.
-    constexpr std::size_t MaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
+    /// Largest request a worker will buffer; declared in the header because
+    /// `WorkerProtocol` is handed the same figure. See `WorkerMaxRequestBytes`.
+    constexpr std::size_t MaxRequestBytes = WorkerMaxRequestBytes;
 
     /// How many payload bytes all the jobs on this worker may be reading at once.
     ///

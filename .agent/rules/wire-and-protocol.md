@@ -79,24 +79,33 @@ Every rule below has already been a bug.
     request cap has to say so or the two disagree about what one request may cost.
     `WorkerProtocol` takes it as a constructor argument, the launcher as a
     `DispatchBudgets` field — a byte budget beside the two time budgets, bounding
-    the same thing they do.
+    the same thing they do. **And the surface has to actually pass it**: the node
+    took the decoder's default and left `WorkerServer`'s own request cap as a second
+    literal holding the same number, which is precisely the "two must agree forever"
+    shape this whole change exists to remove. `WorkerMaxRequestBytes` is exported
+    from `WorkerServer.hpp` and handed over at construction, so lowering the surface's
+    cap lowers the decoder's.
   - **Both ends of a payload need the guard, so there is ONE decoder**
     (`apps/fastcache-cc/CodecEnvelope`). The worker opening a request and the launcher
     opening a worker's reply were copies of one function; a guard added to either is
     half a fix, and two guards must then agree forever. The launcher is not the safe
     half: it dialled a worker the *scheduler* named, which is not a worker it trusts
     with its address space.
-  - **Sharing that decoder must not cost the payload a copy, and a template is how it
-    did.** The two callers want different containers — a `std::string` a compiler will
-    read, a `std::vector<std::byte>` object file — so the shared function was first
-    templated on the container. That *inverted its own justification*:
-    `Compression::Decompress` already returns a `vector<std::byte>` sized exactly
-    `rawLength`, which the old launcher code moved straight through, while a generic
-    version has to range-construct its result and so pays a second full allocation and
-    memcpy of a multi-megabyte object — peak `2N` instead of `N`, on the path a
-    developer's build is waiting on. It returns bytes, and the one caller wanting text
-    converts at its call site. A shared helper is worth a copy at *one* call site,
-    never at the hot one.
+  - **Sharing that decoder must not cost the payload a copy, and there is no call site
+    cheap enough to be the one that pays.** The two callers want different containers
+    — a `std::string` a compiler will read, a `std::vector<std::byte>` object file —
+    and each spelling that unifies them at the *return type* taxes one of them with a
+    full extra allocation and memcpy of a multi-megabyte payload, peak `2N` instead of
+    `N`, on the path a developer's build is waiting on. Returning bytes taxes the text
+    caller, whose source arrives `Identity` — the only codec a node negotiates — and
+    used to be built straight out of the frame. Returning a *generic* container taxes
+    the object caller, because `Compression::Decompress` already hands back a
+    `vector<std::byte>` sized exactly `rawLength` that can be moved through, and a
+    range-constructed generic result copies it. "It is only one call site" is the trap:
+    both are the hot one. So the ceiling, the framing check and the `Identity` length
+    check — everything two implementations could disagree about — live in one internal
+    helper, and `Unenvelope` / `UnenvelopeText` differ only in the container each
+    fills, once.
   - **`auto const` on an `expected` silently turns the move back into a copy.**
     `*std::move(x)` on a `const` object is a `T const&&`, which binds to the **copy**
     constructor with no diagnostic at any warning level — a fix that reads as applied
