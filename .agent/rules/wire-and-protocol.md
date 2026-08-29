@@ -80,11 +80,34 @@ Every rule below has already been a bug.
     `WorkerProtocol` takes it as a constructor argument, the launcher as a
     `DispatchBudgets` field — a byte budget beside the two time budgets, bounding
     the same thing they do.
-  - **Both ends of a payload need the guard, so there is ONE decoder.** The worker
-    opening a request and the launcher opening a worker's reply were copies of one
-    function; a guard added to either is half a fix, and two guards must then agree
-    forever. The launcher is not the safe half: it dialled a worker the *scheduler*
-    named, which is not a worker it trusts with its address space.
+  - **Both ends of a payload need the guard, so there is ONE decoder**
+    (`apps/fastcache-cc/CodecEnvelope`). The worker opening a request and the launcher
+    opening a worker's reply were copies of one function; a guard added to either is
+    half a fix, and two guards must then agree forever. The launcher is not the safe
+    half: it dialled a worker the *scheduler* named, which is not a worker it trusts
+    with its address space.
+  - **Sharing that decoder must not cost the payload a copy, and a template is how it
+    did.** The two callers want different containers — a `std::string` a compiler will
+    read, a `std::vector<std::byte>` object file — so the shared function was first
+    templated on the container. That *inverted its own justification*:
+    `Compression::Decompress` already returns a `vector<std::byte>` sized exactly
+    `rawLength`, which the old launcher code moved straight through, while a generic
+    version has to range-construct its result and so pays a second full allocation and
+    memcpy of a multi-megabyte object — peak `2N` instead of `N`, on the path a
+    developer's build is waiting on. It returns bytes, and the one caller wanting text
+    converts at its call site. A shared helper is worth a copy at *one* call site,
+    never at the hot one.
+  - **`auto const` on an `expected` silently turns the move back into a copy.**
+    `*std::move(x)` on a `const` object is a `T const&&`, which binds to the **copy**
+    constructor with no diagnostic at any warning level — a fix that reads as applied
+    and is not. The decompressed buffer is held in a non-`const` local for exactly
+    this reason.
+  - **An envelope refusal's wire code and its message are one fact, so they are one
+    table row.** A ternary picking the code beside a separate call picking the text
+    answered `unsupported-codec` for a *malformed* envelope while the message said
+    "malformed" — a refusal that sends an operator hunting a codec mismatch that never
+    happened. This is `RefusalTable`'s rule, one layer in, and it is an `EnumTable`
+    guarded by `RowsInEnumeratorOrder` for the same reason that one is.
   - **An `Identity` envelope is checked too.** It takes no decompression path, so it
     never reached `Decompress`'s own length check and could declare any size beside
     any payload. Not an allocation — but a field describing bytes it does not

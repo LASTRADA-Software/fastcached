@@ -133,22 +133,19 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     if (_validator && !_validator(token, fingerprint))
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {});
 
-    // Opened AFTER the lease check and BEFORE any expensive work, and it is the
-    // declared decompressed length that decides which happens. An envelope declaring
-    // more than this surface caps a request at is refused without a byte being
-    // expanded -- `Decompress` value-initializes its output, so believing a `u32`
-    // off a socket turns a thirty-byte frame into a multi-gigabyte allocation that
-    // the listener's byte budget charged nobody for.
+    // Opened AFTER the lease check and BEFORE any expensive work, and refused on the
+    // DECLARED decompressed length rather than on what it expands to -- see
+    // `Unenvelope`, which carries the reasoning.
     //
     // A REPLY, never a close: the frame declared its own length, so the connection is
-    // still synchronised and a peer that guessed wrong learns which. `PayloadTooLarge`
-    // already means "declared payload exceeds the session's cap", which is exactly
-    // this fact about a field one layer in.
-    auto source = Unenvelope<std::string>(fields->source, _maxDecompressedBytes);
+    // still synchronised and a peer that guessed wrong learns which.
+    auto const source = Unenvelope(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
-        return Wire::EncodeErrorReply(source.error() == EnvelopeError::DeclaredTooLarge ? Wire::ErrorCode::PayloadTooLarge
-                                                                                        : Wire::ErrorCode::UnsupportedCodec,
-                                      DescribeEnvelopeError(source.error()));
+        // Code and text come from ONE row rather than a ternary beside a lookup: a
+        // malformed frame answered `UnsupportedCodec` while its message said
+        // "malformed" would send an operator hunting a codec mismatch that never
+        // happened.
+        return Wire::EncodeErrorReply(WireCodeFor(source.error()), DescribeEnvelopeError(source.error()));
 
     // Counted around the runner rather than inside it: the runner is a seam with
     // its own fakes, and a fake that forgot to count would make every test agree
@@ -158,7 +155,7 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 
     auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
                                                 .args = DecodeArgs(fields->args),
-                                                .preprocessed = *std::move(source),
+                                                .preprocessed = std::string { Wire::AsStringView(*source) },
                                                 // Sanitized where it becomes a path, not here: the
                                                 // runner is what creates the file, so the check
                                                 // belongs beside the creation rather than at each

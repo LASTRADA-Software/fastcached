@@ -22,6 +22,7 @@
 set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CacheProtocol.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CmdLine.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CodecEnvelope.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/CompileJob.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/DirectManifest.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Dispatch.cpp"

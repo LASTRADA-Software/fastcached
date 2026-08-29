@@ -2,8 +2,8 @@
 #pragma once
 
 #include "CacheProtocol.hpp"
+#include "CodecEnvelope.hpp"
 
-#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -17,112 +17,6 @@
 
 namespace FastCache::Cc
 {
-
-/// Ceiling on what a codec envelope may declare it expands to.
-///
-/// 256 MiB, the same figure every framed surface in this project caps a request
-/// at, because that is exactly what it has to be: an envelope's declared length
-/// decides an allocation on the receiving side, so the number that bounds it is
-/// the one the surface already promised to bound. A preprocessed C++ translation
-/// unit runs to a few megabytes, so this is orders of magnitude above any honest
-/// payload.
-///
-/// It is a **default**, not the rule: `Unenvelope` takes the ceiling as an
-/// argument so each surface passes its own, and a surface with a smaller request
-/// cap must pass that instead of inheriting this.
-// `ULL`, not `UL`: `unsigned long` is 32 bits on Win64 (LLP64), so a future edit
-// raising this past 4 GiB would silently wrap there and nowhere else.
-inline constexpr std::size_t DefaultMaxDecompressedBytes = 256ULL * 1024ULL * 1024ULL;
-
-/// Why an enveloped payload could not be opened.
-///
-/// Distinct reasons rather than one "no", because they are different facts about
-/// the peer and call for different answers: a codec this build lacks is a
-/// configuration difference between two honest processes, while a declared
-/// expansion above the cap is a peer trying to make this process allocate.
-enum class EnvelopeError : std::uint8_t
-{
-    /// The envelope framing is not decodable, or an Identity payload's declared
-    /// length disagrees with the bytes beside it.
-    Malformed,
-    /// The codec id is one this build cannot decode.
-    UnsupportedCodec,
-    /// The declared decompressed length exceeds the caller's ceiling. Answered
-    /// **before** a byte is decompressed, which is the whole point of the field.
-    DeclaredTooLarge,
-    /// The payload did not expand to exactly the declared length.
-    Corrupt,
-};
-
-/// A human-readable reason, for a refusal a person has to act on.
-/// @param error The reason.
-/// @return Its description.
-[[nodiscard]] std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept;
-
-/// Undo a codec envelope, refusing an oversized declared expansion first.
-///
-/// **The one implementation of this, deliberately.** It was two — the worker
-/// opening a request and the launcher opening a worker's reply — and both trusted
-/// the declared length, so a guard added to either would have been half a fix and
-/// the two would have had to agree forever afterwards.
-///
-/// `Core/Compression.hpp` states the precondition that makes the guard necessary:
-/// `originalLen` is "the trusted expected size taken from the record header", and
-/// it bounds the output allocation. Off a socket it is neither trusted nor a record
-/// header — and `Decompress` **value-initializes** a buffer of that size, so the
-/// pages are touched rather than lazily reserved. A `u32` field therefore turns a
-/// thirty-byte frame into a 4 GiB allocation the surface's byte budget never
-/// charged anyone for.
-///
-/// `Protocol/CompileCacheWire.hpp` already says this is what the field is for:
-/// carrying `rawLen` "is what lets a decoder reject a payload whose declared
-/// expansion exceeds its cap before decompressing a byte". This implements the
-/// guard that comment promised; no decoder in the tree performed it.
-///
-/// An **Identity** envelope is checked too, and for a reason worth stating: it
-/// takes no decompression path at all, so it never reached `Decompress`'s own
-/// length check and could declare any length it liked beside any payload. That is
-/// not an allocation, but it is a field describing bytes it does not describe, and
-/// a receiver that believes it later is the next defect.
-///
-/// @tparam Bytes The owning container to produce — `std::string` for text a
-///         compiler will read, `std::vector<std::byte>` for an object file. A
-///         template rather than one spelling plus a conversion, so neither caller
-///         pays a copy of a multi-megabyte payload to share one implementation.
-/// @param field The enveloped field, exactly as it arrived.
-/// @param maxRawBytes The caller's own ceiling on the decompressed size.
-/// @return The original bytes, or why they could not be produced.
-template <typename Bytes>
-[[nodiscard]] std::expected<Bytes, EnvelopeError> Unenvelope(std::span<std::byte const> field, std::size_t maxRawBytes)
-{
-    auto const envelope = CompileCacheWire::DecodeCodecEnvelope(field);
-    if (!envelope.has_value())
-        return std::unexpected(EnvelopeError::Malformed);
-
-    // FIRST, before the codec is even looked up, and certainly before any byte is
-    // decompressed. Everything below this line can allocate what the field says.
-    if (envelope->rawLength > maxRawBytes)
-        return std::unexpected(EnvelopeError::DeclaredTooLarge);
-
-    auto const* const begin = reinterpret_cast<Bytes::value_type const*>(envelope->bytes.data());
-    if (envelope->codec == CompileCacheWire::IdentityCodec)
-    {
-        if (envelope->rawLength != envelope->bytes.size())
-            return std::unexpected(EnvelopeError::Malformed);
-        return Bytes { begin, begin + envelope->bytes.size() };
-    }
-
-    auto const codec = static_cast<CompressionCodec>(envelope->codec);
-    if (!Compression::IsAvailable(codec))
-        return std::unexpected(EnvelopeError::UnsupportedCodec);
-
-    auto const decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
-    if (!decoded.has_value())
-        return std::unexpected(EnvelopeError::Corrupt);
-
-    auto const* const plain = reinterpret_cast<Bytes::value_type const*>(decoded->data());
-    return Bytes { plain, plain + decoded->size() };
-}
 
 /// Runs one framed request/reply against an endpoint named at runtime.
 ///

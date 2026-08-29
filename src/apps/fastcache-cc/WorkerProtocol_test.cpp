@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -199,7 +201,10 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::PayloadTooLarge);
 
     // A modest overstatement is refused too, and as a different fact: it is within the
-    // cap, so what is wrong with it is the disagreement rather than the size.
+    // cap, so what is wrong with it is the disagreement rather than the size -- and it
+    // is answered `malformed-frame`, not `unsupported-codec`. The codec was never in
+    // question, and a refusal whose code and message disagree sends an operator
+    // hunting a codec mismatch that never happened.
     auto const modest = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 64, payload);
     auto const modestFrame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
                                                                         .fingerprint = "gcc-13",
@@ -209,7 +214,34 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
                                                                         .sourceName = "a.cpp" });
     auto const modestAnswer = fix.worker.Answer(modestFrame);
     REQUIRE(modestAnswer.has_value());
-    CHECK(ErrorOf(Unwrap(modestAnswer)) == Wire::ErrorCode::UnsupportedCodec);
+    CHECK(ErrorOf(Unwrap(modestAnswer)) == Wire::ErrorCode::MalformedFrame);
+}
+
+TEST_CASE("An envelope refusal's wire code and its message are one fact", "[worker-protocol]")
+{
+    // They come from one table row, never a ternary beside a lookup. This was a
+    // ternary, and it answered `unsupported-codec` for a malformed envelope while the
+    // message said "malformed" -- a refusal that sends an operator hunting a codec
+    // mismatch that never happened. The rule this file already states for
+    // `RefusalTable` applies one layer in.
+    CHECK(WireCodeFor(EnvelopeError::Malformed) == Wire::ErrorCode::MalformedFrame);
+    CHECK(WireCodeFor(EnvelopeError::UnsupportedCodec) == Wire::ErrorCode::UnsupportedCodec);
+    CHECK(WireCodeFor(EnvelopeError::DeclaredTooLarge) == Wire::ErrorCode::PayloadTooLarge);
+    CHECK(WireCodeFor(EnvelopeError::Corrupt) == Wire::ErrorCode::MalformedFrame);
+
+    // Every reason says something, and no two say the same thing -- a description
+    // shared between reasons is one an operator cannot act on.
+    std::vector<std::string_view> seen;
+    for (auto const reason: { EnvelopeError::Malformed,
+                              EnvelopeError::UnsupportedCodec,
+                              EnvelopeError::DeclaredTooLarge,
+                              EnvelopeError::Corrupt })
+    {
+        auto const text = DescribeEnvelopeError(reason);
+        CHECK_FALSE(text.empty());
+        CHECK(std::ranges::find(seen, text) == seen.end());
+        seen.push_back(text);
+    }
 }
 
 TEST_CASE("The envelope ceiling is the surface's own, not a figure this class assumed", "[worker-protocol]")

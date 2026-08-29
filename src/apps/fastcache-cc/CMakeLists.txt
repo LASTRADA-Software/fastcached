@@ -118,6 +118,7 @@ endif()
 # distinctly from a miss" be a test rather than a hope.
 set(_fc_cc_sources
     CmdLine.cpp
+    CodecEnvelope.cpp
     CompileJob.cpp
     LauncherCli.cpp
     CacheKey.cpp

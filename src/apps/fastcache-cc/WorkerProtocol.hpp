@@ -2,8 +2,8 @@
 #pragma once
 
 #include "CacheProtocol.hpp"
+#include "CodecEnvelope.hpp"
 #include "CompileJob.hpp"
-#include "Dispatch.hpp"
 
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
