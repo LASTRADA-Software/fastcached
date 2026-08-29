@@ -182,6 +182,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   preprocesses a second time, with `#line` markers.
 - A worker is told its input is preprocessed *and* what language it is in; the
   file extension is the last of three answers, never the first.
+- That language is stated by the flags dispatch APPENDS, so a build that named one
+  itself (`/TP`, which CMake emits for every MSVC C++ source) is folded into the
+  language and dropped — never refused, which made the whole fleet cache and
+  distribute nothing while every scheduler counter read zero. A selector naming a
+  FILE, or an `-x` value with no exact language, is still refused.
 - Leadership and membership are one `Gate()`, and it runs for every verb — reads
   included.
 - Duplicate suppression is asked **before** capacity, or a busy fleet reports
