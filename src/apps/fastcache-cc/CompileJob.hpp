@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -95,9 +96,16 @@ class CompileJobRunner
     /// Run one job to completion.
     ///
     /// **Callable from several threads at once**, which is what a worker serving
-    /// `slots` compiles does through one of these. Everything it reads is fixed at
-    /// construction; the only mutable state is the job counter, and every path a
-    /// job writes hangs off the directory that counter names.
+    /// `slots` compiles does through one of these. Every path a job writes hangs off
+    /// the directory the job counter names, so no two jobs share one.
+    ///
+    /// The toolchain map is the one thing here that is NOT fixed at construction: a
+    /// node re-surveys its machine when a compiler is patched underneath it and
+    /// replaces the map (#238). So the compiler path is copied out under the lock at
+    /// lookup and the copy is what the rest of this uses. Holding the map's iterator
+    /// instead -- as this did -- left it dereferenced twice long downstream, after
+    /// the scratch directory was made and the whole preprocessed source written, on
+    /// the two lines that decide which program executes.
     ///
     /// The process runner it is given must accept concurrent calls too.
     /// @param job The job.
@@ -107,6 +115,25 @@ class CompileJobRunner
     /// The fingerprints this worker can serve, for its registration.
     /// @return Every configured fingerprint, sorted.
     [[nodiscard]] std::vector<std::string> Fingerprints() const;
+
+    /// Serve a different set of toolchains from now on.
+    ///
+    /// The seam a node needs when the machine changes under it. A compiler patched
+    /// in place -- a distro upgrade, a Windows SDK update -- keeps the node
+    /// advertising the pre-upgrade fingerprint while spawning the post-upgrade
+    /// compiler, so clients receive objects built by a compiler they did not key
+    /// against and store them in the shared cache under the old key (#238).
+    ///
+    /// Replaces rather than merges, and that is the whole point: the fingerprint
+    /// this worker can no longer honour has to STOP being served, which a merge
+    /// would leave in place forever. A job naming it afterwards is refused
+    /// `UnknownFingerprint` -- an answer this worker already gives, with a wire code
+    /// and a counter of its own -- and its client compiles locally.
+    ///
+    /// **Safe against concurrent `Run` and `Fingerprints`.** Jobs already admitted
+    /// keep the compiler they looked up; only the next lookup sees the new map.
+    /// @param toolchains Fingerprint to compiler path, as the constructor takes it.
+    void ReplaceToolchains(std::map<std::string, std::string> toolchains);
 
     /// Where scratch files are written.
     ///
@@ -123,6 +150,11 @@ class CompileJobRunner
   private:
     IProcessRunner& _runner;
     std::filesystem::path _scratchRoot;
+
+    /// Guards `_toolchains`. Mutable because `Fingerprints` is logically const and
+    /// must still take it -- the alternative is a const method reading a map another
+    /// thread is replacing.
+    mutable std::shared_mutex _toolchainsMutex;
     std::map<std::string, std::string> _toolchains;
     /// Atomic because a worker runs `slots` compiles at once, on `slots` threads,
     /// through ONE of these.

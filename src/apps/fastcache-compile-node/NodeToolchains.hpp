@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <IProcessRunner.hpp>
 #include <ToolchainDiscovery.hpp>
@@ -22,6 +23,57 @@ struct ToolchainEntry
 {
     std::string fingerprint; ///< Empty when the node must compute it.
     std::string compiler;    ///< Path to the compiler.
+};
+
+/// What a toolchain's fingerprint was computed FROM, so it can be rechecked cheaply.
+///
+/// A node fingerprints once at startup and then lives for weeks, while the launcher
+/// recomputes per invocation -- so a compiler patched in place under a running
+/// service leaves the node advertising the pre-upgrade digest and spawning the
+/// post-upgrade compiler. Clients then receive objects built by a compiler they did
+/// not key against and store them in the shared cache under the old key, where the
+/// whole fleet reads them (#238).
+///
+/// Rechecking that by re-deriving the fingerprint would cost a driver spawn and a
+/// walk of the include tree. What this holds instead is the three INPUTS
+/// `ComputeToolchainStamp` folds, so re-asking is a stat of the binary plus one stat
+/// per include root and spawns nothing at all. The expensive half is paid only once
+/// the cheap half says something moved.
+///
+/// Empty for an operator's `<fingerprint>=<compiler>` override, which is never
+/// probed and must never be second-guessed: pinning a digest by hand is how an
+/// operator forces a fleet to agree while a machine is being repaired, and a node
+/// that re-derived it would undo exactly that. `Watchable()` is how that is asked.
+struct ToolchainWitness
+{
+    /// The compiler as it was STAT'd -- resolved on the search path, not as typed.
+    ///
+    /// A bare `cc` or `cl` cannot be stat'd from an arbitrary working directory, so
+    /// stamping the typed spelling would yield an empty stamp and silently give up
+    /// on the toolchain most likely to be upgraded by a package manager.
+    std::string compiler;
+
+    std::string banner;             ///< The version line the fingerprint folded.
+    std::vector<std::string> roots; ///< The include search roots it folded.
+
+    /// What those three hashed to when this node surveyed the machine.
+    ///
+    /// Empty means the toolchain could not be stamped at all -- an unstattable
+    /// compiler, or a root whose name this process cannot decode. That is not a
+    /// change and must never be read as one: an empty stamp recomputes to empty, so
+    /// such a toolchain is simply never found stale, which is the same "refusing to
+    /// stamp is refusing to cache" trade `ComputeToolchainStamp` documents.
+    std::string stamp;
+
+    /// Whether this toolchain can be rechecked at all.
+    ///
+    /// Asked rather than compared against an empty field, so the two callers cannot
+    /// drift on what counts as watchable the day a third reason to skip appears.
+    /// @return True when a stamp exists to compare against.
+    [[nodiscard]] bool Watchable() const noexcept
+    {
+        return !stamp.empty();
+    }
 };
 
 /// One toolchain this worker serves, once its identity is known.
@@ -41,6 +93,14 @@ struct ServedToolchain
     /// probed and so has no banner to read a label out of. Empty means "did not say"
     /// everywhere it travels, and is rendered as absent rather than as a blank.
     std::string label;
+
+    /// What this toolchain's identity was derived from, for rechecking it later.
+    ///
+    /// Carried HERE rather than in a second map keyed by the same fingerprint. Two
+    /// maps that must agree about which toolchains exist are two maps that will
+    /// eventually disagree, and the one that decides what this worker serves is
+    /// this one.
+    ToolchainWitness witness;
 };
 
 /// Split a `--toolchain` value into its fingerprint and compiler.
@@ -123,5 +183,89 @@ struct ServedToolchain
                                                                                       Cc::IProcessRunner& runner,
                                                                                       Cc::IToolchainHost& host,
                                                                                       ILogger& logger);
+
+/// Which of these toolchains no longer match the machine they were derived from.
+///
+/// The cheap half of #238, and it spawns **nothing**: every input the stamp folds
+/// was recorded when the toolchain was surveyed, so this is a stat of each compiler
+/// binary plus one stat per include search root. That is what makes it affordable on
+/// every heartbeat, and re-deriving a fingerprint -- a driver spawn and a walk of the
+/// whole include tree -- is paid only once this has said something moved.
+///
+/// What it catches is what `ComputeToolchainStamp` covers, which is the pair of cases
+/// that actually happen: the binary's size and mtime catch a distribution upgrading
+/// `gcc` in place, and each root's own mtime catches a Windows SDK update that adds
+/// or removes headers while leaving `cl.exe` untouched. A header edited in place
+/// under an unchanged directory is deliberately not covered -- a system toolchain's
+/// headers are installed rather than edited, and the alternative is the multi-second
+/// walk this exists to avoid.
+///
+/// A toolchain that is not `Watchable()` is skipped rather than reported: an
+/// operator's pinned `<fingerprint>=<compiler>` is never probed and must never be
+/// second-guessed, and a compiler that could not be stamped at all yields an empty
+/// stamp that would otherwise compare equal forever anyway.
+///
+/// @param served What this worker is serving now, witnesses included.
+/// @return The fingerprints whose evidence moved, sorted; empty when nothing did.
+[[nodiscard]] std::vector<std::string> StaleToolchains(std::map<std::string, ServedToolchain> const& served);
+
+/// What rechecking this node's toolchains against the machine concluded.
+struct ToolchainRefresh
+{
+    /// Whether the machine moved and `served` is therefore the new answer.
+    ///
+    /// False means nothing changed and `served` is empty -- deliberately, so a caller
+    /// cannot install a stale copy by forgetting to ask. It is the common case: this
+    /// runs on every heartbeat and answers false on almost all of them.
+    bool changed { false };
+
+    /// What this worker must serve from now on, witnesses refreshed.
+    ///
+    /// **May legitimately be empty while `changed` is true.** That is the machine
+    /// whose only compiler was removed or broken by the upgrade, and it is a state
+    /// this node has to be able to reach: serving nothing is correct, and serving a
+    /// fingerprint it can no longer honour is the wrong-object path itself.
+    std::map<std::string, ServedToolchain> served;
+};
+
+/// Re-derive what this node serves, if the machine changed underneath it.
+///
+/// The whole of #238's decision, in one place a test can drive. A node fingerprints
+/// once at startup and then lives for weeks while the launcher recomputes per
+/// invocation, so a compiler patched in place leaves the node advertising the
+/// pre-upgrade digest and spawning the post-upgrade compiler. Clients receive objects
+/// built by a compiler they did not key against and store them in the shared cache
+/// under the old key, where the whole fleet then reads them.
+///
+/// **It re-registers under the new fingerprint AND stops serving the old one, and
+/// those are not alternatives.** Stopping is the load-bearing half -- it is the
+/// wrong-object path -- but stopping alone would take a machine out of the fleet on
+/// every routine upgrade, and a staggered rollout across an estate would empty the
+/// fleet one machine at a time with nothing anywhere saying so. That is the same
+/// silent-success shape the rest of this system is built to refuse, only slower.
+///
+/// A client holding a lease for a fingerprint that has just been dropped is refused
+/// `UnknownFingerprint` by the worker and compiles locally. That answer, its wire
+/// code and its counter already exist; nothing new is invented for this.
+///
+/// The re-survey is `ResolveToolchains` itself rather than a second, cheaper
+/// derivation. A node whose identity was computed one way at startup and another way
+/// afterwards would drift from its own clients exactly when an operator is least
+/// able to see it.
+///
+/// @param served What this worker is serving now, witnesses included.
+/// @param cfg What the operator asked for.
+/// @param discovery Where the machine's own compilers come from; null when
+///        `--no-toolchain-discovery` was given.
+/// @param runner Process-spawning seam, for the compiler probes.
+/// @param host The machine's filesystem, registry and environment.
+/// @param logger Where the change is announced.
+/// @return What changed, and what to serve; `changed` false when nothing moved.
+[[nodiscard]] ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const& served,
+                                                 NodeConfig const& cfg,
+                                                 Cc::IToolchainDiscovery* discovery,
+                                                 Cc::IProcessRunner& runner,
+                                                 Cc::IToolchainHost& host,
+                                                 ILogger& logger);
 
 } // namespace FastCache::Node

@@ -7,7 +7,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <ranges>
 #include <span>
 #include <string>
@@ -15,6 +19,7 @@
 #include <vector>
 
 #include <ToolchainHostTestUtils.hpp>
+#include <ToolchainProbe.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -664,4 +669,115 @@ TEST_CASE("NodeToolchains: two distinct compilers stay two", "[node][toolchains]
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 2);
     CHECK_FALSE(Logged(logger, "is the same toolchain as"));
+}
+
+namespace
+{
+/// A file standing in for a compiler binary, so the stamp has something real to stat.
+///
+/// `ComputeToolchainStamp` reaches the filesystem directly -- it is a stat of the
+/// binary and of each include root, with no seam in front of it -- so these cases use
+/// real files rather than a scripted host. That is the right shape anyway: what is
+/// under test is precisely whether a change on disk is noticed.
+/// @param path Where to write it.
+/// @param bytes What to put in it.
+void WriteFile(std::filesystem::path const& path, std::string_view bytes)
+{
+    std::ofstream out { path, std::ios::binary };
+    REQUIRE(out.good());
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(out.good());
+}
+
+/// A served toolchain whose witness describes a real file on disk.
+/// @param compiler The stand-in binary.
+/// @param roots Its include search roots.
+/// @return The entry, stamped as the survey would have stamped it.
+[[nodiscard]] ServedToolchain Witnessed(std::filesystem::path const& compiler, std::vector<std::string> roots)
+{
+    auto const path = compiler.string();
+    auto stamp = Cc::ComputeToolchainStamp("cc 1.0", path, roots);
+    REQUIRE_FALSE(stamp.empty());
+    return ServedToolchain {
+        .compiler = path,
+        .label = "cc 1.0",
+        .witness =
+            ToolchainWitness { .compiler = path, .banner = "cc 1.0", .roots = std::move(roots), .stamp = std::move(stamp) }
+    };
+}
+} // namespace
+
+TEST_CASE("NodeToolchains: a toolchain patched under a running node is noticed", "[node][toolchains]")
+{
+    // #238, and the case the whole feature exists for. A node fingerprints its
+    // machine once at startup and then lives for weeks, while the launcher recomputes
+    // per invocation -- so a compiler patched in place leaves the node advertising the
+    // pre-upgrade digest while spawning the post-upgrade compiler. Clients receive
+    // objects built by a compiler they did not key against and store them in the
+    // shared cache under the old key, where the whole fleet reads them.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-node-stale" };
+    auto const compiler = scratch.Path() / "cc";
+    auto const headers = scratch.Path() / "include";
+    std::filesystem::create_directories(headers);
+    WriteFile(compiler, "binary-v1");
+
+    std::map<std::string, ServedToolchain> served;
+    served.emplace("fp-1", Witnessed(compiler, { headers.string() }));
+
+    SECTION("an untouched machine is not stale")
+    {
+        // The steady state, and the one that runs on every heartbeat forever. It
+        // spawns nothing at all: the stamp folds inputs recorded at survey time, so
+        // this is a stat of the binary plus one per root.
+        CHECK(StaleToolchains(served).empty());
+    }
+
+    SECTION("the compiler binary is upgraded in place")
+    {
+        // A distribution replacing `gcc`. The binary's size and mtime are what catch
+        // it, and a longer body guarantees the size moved whatever the clock did.
+        WriteFile(compiler, "binary-v2-which-is-longer");
+        CHECK(StaleToolchains(served) == std::vector<std::string> { "fp-1" });
+    }
+
+    SECTION("a header appears under an include root, the compiler untouched")
+    {
+        // The Windows SDK case, and the reason a stamp over the binary alone would
+        // not have been enough: an SDK update adds headers and never touches
+        // `cl.exe`. The root's own mtime is what moves.
+        //
+        // The mtime is then set FORWARD explicitly rather than left to the write.
+        // A system clock ticks about every 16 ms on Windows, so a header added
+        // microseconds after the stamp was taken lands on the same timestamp and the
+        // change is genuinely invisible -- a real property of an mtime-based stamp,
+        // and one that would make this case pass or fail on how fast the machine is.
+        WriteFile(headers / "new-header.h", "#pragma once");
+        std::filesystem::last_write_time(headers, std::filesystem::last_write_time(headers) + std::chrono::seconds { 30 });
+        CHECK(StaleToolchains(served) == std::vector<std::string> { "fp-1" });
+    }
+
+    SECTION("an operator's pinned identity is never reconsidered")
+    {
+        // `<fingerprint>=<compiler>` is never probed, so it has no witness and must
+        // never grow one by inference. Pinning a digest by hand is how an operator
+        // forces a fleet to agree while a machine is being repaired, and a node that
+        // re-derived it would undo exactly that.
+        std::map<std::string, ServedToolchain> pinned;
+        pinned.emplace("pinned", ServedToolchain { .compiler = compiler.string(), .label = {}, .witness = {} });
+        WriteFile(compiler, "binary-v2-which-is-longer");
+        CHECK(StaleToolchains(pinned).empty());
+    }
+
+    SECTION("a compiler that could not be stamped is never reported")
+    {
+        // An empty stamp means "this toolchain cannot be watched", not "it changed".
+        // Read the other way it would report every heartbeat forever and send the
+        // node into a re-survey loop it could never leave.
+        std::map<std::string, ServedToolchain> unstampable;
+        auto entry = Witnessed(compiler, {});
+        entry.witness.stamp.clear();
+        unstampable.emplace("fp-1", std::move(entry));
+        WriteFile(compiler, "binary-v2-which-is-longer");
+        CHECK(StaleToolchains(unstampable).empty());
+    }
 }
