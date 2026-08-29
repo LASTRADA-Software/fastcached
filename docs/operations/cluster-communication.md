@@ -386,6 +386,52 @@ A version is refreshed on re-registration, so **an upgrade looks like a restart*
     go over loopback, and everything on this page still applies with the
     round trips costing nothing.
 
+### The endpoint a registration names is not verified
+
+`REGISTER` carries the `--advertise` endpoint, and the scheduler hands it to
+clients verbatim — they dial it and send the whole preprocessed translation unit.
+That endpoint is **not** checked against the address the registration arrived
+from ([#242](https://github.com/LASTRADA-Software/fastcached/issues/242)). A
+registration therefore asserts where a toolchain's work should be sent, and the
+only thing standing in front of it is membership, which is itself a source-address
+check ([#180](https://github.com/LASTRADA-Software/fastcached/issues/180)).
+
+What exists today is a **measurement**, not a control. When an endpoint's host
+differs from the caller's, the registration is still accepted and the scheduler
+counts it:
+
+```
+fastcached_dispatch_worker_endpoint_mismatch_total
+```
+
+alongside an **info** line naming both addresses and the toolchain, written for the
+first twenty mismatches and then left to the counter. Info rather than a warning
+deliberately: on a fleet that advertises DNS names this is every registration and
+nothing is wrong, and a signal that fires permanently on a correct deployment is one
+operators learn to filter.
+
+**A rise here is not by itself a fault.** Comparing hosts refuses far more than it
+protects, and the legitimate mismatches are the common shapes rather than the
+exotic ones:
+
+| Shape | Why it mismatches |
+|---|---|
+| `--advertise` names a DNS host | The scheduler cannot resolve it — it is I/O-free, and a resolver is not something a security decision may depend on |
+| A single node dialling itself | It registers over loopback while advertising an address clients can route to — the setup on the getting-started page |
+| Multi-homed worker | It reaches the scheduler on one interface and serves clients on another |
+| NAT or a VPN | The scheduler sees the translated or overlay address |
+
+So the counter answers a question nobody can currently answer: how often endpoints
+legitimately differ on a real estate. That number decides whether a stricter rule
+is deployable at all. Closing the hole properly means a credential rather than an
+address comparison — the mechanism
+[cluster discovery](../getting-started/cluster-discovery.md) already uses.
+
+Until that lands, a fleet's boundary is the one described under [what is
+authenticated, and what is not](#what-is-authenticated-and-what-is-not): keep
+`--fleet-member` tight, and do not put a scheduler where machines you do not
+operate can reach it.
+
 ## What the cluster says to itself
 
 Both of these are off unless configured, and neither carries any compile traffic.

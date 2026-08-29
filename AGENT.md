@@ -222,6 +222,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   every machine without `/usr/local/include`.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
+- A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch`
+  only counts it (#242). Comparing hosts refuses the documented setup (DNS names, a node
+  dialling itself, NAT, VPN, multi-homing) and stops only a *third* host, since membership
+  already let this one in. The fix is a credential, as discovery's `(node, endpoint)` MAC is.
+- `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided
+  from it. It carries no port; a peer dials from an ephemeral one.
 - Cluster membership is one ROUTE to admission, never the whole policy. `--fleet-member`
   admits *clients* — laptops, CI runners — which never join consensus, so what the
   cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`

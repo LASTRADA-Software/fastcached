@@ -175,8 +175,15 @@ class ClusterMembership final: public IMembershipOracle
             // An endpoint that will not split is kept whole rather than dropped: a
             // member the set cannot represent must not silently stop being one, and a
             // bare host is a legitimate spelling for a peer whose port nobody recorded.
-            auto const split = SplitHostPort(endpoint);
-            hosts.push_back(split.has_value() ? split->first : endpoint);
+            //
+            // `HostOfEndpoint`, not `SplitHostPort` + a fallback, which is where this
+            // rule used to be written by hand and got the two IPv6 spellings wrong
+            // both ways: an unbracketed `2001:db8::1` split at its LAST colon and
+            // published the member as `2001:db8:`, and a bracketed `[2001:db8::1]`
+            // with no port would not split at all and was published with its brackets
+            // on -- neither of which any kernel ever reports as a peer address, so
+            // both are a listed member that silently stops being one.
+            hosts.emplace_back(HostOfEndpoint(endpoint));
         }
 
         // Built outside the lock and swapped in, so a reader never observes a set
@@ -227,7 +234,18 @@ class ClusterMembership final: public IMembershipOracle
         // make an explicit choice instead.
         //
         // Whole-string, never a prefix: `10.0.0.1` must not admit `10.0.0.10`.
-        return std::ranges::find(_hosts, peerAddress) != _hosts.end() ? Membership::Member : Membership::Outsider;
+        //
+        // Through `SameHost`, which is the same fold `IsLoopbackHost` applied three
+        // lines above and for the same reason: a node bound to `::` is dual-stack, so
+        // an IPv4 member listed as `10.0.0.1` arrives as `::ffff:10.0.0.1` and a raw
+        // compare refuses every peer in the set while the loopback branch above keeps
+        // working -- a fleet that looks configured, admits its own machine, and
+        // distributes nothing. It also refuses an unnameable caller against an empty
+        // member entry, which a raw compare admitted.
+        auto const admits = [peerAddress](std::string_view host) {
+            return SameHost(peerAddress, host);
+        };
+        return std::ranges::any_of(_hosts, admits) ? Membership::Member : Membership::Outsider;
     }
 
   private:

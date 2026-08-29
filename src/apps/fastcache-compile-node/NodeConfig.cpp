@@ -1018,13 +1018,18 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 [[nodiscard]] bool AdvertisesWildcard(NodeConfig const& cfg)
 {
     auto const advertised = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
-    auto const split = SplitHostPort(advertised);
-    auto const host = split.has_value() ? split->first : advertised;
+
+    // `HostOfEndpoint` rather than `SplitHostPort` plus a fallback: an endpoint that
+    // will not split is a bare host rather than a parse failure, and that rule is
+    // spelled once in `Core/HostPort` for every caller that needs it.
+    auto const host = HostOfEndpoint(advertised);
 
     // The two spellings of "every interface", plus the empty host -- which reaches
     // `getaddrinfo` as nullptr under AI_PASSIVE and is therefore the wildcard as
-    // well, the same third case `--listen-cache=:6674` is refused for.
-    return host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]";
+    // well, the same third case `--listen-cache=:6674` is refused for. The bracketed
+    // spelling needs no row of its own: `HostOfEndpoint` strips the brackets whether
+    // or not a port follows, so `[::]` and `[::]:6676` both arrive here as `::`.
+    return host.empty() || host == "0.0.0.0" || host == "::";
 }
 
 std::string AdmissionSummary(NodeConfig const& cfg)

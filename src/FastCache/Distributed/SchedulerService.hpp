@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
@@ -65,7 +66,27 @@ struct CallerContext
 {
     /// Is this peer a member of the cluster?
     Membership membership { Membership::Outsider };
-    /// Who the peer says it is, for logs. Never trusted for a decision.
+
+    /// The peer's **host**, as the kernel reports it -- never a name the peer
+    /// chose.
+    ///
+    /// This used to say "who the peer says it is, for logs; never trusted for a
+    /// decision", and every clause of that was wrong. The transport fills it from
+    /// `ISocket::PeerAddress()` and hands the *same* string to the membership
+    /// oracle, so it is already the basis of the one decision on this surface that
+    /// matters -- and it is the only fact here a caller cannot forge.
+    ///
+    /// Correcting it is not cosmetic. A comment saying this cannot be trusted is a
+    /// comment telling the next person that tying a registration to where it came
+    /// from is impossible, which is how #242 stayed open: the fact needed to check
+    /// an endpoint was already in the struct, disclaimed.
+    ///
+    /// A bare host, never an endpoint: a peer dials from an **ephemeral source
+    /// port**, so there is no port here to compare anything against.
+    ///
+    /// It can legitimately be empty -- `FormatPeerAddress` answers that for a peer
+    /// whose family is unknown or whose `getpeername` failed -- so anything reading
+    /// it must decide what an unnameable caller means rather than assume a host.
     std::string_view peerId {};
 };
 
@@ -150,7 +171,9 @@ class SchedulerService
     /// @param clock Time source for registry expiry and lease timeouts; must
     ///        outlive the service.
     /// @param metrics Counts the outcomes below; must outlive the service.
-    SchedulerService(IClock& clock, IMetricsSink& metrics) noexcept;
+    /// @param logger Where the one observation this service reports goes; must
+    ///        outlive the service. `NullLogger` where a caller does not want it.
+    SchedulerService(IClock& clock, IMetricsSink& metrics, ILogger& logger) noexcept;
 
     /// Where a node's handed-over history goes, or null to discard it.
     ///
@@ -391,6 +414,24 @@ class SchedulerService
     [[nodiscard]] SchedulerReply Offer(Cluster::Command const& command);
 
     IMetricsSink& _metrics;
+    /// Where the endpoint-mismatch observation goes (#242).
+    ///
+    /// A reference at construction rather than a nullable setter, because unlike
+    /// `SetHistorySink` and `SetRole` -- which exist for collaborators that arrive
+    /// later or change -- every caller already holds a logger when it builds this.
+    /// `NullLogger` is how a caller says it wants none, which is a decision somebody
+    /// makes rather than a pointer somebody forgot.
+    ILogger& _logger;
+
+    /// Mismatch lines already written, so the diagnostic is bounded.
+    ///
+    /// Atomic defensively rather than because it is currently shared: today the
+    /// scheduler port is one `FrameEndpoint` on one reactor thread, and `_workers`
+    /// and `_leases` beside it are plain members that assume exactly that -- so a
+    /// second thread answering registrations would be a bigger change than this
+    /// field. Relaxed because nothing is ordered against it: an exact cut-off is not
+    /// the point, and the counter beside it is what carries the rate anyway.
+    std::atomic<std::uint64_t> _mismatchLines { 0 };
     WorkerRegistry _workers;
     LeaseTable _leases;
 

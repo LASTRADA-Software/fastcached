@@ -7,8 +7,11 @@
 namespace FastCache::Node
 {
 
-SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics):
-    _service { clock, metrics },
+SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
+                             IClock& clock,
+                             IMetricsSink& metrics,
+                             ILogger& logger):
+    _service { clock, metrics, logger },
     _protocol { _service },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
     // object, and a node that answered "is this peer one of ours" differently at its
@@ -38,7 +41,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     IMetricsSink& metrics,
     ILogger& logger)
 {
-    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, metrics } };
+    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, metrics, logger } };
 
     // A bare port binds the WILDCARD here, the opposite of the cache surface's
     // loopback, and why is on `SchedulerListenDefaultHost`. Named rather than spelled

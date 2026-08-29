@@ -74,6 +74,76 @@ TEST_CASE("An endpoint with no port is kept whole", "[distributed][membership]")
     CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
 }
 
+TEST_CASE("Both IPv6 spellings of a member survive publication", "[distributed][membership]")
+{
+    // The two shapes a hand-rolled `SplitHostPort` + fallback got wrong in opposite
+    // directions, each producing a stored "host" no kernel ever reports as a peer
+    // address -- so a listed member silently stopped being one while `Size()` still
+    // counted it.
+    SECTION("an unbracketed literal is not cut at its last colon")
+    {
+        // Split at the last colon this is `2001:db8:`, a plausible-looking wrong
+        // answer rather than a failure.
+        ClusterMembership const cluster { { "2001:db8::1" } };
+
+        CHECK(cluster.Size() == 1);
+        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
+        CHECK(cluster.Classify("2001:db8::2") == Membership::Outsider);
+    }
+
+    SECTION("a bracketed literal with no port loses its brackets")
+    {
+        ClusterMembership const cluster { { "[2001:db8::1]" } };
+
+        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
+    }
+
+    SECTION("and the ordinary bracketed endpoint still works")
+    {
+        ClusterMembership const cluster { { "[2001:db8::1]:7000" } };
+
+        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
+    }
+}
+
+TEST_CASE("A dual-stack listener's mapped spelling still names a listed member", "[distributed][membership]")
+{
+    // The failure `IsLoopbackHost` was already taught to avoid, arriving at the list
+    // instead of at the loopback branch: a node bound to `::` is dual-stack, so an
+    // IPv4 peer reaches `Classify` as `::ffff:10.0.0.1`. Compared raw against the
+    // list, EVERY member is refused while this machine's own clients are still
+    // admitted -- a fleet that looks configured, serves its own box, and distributes
+    // nothing.
+    ClusterMembership const cluster { { "10.0.0.1:7000" } };
+
+    CHECK(cluster.Classify("::ffff:10.0.0.1") == Membership::Member);
+    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
+
+    // Folded, never widened: the mapped form of a stranger is still a stranger, and
+    // the prefix rule survives the fold.
+    CHECK(cluster.Classify("::ffff:10.0.0.2") == Membership::Outsider);
+    CHECK(cluster.Classify("::ffff:10.0.0.10") == Membership::Outsider);
+
+    // The other side of the fold, for a set published in the mapped form. Bracketed,
+    // because that is the only spelling a mapped address with a port can have: bare,
+    // `::ffff:10.0.0.1:7000` is indistinguishable from an IPv6 literal and is
+    // deliberately kept whole rather than cut at a guessed colon.
+    ClusterMembership const mapped { { "[::ffff:10.0.0.1]:7000" } };
+    CHECK(mapped.Classify("10.0.0.1") == Membership::Member);
+}
+
+TEST_CASE("An empty member entry does not admit a peer this machine cannot name", "[distributed][membership]")
+{
+    // Two unanswerable questions are not a match. Under a raw string compare they
+    // were: an endpoint that published as nothing stored an empty host, and the empty
+    // host is exactly what `FormatPeerAddress` answers for a peer whose `getpeername`
+    // failed -- so the one caller that must never be admitted matched.
+    ClusterMembership const cluster { { "", "10.0.0.1:7000" } };
+
+    CHECK(cluster.Classify("") == Membership::Outsider);
+    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
+}
+
 TEST_CASE("Membership can be republished while the scheduler runs", "[distributed][membership]")
 {
     // The carve-out to configuration-at-construction, and the reason for it:
@@ -158,7 +228,8 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
     ClusterMembership const cluster { { "10.0.0.1:7000" } };
     FastCache::ManualClock clock;
     FastCache::AtomicMetricsSink metrics;
-    SchedulerService service { clock, metrics };
+    FastCache::NullLogger schedulerLogger;
+    SchedulerService service { clock, metrics, schedulerLogger };
     service.SetRole(SchedulerRole::Leader, {});
 
     auto const ask = [&](std::string_view peer) {

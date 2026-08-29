@@ -417,6 +417,7 @@ start it with `--admin-listen` and these count the outcomes.
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. Not a problem. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. Any rise names a machine that is **not** in the fleet. |
+| `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was **admitted** while advertising an endpoint whose host is not the address it connected from. Not a fault by itself — DNS names, a node dialling itself, NAT, a VPN and multi-homing all land here. See [the endpoint a registration names is not verified](../operations/cluster-communication.md#the-endpoint-a-registration-names-is-not-verified). |
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. Rising beside a rising registration count is a fleet whose heartbeats are not arriving, not one that is growing. |
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job, or restarted, and the keys it was building were freed. Work nobody will report done — a build that lost part of its distribution, which is a different thing to fix from a fleet that is merely full. |
 

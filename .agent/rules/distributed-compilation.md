@@ -285,6 +285,53 @@ Consequences that are each load-bearing:
     `AdmissionSummary` is one phrase for the worker's ready line and the scheduler
     tier's, so a node that admits nobody says so while an operator is watching, and a
     node running both surfaces states one policy rather than two.
+  - **A registration's endpoint is where work gets SENT, and nothing ties it to the
+    connection that carried it. What landed for #242 is a counter, and calling it a
+    fix would be the error.** `SchedulerService::Register` runs `Gate()` and then
+    checks only that the fields are UTF-8; `WorkerRegistry` stores the endpoint
+    verbatim and `Lease` hands it to clients, which dial it and send a whole
+    preprocessed translation unit. The obvious remedy — refuse an endpoint whose host
+    is not the caller's — was priced and **rejected**, and both halves of that are
+    the rule:
+    - **It refuses the ordinary case.** A worker that advertises a DNS name
+      mismatches and the scheduler cannot resolve it: the service is I/O-free by
+      construction, and a resolver is not something a security decision may depend on
+      — which `IsLoopbackHost` already records about `localhost`. So do multi-homed
+      workers, NAT, a VPN, and the **first fleet the getting-started page builds**,
+      where a node registers with its own scheduler over loopback while advertising a
+      routable name. A control whose false-positive set is the documented setup is
+      not deployable.
+    - **And it buys less than it looks like.** The caller is already an admitted
+      member, so it may receive the fleet's work by naming its **own** address; the
+      comparison only stops it naming a *third* host. Membership already granted "may
+      this machine receive work", so the check narrows the primitive without removing
+      it — which is the same shape as the security theater it was meant to replace.
+    - **The real mechanism is a credential, and this tree already has it one layer
+      over.** Discovery proves a `(node, endpoint)` pair with a MAC over a nonce the
+      challenger chose, *precisely* so a claimed endpoint cannot be substituted. A
+      registration wants that, and it is the same mechanism as the planned signed
+      lease tokens.
+    - **So what shipped is instrumentation, and it says so.**
+      `DispatchWorkerEndpointMismatch` counts an **accepted** registration whose
+      endpoint host is not the caller's, beside a bounded `Info` line naming both
+      addresses — `Info` and not a warning, because on a DNS-named fleet this is every
+      registration and a permanent warning is one an operator learns to filter. No
+      wire code was added: a code nothing returns would put a lie in the refusal
+      table. The number exists because *nobody knows* how often endpoints legitimately
+      differ on a real estate, and that is what decides whether a stricter rule is
+      viable — both ends of the argument were guessing.
+    - **`CallerContext::peerId` used to disclaim itself, and that comment is how the
+      hole stayed open.** It said "who the peer says it is, for logs; never trusted
+      for a decision" — every clause false. The transport fills it from
+      `ISocket::PeerAddress()` and hands the same string to the membership oracle, so
+      it is already the basis of the decision on that surface and is the one fact a
+      caller cannot forge. A comment asserting a check is impossible is worth more
+      than a missing check: it stops the next person looking.
+    - **Hosts only, never ports, and unmapped on both sides.** A peer dials from an
+      ephemeral source port, so `peerId` carries none — the reason `ClusterMembership`
+      keys on hosts too. And `::ffff:10.0.0.1` versus `10.0.0.1` is a property of how
+      the *listener was bound*, so `Core/HostPort::UnmappedHost` folds them or two
+      identically configured nodes disagree about one machine.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped

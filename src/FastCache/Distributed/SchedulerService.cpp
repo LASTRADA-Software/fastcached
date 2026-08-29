@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 
@@ -179,6 +180,35 @@ namespace
                                         .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
     };
 
+    /// Whether a registration's endpoint names the host it arrived from.
+    ///
+    /// **Hosts only, never ports**, which is forced rather than chosen: a peer dials
+    /// from an ephemeral source port, so `peerId` carries none and there is nothing
+    /// for an endpoint's port to be compared against. `Core/HostPort` owns the rest
+    /// of the rule -- what an endpoint's host is, and when two hosts are the same
+    /// machine.
+    /// @param endpoint What the registration advertises, `host:port` or a bare host.
+    /// @param peerHost The host the registration arrived from.
+    /// @return True when the endpoint's host is the caller's own.
+    [[nodiscard]] bool EndpointNamesCaller(std::string_view endpoint, std::string_view peerHost) noexcept
+    {
+        return SameHost(peerHost, HostOfEndpoint(endpoint));
+    }
+
+    /// Mismatch lines one leader will write before it goes quiet.
+    ///
+    /// The line carries the pair of addresses the counter cannot, and it is needed
+    /// once per worker rather than once per registration: `Register` runs per
+    /// toolchain and again on every re-registration, which a fleet does whenever a
+    /// heartbeat is refused -- so an unhealthy fleet drives this hardest at exactly
+    /// the moment its log is least readable. A cap keeps the diagnostic and drops the
+    /// flood; the counter is what carries the rate afterwards, forever.
+    ///
+    /// Rate-limited rather than deduplicated because a table keyed on what a peer
+    /// sent is a table a peer can grow, which this project already refuses for the
+    /// discovery beacon's own provokable line.
+    constexpr std::uint64_t MismatchLineBudget = 20;
+
     /// The counter a refusal moves, if any.
     /// @param code The refusal.
     /// @return Its counter, or nullopt when the code moves none.
@@ -199,8 +229,9 @@ namespace
     }
 } // namespace
 
-SchedulerService::SchedulerService(IClock& clock, IMetricsSink& metrics) noexcept:
+SchedulerService::SchedulerService(IClock& clock, IMetricsSink& metrics, ILogger& logger) noexcept:
     _metrics { metrics },
+    _logger { logger },
     _workers { clock },
     _leases { clock }
 {
@@ -366,6 +397,36 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // against is closed by construction instead: `OfferableSlots` never returns
     // zero, so no registration can produce a worker that matches leases and is
     // never picked.
+
+    // Measured, deliberately NOT refused (#242).
+    //
+    // A registration asserts where work for a toolchain should be sent and nothing
+    // ties that claim to the connection carrying it. Refusing a mismatch was priced
+    // and REJECTED -- it turns away the documented setup, and stops only a third
+    // host, since membership already admitted this one. The full argument, and what
+    // closing it properly needs, is the #242 entry in
+    // `.agent/rules/distributed-compilation.md`; do not re-derive it from here.
+    //
+    // So: a counter, a bounded line, and no wire code at all -- one that nothing
+    // returns would put a lie in the refusal table.
+    if (!EndpointNamesCaller(registration.endpoint, caller.peerId))
+    {
+        _metrics.Increment(IMetricsSink::Counter::DispatchWorkerEndpointMismatch);
+
+        // `Info`, not a warning. On a fleet that advertises DNS names this is every
+        // registration and nothing is wrong, and a signal that fires permanently on
+        // correct deployments is one operators learn to filter -- so it would not be
+        // there on the day it means something. Info is the default production level,
+        // so it is still read.
+        if (auto const written = _mismatchLines.fetch_add(1, std::memory_order_relaxed); written < MismatchLineBudget)
+            _logger.Logf(LogLevel::Info,
+                         "dispatch: worker at {} registered endpoint {} for {}, which this scheduler does not verify "
+                         "(#242); expected with DNS names, NAT, VPN or multi-homing{}",
+                         caller.peerId.empty() ? std::string_view { "an unnameable peer" } : caller.peerId,
+                         registration.endpoint,
+                         registration.fingerprint,
+                         written + 1 == MismatchLineBudget ? " -- further mismatches are counted only" : "");
+    }
 
     auto const id = _workers.Register(registration);
 
