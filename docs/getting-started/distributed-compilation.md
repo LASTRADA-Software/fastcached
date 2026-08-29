@@ -251,15 +251,32 @@ That is the whole of it — but **`--fleet-open` is not optional**, and it is th
 line people leave off. Membership gates this node's *compile port*, so a worker
 without it admits its own machine and nothing else: the scheduler leases it out,
 the client dials it, and the compile is refused `not-a-member` and run locally
-instead. Nothing on the scheduler counts that, because the lease *was* granted
+instead. The scheduler's counters stay flat and correct while that happens,
+because the lease *was* granted
 ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235); before it
-was fixed, the flag could not be given to a worker at all).
+was fixed, the flag could not be given to a worker at all). The worker says which
+it is in its own startup line:
+
+```
+[INFO] compile node ready on 0.0.0.0:6676, advertising worker-01.internal:6676, 16 slot(s) as a … node, 2 toolchain(s), every caller admitted
+[INFO] compile node ready on 0.0.0.0:6676, … , this machine only -- give --fleet-member or --fleet-open to admit peers
+```
 
 Use `--fleet-open` where the build network is already your boundary. Where it is
 not, swap it for a repeated `--fleet-member=dev-01.internal` naming the machines
 whose clients may dispatch here, and everyone else stays refused. The list is
 matched by **host**: a client dials from an ephemeral source port, so there is no
 port for an endpoint to be compared against.
+
+!!! warning "On a node running consensus, `--fleet-member` is the bootstrap answer only"
+
+    Once a cluster forms, the agreed member set **replaces** that list on every
+    node — see [membership at
+    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A client
+    machine is not a cluster peer, so a laptop admitted by `--fleet-member` stops
+    being admitted the moment the cluster agrees anything. On a clustered fleet,
+    admit clients with `--fleet-open` behind a firewalled build network, and keep
+    `--fleet-member` for the pre-cluster deployments it is the answer for.
 
 The worker then surveys the machine at startup and serves every compiler it
 finds, naming each one and the layout it came from:

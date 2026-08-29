@@ -1000,6 +1000,15 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
 }
 
+std::string AdmissionSummary(NodeConfig const& cfg)
+{
+    if (cfg.fleetOpen)
+        return "every caller admitted";
+    if (cfg.fleetMembers.empty())
+        return "this machine only -- give --fleet-member or --fleet-open to admit peers";
+    return std::format("this machine plus {} member host(s)", cfg.fleetMembers.size());
+}
+
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 {
     // A table, so a new rule is a new row rather than another `if` in main().
@@ -1141,9 +1150,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // What the row actually did was pin every non-scheduler node's oracle to an
         // empty list, which admits loopback and nothing else -- so the worker the
         // getting-started page documents refused every dispatched compile with
-        // `NotAMember`, one hop after the lease was granted and therefore without
-        // moving a single counter (#235). The refusal a rule exists to prevent was
-        // the rule's own doing.
+        // `NotAMember` (#235). The refusal a rule exists to prevent was the rule's
+        // own doing, and it was invisible from the side anybody watches: the lease
+        // WAS granted, so no scheduler counter moves. The only signal is the
+        // worker's own `WorkerJobsRefusedNotAMember`, on a machine whose operator
+        // has no reason to scrape it and which exports nothing without
+        // `--admin-listen`. Hence `AdmissionSummary` in the ready line.
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "

@@ -189,11 +189,20 @@ Consequences that are each load-bearing:
     operator believes is in force" — and the premise was simply false. What the row
     achieved was pinning every non-scheduler node's oracle to an *empty list*, which
     admits loopback and nothing else, so the worker the getting-started page called
-    "the whole of it" refused every dispatched compile with `NotAMember` (#235). It
-    was invisible in the way this file keeps naming: the lease **was** granted, the
-    refusal is one hop later, and no counter at either end moves. A rule stating what
-    a flag is *for* is a rule that has to be re-derived when a second surface starts
-    reading it — so check which tiers reach the value, not which flag it reads like.
+    "the whole of it" refused every dispatched compile with `NotAMember` (#235). A
+    rule stating what a flag is *for* is a rule that has to be re-derived when a
+    second surface starts reading it — so check which tiers reach the value, not
+    which flag it reads like.
+  - **A refusal one hop past the lease is invisible from the side anybody watches.**
+    The lease **was** granted, so every scheduler counter is correct and unmoved; the
+    only signal is the *worker's* `WorkerJobsRefusedNotAMember`, on a machine whose
+    operator has no reason to scrape it and which exports nothing at all without
+    `--admin-listen`. "No counter moves" is the tempting summary and it is wrong in a
+    way that matters — it sends a reader looking for a missing counter instead of at
+    the one that exists. What was actually missing is a line at **startup**:
+    `AdmissionSummary` is one phrase for the worker's ready line and the scheduler
+    tier's, so a node that admits nobody says so while an operator is watching, and a
+    node running both surfaces states one policy rather than two.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped

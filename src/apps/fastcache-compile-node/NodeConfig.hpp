@@ -603,6 +603,26 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
 [[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
 
+/// Who this node admits, as one line an operator reads at startup.
+///
+/// One spelling for two callers -- the scheduler tier's ready line and the worker's
+/// -- because the policy is the **node's** rather than any one surface's, and a
+/// phrase each of them built separately is one that drifts. Read off the
+/// configuration rather than off the oracle: the count is a property of what the
+/// operator wrote, and the oracle is shared by three surfaces and no longer any one
+/// tier's to inspect.
+///
+/// It says "this machine" out loud, because that admission is unconditional and an
+/// operator reading "2 member host(s)" would otherwise not know their own builds
+/// were covered. And it names the two flags when there is no policy at all, which is
+/// the whole of #235's second half: such a worker starts, logs a healthy line and
+/// refuses every dispatched compile, so the one line an operator reads has to say
+/// that the port is closed. A scheduler cannot reach that case -- `--listen-scheduler`
+/// with no policy is refused at startup -- so it costs its line nothing.
+/// @param cfg The parsed configuration.
+/// @return A phrase naming who this node admits.
+[[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
+
 /// Why this worker's configuration cannot work, if it cannot.
 ///
 /// A *startup* rule rather than an install-time one, and the split is deliberate:

@@ -342,13 +342,14 @@ struct Fixture
 /// @param membership The policy this server consults.
 /// @param peer The address the connection appears to arrive from.
 /// @param request The frame the caller sends.
-/// @param slots The worker's concurrency cap.
+/// @param slots The worker's concurrency cap; two, which admits every case here
+///        that is not about the cap itself.
 /// @return Everything the server wrote back, which may be empty.
 [[nodiscard]] std::vector<std::byte> ServeOneFrom(Fixture& fix,
                                                   Distributed::IMembershipOracle const& membership,
                                                   std::string peer,
                                                   std::vector<std::byte> const& request,
-                                                  std::size_t slots)
+                                                  std::size_t slots = 2)
 {
     auto pair = InMemorySocketPair::Create(0, std::move(peer));
     REQUIRE(SyncRun([](ISocket* s, std::vector<std::byte> bytes) -> Task<bool> {
@@ -371,6 +372,19 @@ struct Fixture
 [[nodiscard]] std::vector<std::byte> ServeOne(Fixture& fix, std::vector<std::byte> const& request, std::size_t slots)
 {
     return ServeOneFrom(fix, fix.membership, {}, request, slots);
+}
+
+/// Whether a reply frame says the request was served.
+///
+/// `ErrorOf`'s sibling, and there for the same reason: every case asking "was this
+/// caller admitted" otherwise spells out the same decode, guard and member access.
+/// @param frame A reply frame.
+/// @return Its status.
+[[nodiscard]] Wire::Status StatusOf(std::vector<std::byte> const& frame)
+{
+    auto const header = Wire::DecodeReplyHeader(frame);
+    REQUIRE(header.has_value());
+    return Unwrap(header).status;
 }
 
 [[nodiscard]] Wire::ErrorCode ErrorOf(std::vector<std::byte> const& frame)
@@ -638,104 +652,94 @@ TEST_CASE("A stranger is refused this machine's CPU before it can send a payload
     }
 }
 
-TEST_CASE("A worker that schedules nothing still admits the peers its operator listed", "[node][worker][membership]")
+TEST_CASE("A worker admits whoever its operator's policy names, scheduler or not", "[node][worker][membership]")
 {
-    // #235, and it is a WIRING case rather than an oracle one: `ClusterMembership`
-    // was always correct about a listed peer -- the case above proves that -- and a
-    // pure worker could nonetheless never be handed one. `StartupPolicyRejection`
-    // refused `--fleet-member` on any node without `--listen-scheduler`, so the only
-    // oracle such a node could construct was an empty list, which admits loopback
-    // and nothing else. Every dispatched compile was refused `NotAMember` one hop
-    // after the lease was granted, so no counter on either side moved.
+    // #235, and a WIRING case rather than an oracle one: `ClusterMembership` was
+    // always correct about a listed peer -- the case above proves that -- and a pure
+    // worker could nonetheless never be handed one. `StartupPolicyRejection` refused
+    // `--fleet-member` on any node without `--listen-scheduler`, so the only oracle
+    // such a node could construct was an empty list, which admits loopback and
+    // nothing else. Every dispatched compile was refused `NotAMember` one hop after
+    // the lease was granted, so no counter on either side moved.
     //
-    // So this drives the whole chain a `main()` walks -- the argv an operator types,
-    // the startup rules, `NodeMembership`, the oracle it hands out, `WorkerServer` --
-    // rather than the oracle alone. Substituting a hand-built oracle here is exactly
-    // what let the defect live behind a passing suite.
-    NodeConfig cfg;
-    cfg.scheduler = "scheduler.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
-    cfg.fleetMembers = { "10.0.0.1:6676" };
-
-    // The link that was broken: a worker naming who may spend its CPU, and naming no
-    // scheduler of its own, is a configuration this node has to be able to START.
-    CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
-
-    NodeMembership membership { cfg };
-    Fixture fix;
-    auto const request = CompileFrame();
-
-    SECTION("a client on a listed machine is compiled for")
+    // So every row drives the whole chain a `main()` walks below its parser -- the
+    // configuration, the startup rules, `NodeMembership`, the oracle it hands out
+    // and `WorkerServer` -- rather than the oracle alone. Substituting a hand-built
+    // oracle is exactly what let the defect live behind a passing suite.
+    struct Row
     {
-        auto const reply = ServeOneFrom(fix, membership.Oracle(), "10.0.0.1", request, 2);
-        auto const header = Wire::DecodeReplyHeader(reply);
-        REQUIRE(header.has_value());
-        CHECK(Unwrap(header).status == Wire::Status::Ok);
-        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 0);
-    }
+        char const* what;                 ///< The shape, for the failure message.
+        std::vector<std::string> members; ///< `--fleet-member`, if any.
+        bool open;                        ///< Whether `--fleet-open` was given.
+        char const* peer;                 ///< Where the connection appears to arrive from.
+        Wire::Status expected;            ///< `Ok`, or `Error` meaning `NotAMember`.
+    };
 
-    SECTION("and everybody else is still refused")
+    auto const rows = std::to_array<Row>({
+        { .what = "a listed peer, on a worker that schedules nothing",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .peer = "10.0.0.1",
+          .expected = Wire::Status::Ok },
+        // Admitting a listed peer is not opening the port: a worker serving whoever
+        // could route to it would run a stranger's compiler on source they chose,
+        // and `--bind` defaults to the wildcard.
+        { .what = "a stranger, against that same list",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .peer = "10.9.9.9",
+          .expected = Wire::Status::Error },
+        // The other half of the remedy, and the one a build LAN reaches for.
+        // `OpenMembership` is only ever arrived at by an operator saying so.
+        { .what = "a stranger, under --fleet-open",
+          .members = {},
+          .open = true,
+          .peer = "10.9.9.9",
+          .expected = Wire::Status::Ok },
+        // The default #235 must not have moved: a node given neither flag is closed
+        // to the network and useful to the machine it runs on, which is what makes
+        // "off by default" safe and what an operator who types nothing gets.
+        { .what = "this machine, with no policy at all",
+          .members = {},
+          .open = false,
+          .peer = "127.0.0.1",
+          .expected = Wire::Status::Ok },
+        { .what = "the network, with no policy at all",
+          .members = {},
+          .open = false,
+          .peer = "10.0.0.1",
+          .expected = Wire::Status::Error },
+    });
+
+    for (auto const& row: rows)
     {
-        // The half that must survive the fix: admitting a listed peer is not
-        // opening the port. A worker whose compile surface served whoever could
-        // route to it would run a stranger's compiler on source they chose, and
-        // `--bind` defaults to the wildcard.
-        auto const reply = ServeOneFrom(fix, membership.Oracle(), "10.9.9.9", request, 2);
-        auto const header = Wire::DecodeReplyHeader(reply);
-        REQUIRE(header.has_value());
-        CHECK(Unwrap(header).status == Wire::Status::Error);
-        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 1);
-        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+        INFO(row.what);
+
+        // The command line the getting-started page documents, plus whatever policy
+        // this row names. `--scheduler` and `--advertise` are read by neither the
+        // rules nor the oracle; they are here because they are what makes this a
+        // worker rather than a bare struct, and a worker is the shape under test.
+        NodeConfig cfg;
+        cfg.scheduler = "scheduler.internal:6675";
+        cfg.advertise = "worker-01.internal:6676";
+        cfg.fleetMembers = row.members;
+        cfg.fleetOpen = row.open;
+
+        // The link that was broken: a worker naming who may spend its CPU, and
+        // naming no scheduler of its own, is a configuration that has to START.
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        NodeMembership const membership { cfg };
+        Fixture fix;
+
+        CHECK(StatusOf(ServeOneFrom(fix, membership.Oracle(), row.peer, CompileFrame())) == row.expected);
+
+        // A refusal costs nothing, which is the property that matters: it happens
+        // before the payload is read, so nothing was buffered and no compiler ran.
+        auto const refused = row.expected == Wire::Status::Error ? 1U : 0U;
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == refused);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1U - refused);
     }
-}
-
-TEST_CASE("A worker told to admit everybody does, without scheduling anything", "[node][worker][membership]")
-{
-    // The other half of #235's remedy, and the one an operator on a build LAN
-    // reaches for: `--fleet-open` is what makes reachability the boundary, and it
-    // too was refused on a node running no scheduler. `OpenMembership` is only ever
-    // reached by an operator saying so, which is why "no policy" and "admit
-    // everybody" are two different configurations rather than one default.
-    NodeConfig cfg;
-    cfg.scheduler = "scheduler.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
-    cfg.fleetOpen = true;
-
-    CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
-
-    NodeMembership membership { cfg };
-    Fixture fix;
-
-    auto const reply = ServeOneFrom(fix, membership.Oracle(), "10.9.9.9", CompileFrame(), 2);
-    auto const header = Wire::DecodeReplyHeader(reply);
-    REQUIRE(header.has_value());
-    CHECK(Unwrap(header).status == Wire::Status::Ok);
-}
-
-TEST_CASE("A worker given no membership policy at all still admits only its own machine", "[node][worker][membership]")
-{
-    // The default #235 must not have moved. A node started with neither flag is
-    // closed to the network and useful to the machine it runs on -- which is what
-    // makes "off by default" safe, and what an operator who types nothing gets.
-    NodeConfig cfg;
-    cfg.scheduler = "scheduler.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
-
-    CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
-
-    NodeMembership membership { cfg };
-    Fixture fix;
-    auto const request = CompileFrame();
-
-    auto const local = ServeOneFrom(fix, membership.Oracle(), "127.0.0.1", request, 2);
-    auto const localHeader = Wire::DecodeReplyHeader(local);
-    REQUIRE(localHeader.has_value());
-    CHECK(Unwrap(localHeader).status == Wire::Status::Ok);
-
-    auto const remote = ServeOneFrom(fix, membership.Oracle(), "10.0.0.1", request, 2);
-    auto const remoteHeader = Wire::DecodeReplyHeader(remote);
-    REQUIRE(remoteHeader.has_value());
-    CHECK(Unwrap(remoteHeader).status == Wire::Status::Error);
 }
 
 TEST_CASE("A worker bounds the payload bytes it reads at once, not just the jobs", "[worker-server]")

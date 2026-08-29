@@ -965,6 +965,52 @@ TEST_CASE("NodeConfig: a system-scope job owns the directories it was given", "[
     CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable()).ownedPaths.empty());
 }
 
+TEST_CASE("A node says who it admits in the line an operator reads at startup", "[node][policy][membership]")
+{
+    // #235's second half. The first was that a worker could not be GIVEN a policy;
+    // this is that a worker given none said nothing about it -- it started, bound
+    // the wildcard, registered, was leased out and refused every dispatched compile,
+    // while the one line an operator reads to confirm it came up reported nothing
+    // but health. The scheduler tier had such a line; the worker, which is the
+    // surface that actually refuses, did not.
+    //
+    // One function rather than a phrase per surface, because a node running both
+    // must state one policy rather than two, and because `main.cpp` is in no test
+    // target -- a phrase built there could not be asserted on at all.
+    struct Row
+    {
+        char const* what;                 ///< The shape, for the failure message.
+        std::vector<std::string> members; ///< `--fleet-member`, if any.
+        bool open;                        ///< Whether `--fleet-open` was given.
+        char const* says;                 ///< What the line must contain.
+    };
+
+    auto const rows = std::to_array<Row>({
+        { .what = "no policy at all", .members = {}, .open = false, .says = "this machine only" },
+        // Naming the remedy is the point of that row: an operator who reads "this
+        // machine only" and is not told the two flags has been informed of a symptom.
+        { .what = "no policy names the flags that give one", .members = {}, .open = false, .says = "--fleet-member" },
+        { .what = "a member list", .members = { "10.0.0.1:6676", "10.0.0.2:6676" }, .open = false, .says = "2 member" },
+        // "This machine" out loud even when a list exists: that admission is
+        // unconditional, and an operator reading a bare count would not know their
+        // own builds were covered.
+        { .what = "a member list still says this machine",
+          .members = { "10.0.0.1:6676" },
+          .open = false,
+          .says = "this machine" },
+        { .what = "--fleet-open", .members = {}, .open = true, .says = "every caller" },
+    });
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        NodeConfig cfg;
+        cfg.fleetMembers = row.members;
+        cfg.fleetOpen = row.open;
+        CHECK(AdmissionSummary(cfg).contains(row.says));
+    }
+}
+
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")
 {
     // Every rule here describes a configuration that would START SUCCESSFULLY and
@@ -1009,39 +1055,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
         REQUIRE(StartupPolicyRejection(cfg).has_value());
-    }
 
-    SECTION("a policy on a node that schedules nothing is the ordinary worker")
-    {
-        // There used to be a mirror row here, refusing membership on a node running
-        // no scheduler because "a policy nothing consults is a policy an operator
-        // believes is in force". The premise was false: one `NodeMembership` serves
-        // the scheduler, the cache tier AND the compile port, and the compile port
-        // is built unconditionally.
-        //
-        // What the row did instead was pin every worker to an empty member list,
-        // which admits loopback alone -- so the worker the getting-started page
-        // documents refused every dispatched compile with `NotAMember`, one hop
-        // past the lease and therefore without moving a counter anywhere (#235).
-        NodeConfig listed;
-        listed.scheduler = "scheduler.internal:6675";
-        listed.advertise = "worker-01.internal:6676";
-        listed.fleetMembers = { "10.0.0.1:6676" };
-        CHECK_FALSE(StartupPolicyRejection(listed).has_value());
-
-        NodeConfig open;
-        open.scheduler = "scheduler.internal:6675";
-        open.advertise = "worker-01.internal:6676";
-        open.fleetOpen = true;
-        CHECK_FALSE(StartupPolicyRejection(open).has_value());
-
-        // And the contradiction is still refused on such a node: that row never
-        // depended on a scheduler, and the permissive half is the one that would
-        // have won by accident.
-        NodeConfig both;
-        both.fleetMembers = { "10.0.0.1:6676" };
-        both.fleetOpen = true;
-        REQUIRE(StartupPolicyRejection(both).has_value());
+        // And on a node running no scheduler at all, which is where the rest of
+        // this group stopped applying (#235): this row never depended on one, and
+        // the permissive half is the one that would have won by accident.
+        NodeConfig worker;
+        worker.fleetMembers = { "10.0.0.1:6676" };
+        worker.fleetOpen = true;
+        REQUIRE(StartupPolicyRejection(worker).has_value());
     }
 
     SECTION("a joiner with no identity")
@@ -1096,6 +1117,26 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // And a worker running no scheduler at all -- by far the common case -- is
         // untouched by any of this.
         CHECK_FALSE(StartupPolicyRejection(NodeConfig {}).has_value());
+
+        // Including one that names a membership policy, which is the whole of #235.
+        // A mirror row used to refuse exactly this, reasoning that "a policy nothing
+        // consults is a policy an operator believes is in force" -- and the premise
+        // was false: one `NodeMembership` serves the scheduler, the cache tier AND
+        // the compile port, and the compile port is built unconditionally. What the
+        // row achieved was pinning every worker to an empty member list, which
+        // admits loopback alone, so the worker the getting-started page documents
+        // refused every dispatched compile with `NotAMember`.
+        NodeConfig listedWorker;
+        listedWorker.scheduler = "scheduler.internal:6675";
+        listedWorker.advertise = "worker-01.internal:6676";
+        listedWorker.fleetMembers = { "10.0.0.1:6676" };
+        CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
+
+        NodeConfig openWorker;
+        openWorker.scheduler = "scheduler.internal:6675";
+        openWorker.advertise = "worker-01.internal:6676";
+        openWorker.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
     }
 }
 
