@@ -50,6 +50,27 @@ whose session ended is worse than no label, because it reads as coverage. The br
 go stale in that way — it either exists or it does not, and GitHub already renders the link
 on the issue.
 
+### The claim is not the work
+
+A branch says what a session has **pushed**. It says nothing about what is sitting
+uncommitted in that session's worktree, and that is where work is actually lost.
+
+A branch whose tip is already an ancestor of master, with zero unique commits, looks
+from the outside like a session that did nothing. It can just as easily be a session
+holding two hundred uncommitted lines. `git log` cannot tell those apart:
+
+```
+git -C path/to/worktree status --porcelain
+```
+
+That is the check. It found #275 as eight modified files in a worktree named for #175,
+in a session that had been silent for two hours, on a branch that looked empty —
+after a check of the *commits* had already concluded nothing was at risk.
+
+So: a session that goes quiet gets its **working tree** looked at, not its branch. And
+push early, including work that is half finished. An incomplete pushed branch is
+recoverable; an unpushed one disappears with the worktree.
+
 ## Coordination protocol
 
 Each of these is a scar, not a preference.
