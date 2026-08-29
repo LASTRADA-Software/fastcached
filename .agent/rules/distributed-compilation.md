@@ -225,6 +225,31 @@ Consequences that are each load-bearing:
   either way, through the one helper `Release` and `ReleaseWorker` share: the key
   index is erased only when it still points at *this* token, and two copies of that
   guard is how one of them comes to evict the client that replaced the lease.
+- **A refusal is only ever as good as what the table it consults can SAY.**
+  `RemoteCompileArgs` refused any command line naming the input language, on sound
+  reasoning: the launcher appends "this text is preprocessed <language>" LAST so it
+  wins, and silently overriding a language the build chose is a wrong object rather
+  than a failed one. But `LanguageSelectors` recorded only *that* a language was
+  named, never *which* -- so refusing was the best answer available to it, and the
+  comment describing the language as coming from an explicit flag, then the driver
+  default, then the extension described an order only its last two thirds
+  implemented.
+  The cost was total and silent: **CMake emits `/TP` on every C++ source it compiles
+  with MSVC**, so no CMake + MSVC translation unit was ever dispatchable. The fleet
+  cached normally and distributed nothing. Nothing anywhere said so, because no lease
+  was ever *requested* -- `granted`, `no-worker` and `no-capacity` all read zero, and
+  the dashboard showed registered workers with every slot free. A fleet that has
+  never distributed anything is indistinguishable from an idle healthy one.
+  The row carries the language now, so a selector that names one is folded into the
+  language and **dropped** -- what the launcher appends says the same thing and more.
+  Three shapes, and only the first changed: a spelling that names a language is
+  dropped; `/Tc<file>` and `/Tp<file>` are still refused because they name a FILE,
+  which is the build's own source path; and an `-x` value with no exact
+  `SourceLanguage` is still refused, because guessing is how a worker comes to
+  compile something other than what was asked for.
+  The test is a **CMake-shaped** command line, not a minimal one. The hand-written
+  argv the old test used is what let this through: the refusal reads as correct on
+  `cl /c /TP a.c`, and the line CMake actually emits is the one nobody wrote down.
 - **A worker being dropped has to be an EVENT, or nothing can release what was held
   against it.** Registry expiry used to be a filter — `IsLive` hid a dead worker
   from `Pick` while its entry stayed in the map forever — so `ReleaseWorker` had no

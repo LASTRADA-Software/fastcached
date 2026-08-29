@@ -7,7 +7,9 @@
 #include <array>
 #include <expected>
 #include <format>
+#include <optional>
 #include <ranges>
+#include <utility>
 
 namespace FastCache::Cc
 {
@@ -468,16 +470,53 @@ namespace
     /// `/Tc` and `/Tp` are here for a second reason as well: they name a FILE, and
     /// with a bare file name they carry no separator, so the path filter lets them
     /// past.
-    constexpr std::array<std::pair<std::string_view, DriverFamily>, 9> LanguageSelectors { {
-        { "/TC", DriverFamily::Msvc },
-        { "-TC", DriverFamily::Msvc },
-        { "/TP", DriverFamily::Msvc },
-        { "-TP", DriverFamily::Msvc },
-        { "/Tc", DriverFamily::Msvc },
-        { "-Tc", DriverFamily::Msvc },
-        { "/Tp", DriverFamily::Msvc },
-        { "-Tp", DriverFamily::Msvc },
-        { "-x", DriverFamily::Gnu },
+    ///
+    /// Each row carries the language it names, because refusing was only ever the
+    /// best answer available to a table that could not say WHICH language (#232).
+    /// The launcher appends its own "this text is preprocessed <language>" last, and
+    /// for `/TP` that appended flag is `/TP` -- the very argument being refused. A
+    /// row whose language is known is therefore dropped rather than refused: the
+    /// appended spelling states the same language and additionally states that the
+    /// text is preprocessed, which is strictly more than the build said.
+    ///
+    /// CMake emits `/TP` on every C++ source it compiles with MSVC, so this table
+    /// refusing it meant **no CMake + MSVC translation unit was ever dispatchable**.
+    /// The fleet cached normally and distributed nothing, with every scheduler
+    /// counter at zero because no lease was ever requested.
+    struct LanguageSelector
+    {
+        std::string_view spelling; ///< As it appears on the command line.
+        DriverFamily families;     ///< Which family's spellings may match.
+        /// The language this spelling names, or nullopt when the spelling does not
+        /// carry one by itself -- `-x` takes it in a value, and `/Tp` names a file.
+        std::optional<SourceLanguage> language;
+        /// Whether the spelling attaches a FILE. Those can never be dropped: the
+        /// path is the build's own source, which must not reach a worker, and the
+        /// worker compiles a scratch file of its own name regardless.
+        bool namesAFile { false };
+    };
+
+    constexpr std::array<LanguageSelector, 9> LanguageSelectors { {
+        { .spelling = "/TC", .families = DriverFamily::Msvc, .language = SourceLanguage::C },
+        { .spelling = "-TC", .families = DriverFamily::Msvc, .language = SourceLanguage::C },
+        { .spelling = "/TP", .families = DriverFamily::Msvc, .language = SourceLanguage::Cxx },
+        { .spelling = "-TP", .families = DriverFamily::Msvc, .language = SourceLanguage::Cxx },
+        { .spelling = "/Tc", .families = DriverFamily::Msvc, .language = std::nullopt, .namesAFile = true },
+        { .spelling = "-Tc", .families = DriverFamily::Msvc, .language = std::nullopt, .namesAFile = true },
+        { .spelling = "/Tp", .families = DriverFamily::Msvc, .language = std::nullopt, .namesAFile = true },
+        { .spelling = "-Tp", .families = DriverFamily::Msvc, .language = std::nullopt, .namesAFile = true },
+        { .spelling = "-x", .families = DriverFamily::Gnu, .language = std::nullopt },
+    } };
+
+    /// What a GNU `-x` value names. Only the four plain languages: anything else
+    /// (`assembler`, `c-header`, a `-cpp-output` form) has no exact `SourceLanguage`
+    /// and keeps being refused, because guessing at it is how a worker comes to
+    /// compile something other than what the build asked for.
+    constexpr std::array<std::pair<std::string_view, SourceLanguage>, 4> GnuLanguageNames { {
+        { "c", SourceLanguage::C },
+        { "c++", SourceLanguage::Cxx },
+        { "objective-c", SourceLanguage::ObjectiveC },
+        { "objective-c++", SourceLanguage::ObjectiveCxx },
     } };
 
     /// Classify the compiler flavor from its basename.
@@ -612,19 +651,49 @@ namespace
     /// @param arg    The argument as it appeared on the command line.
     /// @param family Which family's spellings may match.
     /// @return True when the build has named the language itself.
-    [[nodiscard]] bool IsLanguageSelector(std::string_view arg, DriverFamily family)
+    [[nodiscard]] LanguageSelector const* MatchLanguageSelector(std::string_view arg, DriverFamily family)
     {
         auto const introducers = IntroducersOf(family);
         if (arg.empty() || introducers.empty() || !introducers.contains(arg.front()))
-            return false;
+            return nullptr;
         // A plain prefix test, and NOT MatchesFlag: that one only recognises a fused
         // value for a flag the path-value table knows takes one, so it reads
         // `-xc++` and `/Tcother.c` as ordinary arguments -- which is exactly how
         // they would have reached a worker.
-        return std::ranges::any_of(LanguageSelectors, [&](auto const& row) {
-            auto const& [spelling, families] = row;
-            return introducers.contains(spelling.front()) && Overlaps(families, family) && arg.starts_with(spelling);
-        });
+        // A loop rather than a named `find_if` iterator, for the reason
+        // `ClassifyCompilerImpl` records: `std::array`'s iterator is a raw pointer on
+        // libstdc++ and libc++ and a class type on MSVC, so no single spelling of the
+        // variable satisfies `readability-qualified-auto` everywhere.
+        for (LanguageSelector const& row: LanguageSelectors)
+            if (introducers.contains(row.spelling.front()) && Overlaps(row.families, family)
+                && arg.starts_with(row.spelling))
+                return &row;
+        return nullptr;
+    }
+
+    /// The language a matched selector names, given the rest of the command line.
+    ///
+    /// @param row The matched row.
+    /// @param arg The argument as it appeared, so a fused `-xc++` is readable.
+    /// @param next The following argument, for the separated `-x c++` form.
+    /// @return The language, or nullopt when this occurrence cannot be reduced to
+    ///         one -- which is a refusal rather than a guess.
+    [[nodiscard]] std::optional<SourceLanguage> LanguageNamedBy(LanguageSelector const& row,
+                                                                std::string_view arg,
+                                                                std::string_view next)
+    {
+        if (row.namesAFile)
+            return std::nullopt;
+        if (row.language.has_value())
+            return row.language;
+
+        // `-x`: the language is the value, fused (`-xc++`) or separate (`-x c++`).
+        auto const fused = arg.substr(row.spelling.size());
+        auto const value = fused.empty() ? next : fused;
+        for (auto const& [name, language]: GnuLanguageNames)
+            if (name == value)
+                return language;
+        return std::nullopt;
     }
 
     /// The ParsedCommand field a path-valued flag's value belongs in.
@@ -1025,6 +1094,29 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
     if (*language == SourceLanguage::C && CompilesEverythingAsCxx(cmd.compiler))
         language = SourceLanguage::Cxx;
 
+    // And the BUILD's own selector outranks both, which is the order the comment on
+    // `LanguageSelectors` describes and nothing implemented: `/TP` on a `.c` file
+    // means C++, whatever the extension or the driver would have said. Resolved
+    // here, before the language is used, so the flags appended below state what the
+    // build asked for rather than overriding it.
+    //
+    // A selector that cannot be reduced to a language -- one naming a FILE, or an
+    // `-x` value with no exact `SourceLanguage` -- is still refused. Refusing costs
+    // one local compile; guessing hands back an object nobody asked for.
+    for (auto const i: std::views::iota(std::size_t { 1 }, argv.size()))
+    {
+        auto const* row = MatchLanguageSelector(argv[i], driver.family);
+        if (row == nullptr)
+            continue;
+        auto const named = LanguageNamedBy(*row, argv[i], i + 1 < argv.size() ? argv[i + 1] : std::string_view {});
+        if (!named.has_value())
+            return std::unexpected(
+                std::format("the command line names the input language itself ({}) in a form this launcher cannot "
+                            "restate to a worker",
+                            argv[i]));
+        language = named;
+    }
+
     auto const preprocessedInput = PreprocessedInputFlagsFor(driver, *language);
     if (!preprocessedInput.has_value())
         return std::unexpected(
@@ -1079,15 +1171,21 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
             continue;
         }
 
-        // A language the BUILD named itself. The flags appended at the end of this
-        // function would silently override it -- they are appended last precisely
-        // so they win -- and compiling as C what a build asked to be compiled as
-        // C++ is a wrong object, not a failed one. Refused rather than reconciled,
-        // because the two spellings mean different things: the build says "this
-        // source is C++", and what must reach the worker is "this text is
-        // preprocessed C++", which is not a substitution that can be made blindly.
-        if (IsLanguageSelector(a, driver.family))
-            return std::unexpected(std::format("the command line names the input language itself ({})", a));
+        // A language the BUILD named itself, already folded into `language` above.
+        // Dropped rather than forwarded: the flags appended at the end of this
+        // function say the same thing and say more -- "this text is preprocessed
+        // <language>" rather than "this source is <language>" -- and forwarding both
+        // would leave two spellings of the input's language on one command line.
+        //
+        // The unreducible forms never reach here; the loop above refused them.
+        if (auto const* row = MatchLanguageSelector(a, driver.family))
+        {
+            // The separated `-x c++` form owns the next argument too, and leaving
+            // its value behind would hand the worker a bare `c++` to open as a file.
+            if (a == row->spelling && i + 1 < argv.size())
+                skipUntil = i + 2;
+            continue;
+        }
 
         // The positive check, and the last word. See the header: refusing the whole
         // command line is the only safe answer, because stripping an argument this

@@ -7,6 +7,7 @@
 #include <expected>
 #include <iterator>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -986,20 +987,72 @@ TEST_CASE("A `++` driver compiles .c as C++, and the worker is told so")
     }
 }
 
-TEST_CASE("A command line that names the language itself is not dispatched")
+TEST_CASE("A language the build named is restated to the worker, not refused")
 {
-    // CMake emits exactly this for `set_source_files_properties(x.c PROPERTIES
-    // LANGUAGE CXX)`. The preprocessed-input flags are appended LAST so they win,
-    // which is right when nothing else stated a language and wrong the moment
-    // something did -- it would compile as C what the build asked for as C++.
-    for (auto const& argv: { std::vector<std::string> { "cl", "/c", "/TP", "a.c", "/Foa.obj" },
-                             std::vector<std::string> { "cl", "/c", "/TC", "a.cpp", "/Foa.obj" },
-                             std::vector<std::string> { "g++", "-c", "-x", "c++", "a.c", "-o", "a.o" },
-                             std::vector<std::string> { "clang", "-c", "-xc++", "a.c", "-o", "a.o" } })
+    // #232. CMake emits `/TP` on EVERY C++ source it compiles with MSVC, and this
+    // used to be a refusal -- so no CMake + MSVC translation unit was dispatchable
+    // at all. The fleet cached normally and distributed nothing, with every
+    // scheduler counter reading zero because no lease was ever requested.
+    //
+    // The refusal was the best answer available to a table that recorded only THAT
+    // a language was named, never WHICH. Now the row carries the language, so the
+    // flag is folded into the language and dropped -- and what the launcher appends
+    // says the same thing and more: "this text is preprocessed C++" rather than
+    // "this source is C++".
+    struct Case
+    {
+        std::vector<std::string> argv;
+        std::string_view spelling; ///< The appended flag that must end the line.
+        std::string_view value;    ///< Its value for a GNU driver; empty for MSVC.
+    };
+
+    // Every case names a language the EXTENSION contradicts, which is the whole
+    // point: if the flag were ignored rather than read, the appended spelling would
+    // be the extension's answer and the worker would compile the wrong language.
+    for (auto const& [argv, spelling, value]:
+         { Case { .argv = { "cl", "/c", "/TP", "a.c", "/Foa.obj" }, .spelling = "/TP", .value = "" },
+           Case { .argv = { "cl", "/c", "/TC", "a.cpp", "/Foa.obj" }, .spelling = "/TC", .value = "" },
+           Case { .argv = { "g++", "-c", "-x", "c", "a.cpp", "-o", "a.o" }, .spelling = "-x", .value = "cpp-output" },
+           Case { .argv = { "clang", "-c", "-xc++", "a.c", "-o", "a.o" }, .spelling = "-x", .value = "c++-cpp-output" } })
     {
         auto const cmd = ParseCommand(argv);
         auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
-        INFO("driver: " << argv.front());
+        INFO("driver: " << argv.front() << " selector: " << spelling);
+        REQUIRE(parsed.has_value());
+        auto const& out = Unwrap(parsed);
+
+        if (value.empty())
+        {
+            CHECK(out.back() == spelling);
+            // ONE occurrence: the build's own copy was dropped rather than
+            // forwarded, so the worker is not handed the language twice.
+            CHECK(std::ranges::count(out, spelling) == 1);
+        }
+        else
+        {
+            REQUIRE(out.size() >= 2);
+            CHECK(out.back() == value);
+            CHECK(out.at(out.size() - 2) == spelling);
+            CHECK(std::ranges::count(out, spelling) == 1);
+            // The separated form's value went with it. Left behind, a bare `c++`
+            // is an argument the worker would try to open as a file.
+            CHECK(std::ranges::count(out, "c++") == 0);
+            CHECK(std::ranges::count(out, "c") == 0);
+        }
+    }
+}
+
+TEST_CASE("A language selector this launcher cannot restate is still refused")
+{
+    // The half that must not change. `-x assembler` has no `SourceLanguage`, so
+    // there is no "this text is preprocessed <language>" to append -- and guessing
+    // hands back an object nobody asked for, which is worse than a local compile.
+    for (auto const& argv: { std::vector<std::string> { "g++", "-c", "-x", "assembler", "a.cpp", "-o", "a.o" },
+                             std::vector<std::string> { "clang", "-c", "-xc-header", "a.c", "-o", "a.o" } })
+    {
+        auto const cmd = ParseCommand(argv);
+        auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+        INFO("argv: " << argv.at(2));
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().contains("names the input language itself"));
     }
@@ -1010,6 +1063,43 @@ TEST_CASE("A command line that names the language itself is not dispatched")
     std::vector<std::string> const named { "cl", "/c", "/Tcother.c", "/Foa.obj", "a.c" };
     auto const namedCmd = ParseCommand(named);
     CHECK_FALSE(RemoteCompileArgs(namedCmd, named, /*targetTriple=*/ {}).has_value());
+}
+
+TEST_CASE("A CMake-shaped MSVC command line is dispatchable")
+{
+    // The shape that actually broke, written the way CMake writes it rather than
+    // the way a test author would. The hand-written argv above is what let #232
+    // through review: the refusal reads as correct on a minimal line, and CMake
+    // puts `/TP` on every C++ source it compiles.
+    std::vector<std::string> const argv { "cl",
+                                          "/nologo",
+                                          "/TP",
+                                          "-DWIN32",
+                                          "-D_WINDOWS",
+                                          "-DNDEBUG",
+                                          "/EHsc",
+                                          "/O2",
+                                          "/MD",
+                                          "-std:c++23",
+                                          "/FoCMakeFiles\tgt.dir\a.cpp.obj",
+                                          "/c",
+                                          "a.cpp" };
+
+    auto const cmd = ParseCommand(argv);
+    auto const parsed = RemoteCompileArgs(cmd, argv, /*targetTriple=*/ {});
+    REQUIRE(parsed.has_value());
+    auto const& out = Unwrap(parsed);
+
+    // Dispatchable, and the language survives as the appended spelling.
+    CHECK(out.back() == "/TP");
+    CHECK(std::ranges::count(out, "/TP") == 1);
+
+    // The flags that change generated code still travel; the object path and the
+    // source do not, because both are the worker's to name.
+    CHECK(std::ranges::count(out, "/EHsc") == 1);
+    CHECK(std::ranges::count(out, "-std:c++23") == 1);
+    CHECK(std::ranges::count(out, "a.cpp") == 0);
+    CHECK(std::ranges::none_of(out, [](std::string const& a) { return a.starts_with("/Fo"); }));
 }
 
 TEST_CASE("A module interface unit is never dispatched, whatever the driver")
