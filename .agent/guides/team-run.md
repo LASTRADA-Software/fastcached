@@ -164,3 +164,25 @@ unverified; a developer who cannot reproduce one reports back rather than "fixin
 Then: Catch2 tests next to the implementation, `clang-format` and `clang-tidy` at the
 version CI pins in a build directory of their own, and CI green. Prove a regression test
 fails without the fix, not merely that it passes with it.
+
+### Sweeping clang-tidy
+
+A skipped file and a clean file look identical in the output, so the sweep has to be
+built to distinguish them:
+
+- Derive the file list from `git diff --name-only origin/master...HEAD`, never from a
+  list you maintain by hand.
+- **Fail loudly on any file absent from `compile_commands.json`** rather than skipping it.
+- Canary that clang-tidy actually executed. A sweep that could not run reads exactly like
+  a clean one — the same trap `scripts/tidy-sweep.sh` guards in CI.
+
+Beware any rule whose last clause tells you which files you may skip. One session swept
+three of five changed files, having recorded that "production sources are where the
+findings actually land"; the finding was in a test file, and it reported clean. The
+comfortable generalisation is the part that fails.
+
+Satisfying the linter is not the same as taking its suggestion. `return { 8 * 1024, 'A' }`
+compiles only because `8192` narrows and makes `std::string`'s `initializer_list<char>`
+candidate non-viable — change the value to one that fits in a `char` and it silently
+becomes a two-character string. `NOLINT` is banned here because the fix is meant to be a
+thought.
