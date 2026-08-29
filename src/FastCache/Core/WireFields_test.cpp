@@ -270,3 +270,38 @@ TEST_CASE("Text survives the byte reinterpretation unchanged", "[core][wirefield
     REQUIRE(text.size() == 3);
     CHECK(WireFields::AsStringView(WireFields::AsBytes(text)) == text);
 }
+
+TEST_CASE("DeclaredCountFits refuses a count the remaining bytes cannot supply")
+{
+    // The guard behind issue #267, checked here rather than only through its callers,
+    // because it is now reachable by every decoder that shares this grammar.
+
+    // The shape that mattered: a huge count against almost no bytes.
+    CHECK_FALSE(WireFields::DeclaredCountFits(0xFFFFFFFFULL, 5, 0));
+    CHECK_FALSE(WireFields::DeclaredCountFits(0xFFFFFFFFULL, 5, 4));
+
+    // The boundary, from both sides: `remaining / minBytesEach` and one past it.
+    CHECK(WireFields::DeclaredCountFits(2, 5, 10));
+    CHECK_FALSE(WireFields::DeclaredCountFits(3, 5, 10));
+    CHECK(WireFields::DeclaredCountFits(2, 5, 14)); // 14/5 == 2, integer division
+    CHECK_FALSE(WireFields::DeclaredCountFits(3, 5, 14));
+
+    // Zero elements need no bytes, which is the ordinary empty list.
+    CHECK(WireFields::DeclaredCountFits(0, 5, 0));
+
+    // It DIVIDES rather than multiplying. `count * minBytesEach` overflows here --
+    // 0x2000000000000000 * 8 wraps a 64-bit product to zero, so a multiplying check
+    // would call this achievable in eight bytes, which is exactly the value class the
+    // guard exists to refuse.
+    constexpr std::uint64_t Overflowing = 0x2000000000000000ULL;
+    static_assert(Overflowing * 8 == 0, "the multiplying spelling wraps, which is why this one divides");
+    CHECK_FALSE(WireFields::DeclaredCountFits(Overflowing, 8, 8));
+
+    // A zero per-element cost would make every count "achievable", so it is refused
+    // rather than treated as unbounded.
+    CHECK_FALSE(WireFields::DeclaredCountFits(1, 0, 1000));
+
+    // And it is constexpr, so a decoder can fold the check where the count is known.
+    static_assert(WireFields::DeclaredCountFits(2, 5, 10));
+    static_assert(!WireFields::DeclaredCountFits(3, 5, 10));
+}

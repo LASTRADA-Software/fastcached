@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <array>
 #include <ranges>
@@ -12,6 +13,16 @@ namespace
 {
 
     constexpr std::uint8_t CompileValueVersion = 1;
+
+    /// The fewest wire bytes one encoded text region can occupy: its grammar tag and
+    /// its length prefix, with empty text. Read straight off `EncodeCompileValue`'s
+    /// loop below, and pinned against it by a test that encodes one empty region and
+    /// measures the difference -- so a field added to that loop fails a test rather
+    /// than quietly weakening the guard this feeds.
+    ///
+    /// Spelled with `FieldPrefixSize` rather than a literal 4, which would restate the
+    /// framing contract beside the one place it is defined.
+    constexpr std::size_t MinRegionBytes = sizeof(std::uint8_t) + WireFields::FieldPrefixSize;
 
     /// The grammar tags that DecodeCompileValue accepts. Kept in sync with
     /// PathCanon::Grammar; an out-of-range tag is a malformed frame.
@@ -156,7 +167,15 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     if (!cursor.ReadU32(regionCount))
         return Malformed("truncated region count");
 
-    value.textRegions.reserve(regionCount);
+    // The count is a claim about bytes this frame must already carry -- see
+    // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
+    // before anything is sized from it (issue #267).
+    if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
+        return Malformed("region count exceeds what the remaining bytes can supply");
+
+    // No `reserve(regionCount)`: a validated count is still an amplifier, and the
+    // realistic count here is one per grammar, so growing from the regions actually
+    // decoded costs nothing measurable beside the object blob copied just above.
     for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
     {
         std::uint8_t grammarTag {};

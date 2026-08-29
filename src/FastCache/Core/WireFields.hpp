@@ -65,6 +65,53 @@ inline constexpr std::uint64_t MaxPayload = 0xFFFFFFFFULL;
 /// Bytes a field costs before its contents: its length prefix.
 inline constexpr std::size_t FieldPrefixSize = sizeof(std::uint32_t);
 
+/// Whether a peer's declared element count is achievable in the bytes that remain.
+///
+/// **A declared count is a claim about bytes the frame must already contain.** It is
+/// not a request, and it is not a size to allocate from -- it is an assertion that can
+/// be checked, because every element costs at least some fixed number of bytes in this
+/// grammar and the frame either carries them or it does not. It sits beside
+/// `FieldPrefixSize` because that constant is usually the answer to @p minBytesEach.
+///
+/// This is the rule behind issue #267. Three decoders reserved container capacity from
+/// a `u32` count with no such check, and the worst of them turned a **nine-byte** frame
+/// into a request for roughly 172 GB -- reachable on the daemon's STORE path and from a
+/// worker's reply to the launcher. `Protocol/CompileCacheWire.hpp` states the same
+/// intent for a codec envelope's expansion field: the number exists so a decoder can
+/// refuse an impossible claim before it allocates.
+///
+/// **It REFUSES; it does not clamp.** A clamping variant -- `reserve(min(count, cap))`
+/// -- keeps a frame that is provably malformed alive and merely makes its allocation
+/// smaller, so the decode fails later, deeper in, having already committed memory. The
+/// refusal is the useful answer, and it is available to the caller precisely because
+/// this returns a `bool` rather than a size. It also takes a REAL per-element cost
+/// rather than assuming one byte, which is what makes the bound `remaining /
+/// minBytesEach` instead of `remaining`.
+///
+/// **Necessary, and on its own not sufficient.** It bounds a count by the bytes
+/// present, which still permits amplification when an in-memory element is much larger
+/// than its wire minimum. A decoder therefore validates the claim with this AND sizes
+/// any reservation from something it owns -- the bytes in hand, or its own configured
+/// ceiling -- never from the peer's number alone.
+///
+/// The division is deliberate and is not a rearrangement of `count * minBytesEach`,
+/// which is the overflowing spelling: at `u32` counts and any element size above one
+/// byte the product wraps a 32-bit type and can wrap a 64-bit one, so the check would
+/// pass on exactly the values it exists to refuse.
+///
+/// @param count The count the peer declared.
+/// @param minBytesEach The fewest wire bytes one element can occupy; must be non-zero,
+///        since a zero-cost element would make every count "achievable" and defeat the
+///        check.
+/// @param remaining Bytes left in the frame at the point the count was read.
+/// @return True when the frame could actually carry that many elements.
+[[nodiscard]] constexpr bool DeclaredCountFits(std::uint64_t count, std::size_t minBytesEach, std::size_t remaining) noexcept
+{
+    if (minBytesEach == 0)
+        return false;
+    return count <= remaining / minBytesEach;
+}
+
 // The byte/text reinterpretation is `Core/Bytes.hpp`'s, re-exported so a caller
 // working in this grammar has one name for it rather than two spellings of the
 // same `reinterpret_cast` in scope at once.

@@ -1,25 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
 namespace
 {
 
+    /// The fewest wire bytes one encoded key can occupy: its length prefix, with an
+    /// empty key. Read off `EncodeKeyList` below, and spelled with `FieldPrefixSize`
+    /// rather than a literal 4, which would restate the framing contract beside the
+    /// one place it is defined.
+    constexpr std::size_t MinKeyBytes = WireFields::FieldPrefixSize;
+
     /// Decode a length-prefixed key list (`[u32 count]{ [u32 len][bytes] }*`) from
-    /// the manifest value bytes. A malformed/short buffer yields the keys decoded
-    /// so far (best-effort; the manifest is metadata, not client data).
+    /// the manifest value bytes.
+    ///
+    /// A buffer that runs out *mid-list* yields the keys decoded so far -- best
+    /// effort, because a manifest is a prefetch hint and a truncated one merely
+    /// prefetches less. Bytes that are **not a key list at all** are different in kind
+    /// and yield nothing: a value too short to hold the count field, or one declaring
+    /// a count its remaining bytes cannot supply. Those are not bytes this build
+    /// wrote, and the caller has to be able to tell that apart from an empty group,
+    /// because on the write path the two lead to opposite actions (issue #267).
     /// @param bytes Encoded manifest value.
-    /// @return The decoded keys.
-    [[nodiscard]] std::vector<std::string> DecodeKeyList(std::span<std::byte const> bytes)
+    /// @return The decoded keys, or nullopt when the value is not a manifest.
+    [[nodiscard]] std::optional<std::vector<std::string>> DecodeKeyList(std::span<std::byte const> bytes)
     {
         std::vector<std::string> keys;
         std::size_t pos = 0;
@@ -33,8 +50,22 @@ namespace
 
         std::uint32_t count {};
         if (!readU32(count))
-            return keys;
-        keys.reserve(count);
+            // Not even a count field. `EncodeKeyList` always writes one, so these are
+            // no more this build's bytes than an impossible count is -- and answering
+            // with an empty list here would leave `AddKey` overwriting them, which is
+            // exactly the hole the count check below closes.
+            return std::nullopt;
+
+        // The count is a claim about bytes this value must already carry -- see
+        // `WireFields::DeclaredCountFits` (issue #267).
+        if (!WireFields::DeclaredCountFits(count, MinKeyBytes, bytes.size() - pos))
+            return std::nullopt;
+
+        // Reserved against THIS BUILD's own cap rather than the peer's number: a group
+        // legitimately runs to `MaxKeysPerGroup`, and this decode happens inside every
+        // STORE's read-modify-write, so growing a hundred thousand strings one
+        // reallocation at a time is the one cost here big enough to measure.
+        keys.reserve(std::min<std::size_t>(count, PrefetchGroupManifest::MaxKeysPerGroup));
         for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, count))
         {
             std::uint32_t len {};
@@ -121,7 +152,20 @@ std::expected<bool, StorageError> PrefetchGroupManifest::AddKey(std::string_view
         [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
             std::vector<std::string> keys;
             if (current.found)
-                keys = DecodeKeyList(current.entry.ValueBytes());
+            {
+                auto decoded = DecodeKeyList(current.entry.ValueBytes());
+                if (!decoded.has_value())
+                    // Refused, never overwritten. Treating an undecodable manifest as
+                    // an empty one would have this STORE replace the whole group with
+                    // a one-key list -- destroying data on the strength of bytes we
+                    // just decided we do not understand. The read path answers the
+                    // same way, so one value cannot be a refusal on FETCH and a fresh
+                    // start on STORE.
+                    return std::unexpected(StorageError { .code = StorageErrorCode::Corrupt,
+                                                          .systemCode = 0,
+                                                          .context = "prefetch-group manifest is not decodable" });
+                keys = *std::move(decoded);
+            }
 
             // Idempotent: do not duplicate a key already recorded.
             if (std::ranges::find(keys, key) != keys.end())
@@ -178,7 +222,16 @@ std::expected<std::vector<std::string>, StorageError> PrefetchGroupManifest::Key
         return std::unexpected(got.error());
     if (!got->found)
         return std::vector<std::string> {};
-    return DecodeKeyList(got->entry.ValueBytes());
+
+    auto decoded = DecodeKeyList(got->entry.ValueBytes());
+    if (!decoded.has_value())
+        // `Corrupt` is exactly the enumerator for "this store holds bytes this build
+        // did not write", and it is a distinct answer from the empty list an unknown
+        // group returns -- which is the distinction that makes the refusal visible
+        // rather than looking like a cold prefetch group.
+        return std::unexpected(StorageError {
+            .code = StorageErrorCode::Corrupt, .systemCode = 0, .context = "prefetch-group manifest is not decodable" });
+    return *std::move(decoded);
 }
 
 } // namespace FastCache

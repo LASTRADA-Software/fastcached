@@ -2,6 +2,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
@@ -27,6 +28,16 @@ namespace
     /// Manifest wire version. Bumped whenever the encoding changes shape, so an
     /// older launcher rejects a newer manifest instead of misreading it.
     constexpr std::uint8_t ManifestVersion = 1;
+
+    /// The fewest wire bytes one encoded entry can occupy: the two length prefixes of
+    /// its canonical path and content hash, both empty. Read off `EncodeManifest`'s
+    /// loop, and pinned against it by a test that encodes one empty entry and measures
+    /// the difference -- so a field added to that loop fails a test rather than quietly
+    /// weakening the guard this feeds.
+    ///
+    /// Spelled with `FieldPrefixSize` rather than a literal 4, which would restate the
+    /// framing contract beside the one place it is defined.
+    constexpr std::size_t MinEntryBytes = 2 * WireFields::FieldPrefixSize;
 
     /// Path prefixes whose headers are treated as immutable toolchain content.
     /// Matched case-insensitively: Windows paths reach us in whatever case the
@@ -116,9 +127,10 @@ namespace
             return true;
         }
 
-        [[nodiscard]] bool AtEnd() const noexcept
+        /// @return Bytes not yet consumed.
+        [[nodiscard]] std::size_t Remaining() const noexcept
         {
-            return _offset == _bytes.size();
+            return _bytes.size() - _offset;
         }
 
       private:
@@ -240,7 +252,19 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     if (!cursor.ReadU32(count))
         return std::unexpected(DirectError::Malformed);
 
-    manifest.entries.reserve(count);
+    // The count is a claim about bytes this blob must already carry -- see
+    // `WireFields::DeclaredCountFits` (issue #267). The bytes come off the network:
+    // the launcher fetches this manifest from the cache server, so the number is a
+    // peer's rather than its own.
+    if (!WireFields::DeclaredCountFits(count, MinEntryBytes, cursor.Remaining()))
+        return std::unexpected(DirectError::Malformed);
+
+    // Reserved from what the BYTES IN HAND could hold, never from the peer's count
+    // alone. A real entry costs ~75-110 wire bytes against 64 in memory, so this is a
+    // no-op for honest manifests -- which run to hundreds of entries for one C++
+    // translation unit, and are worth reserving for -- while a minimum-size hostile
+    // blob is clamped to at most its own size rather than eight times it.
+    manifest.entries.reserve(std::min<std::size_t>(count, cursor.Remaining() / sizeof(DirectManifest::Entry)));
     for (std::uint32_t index = 0; index < count; ++index)
     {
         DirectManifest::Entry entry;
@@ -251,7 +275,7 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
 
     // Trailing bytes mean the encoding is not what this version wrote; refuse it
     // rather than silently ignoring a field a newer writer appended.
-    if (!cursor.AtEnd())
+    if (cursor.Remaining() != 0)
         return std::unexpected(DirectError::Malformed);
 
     return manifest;
