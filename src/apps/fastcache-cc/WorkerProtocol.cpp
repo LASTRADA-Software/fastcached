@@ -3,7 +3,6 @@
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
-#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
@@ -20,24 +19,6 @@ namespace FastCache::Cc
 namespace
 {
     namespace Wire = CompileCacheWire;
-
-    /// Undo a codec envelope, refusing anything this worker cannot decode.
-    [[nodiscard]] std::optional<std::string> Unenvelope(std::span<std::byte const> field)
-    {
-        auto const envelope = Wire::DecodeCodecEnvelope(field);
-        if (!envelope.has_value())
-            return std::nullopt;
-        if (envelope->codec == Wire::IdentityCodec)
-            return std::string { Wire::AsStringView(envelope->bytes) };
-
-        auto const codec = static_cast<CompressionCodec>(envelope->codec);
-        if (!Compression::IsAvailable(codec))
-            return std::nullopt;
-        auto const decoded = Compression::Decompress(codec, envelope->bytes, envelope->rawLength);
-        if (!decoded.has_value())
-            return std::nullopt;
-        return std::string { Wire::AsStringView(*decoded) };
-    }
 
     /// What one refusal means on the wire and in the metrics.
     ///
@@ -99,11 +80,13 @@ namespace
 WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
-                               IMetricsSink& metrics):
+                               IMetricsSink& metrics,
+                               std::size_t maxDecompressedBytes):
     _jobs { jobs },
     _validator { std::move(validator) },
     _acceptedCodecs { std::move(acceptedCodecs) },
-    _metrics { metrics }
+    _metrics { metrics },
+    _maxDecompressedBytes { maxDecompressedBytes }
 {
 }
 
@@ -150,10 +133,23 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     if (_validator && !_validator(token, fingerprint))
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {});
 
-    auto source = Unenvelope(fields->source);
+    // Opened AFTER the lease check and BEFORE any expensive work, and refused on the
+    // DECLARED decompressed length rather than on what it expands to -- see
+    // `Unenvelope`, which carries the reasoning.
+    //
+    // A REPLY, never a close: the frame declared its own length, so the connection is
+    // still synchronised and a peer that guessed wrong learns which.
+    //
+    // `UnenvelopeText`, not `Unenvelope`: the runner wants a `std::string`, and the
+    // `Identity` path -- the only codec a node negotiates -- would otherwise copy a
+    // whole preprocessed translation unit into a `std::vector<std::byte>` on the way.
+    auto source = UnenvelopeText(fields->source, _maxDecompressedBytes);
     if (!source.has_value())
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedCodec,
-                                      "the preprocessed source is in a codec this worker cannot decode");
+        // Code and text come from ONE row rather than a ternary beside a lookup: a
+        // malformed frame answered `UnsupportedCodec` while its message said
+        // "malformed" would send an operator hunting a codec mismatch that never
+        // happened.
+        return Wire::EncodeErrorReply(WireCodeFor(source.error()), DescribeEnvelopeError(source.error()));
 
     // Counted around the runner rather than inside it: the runner is a seam with
     // its own fakes, and a fake that forgot to count would make every test agree
@@ -163,6 +159,10 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 
     auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
                                                 .args = DecodeArgs(fields->args),
+                                                // NOT `auto const source` above, for the reason
+                                                // `CodecEnvelope` records: `*std::move(x)` on a
+                                                // `const expected` is a `T const&&`, which binds
+                                                // to the COPY constructor with no diagnostic.
                                                 .preprocessed = *std::move(source),
                                                 // Sanitized where it becomes a path, not here: the
                                                 // runner is what creates the file, so the check

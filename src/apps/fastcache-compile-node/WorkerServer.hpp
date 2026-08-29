@@ -20,6 +20,21 @@
 namespace FastCache::Node
 {
 
+/// Largest request this worker surface will buffer.
+///
+/// A COMPILE carries a preprocessed translation unit, which for real C++ runs to
+/// several megabytes; 256 MiB is far above any of them and matches the daemon's own
+/// default value ceiling. It exists so a peer cannot declare a length this worker
+/// would try to allocate.
+///
+/// **Exported rather than file-local because a second party needs the same figure.**
+/// `Cc::WorkerProtocol` refuses a codec envelope whose *declared decompressed* size
+/// exceeds this surface's ceiling, and it cannot see the listener that enforced the
+/// frame length — so the surface has to hand it the number. Left to each side's own
+/// constant, the two are two literals that must agree forever, and lowering one
+/// silently stops bounding the other.
+inline constexpr std::size_t WorkerMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
+
 /// Accepts connections and answers each with one compile.
 ///
 /// Shaped after `AdminHttpServer` rather than `Server`, and for the reason that

@@ -5,11 +5,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -134,6 +139,129 @@ TEST_CASE("A worker refuses every verb but COMPILE", "[worker-protocol]")
         REQUIRE(answer.has_value());
         CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::DispatchNotPermitted);
     }
+}
+
+TEST_CASE("A codec envelope declaring more than the cap is refused before it is decompressed", "[worker-protocol]")
+{
+    // Issue #241. `Compression::Decompress` VALUE-INITIALIZES a buffer of the declared
+    // size, so the pages are touched rather than lazily reserved -- and that size is a
+    // `u32` read straight off the wire, with no enforced relation to the compressed
+    // bytes beside it. A frame of a few dozen bytes therefore drove a multi-gigabyte
+    // allocation, and the listener's in-flight byte budget charged only the FRAME
+    // length, so it passed admission unnoticed.
+    //
+    // `CompileCacheWire.hpp` already said this is what `rawLen` is for: it "lets a
+    // decoder reject a payload whose declared expansion exceeds its cap before
+    // decompressing a byte". No decoder in the tree did.
+    Fixture fix;
+
+    // A non-Identity codec, so the payload takes the decompressing path, declaring the
+    // largest expansion the field can hold.
+    constexpr std::uint32_t FourGiB = 0xFFFFFFFFU;
+    std::array<std::byte, 16> const payload { std::byte { 0x41 } };
+    auto const bomb = Wire::EncodeCodecEnvelope(/*codec=*/1, FourGiB, payload);
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = bomb,
+                                                                  .acceptedCodecs = { Wire::IdentityCodec },
+                                                                  .sourceName = "a.cpp" });
+    // The entire hostile frame is smaller than the header of what it asked this worker
+    // to allocate. That is the amplification, stated as an assertion.
+    CHECK(frame.size() < 128);
+
+    auto const answer = fix.worker.Answer(frame);
+    // A REPLY, never a close: the frame declared its own length, so the connection is
+    // still synchronised and the peer learns which of its fields was refused.
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::PayloadTooLarge);
+
+    // Nothing downstream ever saw the frame.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+}
+
+TEST_CASE("An Identity envelope may not lie about the size of the bytes beside it", "[worker-protocol]")
+{
+    // The Identity path never reaches `Decompress`, so it never reached that
+    // function's own length check either -- it could declare any size at all next to
+    // any payload. That is not an allocation, but it is a field describing bytes it
+    // does not describe, and the next receiver to believe it is the next defect.
+    Fixture fix;
+
+    std::array<std::byte, 16> const payload { std::byte { 0x41 } };
+    auto const liar = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 0xFFFFFFFFU, payload);
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = liar,
+                                                                  .acceptedCodecs = { Wire::IdentityCodec },
+                                                                  .sourceName = "a.cpp" });
+    auto const answer = fix.worker.Answer(frame);
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::PayloadTooLarge);
+
+    // A modest overstatement is refused too, and as a different fact: it is within the
+    // cap, so what is wrong with it is the disagreement rather than the size -- and it
+    // is answered `malformed-frame`, not `unsupported-codec`. The codec was never in
+    // question, and a refusal whose code and message disagree sends an operator
+    // hunting a codec mismatch that never happened.
+    auto const modest = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 64, payload);
+    auto const modestFrame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                        .fingerprint = "gcc-13",
+                                                                        .args = {},
+                                                                        .source = modest,
+                                                                        .acceptedCodecs = { Wire::IdentityCodec },
+                                                                        .sourceName = "a.cpp" });
+    auto const modestAnswer = fix.worker.Answer(modestFrame);
+    REQUIRE(modestAnswer.has_value());
+    CHECK(ErrorOf(Unwrap(modestAnswer)) == Wire::ErrorCode::MalformedFrame);
+}
+
+TEST_CASE("An envelope refusal's wire code and its message are one fact", "[worker-protocol]")
+{
+    // They come from one table row, never a ternary beside a lookup. This was a
+    // ternary, and it answered `unsupported-codec` for a malformed envelope while the
+    // message said "malformed" -- a refusal that sends an operator hunting a codec
+    // mismatch that never happened. The rule this file already states for
+    // `RefusalTable` applies one layer in.
+    CHECK(WireCodeFor(EnvelopeError::Malformed) == Wire::ErrorCode::MalformedFrame);
+    CHECK(WireCodeFor(EnvelopeError::UnsupportedCodec) == Wire::ErrorCode::UnsupportedCodec);
+    CHECK(WireCodeFor(EnvelopeError::DeclaredTooLarge) == Wire::ErrorCode::PayloadTooLarge);
+    CHECK(WireCodeFor(EnvelopeError::Corrupt) == Wire::ErrorCode::MalformedFrame);
+
+    // Every reason says something, and no two say the same thing -- a description
+    // shared between reasons is one an operator cannot act on.
+    std::vector<std::string_view> seen;
+    for (auto const reason: { EnvelopeError::Malformed,
+                              EnvelopeError::UnsupportedCodec,
+                              EnvelopeError::DeclaredTooLarge,
+                              EnvelopeError::Corrupt })
+    {
+        auto const text = DescribeEnvelopeError(reason);
+        CHECK_FALSE(text.empty());
+        CHECK(std::ranges::find(seen, text) == seen.end());
+        seen.push_back(text);
+    }
+}
+
+TEST_CASE("The envelope ceiling is the surface's own, not a figure this class assumed", "[worker-protocol]")
+{
+    // Passed in rather than baked in: this class never sees the listener that enforced
+    // the frame length, so a listener with a smaller request cap has to say so or the
+    // two disagree about how much memory one request may cost.
+    StubRunner runner;
+    FastCache::Testing::ScratchDirectory const scratch { "fc-wp" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    AtomicMetricsSink metrics;
+    constexpr std::size_t TinyCap = 8;
+    WorkerProtocol worker {
+        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics, TinyCap
+    };
+
+    // Well under the default ceiling, and over this worker's.
+    auto const answer = worker.Answer(CompileFrame("gcc-13", "int main(){return 0;}"));
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::PayloadTooLarge);
 }
 
 TEST_CASE("A foreign magic is the one case that closes rather than replies", "[worker-protocol]")

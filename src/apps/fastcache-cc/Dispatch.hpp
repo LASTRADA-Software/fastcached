@@ -2,12 +2,14 @@
 #pragma once
 
 #include "CacheProtocol.hpp"
+#include "CodecEnvelope.hpp"
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <span>
 #include <string>
 #include <string_view>
@@ -107,6 +109,14 @@ struct DispatchBudgets
 
     /// The worker's COMPILE: as long as a compiler runs.
     ExchangeBudget compile { .total = DefaultDispatchTotal };
+
+    /// Ceiling on the object a worker may declare its reply expands to.
+    ///
+    /// A byte budget beside the two time budgets, because it bounds the same thing
+    /// they do — what one exchange may cost this process — and a peer's declared
+    /// decompressed length is the one figure in a reply that decides an allocation
+    /// before any of it is validated.
+    std::size_t maxDecompressedBytes { DefaultMaxDecompressedBytes };
 };
 
 /// How a dispatch attempt ended.
