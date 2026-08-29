@@ -1,12 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
 namespace FastCache
 {
+
+/// Encode bytes as standard base64 (RFC 4648 §4), always padded.
+///
+/// The exact inverse of `Base64Decode` below, and written beside it for that
+/// reason: an encoder and a decoder that disagree about the alphabet or about
+/// padding is the failure a shared table exists to prevent, and it is invisible
+/// until something round-trips through a peer built from the other half.
+///
+/// **Always padded, and always the standard alphabet.** The decoder refuses an
+/// unpadded input and refuses `-`/`_`, so an encoder that produced either would
+/// emit something this project cannot read back. There is deliberately no
+/// URL-safe variant: two spellings of one value is what makes a MAC over that
+/// value checkable in one form and not the other.
+/// @param bytes What to encode.
+/// @return The encoded text; empty for empty input.
+[[nodiscard]] std::string Base64Encode(std::span<std::byte const> bytes);
 
 /// Decode standard base64 (RFC 4648 §4), padding required.
 ///

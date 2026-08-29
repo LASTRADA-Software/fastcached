@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Base64.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -17,12 +18,19 @@ namespace
     /// A table rather than four range comparisons per character: the ladder form
     /// has to spell the alphabet's boundaries four times, and the offsets are
     /// exactly the kind of arithmetic that is wrong by one in only one branch.
+    /// The one alphabet, shared by both directions.
+    ///
+    /// Named once rather than spelled in each function: an encoder and a decoder
+    /// holding two copies of these sixty-four characters is two chances to get one
+    /// of them wrong, and the failure only shows up when a value crosses between
+    /// two builds.
+    constexpr std::string_view Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
     consteval std::array<std::uint8_t, 256> BuildDecodeTable()
     {
         std::array<std::uint8_t, 256> table {};
         for (auto& entry: table)
             entry = Invalid;
-        constexpr std::string_view Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for (std::size_t i = 0; i < Alphabet.size(); ++i)
             table[static_cast<unsigned char>(Alphabet[i])] = static_cast<std::uint8_t>(i);
         return table;
@@ -30,6 +38,36 @@ namespace
 
     constexpr auto DecodeTable = BuildDecodeTable();
 } // namespace
+
+std::string Base64Encode(std::span<std::byte const> bytes)
+{
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+
+    for (std::size_t i = 0; i < bytes.size(); i += 3)
+    {
+        // How many of this group's three input bytes actually exist. The final
+        // group is the only short one, and the count drives both how many symbols
+        // are emitted and how many `=` follow -- computed once rather than
+        // branched on twice, which is where the two traditionally disagree.
+        auto const present = std::min<std::size_t>(3, bytes.size() - i);
+
+        std::uint32_t group = 0;
+        for (std::size_t j = 0; j < 3; ++j)
+            group = (group << 8) | (j < present ? std::to_integer<std::uint32_t>(bytes[i + j]) : 0);
+
+        // Three input bytes are four symbols; two are three; one is two. The spare
+        // low bits of a short group are zero because they were shifted in as zero
+        // above, which is exactly the property `Base64Decode` refuses an input for
+        // getting wrong.
+        for (std::size_t j = 0; j < present + 1; ++j)
+            out.push_back(Alphabet[(group >> (18 - (6 * j))) & 0x3F]);
+        for (std::size_t j = present + 1; j < 4; ++j)
+            out.push_back('=');
+    }
+
+    return out;
+}
 
 std::optional<std::string> Base64Decode(std::string_view text)
 {
