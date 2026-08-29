@@ -106,22 +106,35 @@ TEST_CASE("DecodeManifest rejects a length field that overruns the buffer")
     CHECK(decoded.error() == DirectError::Malformed);
 }
 
+namespace
+{
+/// A manifest blob declaring `count` entries and carrying `trailing` bytes after the
+/// header for them to be decoded from.
+[[nodiscard]] std::string BlobDeclaring(std::uint32_t count, std::size_t trailing)
+{
+    std::string out;
+    out.push_back('');  // version
+    out.append(4, '\0'); // toolchainStamp: empty
+    out.append(4, '\0'); // objectKey: empty
+    for (auto const shift: { 24, 16, 8, 0 })
+        out.push_back(static_cast<char>((count >> shift) & 0xFFU));
+    out.append(trailing, '\0');
+    return out;
+}
+} // namespace
+
 TEST_CASE("DecodeManifest refuses an entry count the blob cannot supply")
 {
-    // Issue #267's class, third site. The test above proves a length field cannot
+    // Issue #267's class, third site. The case above proves a length field cannot
     // overrun the buffer; this proves a COUNT field cannot either, which is a
     // different question and was unguarded. This reserved straight from the `u32`
     // before reading a single entry, and an `Entry` is two `std::string`s -- sixty-four
-    // bytes in memory against eight on the wire -- so the eleven-byte blob below asked
-    // for roughly 274 GB.
+    // bytes in memory against eight on the wire -- so the blob below asked for
+    // roughly 274 GB.
     //
     // The bytes come off the network: the launcher fetches this manifest from the
     // cache server, so the count is a peer's number rather than its own.
-    std::string hostile;
-    hostile.push_back('\x01');             // version
-    hostile.append("\x00\x00\x00\x00", 4); // toolchainStamp: empty
-    hostile.append("\x00\x00\x00\x00", 4); // objectKey: empty
-    hostile.append("\xff\xff\xff\xff", 4); // entry count = 0xFFFFFFFF
+    auto const hostile = BlobDeclaring(0xFFFFFFFFU, 0);
     REQUIRE(hostile.size() == 13);
 
     auto const decoded = DecodeManifest(hostile);
@@ -136,30 +149,33 @@ TEST_CASE("DecodeManifest bounds an entry count by the bytes actually left")
     // The boundary, so the guard is neither off by one nor a number somebody picked.
     // An entry needs eight bytes -- two empty length prefixes -- so eight trailing
     // bytes can carry exactly one.
-    auto const blob = [](std::uint32_t count, std::size_t trailing) {
-        std::string out;
-        out.push_back('\x01');
-        out.append("\x00\x00\x00\x00", 4); // toolchainStamp: empty
-        out.append("\x00\x00\x00\x00", 4); // objectKey: empty
-        for (auto const shift: { 24, 16, 8, 0 })
-            out.push_back(static_cast<char>((count >> shift) & 0xFFU));
-        out.append(trailing, '\0');
-        return out;
-    };
 
     // Two entries cannot fit in eight bytes, and that is decided on the count alone.
-    CHECK_FALSE(DecodeManifest(blob(2, 8)).has_value());
+    CHECK_FALSE(DecodeManifest(BlobDeclaring(2, 8)).has_value());
 
     // One entry does fit, and those eight zero bytes really are one entry: two empty
-    // fields. So the guard admits exactly what the blob can carry rather than
-    // capping it at something smaller.
-    auto const exact = DecodeManifest(blob(1, 8));
+    // fields. So the guard admits exactly what the blob can carry rather than capping
+    // it at something smaller.
+    auto const exact = DecodeManifest(BlobDeclaring(1, 8));
     REQUIRE(exact.has_value());
     REQUIRE(exact->entries.size() == 1);
     CHECK(exact->entries[0].canonicalPath.empty());
 
     // And a manifest with no entries and nothing trailing is ordinary.
-    CHECK(DecodeManifest(blob(0, 0)).has_value());
+    CHECK(DecodeManifest(BlobDeclaring(0, 0)).has_value());
+}
+
+TEST_CASE("MinEntryBytes tracks the encoder rather than a comment")
+{
+    // The guard's per-element minimum is derived by hand from `EncodeManifest`'s loop,
+    // which is comment discipline. This pins it structurally: the cost of one EMPTY
+    // entry is measured from the encoder itself, so a field added to that loop fails
+    // here rather than quietly leaving the guard weaker than the format it guards.
+    DirectManifest empty { .toolchainStamp = {}, .objectKey = {}, .entries = {} };
+    DirectManifest one = empty;
+    one.entries.push_back(DirectManifest::Entry { .canonicalPath = {}, .contentHash = {} });
+
+    CHECK(EncodeManifest(one).size() - EncodeManifest(empty).size() == 8);
 }
 
 TEST_CASE("A manifest encoded on one machine decodes identically on another")

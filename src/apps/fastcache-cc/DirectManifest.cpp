@@ -2,7 +2,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
-#include <FastCache/CompileCache/DeclaredSize.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
@@ -31,9 +31,13 @@ namespace
 
     /// The fewest wire bytes one encoded entry can occupy: the two length prefixes of
     /// its canonical path and content hash, both empty. Read off `EncodeManifest`'s
-    /// loop, which is what fixes it -- a field added there must be added here, or the
-    /// guard it feeds becomes weaker than the format it guards.
-    constexpr std::size_t MinEntryBytes = 2 * sizeof(std::uint32_t);
+    /// loop, and pinned against it by a test that encodes one empty entry and measures
+    /// the difference -- so a field added to that loop fails a test rather than quietly
+    /// weakening the guard this feeds.
+    ///
+    /// Spelled with `FieldPrefixSize` rather than a literal 4, which would restate the
+    /// framing contract beside the one place it is defined.
+    constexpr std::size_t MinEntryBytes = 2 * WireFields::FieldPrefixSize;
 
     /// Path prefixes whose headers are treated as immutable toolchain content.
     /// Matched case-insensitively: Windows paths reach us in whatever case the
@@ -121,11 +125,6 @@ namespace
             out.assign(_bytes.substr(_offset, length));
             _offset += length;
             return true;
-        }
-
-        [[nodiscard]] bool AtEnd() const noexcept
-        {
-            return _offset == _bytes.size();
         }
 
         /// @return Bytes not yet consumed.
@@ -253,22 +252,19 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     if (!cursor.ReadU32(count))
         return std::unexpected(DirectError::Malformed);
 
-    // The count is a CLAIM about bytes this blob must already carry, checked before
-    // anything is sized from it -- the rule issue #267 generalises. An entry is two
-    // length-prefixed fields, so it costs `MinEntryBytes` even when both are empty,
-    // and a blob that cannot hold that many is refused here. Unguarded, this reserved
-    // straight from a `u32`: an `Entry` is two `std::string`s, sixty-four bytes in
-    // memory against eight on the wire, so an eleven-byte blob asked for ~274 GB.
-    //
-    // These bytes come off the network -- the launcher fetches the manifest from the
-    // cache server before decoding it -- so the number is a peer's, not this
-    // process's.
-    if (!DeclaredCountFits(count, MinEntryBytes, cursor.Remaining()))
+    // The count is a claim about bytes this blob must already carry -- see
+    // `WireFields::DeclaredCountFits` (issue #267). The bytes come off the network:
+    // the launcher fetches this manifest from the cache server, so the number is a
+    // peer's rather than its own.
+    if (!WireFields::DeclaredCountFits(count, MinEntryBytes, cursor.Remaining()))
         return std::unexpected(DirectError::Malformed);
 
-    // Grown from the entries actually decoded rather than reserved from the declared
-    // count, which the guard bounds by BYTES and so still leaves an eightfold gap
-    // between an entry's wire minimum and its size in memory.
+    // Reserved from what the BYTES IN HAND could hold, never from the peer's count
+    // alone. A real entry costs ~75-110 wire bytes against 64 in memory, so this is a
+    // no-op for honest manifests -- which run to hundreds of entries for one C++
+    // translation unit, and are worth reserving for -- while a minimum-size hostile
+    // blob is clamped to at most its own size rather than eight times it.
+    manifest.entries.reserve(std::min<std::size_t>(count, cursor.Remaining() / sizeof(DirectManifest::Entry)));
     for (std::uint32_t index = 0; index < count; ++index)
     {
         DirectManifest::Entry entry;
@@ -279,7 +275,7 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
 
     // Trailing bytes mean the encoding is not what this version wrote; refuse it
     // rather than silently ignoring a field a newer writer appended.
-    if (!cursor.AtEnd())
+    if (cursor.Remaining() != 0)
         return std::unexpected(DirectError::Malformed);
 
     return manifest;

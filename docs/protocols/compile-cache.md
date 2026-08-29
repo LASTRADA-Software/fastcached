@@ -419,11 +419,11 @@ an entry no matter how many differently-rooted machines produce it.
     roughly 172 GB — reachable on the daemon's STORE path, and from a worker's reply
     to the launcher
     ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). Validating
-    the count is necessary and not sufficient: the decoder also grows its container
-    from the regions it actually reads, because a validated count is still an
-    eightfold amplifier when the in-memory element is forty bytes and its wire
-    minimum is five. The same rule governs the prefetch-group manifest's key list and
-    the launcher's direct-mode manifest.
+    the count is necessary and not sufficient: a validated count is still an amplifier
+    whenever the in-memory element is bigger than its wire minimum, so any capacity a
+    decoder reserves is sized from something *it* owns — the bytes already in hand, or
+    its own configured ceiling — never from the peer's number. The same rule governs
+    the prefetch-group manifest's key list and the launcher's direct-mode manifest.
 
 ## Prefetch groups
 

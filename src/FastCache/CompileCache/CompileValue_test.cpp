@@ -123,3 +123,17 @@ TEST_CASE("DecodeCompileValue bounds a region count by the bytes actually left")
     // And zero regions with nothing left is the ordinary empty value.
     CHECK(DecodeCompileValue(FrameDeclaring(0, 0)).has_value());
 }
+
+TEST_CASE("MinRegionBytes tracks the encoder rather than a comment")
+{
+    // The guard's per-element minimum is derived by hand from `EncodeCompileValue`'s
+    // loop, which is comment discipline. This pins it structurally: the cost of one
+    // EMPTY region is measured from the encoder itself, so a field added to that loop
+    // fails here rather than quietly leaving the guard weaker than the format it
+    // guards.
+    CompileValue const empty {};
+    CompileValue one;
+    one.textRegions.push_back(TextRegion { .grammar = Grammar::ShowIncludes, .bytes = {} });
+
+    CHECK(EncodeCompileValue(one).size() - EncodeCompileValue(empty).size() == 5);
+}

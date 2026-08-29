@@ -107,15 +107,11 @@ TEST_CASE("PrefetchGroupManifest preserves insertion order across many keys")
 
 TEST_CASE("PrefetchGroupManifest refuses a key count the manifest bytes cannot supply")
 {
-    // The second site of issue #267's class, and the same defect as
-    // `DecodeCompileValue`: this reserved from a `u32` count read out of the stored
-    // value with no check that the buffer could hold that many keys. A key costs its
-    // four-byte length prefix at minimum, so the five-byte value below declared four
-    // billion of them -- and a `std::string` is thirty-two bytes, so that is over
-    // 130 GB asked for by five bytes.
-    //
-    // Reachable because the manifest is written from the STORE path's prefetch-group
-    // field, and read back on FETCH.
+    // The second site of issue #267's class: this reserved from a `u32` count read out
+    // of the stored value with no check that the buffer could hold that many keys. A
+    // key costs its four-byte length prefix at minimum, so the four-byte value below
+    // declared four billion of them -- and a `std::string` is thirty-two bytes, so
+    // that is over 130 GB asked for by four bytes.
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
     ManualClock clock;
@@ -123,18 +119,45 @@ TEST_CASE("PrefetchGroupManifest refuses a key count the manifest bytes cannot s
 
     // The manifest's own storage key, as `ManifestKey` builds it: a 0x01 control byte
     // that keeps it out of the user keyspace, then `cohort:`, then the group id.
-    std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envHostile";
+    std::string const manifestKey = std::string { '' } + "cohort:" + "envHostile";
 
     // `[u32 count = 0xFFFFFFFF]` and not one byte more.
-    std::vector<std::byte> hostile;
-    for ([[maybe_unused]] auto const i: { 0, 1, 2, 3 })
-        hostile.push_back(std::byte { 0xFF });
-    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint {}).has_value());
+    std::vector<std::byte> const hostile(4, std::byte { 0xFF });
+    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
 
-    // Refused whole rather than decoded best-effort: a count the bytes cannot supply
-    // means this is not a manifest this build wrote, and a truncated prefix would
-    // silently prefetch part of a group and read as a cold cache.
+    // Refused by NAME rather than read as an empty group. `Corrupt` is the enumerator
+    // for "this store holds bytes this build did not write", and it has to be distinct
+    // from the empty list an unknown group returns -- otherwise the refusal is
+    // indistinguishable from a cold prefetch group.
     auto const keys = manifest.Keys("envHostile", now);
-    REQUIRE(keys.has_value());
-    CHECK(keys->empty());
+    REQUIRE_FALSE(keys.has_value());
+    CHECK(keys.error().code == StorageErrorCode::Corrupt);
+}
+
+TEST_CASE("An undecodable prefetch manifest is never silently overwritten")
+{
+    // The half that matters more, and the one the first version of this fix got
+    // wrong: `DecodeKeyList` is on the WRITE path too. Returning an empty list for an
+    // undecodable value made `AddKey` store a fresh one-key list -- destroying a
+    // hundred thousand keys on the strength of bytes it had just decided it did not
+    // understand. One value cannot be a refusal on FETCH and a fresh start on STORE.
+    InMemoryLruStorage storage { 0 };
+    PrefetchGroupManifest manifest { storage };
+    ManualClock clock;
+    auto const now = clock.Now();
+
+    std::string const manifestKey = std::string { '' } + "cohort:" + "envHostile";
+    std::vector<std::byte> const hostile(4, std::byte { 0xFF });
+    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
+
+    auto const added = manifest.AddKey("envHostile", "objkey1", now);
+    REQUIRE_FALSE(added.has_value());
+    CHECK(added.error().code == StorageErrorCode::Corrupt);
+
+    // And the bytes are still there, unmodified: the refusal cost nothing.
+    auto const still = storage.Peek(manifestKey, now);
+    REQUIRE(still.has_value());
+    REQUIRE(still->found);
+    auto const bytes = still->entry.ValueBytes();
+    CHECK(std::vector<std::byte>(bytes.begin(), bytes.end()) == hostile);
 }
