@@ -177,17 +177,18 @@ jobs:
     name: "Linux-${{ matrix.preset }}"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
         preset: [clang-release, gcc-release]
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
         with:
           fetch-depth: 0
 
       - name: "Cache CPM packages"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
@@ -195,6 +196,7 @@ jobs:
           restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
 
       - name: "ccache"
+        if: needs.changes.outputs.code == 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-${{ matrix.preset }}
@@ -203,12 +205,13 @@ jobs:
       # libssl-dev + openssl: TLS is built and tested (the tls-smoke CTest uses
       # the openssl CLI) in every platform job, not a dedicated one.
       - name: "Install build tools"
+        if: needs.changes.outputs.code == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
-        if: startsWith(matrix.preset, 'clang')
+        if: needs.changes.outputs.code == 'true' && (startsWith(matrix.preset, 'clang'))
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -218,7 +221,7 @@ jobs:
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
 
       - name: "Install GCC ${{ env.GCC_VERSION }}"
-        if: startsWith(matrix.preset, 'gcc')
+        if: needs.changes.outputs.code == 'true' && (startsWith(matrix.preset, 'gcc'))
         run: |
           sudo apt-get install -y gcc-${{ env.GCC_VERSION }} g++-${{ env.GCC_VERSION }}
           sudo ln -sf /usr/bin/gcc-${{ env.GCC_VERSION }} /usr/local/bin/gcc
@@ -236,21 +239,24 @@ jobs:
       # flags (issue #84). A target nothing compiles is a target that rots, and
       # that is what it looks like when nobody notices.
       - name: "Configure"
+        if: needs.changes.outputs.code == 'true'
         run: >-
           cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 
       - name: "Build"
+        if: needs.changes.outputs.code == 'true'
         run: cmake --build --preset ${{ matrix.preset }}
 
       - name: "Test"
+        if: needs.changes.outputs.code == 'true'
         run: ctest --preset ${{ matrix.preset }}
 
       # Both binaries the smoke jobs drive: the daemon every job starts, and the
       # launcher the compile-cache smoke job points at it. They share a parent
       # directory, so the artifact keeps them side by side at its root.
       - name: "Upload Linux binaries for the smoke jobs"
-        if: matrix.preset == 'clang-release'
+        if: needs.changes.outputs.code == 'true' && (matrix.preset == 'clang-release')
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-linux
@@ -976,7 +982,6 @@ jobs:
     name: "Windows-${{ matrix.preset }}"
     runs-on: windows-2025
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     # The Windows jobs were the second-biggest block in this workflow — 21.2 and
     # 15.7 minutes, of which 17.2 and 11.8 were the build — and they were paying
     # a full cold compile every single run. Measured on run 33243524509: sccache
@@ -1004,10 +1009,12 @@ jobs:
         preset: [cl-release, clangcl-release]
     steps:
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.code == 'true'
         with:
           fetch-depth: 0
 
       - name: "Cache CPM packages"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
@@ -1020,9 +1027,11 @@ jobs:
       # SCCACHE_GHA_ENABLED set is the failure this whole block exists to stop —
       # a cache that is configured, announced, and inert.
       - name: "sccache"
+        if: needs.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: "Install ninja"
+        if: needs.changes.outputs.code == 'true'
         run: choco install ninja --no-progress
 
       # Pin the MSVC toolset to 14.44. The windows-2025 image moved to VS 18 /
@@ -1032,6 +1041,7 @@ jobs:
       # toolset clang-cl 20.1.8 accepts and the version CI was green on before
       # the image bump; cl-release builds against it equally well.
       - name: "Setup MSVC dev environment"
+        if: needs.changes.outputs.code == 'true'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           toolset: "14.44"
@@ -1040,12 +1050,14 @@ jobs:
       # (vcpkg is the local-dev path; CI uses the runner's OpenSSL to avoid a
       # from-source build). Quoted because the path contains a space.
       - name: "Configure"
+        if: needs.changes.outputs.code == 'true'
         run: >
           cmake --preset ${{ matrix.preset }}
           -DFASTCACHED_ENABLE_TLS=ON
           "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
 
       - name: "Build"
+        if: needs.changes.outputs.code == 'true'
         run: cmake --build --preset ${{ matrix.preset }}
 
       # A compiler cache that handled nothing is worse than one that is off,
@@ -1078,6 +1090,7 @@ jobs:
       # handled — the E2E job, which runs no ctest, reported 231 requests from the
       # same configuration. A number read after `Test` is somebody else's.
       - name: "Assert sccache actually handled the build"
+        if: needs.changes.outputs.code == 'true'
         shell: pwsh
         run: |
           & $env:SCCACHE_PATH --show-stats
@@ -1096,9 +1109,11 @@ jobs:
           }
 
       - name: "Test"
+        if: needs.changes.outputs.code == 'true'
         run: ctest --preset ${{ matrix.preset }}
 
       - name: "Upload fastcached.exe"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-windows-${{ matrix.preset }}
