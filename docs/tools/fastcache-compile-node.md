@@ -182,13 +182,21 @@ is announced. A client still holding a lease for it is refused `unknown-fingerpr
 and compiles locally — the ordinary fallback, counted by
 `fastcache_worker_jobs_refused_unknown_fingerprint_total`.
 
+A witness-driven check can only ever notice what it is already watching, so once
+every fifteen minutes the node surveys the machine **unconditionally**. That is the
+way back from serving less than the machine has: a toolchain dropped by a transient
+probe failure, or removed and later reinstalled, rejoins on that sweep rather than
+waiting for a restart. A sweep that finds nothing changed is not reported as a
+change, so it costs the fleet no re-registration.
+
 Two consequences worth knowing. An operator's pinned `<fingerprint>=<compiler>` is
 **never** re-derived: it is not probed in the first place, and pinning a digest by
 hand is how you force a fleet to agree while a machine is being repaired. And a
 machine whose only compiler an upgrade removed or broke keeps running while serving
 nothing, rather than exiting — the compiler may come back with the next package, and
 a routine upgrade must not be able to take a machine out of the fleet permanently.
-It says so, and its registry entries expire on their own:
+It says so, its registry entries expire on their own within 90 seconds, and the
+next sweep is what brings it back:
 
 ```
 [WARN] this machine now has no usable toolchain; serving nothing until one returns

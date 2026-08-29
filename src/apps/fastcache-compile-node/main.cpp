@@ -91,6 +91,18 @@ constexpr std::chrono::seconds HeartbeatInterval { 20 };
 /// promptly rather than after a full interval.
 constexpr int HeartbeatSlices = 20;
 
+/// How many heartbeats between unconditional toolchain sweeps.
+///
+/// Every beat asks the recorded witnesses, which costs a handful of `stat` calls and
+/// spawns nothing. This is the slower cadence at which the machine is surveyed
+/// regardless -- the only way back from serving LESS than the machine has, since a
+/// witness-driven recheck can only notice what it is already watching (#238).
+///
+/// 45 beats is about a quarter of an hour at the default interval: long enough that
+/// the survey's driver spawns are nothing against a machine's load, short enough that
+/// a reinstalled compiler rejoins the fleet without anybody restarting a service.
+constexpr std::uint64_t SweepEveryBeats = 45;
+
 /// How often a parked `accept()` returns so the loop can observe a shutdown.
 ///
 /// POSIX honours `SO_RCVTIMEO` for `accept()`, and it is the ONLY portable way to
@@ -405,9 +417,6 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
-    // Projected to what the runner needs: it dispatches on the fingerprint and spawns
-    // the compiler, and has no business with a display label. Taken by value there, so
-    // building it here dangles nothing.
     // Projected to what the runner needs, by a lambda rather than in place, because
     // the re-survey below builds the identical map from a different set of
     // toolchains -- and a projection written twice is one that drifts.
@@ -721,6 +730,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
 
     auto registrars = registrarsFor(toolchains);
 
+    // Read here, where this thread is still the only one that can see `toolchains`.
+    // The ready line below is printed after the heartbeat thread starts, and that
+    // thread may replace the map (#238).
+    auto const startupToolchainCount = toolchains.size();
+
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
     // have no earlier reading to difference against and would report nothing,
@@ -754,6 +768,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                                  .credential = credential,
                                  .logger = logger };
 
+    // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of
+    // the thread's lambda rather than a member of anything: only this thread reads or
+    // writes it.
+    std::uint64_t beat = 0;
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
@@ -768,7 +787,19 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
             // threads. The check itself spawns nothing -- it is a stat per compiler
             // and one per include root -- so it costs a heartbeat almost nothing and
             // pays for the survey only when something moved.
-            if (auto refreshed = Node::RefreshToolchains(toolchains, cfg, discovery.get(), *runner, *toolchainHost, logger);
+            // Every beat asks the witnesses; one beat in `SweepEveryBeats` surveys the
+            // machine regardless. The sweep is the only way back from serving LESS
+            // than this machine has: a recheck driven by witnesses can only notice
+            // what it is already watching, so a toolchain dropped by a transient
+            // probe failure -- or removed and later reinstalled -- would otherwise
+            // never be looked at again, and a node left serving nothing could not
+            // recover at all without a restart.
+            ++beat;
+            auto const depth =
+                beat % SweepEveryBeats == 0 ? Node::RecheckDepth::Unconditional : Node::RecheckDepth::WhenEvidenceMoved;
+
+            if (auto refreshed =
+                    Node::RefreshToolchains(toolchains, cfg, discovery.get(), *runner, *toolchainHost, logger, depth);
                 refreshed.changed)
             {
                 toolchains = std::move(refreshed.served);
@@ -849,7 +880,12 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                 advertise,
                 slots,
                 Distributed::TraitsFor(cfg.nodeClass).name,
-                toolchains.size(),
+                // The count as this node STARTED, captured before the heartbeat
+                // thread could re-survey and replace the map. Reading `toolchains`
+                // here raced that thread the moment the set stopped being fixed at
+                // startup -- and a ready line is a statement about starting anyway,
+                // so the startup number is also the honest one to print.
+                startupToolchainCount,
                 Node::AdmissionSummary(cfg));
 
     SyncRun(server.Run());

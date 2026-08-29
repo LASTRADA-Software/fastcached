@@ -155,11 +155,29 @@ namespace
                 // yield no stamp for exactly the toolchains a package manager
                 // upgrades.
                 auto const resolved = host.ResolveOnSearchPath(entry.compiler).value_or(entry.compiler);
-                auto roots = Cc::DiscoverIncludePaths(runner, host, entry.compiler, spec).roots;
-                auto stamp = Cc::ComputeToolchainStamp(banner, resolved, roots);
-                fingerprints[index].witness = ToolchainWitness {
-                    .compiler = resolved, .banner = banner, .roots = std::move(roots), .stamp = std::move(stamp)
-                };
+                auto discovered = Cc::DiscoverIncludePaths(runner, host, entry.compiler, spec);
+
+                // A probe that did not RUN leaves no witness, rather than one over an
+                // empty root set. The identity above was computed from whatever the
+                // FIRST probe found, so a second probe that failed would leave this
+                // node watching a narrower set of roots than its own fingerprint
+                // covers -- and it would then stop noticing an SDK-side change for
+                // that toolchain, permanently and in silence. Not watching a
+                // toolchain is visible in the next survey; watching the wrong
+                // evidence is not.
+                //
+                // Asked as `answered` rather than as an empty `roots`, for the reason
+                // `IncludeSearchRoots` documents: several mechanisms legitimately find
+                // no roots at all, and only a driver that could not be spawned means
+                // the answer is missing.
+                if (discovered.answered)
+                {
+                    auto stamp = Cc::ComputeToolchainStamp(banner, resolved, discovered.roots);
+                    fingerprints[index].witness = ToolchainWitness { .compiler = resolved,
+                                                                     .banner = banner,
+                                                                     .roots = std::move(discovered.roots),
+                                                                     .stamp = std::move(stamp) };
+                }
 
                 // Derived from the banner that was just computed, rather than by
                 // asking the compiler a second time: the digest is a hash OF this
@@ -288,7 +306,7 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
     // start where an operator is watching. Warm starts read the cache and are
     // instant, so this buys nothing on any boot after the first; it is the first one
     // that decides whether the feature looks like it works.
-    auto const fingerprints = FingerprintAll(entries, runner, host, logger);
+    auto fingerprints = FingerprintAll(entries, runner, host, logger);
 
     // Indexed rather than zipped: `std::views::zip` is C++23 and not uniformly
     // available across the four standard libraries this project builds against.
@@ -329,10 +347,13 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
         // was scheduled: a fingerprint mismatch is invisible from both ends, so this
         // log is where two machines' digests get compared, and one ordered by which
         // thread finished first would be a poor place to do it.
-        auto const [existing, inserted] = toolchains.emplace(fingerprint,
-                                                             ServedToolchain { .compiler = entry.compiler,
-                                                                               .label = fingerprints[index].label,
-                                                                               .witness = fingerprints[index].witness });
+        // Moved out rather than copied: a witness carries a vector of include roots
+        // per toolchain, and the survey entry is never read again.
+        auto const [existing, inserted] =
+            toolchains.emplace(fingerprint,
+                               ServedToolchain { .compiler = entry.compiler,
+                                                 .label = std::move(fingerprints[index].label),
+                                                 .witness = std::move(fingerprints[index].witness) });
         if (inserted)
             logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
         else
@@ -411,10 +432,11 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
                                    Cc::IToolchainDiscovery* discovery,
                                    Cc::IProcessRunner& runner,
                                    Cc::IToolchainHost& host,
-                                   ILogger& logger)
+                                   ILogger& logger,
+                                   RecheckDepth depth)
 {
     auto const stale = StaleToolchains(served);
-    if (stale.empty())
+    if (stale.empty() && depth == RecheckDepth::WhenEvidenceMoved)
         return {};
 
     for (auto const& fingerprint: stale)
@@ -434,23 +456,31 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
     // removed, or the upgrade left it unrunnable. It has already said so. Serving
     // nothing is the correct answer -- every lease is then refused and every client
     // compiles locally -- and it is the one answer that is never a wrong object.
-    auto next = refreshed.has_value() ? *std::move(refreshed) : std::map<std::string, ServedToolchain> {};
+    auto next = std::move(refreshed).value_or(std::map<std::string, ServedToolchain> {});
 
-    // Named individually, because this is the line an operator reads to understand
-    // why a machine's fingerprint moved mid-build, and because a fleet part-way
-    // through a staggered upgrade has several of these to correlate.
+    // Only the REMOVALS are announced here. `ResolveToolchains` has just logged a
+    // "serving {} as {}" line for everything it kept, so naming the additions again
+    // would print every one of them twice on a refresh. What an operator needs from
+    // this trip is the half the re-survey cannot say: what this node has stopped
+    // being able to honour.
     for (auto const& [fingerprint, toolchain]: served)
         if (!next.contains(fingerprint))
             logger.Logf(LogLevel::Info, "no longer serving {} ({})", fingerprint, toolchain.compiler);
-    for (auto const& [fingerprint, toolchain]: next)
-        if (!served.contains(fingerprint))
-            logger.Logf(LogLevel::Info, "now serving {} ({})", fingerprint, toolchain.compiler);
 
-    // `changed` follows the STAMP rather than the fingerprint set, and the difference
-    // matters: an upgrade that moves a file's mtime without changing what the digest
-    // covers leaves the set identical, and returning "nothing changed" there would
-    // leave the old witness in place and re-run this whole survey on every heartbeat
-    // for the life of the process. The refreshed witnesses are the point of the trip.
+    // An unconditional sweep that found the machine exactly as it was left is not a
+    // change, and must not be reported as one: it runs on a timer, and answering
+    // "changed" would re-register every worker in the fleet on that timer for no
+    // reason. Nothing is lost by discarding its witnesses -- no stamp moved, so they
+    // say what the ones already held say.
+    if (stale.empty() && std::ranges::equal(std::views::keys(served), std::views::keys(next)))
+        return {};
+
+    // Otherwise `changed` follows the STAMP as much as the fingerprint set, and the
+    // difference matters: an upgrade that moves a file's mtime without changing what
+    // the digest covers leaves the set identical, and returning "nothing changed"
+    // there would leave the old witness in place and re-run this whole survey on
+    // every heartbeat for the life of the process. The refreshed witnesses are the
+    // point of that trip.
     return ToolchainRefresh { .changed = true, .served = std::move(next) };
 }
 

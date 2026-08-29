@@ -5,6 +5,7 @@
 
 #include <FastCache/Core/Logger.hpp>
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -67,8 +68,8 @@ struct ToolchainWitness
 
     /// Whether this toolchain can be rechecked at all.
     ///
-    /// Asked rather than compared against an empty field, so the two callers cannot
-    /// drift on what counts as watchable the day a third reason to skip appears.
+    /// Asked rather than compared against an empty field, so what counts as watchable
+    /// stays one decision the day a second reason to skip a toolchain appears.
     /// @return True when a stamp exists to compare against.
     [[nodiscard]] bool Watchable() const noexcept
     {
@@ -228,6 +229,29 @@ struct ToolchainRefresh
     std::map<std::string, ServedToolchain> served;
 };
 
+/// How hard a recheck should look.
+enum class RecheckDepth : std::uint8_t
+{
+    /// Ask the witnesses, and survey only if one of them moved.
+    ///
+    /// The cadence a heartbeat runs at: stats only, no process spawned.
+    WhenEvidenceMoved,
+
+    /// Survey regardless of what the witnesses say.
+    ///
+    /// The way back from a machine that is serving LESS than it should. A recheck
+    /// driven by witnesses can only ever notice what it is already watching, and a
+    /// toolchain that leaves the served set takes its witness with it -- so a
+    /// compiler dropped by a transient probe failure, or removed and then
+    /// reinstalled, would never be looked at again. A node serving nothing at all is
+    /// the terminal case: with no witnesses left it could not recover without being
+    /// restarted, which is exactly the "the compiler may come back with the next
+    /// package" promise the rest of this makes.
+    ///
+    /// It costs a survey, so it belongs on a slow cadence rather than a heartbeat.
+    Unconditional,
+};
+
 /// Re-derive what this node serves, if the machine changed underneath it.
 ///
 /// The whole of #238's decision, in one place a test can drive. A node fingerprints
@@ -260,12 +284,18 @@ struct ToolchainRefresh
 /// @param runner Process-spawning seam, for the compiler probes.
 /// @param host The machine's filesystem, registry and environment.
 /// @param logger Where the change is announced.
+/// @param depth Whether to survey unconditionally, or only on moved evidence.
 /// @return What changed, and what to serve; `changed` false when nothing moved.
+///
+/// An unconditional sweep that finds the machine unchanged still answers `changed`
+/// false. It is a recovery path, not a reason to re-register a fleet's worth of
+/// workers every time it runs.
 [[nodiscard]] ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const& served,
                                                  NodeConfig const& cfg,
                                                  Cc::IToolchainDiscovery* discovery,
                                                  Cc::IProcessRunner& runner,
                                                  Cc::IToolchainHost& host,
-                                                 ILogger& logger);
+                                                 ILogger& logger,
+                                                 RecheckDepth depth = RecheckDepth::WhenEvidenceMoved);
 
 } // namespace FastCache::Node

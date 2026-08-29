@@ -781,3 +781,70 @@ TEST_CASE("NodeToolchains: a toolchain patched under a running node is noticed",
         CHECK(StaleToolchains(unstampable).empty());
     }
 }
+
+TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler again", "[node][toolchains]")
+{
+    // The way back, and the case a witness-driven recheck cannot reach on its own.
+    // `StaleToolchains` only ever asks the toolchains this node is already serving,
+    // so a toolchain that leaves the served set takes its evidence with it -- and a
+    // node left serving nothing has no evidence at all. Without an unconditional
+    // sweep it would sit there permanently, which flatly contradicts the promise the
+    // rest of #238 makes: a compiler may come back with the next package, and a
+    // routine upgrade must not remove a machine from the fleet for good.
+    NodeConfig const cfg = Startable();
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    std::map<std::string, ServedToolchain> const nothing;
+
+    SECTION("the cheap recheck cannot, and says so by doing nothing")
+    {
+        // Not a defect in `StaleToolchains` -- it is asked about an empty set and
+        // correctly answers that nothing it was given has moved.
+        FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
+        auto const refreshed = RefreshToolchains(nothing, cfg, &discovery, runner, host, logger);
+
+        CHECK_FALSE(refreshed.changed);
+        CHECK(discovery.Calls() == 0);
+    }
+
+    SECTION("the sweep does")
+    {
+        FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
+        auto const refreshed =
+            RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+
+        CHECK(refreshed.changed);
+        CHECK(refreshed.served.size() == 1);
+        CHECK(discovery.Calls() == 1);
+    }
+
+    SECTION("and a sweep that finds the machine unchanged is not a change")
+    {
+        // It runs on a timer, so answering "changed" here would re-register every
+        // worker in the fleet on that timer for no reason at all.
+        FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
+        auto const first = RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+        REQUIRE(first.changed);
+
+        auto const again =
+            RefreshToolchains(first.served, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+        CHECK_FALSE(again.changed);
+        CHECK(again.served.empty());
+    }
+
+    SECTION("a machine that still has nothing stays serving nothing")
+    {
+        // `ResolveToolchains` refuses an empty result, which at startup is fatal and
+        // here is an ordinary answer. The sweep must absorb that rather than report
+        // a change it cannot describe.
+        FixedDiscovery discovery { {} };
+        auto const refreshed =
+            RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+
+        CHECK_FALSE(refreshed.changed);
+        CHECK(refreshed.served.empty());
+    }
+}

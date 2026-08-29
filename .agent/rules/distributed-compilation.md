@@ -298,12 +298,26 @@ Consequences that are each load-bearing:
     binary plus one per root, on every heartbeat, with the expensive re-survey paid
     only when it says something moved. Re-stamping per job would be the cost #188 is
     separately removing from the launcher's hot path.
+  - **A witness-driven recheck can only notice what it is already watching, so it
+    needs an unconditional sweep beside it.** A toolchain that leaves the served set
+    takes its evidence with it, and `IdentityDefect::UnrunProbe` is transient by
+    construction -- so one unlucky spawn drops a healthy compiler permanently, and a
+    node left serving nothing has no witnesses at all and could never recover without
+    a restart. That directly contradicts the promise the rest of this makes, that a
+    compiler may come back with the next package. A slow unconditional survey is the
+    way back; it must answer unchanged when it finds the machine unchanged, or it
+    re-registers the whole fleet on a timer.
   - **The re-survey is `ResolveToolchains` itself, never a cheaper second
     derivation.** A node whose identity was computed one way at startup and another
     way afterwards drifts from its own clients exactly when nobody is looking.
   - **An operator's pinned identity has no witness and is never reconsidered**, and
     an unstampable compiler yields an empty stamp that must read as "cannot be
     watched" rather than as "changed" — the latter is a re-survey loop with no exit.
+  - **A set that stops being fixed at startup makes every remaining reader of it a
+    race.** `toolchains` was `const` and read by the ready line on the main thread;
+    making the heartbeat thread able to replace it turned that read into UB on a
+    `std::map`. The count is captured before the thread starts -- which is also the
+    honest number, since a ready line is a statement about starting.
   - **A map a job reads must not be held as an ITERATOR across the compile.**
     `CompileJobRunner::Run` looked its compiler up and then dereferenced that
     iterator twice far downstream — after the scratch directory was made and the

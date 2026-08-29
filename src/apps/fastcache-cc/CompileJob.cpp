@@ -185,15 +185,14 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     // decides which program executes. A job already admitted therefore finishes
     // against the compiler it looked up, which is also the honest answer: it is what
     // the client was told it would get.
-    auto const compiler = [&]() -> std::optional<std::string> {
+    std::string compiler;
+    {
         std::shared_lock const guard { _toolchainsMutex };
         auto const found = _toolchains.find(job.fingerprint);
         if (found == _toolchains.end())
-            return std::nullopt;
-        return found->second;
-    }();
-    if (!compiler.has_value())
-        return std::unexpected(JobRefusal::UnknownFingerprint);
+            return std::unexpected(JobRefusal::UnknownFingerprint);
+        compiler = found->second;
+    }
 
     // Checked again here, on the receiving side. The client's filter protects an
     // honest client from dispatching something that would not work; this one
@@ -247,7 +246,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
 
     std::vector<std::string> argv;
     argv.reserve(job.args.size() + 5);
-    argv.push_back(*compiler);
+    argv.push_back(compiler);
     argv.insert(argv.end(), job.args.begin(), job.args.end());
     // The compile action and the output are the worker's to name, which is why the
     // client's `RemoteCompileArgs` dropped both rather than passing them through.
@@ -262,7 +261,7 @@ std::expected<CompileOutcome, JobRefusal> CompileJobRunner::Run(CompileJob const
     //
     // The family is derived from the worker's OWN configured compiler, never from
     // anything the client sent -- the same rule that governs which program runs.
-    auto const family = DriverOf(ClassifyCompiler(*compiler)).family;
+    auto const family = DriverOf(ClassifyCompiler(compiler)).family;
     argv.emplace_back("-c");
     argv.push_back(source.string());
     // Fused, which both families accept and which is the only form MSVC documents
