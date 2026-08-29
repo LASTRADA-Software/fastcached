@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -24,12 +27,13 @@ namespace
     /// Decode a length-prefixed key list (`[u32 count]{ [u32 len][bytes] }*`) from
     /// the manifest value bytes.
     ///
-    /// A short buffer yields the keys decoded so far -- best effort, because a
-    /// manifest is a prefetch hint and a truncated one merely prefetches less. An
-    /// **impossible declared count** is different in kind and yields nothing: those
-    /// are not bytes this build wrote, and the caller has to be able to tell that
-    /// apart from an empty group, because on the write path the two lead to opposite
-    /// actions (issue #267).
+    /// A buffer that runs out *mid-list* yields the keys decoded so far -- best
+    /// effort, because a manifest is a prefetch hint and a truncated one merely
+    /// prefetches less. Bytes that are **not a key list at all** are different in kind
+    /// and yield nothing: a value too short to hold the count field, or one declaring
+    /// a count its remaining bytes cannot supply. Those are not bytes this build
+    /// wrote, and the caller has to be able to tell that apart from an empty group,
+    /// because on the write path the two lead to opposite actions (issue #267).
     /// @param bytes Encoded manifest value.
     /// @return The decoded keys, or nullopt when the value is not a manifest.
     [[nodiscard]] std::optional<std::vector<std::string>> DecodeKeyList(std::span<std::byte const> bytes)
@@ -46,7 +50,11 @@ namespace
 
         std::uint32_t count {};
         if (!readU32(count))
-            return keys;
+            // Not even a count field. `EncodeKeyList` always writes one, so these are
+            // no more this build's bytes than an impossible count is -- and answering
+            // with an empty list here would leave `AddKey` overwriting them, which is
+            // exactly the hole the count check below closes.
+            return std::nullopt;
 
         // The count is a claim about bytes this value must already carry -- see
         // `WireFields::DeclaredCountFits` (issue #267).

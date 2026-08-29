@@ -113,9 +113,9 @@ namespace
 [[nodiscard]] std::string BlobDeclaring(std::uint32_t count, std::size_t trailing)
 {
     std::string out;
-    out.push_back('');  // version
-    out.append(4, '\0'); // toolchainStamp: empty
-    out.append(4, '\0'); // objectKey: empty
+    out.push_back('\x01'); // version
+    out.append(4, '\0');   // toolchainStamp: empty
+    out.append(4, '\0');   // objectKey: empty
     for (auto const shift: { 24, 16, 8, 0 })
         out.push_back(static_cast<char>((count >> shift) & 0xFFU));
     out.append(trailing, '\0');

@@ -119,7 +119,7 @@ TEST_CASE("PrefetchGroupManifest refuses a key count the manifest bytes cannot s
 
     // The manifest's own storage key, as `ManifestKey` builds it: a 0x01 control byte
     // that keeps it out of the user keyspace, then `cohort:`, then the group id.
-    std::string const manifestKey = std::string { '' } + "cohort:" + "envHostile";
+    std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envHostile";
 
     // `[u32 count = 0xFFFFFFFF]` and not one byte more.
     std::vector<std::byte> const hostile(4, std::byte { 0xFF });
@@ -146,7 +146,7 @@ TEST_CASE("An undecodable prefetch manifest is never silently overwritten")
     ManualClock clock;
     auto const now = clock.Now();
 
-    std::string const manifestKey = std::string { '' } + "cohort:" + "envHostile";
+    std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envHostile";
     std::vector<std::byte> const hostile(4, std::byte { 0xFF });
     REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
 
@@ -160,4 +160,35 @@ TEST_CASE("An undecodable prefetch manifest is never silently overwritten")
     REQUIRE(still->found);
     auto const bytes = still->entry.ValueBytes();
     CHECK(std::vector<std::byte>(bytes.begin(), bytes.end()) == hostile);
+}
+
+TEST_CASE("A prefetch manifest too short to hold a count is refused, not overwritten")
+{
+    // The same invariant one byte lower down. A value shorter than the count field
+    // is no more a key list than an impossible count is -- `EncodeKeyList` always
+    // writes four bytes at minimum -- so reading it as an empty group would leave
+    // `AddKey` replacing bytes it just failed to understand, which is precisely the
+    // hole the count check closes.
+    InMemoryLruStorage storage { 0 };
+    PrefetchGroupManifest manifest { storage };
+    ManualClock clock;
+    auto const now = clock.Now();
+
+    std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envStub";
+    std::vector<std::byte> const stub(3, std::byte { 0xFF });
+    REQUIRE(storage.Set(manifestKey, stub, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
+
+    auto const keys = manifest.Keys("envStub", now);
+    REQUIRE_FALSE(keys.has_value());
+    CHECK(keys.error().code == StorageErrorCode::Corrupt);
+
+    auto const added = manifest.AddKey("envStub", "objkey1", now);
+    REQUIRE_FALSE(added.has_value());
+    CHECK(added.error().code == StorageErrorCode::Corrupt);
+
+    auto const still = storage.Peek(manifestKey, now);
+    REQUIRE(still.has_value());
+    REQUIRE(still->found);
+    auto const bytes = still->entry.ValueBytes();
+    CHECK(std::vector<std::byte>(bytes.begin(), bytes.end()) == stub);
 }

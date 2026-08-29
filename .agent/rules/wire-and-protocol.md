@@ -132,11 +132,19 @@ Every rule below has already been a bug.
   element costs some fixed minimum in the shared field grammar, so the claim is
   checkable, and `WireFields::DeclaredCountFits` is where that check lives
   ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). Three decoders
-  reserved from a `u32` before reading a single element: `DecodeCompileValue`
-  (~172 GB from a **nine-byte** frame — measured, `sizeof(TextRegion)` is 40, and under
-  a 2 GiB address-space cap the pre-fix decoder aborts on `std::bad_alloc`),
-  `PrefetchGroupManifest`'s key list, and `DirectManifest` (~274 GB from thirteen
-  bytes).
+  in the compile-cache path reserved from a `u32` before reading a single element:
+  `DecodeCompileValue` (~172 GB from a **nine-byte** frame — measured,
+  `sizeof(TextRegion)` is 40, and under a 2 GiB address-space cap the pre-fix decoder
+  aborts on `std::bad_alloc`), `PrefetchGroupManifest`'s key list, and `DirectManifest`
+  (~274 GB from thirteen bytes).
+  - **A value blob is a peer's bytes too, and the sweep must go where that is not
+    obvious.** The daemon's own value codecs are the other half of this class and are
+    tracked separately (`Cache/SetCodec`, `Cache/StreamCodec`; see
+    [#269](https://github.com/LASTRADA-Software/fastcached/issues/269)). They look
+    internal — a set this daemon wrote — but what marks a value as a set is its
+    `flags` word, and the memcached verbs let a client choose it. "Only we write these
+    bytes" is a claim to check against every protocol the engine serves, never an
+    assumption.
   - **It lives in `Core/WireFields.hpp` beside `FieldPrefixSize`**, which is usually the
     answer to its `minBytesEach`, and which that header already argues must stay
     header-only and dependency-free because `fastcache-cc` compiles it in *without
