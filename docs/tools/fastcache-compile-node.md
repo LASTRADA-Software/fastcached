@@ -146,6 +146,62 @@ fastcache-compile-node --scheduler=... --advertise=...
 [INFO] discovered 2 toolchain(s) on this machine; pass --toolchain to serve a narrower set
 ```
 
+### When a compiler is upgraded under a running node
+
+**The node notices, and re-registers under the new fingerprint.** A worker
+fingerprints its machine at startup and then runs for weeks, while `fastcache-cc`
+recomputes per invocation — so without this, a compiler patched in place would leave
+the node advertising the *pre-upgrade* digest while spawning the *post-upgrade*
+compiler. Clients would receive objects built by a compiler they did not key against
+and store them in the shared cache under the old key, where the whole fleet then
+reads them ([#238](https://github.com/LASTRADA-Software/fastcached/issues/238)).
+
+Each heartbeat re-checks the evidence the fingerprint was derived from — the
+compiler binary's size and modification time, and the modification time of each
+include search root. That is a handful of `stat` calls and **no compiler is
+spawned**, so it costs a heartbeat essentially nothing. Only when something has
+moved does the node pay for the full re-survey.
+
+That pair of checks covers the two upgrades that happen in practice: a distribution
+replacing `gcc` in place moves the binary, and a Windows SDK update that never
+touches `cl.exe` moves an include root. A header *edited* in place under an
+unchanged directory is deliberately not covered — a system toolchain's headers are
+installed rather than edited, and catching it would mean the multi-second walk of
+the whole include tree on every heartbeat.
+
+When something did move:
+
+```
+[INFO] the toolchain behind 4f2c… changed on this machine; re-deriving what this worker serves
+[INFO] no longer serving 4f2c… (/usr/bin/g++)
+[INFO] now serving 9b71… (/usr/bin/g++)
+```
+
+The old fingerprint **stops being served immediately**, before the new registration
+is announced. A client still holding a lease for it is refused `unknown-fingerprint`
+and compiles locally — the ordinary fallback, counted by
+`fastcache_worker_jobs_refused_unknown_fingerprint_total`.
+
+A witness-driven check can only ever notice what it is already watching, so once
+every fifteen minutes the node surveys the machine **unconditionally**. That is the
+way back from serving less than the machine has: a toolchain dropped by a transient
+probe failure, or removed and later reinstalled, rejoins on that sweep rather than
+waiting for a restart. A sweep that finds nothing changed is not reported as a
+change, so it costs the fleet no re-registration.
+
+Two consequences worth knowing. An operator's pinned `<fingerprint>=<compiler>` is
+**never** re-derived: it is not probed in the first place, and pinning a digest by
+hand is how you force a fleet to agree while a machine is being repaired. And a
+machine whose only compiler an upgrade removed or broke keeps running while serving
+nothing, rather than exiting — the compiler may come back with the next package, and
+a routine upgrade must not be able to take a machine out of the fleet permanently.
+It says so, its registry entries expire on their own within 90 seconds, and the
+next sweep is what brings it back:
+
+```
+[WARN] this machine now has no usable toolchain; serving nothing until one returns
+```
+
 `--toolchain` is an **override** that narrows that set:
 
 ```sh

@@ -91,6 +91,18 @@ constexpr std::chrono::seconds HeartbeatInterval { 20 };
 /// promptly rather than after a full interval.
 constexpr int HeartbeatSlices = 20;
 
+/// How many heartbeats between unconditional toolchain sweeps.
+///
+/// Every beat asks the recorded witnesses, which costs a handful of `stat` calls and
+/// spawns nothing. This is the slower cadence at which the machine is surveyed
+/// regardless -- the only way back from serving LESS than the machine has, since a
+/// witness-driven recheck can only notice what it is already watching (#238).
+///
+/// 45 beats is about a quarter of an hour at the default interval: long enough that
+/// the survey's driver spawns are nothing against a machine's load, short enough that
+/// a reinstalled compiler rejoins the fleet without anybody restarting a service.
+constexpr std::uint64_t SweepEveryBeats = 45;
+
 /// How often a parked `accept()` returns so the loop can observe a shutdown.
 ///
 /// POSIX honours `SO_RCVTIMEO` for `accept()`, and it is the ONLY portable way to
@@ -103,8 +115,13 @@ constexpr std::chrono::milliseconds AcceptPollInterval { 200 };
 ///
 /// Generous, because a request carries a whole preprocessed translation unit and
 /// the client may be on the other side of a slow link -- but not unbounded, so one
-/// stalled client cannot hold a slot forever against a worker that serves its jobs
-/// inline.
+/// stalled client cannot hold a slot, and its share of the in-flight byte budget,
+/// for as long as it likes.
+///
+/// It used to justify itself by the worker serving its jobs *inline*, where a stall
+/// held up every other client. That stopped being true at 87211fe, and the bound
+/// matters more rather than less for it: the slot cap is reachable now, so a stalled
+/// client occupies one of a countable few rather than a queue nobody was in.
 constexpr std::chrono::milliseconds RequestIoTimeout { 120'000 };
 
 /// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
@@ -350,7 +367,9 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, logger);
     if (!toolchainsOrNone.has_value())
         return ExitUsage;
-    auto const toolchains = *std::move(toolchainsOrNone);
+    // NOT const: a compiler patched under a running service makes this stale, and the
+    // heartbeat re-derives it (#238).
+    auto toolchains = *std::move(toolchainsOrNone);
 
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
@@ -398,13 +417,16 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
     auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
-    // Projected to what the runner needs: it dispatches on the fingerprint and spawns
-    // the compiler, and has no business with a display label. Taken by value there, so
-    // building it here dangles nothing.
-    std::map<std::string, std::string> compilers;
-    for (auto const& [fingerprint, served]: toolchains)
-        compilers.emplace(fingerprint, served.compiler);
-    Cc::CompileJobRunner jobs { *runner, scratch, std::move(compilers) };
+    // Projected to what the runner needs, by a lambda rather than in place, because
+    // the re-survey below builds the identical map from a different set of
+    // toolchains -- and a projection written twice is one that drifts.
+    auto compilersOf = [](std::map<std::string, Node::ServedToolchain> const& served) {
+        std::map<std::string, std::string> compilers;
+        for (auto const& [fingerprint, toolchain]: served)
+            compilers.emplace(fingerprint, toolchain.compiler);
+        return compilers;
+    };
+    Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains) };
 
     // Every lease is accepted, and that is stated rather than hidden. The boundary
     // today is reachability of this port plus the shared credential -- the same
@@ -687,17 +709,31 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // field; the message's own arity is exact and stays that way forever.
     advertisedWire.version = VersionString;
 
-    std::vector<Cc::WorkerRegistrar> registrars;
-    registrars.reserve(toolchains.size());
-    for (auto const& [fingerprint, served]: toolchains)
-    {
-        // A copy per registrar, because the label is the one field of this record that
-        // is NOT node-wide: a machine with two toolsets sends two registrations
-        // describing one machine and two different compilers (#194).
-        auto perToolchain = advertisedWire;
-        perToolchain.toolchainLabel = served.label;
-        registrars.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, perToolchain);
-    }
+    // A lambda, for the reason `compilersOf` is one: the heartbeat rebuilds this list
+    // when the machine's toolchains change underneath the node, and two spellings of
+    // what a registration carries is how a re-registered worker comes to advertise
+    // something subtly different from the one it replaced.
+    auto registrarsFor = [&](std::map<std::string, Node::ServedToolchain> const& served) {
+        std::vector<Cc::WorkerRegistrar> built;
+        built.reserve(served.size());
+        for (auto const& [fingerprint, toolchain]: served)
+        {
+            // A copy per registrar, because the label is the one field of this record
+            // that is NOT node-wide: a machine with two toolsets sends two
+            // registrations describing one machine and two different compilers (#194).
+            auto perToolchain = advertisedWire;
+            perToolchain.toolchainLabel = toolchain.label;
+            built.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, perToolchain);
+        }
+        return built;
+    };
+
+    auto registrars = registrarsFor(toolchains);
+
+    // Read here, where this thread is still the only one that can see `toolchains`.
+    // The ready line below is printed after the heartbeat thread starts, and that
+    // thread may replace the map (#238).
+    auto const startupToolchainCount = toolchains.size();
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
@@ -732,9 +768,60 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                                  .credential = credential,
                                  .logger = logger };
 
+    // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of
+    // the thread's lambda rather than a member of anything: only this thread reads or
+    // writes it.
+    std::uint64_t beat = 0;
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
+            // Asked BEFORE the announcement, so a machine whose compiler was patched
+            // since the last round registers under the identity it can actually
+            // honour rather than announcing the old one once more (#238).
+            //
+            // On this thread and nowhere else, which is what makes the two mutations
+            // below safe without a lock of their own: `registrars` is read only by
+            // `AnnounceOnce`, three lines down and on this same thread, and
+            // `ReplaceToolchains` takes the runner's own lock against the compile
+            // threads. The check itself spawns nothing -- it is a stat per compiler
+            // and one per include root -- so it costs a heartbeat almost nothing and
+            // pays for the survey only when something moved.
+            // Every beat asks the witnesses; one beat in `SweepEveryBeats` surveys the
+            // machine regardless. The sweep is the only way back from serving LESS
+            // than this machine has: a recheck driven by witnesses can only notice
+            // what it is already watching, so a toolchain dropped by a transient
+            // probe failure -- or removed and later reinstalled -- would otherwise
+            // never be looked at again, and a node left serving nothing could not
+            // recover at all without a restart.
+            ++beat;
+            auto const depth =
+                beat % SweepEveryBeats == 0 ? Node::RecheckDepth::Unconditional : Node::RecheckDepth::WhenEvidenceMoved;
+
+            if (auto refreshed =
+                    Node::RefreshToolchains(toolchains, cfg, discovery.get(), *runner, *toolchainHost, logger, depth);
+                refreshed.changed)
+            {
+                toolchains = std::move(refreshed.served);
+
+                // The compile port first, the registration second. Between the two
+                // this worker refuses a job naming the dropped fingerprint rather
+                // than serving it with the new compiler, which is the wrong-object
+                // path this exists to close; the other order would leave that window
+                // open for a whole heartbeat.
+                jobs.ReplaceToolchains(compilersOf(toolchains));
+                registrars = registrarsFor(toolchains);
+
+                // A worker that ends up serving nothing keeps running and keeps
+                // saying nothing, rather than exiting: the compiler may come back
+                // with the next package, and a routine upgrade must not be able to
+                // remove a machine from the fleet permanently. Its entries expire
+                // from the registry on their own.
+                if (toolchains.empty())
+                    logger.Logf(LogLevel::Warn,
+                                "this machine now has no usable toolchain; serving nothing until one returns");
+            }
+
             auto client = Cc::DialEndpointBlocking(heartbeatConnector, cfg.scheduler, HeartbeatConnectTimeout);
             if (client == nullptr)
                 logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
@@ -793,7 +880,12 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                 advertise,
                 slots,
                 Distributed::TraitsFor(cfg.nodeClass).name,
-                toolchains.size(),
+                // The count as this node STARTED, captured before the heartbeat
+                // thread could re-survey and replace the map. Reading `toolchains`
+                // here raced that thread the moment the set stopped being fixed at
+                // startup -- and a ready line is a statement about starting anyway,
+                // so the startup number is also the honest one to print.
+                startupToolchainCount,
                 Node::AdmissionSummary(cfg));
 
     SyncRun(server.Run());

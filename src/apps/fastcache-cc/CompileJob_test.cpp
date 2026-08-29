@@ -523,3 +523,134 @@ TEST_CASE("Concurrent jobs each get their OWN object rather than a sibling's", "
         runner.NextRound();
     }
 }
+
+namespace
+{
+/// A runner that parks inside the compile until a case lets it out.
+///
+/// What makes the case below mean anything. The hazard is a job holding a reference
+/// into the toolchain map across the compile, so a test that replaces the map before
+/// or after `Run` proves nothing at all -- the replacement has to land while a job is
+/// provably inside, which is what the two latches buy.
+class ParkingRunner final: public IProcessRunner
+{
+  public:
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        // Recorded BEFORE parking, so the case can see which compiler was chosen
+        // while it still has the chance to swap the map.
+        _argv.assign(argv.begin(), argv.end());
+        _inside.count_down();
+        _release.wait();
+        Test::WriteStubObject(_argv);
+        return CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// Block until a job is inside the compile. Bounded by the latch rather than by
+    /// a sleep: this returns when the job arrives and never before.
+    void WaitUntilInside()
+    {
+        _inside.wait();
+    }
+
+    /// Let the parked job finish.
+    void Release()
+    {
+        _release.count_down();
+    }
+
+    [[nodiscard]] std::vector<std::string> const& Argv() const noexcept
+    {
+        return _argv;
+    }
+
+  private:
+    std::latch _inside { 1 };
+    std::latch _release { 1 };
+    std::vector<std::string> _argv;
+};
+} // namespace
+
+TEST_CASE("A worker serves the toolchains it was last given, not the ones it started with", "[compile-job]")
+{
+    // #238. A node fingerprints its machine once at startup and then lives for weeks,
+    // so a compiler patched in place -- a distro upgrade, a Windows SDK update --
+    // leaves it advertising the pre-upgrade digest while spawning the post-upgrade
+    // compiler. Clients then get objects built by a compiler they did not key against
+    // and store them in the shared cache under the old key, where the whole fleet
+    // reads them.
+    //
+    // The node's remedy is to re-survey and hand the new set down. Both halves are
+    // asserted here, and the first is the load-bearing one: the fingerprint this
+    // worker can no longer honour must STOP being served. `UnknownFingerprint` is the
+    // existing answer for that, so the client falls back to a local compile with no
+    // new refusal, wire code or counter invented for the case.
+    ScriptedRunner runner;
+    ScratchDirectory const scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+
+    REQUIRE(jobs.Run(Job()).has_value());
+    CHECK(jobs.Fingerprints() == std::vector<std::string> { "gcc-13" });
+
+    jobs.ReplaceToolchains({ { "gcc-14", "/opt/real/g++" } });
+
+    // Replaced, never merged: a set that kept the old entry would leave the
+    // wrong-object path open forever, which is the whole defect.
+    CHECK(jobs.Fingerprints() == std::vector<std::string> { "gcc-14" });
+    auto const stale = jobs.Run(Job());
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == JobRefusal::UnknownFingerprint);
+
+    // And the new identity IS served, so a machine rejoins the fleet under the
+    // toolchain it now has rather than dropping out of it.
+    auto fresh = Job();
+    fresh.fingerprint = "gcc-14";
+    CHECK(jobs.Run(fresh).has_value());
+}
+
+TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[compile-job]")
+{
+    // The hazard the change above would otherwise have introduced, and it is not a
+    // theoretical one: `Run` used to hold the map's ITERATOR and dereference it twice
+    // far downstream -- after the scratch directory was created and the whole
+    // preprocessed source written -- on the two lines that decide which program
+    // executes and which driver family names its output flag. A replacement landing
+    // in that window left both reading freed memory.
+    //
+    // So the compiler is copied out under the lock at lookup, and the copy is what
+    // the rest of the job uses. That also gives the honest answer: a job already
+    // admitted finishes against the compiler its client was told it would get, rather
+    // than half against one and half against another.
+    ParkingRunner runner;
+    ScratchDirectory const scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/before/g++" } } };
+
+    std::expected<CompileOutcome, JobRefusal> outcome;
+    std::thread worker { [&] { outcome = jobs.Run(Job()); } };
+
+    // The replacement lands while the job is provably inside the compile, which is
+    // the only arrangement that exercises the window at all. Written the obvious way
+    // -- replace, then run -- this case would pass against the dangling iterator too.
+    runner.WaitUntilInside();
+    jobs.ReplaceToolchains({ { "gcc-13", "/opt/after/g++" } });
+    runner.Release();
+    worker.join();
+
+    REQUIRE(outcome.has_value());
+    REQUIRE_FALSE(runner.Argv().empty());
+    CHECK(runner.Argv().front() == "/opt/before/g++");
+
+    // And the NEXT job takes the new one, so what the case above proves is that the
+    // replacement was survived rather than ignored.
+    ScriptedRunner after;
+    CompileJobRunner replaced { after, scratch.Path(), { { "gcc-13", "/opt/before/g++" } } };
+    replaced.ReplaceToolchains({ { "gcc-13", "/opt/after/g++" } });
+    REQUIRE(replaced.Run(Job()).has_value());
+    REQUIRE_FALSE(after.Argv().empty());
+    CHECK(after.Argv().front() == "/opt/after/g++");
+}

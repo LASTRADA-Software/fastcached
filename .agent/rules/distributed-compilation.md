@@ -274,6 +274,68 @@ Consequences that are each load-bearing:
     a knob documented as "turn the ceiling off" that turns the *cache* off instead,
     silently, because every caller answers a transport failure by compiling. The
     timer is not armed at all below one millisecond.
+- **A node's toolchain identity is derived once and the machine keeps moving, so it
+  is re-derived.** The launcher recomputes its fingerprint per invocation; a worker
+  computed one at startup and then ran for weeks. A compiler patched in place — a
+  distribution upgrading `gcc`, a Windows SDK update — left the node advertising the
+  pre-upgrade digest while spawning the post-upgrade compiler, so clients received
+  objects built by a compiler they had not keyed against and stored them in the
+  shared cache under the old key, where the whole fleet then read them (#238). A
+  wrong-object path, and the one a staggered upgrade across an estate walks into
+  deliberately.
+  - **Re-register under the new fingerprint AND stop serving the old one; they are
+    not alternatives.** Stopping is the load-bearing half — it *is* the wrong-object
+    path — but stopping alone takes a machine out of the fleet on every routine
+    upgrade, and a staggered rollout would empty the fleet one machine at a time with
+    nothing saying so. The dropped fingerprint is refused `UnknownFingerprint`, which
+    already exists with its own wire code and counter; nothing new is invented, and
+    the client falls back to a local compile. The compile port is updated **before**
+    the registration, or the window between them is the defect itself.
+  - **The staleness check spawns nothing, and that is what makes it affordable.**
+    `ComputeToolchainStamp` is pure filesystem stats — it is its *inputs* that cost
+    driver spawns. So the banner, the resolved compiler path and the include roots
+    are recorded at survey time and the stamp is recomputed from them: a stat of the
+    binary plus one per root, on every heartbeat, with the expensive re-survey paid
+    only when it says something moved. Re-stamping per job would be the cost #188 is
+    separately removing from the launcher's hot path.
+  - **A witness-driven recheck can only notice what it is already watching, so it
+    needs an unconditional sweep beside it.** A toolchain that leaves the served set
+    takes its evidence with it, and `IdentityDefect::UnrunProbe` is transient by
+    construction -- so one unlucky spawn drops a healthy compiler permanently, and a
+    node left serving nothing has no witnesses at all and could never recover without
+    a restart. That directly contradicts the promise the rest of this makes, that a
+    compiler may come back with the next package. A slow unconditional survey is the
+    way back; it must answer unchanged when it finds the machine unchanged, or it
+    re-registers the whole fleet on a timer.
+  - **The re-survey is `ResolveToolchains` itself, never a cheaper second
+    derivation.** A node whose identity was computed one way at startup and another
+    way afterwards drifts from its own clients exactly when nobody is looking.
+  - **A witness recorded from a probe that did not RUN is worse than no witness.**
+    The identity was computed from what the FIRST include probe found, so a witness
+    built on a failed SECOND probe watches a narrower root set than the fingerprint
+    covers — and the node then stops noticing SDK-side changes for that toolchain,
+    permanently and in silence. This is #225's rule reaching a second caller, by a
+    door nobody had opened yet: **a probe that did not RUN is not a probe that
+    answered nothing**, so `IncludeSearchRoots::answered` decides, never an empty
+    `roots`. Not watching a toolchain is visible at the next sweep; watching the
+    wrong evidence is not.
+  - **An operator's pinned identity has no witness and is never reconsidered**, and
+    an unstampable compiler yields an empty stamp that must read as "cannot be
+    watched" rather than as "changed" — the latter is a re-survey loop with no exit.
+  - **A set that stops being fixed at startup makes every remaining reader of it a
+    race.** `toolchains` was `const` and read by the ready line on the main thread;
+    making the heartbeat thread able to replace it turned that read into UB on a
+    `std::map`. The count is captured before the thread starts -- which is also the
+    honest number, since a ready line is a statement about starting.
+  - **A map a job reads must not be held as an ITERATOR across the compile.**
+    `CompileJobRunner::Run` looked its compiler up and then dereferenced that
+    iterator twice far downstream — after the scratch directory was made and the
+    whole preprocessed source written — on the two lines that decide which program
+    executes and which driver family names the output flag. Making the map
+    replaceable turned that into a dangling read. The compiler path is copied out
+    under the lock at lookup, so a job already admitted finishes against the compiler
+    its client was told it would get. A test that replaces the map before or after
+    `Run` proves nothing; the replacement has to land while a job is provably inside.
 - **Duplicate suppression is asked BEFORE capacity, and the order is the whole
   point.** `LeaseTable::Acquire` needs a worker id, so the code this was lifted from
   had to `Pick` first — which meant a second client missing the same key at a busy
