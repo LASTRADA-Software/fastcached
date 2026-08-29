@@ -159,3 +159,194 @@ TEST_CASE("StreamCodec: ParseId accepts ms and ms-seq, rejects junk", "[cache][s
     REQUIRE_FALSE(StreamCodec::ParseId("1-2-3").has_value());
     REQUIRE_FALSE(StreamCodec::ParseId("-5").has_value());
 }
+
+namespace
+{
+
+/// Assembles a stream blob field by field, so a case can stop at any declared count.
+///
+/// Built from the codec's own `Magic`/`TypeStream` and its big-endian convention
+/// rather than a hex literal, so it cannot drift from the format it exercises.
+class BlobBuilder
+{
+  public:
+    BlobBuilder()
+    {
+        _out.push_back(StreamCodec::Magic);
+        _out.push_back(StreamCodec::TypeStream);
+    }
+
+    BlobBuilder& U32(std::uint32_t v)
+    {
+        for (auto const shift: { 24, 16, 8, 0 })
+            _out.push_back(static_cast<std::byte>((v >> shift) & 0xFFU));
+        return *this;
+    }
+
+    BlobBuilder& U64(std::uint64_t v)
+    {
+        for (auto const shift: { 56, 48, 40, 32, 24, 16, 8, 0 })
+            _out.push_back(static_cast<std::byte>((v >> shift) & 0xFFU));
+        return *this;
+    }
+
+    /// A stream id: two u64s, as `AppendId` writes it.
+    BlobBuilder& Id()
+    {
+        return U64(0).U64(0);
+    }
+
+    /// A length-prefixed empty string, the cheapest a field can be on the wire.
+    BlobBuilder& EmptyField()
+    {
+        return U32(0);
+    }
+
+    /// Everything before the entry count: the two ids and the entries-added counter.
+    BlobBuilder& StreamHeader()
+    {
+        return Id().Id().U64(0);
+    }
+
+    BlobBuilder& Pad(std::size_t n)
+    {
+        _out.insert(_out.end(), n, std::byte { 0 });
+        return *this;
+    }
+
+    [[nodiscard]] std::span<std::byte const> Bytes() const
+    {
+        return _out;
+    }
+
+  private:
+    std::vector<std::byte> _out;
+};
+
+/// The largest count the field can hold -- the shape every instance of this defect
+/// class was reported with.
+constexpr std::uint32_t Impossible = 0xFFFFFFFFU;
+
+/// Trailing bytes to leave after a hostile count.
+///
+/// Not zero, and that is the point: the old clamp was `min(count, remainingBytes)`,
+/// so with nothing trailing it clamped to zero and looked like a refusal. It is the
+/// bytes being PRESENT that exposes the one-byte-per-element assumption -- forty
+/// trailing bytes bought forty reserved elements where the format can hold at most
+/// two.
+constexpr std::size_t TrailingBytes = 40;
+
+} // namespace
+
+TEST_CASE("StreamCodec: every declared count is refused when the blob cannot supply it", "[cache][stream][security]")
+{
+    // Issue #269. All five counts went through `BoundedReserve`, which CLAMPED rather
+    // than refusing and assumed one byte per element -- so a blob with ten bytes left
+    // and a 0xFFFFFFFF count still reserved ten elements and only failed afterwards,
+    // inside the loop, on bytes that were never there.
+    //
+    // Reachable the same way `SetCodec` is: `FcTypeStream` is a flags word an ordinary
+    // memcached `set` can choose, after which any stream verb decodes the value.
+    //
+    // One section per site, because a guard added to four of five leaves the fifth
+    // reserving and every one of these would still pass.
+    //
+    // `Decode` returned false BEFORE this change too -- the clamped reserve happened
+    // and then the loop failed on the missing bytes -- so a bare `CHECK_FALSE` proves
+    // nothing about the defect. What distinguishes refusing from reserving-then-failing
+    // is whether the reserve happened at all, and for the two counts that size a vector
+    // the CALLER owns, that is observable: `Decode` starts with `out = Stream {}`, so a
+    // non-zero capacity afterwards can only have come from the reserve.
+    //
+    // The other three size vectors local to the loop, which are discarded on failure
+    // and cannot be observed from outside without an allocator hook. What pins those is
+    // that all five now go through the same `ReadCount` call, plus the minimums case
+    // below -- and the boundary case, which catches a missing guard at the entry count
+    // by a decoded entry that should not exist.
+    Stream out;
+
+    SECTION("the entry count")
+    {
+        auto const blob = BlobBuilder {}.StreamHeader().U32(Impossible).Pad(TrailingBytes);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+        CHECK(out.entries.capacity() == 0); // refused, not reserved-then-failed
+    }
+
+    SECTION("an entry's field count")
+    {
+        auto const blob = BlobBuilder {}.StreamHeader().U32(1).Id().U32(Impossible);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+    }
+
+    SECTION("the group count")
+    {
+        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(Impossible).Pad(TrailingBytes);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+        CHECK(out.groups.capacity() == 0); // refused, not reserved-then-failed
+    }
+
+    SECTION("a group's consumer count")
+    {
+        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(1).EmptyField().Id().U64(0).U32(Impossible);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+    }
+
+    SECTION("a group's pending-entry count")
+    {
+        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(1).EmptyField().Id().U64(0).U32(0).U32(Impossible);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+    }
+}
+
+TEST_CASE("StreamCodec: a declared count is bounded by the bytes actually left", "[cache][stream]")
+{
+    // The boundary, so each guard is neither off by one nor a number somebody picked.
+    // An entry costs twenty wire bytes at minimum -- its id and its field count -- so
+    // twenty trailing bytes can carry exactly one.
+    Stream out;
+
+    // One entry is achievable, and those twenty zero bytes really are one: a zero id
+    // and a zero field count. The blob then ends before the group count, so the decode
+    // still fails -- but on TRUNCATION, further in, not on the claim.
+    auto const oneFits = BlobBuilder {}.StreamHeader().U32(1).Pad(StreamCodec::detail::MinEntryBytes);
+    CHECK_FALSE(StreamCodec::Decode(oneFits.Bytes(), out));
+    CHECK(out.entries.size() == 1); // it got past the count and decoded the entry
+
+    // Two cannot fit in the same twenty bytes, and that is decided on the count alone
+    // -- so nothing is decoded at all.
+    auto const twoDoNot = BlobBuilder {}.StreamHeader().U32(2).Pad(StreamCodec::detail::MinEntryBytes);
+    CHECK_FALSE(StreamCodec::Decode(twoDoNot.Bytes(), out));
+    CHECK(out.entries.empty());
+}
+
+TEST_CASE("StreamCodec: the per-element minimums track the encoder", "[cache][stream]")
+{
+    // Each minimum is a security bound derived by hand from `Encode`. This pins every
+    // one of them to that encoder: the cost of one EMPTY element of each kind is
+    // measured from the encoder itself, so a field added there fails here rather than
+    // silently leaving a guard weaker than the format it guards.
+    auto const sizeOf = [](Stream const& s) {
+        return StreamCodec::Encode(s).size();
+    };
+
+    Stream base;
+    Stream withEntry = base;
+    withEntry.entries.push_back(StreamEntry {});
+    CHECK(sizeOf(withEntry) - sizeOf(base) == StreamCodec::detail::MinEntryBytes);
+
+    Stream withField = withEntry;
+    withField.entries[0].fields.emplace_back("", "");
+    CHECK(sizeOf(withField) - sizeOf(withEntry) == StreamCodec::detail::MinFieldBytes);
+
+    Stream withGroup = base;
+    withGroup.groups.push_back(ConsumerGroup {});
+    CHECK(sizeOf(withGroup) - sizeOf(base) == StreamCodec::detail::MinGroupBytes);
+
+    Stream withConsumer = withGroup;
+    withConsumer.groups[0].consumers.emplace_back("");
+    CHECK(sizeOf(withConsumer) - sizeOf(withGroup) == StreamCodec::detail::MinConsumerBytes);
+
+    Stream withPending = withGroup;
+    withPending.groups[0].pel.push_back(PendingEntry {});
+    CHECK(sizeOf(withPending) - sizeOf(withGroup) == StreamCodec::detail::MinPendingBytes);
+}
