@@ -13,6 +13,7 @@
 #include <format>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -64,17 +65,32 @@ struct Fixture
 };
 
 /// A well-formed COMPILE frame.
+/// A COMPILE frame carrying `source` as its source field, already enveloped.
+///
+/// The envelope belongs to the caller because that is exactly what the footprint
+/// cases differ in -- an honest `Identity` one, one declaring an expansion it does
+/// not carry, or a field too short to be an envelope at all. Everything around it
+/// is boilerplate no case varies, so it lives here once.
+/// @param source The source field, enveloped or not, exactly as it should travel.
+/// @param fingerprint The toolchain to claim.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> FrameWithSource(std::span<std::byte const> source,
+                                                     std::string_view fingerprint = "gcc-13")
+{
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                      .fingerprint = fingerprint,
+                                                      .args = {},
+                                                      .source = source,
+                                                      .acceptedCodecs = { Wire::IdentityCodec },
+                                                      .sourceName = "a.cpp" });
+}
+
 [[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13",
                                                   std::string_view source = "int main(){return 0;}")
 {
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(source.size()), Wire::AsBytes(source));
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
-                                                      .fingerprint = fingerprint,
-                                                      .args = {},
-                                                      .source = enveloped,
-                                                      .acceptedCodecs = { Wire::IdentityCodec },
-                                                      .sourceName = "a.cpp" });
+    return FrameWithSource(enveloped, fingerprint);
 }
 
 /// Decode a reply frame into its status and payload.
@@ -406,4 +422,63 @@ TEST_CASE("A refusal's counter and its wire code come from one row", "[worker-pr
     auto const reply = Decode(Unwrap(answer));
     CHECK(reply.status == Wire::Status::Error);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint) == 1);
+}
+TEST_CASE("A request's declared footprint is what its envelope asks for", "[worker-protocol]")
+{
+    // What an admitting surface charges a request, and the number that was missing:
+    // a frame's own `payloadLength` is the COMPRESSED length, while the envelope one
+    // layer in declares the buffer `Unenvelope` will size and value-initialize. A
+    // hundred bytes may ask for 256 MiB, so a budget reading the frame length admits
+    // as many of them as there are slots (#241).
+    //
+    // Everything that is not a decodable COMPILE answers the frame length instead:
+    // `Answer` refuses each of those on its own terms and none of them ever reaches a
+    // decoder, so charging them anything more would turn a malformed frame into a
+    // busy signal.
+    constexpr std::uint32_t Declared = 64U * 1024U * 1024U;
+
+    SECTION("an envelope declaring a large expansion is charged that expansion")
+    {
+        auto const enveloped = Wire::EncodeCodecEnvelope(0xFE, Declared, Wire::AsBytes(std::string_view { "xx" }));
+        auto const frame = FrameWithSource(enveloped);
+        CHECK(frame.size() < 256U);
+        CHECK(DeclaredRequestFootprint(frame) == Declared);
+    }
+
+    SECTION("an ordinary compile is charged its frame length")
+    {
+        // The envelope declares its own true size, which is smaller than the payload
+        // carrying it, so the frame length is the larger of the two.
+        auto const frame = CompileFrame();
+        CHECK(DeclaredRequestFootprint(frame) == frame.size() - Wire::RequestHeaderSize);
+    }
+
+    SECTION("a foreign verb is charged its frame length")
+    {
+        auto frame = CompileFrame();
+        frame[2] = std::byte { 0x7F };
+        CHECK(DeclaredRequestFootprint(frame) == frame.size() - Wire::RequestHeaderSize);
+    }
+
+    SECTION("a frame shorter than it claims is charged what it claimed")
+    {
+        auto const whole = CompileFrame();
+        auto truncated = whole;
+        truncated.resize(Wire::RequestHeaderSize);
+        CHECK(DeclaredRequestFootprint(truncated) == whole.size() - Wire::RequestHeaderSize);
+    }
+
+    SECTION("a source field too short to be an envelope is charged the frame length")
+    {
+        auto const frame = FrameWithSource({});
+        // Zero bytes cannot hold a codec byte and a `u32`, so the envelope decode is
+        // the one below `SplitFields` that still fails here.
+        CHECK(DeclaredRequestFootprint(frame) == frame.size() - Wire::RequestHeaderSize);
+    }
+
+    SECTION("a frame this protocol does not speak at all is charged nothing")
+    {
+        std::vector<std::byte> const junk(Wire::RequestHeaderSize, std::byte { 'G' });
+        CHECK(DeclaredRequestFootprint(junk) == 0);
+    }
 }

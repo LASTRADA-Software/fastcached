@@ -125,6 +125,44 @@ Every rule below has already been a bug.
     its own length, so the link is still synchronised and the peer learns which of
     its fields was refused. That is the framing rule at the top of this section,
     applied one layer in.
+  - **A per-request ceiling is not a bound on a surface that serves many at once, and
+    the guard above is only per request.** `Unenvelope` refuses one envelope declaring
+    more than 256 MiB; it says nothing about `slots` of them declaring exactly that.
+    The worker's in-flight byte budget was the thing that bounded the surface, and it
+    reserved `payloadLength` — the **compressed** frame length — so a hundred-byte
+    frame declaring a 256 MiB expansion passed admission having charged a hundred
+    bytes. `slots` connections, `slots × 256 MiB` of value-initialized memory: the
+    exact shape `MaxInFlightBytes` was introduced to close, reopened one layer in by
+    the fix that named the layer. **A ceiling and a budget are different questions,
+    and answering the first is not answering the second.**
+    - **What a request costs is charged where the budget is, on the accept path**, and
+      it is `DeclaredRequestFootprint` — the larger of the frame's own length and what
+      its envelope declares it expands to. One counter, one refusal, one `EndpointBusy`:
+      a second budget inside the decoder would be two numbers that have to agree about
+      one machine's memory, and a job that has to remember to give back two things.
+    - **It cannot be charged any earlier, and that is a property of the format.** The
+      envelope is a *field of the payload*, so nothing knows the declared expansion
+      until the payload — which the frame length already paid for — has been read. The
+      reservation is therefore RAISED rather than taken twice: a job holds one amount
+      and gives back what it holds.
+    - **The larger of the two, not their sum, and the budget bounds the surface at a
+      constant multiple of one request rather than byte-exactly.** Byte-exactness was
+      never on offer and is not what was lost: by the time the footprint is known, the
+      reader's buffer, the payload copy and the assembled frame are already three
+      copies of the same bytes. The sum would buy a number that still is not the peak,
+      at the price of refusing one honest maximal translation unit on an idle worker —
+      which is dividing the per-request cap by the slot count, arrived at from the
+      other side. What matters is that the bound does not grow with `slots`.
+    - **A price nothing could ever pay is not charged at all.** A footprint above the
+      *whole* budget is the per-request ceiling, which `Unenvelope` answers by name
+      with `payload-too-large` and without allocating. Reserved for, it comes back
+      `EndpointBusy` on a completely idle worker — "ask again shortly" for a frame no
+      amount of waiting will fit, which is a client in a retry loop and an operator
+      reading a busy signal from an idle machine. `EndpointBusy` is transient or it is
+      the wrong word.
+    - Refused as a **reply**, like every other refusal here: the frame declared its
+      own length and has been read in full, so the link is synchronised and the peer
+      learns that memory — not the fleet, and not a slot — is what it waited for.
 
 - **A number a PEER declares sizes nothing until it has been checked against the bytes
   that are actually there.** A declared count or length is a *claim about bytes the

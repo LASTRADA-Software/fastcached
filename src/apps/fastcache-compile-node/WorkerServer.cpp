@@ -52,7 +52,15 @@ namespace
     /// Deliberately ONE request's worth, which is the same figure the cache
     /// responder chose and for the same reason: ordinary translation units are a few
     /// megabytes, so dozens run side by side, while a single 256 MiB monster cannot
-    /// be joined by a second one.
+    /// be joined by a second one. Dividing it by `slots` would be the other way to
+    /// bound the surface and is the wrong one -- it refuses one honest maximal
+    /// translation unit on a many-slot machine, which is a build that fails on the
+    /// big machine and succeeds on the small one.
+    ///
+    /// What one request COSTS is `DeclaredRequestFootprint`, not its frame length:
+    /// the declared expansion of the codec envelope one layer in is the larger
+    /// number, and charging only the frame reopened this hole where the budget could
+    /// not see it (#241).
     constexpr std::size_t MaxInFlightBytes = MaxRequestBytes;
 
     /// Take `want` bytes from `counter` without exceeding `budget`.
@@ -60,10 +68,18 @@ namespace
     /// @param want How many bytes this job declared.
     /// @param budget The ceiling.
     /// @return Whether the reservation was made.
-    [[nodiscard]] bool TryReserve(std::atomic<std::size_t>& counter, std::size_t want, std::size_t budget)
+    [[nodiscard]] bool TryReserve(std::atomic<std::size_t>& counter, std::size_t want, std::size_t budget) noexcept
     {
+        // Compared by SUBTRACTION, not as `current + want <= budget`: that sum wraps
+        // on a `want` near the top of the range and passes a check it should fail --
+        // admitting an unbounded reservation through the one function whose whole job
+        // is to refuse them. Neither caller can reach it today, because both clamp
+        // against this same budget first, but a reservation helper that admits on
+        // overflow is one careless call away from being the hole it exists to close.
+        if (want > budget)
+            return false;
         auto current = counter.load(std::memory_order_acquire);
-        while (current + want <= budget)
+        while (current <= budget - want)
             if (counter.compare_exchange_weak(current, current + want, std::memory_order_acq_rel, std::memory_order_acquire))
                 return true;
         return false;
@@ -88,6 +104,25 @@ namespace
         ReservedBytes& operator=(ReservedBytes const&) = delete;
         ReservedBytes(ReservedBytes&&) = delete;
         ReservedBytes& operator=(ReservedBytes&&) = delete;
+
+        /// Raise this reservation to `total`, or leave it exactly as it was.
+        ///
+        /// Growing an existing reservation rather than taking a second one, because a
+        /// job holds ONE amount and gives back what it holds: two live reservations
+        /// per job is two things a path out of `Serve` has to remember, and the one it
+        /// forgets is a budget that never returns to zero.
+        /// @param total What this job should hold from now on.
+        /// @param budget The ceiling.
+        /// @return Whether the reservation now stands at `total`.
+        [[nodiscard]] bool TryRaiseTo(std::size_t total, std::size_t budget) noexcept
+        {
+            if (total <= _bytes)
+                return true;
+            if (!TryReserve(*_counter, total - _bytes, budget))
+                return false;
+            _bytes = total;
+            return true;
+        }
 
       private:
         std::atomic<std::size_t>* _counter;
@@ -367,7 +402,7 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 socket->Close();
                 co_return;
             }
-            ReservedBytes const reserved { _bytesInFlight, decoded->payloadLength };
+            ReservedBytes reserved { _bytesInFlight, decoded->payloadLength };
 
             auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
             if (payload.has_value())
@@ -377,8 +412,50 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
 
                 // Counted at the socket, which is what "bytes received" means
                 // to an operator sizing a link: the payload as it arrived, not
-                // what it decompressed to.
+                // what it decompressed to. Before the second budget check below,
+                // because these bytes did arrive whatever this worker decides next.
                 _metrics.Increment(IMetricsSink::Counter::WorkerBytesReceived, static_cast<std::uint64_t>(frame.size()));
+
+                // The frame length charged above is the COMPRESSED one, and it is not
+                // what this request costs. A codec envelope one layer in declares what
+                // it expands to, and `Unenvelope` allocates that -- so a few dozen
+                // bytes declaring a 256 MiB expansion passed admission having reserved
+                // almost nothing, and `slots` of them are `slots` times the
+                // per-request ceiling. Exactly the shape the budget above exists to
+                // close, reopened one layer in (#241).
+                //
+                // Charged only now because it cannot be asked earlier: the envelope is
+                // a FIELD of the payload, so nothing knows the declared expansion
+                // until the payload the frame length already paid for has been read.
+                auto const footprint = Cc::DeclaredRequestFootprint(frame);
+
+                // A footprint above the whole budget is not a transient shortage and
+                // must not be reported as one. It is the PER-REQUEST ceiling, which
+                // `Unenvelope` answers by name with `payload-too-large` and without
+                // allocating a byte; charged here it would come back `EndpointBusy` on
+                // a completely idle worker and send the client off to retry a frame
+                // that can never fit. So an unpayable price is not charged at all --
+                // it is left to the decoder, which refuses it before it is spent.
+                //
+                // **That hand-off is only safe while the decoder's ceiling is no larger
+                // than this budget**, and it is exactly why `WorkerMaxRequestBytes` is
+                // exported from the header and handed to `WorkerProtocol` rather than
+                // each side keeping its own literal: a protocol built with a LARGER
+                // ceiling would accept, and allocate, precisely the frames skipped
+                // here -- unbudgeted, which is this whole defect again. One number,
+                // one place, and the skip below stays sound.
+                if (footprint <= MaxInFlightBytes && !reserved.TryRaiseTo(footprint, MaxInFlightBytes))
+                {
+                    _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy);
+                    // A REPLY, not a close, and the same code the frame-length
+                    // refusal uses: the frame declared its own length and has been
+                    // read in full, so the link is synchronised and the peer learns
+                    // that memory -- not the fleet, and not a slot -- is what it has
+                    // to wait for.
+                    (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, {}));
+                    socket->Close();
+                    co_return;
+                }
 
                 if (auto const reply = _protocol.Answer(frame); reply.has_value())
                 {

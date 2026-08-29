@@ -853,6 +853,19 @@ spelled it the same way, which is what makes this a drift rather than a discover
     `EndpointBusy` and its own counter: slots were free and memory was not, so
     reporting it as `NoCapacity` would send an operator to buy machines that would
     not help.
+  - **And the declared length it checks is the COMPRESSED one, which is not what the
+    request costs.** A COMPILE carries its preprocessed source in a codec envelope
+    whose `rawLen` is what the decoder sizes its output buffer from, so a hundred-byte
+    frame may declare a 256 MiB expansion and pass admission having reserved a hundred
+    bytes -- `slots` of them are `slots` times the per-request ceiling all over again,
+    now where the budget cannot see it. #241's ceiling is per REQUEST and closes only
+    half of this; the budget charges `DeclaredRequestFootprint`, the larger of the
+    frame length and the declared expansion, raised onto the same reservation once the
+    payload has been read. It cannot be asked earlier -- the envelope is a field of the
+    payload. The reasoning, including why the larger and not the sum, and why a
+    footprint above the whole budget is left to the decoder rather than answered
+    `EndpointBusy` on an idle worker, is in
+    [`wire-and-protocol.md`](wire-and-protocol.md).
   - **Concurrency turned a per-call scratch path into a per-thread one.**
     `CompileJobRunner` derived `job-N` from a plain `++`, and the source file and the
     hard-coded `tu.o` both live inside it. Two jobs reading the same counter compiled

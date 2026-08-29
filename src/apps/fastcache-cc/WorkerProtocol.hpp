@@ -90,6 +90,38 @@ class WorkerProtocol
     std::size_t _maxDecompressedBytes;
 };
 
+/// What one request declares it will make a worker hold, in bytes.
+///
+/// The frame's own `payloadLength` is not the answer, and believing it was reopened
+/// the hole the in-flight byte budget exists to close, one layer in: a COMPILE
+/// carries its preprocessed source in a **codec envelope**, whose `rawLen` is what
+/// `Unenvelope` sizes its output buffer from. A few dozen compressed bytes may
+/// declare a 256 MiB expansion, so a caller charging only the frame length admits
+/// `slots` of them having reserved almost nothing -- `slots` times the per-request
+/// ceiling, asked for by any cluster member
+/// ([#241](https://github.com/LASTRADA-Software/fastcached/issues/241)).
+///
+/// The **larger** of the two rather than their sum, and the budget therefore bounds
+/// the surface at a constant multiple of one request rather than byte-exactly.
+/// Byte-exactness was never on offer and is not what was lost: by the time this is
+/// asked, the reader's own buffer, the payload copy and the assembled frame are
+/// already three copies of the same bytes. What the sum would buy is a number that
+/// still is not the peak, at the price of refusing one honest maximal translation
+/// unit on an idle worker -- which is the same mistake as dividing the per-request
+/// cap by the slot count, arrived at from the other side. What matters, and what
+/// this restores, is that the bound does not grow with `slots`.
+///
+/// Lives HERE, beside the code that spends it, rather than in the accept loop that
+/// charges it: which field of which verb carries an envelope is `Compile`'s own
+/// knowledge, and a second reading of it in another file is two answers that would
+/// have to agree forever.
+///
+/// @param frame A whole request, header included.
+/// @return The largest buffer this request declares, or the frame's payload length
+///         when it declares nothing more than that -- including every request that
+///         is not a decodable COMPILE, which the protocol refuses on its own terms.
+[[nodiscard]] std::size_t DeclaredRequestFootprint(std::span<std::byte const> frame) noexcept;
+
 /// Register this worker with a scheduler, and keep it registered.
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
