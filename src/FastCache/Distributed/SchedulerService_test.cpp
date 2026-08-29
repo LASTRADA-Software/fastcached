@@ -71,8 +71,10 @@ struct Leading
     /// Capturing rather than null, so the one line this service writes is readable
     /// from any case that cares and costs the rest nothing.
     CapturingLogger logger;
-    SchedulerService service { clock, metrics, logger };
+    ManualWallClock wallClock;
+    SchedulerService service { clock, wallClock, metrics, logger, {} };
 };
+
 } // namespace
 
 TEST_CASE("A granted lease reaches the fleet page's compiling figure", "[distributed][scheduler][fleetview]")
@@ -142,7 +144,8 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    SchedulerService service { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
 
     SECTION("an undecided node refuses, and names nobody")
     {
@@ -209,7 +212,8 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    SchedulerService service { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
 
     CHECK(service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);

@@ -649,7 +649,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
                          "a command line is readable through ps, and a key that\n"
                          "leaks admits a node whose objects the whole fleet\n"
-                         "then caches." },
+                         "then caches. Discovery proves the cluster with it,\n"
+                         "and the scheduler SIGNS lease grants with it. Without\n"
+                         "one, a grant is unsigned and any client that can reach\n"
+                         "a worker's compile port can spend it." },
         { .primary = "--admin-listen",
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
@@ -1313,10 +1316,13 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "answers somewhere only it holds -- because just one of the sockets sharing a port is handed "
                      "a unicast. Pointing both at one port is the configuration that made two nodes on a host see "
                      "each other and never finish proving the key. Pick another, or leave it unset." },
-        { .refuses = [](NodeConfig const& c) { return !c.clusterKeyFile.empty() && c.discoveryAddress.empty(); },
-          .message = "--cluster-key-file is read by discovery and nothing else, and --discovery is not set. A "
-                     "secret an operator went to the trouble of provisioning, being read by nobody, is exactly "
-                     "the silent no-op this list exists to refuse." },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !c.clusterKeyFile.empty() && c.discoveryAddress.empty() && c.schedulerListen.empty();
+              },
+          .message = "--cluster-key-file is read by discovery and by the scheduler, and neither --discovery nor "
+                     "--listen-scheduler is set. A secret an operator went to the trouble of provisioning, being "
+                     "read by nobody, is exactly the silent no-op this list exists to refuse." },
         { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
           .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
                      "without one there is no port for it to answer on. It would start, log nothing wrong, "

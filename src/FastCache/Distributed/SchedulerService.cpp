@@ -229,9 +229,15 @@ namespace
     }
 } // namespace
 
-SchedulerService::SchedulerService(IClock& clock, IMetricsSink& metrics, ILogger& logger) noexcept:
+SchedulerService::SchedulerService(IClock& clock,
+                                   IWallClock const& wallClock,
+                                   IMetricsSink& metrics,
+                                   ILogger& logger,
+                                   std::span<std::byte const> signingKey):
+    _wallClock { wallClock },
     _metrics { metrics },
     _logger { logger },
+    _signingKey { signingKey.begin(), signingKey.end() },
     _workers { clock },
     _leases { clock }
 {

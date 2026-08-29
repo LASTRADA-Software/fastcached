@@ -505,10 +505,17 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     SteadyClock schedulerClock;
     SteadyClock cacheClock;
 
+    // Wall-clock, and separate from the steady clocks beside it, because a lease
+    // grant's expiry is checked on ANOTHER machine: a steady instant is meaningless
+    // off the host that read it, while a system-clock instant is comparable anywhere
+    // -- which is also why the check that reads it carries skew slack.
+    SystemWallClock const schedulerWallClock;
+
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (!cfg.schedulerListen.empty())
     {
-        auto started = Node::SchedulerTier::Start(nodeIo, cfg, membership.Oracle(), schedulerClock, metrics, logger);
+        auto started = Node::SchedulerTier::Start(
+            nodeIo, cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked

@@ -63,7 +63,8 @@ struct Fixture
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    Distributed::SchedulerService service { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
     Distributed::SchedulerProtocol protocol { service };
 
     /// Frame `request`, answer it, and hand back the reply bytes.

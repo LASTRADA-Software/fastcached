@@ -44,7 +44,8 @@ struct Fixture
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    SchedulerService service { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
     SchedulerProtocol protocol { service };
 };
 

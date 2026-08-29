@@ -1980,3 +1980,31 @@ TEST_CASE("The drain bound is an operator's to set, zero included", "[node][conf
     // Refused by the row's own grammar rather than clamped somewhere downstream.
     CHECK_FALSE(ParseNodeArgv({ "--drain-timeout=soon" }).has_value());
 }
+
+TEST_CASE("NodeConfig: a cluster key is read by discovery OR by the scheduler", "[node][policy][lease]")
+{
+    // This rule used to refuse `--cluster-key-file` unless `--discovery` was set, on
+    // the stated premise that discovery was its only reader. The scheduler now signs
+    // lease grants with the same key, so that premise is false -- and a refusal whose
+    // premise has become false is worse than no refusal: it turns the correct
+    // configuration into a node that will not start.
+    SECTION("a scheduler alone is a reader")
+    {
+        auto cfg = Installable();
+        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.fleetOpen = true;
+        cfg.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("neither reader is still a secret nobody reads")
+    {
+        auto cfg = Installable();
+        cfg.clusterKeyFile = "cluster.key";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--cluster-key-file"));
+        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+    }
+}

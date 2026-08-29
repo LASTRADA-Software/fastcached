@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "DiscoveryTier.hpp"
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
+#include <cstddef>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
 
 SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              IClock& clock,
+                             IWallClock const& wallClock,
                              IMetricsSink& metrics,
-                             ILogger& logger):
-    _service { clock, metrics, logger },
+                             ILogger& logger,
+                             std::span<std::byte const> signingKey):
+    _service { clock, wallClock, metrics, logger, signingKey },
     _protocol { _service },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
     // object, and a node that answered "is this peer one of ours" differently at its
@@ -38,10 +43,29 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
+    IWallClock const& wallClock,
     IMetricsSink& metrics,
     ILogger& logger)
 {
-    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, metrics, logger } };
+    // The key a lease grant is signed with, and the same file discovery proves the
+    // cluster's identity from -- read again here rather than passed down, because the
+    // scheduler is built before discovery is and may be the only one of the two an
+    // operator asked for. Reading a small file twice at startup is not a cost worth a
+    // dependency between two tiers that otherwise have none.
+    //
+    // Absent is legal and means unsigned grants; unreadable is not, and is fatal for
+    // the reason the header states.
+    std::vector<std::byte> signingKey;
+    if (!cfg.clusterKeyFile.empty())
+    {
+        auto key = ReadClusterKey(cfg.clusterKeyFile);
+        if (!key.has_value())
+            return std::unexpected { key.error() };
+        signingKey = std::move(*key);
+    }
+
+    auto tier =
+        std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, wallClock, metrics, logger, signingKey } };
 
     // A bare port binds the WILDCARD here, the opposite of the cache surface's
     // loopback, and why is on `SchedulerListenDefaultHost`. Named rather than spelled

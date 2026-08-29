@@ -170,10 +170,24 @@ class SchedulerService
   public:
     /// @param clock Time source for registry expiry and lease timeouts; must
     ///        outlive the service.
+    /// @param wallClock Where a grant's absolute expiry comes from; must outlive the
+    ///        service. Separate from @p clock because a steady instant means nothing
+    ///        on the machine that has to check it, and a lease is checked on another
+    ///        machine by definition. Read by nothing yet; the signing it exists for
+    ///        arrives in the next commit.
     /// @param metrics Counts the outcomes below; must outlive the service.
     /// @param logger Where the one observation this service reports goes; must
     ///        outlive the service. `NullLogger` where a caller does not want it.
-    SchedulerService(IClock& clock, IMetricsSink& metrics, ILogger& logger) noexcept;
+    /// @param signingKey The cluster's pre-shared key, copied. **Empty is legal and
+    ///        means unsigned grants** -- the boundary this surface had before signed
+    ///        leases existed, which a single machine with no `--cluster-key-file`
+    ///        still runs. It is not silent: the first unsigned grant says so in the
+    ///        log, once.
+    SchedulerService(IClock& clock,
+                     IWallClock const& wallClock,
+                     IMetricsSink& metrics,
+                     ILogger& logger,
+                     std::span<std::byte const> signingKey);
 
     /// Where a node's handed-over history goes, or null to discard it.
     ///
@@ -413,6 +427,7 @@ class SchedulerService
     /// @return `Ok`, or the refusal with its reason.
     [[nodiscard]] SchedulerReply Offer(Cluster::Command const& command);
 
+    IWallClock const& _wallClock;
     IMetricsSink& _metrics;
     /// Where the endpoint-mismatch observation goes (#242).
     ///
@@ -432,6 +447,15 @@ class SchedulerService
     /// field. Relaxed because nothing is ordered against it: an exact cut-off is not
     /// the point, and the counter beside it is what carries the rate anyway.
     std::atomic<std::uint64_t> _mismatchLines { 0 };
+
+    /// The cluster's pre-shared key, or empty for unsigned grants.
+    ///
+    /// Copied rather than a `std::span` at the caller's buffer: the key is read from
+    /// a file by a tier that has no reason to outlive this service, and a signing key
+    /// that quietly becomes a dangling view is the kind of defect that authenticates
+    /// nothing while every test passes.
+    std::vector<std::byte> _signingKey;
+
     WorkerRegistry _workers;
     LeaseTable _leases;
 
