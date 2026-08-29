@@ -130,3 +130,53 @@ TEST_CASE("Loopback still answers for every spelling a kernel produces", "[core]
     // depend on.
     CHECK_FALSE(IsLoopbackHost("localhost"));
 }
+
+TEST_CASE("An endpoint gives up its host without dropping a bare one", "[core][hostport]")
+{
+    // The two shapes `SplitHostPort` answers for.
+    CHECK(HostOfEndpoint("10.0.0.1:6674") == "10.0.0.1");
+    CHECK(HostOfEndpoint("[2001:db8::1]:6674") == "2001:db8::1");
+    CHECK(HostOfEndpoint("worker-01.internal:6674") == "worker-01.internal");
+
+    // And the three it does NOT, which is the reason this exists. An endpoint that
+    // will not split is a legitimate bare host rather than a parse failure, and every
+    // one of these reached a caller as an unusable "host" before it was named here.
+    CHECK(HostOfEndpoint("10.0.0.1") == "10.0.0.1");
+    // `SplitHostPort` cuts this at its LAST colon and answers `2001:db8:`.
+    CHECK(HostOfEndpoint("2001:db8::1") == "2001:db8::1");
+    // `SplitHostPort` will not split a bracketed host with no port, so a caller
+    // falling back to the whole string keeps the brackets — which no kernel ever
+    // reports as a peer address.
+    CHECK(HostOfEndpoint("[2001:db8::1]") == "2001:db8::1");
+
+    CHECK(HostOfEndpoint("").empty());
+    CHECK(HostOfEndpoint("::") == "::");
+    CHECK(HostOfEndpoint("[::]") == "::");
+    CHECK(HostOfEndpoint("[::]:6674") == "::");
+}
+
+TEST_CASE("Two hosts name one machine across the spellings a listener imposes", "[core][hostport]")
+{
+    CHECK(SameHost("10.0.0.1", "10.0.0.1"));
+
+    // The fold, both ways round: which side carries the mapped form depends on how
+    // the listener was bound, so neither may be privileged.
+    CHECK(SameHost("::ffff:10.0.0.1", "10.0.0.1"));
+    CHECK(SameHost("10.0.0.1", "::ffff:10.0.0.1"));
+
+    // Whole-string, never a prefix.
+    CHECK_FALSE(SameHost("10.0.0.1", "10.0.0.10"));
+    CHECK_FALSE(SameHost("10.0.0.1", "10.0.0.2"));
+
+    // An empty host matches nothing, the empty host included: it is what
+    // `FormatPeerAddress` answers for a peer it could not identify, and two
+    // unanswerable questions are not a match.
+    CHECK_FALSE(SameHost("", "10.0.0.1"));
+    CHECK_FALSE(SameHost("10.0.0.1", ""));
+    CHECK_FALSE(SameHost("", ""));
+
+    // The same rule after the fold rather than before it: `::ffff:` unmaps to
+    // nothing, so a guard on the argument would let it match the empty host and hand
+    // an unnameable peer the answer the rule above exists to deny it.
+    CHECK_FALSE(SameHost("::ffff:", ""));
+}

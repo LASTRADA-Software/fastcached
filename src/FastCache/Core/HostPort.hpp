@@ -159,12 +159,17 @@ namespace FastCache
 /// an unidentifiable peer has to fail in -- it is what `FormatPeerAddress` answers
 /// for a peer whose family is unknown or whose `getpeername` failed, and two
 /// unanswerable questions are not a match.
+///
+/// The emptiness test is on the **folded** host rather than the argument, or a bare
+/// `::ffff:` -- which unmaps to nothing -- would match the empty host and hand an
+/// unnameable peer the answer the rule above exists to deny it.
 /// @param left One host, without a port or brackets.
 /// @param right The other.
 /// @return True when they name the same machine.
 [[nodiscard]] inline bool SameHost(std::string_view left, std::string_view right) noexcept
 {
-    return !left.empty() && UnmappedHost(left) == UnmappedHost(right);
+    auto const bare = UnmappedHost(left);
+    return !bare.empty() && bare == UnmappedHost(right);
 }
 
 /// Whether a host names this machine over the loopback interface.

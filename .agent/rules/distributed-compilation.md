@@ -313,7 +313,9 @@ Consequences that are each load-bearing:
       lease tokens.
     - **So what shipped is instrumentation, and it says so.**
       `DispatchWorkerEndpointMismatch` counts an **accepted** registration whose
-      endpoint host is not the caller's, beside a warning naming both addresses. No
+      endpoint host is not the caller's, beside a bounded `Info` line naming both
+      addresses — `Info` and not a warning, because on a DNS-named fleet this is every
+      registration and a permanent warning is one an operator learns to filter. No
       wire code was added: a code nothing returns would put a lie in the refusal
       table. The number exists because *nobody knows* how often endpoints legitimately
       differ on a real estate, and that is what decides whether a stricter rule is

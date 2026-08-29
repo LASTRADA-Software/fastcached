@@ -404,7 +404,11 @@ counts it:
 fastcached_dispatch_worker_endpoint_mismatch_total
 ```
 
-alongside a warning naming both addresses and the toolchain.
+alongside an **info** line naming both addresses and the toolchain, written for the
+first twenty mismatches and then left to the counter. Info rather than a warning
+deliberately: on a fleet that advertises DNS names this is every registration and
+nothing is wrong, and a signal that fires permanently on a correct deployment is one
+operators learn to filter.
 
 **A rise here is not by itself a fault.** Comparing hosts refuses far more than it
 protects, and the legitimate mismatches are the common shapes rather than the

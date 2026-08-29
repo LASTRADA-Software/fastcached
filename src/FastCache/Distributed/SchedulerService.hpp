@@ -425,9 +425,12 @@ class SchedulerService
 
     /// Mismatch lines already written, so the diagnostic is bounded.
     ///
-    /// Atomic because several reactor threads answer registrations, and relaxed
-    /// because nothing is ordered against it: an exact cut-off is not the point, and
-    /// the counter beside it is what carries the rate anyway.
+    /// Atomic defensively rather than because it is currently shared: today the
+    /// scheduler port is one `FrameEndpoint` on one reactor thread, and `_workers`
+    /// and `_leases` beside it are plain members that assume exactly that -- so a
+    /// second thread answering registrations would be a bigger change than this
+    /// field. Relaxed because nothing is ordered against it: an exact cut-off is not
+    /// the point, and the counter beside it is what carries the rate anyway.
     std::atomic<std::uint64_t> _mismatchLines { 0 };
     WorkerRegistry _workers;
     LeaseTable _leases;
