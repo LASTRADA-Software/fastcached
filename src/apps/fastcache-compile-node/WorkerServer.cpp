@@ -132,7 +132,9 @@ WorkerServer::~WorkerServer()
 
     // Every job holds a slot until it ends, so zero means nothing is still running
     // on the executor with a pointer into this object.
-    auto const idle = [this] { return _inFlight.load(std::memory_order_acquire) == 0; };
+    auto const idle = [this] {
+        return _inFlight.load(std::memory_order_acquire) == 0;
+    };
 
     auto const started = std::chrono::steady_clock::now();
     auto guard = std::unique_lock { _drainMutex };
@@ -144,7 +146,8 @@ WorkerServer::~WorkerServer()
         // line reports and the count the decision was made on are the same one.
         (void) _drained.wait_for(guard, DrainReportInterval, idle);
 
-        switch (NextDrainAction(_inFlight.load(std::memory_order_acquire), std::chrono::steady_clock::now() - started, _drainTimeout))
+        switch (NextDrainAction(
+            _inFlight.load(std::memory_order_acquire), std::chrono::steady_clock::now() - started, _drainTimeout))
         {
             case DrainAction::Finished:
                 return;
