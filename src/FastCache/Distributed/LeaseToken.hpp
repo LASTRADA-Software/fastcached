@@ -21,8 +21,8 @@
 #include <utility>
 #include <vector>
 
-/// The lease token: what the scheduler signs, and what a worker checks before it
-/// spawns anything.
+/// The lease token: what the scheduler signs, and what a worker will check before it
+/// spawns anything (#282 -- see "What this does NOT close" below).
 ///
 /// ## What this closes
 ///
@@ -33,9 +33,22 @@
 /// worker could check. Membership decided *who may connect*; nothing decided *who
 /// the scheduler actually sent*.
 ///
+/// ## What this does NOT close
+///
+/// Only the scheduler half. It **mints** a signed grant and authenticates one handed
+/// back to `Release`; no worker checks a token before it spawns a compiler yet, so a
+/// compile port's boundary today is still reachability plus membership. That half is
+/// [#282](https://github.com/LASTRADA-Software/fastcached/issues/282), and until it
+/// lands `VerifyLeaseToken` and `LeaseRefusalTable` below have no production caller.
+/// A signed grant nobody verifies buys nothing on its own; what it buys is that the
+/// format, the wire codes and the counters exist for #282 to be written against,
+/// which is also why signing must ship first -- a worker that refused unsigned leases
+/// before every scheduler in a fleet could mint them would stop distributing
+/// mid-upgrade.
+///
 /// ## Why it is header-only
 ///
-/// `apps/fastcache-cc/WorkerProtocol.cpp` is where a lease is verified, and that
+/// `apps/fastcache-cc/WorkerProtocol.cpp` is where a lease will be verified, and that
 /// file is compiled into `fastcache-cc`, which deliberately does **not link**
 /// `FastCache`. Being header-only over `Core/Sha256`, `Core/Base64` and the
 /// header-only `Core/WireFields` is what lets the launcher's build reach this

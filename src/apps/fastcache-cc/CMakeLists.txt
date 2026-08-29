@@ -69,10 +69,12 @@ set(_fc_cc_core
 
 # Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token is made of:
 # HMAC-SHA256 over the granted endpoint, fingerprint, key and expiry, rendered as
-# base64 text (src/FastCache/Distributed/LeaseToken.hpp). A worker verifies that
-# before it spawns a compiler, and the worker's protocol is WorkerProtocol.cpp --
-# which lives in this directory and is compiled into BOTH binaries, so the launcher
-# has to be able to build it.
+# base64 text (src/FastCache/Distributed/LeaseToken.hpp). Nothing here reaches that
+# header YET -- the scheduler signs a grant and no worker checks one until #282 --
+# and the two rows are here ahead of it on purpose: the worker's protocol is
+# WorkerProtocol.cpp, which lives in THIS directory and is compiled into both
+# binaries, so the verification half lands in a launcher build that already links
+# what it needs rather than in one that discovers it cannot.
 #
 # They cost nothing the rule above protects. Sha256.hpp reaches only the standard
 # library; Sha256.cpp adds Core/Endian.hpp, which is header-only and std-only and

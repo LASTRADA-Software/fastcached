@@ -13,11 +13,6 @@ namespace
     /// Sentinel for a byte the alphabet does not contain.
     constexpr std::uint8_t Invalid = 0xFF;
 
-    /// Value per input byte, built once at compile time.
-    ///
-    /// A table rather than four range comparisons per character: the ladder form
-    /// has to spell the alphabet's boundaries four times, and the offsets are
-    /// exactly the kind of arithmetic that is wrong by one in only one branch.
     /// The one alphabet, shared by both directions.
     ///
     /// Named once rather than spelled in each function: an encoder and a decoder
@@ -26,6 +21,12 @@ namespace
     /// two builds.
     constexpr std::string_view Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+    /// Value per input byte, built once at compile time.
+    ///
+    /// A table rather than four range comparisons per character: the ladder form
+    /// has to spell the alphabet's boundaries four times, and the offsets are
+    /// exactly the kind of arithmetic that is wrong by one in only one branch.
+    /// @return The decode table.
     consteval std::array<std::uint8_t, 256> BuildDecodeTable()
     {
         std::array<std::uint8_t, 256> table {};
