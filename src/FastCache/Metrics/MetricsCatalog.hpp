@@ -143,6 +143,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "nobody will report done; every one of these keys was being refused "
               "as in-flight until it was reclaimed.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesUnauthorized,
+      .prometheusName = "fastcached_dispatch_leases_unauthorized_total",
+      .help = "Releases refused because the token was not signed by this cluster. "
+              "Never sum with unknown-lease refusals: those name a lease this "
+              "scheduler issued and has forgotten, this one was never issued.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
       .help = "Compiles this worker began. Minus jobs_completed_total, the number "
@@ -218,6 +224,24 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Jobs refused because the payload did not expand to its declared "
               "size. The only envelope refusal that implicates the transport: a "
               "codec version skew, or a link damaging payloads.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_unauthorized_total",
+      .help = "Jobs refused because the lease was not signed by this cluster. A "
+              "security signal, not a capacity one -- or a launcher predating "
+              "signed leases, which presents a token that cannot authenticate.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseEndpointMismatch,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_endpoint_mismatch_total",
+      .help = "Jobs refused because an authentic lease named a different worker. "
+              "Usually a registered endpoint that is not the one clients dial, not "
+              "a replay.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_expired_total",
+      .help = "Jobs refused because an authentic lease had expired. A rise on one "
+              "machine and nowhere else is that machine's clock, not the fleet's "
+              "leases.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerBytesReceived,
       .prometheusName = "fastcache_worker_bytes_received_total",

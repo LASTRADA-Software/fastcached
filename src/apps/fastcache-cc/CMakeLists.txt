@@ -34,7 +34,9 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Base64.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
@@ -65,6 +67,20 @@ set(_fc_cc_core
 # four reach only Net/NetError.hpp, Async/Task.hpp and Core/Profiling.hpp,
 # all header-only and all std-only. ws2_32 was already linked below.
 
+# Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token is made of:
+# HMAC-SHA256 over the granted endpoint, fingerprint, key and expiry, rendered as
+# base64 text (src/FastCache/Distributed/LeaseToken.hpp). A worker verifies that
+# before it spawns a compiler, and the worker's protocol is WorkerProtocol.cpp --
+# which lives in this directory and is compiled into BOTH binaries, so the launcher
+# has to be able to build it.
+#
+# They cost nothing the rule above protects. Sha256.hpp reaches only the standard
+# library; Sha256.cpp adds Core/Endian.hpp, which is header-only and std-only and
+# was already here through CompileCacheWire.hpp. Base64 reaches the standard library
+# alone. No vcpkg package, no OpenSSL -- which is the point of having SHA-256 in this
+# tree at all, since FASTCACHED_ENABLE_TLS is off by default and peer authentication
+# is not optional.
+#
 # Core/Compression.cpp is the one row here that is NOT dependency-free, and it is a
 # deliberate exception to the rule the comment above states.
 #

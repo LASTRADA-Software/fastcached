@@ -334,6 +334,51 @@ enum class ErrorCode : std::uint8_t
     /// fleet forever, registered and never picked, with nothing anywhere saying
     /// why. A refusal is loud; a repair is a worker that quietly does nothing.
     MalformedRegistration = 0x18,
+
+    /// The lease presented is not one this cluster issued.
+    ///
+    /// Its MAC does not verify under the shared key, or it is not a lease token at
+    /// all -- and those two are deliberately ONE code, because from the receiving
+    /// end they are indistinguishable: a forged token and a random string differ
+    /// only in how much effort went into them. It is also what an old launcher's
+    /// bare serial arrives as, which is the right answer for it too: the client
+    /// answers every refusal here by compiling locally, so a mixed-version fleet
+    /// degrades to local compiles rather than to a broken build.
+    ///
+    /// Emphatically NOT `UnknownLease`, which is the scheduler saying it has no
+    /// record of a token it may well have issued -- an expired or already-resolved
+    /// lease, a fleet condition. This one says the token was never issued by
+    /// anybody holding the key, which is a security event and reads as one.
+    ///
+    /// Nothing the token CLAIMS is reported alongside it. A caller that cannot
+    /// authenticate a token has established no fact about it, and echoing its
+    /// contents back would turn the refusal into an oracle.
+    LeaseUnauthorized = 0x19,
+
+    /// An authentic lease, presented to a worker it was not issued for.
+    ///
+    /// Only ever reported once the MAC has verified, which is what makes it a
+    /// diagnostic rather than a hint to an attacker: the endpoint the scheduler
+    /// granted is stated in the message, because the overwhelmingly common cause is
+    /// not a replay at all but a worker whose advertised endpoint and actual one
+    /// disagree -- a NAT, or a hostname registered where clients resolve an address.
+    ///
+    /// The replay it also closes is the reason the endpoint is inside the MAC:
+    /// without it, a lease minted for one worker is a lease on every worker in the
+    /// fleet.
+    LeaseEndpointMismatch = 0x1A,
+
+    /// An authentic lease, presented after it expired.
+    ///
+    /// The expiry is a bound on how long a CAPTURED token stays useful, and nothing
+    /// else -- a worker's own slot accounting is what bounds concurrency, so this
+    /// code never means "the fleet is full". Reported by name rather than by closing
+    /// the connection, because a close is indistinguishable from a network fault and
+    /// sends a client into silent local fallback with nothing to report.
+    ///
+    /// Clock skew is real across a fleet, so the check carries slack; a rise here on
+    /// one machine and nowhere else is that machine's clock, not the fleet's leases.
+    LeaseExpired = 0x1B,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -559,6 +604,13 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::MalformedRegistration,
                       .name = "malformed-registration",
                       .defaultMessage = "a worker must name itself in UTF-8" },
+    ErrorDescriptor { .code = ErrorCode::LeaseUnauthorized,
+                      .name = "lease-unauthorized",
+                      .defaultMessage = "this lease was not issued by this cluster" },
+    ErrorDescriptor { .code = ErrorCode::LeaseEndpointMismatch,
+                      .name = "lease-endpoint-mismatch",
+                      .defaultMessage = "this lease was issued for another worker" },
+    ErrorDescriptor { .code = ErrorCode::LeaseExpired, .name = "lease-expired", .defaultMessage = "this lease has expired" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
