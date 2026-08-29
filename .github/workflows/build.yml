@@ -71,6 +71,8 @@ jobs:
   check-clang-format:
     name: "Check C++ style"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -118,9 +120,64 @@ jobs:
           fi
           echo "all $(wc -l < "$RUNNER_TEMP/jobs.txt") sibling jobs gate this release"
 
+  # What this change can affect, decided once and read by every job below.
+  #
+  # A pull request touching only `docs/`, `.agent/` or a `*.md` runs no compiler
+  # here — but it must still REPORT every required check, and that is the whole
+  # difficulty. Master is protected by a ruleset (`default-master`, active) whose
+  # required contexts include Windows-cl-release, Windows-clangcl-release,
+  # Linux-clang-release, Linux-gcc-release, macOS-clang-release, clang-tidy, the
+  # three sccache smokes and Check C++ style. A required context that never
+  # reports leaves the pull request waiting on it forever.
+  #
+  # So this is deliberately NOT `on: paths-ignore`. That filter stops the
+  # workflow from triggering at all, no check run is ever created, and "slow"
+  # becomes "unmergeable". A job-level `if:` is a different mechanism: the job is
+  # created and reports a `skipped` conclusion, which a required check accepts.
+  #
+  # Note also `strict_required_status_checks_policy: true` on that ruleset —
+  # branches must be up to date before merging. Every merge therefore puts every
+  # other open pull request behind and forces a rebase and a full re-run, so the
+  # matrix is not paid once per pull request but once per pull request per merge
+  # that lands while it is open. That multiplier is the larger half of why this
+  # job exists.
+  #
+  # The classification lives in `scripts/ci-scope.sh` rather than inline, so it is
+  # testable without a runner (`ctest -R ci-scope`) and so the path table is one
+  # list rather than a YAML glob nobody can exercise. Every way of not knowing --
+  # an unresolvable ref, a failed diff, an empty diff, a path matching no row --
+  # resolves to `code=true`, for the reason `scripts/tidy-sweep.sh` states about
+  # its own base ref: "we could not tell what changed" must never read as
+  # "nothing did".
+  changes:
+    name: "Decide what this change can affect"
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the classifier diffs against the merge base, which a
+          # depth-1 clone does not contain.
+          fetch-depth: 0
+
+      # A push or a tag has no pull-request base to diff against, and inventing
+      # one would be guessing. Those events build everything, which is also what
+      # makes the `release` job safe: on a tag nothing below is ever skipped.
+      - id: classify
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            scripts/ci-scope.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
+          else
+            echo "not a pull request (${{ github.event_name }}); building everything" >&2
+            echo "code=true" | tee -a "$GITHUB_OUTPUT"
+          fi
+
   linux:
     name: "Linux-${{ matrix.preset }}"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -228,6 +285,8 @@ jobs:
   clang-tidy:
     name: "clang-tidy"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       # fetch-depth: 0 is load-bearing here for a second reason beyond the one
       # at the top of this file: the sweep diffs against the pull request's base
@@ -321,6 +380,8 @@ jobs:
   clang-asan-ubsan:
     name: "clang-asan-ubsan"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -441,6 +502,8 @@ jobs:
   clang-tsan:
     name: "clang-tsan"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # The gate bounds each test binary itself, which names the target that stalled;
     # this bounds the build as well, so a hang anywhere in the job stops in an hour
     # rather than at GitHub's six-hour default. Every wait is bounded.
@@ -565,6 +628,8 @@ jobs:
   coverage:
     name: "Code coverage"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Read here rather than in each step's `if`, because the `secrets` context is
     # not available in a step-level condition while `env` is. Empty on a pull
     # request from a fork, where GitHub withholds secrets — which is exactly the
@@ -696,6 +761,8 @@ jobs:
   macos:
     name: "macOS-clang-release"
     runs-on: macos-14
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -754,6 +821,8 @@ jobs:
   docker:
     name: "Docker image"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -790,7 +859,8 @@ jobs:
   sccache-smoke-memcached-text:
     name: "sccache smoke (memcached text)"
     runs-on: ubuntu-24.04
-    needs: linux
+    needs: [changes, linux]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -812,7 +882,8 @@ jobs:
   sccache-smoke-memcached-binary:
     name: "sccache smoke (memcached binary)"
     runs-on: ubuntu-24.04
-    needs: linux
+    needs: [changes, linux]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -844,7 +915,8 @@ jobs:
   sccache-smoke-redis:
     name: "sccache smoke (redis RESP2)"
     runs-on: ubuntu-24.04
-    needs: linux
+    needs: [changes, linux]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -873,7 +945,8 @@ jobs:
   fastcache-cc-smoke:
     name: "fastcache-cc smoke (compile-cache 0xFC)"
     runs-on: ubuntu-24.04
-    needs: linux
+    needs: [changes, linux]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -902,6 +975,8 @@ jobs:
   windows:
     name: "Windows-${{ matrix.preset }}"
     runs-on: windows-2025
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # The Windows jobs were the second-biggest block in this workflow — 21.2 and
     # 15.7 minutes, of which 17.2 and 11.8 were the build — and they were paying
     # a full cold compile every single run. Measured on run 33243524509: sccache
@@ -1045,6 +1120,8 @@ jobs:
   compile-cache-e2e-linux:
     name: "compile-cache E2E (Linux)"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1107,6 +1184,8 @@ jobs:
   compile-cache-e2e-windows:
     name: "compile-cache E2E (Windows)"
     runs-on: windows-2025
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Same backend, same version, same reasons as the `windows` job above, where
     # they are written out. This job builds the same cl-release configuration, so
     # it also hits entries that job stored.
@@ -1192,6 +1271,8 @@ jobs:
   package-linux:
     name: "Package (Linux .deb/.rpm)"
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1490,6 +1571,8 @@ jobs:
   package-macos:
     name: "Package (macOS .pkg)"
     runs-on: macos-15
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1769,6 +1852,8 @@ jobs:
   package-windows:
     name: "Package (Windows .msi)"
     runs-on: windows-2025
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # Same backend, same version, same reasons as the `windows` job above, where
     # they are written out.
     env:
@@ -2127,6 +2212,7 @@ jobs:
     # row here — asserts the list still covers the whole workflow, and does so on
     # every push and pull request rather than only when a tag is already pushed.
     needs:
+      - changes
       - check-clang-format
       - check-release-gate
       - linux
