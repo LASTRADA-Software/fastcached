@@ -116,7 +116,9 @@ namespace
                 return std::unexpected(EnvelopeError::Malformed);
             // Straight out of the frame. An intermediate `std::vector<std::byte>` here
             // would be a second full copy of a preprocessed translation unit, on the
-            // one codec a node actually negotiates.
+            // path a build with compression configured out takes for every payload --
+            // the one least able to afford it. (It used to be EVERY payload's path,
+            // because the node negotiated no codec but `Identity`; #265.)
             return materialize(envelope->bytes);
         }
 
