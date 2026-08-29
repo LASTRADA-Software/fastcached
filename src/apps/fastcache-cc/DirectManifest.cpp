@@ -2,6 +2,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
+#include <FastCache/CompileCache/DeclaredSize.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
@@ -27,6 +28,12 @@ namespace
     /// Manifest wire version. Bumped whenever the encoding changes shape, so an
     /// older launcher rejects a newer manifest instead of misreading it.
     constexpr std::uint8_t ManifestVersion = 1;
+
+    /// The fewest wire bytes one encoded entry can occupy: the two length prefixes of
+    /// its canonical path and content hash, both empty. Read off `EncodeManifest`'s
+    /// loop, which is what fixes it -- a field added there must be added here, or the
+    /// guard it feeds becomes weaker than the format it guards.
+    constexpr std::size_t MinEntryBytes = 2 * sizeof(std::uint32_t);
 
     /// Path prefixes whose headers are treated as immutable toolchain content.
     /// Matched case-insensitively: Windows paths reach us in whatever case the
@@ -119,6 +126,12 @@ namespace
         [[nodiscard]] bool AtEnd() const noexcept
         {
             return _offset == _bytes.size();
+        }
+
+        /// @return Bytes not yet consumed.
+        [[nodiscard]] std::size_t Remaining() const noexcept
+        {
+            return _bytes.size() - _offset;
         }
 
       private:
@@ -240,7 +253,22 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     if (!cursor.ReadU32(count))
         return std::unexpected(DirectError::Malformed);
 
-    manifest.entries.reserve(count);
+    // The count is a CLAIM about bytes this blob must already carry, checked before
+    // anything is sized from it -- the rule issue #267 generalises. An entry is two
+    // length-prefixed fields, so it costs `MinEntryBytes` even when both are empty,
+    // and a blob that cannot hold that many is refused here. Unguarded, this reserved
+    // straight from a `u32`: an `Entry` is two `std::string`s, sixty-four bytes in
+    // memory against eight on the wire, so an eleven-byte blob asked for ~274 GB.
+    //
+    // These bytes come off the network -- the launcher fetches the manifest from the
+    // cache server before decoding it -- so the number is a peer's, not this
+    // process's.
+    if (!DeclaredCountFits(count, MinEntryBytes, cursor.Remaining()))
+        return std::unexpected(DirectError::Malformed);
+
+    // Grown from the entries actually decoded rather than reserved from the declared
+    // count, which the guard bounds by BYTES and so still leaves an eightfold gap
+    // between an entry's wire minimum and its size in memory.
     for (std::uint32_t index = 0; index < count; ++index)
     {
         DirectManifest::Entry entry;

@@ -126,6 +126,36 @@ Every rule below has already been a bug.
     its fields was refused. That is the framing rule at the top of this section,
     applied one layer in.
 
+- **A number a PEER declares sizes nothing until it has been checked against the bytes
+  that are actually there.** A declared count or length is a *claim about bytes the
+  frame must already contain* — not a request, and not a size to allocate from. Every
+  element costs some fixed minimum on the wire, so the claim is checkable, and
+  `CompileCache/DeclaredSize.hpp` is where that check lives
+  ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). Three decoders
+  reserved from a `u32` before reading a single element: `DecodeCompileValue`
+  (~172 GB from a **nine-byte** frame — measured, `sizeof(TextRegion)` is 40),
+  `PrefetchGroupManifest`'s key list, and `DirectManifest` (~274 GB from eleven bytes).
+  Under a 2 GiB address-space cap the pre-fix `DecodeCompileValue` aborts on
+  `std::bad_alloc`.
+  - **Validating the count is necessary and NOT sufficient.** It bounds the claim by
+    bytes present, which still leaves an amplifier whenever the in-memory element is
+    bigger than its wire minimum — a `TextRegion` is 40 bytes against 5, so a *capped*
+    frame could still reserve eight times its own size. So a decoder validates the
+    claim **and** grows its container from the elements it actually decodes, rather
+    than reserving what a peer said was coming. `reserve(declaredCount)` is the
+    defect; there is no safe validated version of it.
+  - **Divide, never multiply.** `count <= remaining / minBytesEach`, because
+    `count * minBytesEach` is the overflowing spelling and wraps on exactly the values
+    the check exists to refuse.
+  - **The per-element minimum is read off the ENCODER**, and named beside it. A field
+    added to the encoder that is not added to the minimum leaves the guard weaker than
+    the format it guards.
+  - **It is a class, not a site.** The same shape sits behind every decoder that
+    reserves, resizes or value-initializes from a wire number, and the fix is only
+    worth anything applied to all of them. `Cache/StreamCodec.hpp` had already learned
+    this and grew a `BoundedReserve`; its sibling `Cache/SetCodec.hpp` was missed. Sweep
+    when you touch one.
+
 ## Authentication on the compile-cache port
 
 - **Every protocol checks the configured credential, and the compile cache was the

@@ -407,6 +407,24 @@ This asymmetry is the whole design: canonicalize on STORE, serve canonical on
 FETCH, localize on the client. The server stores exactly one representation of
 an entry no matter how many differently-rooted machines produce it.
 
+!!! note "The region count is a claim about bytes, and it is checked against them"
+
+    `textRegions` is length-prefixed with a 32-bit count, and a decoder must treat
+    that number as an **assertion the frame either backs up or does not** — never as
+    a size to allocate from. A region costs five bytes on the wire at the very least
+    (its grammar tag and its length prefix), so a frame declaring more regions than
+    `remaining / 5` is refused as `malformed-value` before anything is reserved.
+
+    Unchecked, a **nine-byte** STORE payload declaring `0xFFFFFFFF` regions asked for
+    roughly 172 GB — reachable on the daemon's STORE path, and from a worker's reply
+    to the launcher
+    ([#267](https://github.com/LASTRADA-Software/fastcached/issues/267)). Validating
+    the count is necessary and not sufficient: the decoder also grows its container
+    from the regions it actually reads, because a validated count is still an
+    eightfold amplifier when the in-memory element is forty bytes and its wire
+    minimum is five. The same rule governs the prefetch-group manifest's key list and
+    the launcher's direct-mode manifest.
+
 ## Prefetch groups
 
 The `prefetchGroup` field on a STORE groups keys that tend to be needed together

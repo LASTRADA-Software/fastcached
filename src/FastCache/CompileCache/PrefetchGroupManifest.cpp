@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/CompileCache/DeclaredSize.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Core/Endian.hpp>
 
@@ -34,7 +35,22 @@ namespace
         std::uint32_t count {};
         if (!readU32(count))
             return keys;
-        keys.reserve(count);
+
+        // The same claim-about-bytes rule `DecodeCompileValue` applies, and the same
+        // defect: this reserved from a `u32` read out of the value with no check that
+        // the buffer could hold that many keys, so a five-byte manifest declared four
+        // billion of them. A key costs its length prefix at minimum (issue #267).
+        //
+        // A count the bytes cannot supply means the manifest is not one this build
+        // wrote, so nothing is decoded from it -- rather than the best-effort prefix
+        // the loop below would otherwise return, which would silently prefetch a
+        // truncated group and look like a cold cache.
+        if (!DeclaredCountFits(count, sizeof(std::uint32_t), bytes.size() - pos))
+            return {};
+
+        // Grown from the keys actually decoded, never reserved from the declared
+        // count: a `std::string` is thirty-two bytes in memory against four on the
+        // wire, so even a validated count is an eightfold amplifier.
         for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, count))
         {
             std::uint32_t len {};

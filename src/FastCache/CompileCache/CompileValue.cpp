@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
+#include <FastCache/CompileCache/DeclaredSize.hpp>
 #include <FastCache/Core/Endian.hpp>
 
 #include <array>
@@ -12,6 +13,12 @@ namespace
 {
 
     constexpr std::uint8_t CompileValueVersion = 1;
+
+    /// The fewest wire bytes one encoded text region can occupy: its grammar tag and
+    /// its length prefix, with empty text. Read straight off `EncodeCompileValue`'s
+    /// loop below, which is what fixes it -- a field added there must be added here,
+    /// or the guard it feeds becomes weaker than the format it is guarding.
+    constexpr std::size_t MinRegionBytes = sizeof(std::uint8_t) + sizeof(std::uint32_t);
 
     /// The grammar tags that DecodeCompileValue accepts. Kept in sync with
     /// PathCanon::Grammar; an out-of-range tag is a malformed frame.
@@ -156,7 +163,20 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     if (!cursor.ReadU32(regionCount))
         return Malformed("truncated region count");
 
-    value.textRegions.reserve(regionCount);
+    // The count is a CLAIM about bytes this frame must already carry, checked before
+    // anything is sized from it. A region costs `MinRegionBytes` on the wire at the
+    // very least, so a frame that cannot hold that many is refused here rather than
+    // discovered mid-loop -- which is what let a nine-byte frame declare four billion
+    // regions and reserve on the order of 170 GB (issue #267).
+    if (!DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
+        return Malformed("region count exceeds what the remaining bytes can supply");
+
+    // Deliberately NOT `reserve(regionCount)`, even now that the count is bounded.
+    // The guard above bounds it by BYTES, and a `TextRegion` is forty bytes in memory
+    // against five on the wire -- so reserving a validated count still lets a frame
+    // demand eight times its own size. Growing from the regions actually decoded keeps
+    // the allocation proportional to what was really received, and the realistic count
+    // is one per grammar.
     for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
     {
         std::uint8_t grammarTag {};
