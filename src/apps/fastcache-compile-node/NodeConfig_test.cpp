@@ -247,6 +247,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.clusterKeyFile = "cluster.key";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
+    cfg.drainTimeoutSeconds = 90;
 
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
 
