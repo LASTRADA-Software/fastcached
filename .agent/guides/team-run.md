@@ -83,10 +83,27 @@ Each of these is a scar, not a preference.
 - **Rebase on the manager's signal.** `origin/master` moves fast here and a build that was
   running when a rebase landed is **poisoned** — mixed object vintages, a result describing
   a tree that never existed. Check the base before starting anything long.
+- **`origin/master` moves under you without you fetching.** Every worktree here shares one
+  `.git`, so any other session's `git fetch` advances the ref for all of them. Anything you
+  compare against `origin/master` is compared against a ref another session may have moved
+  seconds ago, and nothing in your own shell will have hinted at it.
 - **Never `git reset --soft origin/master`** to squash after the base moved: the reset
   re-parents onto the new master while the index still holds the old tree, so everything
-  that landed in between becomes a deletion in your commit. Use `rebase -i`. Read the
-  diffstat before pushing and check `git diff --diff-filter=D`.
+  that landed in between becomes a deletion in your commit. Use `rebase -i`. Before pushing,
+  read the diffstat and check `git diff --diff-filter=D`.
+
+  **Three dots, always:**
+
+  ```
+  git diff --stat origin/master...HEAD
+  ```
+
+  Two-dot compares master's *tip* to your HEAD, so the moment master moves, its new
+  commits render as **your deletions** — the exact signature of the disaster this check
+  exists to catch. It false-alarms on every upstream merge, and a check that cries wolf
+  routinely is one nobody believes on the day it is right. Three-dot compares from the
+  merge base and shows only your work. It still catches the real accident: after a
+  `reset --soft`, the merge base *is* the new master, so the deletions show up either way.
 - **New build directories need `--fresh`.** Existing trees can have `FASTCACHE_CC-NOTFOUND`
   baked into `CMakeCache`, and `find_program` never revisits a filled entry — they fall
   back to sccache silently. Confirm the `[cache] Enabling fastcache-cc` configure line.
