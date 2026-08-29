@@ -357,3 +357,5 @@ cd out/build/clang-release && cpack -G "DEB;RPM;TGZ"    # Windows: cpack -G WIX
 ```
 
 The Windows MSI additionally needs the WiX Toolset (v4 or v5) installed.
+
+<!-- #300 scope probe: docs-only. -->
