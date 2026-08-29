@@ -160,9 +160,12 @@ numbers are kept because each one is the reason a knob is where it is.
 
 - **The unit of work is a compile command, not a file, and that is what makes the
   swap lossless.** `Stats.cpp` builds into `fastcache-cc`, `fastcache-cc-tests`
-  and `fastcache-compile-node`, which do not agree about `FC_COMPRESSION_ENABLED`;
-  `clang-tidy -p <dir> <file>` always takes the *first* matching entry, so the
-  second and later commands for a file each get a one-entry database of their own.
+  and `fastcache-compile-node`, which do not agree about `FC_COMPRESSION_ENABLED`.
+  `clang-tidy -p <dir> <file>` does **not** take the first matching entry:
+  libTooling's `ClangTool::run` loops over *every* command the database returns for
+  that file. So a file with one command needs nothing special, and a file with
+  several is served **only** by one single-entry database per command — handing it
+  to the shared database *as well* analyses each of its commands twice.
   Measured against a CI-shaped database: 594 entries, 445 of them first-party, and
   329 distinct files — so a per-file sweep would have stopped checking a quarter of
   what the build checked. 445 is also exactly what the old job tidied
@@ -398,6 +401,19 @@ numbers are kept because each one is the reason a knob is where it is.
   against a real source file first, treats exit codes ≥ 126 as fatal rather than as
   findings, and refuses to print a clean verdict it did not earn. Use it, and if you
   write a one-off loop instead, make it fail loudly the same way.
+
+  "Refuses a verdict it did not earn" is four separate refusals, and each one closes
+  a path that ends in `CLEAN` over nothing: the plan's exit status is *observed*
+  (`mapfile < <(plan)` throws it away, and every way a compile database can fail to
+  parse then yields zero rows, which reads as "nothing to sweep"); the include scan
+  is fatal when `grep` **fails** rather than merely matching nothing (an empty graph
+  silently narrows the scope to the changed `.cpp` files); a plan with units in it
+  and none of them present in the tree is fatal, not `CLEAN (0 translation
+  unit(s))`; and the extension table that decides what may be handed to clang-tidy
+  is a table, so a `.c` unit cannot be walked into the graph and dropped on the way
+  out. The self-test also pins `LC_ALL=C` on its ordering — under `en_US.UTF-8`
+  `sort` collates case-insensitively and the assertions fail on a developer's
+  machine while passing on a runner's `C.UTF-8`.
 
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more

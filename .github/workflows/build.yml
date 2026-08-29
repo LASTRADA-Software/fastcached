@@ -835,6 +835,12 @@ jobs:
       # back to and the exact string this job must never see again, while what
       # the GHA backend calls itself is sccache's to rename.
       #
+      # And because it is sccache's to rename, the two fields are checked to be
+      # PRESENT first. A `-match` against `$null` is `$false`, so an sccache that
+      # moves or renames `cache_location` would leave this step green while
+      # asserting nothing — the same "configured, announced, inert" shape the step
+      # exists to catch, one level up.
+      #
       # Here, and NOT in the action's own post step, because sccache keeps its
       # counters in the server and this suite restarts that server: the
       # `sccache-smoke-*` tests point sccache at a fastcached daemon through
@@ -847,6 +853,10 @@ jobs:
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($null -eq $stats.stats.compile_requests -or $null -eq $stats.cache_location) {
+            Write-Host "::error::sccache reported no compile_requests/cache_location field; the assertion below cannot run and a null never matches, so this is a refusal rather than a pass"
+            exit 1
+          }
           if ($stats.stats.compile_requests -eq 0) {
             Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
             exit 1
@@ -986,6 +996,10 @@ jobs:
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($null -eq $stats.stats.compile_requests -or $null -eq $stats.cache_location) {
+            Write-Host "::error::sccache reported no compile_requests/cache_location field; the assertion below cannot run and a null never matches, so this is a refusal rather than a pass"
+            exit 1
+          }
           if ($stats.stats.compile_requests -eq 0) {
             Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
             exit 1
@@ -1657,6 +1671,10 @@ jobs:
         run: |
           & $env:SCCACHE_PATH --show-stats
           $stats = & $env:SCCACHE_PATH --show-stats --stats-format=json | ConvertFrom-Json
+          if ($null -eq $stats.stats.compile_requests -or $null -eq $stats.cache_location) {
+            Write-Host "::error::sccache reported no compile_requests/cache_location field; the assertion below cannot run and a null never matches, so this is a refusal rather than a pass"
+            exit 1
+          }
           if ($stats.stats.compile_requests -eq 0) {
             Write-Host "::error::sccache handled 0 compile requests; the launcher is not wired in"
             exit 1

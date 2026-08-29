@@ -53,8 +53,14 @@
 #                Needs no compile database and no clang-tidy.
 set -u
 
-if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
-    echo "TIDY SWEEP FATAL: bash >= 4 is required (associative arrays)" >&2
+# 4.4 rather than 4.0, and each digit is load-bearing: associative arrays are 4.0,
+# `wait -n` is 4.3, and expanding an EMPTY array as `"${a[@]}"` under `set -u` stops
+# being an "unbound variable" error at 4.4 -- which this script does on any tree
+# with nothing changed. macOS ships 3.2; `brew install bash` is the answer there.
+if [[ -z "${BASH_VERSINFO:-}" ]] \
+   || [[ "${BASH_VERSINFO[0]}" -lt 4 ]] \
+   || { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 4 ]]; }; then
+    echo "TIDY SWEEP FATAL: bash >= 4.4 is required" >&2
     exit 2
 fi
 
@@ -94,7 +100,25 @@ SweepEverythingWhen=(
 # `git ls-files` globs and as a `case` pattern -- it is a two-site edit for a
 # one-fact change, in a script whose whole thesis is that a wrong scope is
 # invisible.
-SourceExtensions=(c h hpp cpp ipp hxx inl)
+SourceExtensions=(c cc cxx h hh hpp cpp ipp hxx inl)
+
+# Which of those are TRANSLATION UNITS, and therefore what the sweep can hand to
+# clang-tidy. Spelled as its own table rather than as a `*.cpp` test buried in
+# AffectedTranslationUnits: `c` is on the list above, so a `.c` file added
+# tomorrow would otherwise be walked into the graph and then dropped on the way
+# out -- unswept, with a clean verdict printed over it. The compile database has
+# the final say either way; this only decides what is offered to it.
+TranslationUnitExtensions=(c cc cxx cpp)
+
+# True when a path is a translation unit this sweep can hand to clang-tidy.
+# @param 1 Repo-relative path.
+IsTranslationUnit() {
+    local path="$1" extension
+    for extension in "${TranslationUnitExtensions[@]}"; do
+        [[ "$path" == *".${extension}" ]] && return 0
+    done
+    return 1
+}
 
 # True when a changed path forces the full sweep.
 # @param 1 Repo-relative path.
@@ -139,6 +163,24 @@ BuildIncludeGraph() {
 
     # One grep over the whole tree rather than one per file: 1400 process spawns
     # is the difference between a second and a minute, and on Windows a lot more.
+    #
+    # Into a FILE rather than through a process substitution, and the exit status
+    # is checked, because that status is the only thing standing between a grep
+    # that could not run -- an argument list past this host's ARG_MAX, a file it
+    # cannot read -- and an EMPTY include graph. An empty graph is not an error
+    # anywhere downstream: it silently narrows the sweep to the changed `.cpp`
+    # files, prints a confident count, and reports clean. grep says 1 for "no
+    # line matched" and >= 2 for "I failed", and only the second is fatal.
+    local scan rc
+    scan="$(mktemp)" || fatal "cannot create a scratch file for the include scan"
+    grep -HoE '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"][^">]+[">]' \
+         -- "${files[@]}" > "$scan"
+    rc=$?
+    if [[ "$rc" -gt 1 ]]; then
+        rm -f "$scan"
+        fatal "the include scan failed (grep exit ${rc}); the sweep's scope cannot be trusted"
+    fi
+
     local line file spelling owner
     while IFS= read -r line; do
         file="${line%%:*}"
@@ -149,8 +191,8 @@ BuildIncludeGraph() {
             [[ "$owner" == "$file" ]] && continue
             includers["$owner"]="${includers["$owner"]:-} $file"
         done
-    done < <(grep -HoE '^[[:space:]]*#[[:space:]]*include[[:space:]]*[<"][^">]+[">]' \
-                  -- "${files[@]}" 2>/dev/null)
+    done < "$scan"
+    rm -f "$scan"
 }
 
 # Every `.cpp` reachable from a set of changed files through the include graph,
@@ -172,10 +214,16 @@ AffectedTranslationUnits() {
             [[ -z "${seen["$includer"]:-}" ]] && queue+=("$includer")
         done
     done
+    # `LC_ALL=C` because `sort` is COLLATED, not byte-ordered: under `en_US.UTF-8`
+    # it ignores case and punctuation at the primary level and puts
+    # `src/apps/Direct.cpp` before `src/Deep/User.cpp`, while a CI runner's
+    # `C.UTF-8` does the opposite. The sweep does not care about the order, but
+    # the self-test below compares against a literal, so a host locale must not
+    # be able to decide whether it passes.
     local path
     for path in "${!seen[@]}"; do
-        [[ "$path" == *.cpp ]] && printf '%s\n' "$path"
-    done | sort
+        IsTranslationUnit "$path" && printf '%s\n' "$path"
+    done | LC_ALL=C sort
 }
 
 # ---------------------------------------------------------------------------
@@ -200,11 +248,12 @@ SelfTest() {
     printf '#include "Deep/Middle.hpp"\n#include <string>\n'  > "$scratch/src/Deep/User.cpp"
     printf '#include <Deep/Base.hpp>\n'                       > "$scratch/src/apps/Direct.cpp"
     printf '#include <string>\n'                              > "$scratch/src/apps/Unrelated.cpp"
+    printf '#include "Deep/Base.hpp"\n'                       > "$scratch/src/apps/Legacy.c"
 
     local here="$PWD"
     cd "$scratch" || fatal "cannot enter the scratch directory"
-    BuildIncludeGraph src/Deep/Base.hpp src/Deep/Middle.hpp \
-                      src/Deep/User.cpp src/apps/Direct.cpp src/apps/Unrelated.cpp
+    BuildIncludeGraph src/Deep/Base.hpp src/Deep/Middle.hpp src/Deep/User.cpp \
+                      src/apps/Direct.cpp src/apps/Unrelated.cpp src/apps/Legacy.c
     cd "$here" || fatal "cannot return from the scratch directory"
 
     Expect() {
@@ -218,9 +267,11 @@ SelfTest() {
     }
 
     echo "TIDY SWEEP SELF-TEST"
-    # A header two levels down still reaches the translation unit at the top.
+    # A header two levels down still reaches the translation unit at the top --
+    # and a `.c` unit is one of them, which is the assertion that stops the
+    # translation-unit table from silently drifting back to "only `.cpp`".
     Expect "a transitively included header reaches its TU" \
-           "src/Deep/User.cpp"$'\n'"src/apps/Direct.cpp" \
+           "src/Deep/User.cpp"$'\n'"src/apps/Direct.cpp"$'\n'"src/apps/Legacy.c" \
            "$(AffectedTranslationUnits src/Deep/Base.hpp)"
     # And only that one -- an unrelated TU is not swept.
     Expect "an unrelated TU is not swept" \
@@ -230,6 +281,10 @@ SelfTest() {
     Expect "a changed TU sweeps itself" \
            "src/apps/Unrelated.cpp" \
            "$(AffectedTranslationUnits src/apps/Unrelated.cpp)"
+    # A header is never offered to clang-tidy as a unit of its own.
+    Expect "a changed header is not itself a unit" \
+           "0" \
+           "$(AffectedTranslationUnits src/Deep/Base.hpp | grep -c '\.hpp$' || true)"
 
     ExpectForce() {
         local path="$1" want="$2" got=no
@@ -290,8 +345,16 @@ trap "rm -rf '$scratch'" EXIT
 # builds into `fastcache-cc`, `fastcache-cc-tests` and `fastcache-compile-node`,
 # and those targets do not agree about `FC_COMPRESSION_ENABLED` -- so one
 # invocation per file would silently stop checking the other configurations.
-# `clang-tidy -p <dir> <file>` always takes the FIRST matching entry, so the
-# second and later commands for a file each get a one-entry database of their own.
+#
+# `clang-tidy -p <dir> <file>` does NOT take the first matching entry: libTooling's
+# `ClangTool::run` asks the database for the commands of a file and then loops over
+# **all** of them. So a file with one command needs nothing special, and a file with
+# several must not ALSO be handed to the shared database -- that invocation already
+# analyses every one of its commands, and the per-command databases would then
+# re-analyse each of them a second time. A file is therefore served by the shared
+# database when it has exactly one command, and by one single-entry database per
+# command when it has more. The unit of work stays the compile command either way;
+# what changes is that each is analysed exactly once.
 #
 # Reading the database is also the only honest answer to what this platform
 # compiles: `IocpReactor.cpp` is a translation unit on Windows and a file on
@@ -315,6 +378,12 @@ trap "rm -rf '$scratch'" EXIT
 PlanUnits() {
     python3 - "${DB}/compile_commands.json" "$repo_root" "$DB" "${scratch}/db" "$1" "$2" <<'PLAN'
 import json, os, sys
+
+# The rows below are split on tabs and newlines by the caller, so the newline has
+# to be the one byte the shell expects. Python's stdout translates "\n" to the
+# platform line ending, and a trailing "\r" on every path turns the whole plan into
+# files that "do not exist".
+sys.stdout.reconfigure(newline="\n")
 
 dbPath, root, dbDir, outDir, selectionPath, firstPartyPath = sys.argv[1:7]
 
@@ -345,14 +414,16 @@ if selection is not None:
     for path in sorted(selection - byFile.keys()):
         print("not a translation unit here: " + path, file=sys.stderr)
 
-# The first command for a file is served by the real database; every later one
-# gets a single-entry database of its own.
+# A file with a single command is served by the real database, which analyses that
+# one command. A file with several is served only by single-entry databases, one
+# per command -- the shared database would analyse all of them in one invocation
+# and the per-command ones would then repeat every single analysis.
 slot = 0
 for path, commands in byFile.items():
-    for index, entry in enumerate(commands.values()):
-        if index == 0:
-            print(dbDir + "\t" + path)
-            continue
+    if len(commands) == 1:
+        print(dbDir + "\t" + path)
+        continue
+    for entry in commands.values():
         slot += 1
         directory = os.path.join(outDir, str(slot))
         os.makedirs(directory, exist_ok=True)
@@ -426,7 +497,19 @@ fi
 if [[ "$mode" != all ]]; then
     declare -a sources=() touched=() globs=()
     for extension in "${SourceExtensions[@]}"; do globs+=("*.${extension}"); done
-    mapfile -t sources < <(git ls-files "${globs[@]}")
+    # `--cached --others --exclude-standard`, the same definition of first-party
+    # the plan below uses. A bare `git ls-files` sees only what is TRACKED, so a
+    # header created and not yet added would be missing from the include graph and
+    # every translation unit that includes it would drop out of the scope --
+    # silently, and for exactly the code nothing has ever checked.
+    #
+    # Filtered to what is actually on disk, because `--cached` also lists a tracked
+    # file deleted from the worktree and not yet staged, and the include scan now
+    # treats a file it cannot read as fatal rather than as an empty graph.
+    mapfile -t sources < <(git ls-files --cached --others --exclude-standard "${globs[@]}" \
+                           | while IFS= read -r candidate; do
+                                 [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
+                             done)
     for path in "${changed[@]}"; do
         for extension in "${SourceExtensions[@]}"; do
             [[ "$path" == *".${extension}" ]] && { touched+=("$path"); break; }
@@ -446,7 +529,17 @@ fi
 # source that has been created but not added yet is exactly the code nothing has
 # ever checked, and dropping it here would drop it silently.
 git ls-files --cached --others --exclude-standard > "${scratch}/first-party"
-mapfile -t plan < <(PlanUnits "$selection" "${scratch}/first-party")
+
+# Through a file, so the plan's exit status is OBSERVED. `mapfile < <(PlanUnits …)`
+# discards it, and every way the plan can fail -- a compile database this build
+# cannot parse, a scratch directory it cannot write, a python that dies -- then
+# produces exactly zero rows, which reads as "nothing to sweep" and exits 0. A
+# green check over nothing analysed is the one verdict this script exists to make
+# impossible.
+if ! PlanUnits "$selection" "${scratch}/first-party" > "${scratch}/plan"; then
+    fatal "could not read ${DB}/compile_commands.json"
+fi
+mapfile -t plan < "${scratch}/plan"
 if [[ "${#plan[@]}" -eq 0 ]]; then
     if [[ "$mode" == all ]]; then
         fatal "no first-party translation units in ${DB}/compile_commands.json"
@@ -510,6 +603,15 @@ wait
 if [[ "${#skipped[@]}" -gt 0 ]]; then
     echo "TIDY SWEEP: ${#skipped[@]} unit(s) in the database are not in the tree and were"
     echo "            not swept: ${skipped[*]}"
+fi
+
+# A plan with units in it and nothing swept out of it is not a clean branch: it is
+# a database that no longer describes this tree -- every entry stale, or every path
+# in it unreachable from here. Left alone it prints "CLEAN (0 translation unit(s))"
+# and exits 0, which is the same green check as a real sweep and covers no code at
+# all. The empty-plan cases above are the legitimate ones and have already exited.
+if [[ "$index" -eq 0 ]]; then
+    fatal "none of the ${#plan[@]} planned unit(s) exist in this tree; ${DB} does not describe it"
 fi
 
 shopt -s nullglob
