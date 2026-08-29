@@ -153,6 +153,32 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
+# directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
+# is enforced rather than merely asserted.
+#
+# It is registered here, in the DEFAULT set, and deliberately not under
+# `if(ENABLE_SANITIZER_THREAD)`. The scope rots in ordinary builds -- somebody adds
+# `Async/Foo_test.cpp` tagged `[reactor]` and nothing says otherwise -- so a check
+# that only runs in the sanitizer preset would report the drift to the one
+# configuration nobody runs locally. This costs milliseconds and reads source
+# files, so it survives `ctest -LE smoke` like the checks above.
+#
+# The failure it exists for has already happened once, before the gate merged: the
+# first tag expression excluded six of ten `Async/` test files and every signal in
+# the run still said clean. See the header of scripts/check-tsan-scope.cmake.
+add_test(
+    NAME "tsan-scope-hygiene"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-scope.cmake"
+)
+set_tests_properties("tsan-scope-hygiene" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and

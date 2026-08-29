@@ -138,14 +138,27 @@ determinism rests on.
     an exit of 0 that reported no assertions. This is the same shape as a sweep that
     skips files and a `-header-filter` that matches no path: the tool ran, the
     artefact was fine, and *nothing was examined*.
-  - **`nm | grep -q` is a false negative under `set -o pipefail`.** A `grep -q` that
-    matches closes the pipe early, `nm` dies of SIGPIPE, and the pipeline reports
-    failure -- so a correctly instrumented binary is diagnosed as an uninstrumented
-    one. Capture the symbols into a variable and match afterwards. This bit the gate
-    that exists to catch exactly this class of thing.
-  - **`nm` on a path that does not exist prints nothing**, and a grep for a symbol in
-    nothing counts zero -- identical to an uninstrumented binary and fixed somewhere
-    completely different. Check existence first, and say which one it was.
+  - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
+    on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
+    pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
+    status and the pipeline reports failure. So `nm "$bin" | grep -q __tsan_init`
+    says "no such symbol" precisely *because* the symbol was there. Capture the
+    output into a variable and match afterwards
+    (`syms="$(nm "$bin")"; [[ "$syms" == *__tsan_init* ]]`), or drop `-q`. This is
+    not specific to `nm`: **every "does this artefact contain X" idiom in this tree
+    is exposed to it** -- symbol checks, `strings | grep -q`, `objdump | grep -q`,
+    any long producer feeding an early-exiting matcher. It bit `scripts/tsan-gate.sh`
+    itself, which is the script written to catch exactly this class of thing, and
+    that is the first time here that the *checking mechanism* produced the false
+    reading rather than the thing being checked.
+  - **A tool given a path that does not exist reports nothing, which is what "absent"
+    also looks like.** `nm` on a missing file prints no symbols, so a grep for one
+    counts zero -- character-for-character identical to a binary that was built
+    without instrumentation, and fixed somewhere else entirely. Test existence first
+    and say which of the two it was; a single message covering both sends the reader
+    to the wrong place. Same shape as a `-header-filter` that matches no path and a
+    sweep that skips files: the tool ran, the artefact was fine, and nothing was
+    examined.
   - **A known race lives in `.tsan-suppressions` with its issue number, never in a
     deleted check.** Every entry is an open bug; removing it is part of closing that
     bug. `race:` matches a function name anywhere in a stack, so an entry is always

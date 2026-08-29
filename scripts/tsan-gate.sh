@@ -44,14 +44,24 @@
 # below runs zero cases, and every other signal in the run says clean.
 #
 # **The suite is scoped, and `ctest` has no vocabulary for the scope.** The
-# concurrency in this tree is in `Async`, `Consensus`, `Distributed` and the node,
-# and those map exactly onto three Catch2 tags plus one binary (verified: the tags
-# `[async]`, `[consensus]` and `[distributed]` appear in those three directories
-# and nowhere else). `catch_discover_tests` registers cases by NAME and this
-# project's Catch2 is older than `ADD_TAGS_AS_LABELS`, so there is no label to
-# select on. Running the two binaries directly also collapses ~700 sanitized
-# processes into two: measured at 1.2s and 17.6s against several minutes of
-# per-process runtime startup.
+# concurrency in this tree is in `Async`, `Consensus`, `Distributed` and the node.
+# `catch_discover_tests` registers cases by NAME and this project's Catch2 (3.6)
+# predates `ADD_TAGS_AS_LABELS`, so there is no ctest label to select on and the
+# scope has to be a Catch2 tag expression. Running the two binaries directly also
+# collapses ~700 sanitized processes into two: measured at 1.2s and 17.6s against
+# several minutes of per-process runtime startup.
+#
+# The tag list is NOT self-evidently the right one, and an earlier version of it
+# was wrong: `[async],[consensus],[distributed]` looks complete and silently
+# excluded six of ten `Async/` test files, because the reactor and coroutine tests
+# are tagged `[reactor]` and `[task]` and carry no `[async]`. It matched 511 cases
+# and they passed. Nothing in the run could have said otherwise -- which is
+# refusal (4) failing at one level up from where it can see.
+#
+# So the tag list is not trusted here. `scripts/check-tsan-scope.cmake` runs in the
+# default ctest set and fails when a test file in one of those directories carries
+# no tag this expression selects, which is what makes the convention load-bearing
+# rather than aspirational. Change one and it will tell you about the other.
 #
 # **Known-open races need somewhere to live.** `.tsan-suppressions` is that place
 # and every entry names an issue; see the header of that file for why an entry is
@@ -67,7 +77,7 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # is run with (empty means the whole binary). Adding a concurrency-bearing target
 # is adding a row.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed]"
+    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task]"
     "fastcache-compile-node-tests|"
 )
 
@@ -78,6 +88,15 @@ fatal() {
 
 note() { echo "==> $*"; }
 
+# One scratch directory with one EXIT trap, which is this repository's idiom
+# (cluster-e2e.sh, compile-cache-e2e.sh, tidy-sweep.sh all do it). Per-log `rm`
+# calls scattered down the function were five places for the sixth exit path to
+# forget -- and `fatal` exits rather than returning, so a RETURN-scoped trap would
+# not have covered them either.
+SCRATCH="$(mktemp -d)"
+cleanup() { rm -rf "${SCRATCH}"; }
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
 # Locate the binaries.
 # ---------------------------------------------------------------------------
@@ -85,14 +104,16 @@ note() { echo "==> $*"; }
 [[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
 
 BinaryPath() {
-    # `target/` is where this project's CMake puts executables; the find is a
-    # fallback so a layout change is a slower gate rather than a broken one.
-    local name="$1" path
-    path="${BUILD_DIR}/target/${name}"
-    if [[ ! -f "$path" ]]; then
-        path="$(find "$BUILD_DIR" -type f -name "$name" -perm -u+x 2>/dev/null | head -1)"
-    fi
-    printf '%s' "$path"
+    # `target/` is where this project's CMake puts executables
+    # (CMAKE_RUNTIME_OUTPUT_DIRECTORY, set in the top-level CMakeLists).
+    #
+    # No `find` fallback, on purpose. Searching the build tree and taking the
+    # first match is a GUESS, and a guess that silently picks some other build's
+    # binary is the failure this whole script exists to refuse -- it would happily
+    # verify and run an artefact nobody asked about. A layout change should stop
+    # the gate with a path in the message, which is a one-line fix, rather than
+    # quietly test the wrong file.
+    printf '%s' "${BUILD_DIR}/target/$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -114,8 +135,13 @@ AssertInstrumented() {
     # of SIGPIPE, and the pipeline reports failure -- so a correctly instrumented
     # binary is diagnosed as an uninstrumented one. Verified here, not theorised:
     # that is exactly how this function first behaved.
+    #
+    # `--no-demangle`, and only the defined global symbols: `__tsan_init` is a C
+    # symbol that is never mangled, so demangling a Debug+TSan symbol table of
+    # several hundred thousand entries -- into a bash variable, three times a run
+    # -- buys nothing at all.
     local symbols
-    symbols="$(nm -C "$path" 2>/dev/null || true)"
+    symbols="$(nm -g --defined-only --no-demangle "$path" 2>/dev/null || true)"
     [[ -n "$symbols" ]] || fatal "${label}: nm produced no symbol table for ${path}; cannot verify instrumentation (stripped binary, or the wrong nm for this object format)."
     if [[ "$symbols" != *__tsan_init* ]]; then
         fatal "${label}: built WITHOUT ThreadSanitizer instrumentation (no __tsan_init).
@@ -166,7 +192,7 @@ RunTarget() {
     path="$(BinaryPath "$name")"
     AssertInstrumented "$path" "$name"
 
-    log="$(mktemp)"
+    log="${SCRATCH}/${name}.log"
     note "running ${name} ${tags:+(${tags})}"
     # `exitcode=66` is TSan's default and is named rather than assumed: this gate
     # decides on the exit code, so it must not be something a stray TSAN_OPTIONS
@@ -196,12 +222,10 @@ RunTarget() {
     # would be diagnosed there as a mysterious non-race failure. Name it instead,
     # and assert positively that cases ran rather than trusting the exit code.
     if grep -q 'No test cases matched' "$log"; then
-        rm -f "$log"
         fatal "${name}: the filter '${tags}' matched no test cases, so this target tested NOTHING.
     Fix the tag expression in the TARGETS table in $(basename "${BASH_SOURCE[0]}")."
     fi
     if [[ "$rc" -eq 0 ]] && ! grep -q 'assertions in' "$log"; then
-        rm -f "$log"
         fatal "${name}: exited 0 but reported no assertions; refusing to call that clean."
     fi
 
@@ -217,10 +241,8 @@ RunTarget() {
         else
             echo "::error::tsan-gate: ${name} failed (exit ${rc}) without a ThreadSanitizer report" >&2
         fi
-        rm -f "$log"
         exit 1
     fi
-    rm -f "$log"
     note "${name}: clean"
 }
 

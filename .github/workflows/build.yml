@@ -405,10 +405,20 @@ jobs:
   #
   # SCOPE. `Async`, `Consensus`, `Distributed` and the node are where the threads
   # are; the rest of the suite is single-threaded by construction and would pay
-  # sanitizer cost to prove it. Those four map onto three Catch2 tags plus one
-  # binary, and the tags were checked to appear in those three directories and
-  # nowhere else. Widening the scope is editing the `TARGETS` table in
-  # `scripts/tsan-gate.sh`.
+  # sanitizer cost to prove it. Those four map onto five Catch2 tags —
+  # `[async]`, `[consensus]`, `[distributed]`, `[reactor]`, `[task]` — plus one
+  # binary run whole. The tags are not claimed to be confined to those three
+  # directories: three test files elsewhere carry one and are swept in, which is
+  # harmless, because running MORE than the scope is not the failure this guards.
+  # Running LESS is, and the first version of that list ran less — it named three
+  # tags and silently excluded six of ten `Async/` test files while every signal
+  # in the run said clean.
+  #
+  # So the scope is enforced rather than asserted: `ctest -R tsan-scope-hygiene`
+  # runs in the DEFAULT set and fails when a test file in one of those
+  # directories carries no selected tag. Widening the scope is therefore two
+  # edits that check each other — the `TARGETS` table in `scripts/tsan-gate.sh`
+  # and `FastCachedTsanScopeTags` in `scripts/check-tsan-scope.cmake`.
   #
   # WHY A SCRIPT AND NOT `ctest`. Because a clean sanitizer run is not evidence.
   # `cmake/portable/Sanitizers.cmake` records a defect on this repository where
@@ -431,23 +441,38 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Same key as clang-tidy and clang-asan-ubsan, for the reason the first of
+      # them states: this cache holds SOURCE, which is identical whatever sanitizer
+      # the build then applies. A third entry would spend the repository's shared
+      # 10 GB budget again and make this job's first run a cold download of every
+      # CPM package.
       - name: "Cache CPM packages"
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
-          key: cpm-${{ runner.os }}-clang-tsan-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cpm-${{ runner.os }}-clang-tsan-
+          key: cpm-${{ runner.os }}-clang-debug-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-clang-debug-
 
-      # 1G for the same measured reason the clang-asan-ubsan job gives: a
-      # sanitized Debug build produces far larger objects than the Release jobs,
-      # and a 256M cache evicts its own objects inside a single build. `save` only
-      # on a push, so pull-request runs read master's entry without each writing a
-      # gigabyte of the repository's shared 10 GB budget.
+      # A ccache key of its own, deliberately: `-fsanitize=thread` and
+      # `-fsanitize=address,undefined` give every translation unit a different
+      # compiler command line, so sharing clang-debug's key would produce no
+      # cross-job hits at all while forcing two working sets into one cap. That is
+      # thrashing, not sharing.
+      #
+      # 512M rather than the 1G clang-asan-ubsan measured for itself, because this
+      # job builds a strict SUBSET of that one -- no daemon, no launcher, no
+      # benchmarks, no testclient -- and the rule for this knob is that a cap is
+      # judged by `Cleanups` rather than copied from a neighbour: raising a cap
+      # that is not full spends a shared budget on nothing, and that budget also
+      # carries the Windows sccache entries. The `--show-stats` step below is what
+      # says whether 512M is enough; raise it when `Cleanups` is non-zero, not
+      # before. `save` only on a push, so pull-request runs read master's entry
+      # without each writing their own.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-tsan
-          max-size: 1G
+          max-size: 512M
           save: ${{ github.event_name == 'push' }}
 
       - name: "Install build tools"

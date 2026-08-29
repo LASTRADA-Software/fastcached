@@ -13,10 +13,13 @@
 #
 # ## Scope, and why it is worth stating
 #
-# `race:` matches a FUNCTION NAME anywhere in the stack, so an entry is broader
-# than the one race it was written for: it also silences a future, unrelated race
-# reported through the same function. That is a real cost and the reason to keep
-# this file short and to name the narrowest frame that identifies the report.
+# Prefer `race_top:` to `race:`. `race:` matches a function name ANYWHERE in either
+# stack, so it also silences a future, unrelated race that merely passes through
+# that function -- and a teardown path like `Close()` is traversed by a great many
+# stacks. `race_top:` matches only the frame the racy access is actually in, which
+# is the report being suppressed and nothing wider. If a `race_top:` entry stops
+# matching, the accessing frame has been inlined: name the inlining frame, do not
+# widen back to `race:`.
 # `scripts/tsan-gate.sh` prints ThreadSanitizer's own "Matched N suppressions"
 # line on every run, so a suppression that starts matching more than it did is at
 # least visible rather than silent.
@@ -38,4 +41,4 @@
 #
 # Found by the first ThreadSanitizer run ever done on this tree, which is the
 # argument for this gate existing at all.
-race:FastCache::BlockingListener::Close
+race_top:FastCache::BlockingListener::Close
