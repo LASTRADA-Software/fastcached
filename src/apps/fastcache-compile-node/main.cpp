@@ -460,11 +460,17 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // the decoder's default: `WorkerProtocol` never sees the listener that enforced
     // the frame length, so a copy of the figure on each side is two literals that
     // have to agree forever, and lowering one would silently stop bounding the other.
-    Cc::WorkerProtocol protocol { jobs,
-                                  [](std::string_view, std::string_view) { return true; },
-                                  { Wire::IdentityCodec },
-                                  metrics,
-                                  WorkerMaxRequestBytes };
+    //
+    // `AvailableCodecs()`, not a literal `{ Identity }`. This list is what the worker
+    // answers a compile in, chosen against what the client said it accepts -- so a
+    // literal here is a node that can never compress a reply however both ends are
+    // built, which is what it was, and every dispatched object crossed the network
+    // uncompressed (#265). It is the client's own list computed by the client's own
+    // function, because the two ends of a negotiation deriving it separately is how
+    // they come to disagree.
+    Cc::WorkerProtocol protocol {
+        jobs, [](std::string_view, std::string_view) { return true; }, Cc::AvailableCodecs(), metrics, WorkerMaxRequestBytes
+    };
 
     // The worker server and the admin endpoint are both built BELOW the cache tier,
     // and in both cases moving them down was the fix rather than tidying: one takes
@@ -731,7 +737,12 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
             // registrations describing one machine and two different compilers (#194).
             auto perToolchain = advertisedWire;
             perToolchain.toolchainLabel = toolchain.label;
-            built.emplace_back(fingerprint, advertise, slots, Wire::CodecList { Wire::IdentityCodec }, perToolchain);
+            // The same list the worker protocol above answers in, and it governs the
+            // OTHER direction too: the scheduler files it against this worker and the
+            // grant relays it to the client, which compresses the preprocessed
+            // translation unit against it. A literal `{ Identity }` here therefore sent
+            // several megabytes per TU uncompressed as well (#265).
+            built.emplace_back(fingerprint, advertise, slots, Cc::AvailableCodecs(), perToolchain);
         }
         return built;
     };

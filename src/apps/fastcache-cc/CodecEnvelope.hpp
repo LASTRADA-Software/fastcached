@@ -71,6 +71,49 @@ enum class EnvelopeError : std::uint8_t
 /// @return Its description.
 [[nodiscard]] std::string_view DescribeEnvelopeError(EnvelopeError error) noexcept;
 
+/// The codec ids this build can actually produce and consume, most-preferred first.
+///
+/// Derived from `Core/Compression`, so a build configured without compression offers
+/// only `Identity` and still interoperates -- the negotiation falls back to it rather
+/// than refusing, because a build must never lose distribution because two machines
+/// were configured differently.
+///
+/// **Here rather than private to one caller, for the reason `Unenvelope` is.** Both
+/// halves of this protocol need the same answer: a client states this in every
+/// request, and a worker answers from it. While it was the client's alone the node
+/// constructed its worker and its registrar with a hard-coded `{ IdentityCodec }`,
+/// and every dispatched object crossed the network uncompressed (#265).
+/// @return The ids, most-preferred first, always ending in `IdentityCodec`.
+[[nodiscard]] CompileCacheWire::CodecList AvailableCodecs();
+
+/// Wrap a payload in a codec envelope, compressing when it is worth it.
+///
+/// The encoding half of `Unenvelope`, and one function for the same reason: the two
+/// directions of this protocol are one negotiation -- every exchange is
+/// client-initiated, so the request states what its sender can decode and the answer
+/// picks from that -- and a second implementation of the choice is how the two ends
+/// come to disagree. The worker's reply used to be that second implementation, and it
+/// chose from its OWN list on both sides, discarded the result and sent `Identity`.
+///
+/// Falls back to `Identity` whenever compression did not actually shrink the payload,
+/// which is the same shrink-check `Core/Compression` applies to stored values: an
+/// incompressible object should not pay a decompress on the way out. `rawLength` is
+/// always the UNCOMPRESSED size, because that is the field `Unenvelope` bounds its
+/// allocation by before it decompresses a byte.
+///
+/// @param payload The bytes to send.
+/// @param peerCodecs What the receiving end said it can decode.
+/// @param ownCodecs What this end can produce -- `AvailableCodecs()` for a client,
+///        and for a worker the list it registered with the scheduler, which is what
+///        the grant relayed to the client in the first place. A list WIDER than the
+///        build can honour is not an error: `Compression::IsAvailable` is asked at
+///        the point of use, so such an end answers `Identity` rather than in a codec
+///        it cannot produce.
+/// @return The framed envelope, ready to be used as one length-prefixed field.
+[[nodiscard]] std::vector<std::byte> Envelope(std::span<std::byte const> payload,
+                                              CompileCacheWire::CodecList const& peerCodecs,
+                                              CompileCacheWire::CodecList const& ownCodecs);
+
 /// Undo a codec envelope, refusing an oversized declared expansion first.
 ///
 /// **The one implementation of this, deliberately.** It was two — the worker
@@ -100,10 +143,12 @@ enum class EnvelopeError : std::uint8_t
 /// Two entry points rather than one, because the two callers want different
 /// containers and neither may pay a copy for the other's. A single public function
 /// returning `std::vector<std::byte>` was tried and cost the *text* caller a copy it
-/// never used to pay: the worker's source arrives `Identity` — the only codec a node
-/// negotiates — and built its `std::string` straight out of the frame, so routing it
-/// through a `vector` first is a second full allocation and memcpy of a preprocessed
-/// translation unit, on the path a developer's build is waiting on. A *generic*
+/// never used to pay: an `Identity` source builds its `std::string` straight out of
+/// the frame, so routing it through a `vector` first is a second full allocation and
+/// memcpy of a preprocessed translation unit, on the path a developer's build is
+/// waiting on. (That was once *every* source, because a node negotiated no other
+/// codec — see `AvailableCodecs` and #265. It is now the compression-less build's
+/// path, which is exactly the one least able to afford a spare copy.) A *generic*
 /// public function inverts the same argument the other way: `Decompress` already
 /// returns a `vector<std::byte>` sized exactly `rawLength`, which `Unenvelope` moves
 /// straight through, while a range-constructing generic result would copy that.

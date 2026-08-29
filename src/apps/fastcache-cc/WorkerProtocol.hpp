@@ -51,7 +51,14 @@ class WorkerProtocol
   public:
     /// @param jobs Runs the compiles; must outlive this.
     /// @param validator Decides whether a lease token authorizes a job.
-    /// @param acceptedCodecs What this worker can decode, most-preferred first.
+    /// @param acceptedCodecs What this worker can produce and decode, most-preferred
+    ///        first — normally `AvailableCodecs()`. It is one list because it is one
+    ///        negotiation: the same value is registered with the scheduler, relayed to
+    ///        clients in their grant, and used here to pick the envelope the object
+    ///        goes home in. A worker built with a narrower list than it can actually
+    ///        speak simply answers in a weaker codec; one built with a *wider* list
+    ///        falls back to `Identity` rather than answering in a codec it cannot
+    ///        produce.
     /// @param metrics Where job outcomes are counted; must outlive this.
     ///
     /// The metrics sink is injected like every other collaborator rather than

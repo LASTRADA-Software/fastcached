@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Dispatch.hpp"
 
-#include <FastCache/Core/Compression.hpp>
-
 #include <format>
 #include <utility>
 
@@ -12,22 +10,6 @@ namespace FastCache::Cc
 namespace
 {
     namespace Wire = CompileCacheWire;
-
-    /// The codec ids this build can actually produce and consume.
-    ///
-    /// Derived from `Core/Compression`, so a build configured without compression
-    /// offers only `Identity` and still interoperates -- the negotiation falls back
-    /// to it rather than refusing, because a build must never lose distribution
-    /// because two machines were configured differently.
-    [[nodiscard]] Wire::CodecList AvailableCodecs()
-    {
-        Wire::CodecList out;
-        for (auto const codec: { CompressionCodec::Zstd, CompressionCodec::Lz4 })
-            if (Compression::IsAvailable(codec))
-                out.push_back(static_cast<std::uint8_t>(codec));
-        out.push_back(Wire::IdentityCodec); // always, and always last
-        return out;
-    }
 
     /// The final component of a path, in either separator style.
     ///
@@ -44,27 +26,6 @@ namespace
     {
         auto const slash = path.find_last_of("/\\");
         return slash == std::string_view::npos ? path : path.substr(slash + 1);
-    }
-
-    /// Wrap `payload` in a codec envelope, compressing when it is worth it.
-    ///
-    /// Falls back to `Identity` whenever compression did not actually shrink the
-    /// payload, which is the same shrink-check `Core/Compression` applies to stored
-    /// values: an incompressible object should not pay a decompress on the way out.
-    /// @param payload The bytes to send.
-    /// @param peerCodecs What the receiving end can decode.
-    /// @return The framed envelope.
-    [[nodiscard]] std::vector<std::byte> Envelope(std::string_view payload, Wire::CodecList const& peerCodecs)
-    {
-        auto const raw = Wire::AsBytes(payload);
-        auto const chosen = Wire::ChooseCodec(peerCodecs, AvailableCodecs());
-        if (chosen != Wire::IdentityCodec)
-        {
-            auto compressed = Compression::Compress(static_cast<CompressionCodec>(chosen), raw, /*level=*/1);
-            if (compressed.size() < raw.size())
-                return Wire::EncodeCodecEnvelope(chosen, static_cast<std::uint32_t>(raw.size()), compressed);
-        }
-        return Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(raw.size()), raw);
     }
 
     /// Build a `DispatchResult` that carries only a reason.
@@ -134,7 +95,7 @@ namespace
         // against this client's. The two need not agree, and guessing wrong would
         // only be discovered after the whole preprocessed payload had crossed the
         // network.
-        auto const sourceField = Envelope(job.request.preprocessed, job.codecs);
+        auto const sourceField = Envelope(Wire::AsBytes(job.request.preprocessed), job.codecs, AvailableCodecs());
 
         // Not `const`: the frame carries a whole preprocessed translation unit, so it
         // is MOVED into the exchange rather than copied on the hot path of a build.

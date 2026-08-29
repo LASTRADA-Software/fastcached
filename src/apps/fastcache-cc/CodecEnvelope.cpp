@@ -123,6 +123,33 @@ namespace
     }
 } // namespace
 
+Wire::CodecList AvailableCodecs()
+{
+    Wire::CodecList out;
+    for (auto const codec: { CompressionCodec::Zstd, CompressionCodec::Lz4 })
+        if (Compression::IsAvailable(codec))
+            out.push_back(static_cast<std::uint8_t>(codec));
+    out.push_back(Wire::IdentityCodec); // always, and always last
+    return out;
+}
+
+std::vector<std::byte> Envelope(std::span<std::byte const> payload,
+                                Wire::CodecList const& peerCodecs,
+                                Wire::CodecList const& ownCodecs)
+{
+    auto const chosen = Wire::ChooseCodec(peerCodecs, ownCodecs);
+    // `ownCodecs` is what this end SAID it can produce, which need not be what it
+    // can: a worker's list reaches its caller through a registration and a grant, so
+    // asking `Compression` itself is the only check that cannot be stale.
+    if (chosen != Wire::IdentityCodec && Compression::IsAvailable(static_cast<CompressionCodec>(chosen)))
+    {
+        auto const compressed = Compression::Compress(static_cast<CompressionCodec>(chosen), payload, /*level=*/1);
+        if (compressed.size() < payload.size())
+            return Wire::EncodeCodecEnvelope(chosen, static_cast<std::uint32_t>(payload.size()), compressed);
+    }
+    return Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(payload.size()), payload);
+}
+
 Wire::ErrorCode WireCodeFor(EnvelopeError error) noexcept
 {
     return RowFor(error).code;

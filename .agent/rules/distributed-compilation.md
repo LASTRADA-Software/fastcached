@@ -1258,6 +1258,46 @@ ran on happened to have installed — five of them passed for that reason and fa
 the moment the hole was closed. If concurrency needs something of a seam, say so in
 the seam.
 
+**The codec a reply travels in is chosen from what the OTHER end said it accepts,
+and a hard-coded list is a fleet that never compresses.** Both directions negotiate
+the same way — every exchange is client-initiated, so the request states what its
+sender can decode and the answer picks from it, which is what buys the whole thing
+without a handshake round trip. The worker's half of that was wrong three times over
+and each defect hid the next (#265): `ChooseCodec` was called with the worker's own
+list on **both** sides, so the client's was never read; the answer was then discarded
+and the envelope hard-coded to `Identity`; and the node constructed both its
+`WorkerProtocol` and its `WorkerRegistrar` with a literal `{ Identity }`, so even a
+correct negotiation had nothing to pick from. The last of those governs the *request*
+direction too — the scheduler files that list against the worker and the grant relays
+it to the client — so a preprocessed translation unit, several megabytes on the hot
+path of a parallel build, crossed the network uncompressed as well. Nothing anywhere
+reported any of it: an uncompressed envelope is a *correct* envelope, so every object
+arrived intact and every counter read normally.
+
+So: a codec list is `AvailableCodecs()`, never a literal, and it is **one** function
+in `CodecEnvelope.hpp` that both halves call rather than each deriving what it can
+speak. `Envelope` sits beside it for the reason `Unenvelope` already does — the
+encoding and decoding halves of one negotiation, in the module named for it. It takes
+the peer's list and this end's, falls back to `Identity` for anything compression did
+not actually shrink — the same shrink-check `Core/Compression` applies to stored
+values — and always declares the **uncompressed** size as `rawLength`, because that
+is the field `Unenvelope` bounds its allocation by before it decompresses a byte. A
+list wider than the build can honour is not an error: `Compression::IsAvailable` is
+asked at the point of use, so two peers compiled with different codec sets still
+complete the exchange, and a build never loses distribution over configuration.
+
+One consequence worth stating, because a comment in `CodecEnvelope.hpp` used to rest
+on it: "the source arrives `Identity` — the only codec a node negotiates" was true
+only *because* of this defect. `UnenvelopeText` exists to spare that path a copy, and
+after the fix it is the compression-less build's path rather than every build's.
+
+The property to assert is what the two ends **disagree** about, which is why a single
+"the object round-trips" case is worth nothing here: it passes under every one of the
+defects above. What separates them is a client that accepts a codec being answered in
+one, and a client that accepts only `Identity` being answered in `Identity` — with an
+object that actually compresses, or the shrink-check makes both cases `Identity` and
+the pair is indistinguishable again.
+
 ## Open work
 
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
