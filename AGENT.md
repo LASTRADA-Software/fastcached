@@ -241,7 +241,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   (`CacheIsServing`), never whether the invocation continues: an unreachable or
   refusing cache still dispatches, because the two live on different machines. The
   reason is still recorded, the MISS trace is skipped so it is not overwritten, and
-  the `STORE` is skipped so a dead cache still costs one connect, not two.
+  the `STORE` is skipped so a dead cache is asked no more often than before.
 - An unbounded drain does not avoid an ending, it hands the choice to the supervisor,
   which answers `SIGKILL` with no diagnostic. `~WorkerServer` bounds it, says what it
   abandons and ends the process itself — returning would free members a running job is

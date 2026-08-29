@@ -1130,14 +1130,12 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
 
         # --- 5: an unreachable cache does not take the fleet with it ---------
         #
-        # THE regression case for issue #236. `RunCached` returned on a fetch that
-        # failed at the transport, above the call site that would dispatch -- so a
-        # cache the launcher could not reach turned off distribution as well. The
-        # docs put the shared cache on a different machine from the scheduler,
-        # which makes those two independent failure domains, and the less important
-        # one was load-bearing for the more important one: a mistyped
-        # FASTCACHE_ADDR sent every build on the estate local while the fleet sat
-        # idle and healthy, with a green build throughout.
+        # THE regression case for issue #236 -- `RunCached` returned on a fetch
+        # that failed at the transport, above the call site that would dispatch,
+        # so a cache the launcher could not reach turned off distribution too. The
+        # reasoning is at case 12 of the POSIX fixture and in
+        # `.agent/rules/distributed-compilation.md`; what matters here is that
+        # every property this suite normally checks held while it was broken.
         #
         # `$deadCachePort` comes out of the port block and is never bound, so the
         # connect is REFUSED rather than black-holed: what is under test is the
@@ -1174,9 +1172,9 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             Write-Host $r.stderr
             throw "a cache that never answered was traced as a miss"
         }
-        # Nothing is pushed at a daemon that did not answer the fetch: before this
-        # case a failed fetch returned, so the store was never reached, and
-        # carrying on must not turn one connect per invocation into two.
+        # Nothing is pushed at a daemon that did not answer the fetch: before the
+        # fix a failed fetch returned, so nothing was ever offered to a daemon that
+        # had just failed to answer, and carrying on had to leave that true.
         if ($r.stderr -match "STORED key=") {
             Write-Host $r.stderr
             throw "an object was offered to a cache that never answered"

@@ -342,98 +342,120 @@ void Note(std::string_view reason)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
-/// What the launcher does once a fall-back reason has been recorded.
+/// The ways the cache can fail to serve a compile, as far as anybody outside this
+/// file can tell them apart.
 ///
-/// A row rather than a hard-coded sentence ending, because the ending WAS
-/// hard-coded and went untrue. Every fall-back used to be the end of the cache
-/// flow, so "running real compiler" described all of them; a cache failure now
-/// carries on to the fleet instead (issue #236), and a line telling an operator
-/// their build compiled locally when a worker compiled it is worse than no line.
-enum class Continuation : std::uint8_t
+/// A row per kind rather than three near-identical reporting functions, because
+/// the three facts each one carries have to move together and used to be paired by
+/// hand. A fall-back reason distinguishes "deliberately not cacheable" from "the
+/// cache let us down" — an operator acts on the second and cannot act on the first,
+/// so `--show-stats` separates them — and the sentence has to say the same thing
+/// the outcome does at both ends of it. "cache unavailable" is a claim about the
+/// cache and is simply untrue of a refusal, which is the "a refusal reported under
+/// the wrong reason sends an operator to fix something that was never wrong" rule
+/// this tree records elsewhere; and "running real compiler" is a claim about what
+/// happens next, which stopped being true of a cache failure at issue #236.
+///
+/// The classification used to be derived by sniffing the reason text for a
+/// `uses __TIME__` prefix, which cannot survive a second deliberate reason: the
+/// next one is counted as a cache failure, inflating the very bucket somebody
+/// investigates.
+enum class Fallback : std::uint8_t
 {
-    /// The cache flow ends here and `main()` runs the compiler itself.
-    LocalCompiler,
-    /// The invocation carries on — a worker may still compile this, and the local
-    /// compiler is only what happens if none does.
-    KeepGoing,
+    /// The cache let us down and the cache flow ends here.
+    Unavailable,
+    /// The cache let us down and the invocation carries on — a worker may still
+    /// compile this, and the local compiler is only what happens if none does.
+    UnavailableCarryOn,
+    /// This translation unit is one the launcher deliberately will not cache.
+    Uncacheable,
     Last
 };
 
-/// One continuation and how the diagnostic line ends for it.
-struct ContinuationRow
+/// How one fall-back kind is reported and recorded.
+struct FallbackRow
 {
-    Continuation continuation {}; ///< Which case this row describes.
-    std::string_view tail;        ///< Appended after the reason, on the same line.
+    Fallback kind {};              ///< Which case this row describes.
+    std::string_view leadIn;       ///< What kind of non-answer this is.
+    Cc::Outcome outcome {};        ///< How `--show-stats` buckets it.
+    std::string_view continuation; ///< What happens next, ending the same line.
 };
 
-constexpr EnumTable<Continuation, ContinuationRow> ContinuationTable { {
-    ContinuationRow { .continuation = Continuation::LocalCompiler, .tail = "running real compiler" },
-    ContinuationRow { .continuation = Continuation::KeepGoing, .tail = "compiling this translation unit anyway" },
+constexpr EnumTable<Fallback, FallbackRow> FallbackTable { {
+    FallbackRow { .kind = Fallback::Unavailable,
+                  .leadIn = "cache unavailable",
+                  .outcome = Cc::Outcome::Unavailable,
+                  .continuation = "running real compiler" },
+    FallbackRow { .kind = Fallback::UnavailableCarryOn,
+                  .leadIn = "cache unavailable",
+                  .outcome = Cc::Outcome::Unavailable,
+                  .continuation = "compiling this translation unit anyway" },
+    FallbackRow { .kind = Fallback::Uncacheable,
+                  .leadIn = "not caching",
+                  .outcome = Cc::Outcome::Uncacheable,
+                  .continuation = "running real compiler" },
 } };
-static_assert(RowsInEnumeratorOrder(ContinuationTable, &ContinuationRow::continuation));
+static_assert(RowsInEnumeratorOrder(FallbackTable, &FallbackRow::kind),
+              "FallbackTable must hold exactly one row per Fallback kind, in enumerator order");
+
+/// @param kind The fall-back kind. @return Its row.
+[[nodiscard]] constexpr FallbackRow const& RowFor(Fallback kind) noexcept
+{
+    return FallbackTable[static_cast<std::size_t>(kind)];
+}
 
 /// Record that the cache did not serve this compile, and say why.
 ///
 /// OVERWRITES the recorded outcome, so it is only for a compile the cache has not
 /// answered for. Once a HIT or MISS has been traced, use Note() instead.
 ///
-/// Reached through Warn or Decline rather than called directly, because the two
-/// facts it carries have to move together. A fall-back reason distinguishes
-/// "deliberately not cacheable" from "the cache let us down" — an operator acts
-/// on the second and cannot act on the first, so `--show-stats` separates them —
-/// and the LEAD-IN has to say the same thing the outcome does: "cache
-/// unavailable" is a claim about the cache and is simply untrue of a refusal,
-/// which is the "a refusal reported under the wrong reason sends an operator to
-/// fix something that was never wrong" rule this tree records elsewhere. Pairing
-/// them here is what stops a caller supplying one without the other.
-///
-/// The classification used to be derived by sniffing the reason text for a
-/// `uses __TIME__` prefix, which cannot survive a second deliberate reason: the
-/// next one is counted as a cache failure, inflating the very bucket somebody
-/// investigates.
-///
-/// @param leadIn       What kind of non-answer this is.
-/// @param reason       The fall-back reason, recorded as the statistics detail.
-/// @param outcome      How `--show-stats` should bucket it.
-/// @param continuation What happens next, which the line has to say truthfully.
-void RecordFallback(std::string_view leadIn, std::string_view reason, Cc::Outcome outcome, Continuation continuation)
+/// @param kind   Which fall-back this is; its row supplies everything but the reason.
+/// @param reason The fall-back reason, recorded as the statistics detail. A FIXED
+///               string wherever one will do: `--show-stats` tallies these, so one
+///               carrying a path or a key produces a row per compile instead of a
+///               row per cause, and variable detail goes in a Note() beside the
+///               call. A daemon's own refusal words are the admitted exception,
+///               for the reason `DescribeOutcome` gives: they are bounded by
+///               cause, and lumping a version mismatch in with an unreachable
+///               daemon is what makes the tally useless.
+void RecordFallback(Fallback kind, std::string_view reason)
 {
-    invocation.outcome = outcome;
+    auto const& row = RowFor(kind);
+    invocation.outcome = row.outcome;
     invocation.outcomeDetail = reason;
     if (invocation.verbose)
-        std::cerr << "fastcache-cc: " << leadIn << " (" << reason << "); "
-                  << ContinuationTable[static_cast<std::size_t>(continuation)].tail << '\n';
+        std::cerr << "fastcache-cc: " << row.leadIn << " (" << reason << "); " << row.continuation << '\n';
 }
 
-/// Report that the cache could not serve this compile: it is reachable in
-/// principle and something went wrong.
+/// Report that the cache could not serve this compile, and end the cache flow.
 ///
-/// @param reason The fall-back reason. A FIXED string: `--show-stats` tallies
-///               these, so one carrying a path or a key produces a row per
-///               compile instead of a row per cause. Variable detail goes in a
-///               Note() beside the call.
-void Warn(std::string_view reason)
+/// **The return value is the continuation, so the line cannot lie about it.** The
+/// row above promises the operator that the real compiler runs next; returning
+/// `std::nullopt` is how that happens, and making it this function's result means
+/// the only spelling at a call site is `return Warn(...)`. Announcing one
+/// continuation and taking the other was previously a thing a caller could do by
+/// accident, and issue #236 is what it costs.
+/// @param reason The fall-back reason, under `RecordFallback`'s fixed-string rule.
+/// @return Always `std::nullopt` — "fall back to a plain real compile".
+[[nodiscard]] std::optional<int> Warn(std::string_view reason)
 {
-    RecordFallback("cache unavailable", reason, Cc::Outcome::Unavailable, Continuation::LocalCompiler);
+    RecordFallback(Fallback::Unavailable, reason);
+    return std::nullopt;
 }
 
 /// Report that the cache is out of the picture for the rest of this invocation,
 /// which continues without it.
 ///
-/// The same bucket `Warn` records — an operator still has to see that the cache
-/// is broken, and `--show-stats` still ranks the reason — with a different line,
-/// because the two facts came apart. A daemon that refused, and one that was
-/// never reached, both leave this launcher with a key, a preprocessed translation
-/// unit and a fleet that knows nothing about any of it; the compile goes on being
-/// attempted, remotely first.
-///
-/// @param reason The fall-back reason, under Warn's fixed-string rule. A daemon's
-///               own refusal words are admitted for the reason `DescribeOutcome`
-///               gives: they are bounded by cause, and lumping a version mismatch
-///               in with an unreachable daemon is what makes the tally useless.
+/// The same bucket `Warn` records — an operator still has to see that the cache is
+/// broken, and `--show-stats` still ranks the reason — with a different line,
+/// because the two facts came apart. A daemon that refused, and one that was never
+/// reached, both leave this launcher holding a key and a fleet that knows nothing
+/// about either, so the compile goes on being attempted, remotely first. It
+/// returns nothing for the same reason `Warn` returns `std::nullopt`.
+/// @param reason The fall-back reason, under `RecordFallback`'s fixed-string rule.
 void WarnAndCarryOn(std::string_view reason)
 {
-    RecordFallback("cache unavailable", reason, Cc::Outcome::Unavailable, Continuation::KeepGoing);
+    RecordFallback(Fallback::UnavailableCarryOn, reason);
 }
 
 /// Report that this compile is deliberately not cacheable.
@@ -442,11 +464,12 @@ void WarnAndCarryOn(std::string_view reason)
 /// launcher will not cache — because it could never hit (a time macro), or
 /// because caching it could not be made truthful (a path that is neither keyed
 /// nor guarded, issue #104).
-///
-/// @param reason The refusal reason, under Warn's fixed-string rule.
-void Decline(std::string_view reason)
+/// @param reason The refusal reason, under `RecordFallback`'s fixed-string rule.
+/// @return Always `std::nullopt`, as `Warn` does and for the same reason.
+[[nodiscard]] std::optional<int> Decline(std::string_view reason)
 {
-    RecordFallback("not caching", reason, Cc::Outcome::Uncacheable, Continuation::LocalCompiler);
+    RecordFallback(Fallback::Uncacheable, reason);
+    return std::nullopt;
 }
 
 /// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
@@ -1541,8 +1564,7 @@ void RecordManifest(Config const& cfg,
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
     {
-        Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
-        return std::nullopt;
+        return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
     }
 
     // One layout, and it is the build system's own spelling — every consumer of it
@@ -1570,9 +1592,8 @@ void RecordManifest(Config const& cfg,
         // The argument goes in a Note and not in the reason: the reason is what
         // `--show-stats` tallies, and one carrying a path is a row per compile.
         Note(std::format("drive-relative path under no root, in argument {}", *unkeyable));
-        Decline("a command-line path is drive-relative under no root; not caching "
-                "(neither keyed nor guarded)");
-        return std::nullopt;
+        return Decline("a command-line path is drive-relative under no root; not caching "
+                       "(neither keyed nor guarded)");
     }
 
     // Directory-flavoured, because an argument's own last component can be the
@@ -1660,20 +1681,20 @@ void RecordManifest(Config const& cfg,
     // process — has no use for it once the key exists. Leaving it live held that
     // much dead memory resident for exactly as long as the machine is busiest.
     std::string key;
-    // Kept alive past the block below ONLY when a scheduler is configured. The
-    // preprocessed form of a real translation unit runs to several megabytes, and
-    // the block exists to drop it the moment the key is computed -- see below.
-    // Dispatch is the one caller that still needs it afterwards, because it is
-    // exactly what a worker compiles, so it pays that cost and nobody else does.
-    std::string dispatchSource;
+    // Kept alive past the block below ONLY when a scheduler is configured, and it
+    // is the dependency PATHS rather than the preprocessed text. A worker gets its
+    // own preprocess, with `#line` markers the key's copy deliberately suppresses,
+    // so the text this block produced has no reader after the key -- the launcher
+    // once held several megabytes of it alive across the whole compile for a
+    // consumer that no longer existed. The paths it cannot re-derive: a worker sees
+    // no `#include` at all, so the client writes the dependency record.
     std::vector<std::string> dispatchDependencies;
     bool const dispatchConfigured = !cfg.schedulerAddr.empty();
     {
         auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
         {
-            Warn("preprocess failed");
-            return std::nullopt;
+            return Warn("preprocess failed");
         }
 
         // Skip translation units that reference a time/date macro. `__TIME__` /
@@ -1686,8 +1707,7 @@ void RecordManifest(Config const& cfg,
         // its only cost is a permanent miss, never incorrectness.
         if (SourceReferencesVolatileMacro(cmd.source))
         {
-            Decline("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
-            return std::nullopt;
+            return Decline("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
         }
 
         // The dependency set is reduced to its portable form before it reaches the
@@ -1738,9 +1758,8 @@ void RecordManifest(Config const& cfg,
         // is a second place for the answer to drift.
         if (dependencies.Count(Cc::PathDisposition::DriveRelative) != 0)
         {
-            Decline("a reported dependency path is drive-relative under no root; not caching "
-                    "(neither keyed nor guarded)");
-            return std::nullopt;
+            return Decline("a reported dependency path is drive-relative under no root; not caching "
+                           "(neither keyed nor guarded)");
         }
 
         // The same hazard reached by a different road, and it has to be its own ask
@@ -1755,9 +1774,8 @@ void RecordManifest(Config const& cfg,
         // console: `chcp 65001` makes `cl` emit UTF-8 and this stops firing.
         if (reconciler.UnreadablePaths() != 0)
         {
-            Decline("a reported dependency path is not text this host can read; not caching "
-                    "(neither keyed nor guarded) -- try a UTF-8 console code page");
-            return std::nullopt;
+            return Decline("a reported dependency path is not text this host can read; not caching "
+                           "(neither keyed nor guarded) -- try a UTF-8 console code page");
         }
 
         // Non-const so the preprocessed text can be MOVED out below rather than
@@ -1774,57 +1792,49 @@ void RecordManifest(Config const& cfg,
         key = Cc::ComputeKey(inputs);
 
         // Moved out AFTER the key is computed, so the key path pays nothing: by
-        // here ComputeKey has finished with the text and would otherwise drop it.
+        // here ComputeKey has finished with them and would otherwise drop them.
         if (dispatchConfigured)
-        {
-            dispatchSource = std::move(inputs.preprocessed);
             dispatchDependencies = std::move(probe->dependencyPaths);
-        }
     }
     invocation.preprocessMs = MsSince(preprocessStarted);
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
-    // Whether the daemon answered this launcher at all, which decides one thing
-    // below and one thing only: whether the STORE at the bottom is worth the
-    // transfer. See `Cc::CacheIsServing`.
+    // How the fetch ended, kept for the two questions the rest of this function
+    // asks of it: whether a MISS may be traced, and whether the STORE at the bottom
+    // is worth the transfer. It answers neither "does this invocation continue" --
+    // that is `Cc::CacheIsServing`'s doc comment, and issue #236.
     //
-    // It is NOT whether this invocation goes on. A cache that refused and a cache
-    // that could not be reached are both answers about the CACHE, and the compile
-    // fleet is a different service on a different machine -- the layout the
-    // operator docs describe -- so neither says anything about whether a worker
-    // can build this translation unit. Returning here is what made the less
-    // important of the two failure domains load-bearing for the more important
-    // one: on an estate of forty machines a mistyped `FASTCACHE_ADDR` turned every
-    // build local while the fleet sat idle and healthy, and the build stayed
-    // green throughout (issue #236).
-    bool cacheServing = true;
+    // Carried out of the block below rather than a `bool` derived from it, so the
+    // two asks further down put the same question to the same predicate instead of
+    // reading a summary somebody has to keep in step with it. `Transport` is the
+    // right thing to start on and not merely a filler: it is what `CacheOutcome`
+    // itself defaults to, and it means "we never got an answer", which is the
+    // fail-safe reading of every path that could leave it untouched.
+    auto fetchKind = Cc::CacheOutcomeKind::Transport;
 
     // FETCH.
     {
         auto const outcome = Cc::RunOneExchange(cfg.addr, Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
         NoteIfCredentialIgnored(outcome);
-        cacheServing = Cc::CacheIsServing(outcome.kind);
-        if (outcome.kind == Cc::CacheOutcomeKind::Transport)
-            // No answer at all: an endpoint that refused the connection, a peer
-            // that broke mid-reply, or the budget running out. A FIXED string, so
-            // `--show-stats` gets one row per cause rather than one per compile.
-            WarnAndCarryOn("fetch exchange failed");
-        else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-            // The daemon answered and declined. Its own code and words go into
-            // the fall-back reason, so `--show-stats` names the cause instead of
-            // lumping a version mismatch in with an unreachable daemon -- which is
-            // the distinction between the two branches, kept because an operator
-            // fixes them in different places.
-            WarnAndCarryOn(Cc::DescribeOutcome(outcome));
+        fetchKind = outcome.kind;
+        if (!Cc::CacheIsServing(fetchKind))
+        {
+            // Told apart, because an operator fixes them in different places. A
+            // refusal is the daemon answering, so its own code and words become the
+            // reason -- `--show-stats` then names a version mismatch instead of
+            // lumping it in with an unreachable daemon. A transport failure has no
+            // answer to quote: an endpoint that refused the connection, a peer that
+            // broke mid-reply, or the budget running out, all under one FIXED
+            // string so the tally gets a row per cause rather than one per compile.
+            bool const refused = fetchKind == Cc::CacheOutcomeKind::Rejected;
+            WarnAndCarryOn(refused ? Cc::DescribeOutcome(outcome) : std::string { "fetch exchange failed" });
+        }
         else if (outcome.IsHit())
         {
             auto decoded = DecodeCompileValue(outcome.value);
             if (!decoded.has_value())
-            {
-                Warn("fetch decoded malformed");
-                return std::nullopt;
-            }
+                return Warn("fetch decoded malformed");
 
             // HIT: check what the value asserts, then write the object, reproduce
             // the depfile, and replay the streams (all with paths localized).
@@ -1835,8 +1845,7 @@ void RecordManifest(Config const& cfg,
             auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory);
             if (materialized.disposition == HitDisposition::Unusable)
             {
-                Warn("could not write object on hit");
-                return std::nullopt;
+                return Warn("could not write object on hit");
             }
             if (materialized.disposition == HitDisposition::Served)
             {
@@ -1882,7 +1891,7 @@ void RecordManifest(Config const& cfg,
     // over the top would clear the reason `--show-stats` ranks and report a broken
     // cache as a cold one -- the exact conflation `CacheOutcomeKind` was split to
     // end, arriving by a different road.
-    if (cacheServing)
+    if (Cc::CacheIsServing(fetchKind))
         TraceOutcome("MISS", key);
 
     // MISS: try a worker first when one is configured, then the real compiler.
@@ -1912,11 +1921,16 @@ void RecordManifest(Config const& cfg,
     // unit, spent to be told the same thing again. It is the argument
     // `IsStorableSize` makes, reached from the other side.
     //
-    // It is also what keeps the change above free. Before it a failed fetch
-    // returned here and no store was ever attempted, so a dead cache cost exactly
-    // one connect per invocation; carrying on must not quietly turn that into two,
-    // which on a remote address is two connect timeouts rather than two refusals.
-    if (!cacheServing)
+    // It is also what keeps the change above free of a cost an operator would
+    // notice. Before it a failed fetch returned here, so nothing was ever pushed at
+    // a daemon that had just failed to answer; carrying on must leave that true, or
+    // every translation unit in a build against a wrong address pays another
+    // connect -- a timeout rather than a refusal, whenever the address is remote
+    // enough to be worth pointing at. What it is NOT is a claim that one connect is
+    // all a dead cache costs: direct mode is on by default and asks for a manifest
+    // before the block above runs at all, so the ceiling is two either way, and it
+    // is `TryDirectMode` that would have to change for it to be one.
+    if (!Cc::CacheIsServing(fetchKind))
     {
         Note("the cache did not answer the fetch; not offering this object to it");
         return code;

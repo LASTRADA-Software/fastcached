@@ -43,6 +43,17 @@
 #                            wrong object rather than a failed one.
 #   8. Graceful stop        — a worker asked to stop does, promptly, rather than
 #                            waiting for a supervisor to escalate.
+#  12. Cache independence   — a cache the launcher cannot reach does not stop the
+#                            compile being dispatched. The cache and the scheduler
+#                            are separate services on separate machines, so a
+#                            failure of one is not a failure of the other; joining
+#                            them turned a mistyped FASTCACHE_ADDR into a
+#                            fleet-wide outage behind an entirely green build.
+#
+# Cases 9 to 11 — the node's own cache tier, a worker that sizes itself, and a
+# black-holed upstream — carry their reasoning at the case rather than here,
+# because each is about a node's internals rather than about the client contract
+# this list describes.
 #
 # Ports are allocated per run rather than fixed. This fixture needs four of them
 # (cache, dispatch, and two workers), and four more fixed ports is four more ways
@@ -993,9 +1004,9 @@ grep -q "cache unavailable (fetch exchange failed)" "${workdir}/case12.log" \
 grep -q "fastcache-cc: MISS" "${workdir}/case12.log" \
     && { cat "${workdir}/case12.log" >&2; fail "a cache that never answered was traced as a miss"; }
 
-# Nothing is pushed at a daemon that did not answer the fetch. Before this case a
-# failed fetch returned, so the store was never reached; carrying on must not turn
-# one connect per invocation into two.
+# Nothing is pushed at a daemon that did not answer the fetch. Before the fix a
+# failed fetch returned, so nothing was ever offered to a daemon that had just
+# failed to answer; carrying on had to leave that true.
 grep -q "STORED key=" "${workdir}/case12.log" \
     && { cat "${workdir}/case12.log" >&2; fail "an object was offered to a cache that never answered"; }
 

@@ -709,11 +709,15 @@ the other. Three parts of that are each load-bearing:
   *skipped* when the daemon did not answer, since tracing one clears the reason
   `--show-stats` ranks and reports a broken cache as a cold one.
 - **The `STORE` is skipped when the fetch was not answered, and that is not an
-  optimisation but a restoration.** Before the fix a failed fetch returned and no
-  store was ever attempted, so a dead cache cost exactly one connect per invocation.
-  Carrying on must not quietly make that two — which on a remote address is two
-  connect *timeouts*, per translation unit, and on a refusing daemon is an
-  object-sized transfer paid to be told the same thing again.
+  optimisation but a restoration.** Before the fix a failed fetch returned, so
+  nothing was ever pushed at a daemon that had just failed to answer; carrying on
+  had to leave that true, or every translation unit in a build against a wrong
+  address pays another connect — a *timeout* rather than a refusal whenever the
+  address is remote enough to be worth pointing at, and on a refusing daemon an
+  object-sized transfer paid to be told the same thing again. It is **not** a claim
+  that one connect is all a dead cache costs: direct mode is on by default and asks
+  for a manifest before the object fetch runs at all, so the ceiling is two either
+  way, and `TryDirectMode` is what would have to change for it to be one.
 
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node

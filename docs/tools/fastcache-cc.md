@@ -391,11 +391,10 @@ rejected STORE call for very different responses.
 
 Every reason that appears under `fall-back reasons`, and what to do about it:
 
-Every one of them still produces a correct object, and every one of them that is
-about the **cache** — an unreachable daemon, or one that answered and refused —
-leaves distribution running: the compile is dispatched if a scheduler is
-configured, and only the caching is lost. The ones marked *uncacheable* are the
-launcher's own refusals and are not about the daemon at all.
+Every one of them still produces a correct object, and — per the note at the top
+of this page — every one that is about the **cache** leaves distribution running.
+The ones marked *uncacheable* are the launcher's own refusals and are not about
+the daemon at all.
 
 | Reason | Meaning |
 |--------|---------|

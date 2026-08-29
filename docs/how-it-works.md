@@ -77,8 +77,8 @@ a mistyped `FASTCACHE_ADDR` turn every build on an estate local while the fleet
 sat idle and healthy, with the build green throughout
 ([#236](https://github.com/LASTRADA-Software/fastcached/issues/236)). What the
 launcher does *not* do afterwards is push the result at a daemon that just failed
-to answer — step 9 is skipped in that case, so a dead cache still costs exactly
-one connection per translation unit.
+to answer — step 9 is skipped in that case, so reaching step 7 costs a wrong
+`FASTCACHE_ADDR` no more connections than it cost before.
 
 ### 1. Identify the compiler
 
@@ -382,16 +382,9 @@ differ, their toolchains genuinely differ, and the fix is to make them the same
 rather than to loosen the match — an over-loose match produces a wrong object that
 every other machine then fetches.
 
-What is **not** a reason any more is the cache being down. A line like
-
-```
-fastcache-cc: cache unavailable (fetch exchange failed); compiling this translation unit anyway
-```
-
-is a wrong or unreachable `FASTCACHE_ADDR`, and a `DISPATCHED` line follows it:
-the fleet is unaffected. If you are reading this against an older launcher, that
-line ended the invocation and no dispatch was attempted — see
-[#236](https://github.com/LASTRADA-Software/fastcached/issues/236).
+What is **not** a reason is the cache being down. `cache unavailable (…)` names a
+wrong or unreachable `FASTCACHE_ADDR`, and a `DISPATCHED` line follows it — see
+[the two edges out of step 5](#one-compile-start-to-finish).
 
 ---
 
