@@ -310,6 +310,15 @@ Consequences that are each load-bearing:
   - **The re-survey is `ResolveToolchains` itself, never a cheaper second
     derivation.** A node whose identity was computed one way at startup and another
     way afterwards drifts from its own clients exactly when nobody is looking.
+  - **A witness recorded from a probe that did not RUN is worse than no witness.**
+    The identity was computed from what the FIRST include probe found, so a witness
+    built on a failed SECOND probe watches a narrower root set than the fingerprint
+    covers — and the node then stops noticing SDK-side changes for that toolchain,
+    permanently and in silence. This is #225's rule reaching a second caller, by a
+    door nobody had opened yet: **a probe that did not RUN is not a probe that
+    answered nothing**, so `IncludeSearchRoots::answered` decides, never an empty
+    `roots`. Not watching a toolchain is visible at the next sweep; watching the
+    wrong evidence is not.
   - **An operator's pinned identity has no witness and is never reconsidered**, and
     an unstampable compiler yields an empty stamp that must read as "cannot be
     watched" rather than as "changed" — the latter is a re-survey loop with no exit.
