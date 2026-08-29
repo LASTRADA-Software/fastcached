@@ -324,10 +324,15 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
         // the correct one -- a clock this far behind has not reached any expiry.
         auto const farFuture =
             std::chrono::system_clock::time_point { std::chrono::milliseconds { Detail::MaxExpiryMillis } };
-        auto const distant = MintLeaseToken(key, LeaseClaims { .serial = "17", .expiresAt = farFuture });
+        auto const distant = MintLeaseToken(key,
+                                            LeaseClaims { .serial = "17",
+                                                          .endpoint = "10.0.0.7:6675",
+                                                          .fingerprint = "clang-19-x86_64",
+                                                          .key = "obj-abc",
+                                                          .expiresAt = farFuture });
 
         auto const preEpoch = std::chrono::system_clock::time_point {} - 24h;
-        CHECK(VerifyLeaseToken(key, distant, LeaseExpectation {}, preEpoch).has_value());
+        CHECK(VerifyLeaseToken(key, distant, Worker(), preEpoch).has_value());
     }
 }
 
