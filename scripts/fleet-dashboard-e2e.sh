@@ -68,6 +68,21 @@ fi
 workdir="$(mktemp -d)"
 node_pid=""
 
+# The cluster's pre-shared key, which every node here shares.
+#
+# Not decoration and not a workaround for the startup rule: these nodes leave
+# `--bind` at the wildcard and say `--fleet-open`, so another machine genuinely
+# could dial their compile ports, and a node in that shape has to be able to check
+# the lease a client presents it (#282). Giving them the key is what a real fleet in
+# this shape does, and it means these fixtures exercise the SIGNING scheduler and
+# the VERIFYING worker rather than the unchecked pair.
+#
+# Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
+# with the key's value, and a per-run secret would make a failure look like a flake.
+# Sixteen bytes is the minimum `ReadClusterKey` accepts.
+cluster_key="${workdir}/cluster.key"
+printf 'e2e-fixture-cluster-key-not-a-secret\n' > "$cluster_key"
+
 cleanup() {
     [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null
     [[ -n "$node_pid" ]] && wait "$node_pid" 2>/dev/null
@@ -228,6 +243,7 @@ tls_args=()
     --advertise "127.0.0.1:${worker_port}" \
     --listen-scheduler "$sched_port" \
     --fleet-open \
+    --cluster-key-file "$cluster_key" \
     --admin-listen "$admin_port" \
     --dashboard \
     --dashboard-token-file "${workdir}/token" \

@@ -877,14 +877,24 @@ can read than can read a mode-0600 file. A leaked key admits a node, an admitted
 is assigned compile jobs, and the objects it returns are cached fleet-wide — so it is
 object injection into everybody's build.
 
-**Two surfaces read it, not one.** Discovery proves the cluster's identity with it,
-and the scheduler **signs lease grants** with it — a MAC over the granted worker's
+**Three surfaces read it, not one.** Discovery proves the cluster's identity with
+it; the scheduler **signs lease grants** with it — a MAC over the granted worker's
 endpoint, the toolchain, the object key and an expiry
-([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)). A node running
-`--listen-scheduler` therefore wants the key whether or not it runs `--discovery`,
-and a scheduler started without one hands out unsigned grants and says so in its log
-at the first one. Both surfaces missing is still refused at startup: a secret nobody
-reads is the silent no-op that check exists for.
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)); and the worker
+**verifies** that MAC before it compiles anything
+([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). So every node
+wants the key, not only the one running `--listen-scheduler`.
+
+A worker that another machine could dial and has no key **will not start** — the
+refusal names the flag. One nothing else can dial runs without the check and warns
+once, loudly. A scheduler with no key hands out unsigned grants and says so at the
+first one. Provision the key everywhere *before* rolling the binary: a worker that
+has it and a scheduler that does not is a worker refusing every grant that scheduler
+issues.
+
+There is no longer a refusal for a key nothing reads. That rule was wrong twice —
+each new reader made it reject the configuration that reader needed — and whether a
+worker tier exists is not something the flag table can see.
 
 **`--cluster-id` is routing, not authentication.** It is plain text in every beacon,
 so treating it as a credential would be the mistake. What it buys is that two

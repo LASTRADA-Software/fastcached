@@ -1614,8 +1614,12 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
 
     SECTION("a credential nothing reads")
     {
-        // The sibling of the existing --cluster-key-file rule: a secret an operator
-        // went to the trouble of provisioning, read by nobody.
+        // A secret an operator went to the trouble of provisioning, read by
+        // nobody. `--cluster-key-file` used to have a sibling rule and no longer
+        // does -- its readers grew until the rule refused the configurations they
+        // needed -- and this one survives because it does not have that problem:
+        // the dashboard is either on or off, and that is a flag, not something a
+        // tier resolves at startup.
         auto cfg = servingNode();
         cfg.dashboard = false;
         cfg.dashboardTokenFile = "dashboard.token";

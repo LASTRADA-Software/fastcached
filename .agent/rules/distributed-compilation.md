@@ -1628,21 +1628,14 @@ the pair is indistinguishable again.
 
 ## Open work
 
-- **[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)** — the worker
-  does not verify the lease it is handed. The scheduler signs a grant
-  ([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)) and
-  `VerifyLeaseToken` exists with its wire codes and its counters, but nothing calls it
-  before a compiler is spawned, so a compile port's real boundary is still
-  reachability plus membership. Signing had to ship first — a worker refusing unsigned
-  leases before every scheduler in a fleet could mint them would stop distributing
-  mid-upgrade — but a signed grant nobody checks buys nothing, and the three
-  `fastcache_worker_jobs_refused_lease_*` series read zero until this lands.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
-  with no `--cluster-key-file` signs nothing and only warns. Refusing at startup is
-  what a credential deserves and would break every single-machine install, which is
-  what most people run; the current answer is the bare serial plus one bounded warning
-  line at the first grant. What is missing is a way for an operator to say *this fleet
-  signs* and have the absence of a key be fatal, without that being the default.
+  with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
+  the same question is now a startup refusal (#282). The objection this issue was
+  filed on — refusing would break every single-machine install, which is what most
+  people run — is answered by the shape #282 landed on: ask whether a machine that is
+  not this one can reach the surface, not whether a key is configured, and a
+  single-machine install is out of scope by construction. What is left is applying
+  that predicate to `--listen-scheduler` rather than to `--bind`.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and
