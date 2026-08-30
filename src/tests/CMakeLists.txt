@@ -195,6 +195,35 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Target-file guard hygiene. Fails when a `$<TARGET_FILE:>` names an executable
+# the app table can gate off, without any enclosing condition asking whether
+# that target exists.
+#
+# Such a reference is not a test that gets skipped -- it is a hard error at
+# GENERATE time, so the whole configure fails and the message names CMake rather
+# than the option the operator set. #390: `tls-smoke` was guarded on
+# `FASTCACHED_ENABLE_TLS` and the sccache smokes on `SCCACHE`, so
+# `-DFASTCACHED_BUILD_DAEMON=OFF` could not be configured at all.
+#
+# It ran green for everyone who does not have sccache installed, because the
+# sccache rows are themselves gated on finding the binary. That is why this
+# belongs in CI rather than in a reviewer's head: the tree alone does not say
+# whether the bug is reachable, the developer's machine does.
+#
+# In the default set, for the reason test-name-hygiene gives above: it reads
+# source files and reports.
+add_test(
+    NAME "target-file-guards"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-target-file-guards.cmake"
+)
+set_tests_properties("target-file-guards" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
 # directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
 # is enforced rather than merely asserted.
