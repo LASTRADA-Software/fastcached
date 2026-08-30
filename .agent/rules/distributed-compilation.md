@@ -607,9 +607,103 @@ Consequences that are each load-bearing:
   most people run; doing it quietly is the failure class this repository keeps
   rediscovering — a fleet that is green and is not doing the thing it claims. So the
   fallback is the bare serial exactly as before, plus one bounded warning line at the
-  first grant. The flag's startup rule moved with it: it used to be refused unless
-  `--discovery` was set, on the stated premise that discovery was its only reader,
-  and a refusal whose premise has become false is worse than no refusal.
+  first grant. #303 is the open question of whether that should become a refusal;
+  the worker's answer below is the shape it should take.
+- **Whether a worker CHECKS a lease is a startup decision, never a per-request
+  fallback.** The two are not the same rule written twice. "No key, so skip the
+  check" taken per request is silent degradation of exactly the kind this file
+  exists to name: the compile port is open, all three `worker_jobs_refused_lease_*`
+  counters read zero, and the fleet looks healthy from both ends — indistinguishable
+  from a fleet where nobody ever presented a bad lease. Taken once, before anything
+  is served, it is a node that states what it cannot do. So a node another machine
+  could dial and holding no key is refused **by name** at startup, and a node
+  nothing else can dial runs unchecked and warns once, loudly.
+- **The question is "can a machine that is not this one reach the surface", never
+  "is a key configured".** Keying the refusal on the key alone breaks every
+  single-machine install to prevent nothing — a process on this host already has
+  this host's compiler, so a lease check there escalates nobody. "Could reach it"
+  has **two halves and either one closes it**: the socket (a loopback `--bind`
+  answers no other machine whatever the policy says — which is what keeps this
+  repository's own `--fleet-open` e2e fleets working) and the policy
+  (`--fleet-open`, a non-loopback `--fleet-member`, or consensus). **Consensus
+  counts**, because a clustered node's admitted set GROWS at runtime: the agreed
+  member list is published into the same oracle the compile port consults, so such a
+  node admits machines nobody typed. `CompilePortFacesTheNetwork` and
+  `AdmitsRemotePeers` in `NodeConfig.cpp` (#282).
+- **A validator returns a REASON, not a `bool`, and it does not take the endpoint.**
+  Three refusals are distinguishable on the wire and counted apart, so a boolean
+  collapses the one distinction an operator needs — somebody probing the port, a
+  worker whose advertised endpoint is not the one clients dial, and a machine whose
+  clock has drifted are three different things to go and do. The endpoint checked
+  against is the WORKER's own advertised address, captured at construction: a
+  parameter would invite a caller to pass something the *request* supplied, which is
+  the whole failure the endpoint is inside the MAC to prevent. And the refusal is
+  never `UnknownLease` — that is the SCHEDULER's code, meaning "a lease I issued and
+  have since forgotten", and a worker answering with it sent an operator to the
+  scheduler to look for a fault that is local.
+- **A fixture that carries the key and never dispatches proves only that a keyed node
+  STARTS.** `cluster-e2e` and `fleet-dashboard-e2e` were given `--cluster-key-file`
+  because they leave `--bind` at the wildcard, and neither compiles anything — so for
+  a while the only end-to-end evidence for the lease check was construction. Meanwhile
+  the fixtures that *do* dispatch bind loopback, slipped under the startup rule, and
+  ran `UncheckedLeaseValidator` for every one of their hundreds of compiles. Both
+  halves have to meet in one fixture, which is why `dist-compile-e2e` carries the key
+  on every node: an in-process test mints and verifies inside one process and cannot
+  show that the endpoint a worker ADVERTISED is the endpoint the scheduler signed.
+- **A flag that describes nothing under socket activation cannot answer whether a
+  port faces the network.** `--bind` is the obvious answer to "is this port local",
+  and it is wrong for a reason nothing in this tree stated until now. Under
+  activation the unit owns the address -- the shipped
+  `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
+  `--bind`/`--port` are read by nothing. The value is still *in* the configuration;
+  it has simply stopped describing anything. So a keyless node carrying a stale
+  `--bind=127.0.0.1` in `FASTCACHE_NODE_ARGS`, plus `--fleet-open` or a remote
+  `--fleet-member`, passed the startup table, built `UncheckedLeaseValidator` and
+  served an unauthenticated compile port to the network with all three
+  `worker_jobs_refused_lease_*` counters reading zero. #282 recurring inside the fix
+  for #282, and found by review rather than by CI.
+  - **The table's rule is INSUFFICIENT, not wrong, and that distinction is the whole
+    entry.** `--install-service` bakes `--bind` into a command line it replays at
+    every boot, so a startup-time check on it is right for the configuration it was
+    written about -- and it is the only check that can run before any tier exists.
+    What it cannot cover is a listener this process did not open. Hence two rules:
+    the table keeps `--bind`, and `MakeWorkerLeaseValidator` takes whether the
+    listener was inherited and refuses the activated case by name. Delete either as
+    redundant and one of the two shapes goes unguarded.
+  - **So the test asserts the PAIRING, not either half.** One case drives the same
+    `NodeConfig` through `StartupPolicyRejection`, checks it PASSES, and then checks
+    `MakeWorkerLeaseValidator` refuses it. That regresses the gap. A case asserting
+    only the guard regresses the rule, and leaves the next reader free to collapse
+    the two.
+  - **The family: a premise that is true and a conclusion that does not follow.** The
+    premise -- `--bind` records what this process asked for -- is true. The
+    conclusion -- therefore it says what the port faces -- does not follow, and only
+    under activation. This file already carries the same shape in the
+    `~WorkerServer` unbounded drain, whose defending comment was "right about its
+    premise and wrong about its conclusion". That one was in a comment; this one is
+    in a guard. Two instances make it a family rather than a coincidence: when a
+    premise is doing load-bearing work, check it still holds on every path that reads
+    it, not only on the path it was written for.
+  - **And the sibling is already known.** `--listen-scheduler` describes nothing under
+    activation for exactly the same reason, so the scheduler-side refusal (#303) will
+    have this hole the day it is written. Recorded on that issue from the other
+    direction.
+- **The trust decision does not live in `main()`.** It lived there, as
+  `[](...){ return true; }`, through a fully passing suite — the shape this file
+  already names as *a reclaimer nothing constructs is the bug it was written to
+  fix*. `main` is the one translation unit no test can reach, so the choice is
+  `Node::MakeWorkerLeaseValidator`, exercised directly from a `NodeConfig` and a real
+  key file, and `main` is left with a call. A key file that cannot be READ stops the
+  node; falling back to checking nothing is the failure this whole rule is about.
+- **A `--cluster-key-file` rule keyed on "does anything read it" has been wrong
+  twice and is gone.** It began as *unless `--discovery`*; #281 made the scheduler a
+  reader and the rule refused the correct scheduler. It was widened to name the
+  scheduler; #282 made the worker a reader, and a plain worker runs neither of the
+  other two surfaces — so the rule refused the configuration the lease rule above
+  *requires*. There is no third narrowing: whether a worker tier exists depends on
+  what `--toolchain` and discovery resolve to on the machine, which the config table
+  cannot see. A refusal whose premise has become false is worse than no refusal, and
+  one that cannot state its premise without guessing has no business firing.
 - **A resolve answers on liveness, never on presence, and an unknown token is
   refused.** Nothing visits an expired token but an `Acquire` for the same key, so
   an expired entry is still sitting in the table when its holder finally reports —
@@ -1581,21 +1675,14 @@ the pair is indistinguishable again.
 
 ## Open work
 
-- **[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)** — the worker
-  does not verify the lease it is handed. The scheduler signs a grant
-  ([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)) and
-  `VerifyLeaseToken` exists with its wire codes and its counters, but nothing calls it
-  before a compiler is spawned, so a compile port's real boundary is still
-  reachability plus membership. Signing had to ship first — a worker refusing unsigned
-  leases before every scheduler in a fleet could mint them would stop distributing
-  mid-upgrade — but a signed grant nobody checks buys nothing, and the three
-  `fastcache_worker_jobs_refused_lease_*` series read zero until this lands.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
-  with no `--cluster-key-file` signs nothing and only warns. Refusing at startup is
-  what a credential deserves and would break every single-machine install, which is
-  what most people run; the current answer is the bare serial plus one bounded warning
-  line at the first grant. What is missing is a way for an operator to say *this fleet
-  signs* and have the absence of a key be fatal, without that being the default.
+  with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
+  the same question is now a startup refusal (#282). The objection this issue was
+  filed on — refusing would break every single-machine install, which is what most
+  people run — is answered by the shape #282 landed on: ask whether a machine that is
+  not this one can reach the surface, not whether a key is configured, and a
+  single-machine install is out of scope by construction. What is left is applying
+  that predicate to `--listen-scheduler` rather than to `--bind`.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and

@@ -78,6 +78,42 @@ namespace
     }
 } // namespace
 
+LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
+                                    std::string advertisedEndpoint,
+                                    IWallClock const& clock)
+{
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock](
+               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+        // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
+        // has checked that this worker serves it -- `CompileJobRunner::Run` answers
+        // that later, with `UnknownFingerprint`. So the two comparisons compose rather
+        // than one presupposing the other: the grant must name what the request names,
+        // and the request must name something served. Together that stops one
+        // toolchain's lease from paying for another's compile; neither does it alone,
+        // which is why the grant's fingerprint check is not redundant with the
+        // worker's.
+        auto verified = Distributed::VerifyLeaseToken(
+            key, token, Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint }, clock.Now());
+        if (verified.has_value())
+            return std::nullopt;
+
+        // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
+        // permission, and the object key inside it is the SCHEDULER's bookkeeping, so
+        // a worker comparing it against what it was asked to compile would be
+        // re-deriving a decision it is not the one making. The refusal travels whole,
+        // diagnostic included: that string was formatted for this caller and used to
+        // be allocated and dropped.
+        return std::move(verified.error());
+    };
+}
+
+LeaseValidator UncheckedLeaseValidator()
+{
+    return [](std::string_view, std::string_view) {
+        return std::optional<Distributed::LeaseRefusal> {};
+    };
+}
+
 WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
@@ -167,10 +203,34 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     auto const token = Wire::AsStringView(fields->leaseToken);
     auto const fingerprint = Wire::AsStringView(fields->fingerprint);
 
-    // Checked BEFORE the payload is decompressed, let alone compiled: an
-    // unauthorized peer must not be able to make this worker do the expensive part.
-    if (_validator && !_validator(token, fingerprint))
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {});
+    // Checked BEFORE the payload is decompressed, let alone compiled.
+    //
+    // Stated precisely, because the obvious stronger claim is false: by the time this
+    // runs, `WorkerServer` has already read the whole frame off the socket and
+    // charged it against the in-flight byte budget, and the token is a field INSIDE
+    // that payload -- so no earlier gate exists short of a protocol change, and an
+    // unauthorized peer still costs a read and a slot. What the check saves is
+    // decompression and the compiler spawn, which is the part that matters by three
+    // or four orders of magnitude.
+    //
+    // The reason is carried out rather than collapsed to a bool, and its wire code
+    // and its counter come from ONE row of `LeaseRefusalTable` -- one fact, two
+    // audiences, which is what that table was built for in #281.
+    //
+    // NOT `UnknownLease`. That is the SCHEDULER's code, meaning "a lease I issued
+    // and have since forgotten", and a worker answering with it sent an operator to
+    // the scheduler to look for a fault that is local.
+    if (auto const refusal = _validator(token, fingerprint); refusal.has_value())
+    {
+        auto const& row = Distributed::DescribeLeaseRefusal(refusal->reason);
+        _metrics.Increment(row.workerCounter);
+
+        // The detail travels. It is empty for anything that failed the MAC -- a
+        // caller that could not authenticate a token has established no fact about
+        // it, so there is nothing truthful to say -- and populated for the two
+        // refusals an operator actually has to act on.
+        return Wire::EncodeErrorReply(row.code, refusal->detail);
+    }
 
     // Opened AFTER the lease check and BEFORE any expensive work, and refused on the
     // DECLARED decompressed length rather than on what it expands to -- see

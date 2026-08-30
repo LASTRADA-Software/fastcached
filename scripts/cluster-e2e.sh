@@ -68,6 +68,21 @@ readonly SKIP=77
 
 workdir="$(mktemp -d)"
 pids=()
+
+# The cluster's pre-shared key, which every node here shares.
+#
+# Not decoration and not a workaround for the startup rule: these nodes leave
+# `--bind` at the wildcard and say `--fleet-open`, so another machine genuinely
+# could dial their compile ports, and a node in that shape has to be able to check
+# the lease a client presents it (#282). Giving them the key is what a real fleet in
+# this shape does, and it means these fixtures exercise the SIGNING scheduler and
+# the VERIFYING worker rather than the unchecked pair.
+#
+# Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
+# with the key's value, and a per-run secret would make a failure look like a flake.
+# Sixteen bytes is the minimum `ReadClusterKey` accepts.
+cluster_key="${workdir}/cluster.key"
+printf 'e2e-fixture-cluster-key-not-a-secret\n' > "$cluster_key"
 cleanup() {
     # SIGTERM first, then SIGKILL after a grace period -- never a bare `wait`.
     # These processes handle SIGTERM, so a bug that stops one from finishing its
@@ -206,6 +221,7 @@ start_node() {
         --cluster-dir="${workdir}/${id}" \
         --listen-scheduler="127.0.0.1:${scheduler_ports[$index]}" \
         --fleet-open \
+        --cluster-key-file="$cluster_key" \
         --listen-cache= \
         --scheduler="127.0.0.1:${scheduler_ports[$index]}" \
         --toolchain="/bin/sh" \
@@ -546,6 +562,7 @@ scheduler_ports+=("$(free_port)")
     --cluster-dir="${workdir}/n4" \
     --listen-scheduler="127.0.0.1:${scheduler_ports[3]}" \
     --fleet-open \
+    --cluster-key-file="$cluster_key" \
     --listen-cache= \
     --scheduler="127.0.0.1:${scheduler_ports[3]}" \
     --toolchain="/bin/sh" \

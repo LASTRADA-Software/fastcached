@@ -197,6 +197,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A lease has three transitions and expiry is the third: the **client** resolves it,
   on every path out of the compile, over a fresh connection. Expiry is the safety net
   for a client that died.
+- `--bind` answers "does this port face the network" only when this process bound
+  the port. Under socket activation the unit owns the address and the flag still
+  holds a value that describes nothing — a stale `--bind=127.0.0.1` passed the
+  startup table and served an unauthenticated compile port. The config table's rule
+  is insufficient there, not wrong, so both it and the runtime guard stay.
+- Whether a worker **checks** a lease is a startup decision, never a per-request
+  fallback — skipped per request, the port is open and every refusal counter reads
+  zero. The question is "can a machine that is not this one reach the compile
+  surface", not "is a key configured": a loopback bind and a loopback-only policy
+  each close it on their own. A validator returns a REASON rather than a `bool`,
+  captures the worker's own endpoint rather than taking one, and never answers
+  `UnknownLease` — that is the scheduler's code.
 - A resolve answers on liveness, not presence — an unknown token is refused, because
   that is the only place "this job outlived its lease" can be observed.
 - A lease token is a credential, and its MAC covers the granted **endpoint** or it is
@@ -206,8 +218,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.
-- No key means unsigned grants and one bounded warning, never a silent fallback and
-  never a startup refusal that would break every single-machine install.
+- No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
+  never a silent fallback. Its startup refusal is still open (#303) and must take the
+  worker's shape above, or it breaks every single-machine install.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.

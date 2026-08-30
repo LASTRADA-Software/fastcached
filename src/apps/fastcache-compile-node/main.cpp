@@ -20,6 +20,7 @@
 #include "NodeToolchains.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
+#include "WorkerLease.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -32,6 +33,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -516,25 +518,23 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // a command-line list.
     Node::NodeMembership membership { cfg };
 
-    // No lease validation, and it is recorded here rather than left looking like a
-    // stub. `WorkerServer` gates the port on membership, so what reaches this
-    // protocol is already this machine or a peer the operator admitted.
+    // The lease a client presents is CHECKED here, and membership is not a substitute
+    // for it. `WorkerServer` gates the port on the member oracle, so what reaches
+    // this protocol is this machine or a peer the operator admitted -- but "admitted
+    // to the fleet" is not "granted this compile", and for as long as those were the
+    // same answer any admitted machine could spend any worker's CPU without ever
+    // asking the scheduler for a slot (#282).
     //
-    // This used to add "and a worker cannot check a token it did not issue without a
-    // round trip to the scheduler per job, or a signing key the two would have to
-    // share". Both halves of that are now false: a grant carries an HMAC over this
-    // worker's endpoint, the toolchain, the key and an expiry, and the key it is
-    // signed with is `--cluster-key-file`, which this node already reads for
-    // discovery (#281, `Distributed/LeaseToken.hpp`). So the check is a local
-    // `VerifyLeaseToken` call with no round trip -- it is simply not written yet, and
-    // that is #282. Leaving the obsolete reason in place would be worse than saying
-    // nothing: it tells the next reader the thing is impossible.
+    // No round trip: a grant carries an HMAC over this worker's endpoint, the
+    // toolchain, the key and an expiry, signed with `--cluster-key-file` -- which
+    // this node already reads for discovery (#281, `Distributed/LeaseToken.hpp`). So
+    // the check is a local `VerifyLeaseToken` and costs the job nothing.
     //
-    // The residual, deliberately: an admitted member can compile here without taking
-    // a lease first, bypassing the scheduler's slot accounting. Inside a trusted
-    // fleet that is a fairness question rather than a security one -- the machine
-    // would be busier than the scheduler believes, which the heartbeat corrects
-    // within one interval.
+    // The residual, deliberately: a lease is checked, not SPENT. Nothing here tells
+    // the scheduler the slot was taken, and a client that mints one request and sends
+    // it twice compiles twice against one grant. Inside a fleet that has agreed a key
+    // that is a fairness question rather than a security one -- the machine is busier
+    // than the scheduler believes, which the heartbeat corrects within one interval.
     //
     // The envelope ceiling is THIS surface's request cap, named rather than left to
     // the decoder's default: `WorkerProtocol` never sees the listener that enforced
@@ -548,9 +548,35 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // uncompressed (#265). It is the client's own list computed by the client's own
     // function, because the two ends of a negotiation deriving it separately is how
     // they come to disagree.
-    Cc::WorkerProtocol protocol {
-        jobs, [](std::string_view, std::string_view) { return true; }, Cc::AvailableCodecs(), metrics, WorkerMaxRequestBytes
-    };
+
+    // The key the validator verifies with is the same `--cluster-key-file` that
+    // discovery and the scheduler read. Absent means a node admitting only its own
+    // machine -- `StartupPolicyRejection` refuses every other shape -- so by the time
+    // this runs the decision has been made once and announced, rather than being
+    // taken per request where nothing would ever say it had been.
+    // The whole trust decision is one call, made and announced where a test can
+    // reach it. `main` is the one translation unit that cannot be unit-tested, so it
+    // holds none of the policy -- see `MakeWorkerLeaseValidator`.
+    //
+    // A **wall** clock, because the expiry it checks was stamped on another machine
+    // and a steady instant means nothing off the host that read it. The process
+    // singleton rather than a local: the validator borrows it for the rest of this
+    // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
+    // wants -- a local here was one more object whose outliving had to be reasoned
+    // about, for no gain.
+    auto validator =
+        Node::MakeWorkerLeaseValidator(cfg,
+                                       advertise,
+                                       activated != nullptr ? Node::SocketActivation::Yes : Node::SocketActivation::No,
+                                       DefaultSystemWallClock(),
+                                       logger);
+    if (!validator.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}", validator.error());
+        return ExitUsage;
+    }
+
+    Cc::WorkerProtocol protocol { jobs, *std::move(validator), Cc::AvailableCodecs(), metrics, WorkerMaxRequestBytes };
 
     // The worker server and the admin endpoint are both built BELOW the cache tier,
     // and in both cases moving them down was the fix rather than tidying: one takes

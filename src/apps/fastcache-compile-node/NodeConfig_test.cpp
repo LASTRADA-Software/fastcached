@@ -715,11 +715,15 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
     // "--node-id --node-id names no --raft-peer".
     CHECK(NodeIdNamesNoPeerRefusal.starts_with("--node-id"));
 
-    // A node that names itself is accepted, bootstrapping or joining.
+    // A node that names itself is accepted, bootstrapping or joining. The key is
+    // part of that shape rather than decoration: consensus grows the set this node's
+    // compile port admits, so a clustered node has to be able to check a grant
+    // (#282, the lease rule).
     auto bootstrapping = Installable();
     bootstrapping.nodeId = "n1";
     bootstrapping.raftListen = "6680";
     bootstrapping.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+    bootstrapping.clusterKeyFile = "cluster.key";
     CHECK_FALSE(StartupPolicyRejection(bootstrapping).has_value());
 }
 
@@ -753,6 +757,9 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     bare.raftPeers = { Peer("n1=10.0.0.1:6680") };
     bare.raftListen = "6680";
     bare.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
+    // Consensus admits machines to this node's compile port, so a clustered node
+    // needs the key that checks their grants (#282).
+    bare.clusterKeyFile = "cluster.key";
     CHECK_FALSE(StartupPolicyRejection(bare).has_value());
     CHECK_FALSE(NodeInstallRejection(bare).has_value());
 
@@ -843,6 +850,9 @@ TEST_CASE("NodeConfig: a listen flag that is absent, defaulted or valid is accep
     auto configured = Installable();
     configured.schedulerListen = "6678";
     configured.fleetOpen = true;
+    // `--fleet-open` admits every machine there is, so this node has to be able to
+    // check the grants they present (#282).
+    configured.clusterKeyFile = "cluster.key";
     configured.adminListen = "127.0.0.1:6677";
     configured.cacheListen = "[::1]:6679";
     configured.dashboard = true;
@@ -872,6 +882,7 @@ TEST_CASE("NodeConfig: a listen flag with a port and no host is refused, not wid
     bare.adminListen = "6677";
     bare.schedulerListen = "6678";
     bare.fleetOpen = true;
+    bare.clusterKeyFile = "cluster.key"; // --fleet-open admits other machines (#282)
     CHECK_FALSE(StartupPolicyRejection(bare).has_value());
 }
 
@@ -1186,6 +1197,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // sent to anybody and the wildcard costs it nothing.
         NodeConfig cacheOnly;
         cacheOnly.fleetMembers = { "10.0.0.1:6676" };
+        cacheOnly.clusterKeyFile = "cluster.key"; // it admits another machine (#282)
         CHECK_FALSE(StartupPolicyRejection(cacheOnly).has_value());
 
         // And the worker the getting-started page documents, which names both.
@@ -1193,6 +1205,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         worker.scheduler = "scheduler.internal:6675";
         worker.advertise = "worker-01.internal:6676";
         worker.fleetOpen = true;
+        worker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(worker).has_value());
     }
 
@@ -1226,14 +1239,19 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
 
     SECTION("the working shapes are accepted")
     {
+        // Each carries `--cluster-key-file`, which every shape admitting another
+        // machine now needs: the scheduler signs a grant and the worker checks it,
+        // and neither is possible without the key (#282).
         NodeConfig listed;
         listed.schedulerListen = "0.0.0.0:6678";
         listed.fleetMembers = { "10.0.0.1:6676" };
+        listed.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
         open.schedulerListen = "0.0.0.0:6678";
         open.fleetOpen = true;
+        open.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
 
         // A joiner names itself and the cluster it is asking to join: under
@@ -1243,6 +1261,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         joiner.nodeId = "n4";
         joiner.raftListen = "6680";
         joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+        joiner.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
         // And a worker running no scheduler at all -- by far the common case -- is
@@ -1261,12 +1280,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         listedWorker.scheduler = "scheduler.internal:6675";
         listedWorker.advertise = "worker-01.internal:6676";
         listedWorker.fleetMembers = { "10.0.0.1:6676" };
+        listedWorker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
 
         NodeConfig openWorker;
         openWorker.scheduler = "scheduler.internal:6675";
         openWorker.advertise = "worker-01.internal:6676";
         openWorker.fleetOpen = true;
+        openWorker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
     }
 }
@@ -1557,6 +1578,10 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         NodeConfig cfg;
         cfg.schedulerListen = "0.0.0.0:6678";
         cfg.fleetOpen = true;
+        // `--fleet-open` admits other machines, and a node that admits them has to
+        // be able to check the grants they present (#282). Present here so that only
+        // the dashboard rule under test can fire.
+        cfg.clusterKeyFile = "cluster.key";
         cfg.adminListen = "6677"; // a bare port, so loopback
         cfg.dashboard = true;
         return cfg;
@@ -1589,8 +1614,12 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
 
     SECTION("a credential nothing reads")
     {
-        // The sibling of the existing --cluster-key-file rule: a secret an operator
-        // went to the trouble of provisioning, read by nobody.
+        // A secret an operator went to the trouble of provisioning, read by
+        // nobody. `--cluster-key-file` used to have a sibling rule and no longer
+        // does -- its readers grew until the rule refused the configurations they
+        // needed -- and this one survives because it does not have that problem:
+        // the dashboard is either on or off, and that is a flag, not something a
+        // tier resolves at startup.
         auto cfg = servingNode();
         cfg.dashboard = false;
         cfg.dashboardTokenFile = "dashboard.token";
@@ -2066,14 +2095,23 @@ TEST_CASE("The drain bound is an operator's to set, zero included", "[node][conf
     CHECK_FALSE(ParseNodeArgv({ "--drain-timeout=soon" }).has_value());
 }
 
-TEST_CASE("NodeConfig: a cluster key is read by discovery OR by the scheduler", "[node][policy][lease]")
+TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[node][policy][lease]")
 {
-    // This rule used to refuse `--cluster-key-file` unless `--discovery` was set, on
-    // the stated premise that discovery was its only reader. The scheduler now signs
-    // lease grants with the same key, so that premise is false -- and a refusal whose
-    // premise has become false is worse than no refusal: it turns the correct
-    // configuration into a node that will not start.
-    SECTION("a scheduler alone is a reader")
+    // A rule here used to refuse `--cluster-key-file` unless something read it, and
+    // it was wrong twice for the same reason: each time a new reader appeared, the
+    // rule refused the configuration that reader needed.
+    //
+    // It began as "unless --discovery". Then the scheduler started SIGNING lease
+    // grants with the key (#281), and the rule turned a correct scheduler into a node
+    // that would not start; it was widened to name the scheduler too. Then the WORKER
+    // became a reader (#282) -- and a worker is exactly the node that runs neither of
+    // the other two surfaces, so the rule refused the configuration the rule below
+    // requires.
+    //
+    // There is no third narrowing, which is why the rule is gone rather than widened
+    // again: whether a worker tier exists depends on what `--toolchain` and discovery
+    // resolve to on the machine, which is not a fact this table can see.
+    SECTION("a scheduler alone")
     {
         auto cfg = Installable();
         cfg.schedulerListen = "0.0.0.0:6678";
@@ -2082,14 +2120,165 @@ TEST_CASE("NodeConfig: a cluster key is read by discovery OR by the scheduler", 
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
-    SECTION("neither reader is still a secret nobody reads")
+    SECTION("a plain worker, which is what the last narrowing refused")
     {
+        // No scheduler, no discovery, no consensus. This is the shape the previous
+        // rule rejected and the shape the lease rule below makes mandatory for any
+        // worker admitting a peer on another machine.
+        auto cfg = Installable();
+        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a node reaching nothing but itself")
+    {
+        // Provisioning a key here reads no worse than provisioning one for a machine
+        // that is about to be given peers, and refusing it bought nothing.
         auto cfg = Installable();
         cfg.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+}
+
+TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", "[node][policy][lease][service]")
+{
+    // The one genuinely new interaction between #282 and #286, and it is new in one
+    // direction only: `emitIfExplicit` makes a TYPED DEFAULT reach the supervisor
+    // where it used to be dropped, so a registration now carries flags a startup rule
+    // never had to see before. A rule that refused one of them would turn a working
+    // install into a service that registers cleanly and refuses at every boot.
+    //
+    // Asserted rather than reasoned about. The lease rule reads `clusterKeyFile`,
+    // `bindAddress` and the membership fields and none of the cache ones, so by
+    // inspection it cannot refuse these -- but "by inspection" is what this file
+    // exists to replace, and the next rule added to either table gets this case for
+    // free.
+    auto cfg = Installable();
+    cfg.fleetMembers = { "10.0.0.1:6676" };
+    cfg.clusterKeyFile = "cluster.key"; // the lease rule's own requirement (#282)
+
+    // Both provenance-bearing flags typed at exactly their defaults, which is the
+    // whole point of `explicitBit`: the value says nothing, the fact that it was
+    // typed says everything.
+    NodeConfig const defaults;
+    cfg.cacheListen = defaults.cacheListen;
+    cfg.cacheListenExplicit = true;
+    cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
+    cfg.cacheMemoryExplicit = true;
+
+    // It installs.
+    CHECK_FALSE(NodeInstallRejection(cfg).has_value());
+
+    // And the registration really does carry them -- otherwise this case would pass
+    // for the wrong reason, having asserted a rule permits flags that were never
+    // emitted.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--listen-cache="); }));
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--cache-memory="); }));
+
+    // The half that actually bites: what a supervisor replays has to pass the
+    // startup rules at every boot, not merely at install time.
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK_FALSE(StartupPolicyRejection((*reparsed)).has_value());
+
+    // And provenance survives the round trip, or the second boot silently drops what
+    // the first one was told.
+    CHECK((*reparsed).cacheListenExplicit);
+    CHECK((*reparsed).cacheMemoryExplicit);
+}
+
+TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check their grants", "[node][policy][lease]")
+{
+    // The scheduler signs a grant; a worker with no key cannot check the signature,
+    // so its compile port serves whoever reaches it (#282). A STARTUP refusal rather
+    // than a per-request fallback, because "no key, so no check" decided per request
+    // leaves the port open with every refusal counter at zero -- a fleet that looks
+    // healthy from both ends.
+    SECTION("a listed peer on another machine")
+    {
+        auto cfg = Installable();
+        cfg.fleetMembers = { "10.0.0.1:6676" };
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--cluster-key-file"));
-        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+    }
+
+    SECTION("--fleet-open, which admits every machine there is")
+    {
+        auto cfg = Installable();
+        cfg.fleetOpen = true;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--cluster-key-file"));
+    }
+
+    SECTION("consensus, whose member set grows to machines nobody typed")
+    {
+        // The admitted set is published into the same oracle the compile port
+        // consults, so a clustered node's peers reach it without appearing in
+        // `--fleet-member` at all.
+        auto bootstrapping = Installable();
+        bootstrapping.nodeId = "n1";
+        bootstrapping.raftListen = "6680";
+        bootstrapping.raftPeers = { Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
+        REQUIRE(StartupPolicyRejection(bootstrapping).has_value());
+        CHECK(Unwrap(StartupPolicyRejection(bootstrapping)).contains("--cluster-key-file"));
+
+        // And a node waiting to be admitted, which is the shape the peer list cannot
+        // speak for: a joiner names only ITSELF, on loopback here, and every machine
+        // it will admit arrives from the cluster that admits it.
+        auto joining = Installable();
+        joining.nodeId = "n1";
+        joining.raftListen = "6680";
+        joining.raftJoin = true;
+        joining.raftPeers = { Peer("n1=127.0.0.1:6680") };
+        REQUIRE(StartupPolicyRejection(joining).has_value());
+        CHECK(Unwrap(StartupPolicyRejection(joining)).contains("--cluster-key-file"));
+    }
+
+    SECTION("a compile port bound to loopback keeps working, whatever its policy")
+    {
+        // The other half of the predicate, and the one this repository's own e2e
+        // harnesses depend on: they run whole fleets of loopback nodes under
+        // `--fleet-open`, where "admit everybody" reaches nobody because the socket
+        // answers on 127.0.0.1 alone. Refusing that would refuse a configuration in
+        // which no other machine can dial the compile port at all.
+        auto loopbackBound = Installable();
+        loopbackBound.bindAddress = "127.0.0.1";
+        loopbackBound.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
+
+        // And the default bind is the WILDCARD, so the same node without that flag
+        // is refused -- which is what makes the check worth having rather than
+        // something an ordinary deployment slips past.
+        auto wildcardBound = Installable();
+        wildcardBound.fleetOpen = true;
+        CHECK(wildcardBound.bindAddress == "0.0.0.0");
+        CHECK(StartupPolicyRejection(wildcardBound).has_value());
+    }
+
+    SECTION("a node that admits only its own machine keeps working")
+    {
+        // The single-machine install, and the reason this rule is scoped to remote
+        // peers rather than to "is a key configured": a process on this host already
+        // has this host's compiler, so a lease check there escalates nobody.
+        // Refusing it would break every developer's laptop to prevent nothing.
+        CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+
+        auto loopback = Installable();
+        loopback.fleetMembers = { "127.0.0.1", "127.0.0.2:6676", "[::1]:6676" };
+        CHECK_FALSE(StartupPolicyRejection(loopback).has_value());
+    }
+
+    SECTION("and a key is all it takes")
+    {
+        auto cfg = Installable();
+        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 }

@@ -804,6 +804,16 @@ try {
         if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
+        # The cluster key every node here shares, and what makes this fixture's
+        # dispatch path the SIGNED one: without it the scheduler hands out bare
+        # serials and every worker runs the unchecked validator, so a run that
+        # dispatches this many compiles would exercise none of the lease check
+        # (#282). The shell twin does the same, with the same fixed text -- nothing
+        # here turns on the value, and a per-run secret would make a failure look
+        # like a flake.
+        $clusterKey = Join-Path $scratch "cluster.key"
+        Set-Content -Path $clusterKey -Value "e2e-fixture-cluster-key-not-a-secret" -NoNewline
+
         if (-not (Test-CompilerWorks $cc $scratch)) {
             Write-Host "skip $cc (on PATH but cannot compile here)"
             continue
@@ -839,7 +849,7 @@ try {
         $schedWorkerPort = $BasePort + 6
         $schedLog = Join-Path $scratch "scheduler.log"
         $scheduler = Start-Background $Node @(
-            $NoLocalCache,
+            $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--listen-scheduler=127.0.0.1:$dispatchPort", "--fleet-open",
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1",
             "--port=$schedWorkerPort", "--advertise=127.0.0.1:$schedWorkerPort",
@@ -878,7 +888,7 @@ try {
 
         $workerLog = Join-Path $scratch "worker.log"
         $worker = Start-Background $Node @(
-            $NoLocalCache,
+            $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1", "--port=$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
@@ -1080,7 +1090,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoSchedWorker = $BasePort + 7
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoScheduler = Start-Background $Node @(
-            $NoLocalCache,
+            $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--listen-scheduler=127.0.0.1:$isoDispatch", "--fleet-open",
             "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1",
             "--port=$isoSchedWorker", "--advertise=127.0.0.1:$isoSchedWorker",
@@ -1091,7 +1101,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache,
+            $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1", "--port=$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
