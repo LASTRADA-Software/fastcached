@@ -343,6 +343,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   the gate runs before the payload is buffered.
 - A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one
   cannot reopen the hole by omission.
+- An unimplemented verb is refused `UnknownOpcode`, never `DispatchNotPermitted`. The
+  launcher steps over the first and proceeds unauthenticated; the second it treats as
+  fatal, so a `FASTCACHE_TOKEN` client got a permanent 0% hit rate that presented as a
+  cold cache. The choice is a `(op, code, why)` table row, not a `switch` special case.
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher

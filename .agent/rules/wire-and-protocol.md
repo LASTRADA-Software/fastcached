@@ -332,6 +332,30 @@ Every rule below has already been a bug.
     identical either way so the outcome alone cannot tell the two apart. The client must
     still consume the AUTH reply even when it intends to ignore it; skipping it strands a
     frame and the next command reads the previous one's answer.
+
+- **The code an endpoint refuses an unimplemented verb with is a wire contract, and
+  the only tolerated one is `UnknownOpcode`.** `Cc::CacheProtocol::Exchange` steps
+  over exactly that code and proceeds unauthenticated — correct against a surface
+  with no credential to check — and treats every *other* refusal as being about the
+  credential, returning it in place of the answer to the request the caller actually
+  sent. So a surface that answers AUTH with `DispatchNotPermitted` gives every
+  `FASTCACHE_TOKEN`-configured launcher a permanent 0% hit rate, reported as
+  `rejected`, which is indistinguishable from a cache that is merely cold. The
+  launcher's own comment had already recorded this for the *daemon* — a
+  pre-AUTH `fastcached` answers `unknown-opcode` and serves the pipelined command
+  perfectly well, which is the mixed-fleet case the framing's extensibility exists
+  for — and the node then reintroduced it on three surfaces by picking a code that
+  reads as more accurate. It is not more accurate; it is a different sentence to a
+  reader that only parses one. `DispatchNotPermitted` says *this endpoint does not
+  do that job*, which is a routing fact a client acts on; `UnknownOpcode` says *I do
+  not implement this verb*, which is what an absent capability is. The correction
+  belongs in a small `(op, code, why)` table consulted before the generic refusal —
+  the shape `CacheProxy::RefusedVerbs` and `CompileCacheHandler::RelocatedVerbs`
+  both have — never a special case in the `switch`, because the moment there are two
+  answers the next verb must *state* which it is instead of inheriting whichever the
+  catch-all happens to give. Three surfaces answering this question in three
+  hand-written ways is how they drifted apart to begin with.
+
 ## The Net boundary
 
 - **`Net/` is meant to be lifted out of this tree, so what it may include is a
