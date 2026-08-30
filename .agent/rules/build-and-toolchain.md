@@ -121,6 +121,18 @@ determinism rests on.
   and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
   that silently does nothing is worse than one that is off, because the second is
   visible.
+  - **A guard written above an existing one can be silently discarded, and it
+    disappears from exactly the cases that already needed thinking about.** Adding
+    a step-level `if:` to `.github/workflows/build.yml` inserted a second `if:` key
+    above three steps that already carried
+    `if: startsWith(matrix.preset, 'clang')`. YAML keeps the **last** duplicate key,
+    so the new gate evaporated on precisely the conditional steps -- the ones a
+    reader is least likely to re-check, because they visibly have a condition. No
+    warning from YAML, none from Actions, and the workflow ran. Same family as the
+    sanitizer above: the knob reads set, and nothing it names is in effect. Merge
+    into one expression (`gate && (original)`) rather than stacking, and scan for
+    adjacent `if:` lines afterwards -- `awk` over the file is enough, and it is the
+    only thing that distinguishes "gated" from "gated on paper".
   - **So a sanitizer job proves the tree only once something proves the sanitizer.**
     `scripts/tsan-gate.sh` will not report clean until it has answered two separate
     questions, because they fail separately: `__tsan_init` in the **test binaries**
@@ -848,11 +860,10 @@ and every heavy job is gated on it.
   is gated on its **steps**: the job starts, the matrix expands, each leg reports
   under its real name, and no step does any work. It costs one runner start per
   leg and buys the only thing that matters.
-- **Inserting a step-level `if:` above a step that already had one is a silent
-  no-op.** YAML keeps the last of two duplicate keys, so the gate vanished on
-  exactly the three steps carrying their own `startsWith(matrix.preset, ...)`
-  condition — and nothing warns. Merge into one expression
-  (`gate && (original)`), and scan for adjacent `if:` lines afterwards.
+- **Three of those steps already carried an `if:`, and the gate silently vanished
+  from them.** That is the duplicate-key trap recorded under the local gate above,
+  met here for the first time: YAML keeps the last of two `if:` keys, so merge into
+  `gate && (original)` rather than stacking, and scan for adjacent `if:` lines.
 - **A gated job must still gate the release.** `check-release-gate` asserts
   statically, with `yq`, that every job key appears in `release.needs`; it never
   asks whether a job ran, so a job that no-ops on a docs change still counts. The
