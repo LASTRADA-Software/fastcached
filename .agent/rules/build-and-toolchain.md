@@ -1062,8 +1062,10 @@ feature working, right up until the first pull request enters the queue.
   per-leg contexts never existed, so the pull request *hung* instead of merging
   green. That accident was the only thing standing between a dead classifier and
   a merged, uncompiled change. Both matrix jobs now carry `if: ${{ !cancelled() }}`,
-  which is the one job-level condition on a matrix job that is safe (false only
-  while the run is being cancelled, so the matrix always expands). Do not
+  which is the one job-level condition on a matrix job that is safe: it is false
+  only while the run is being cancelled, so the matrix **always expands and every
+  leg reports under its real name** — the exact opposite of relying on
+  non-expansion. **The dependency on the accident is gone, not reduced.** Do not
   reintroduce a job-level `if:` on either believing the accident is still there to
   catch you — it is not, and it never should have been load-bearing.
 
