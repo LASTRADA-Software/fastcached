@@ -100,6 +100,7 @@ if(FASTCACHED_BUILD_TESTS)
         RemoteUpstream.cpp
         NodeConfig.cpp
         AuthRefusalContract_test.cpp
+        FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
         NodeMembership_test.cpp
         NodeToolchains.cpp

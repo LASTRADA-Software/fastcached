@@ -1780,6 +1780,16 @@ the pair is indistinguishable again.
 
 ## Open work
 
+- **[#371](https://github.com/LASTRADA-Software/fastcached/issues/371)** — a scheduler
+  that loses leadership between granting a lease and being handed it back refuses its
+  own release, because `Gate()` puts leadership ahead of every verb. The client is
+  right and the key stays pinned on the only machine that could free it, until it
+  expires. Routing the release to the new leader instead is strictly worse and the
+  fleet harness demonstrates why: two schedulers number their leases independently and
+  both start at one, so that release matches another client's live lease for the same
+  key and frees a job somebody is still running. So the fix is on the scheduler, and
+  which shape it takes — exempting `Release` from the leadership check, sweeping on
+  demotion, or accepting the flap window — is the open question.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was

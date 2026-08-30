@@ -746,6 +746,15 @@ and what they may assume.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process
   counter is not unique — `catch_discover_tests` gives every case its own
   process, and the suite runs in parallel.
+- A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
+  copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
+  them, found a day apart — a fake nothing exercises does not report its own bugs.
+- A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
+  `OnCompile` places the interleaving rather than waiting for one. It is in
+  `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library
+  AND the apps, and `src/FastCache/` must not include an app header. A harness earns
+  its place only by a property shown RED when its rule is removed — and prove it with
+  a case that stays GREEN under the same break, or the suite is measuring nothing.
 
 ## Issues and pull requests
 
