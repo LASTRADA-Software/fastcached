@@ -84,10 +84,14 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
 {
     return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock](
                std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
-        // The fingerprint is the one the REQUEST names. `WorkerProtocol` has already
-        // matched it against a toolchain this worker actually serves, so checking the
-        // grant against it is what stops one toolchain's lease from paying for
-        // another's compile.
+        // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
+        // has checked that this worker serves it -- `CompileJobRunner::Run` answers
+        // that later, with `UnknownFingerprint`. So the two comparisons compose rather
+        // than one presupposing the other: the grant must name what the request names,
+        // and the request must name something served. Together that stops one
+        // toolchain's lease from paying for another's compile; neither does it alone,
+        // which is why the grant's fingerprint check is not redundant with the
+        // worker's.
         auto verified = Distributed::VerifyLeaseToken(
             key, token, Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint }, clock.Now());
         if (verified.has_value())

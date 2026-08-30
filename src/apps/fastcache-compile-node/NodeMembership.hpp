@@ -42,6 +42,7 @@ namespace FastCache::Node
 /// letting either publisher speak for the other. Each is still replaced wholesale by
 /// whoever owns it, which is right: a publisher holds the whole truth about *its*
 /// question.
+
 /// Whether this configuration admits a machine that is not this one.
 ///
 /// The same three routes `NodeMembership`'s constructor composes, asked of the

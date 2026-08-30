@@ -1024,7 +1024,7 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
         NodeConfig cfg;
         cfg.clusterKeyFile = keyFile;
 
-        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, clock, logger);
+        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::No, clock, logger);
         REQUIRE(validator.has_value());
 
         // A string no scheduler signed. `Malformed` rather than `Unauthorized`, and
@@ -1077,9 +1077,39 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
         NodeConfig cfg;
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
 
-        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, clock, logger);
+        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::No, clock, logger);
         REQUIRE(validator.has_value());
         CHECK_FALSE((*validator)("not-a-lease-at-all", "gcc-13").has_value());
+    }
+
+    SECTION("a socket-activated worker admitting other machines is refused without a key")
+    {
+        // The half `StartupPolicyRejection` cannot see. Under socket activation the
+        // unit owns the address -- the shipped unit says `ListenStream=6676`, every
+        // interface -- so `--bind` describes nothing, and a leftover loopback `--bind`
+        // told the startup table this port was local while it answered the network.
+        //
+        // The config below therefore PASSES the table and must still be refused here:
+        // that pairing is the assertion, not either half.
+        NodeConfig cfg;
+        cfg.bindAddress = "127.0.0.1";
+        cfg.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        CHECK_FALSE(MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::Yes, clock, logger).has_value());
+
+        // And the same node that bound the port itself is untouched, because its
+        // `--bind` really does describe where it answers.
+        CHECK(MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::No, clock, logger).has_value());
+    }
+
+    SECTION("a socket-activated worker admitting only its own machine still runs")
+    {
+        // Activation is not by itself a reason to demand a key: a unit can open a
+        // loopback socket, and a node admitting nobody escalates nobody. Refusing
+        // here would break the single-machine systemd install.
+        NodeConfig cfg;
+        CHECK(MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::Yes, clock, logger).has_value());
     }
 
     SECTION("a key file that cannot be read stops the node rather than opening it")
@@ -1090,6 +1120,6 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
         NodeConfig cfg;
         cfg.clusterKeyFile = scratch.Path() / "no-such-file.key";
 
-        CHECK_FALSE(MakeWorkerLeaseValidator(cfg, Advertise, clock, logger).has_value());
+        CHECK_FALSE(MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::No, clock, logger).has_value());
     }
 }

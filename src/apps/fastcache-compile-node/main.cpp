@@ -564,7 +564,12 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
     // wants -- a local here was one more object whose outliving had to be reasoned
     // about, for no gain.
-    auto validator = Node::MakeWorkerLeaseValidator(cfg, advertise, DefaultSystemWallClock(), logger);
+    auto validator =
+        Node::MakeWorkerLeaseValidator(cfg,
+                                       advertise,
+                                       activated != nullptr ? Node::SocketActivation::Yes : Node::SocketActivation::No,
+                                       DefaultSystemWallClock(),
+                                       logger);
     if (!validator.has_value())
     {
         logger.Logf(LogLevel::Error, "{}", validator.error());

@@ -6,6 +6,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -14,6 +15,16 @@
 
 namespace FastCache::Node
 {
+
+/// Whether a supervisor handed this worker its listening socket.
+///
+/// An `enum class` rather than a `bool` because it is an API-surface argument and a
+/// bare `true` at the call site says nothing about which way round it is.
+enum class SocketActivation : std::uint8_t
+{
+    No = 0, ///< This process bound its own port, so `--bind` describes it.
+    Yes,    ///< A socket unit owns the port, and `--bind` describes nothing.
+};
 
 /// Build the lease check this node's compile port applies, from its configuration.
 ///
@@ -43,6 +54,19 @@ namespace FastCache::Node
 /// nothing -- a node told to verify and unable to must not serve.
 ///
 /// @param cfg What this node was told to be; `clusterKeyFile` is the field read.
+/// @param activation Whether the listener was inherited. **Load-bearing, and the
+///        reason this refuses rather than only warning.** `StartupPolicyRejection`
+///        decides reachability from `--bind`, which is the right answer for a node
+///        that binds its own port and is worth nothing for one that does not: under
+///        socket activation the unit chose the address -- the shipped
+///        `fastcache-compile-node.socket` says `ListenStream=6676`, every interface --
+///        and a leftover `--bind=127.0.0.1` in `FASTCACHE_NODE_ARGS` is ignored while
+///        still telling the table this port is local. That combination passed the
+///        table, built the unchecked validator and served an unauthenticated compile
+///        port to the network, with all three refusal counters reading zero: the exact
+///        defect #282 exists to close, surviving inside the fix for it. The table
+///        keeps its rule because an install must be refused before any tier exists;
+///        this is the backstop for the one fact the table cannot see.
 /// @param advertise This worker's address as clients are told to dial it -- exactly
 ///        the string it registers under, because that is the string the scheduler
 ///        signs into the grant.
@@ -53,6 +77,7 @@ namespace FastCache::Node
 /// @return The validator, or why the key file cannot serve as one.
 [[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
                                                                                       std::string_view advertise,
+                                                                                      SocketActivation activation,
                                                                                       IWallClock const& clock,
                                                                                       ILogger& logger);
 
