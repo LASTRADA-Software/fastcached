@@ -2,6 +2,7 @@
 #include "CacheProtocol.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/TcpClient.hpp>
 
 #include <format>
@@ -183,6 +184,25 @@ namespace
 Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential)
 {
     co_return co_await Exchange(client, std::move(frame), std::move(credential));
+}
+
+std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
+{
+    if (outcome.kind != CacheOutcomeKind::Rejected || outcome.code != Wire::ErrorCode::NotLeader)
+        return std::nullopt;
+    // `ParseDialEndpoint`, which is where the reasoning lives: splitting is not
+    // parsing, an empty host names nobody, and a bare port would send the client
+    // back to itself. Asked through that helper rather than re-derived here because
+    // it is also what `DialEndpoint` asks of this very string a moment later -- two
+    // spellings of "is this an address" would eventually disagree, and the hop is
+    // wasted either way round.
+    //
+    // The message itself is returned rather than the parse: the endpoint travels on
+    // to `DialEndpoint`, which splits it again, and handing back a re-joined form
+    // would be this layer normalising text the scheduler chose.
+    if (!ParseDialEndpoint(outcome.message).has_value())
+        return std::nullopt;
+    return outcome.message;
 }
 
 std::string DescribeOutcome(CacheOutcome const& outcome)

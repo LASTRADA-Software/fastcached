@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -161,6 +162,38 @@ struct ExchangeBudget
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome.
 [[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential = {});
+
+/// Where a refusal says to ask instead, when it says so.
+///
+/// `NotLeader` is not a refusal in the sense the others are: `NoWorker` and
+/// `NoCapacity` are answers about the fleet, while this one is an instruction about
+/// WHOM to ask, and a client that reads it as the former takes itself out of
+/// distribution over a leader election it could simply have followed
+/// ([#237](https://github.com/LASTRADA-Software/fastcached/issues/237)).
+///
+/// **Judged by PARSING the message, never by asking whether it is empty.** An empty
+/// message is replaced with the error table's default sentence before it reaches the
+/// wire, so "no leader is known" and "the leader is at h:p" arrive as the same shape
+/// -- a non-empty string either way. Only "does this parse as an address" separates
+/// them, and a client that dialled a sentence would report a scheduler endpoint no
+/// operator ever typed. `ClusterAdminCli` learned this the hard way; that call site
+/// now asks here, so the two cannot come to disagree.
+///
+/// Parsing means a host, a colon and a port that is a number, which is
+/// `Core/HostPort.hpp`'s `ParseDialEndpoint` and not a test spelled again here --
+/// `DialEndpoint` asks that helper the same question about the same string a moment
+/// later, and a second author would eventually answer differently. `ClusterAdminCli`
+/// only ever PRINTED such a message; a launcher dials it, and every hop spent on
+/// prose is one the real leader never hears.
+///
+/// A redirect naming an address is therefore distinguishable from an election in
+/// progress, which names none and has nothing to offer but "try again shortly".
+///
+/// @param outcome A completed exchange's outcome.
+/// @return The endpoint to retry against, or `std::nullopt` when this outcome is not
+///         a redirect -- a `NotLeader` raised while no leader is known included, and
+///         any message that does not parse as `host:port`.
+[[nodiscard]] std::optional<std::string> RedirectTarget(CacheOutcome const& outcome);
 
 /// FETCH one key over an already-connected client.
 ///

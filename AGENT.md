@@ -247,6 +247,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
   reported and none survived; `ValidateManifest` refuses an empty set rather than
   letting `all_of` pass vacuously.
+- `NotLeader` is an instruction, not an answer about the fleet: a client follows it to
+  the endpoint it names (`RedirectTarget`, which `ClusterAdminCli` asks too), and the
+  RELEASE goes to whoever ISSUED the lease, never to the configured address. Judged by
+  PARSING the message, never by testing it for empty — an empty one is replaced by the
+  error table's default sentence, so "no leader known" and "the leader is at h:p" arrive
+  the same shape. Splitting is not parsing: `SplitHostPort` takes the LAST colon, so
+  "no leader: try again" splits into a host and a port of " try again", and a launcher
+  DIALS what the admin CLI only printed — one predicate, `ParseDialEndpoint`, because
+  `DialEndpoint` asks the same of the same string a moment later. Bounded, because two
+  nodes with a stale `_knownLeader` name each other forever. The CLIENT half only: a
+  node still registers with its configured `--scheduler` and retries a `NotLeader`
+  there forever, so a redirected launcher reaches a leader with an empty registry.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - A `FETCH` outcome decides whether the daemon is worth a second command

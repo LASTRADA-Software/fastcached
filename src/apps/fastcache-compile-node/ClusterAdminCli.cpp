@@ -3,7 +3,6 @@
 #include "ClusterAdminCli.hpp"
 #include "EndpointDial.hpp"
 
-#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -145,17 +144,15 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
     {
         // `NotLeader` carries the leader's endpoint as its message, so the refusal is
-        // turned into the instruction it actually is.
-        //
-        // Tested by SPLITTING it rather than by asking whether it is empty, and that
-        // is not fastidiousness: an empty message is replaced with the error table's
-        // default sentence before it reaches the wire, so "no leader is known" and
-        // "the leader is at h:p" arrive as the same shape. Only "does this parse as
-        // an address" tells them apart -- and a client told to ask a sentence would
-        // report a scheduler endpoint no operator ever typed.
-        if (outcome.code == Wire::ErrorCode::NotLeader && SplitHostPort(outcome.message).has_value())
+        // turned into the instruction it actually is. WHETHER it carries one is
+        // `Cc::RedirectTarget`'s question and no longer this file's: the launcher
+        // asks the same thing of the same replies, and this was the second author
+        // of a rule that only works while both agree (#237). The reasoning -- why an
+        // empty message never reaches the wire, and why one that splits is still not
+        // necessarily an address -- lives there in full.
+        if (auto const leader = Cc::RedirectTarget(outcome); leader.has_value())
             return std::unexpected { std::format("this node does not lead the cluster; ask --scheduler={} instead",
-                                                 outcome.message) };
+                                                 *leader) };
         if (outcome.code == Wire::ErrorCode::NotLeader)
             // An election in progress, which is a different fact from "somebody else
             // leads" and has no address to offer.

@@ -18,30 +18,22 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
                                             std::string_view hostPort,
                                             std::chrono::milliseconds connectTimeout)
 {
-    // `SplitHostPort` and not `ParseEndpoint`, deliberately: the latter accepts a
-    // bare port and supplies a default host, which is right for a *bind* address
-    // an operator types and wrong here. Every caller up here is dialling something
-    // it was configured with (`FASTCACHE_ADDR`, a scheduler endpoint, a redirect
-    // from `NotLeader`), and text with no host in it is a misconfiguration worth
-    // refusing rather than a request to try this machine.
-    auto const split = SplitHostPort(hostPort);
-    if (!split.has_value())
-        co_return nullptr;
-    // An EMPTY host is that same misconfiguration reached by a different
-    // spelling -- `:6674` and `[]:6674` both split cleanly and name nobody, so the
-    // guard above does not see them. `Detail::RunConnectFlow` refuses an empty
-    // host, so nothing is reachable through this; what it buys is that the
-    // refusal is THIS layer's, which is the difference between "no connector was
-    // asked" and "a connector was asked and said no". The distinction is the one
-    // `EndpointDial_test`'s `RecordingConnector` exists to make, and it matters
-    // for a caller holding a connector that does not share the funnel.
-    if (split->first.empty())
-        co_return nullptr;
-    auto const port = ParseTcpPort(split->second);
-    if (!port.has_value())
+    // `ParseDialEndpoint` and not `SplitHostPort`/`ParseEndpoint`: the reasoning for
+    // each of its three refusals -- a sentence that merely splits, an empty host, a
+    // bare port that would mean this machine -- is in `Core/HostPort.hpp`, spelled
+    // once because `Cc::RedirectTarget` has to answer the identical question about
+    // the identical text (#237).
+    //
+    // Refused HERE rather than left to the connector, which matters even though
+    // `Detail::RunConnectFlow` refuses an empty host too: the difference is between
+    // "no connector was asked" and "a connector was asked and said no", which is the
+    // distinction `EndpointDial_test`'s `RecordingConnector` exists to make and the
+    // one a caller holding a connector outside the funnel depends on.
+    auto const target = ParseDialEndpoint(hostPort);
+    if (!target.has_value())
         co_return nullptr;
 
-    auto socket = co_await connector->Connect(std::string { split->first }, *port, connectTimeout);
+    auto socket = co_await connector->Connect(target->first, target->second, connectTimeout);
     if (!socket.has_value())
         co_return nullptr;
     co_return std::move(*socket);

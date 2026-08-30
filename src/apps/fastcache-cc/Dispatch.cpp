@@ -2,6 +2,7 @@
 #include "Dispatch.hpp"
 
 #include <format>
+#include <ranges>
 #include <utility>
 
 namespace FastCache::Cc
@@ -169,12 +170,18 @@ namespace
     /// the client can do nothing about and the fleet recovers from on its own, and
     /// there is no caller decision it could change.
     /// @param exchange How to reach the scheduler.
-    /// @param request The job, for the scheduler endpoint and the key.
+    /// @param scheduler The scheduler that ISSUED this lease, which is not always the
+    ///        one the client was configured with -- see `LeaseFromFleet`. A release
+    ///        sent anywhere else resolves nothing: the key stays marked in flight on
+    ///        the machine that actually holds it, which is the outcome this function
+    ///        exists to prevent, reached by a different route (#237).
+    /// @param request The job, for the key.
     /// @param leaseToken The token that was granted.
     /// @param credential Presented to the scheduler.
     /// @param budget The control budget; a release is a short request/reply and
     ///        must not inherit the compile's minutes.
     void ReleaseLease(IEndpointExchange& exchange,
+                      std::string_view scheduler,
                       DispatchRequest const& request,
                       std::string_view leaseToken,
                       Credential const& credential,
@@ -184,7 +191,77 @@ namespace
         // scheduler will have reissued, and resolving the wrong lease frees a key
         // somebody else is building.
         auto frame = Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = leaseToken, .key = request.objectKey });
-        (void) exchange.Exchange(request.schedulerEndpoint, std::move(frame), credential, budget);
+        (void) exchange.Exchange(scheduler, std::move(frame), credential, budget);
+    }
+
+    /// How many `NotLeader` redirects one lease will follow.
+    ///
+    /// Two, which is one more than a correct fleet ever needs: a client points at a
+    /// member, that member names the leader, and the second ask is answered. The
+    /// spare hop covers the leader having moved again between the two, which an
+    /// election in progress makes ordinary rather than exotic.
+    ///
+    /// Bounded at all because the chain is not this client's to trust. Two nodes that
+    /// disagree about who leads -- a partition healing, a stale `_knownLeader` -- can
+    /// name each other indefinitely, and a client without a ceiling would spend a
+    /// build's worth of connects discovering that. The ceiling turns a cycle into an
+    /// ordinary local compile, which is what every other lease refusal already means.
+    constexpr int MaxLeaseRedirects = 2;
+
+    /// One lease, following `NotLeader` to wherever it points.
+    struct LeaseAttempt
+    {
+        CacheOutcome outcome;  ///< How the last exchange ended.
+        std::string scheduler; ///< Who answered it, and who must resolve the lease.
+    };
+
+    /// Ask for a lease, following a redirect rather than reading it as a refusal.
+    ///
+    /// `SchedulerService` has always answered a non-leader with the leader's endpoint
+    /// and this client used to discard it, so one election took every launcher out of
+    /// distribution until somebody re-pointed them by hand (#237). The endpoint that
+    /// finally answers travels back with the outcome because the RELEASE has to go to
+    /// the same place -- see `ReleaseLease`.
+    /// @param exchange How to reach a scheduler.
+    /// @param start The configured endpoint to begin at.
+    /// @param request The job, for the fingerprint and key.
+    /// @param accepted What this client will read an object back in.
+    /// @param credential Presented to each scheduler.
+    /// @param budget The control budget, spent per attempt.
+    /// @return The final outcome and the endpoint that produced it.
+    [[nodiscard]] LeaseAttempt LeaseFromFleet(IEndpointExchange& exchange,
+                                              std::string_view start,
+                                              DispatchRequest const& request,
+                                              Wire::CodecList const& accepted,
+                                              Credential const& credential,
+                                              ExchangeBudget budget)
+    {
+        LeaseAttempt attempt { .outcome = {}, .scheduler = std::string { start } };
+        for (auto const hop: std::views::iota(0, MaxLeaseRedirects + 1))
+        {
+            // Rebuilt per attempt: `Exchange` takes the frame by value and moves it,
+            // so the second ask cannot reuse the first one's bytes.
+            auto frame = Wire::EncodeLease(Wire::LeaseRequest {
+                .fingerprint = request.fingerprint, .key = request.objectKey, .acceptedCodecs = accepted });
+            attempt.outcome = exchange.Exchange(attempt.scheduler, std::move(frame), credential, budget);
+
+            auto redirect = RedirectTarget(attempt.outcome);
+            // The ceiling is tested BEFORE the endpoint is advanced, and that is the
+            // whole of what `scheduler` promises: it names whoever ANSWERED. Running
+            // out of hops while still being redirected would otherwise leave it
+            // naming a machine nobody asked -- harmless only for as long as every
+            // caller happens to check `IsHit()` first, which is exactly the shape of
+            // trap the RELEASE rule above exists to close.
+            //
+            // Out of hops, the outcome is returned as it stands so the caller reports
+            // the scheduler's own words rather than inventing a reason. `Declined` is
+            // right: the fleet said something ordinary and this compile happens
+            // locally, which is what every other lease refusal already means.
+            if (!redirect.has_value() || hop == MaxLeaseRedirects)
+                return attempt;
+            attempt.scheduler = std::move(*redirect);
+        }
+        return attempt; // unreachable: the last turn of the loop always returns
     }
 
 } // namespace
@@ -218,10 +295,10 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     auto const& accepted = acceptedCodecs.empty() ? available : acceptedCodecs;
 
     // --- ask the scheduler where to compile ---------------------------------
-    auto leaseFrame = Wire::EncodeLease(
-        Wire::LeaseRequest { .fingerprint = request.fingerprint, .key = request.objectKey, .acceptedCodecs = accepted });
-    auto const leaseOutcome =
-        exchange.Exchange(request.schedulerEndpoint, std::move(leaseFrame), credential, budgets.control);
+    // Following `NotLeader` rather than reading it as a refusal, and remembering who
+    // answered: the lease must be resolved against whoever issued it (#237).
+    auto const lease = LeaseFromFleet(exchange, request.schedulerEndpoint, request, accepted, credential, budgets.control);
+    auto const& leaseOutcome = lease.outcome;
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
         // Unreachable or broken mid-reply. Nothing was leased, so there is nothing
         // to release and the worker is never asked -- the client does not guess at
@@ -262,7 +339,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // rather than a run of early returns: an unreachable worker, a refused job and
     // a finished one all mean the same thing to the scheduler -- this key is no
     // longer being built here.
-    ReleaseLease(exchange, request, token, credential, budgets.control);
+    ReleaseLease(exchange, lease.scheduler, request, token, credential, budgets.control);
     return result;
 }
 
