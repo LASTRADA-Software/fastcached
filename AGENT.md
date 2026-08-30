@@ -581,6 +581,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a configure.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
+- A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler,
+  so it runs `ctest` rather than only building. Nothing states that level — it follows
+  from `_DEBUG`, from the runtime library, from `CMAKE_BUILD_TYPE` — so
+  `iterator-debug-canary` is a program that must die and
+  `scripts/iterator-debug-gate.ps1` refuses a build where it survives. It is guarded
+  to MSVC Debug, so its absence on other platforms is normal rather than a lost
+  registration.
 - So a sanitizer job proves nothing until something proves the sanitizer.
   `scripts/tsan-gate.sh` refuses to report clean until the test binaries show
   `__tsan_init` **and** a deliberate race (`src/tests/TsanCanary.cpp`, built by the

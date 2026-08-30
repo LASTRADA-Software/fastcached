@@ -252,6 +252,46 @@ problems, which is why it survived being seen repeatedly.
   `::warning::` when it fires, because a silent repair would leave nobody knowing
   how often the race occurs — which is exactly how the original survived.
 
+## The Windows Debug leg exists for the RUNTIME, and proves it is live
+
+`build.yml`'s Windows matrix ran `cl-release` and `clangcl-release` only, so the
+one Debug configuration on Windows was never built in CI — while being the default
+preset every developer here debugs with. A `cl-debug`-only defect could therefore
+live on master indefinitely with every status check green (#315).
+
+- **The value is `_ITERATOR_DEBUG_LEVEL=2`, not the compiler.** MSVC's Debug CRT
+  traps invalidated iterators, out-of-range indexing and mismatched container
+  iterators *at the point they happen* — the class a Release build tolerates in
+  silence and a sanitizer would otherwise have to find. So the leg runs `ctest`;
+  a Debug leg that only compiles exercises none of what it was added for.
+- **Nothing in this project states that level, which is why it is asserted rather
+  than assumed.** It follows from `_DEBUG`, which follows from the runtime library
+  flavour, which follows from `CMAKE_BUILD_TYPE` and `CMAKE_MSVC_RUNTIME_LIBRARY`.
+  Any of those moving removes the checks with no warning, and the leg would still
+  build, still run the suite, and still report green. `iterator-debug-canary` is a
+  program that must die, and `scripts/iterator-debug-gate.ps1` refuses a build
+  where it survives — the same answer as `tsan-canary`, deliberately the same
+  shape rather than a second idiom.
+- **A non-zero exit is not proof.** The gate requires the runtime's own
+  `subscript out of range` diagnostic, exactly as the TSan gate requires
+  `data race`: a canary that died of something else is a canary proving nothing.
+- **The canary sets its own CRT report modes**, and that is load-bearing rather
+  than defensive: an unhandled debug assertion pops a modal dialog, and on a
+  runner that means the job hangs to its timeout instead of failing in a second.
+- **A third leg rather than replacing a Release one, and that was measured.**
+  Windows costs ~9 and ~7 minutes today; the 21.2 and 15.7 quoted in
+  `build.yml`'s own `windows:` comment predate `SCCACHE_GHA_ENABLED` and are stale
+  — that comment states them in the past tense, and a reader skimming it for a
+  current figure will take the wrong one. Neither leg is near the
+  critical path — `clang-tidy` runs ~20 minutes and finishes last — so the Debug
+  leg costs about eight runner-minutes and no wall clock. Giving up a Release
+  configuration to buy that would have traded coverage for capacity already there.
+- **Guarded to `MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"`, which means its
+  absence elsewhere is normal.** That is worth knowing before debugging it: a
+  platform-guarded registration is indistinguishable from a lost one when you look
+  at a single platform's `ctest -N`. Check a listing where it *should* be missing
+  and one where it should not, and confirm a neighbouring test is still present.
+
 ## What CI costs
 
 The workflow's *critical path* is the longest single job, and for a long time that
