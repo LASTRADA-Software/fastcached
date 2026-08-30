@@ -44,8 +44,8 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
-    CHECK(CurrentVersion == 1);
-    CHECK(MinSupportedVersion == 1);
+    CHECK(CurrentVersion == 2);
+    CHECK(MinSupportedVersion == 2);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -64,7 +64,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x01,                   // version
+        0x02,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -83,7 +83,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x01,                               // version
+        0x02,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -350,7 +350,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x01, 0x03,       // magic, version, op=Auth
+        0xFC, 0x02, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -707,19 +707,29 @@ TEST_CASE("A LEASE grant and a COMPILE result round-trip")
     SECTION("result")
     {
         auto const object = Bytes({ 0x7F, 0x45, 0x4C, 0x46 });
-        auto const payload = EncodeCompileResult(
-            CompileResult { .exitCode = 0, .object = object, .stdoutText = AsBytes("out"), .stderrText = AsBytes("err") });
+        auto const payload = EncodeCompileResult(CompileResult { .exitCode = 0,
+                                                                 .object = object,
+                                                                 .stdoutText = AsBytes("out"),
+                                                                 .stderrText = AsBytes("err"),
+                                                                 .correlation = AsBytes("c0") });
         auto const decoded = DecodeCompileResult(payload);
         REQUIRE(decoded.has_value());
         CHECK(Unwrap(decoded).exitCode == 0);
         CHECK(std::ranges::equal(Unwrap(decoded).object, object));
         CHECK(AsStringView(Unwrap(decoded).stdoutText) == "out");
         CHECK(AsStringView(Unwrap(decoded).stderrText) == "err");
+        // The correlation is a field like any other and must survive the round trip:
+        // a client refuses a reply whose digest does not match, so one lost in
+        // framing would refuse every honest compile (#280).
+        CHECK(AsStringView(Unwrap(decoded).correlation) == "c0");
     }
     SECTION("a failed compile carries its diagnostics and no object")
     {
-        auto const payload = EncodeCompileResult(
-            CompileResult { .exitCode = 1, .object = {}, .stdoutText = {}, .stderrText = AsBytes("error: nope") });
+        auto const payload = EncodeCompileResult(CompileResult { .exitCode = 1,
+                                                                 .object = {},
+                                                                 .stdoutText = {},
+                                                                 .stderrText = AsBytes("error: nope"),
+                                                                 .correlation = AsBytes("c1") });
         auto const decoded = DecodeCompileResult(payload);
         REQUIRE(decoded.has_value());
         CHECK(Unwrap(decoded).exitCode == 1);

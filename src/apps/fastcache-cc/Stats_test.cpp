@@ -163,6 +163,33 @@ TEST_CASE("FormatReport ranks the fall-back reasons")
     CHECK(report.contains("1x  preprocess failed"));
 }
 
+TEST_CASE("A miss that fell back from a worker is still ranked by its reason")
+{
+    // The launcher's substitute for a counter, and the reason it works at all: the
+    // reason tally is keyed on the DETAIL and is indifferent to the outcome.
+    //
+    // A dispatched compile whose reply did not belong to its request (#280) is
+    // refused and compiled locally, but the cache answered honestly and still stores
+    // the object -- so the outcome is a MISS with a fall-back reason on it. Recording
+    // it as `Unavailable` instead would blame the cache and file the source under
+    // "never cached", both untrue; and since `fastcache-cc` is one short-lived process
+    // per translation unit with no metrics sink, this ranking is the only aggregate of
+    // that event that exists anywhere.
+    ScopedStateDir const scoped;
+    for (int i = 0; i < 2; ++i)
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 5);
+        record.detail = "a worker answered about a different compile";
+        AppendRecord(record);
+    }
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("2x  a worker answered about a different compile"));
+    // Still a miss: the cache was never the thing that failed.
+    CHECK(report.contains("misses"));
+    CHECK_FALSE(report.contains("never cached"));
+}
+
 TEST_CASE("FormatReport restricts the fold to one prefetch group when filtered")
 {
     ScopedStateDir const scoped;

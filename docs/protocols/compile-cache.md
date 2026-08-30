@@ -24,7 +24,7 @@ declares:
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
 | 0 | 1 | magic | Always `0xFC`. |
-| 1 | 1 | version | Protocol version. Current: **1**. |
+| 1 | 1 | version | Protocol version. Current: **2**. |
 | 2 | 1 | op | `0x01` STORE, `0x02` FETCH. |
 | 3 | 4 | payloadLength | Bytes of payload following the header. |
 
@@ -174,7 +174,7 @@ REGISTER   [fingerprint][endpoint][slots][codecs][capacity] -> [workerId]
 HEARTBEAT  [workerId][inFlight][load]                       -> Ok
 LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
-                                                            -> [exitCode][object][stdout][stderr]
+                                              -> [exitCode][object][stdout][stderr][correlation]
 RELEASE    [leaseToken][objectKey]                          -> Ok
 ```
 
@@ -194,6 +194,33 @@ can name its scratch file the same way: a compiler records the name of the file 
 was handed, and an object built under an invented name is gratuitously different
 from a locally built one. It is sanitized before it becomes a path, and it never
 decides the language — the client states that explicitly.
+
+`correlation` is what ties a reply to the request that asked for it, and it is the
+one field on this wire that exists only to catch a defect. Everything else here is
+upstream of the reply — the key covers the inputs, the fingerprint covers the
+toolchain, the lease covers the authorization — so before it existed a client sent a
+job and accepted whatever object came back on that connection. Any defect that
+crossed two jobs therefore produced a build that succeeded with the **wrong object
+under a correct key**: silent, stored, and then served to every other machine that
+fetched that key.
+
+It is a digest of what the worker **actually compiled** — the preprocessed text it
+wrote to scratch, the client's own argument slice as the worker decoded it, the
+fingerprint and the source name — taken inside the worker's runner from the values
+it was about to spawn with, never recomputed from the decoded request. A digest
+taken at the wire layer would agree with whatever it was compared against, because
+at that layer both of two crossed requests are still pristine. The client recomputes
+the same digest from what it asked for and **refuses** a reply that does not match,
+before the object envelope is opened. There is no best-effort match and no fallback
+to using the object anyway: a mismatch means the translation unit is compiled
+locally, and the launcher says so unconditionally on stderr rather than only under
+`FASTCACHE_VERBOSE`. `fastcache-cc --show-stats` ranks it as a fall-back reason.
+
+It is integrity against **accident**, not against a hostile worker: the digest is
+unkeyed, so a worker that can return a wrong object can return a wrong digest just
+as easily. It also cannot see a runner that fed the right bytes and read back the
+wrong object file — there the metadata is honest and only the object is foreign, and
+the worker's exclusive scratch claim is what closes that.
 
 Two rules carry the weight and neither is configurable. A job goes only to a
 worker whose fingerprint is **byte-identical**: an over-strict match costs a
@@ -365,7 +392,7 @@ through the daemon's connection logger, so a rejection is visible to the
 operator as well as to the client.
 
 An `unsupported-version` message names the offered version *and* the supported
-range (`unsupported wire version 2; this server speaks 1..1`). A rejection that
+range (`unsupported wire version 1; this server speaks 2..2`). A rejection that
 does not say what would have worked cannot be acted on, and this is the only
 message an operator with a mismatched install will ever see.
 

@@ -105,6 +105,53 @@ struct CompileOutcome
     std::vector<std::byte> object; ///< The object, empty when the compile failed.
     std::string stdoutText;
     std::string stderrText;
+    /// What this worker actually compiled, tying the reply to its request (#280).
+    ///
+    /// Filled by the RUNNER from the values it used, never recomputed by the wire
+    /// layer from the decoded request: at the wire layer both of two crossed requests
+    /// are still pristine, so a digest taken there matches whatever it is compared
+    /// against and catches nothing. See `CompileCorrelation`, which also records the
+    /// half of the problem this cannot see.
+    std::string correlation;
+};
+
+/// Runs one compile job, and the seam `WorkerProtocol` reaches a compiler through.
+///
+/// **Why this exists rather than `WorkerProtocol` naming `CompileJobRunner`.** This
+/// project's rule is that anything touching I/O, the filesystem or process spawning is
+/// reached through an injected interface, never a concrete type. `CompileJobRunner`
+/// does all three, and was a concrete dependency of `WorkerProtocol` from the day it
+/// was written. What hid it is that the inner `IProcessRunner` seam made the
+/// arrangement *look* injected while sitting one layer too deep to substitute the
+/// thing that matters.
+///
+/// That depth is demonstrable rather than a matter of taste. A fake `IProcessRunner`
+/// receives `argv` AFTER the runner has recorded what it is about to compile, so it can
+/// make the OUTPUT wrong but cannot make the execution diverge from the record. The
+/// only crossed-job fixture the tree could build was therefore
+/// [#279](https://github.com/LASTRADA-Software/fastcached/issues/279)'s half -- right
+/// input, foreign object -- and never
+/// [#280](https://github.com/LASTRADA-Software/fastcached/issues/280)'s, where a runner
+/// reports on work other than the work it was asked for. See `CompileOutcome`'s
+/// `correlation`.
+///
+/// Deliberately ONE method, because that is all `WorkerProtocol` calls. An interface
+/// mirroring `CompileJobRunner`'s whole surface would be a second name for the class
+/// rather than a seam, and every future fake would carry methods no test uses.
+class ICompileJobRunner
+{
+  public:
+    ICompileJobRunner() = default;
+    virtual ~ICompileJobRunner() = default;
+    ICompileJobRunner(ICompileJobRunner const&) = delete;
+    ICompileJobRunner& operator=(ICompileJobRunner const&) = delete;
+    ICompileJobRunner(ICompileJobRunner&&) = delete;
+    ICompileJobRunner& operator=(ICompileJobRunner&&) = delete;
+
+    /// Run one job to completion.
+    /// @param job What to compile.
+    /// @return The outcome, or why the job was refused before any compiler ran.
+    [[nodiscard]] virtual std::expected<CompileOutcome, JobError> Run(CompileJob const& job) = 0;
 };
 
 /// Runs compile jobs on this worker.
@@ -132,7 +179,7 @@ struct CompileOutcome
 ///
 /// The source *name* is used for exactly one thing: its extension, so the compiler
 /// picks the right language. Even that is sanitized rather than trusted.
-class CompileJobRunner
+class CompileJobRunner final: public ICompileJobRunner
 {
   public:
     /// @param runner Process spawning seam; must outlive the runner.
@@ -161,7 +208,7 @@ class CompileJobRunner
     /// @param job The job.
     /// @return What the compiler produced, or why the job was refused (with the
     ///         offending argument named, for a rejected one).
-    [[nodiscard]] std::expected<CompileOutcome, JobError> Run(CompileJob const& job);
+    [[nodiscard]] std::expected<CompileOutcome, JobError> Run(CompileJob const& job) override;
 
     /// The fingerprints this worker can serve, for its registration.
     /// @return Every configured fingerprint, sorted.

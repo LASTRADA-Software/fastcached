@@ -259,6 +259,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheKey_test.cpp
         ParallelFor_test.cpp
         CacheProtocol_test.cpp
+        CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
         # Test infrastructure, and on THIS target only: the shipped launcher must
         # not carry a test double, and `_fc_cc_core` is what it is built from.

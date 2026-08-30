@@ -134,6 +134,23 @@ enum class DispatchStatus : std::uint8_t
     Declined,
     /// The scheduler or the worker could not be reached, or the exchange broke.
     Unavailable,
+    /// The worker answered about a compile other than the one it was asked for
+    /// ([#280](https://github.com/LASTRADA-Software/fastcached/issues/280)).
+    ///
+    /// **Its own status rather than an `Unavailable`, because it is the only one
+    /// here that is not ordinary.** Every other way a dispatch ends is a fleet
+    /// declining to help — a scheduler with nobody free, a worker that went away —
+    /// and an operator seeing those has nothing to fix. This one says a machine
+    /// returned an object for work nobody asked it to do, which is a defect
+    /// somewhere in the fleet and the one outcome worth waking somebody for. Folded
+    /// into `Unavailable` it would be tallied beside "the worker was down" and read
+    /// as a network blip.
+    ///
+    /// The build still succeeds: like every other non-answer the client compiles
+    /// locally, because it is holding the source. What it must never do is *use*
+    /// the object, which would be a wrong object under a correct key — the failure
+    /// this whole mechanism exists to make impossible.
+    Mismatched,
 };
 
 /// The result of one dispatch attempt.

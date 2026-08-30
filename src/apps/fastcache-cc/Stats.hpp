@@ -33,7 +33,12 @@ struct Record
     std::string source;          ///< Translation-unit path, for per-TU attribution.
     std::uint64_t valueBytes {}; ///< Cached payload size (0 when nothing moved).
     std::uint64_t elapsedMs {};  ///< Wall time this invocation took.
-    std::string detail;          ///< Fall-back reason; empty on hit/miss.
+    /// Fall-back reason, tallied per cause by `--show-stats`. Empty on a hit, and
+    /// on a miss that had nothing to fall back FROM -- but a miss CAN carry one:
+    /// a dispatched compile whose reply did not belong to the request is refused
+    /// and compiled locally (#280), which leaves the outcome an honest miss with a
+    /// reason worth ranking.
+    std::string detail;
 
     // Phase breakdown of elapsedMs. A hit is not "cache latency": it also pays a
     // full preprocess to derive the key, so a slow hit needs these to attribute.

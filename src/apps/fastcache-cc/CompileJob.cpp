@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CmdLine.hpp"
+#include "CompileCorrelation.hpp"
 #include "CompileJob.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <ranges>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -880,6 +882,18 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // for `/Fo`.
     argv.push_back(std::string { ObjectOutputPrefixFor(family) } + object.string());
 
+    // Recorded HERE, from the vector that is about to be spawned and the text that
+    // was just written to scratch -- not in `WorkerProtocol` from the decoded request.
+    // That placement is the whole mechanism: at the wire layer two crossed requests are
+    // both still pristine, so a digest taken there agrees with whatever it is compared
+    // against. Taken from `argv`'s own client slice rather than from `job.args` again,
+    // so anything that ever edits the vector between here and the spawn is followed
+    // rather than described. See `CompileCorrelation` (#280).
+    auto const correlation = CompileCorrelation(job.preprocessed,
+                                                std::span<std::string const> { argv }.subspan(1, job.args.size()),
+                                                job.fingerprint,
+                                                job.sourceName);
+
     auto run = _runner.RunCaptureSplit(argv);
     if (run.exitCode == NotSpawned)
         // The compiler could not be spawned at all. Deliberately NOT reported as a
@@ -888,7 +902,11 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
         return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed, .detail = {} });
 
     CompileOutcome outcome {
-        .exitCode = run.exitCode, .object = {}, .stdoutText = std::move(run.out), .stderrText = std::move(run.err)
+        .exitCode = run.exitCode,
+        .object = {},
+        .stdoutText = std::move(run.out),
+        .stderrText = std::move(run.err),
+        .correlation = correlation,
     };
     if (run.exitCode == 0)
     {

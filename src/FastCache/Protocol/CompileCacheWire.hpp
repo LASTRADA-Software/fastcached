@@ -103,12 +103,12 @@ using WireVersion = std::uint8_t;
 /// Bump this whenever the framing changes shape. It is deliberately **not**
 /// derived from the release version: the wire format changes far more rarely than
 /// the product does, and tying them would force a flag day on every release.
-inline constexpr WireVersion CurrentVersion = 1;
+inline constexpr WireVersion CurrentVersion = 2;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
 /// build can still decode the older shape.
-inline constexpr WireVersion MinSupportedVersion = 1;
+inline constexpr WireVersion MinSupportedVersion = 2;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -2430,6 +2430,18 @@ struct CompileResult
     std::span<std::byte const> object; ///< Codec envelope; empty on a failed compile.
     std::span<std::byte const> stdoutText;
     std::span<std::byte const> stderrText;
+    /// What the worker says it actually compiled, tying this reply to its request.
+    ///
+    /// Nothing else did. The cache key covers the inputs, the fingerprint the
+    /// toolchain and the lease the authorization -- every one of them upstream of the
+    /// reply -- so a client sent a job and accepted whatever object came back on that
+    /// connection ([#280](https://github.com/LASTRADA-Software/fastcached/issues/280)).
+    ///
+    /// Produced by `Cc::CompileCorrelation` in the RUNNER, from what it actually
+    /// spawned and wrote, never recomputed at this layer from the decoded request: at
+    /// this layer two crossed requests are both still pristine, so a digest taken here
+    /// agrees with whatever it is compared against.
+    std::span<std::byte const> correlation;
 };
 
 /// Frame the payload of a COMPILE reply.
@@ -2438,7 +2450,8 @@ struct CompileResult
 [[nodiscard]] inline std::vector<std::byte> EncodeCompileResult(CompileResult const& result)
 {
     auto const code = EncodeU32Field(result.exitCode);
-    return WireFields::Encode({ std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText });
+    return WireFields::Encode(
+        { std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText, result.correlation });
 }
 
 /// Split a COMPILE reply payload.
@@ -2446,15 +2459,17 @@ struct CompileResult
 /// @return The result, or nullopt when malformed.
 [[nodiscard]] inline std::optional<CompileResult> DecodeCompileResult(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 4);
+    auto const fields = SplitFields(payload, 5);
     if (!fields.has_value())
         return std::nullopt;
     auto const code = DecodeU32Field((*fields)[0]);
     if (!code.has_value())
         return std::nullopt;
-    return CompileResult {
-        .exitCode = *code, .object = (*fields)[1], .stdoutText = (*fields)[2], .stderrText = (*fields)[3]
-    };
+    return CompileResult { .exitCode = *code,
+                           .object = (*fields)[1],
+                           .stdoutText = (*fields)[2],
+                           .stderrText = (*fields)[3],
+                           .correlation = (*fields)[4] };
 }
 
 } // namespace FastCache::CompileCacheWire

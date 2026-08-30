@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -179,17 +180,77 @@ constexpr std::string_view Worker = "worker:6676";
                                  .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs) }));
 }
 
-/// A compile reply carrying `object` and an exit code.
-[[nodiscard]] std::vector<std::byte> CompileReply(std::string_view object,
+/// The base name of `path`, as the client sends it and the worker digests it.
+///
+/// Deliberately restated here rather than reached from `Dispatch.cpp`, so that a
+/// change to which part of the path travels shows up as a failing test instead of
+/// being mirrored automatically into the expectation.
+/// @param path The source path as a case spelled it.
+/// @return Its final component.
+[[nodiscard]] std::string_view SentSourceName(std::string_view path)
+{
+    // `npos + 1 == 0`, so a path with no separator yields the whole string.
+    return path.substr(path.find_last_of("/\\") + 1);
+}
+
+/// What a COMPILE reply says, with every field a case might want to make dishonest.
+///
+/// A struct and one encoder rather than a `CompileResult` spelled out per case: the
+/// cases below vary the object field, the correlation and the exit code
+/// independently, and three hand-rolled copies of the aggregate is three places for
+/// a field added to the reply to be forgotten.
+struct ReplyFields
+{
+    std::span<std::byte const> objectField; ///< The object exactly as it travels, envelope and all.
+    std::string_view correlation;           ///< What the worker claims it compiled.
+    std::string_view err;                   ///< The remote compiler's stderr.
+    std::uint32_t exitCode { 0 };           ///< What the remote compiler thought of the code.
+};
+
+/// Frame one COMPILE reply.
+/// @param fields What it says.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> ReplyFrom(ReplyFields const& fields)
+{
+    return Wire::EncodeReply(
+        Wire::Status::Ok,
+        Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = fields.exitCode,
+                                                        .object = fields.objectField,
+                                                        .stdoutText = {},
+                                                        .stderrText = Wire::AsBytes(fields.err),
+                                                        .correlation = Wire::AsBytes(fields.correlation) }));
+}
+
+/// What an honest worker would report having compiled, for `request`.
+///
+/// Derived from the request rather than fixed, which is what lets a case build a
+/// CROSSED reply by handing it a different one -- the whole of #280's acceptance
+/// criterion.
+/// @param request The job.
+/// @return The correlation an honest worker puts on its reply.
+[[nodiscard]] std::string HonestCorrelation(DispatchRequest const& request)
+{
+    return CompileCorrelation(request.preprocessed, request.args, request.fingerprint, SentSourceName(request.sourceName));
+}
+
+/// The reply an HONEST worker sends back for `request`.
+///
+/// Every case here goes through it, so an honest reply is the default and a crossed
+/// one has to be asked for by name.
+/// @param request The job this reply answers.
+/// @param object The object bytes the worker claims to have produced.
+/// @param exitCode What the remote compiler thought of the code.
+/// @param err The remote compiler's stderr.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> CompileReply(DispatchRequest const& request,
+                                                  std::string_view object,
                                                   std::uint32_t exitCode = 0,
                                                   std::string_view err = {})
 {
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(object.size()), Wire::AsBytes(object));
-    return Wire::EncodeReply(
-        Wire::Status::Ok,
-        Wire::EncodeCompileResult(Wire::CompileResult {
-            .exitCode = exitCode, .object = enveloped, .stdoutText = {}, .stderrText = Wire::AsBytes(err) }));
+    return ReplyFrom(ReplyFields {
+        .objectField = enveloped, .correlation = HonestCorrelation(request), .err = err, .exitCode = exitCode });
 }
 
 /// The request frames written to `endpoint`, split apart.
@@ -245,12 +306,14 @@ constexpr std::string_view Worker = "worker:6676";
 
 TEST_CASE("A dispatched compile reaches the worker the scheduler named", "[dispatch]")
 {
+    std::vector<std::string> const args { "-O2", "-std=c++23" };
+    auto const request = Request(args);
+
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJECTBYTES"));
 
-    std::vector<std::string> const args { "-O2", "-std=c++23" };
-    auto const result = Dispatch(fleet, Request(args));
+    auto const result = Dispatch(fleet, request);
 
     REQUIRE(result.Ran());
     CHECK(result.exitCode == 0);
@@ -286,11 +349,12 @@ TEST_CASE("A compile longer than the cache deadline is still dispatched", "[disp
     // than by an argument about averages.
     constexpr auto RemoteCompileTime = 90s;
 
+    std::vector<std::string> const args { "-O2" };
+
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
     fleet.AnswersAfter(std::string { Worker }, RemoteCompileTime);
-    std::vector<std::string> const args { "-O2" };
 
     SECTION("under the default budgets")
     {
@@ -322,11 +386,12 @@ TEST_CASE("A slow cache does not get the compile's minutes", "[dispatch]")
     // request/reply verbs answered from its own tables, so they keep the launcher's
     // ordinary budget: raising the compile ceiling to two minutes must not make a
     // wedged scheduler hold a build for two minutes as well.
+    std::vector<std::string> const args { "-O2" };
+
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
 
-    std::vector<std::string> const args { "-O2" };
     REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
     // Lease, compile, release -- in that order, so the budgets line up with them.
@@ -352,9 +417,9 @@ TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")
     // their own compile error.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("", 1, "error: no"));
-
     std::vector<std::string> const args { "-O2" };
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "", 1, "error: no"));
+
     auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.Ran());
@@ -446,7 +511,7 @@ TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
 
     SECTION("after a compile that ran")
     {
-        fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
         REQUIRE(Dispatch(fleet, Request(args)).Ran());
     }
     SECTION("after the worker refused the job")
@@ -492,10 +557,10 @@ TEST_CASE("A scheduler that has gone away by then changes nothing", "[dispatch]"
     // failure because of what happened after it.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    std::vector<std::string> const args { "-O2" };
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
     fleet.ReachableFor(std::string { Scheduler }, 1);
 
-    std::vector<std::string> const args { "-O2" };
     auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.Ran());
@@ -535,19 +600,23 @@ TEST_CASE("A worker's reply may not declare an expansion above the launcher's ce
     // worker this process trusts with its address space: a rogue or compromised fleet
     // member answers this exchange too, and `Decompress` value-initializes whatever
     // the reply declares.
+    std::vector<std::string> const args { "-O2" };
+    auto const request = Request(args);
+
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
 
     constexpr std::uint32_t FourGiB = 0xFFFFFFFFU;
     std::array<std::byte, 16> const payload { std::byte { 0x41 } };
     auto const bomb = Wire::EncodeCodecEnvelope(/*codec=*/1, FourGiB, payload);
-    fleet.Serve(std::string { Worker },
-                Wire::EncodeReply(Wire::Status::Ok,
-                                  Wire::EncodeCompileResult(Wire::CompileResult {
-                                      .exitCode = 0, .object = bomb, .stdoutText = {}, .stderrText = {} })));
+    // Correlated honestly, because this case is about the CEILING: a reply that is
+    // also crossed is refused for that instead, one check earlier, and the assertion
+    // below would be about the wrong guard.
+    fleet.Serve(
+        std::string { Worker },
+        ReplyFrom(ReplyFields { .objectField = bomb, .correlation = HonestCorrelation(request), .err = {}, .exitCode = 0 }));
 
-    std::vector<std::string> const args { "-O2" };
-    auto const result = Dispatch(fleet, Request(args));
+    auto const result = Dispatch(fleet, request);
 
     // Unavailable, never Compiled: a reply this process refused to open is not an
     // object, and the launcher answers it the way it answers every dispatch failure --
@@ -566,9 +635,8 @@ TEST_CASE("The launcher's envelope ceiling is a budget the caller can set", "[di
     // what one exchange may cost this process.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJECT"));
-
     std::vector<std::string> const args { "-O2" };
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECT"));
 
     // Default ceiling: an ordinary object comes back.
     CHECK(Dispatch(fleet, Request(args)).status == DispatchStatus::Compiled);
@@ -577,7 +645,7 @@ TEST_CASE("The launcher's envelope ceiling is a budget the caller can set", "[di
     // caller's rather than a constant baked into the decoder.
     ScriptedFleet tight;
     tight.Serve(std::string { Scheduler }, GrantReply());
-    tight.Serve(std::string { Worker }, CompileReply("OBJECT"));
+    tight.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECT"));
     DispatchBudgets budgets;
     budgets.maxDecompressedBytes = 2;
     CHECK(Dispatch(tight, Request(args), budgets).status == DispatchStatus::Unavailable);
@@ -589,9 +657,9 @@ TEST_CASE("The arguments the worker receives are the ones it was given", "[dispa
     // space is the case a joined-string encoding would silently split.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
-
     std::vector<std::string> const args { "-O2", "-DMSG=hello world", "-std=c++23" };
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
     REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -614,11 +682,11 @@ TEST_CASE("The worker is told what to call its scratch file, and not where it ca
     // if it wanted to: the file it creates is inside its own scratch directory.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
-
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.sourceName = "/home/dev/checkout/src/Widget.cpp";
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
     REQUIRE(Dispatch(fleet, request).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -632,11 +700,11 @@ TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dis
 {
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
-
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.sourceName = R"(D:\checkout\src\Widget.cpp)";
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
     REQUIRE(Dispatch(fleet, request).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -650,11 +718,11 @@ TEST_CASE("The preprocessed source reaches the worker intact", "[dispatch]")
 {
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
-
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
     request.preprocessed = "int answer() { return 42; }";
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
     REQUIRE(Dispatch(fleet, request).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -672,10 +740,10 @@ TEST_CASE("A worker that accepts no codec is sent Identity", "[dispatch]")
     // still receive something it can read, or the payload crosses the network only
     // to be refused.
     ScriptedFleet fleet;
-    fleet.Serve(std::string { Scheduler }, GrantReply(/*codecs=*/ {}));
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
-
     std::vector<std::string> const args { "-O2" };
+    fleet.Serve(std::string { Scheduler }, GrantReply(/*codecs=*/ {}));
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
     REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -702,8 +770,8 @@ TEST_CASE("DecodeArgs round-trips an empty list and an empty argument", "[dispat
 
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJ"));
     std::vector<std::string> const args { "", "-O2" };
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
     REQUIRE(Dispatch(fleet, Request(args)).Ran());
 
     auto const& toWorker = fleet.SentTo(std::string { Worker });
@@ -726,12 +794,13 @@ TEST_CASE("A lease refused with NotLeader is retried against the leader it names
     // the client goes where it was sent rather than guessing at an endpoint.
     constexpr std::string_view Leader = "leader:6675";
 
+    std::array<std::string, 1> const args { "-c" };
+
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader));
     fleet.Serve(std::string { Leader }, GrantReply());
-    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
 
-    std::array<std::string, 1> const args { "-c" };
     auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.status == DispatchStatus::Compiled);
@@ -814,4 +883,205 @@ TEST_CASE("Two schedulers naming each other stop at the redirect ceiling", "[dis
     for (auto const& endpoint: { Scheduler, Other })
         for (auto const& frame: FramesTo(fleet, endpoint))
             CHECK(OpOf(frame) == Wire::Op::Lease);
+}
+
+TEST_CASE("A reply belonging to another compile is refused, never served", "[dispatch][correlation]")
+{
+    // #280, written the way the ticket asks for: two jobs, their replies swapped.
+    //
+    // A crossed reply accepted here is the worst failure this project has -- a WRONG
+    // OBJECT UNDER A CORRECT KEY. It is silent (the build succeeds), it is durable
+    // (the client stores it), and it is shared (every other machine that fetches that
+    // key gets it). Nothing else covers it: the key covers the inputs, the fingerprint
+    // the toolchain and the lease the authorization, and all three are upstream of the
+    // reply. So the refusal is a refusal, never a best-effort match and never a
+    // fallback to using the object anyway.
+    std::vector<std::string> const argsA { "-O2" };
+    std::vector<std::string> const argsB { "-O0", "-g" };
+
+    auto requestA = Request(argsA);
+    requestA.sourceName = "a.cpp";
+    requestA.preprocessed = "int a() { return 1; }";
+
+    auto requestB = Request(argsB);
+    requestB.sourceName = "b.cpp";
+    requestB.preprocessed = "int b() { return 2; }";
+
+    SECTION("uncrossed, each is served its own object")
+    {
+        // The control, and it is not decoration: without it a client that refused
+        // EVERY reply would pass every assertion below while distributing nothing.
+        ScriptedFleet toA;
+        toA.Serve(std::string { Scheduler }, GrantReply());
+        toA.Serve(std::string { Worker }, CompileReply(requestA, "OBJECT-A"));
+        auto const servedA = Dispatch(toA, requestA);
+        REQUIRE(servedA.Ran());
+        CHECK(std::string(reinterpret_cast<char const*>(servedA.object.data()), servedA.object.size()) == "OBJECT-A");
+
+        ScriptedFleet toB;
+        toB.Serve(std::string { Scheduler }, GrantReply());
+        toB.Serve(std::string { Worker }, CompileReply(requestB, "OBJECT-B"));
+        auto const servedB = Dispatch(toB, requestB);
+        REQUIRE(servedB.Ran());
+        CHECK(std::string(reinterpret_cast<char const*>(servedB.object.data()), servedB.object.size()) == "OBJECT-B");
+    }
+
+    SECTION("crossed, both are refused and neither object is returned")
+    {
+        // Both directions, because a check that compared against one side's digest
+        // rather than against the job in hand would pass one of them.
+        ScriptedFleet crossedToA;
+        crossedToA.Serve(std::string { Scheduler }, GrantReply());
+        crossedToA.Serve(std::string { Worker }, CompileReply(requestB, "OBJECT-B"));
+        auto const answeredA = Dispatch(crossedToA, requestA);
+
+        CHECK(answeredA.status == DispatchStatus::Mismatched);
+        CHECK_FALSE(answeredA.Ran());
+        // The object is not merely unused -- it never leaves this function, so no
+        // caller can reach for it in a later refactor.
+        CHECK(answeredA.object.empty());
+        // Named, so an operator can find the machine rather than being told that
+        // "distribution stopped working".
+        CHECK(answeredA.detail.contains(Worker));
+
+        // And the lease is still handed back, so a refusal does not pin the key for
+        // the scheduler's whole lease timeout (#212). This is the newest branch out
+        // of the compile and therefore the one most likely to have forgotten.
+        REQUIRE(crossedToA.Dialled().size() == 3);
+        CHECK(crossedToA.Dialled()[2] == Scheduler);
+
+        ScriptedFleet crossedToB;
+        crossedToB.Serve(std::string { Scheduler }, GrantReply());
+        crossedToB.Serve(std::string { Worker }, CompileReply(requestA, "OBJECT-A"));
+        auto const answeredB = Dispatch(crossedToB, requestB);
+
+        CHECK(answeredB.status == DispatchStatus::Mismatched);
+        CHECK(answeredB.object.empty());
+    }
+}
+
+TEST_CASE("A crossed reply is refused whichever part of the job differs", "[dispatch][correlation]")
+{
+    // The digest's coverage, one mutation per case. A correlation folding only the
+    // source text would accept three of these four, and each of them really is a
+    // different compile with a different correct object:
+    //
+    //  * the FINGERPRINT, because two jobs identical in text, flags and name but
+    //    built for different toolchains have different correct objects, and crossing
+    //    them is invisible in every other field;
+    //  * the ARGUMENTS, for the obvious reason;
+    //  * the SOURCE TEXT, likewise;
+    //  * the SOURCE NAME, because a compiler records the name of the file it was
+    //    handed -- the COFF/ELF `.file` symbol -- so two otherwise identical jobs
+    //    differ in the object by those bytes.
+    //
+    // A table rather than four near-identical cases, so the fifth field is one row.
+    struct Mutation
+    {
+        std::string_view what;                 ///< What this row changes.
+        void (*apply)(DispatchRequest& other); ///< How it differs from the job asked for.
+    };
+
+    static constexpr std::array<Mutation, 4> mutations { {
+        { .what = "fingerprint", .apply = [](DispatchRequest& other) { other.fingerprint = "clang-19-def"; } },
+        { .what = "source text", .apply = [](DispatchRequest& other) { other.preprocessed = "int other() { return 9; }"; } },
+        { .what = "source name", .apply = [](DispatchRequest& other) { other.sourceName = "other.cpp"; } },
+        // The arguments are the one field a lambda cannot rewrite in place, because
+        // the request only borrows them -- so the row names the difference and the
+        // loop below owns the storage.
+        { .what = "arguments", .apply = nullptr },
+    } };
+
+    std::vector<std::string> const args { "-O2" };
+    std::vector<std::string> const otherArgs { "-O2", "-DNDEBUG" };
+    auto const request = Request(args);
+
+    for (auto const& mutation: mutations)
+    {
+        INFO("differing in " << mutation.what);
+
+        auto other = Request(args);
+        if (mutation.apply != nullptr)
+            mutation.apply(other);
+        else
+            other.args = otherArgs;
+
+        // The reply is honest ABOUT ANOTHER JOB -- which is exactly what a crossed
+        // reply is, and why this is not the same as a corrupted field.
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, CompileReply(other, "FOREIGN"));
+
+        auto const result = Dispatch(fleet, request);
+        CHECK(result.status == DispatchStatus::Mismatched);
+        CHECK(result.object.empty());
+    }
+}
+
+TEST_CASE("A reply carrying no correlation at all is refused", "[dispatch][correlation]")
+{
+    // A worker that fills nothing in is not a worker that agrees. The empty field is
+    // the shape a peer built before this existed would send, and the shape a
+    // half-implemented one would send, and neither may be waved through: "absent"
+    // must fail the same way "wrong" does, or the check is optional in practice.
+    //
+    // The message says so by shape rather than by quoting the peer -- a reply this
+    // client has just refused is not a source of text to print at an operator.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+
+    auto const enveloped = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 3, Wire::AsBytes("OBJ"));
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = {}, .err = {}, .exitCode = 0 }));
+
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    CHECK(result.status == DispatchStatus::Mismatched);
+    CHECK(result.object.empty());
+    CHECK(result.detail.contains("none"));
+}
+
+TEST_CASE("A correlation that is not a digest is described rather than quoted", "[dispatch][correlation]")
+{
+    // Text a peer sent is text. A worker that has just proved it is misbehaving is
+    // the last thing whose bytes belong on an operator's terminal, so a field that
+    // is not `KeyDigest::HexLength` lowercase hex characters is named by its shape.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+
+    constexpr std::string_view Hostile = "\x1b]0;pwned\x07";
+    auto const enveloped = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 3, Wire::AsBytes("OBJ"));
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = Hostile, .err = {}, .exitCode = 0 }));
+
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    CHECK(result.status == DispatchStatus::Mismatched);
+    CHECK(result.detail.contains("not a correlation"));
+    CHECK_FALSE(result.detail.contains(Hostile));
+}
+
+TEST_CASE("A crossed reply is refused before its object is expanded", "[dispatch][correlation]")
+{
+    // Ordering, and it is not tidiness: the correlation is a string comparison and
+    // opening an envelope is an allocation the peer's own declared length decides.
+    // A client that decoded first would let a reply it is about to refuse cost it
+    // that allocation -- so the bomb from the ceiling case, in a reply that is ALSO
+    // crossed, must come back `Mismatched` rather than as a decode failure.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+
+    constexpr std::uint32_t FourGiB = 0xFFFFFFFFU;
+    std::array<std::byte, 16> const payload { std::byte { 0x41 } };
+    auto const bomb = Wire::EncodeCodecEnvelope(/*codec=*/1, FourGiB, payload);
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = bomb, .correlation = {}, .err = {}, .exitCode = 0 }));
+
+    std::vector<std::string> const args { "-O2" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    CHECK(result.status == DispatchStatus::Mismatched);
+    CHECK_FALSE(result.detail.contains("declared decompressed size"));
 }

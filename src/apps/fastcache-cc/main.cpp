@@ -310,8 +310,10 @@ struct InvocationRecord
     bool verbose = false; ///< FASTCACHE_VERBOSE; gates every diagnostic here.
 
     Cc::Outcome outcome = Cc::Outcome::Unavailable; ///< Hit / Miss / Uncacheable / Unavailable.
-    std::string outcomeDetail;                      ///< Fall-back reason; empty on hit and miss.
-    std::uint64_t valueBytes = 0;                   ///< Cached payload size; 0 when nothing moved.
+    /// Fall-back reason. Empty on a hit; usually empty on a miss, but see
+    /// `ReportCrossedReply` for the one miss that carries one.
+    std::string outcomeDetail;
+    std::uint64_t valueBytes = 0; ///< Cached payload size; 0 when nothing moved.
 
     std::uint64_t preprocessMs = 0; ///< Deriving the key (preprocess + compiler id).
     std::uint64_t cacheMs = 0;      ///< Talking to the daemon (connect + transfer).
@@ -476,6 +478,48 @@ void WarnAndCarryOn(std::string_view reason)
 {
     RecordFallback(Fallback::Uncacheable, reason);
     return std::nullopt;
+}
+
+/// The fixed reason `--show-stats` tallies a crossed worker reply under.
+///
+/// Fixed, under `RecordFallback`'s rule: the endpoint and the two digests are what
+/// an operator acts on but they differ per compile, so tallying them would produce
+/// a row per translation unit instead of a row per cause. They ride the announced
+/// line instead.
+constexpr std::string_view CrossedReplyReason = "a worker answered about a different compile";
+
+/// Report that a worker's reply did not belong to the request that asked for it,
+/// and that this client refused it (#280).
+///
+/// **Announced unconditionally, unlike every other fall-back here.** The rest are a
+/// fleet declining to help — a scheduler with nobody free, a worker that went away —
+/// and an operator has nothing to fix; those are `--verbose` material. This one says
+/// a machine produced an object for work nobody asked it to do, which is a defect,
+/// and it is the failure class this project fears most: accepted, it would be a
+/// wrong object under a correct key, stored, and then served to every other machine
+/// that fetches that key. A correctness alarm and a "distribution did not help
+/// today" note must not share a verbosity level.
+///
+/// **This line and `--show-stats` are the complete set of places the fact can live,
+/// and no fleet-wide aggregate of it exists or can.** Only the client can detect a
+/// crossed reply — a worker that knew its reply was crossed would not have sent it,
+/// so the server has nothing to count — and the client is `fastcache-cc`, one
+/// short-lived process per translation unit with no metrics sink. A
+/// `MetricsCatalog` row would therefore be a `/metrics` series reading a permanent
+/// zero *while the defect fires*, which misinforms an operator rather than merely
+/// failing to inform one. Do not add one; add a way for a client to report it, or
+/// leave it here.
+///
+/// **The outcome is deliberately not touched.** The cache answered honestly and
+/// this translation unit is still a MISS that the local compiler will serve and the
+/// daemon will store; what failed was a worker. Recording it as `Unavailable` would
+/// blame the cache and file the source under "never cached", both untrue.
+/// @param detail What the dispatch saw — the worker and the two correlations.
+void ReportCrossedReply(std::string_view detail)
+{
+    invocation.outcomeDetail = CrossedReplyReason;
+    std::cerr << "fastcache-cc: " << CrossedReplyReason << " (" << detail
+              << "); refusing that object and compiling this translation unit locally\n";
 }
 
 /// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
@@ -1541,6 +1585,13 @@ void RecordManifest(Config const& cfg,
                                                             .sourceName = cmd.source },
                                       DispatchBudgetsOf(cfg),
                                       cfg.credential);
+    if (outcome.status == Cc::DispatchStatus::Mismatched)
+    {
+        // Not one of the two below, and not reported like them: a worker answering
+        // about somebody else's compile is a defect rather than a fleet declining.
+        ReportCrossedReply(outcome.detail);
+        return std::nullopt;
+    }
     if (!outcome.Ran())
     {
         // Declined and Unavailable are both ordinary and both end the same way. The
