@@ -841,6 +841,67 @@ Every rule below has already been a bug.
   - **The regression test decodes from a temporary on purpose**, and a second one
     scopes the buffer and reads every field after it is gone. A rule this shape
     cannot be left to a case that happens to exercise it.
+  - **It happened twice, and the second time nobody was warned either.**
+    `CompileResult` and `CodecEnvelope` in `CompileCacheWire.hpp` were the same
+    shape -- returned by value from a decoder, borrowing what they decoded -- and
+    neither name said so ([#366](https://github.com/LASTRADA-Software/fastcached/issues/366)).
+    `CompileResult` reached four borrowing members before anyone counted; #280 added
+    the fourth.
+
+    **They got different answers, decided per type rather than by uniformity.**
+    `DecodeCompileResult` now returns an owning `CompileResultFields`, because
+    `Dispatch` holds a decoded reply across statements and hands the object onward;
+    the encode side keeps the name `CompileResult` and its spans, since borrowing an
+    INPUT is safe and is what every encode-side struct there does. `CodecEnvelope`
+    became `CodecEnvelopeView` and still borrows, because **every** consumer reads it
+    in scope and its `Identity` branch in `OpenAs` hands `bytes` straight to the
+    caller's container -- owning would reinstate precisely the "second full copy of a
+    preprocessed translation unit, on the path least able to afford it" that the
+    comment there exists to prevent. The question to ask is per type: does anything
+    depend on this not copying, and does the result outlive the buffer in practice.
+    Both shapes satisfy the rule; what the rule forbids is borrowing while saying
+    nothing.
+
+    The tell was already in the tree: `WorkerProtocol_test.cpp` carried **two**
+    hand-rolled workarounds -- a `FieldOf` that copied the span out, and an
+    `ObjectField` that mirrored `CodecEnvelope` with an owning `bytes` and a comment
+    explaining the dangle. Somebody hit this, understood it, and solved it locally
+    twice rather than at the type. `FieldOf`'s copy is gone, because that type owns
+    now. `ObjectField` stays, and the difference is the point: it returns outward
+    from a helper whose buffer dies with the call, so a local copy is the right
+    answer against a type that borrows BY DESIGN. A workaround against an unlabelled
+    hazard is evidence the type is wrong; the same code against a `*View` is just a
+    caller doing what the name told it to.
+  - **Detectability depends on the SIZE of the payload, not only on heap churn.**
+    Measured while fixing #366: a four-byte object decoded from a temporary reads
+    back correctly under ASan even when the member borrows, and reports nothing. The
+    same case at 64 KiB is reported immediately. So a regression test for this rule
+    that uses short literals is a test that cannot fail -- which is how it would be
+    written by anybody tidying one up. The sizes in
+    `CompileCacheWire_test.cpp` are load-bearing and say so.
+  - **A deleted overload IS probeable, but only from a dependent context**, and
+    getting this wrong is easy. `static_assert(!requires { Decode(Encode(x)) })`
+    written at namespace scope with concrete types is a **hard error** on MSVC,
+    Clang and GCC alike: a non-dependent requires-expression checks its requirements
+    immediately, and there is no substitution for the failure to be a *substitution*
+    failure. Lift it into a template and it works everywhere:
+
+    ```cpp
+    template <class T> concept Decodable = requires(T&& t) { Decode(std::forward<T>(t)); };
+    static_assert(Decodable<std::vector<std::byte>&>);   // named buffer: fine
+    static_assert(!Decodable<std::vector<std::byte>>);   // temporary: rejected
+    ```
+
+    That is the mechanism the ranges poison pills rely on, and `std::is_invocable`
+    reports `false` for a deleted candidate on the same basis. Measured on all three
+    compilers in both forms before this was written down, because the first version
+    of this bullet claimed the property was untestable and was simply wrong.
+
+    No decoder here carries such an overload, and the reason is **not** testability:
+    the ten `*View` types all have the same trap, so guarding one would be
+    inconsistent, and it would reject three existing call sites that use the
+    spelling *safely* inside a single full expression. If it is ever added it should
+    be added to all of them at once.
 
 ## Keyspace events for what nobody asked for
 

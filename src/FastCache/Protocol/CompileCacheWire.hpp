@@ -1166,7 +1166,27 @@ inline constexpr std::uint8_t IdentityCodec = 0;
 
 /// A bulk payload as it travels: a codec tag, the pre-compression size, and the
 /// (possibly compressed) bytes.
-struct CodecEnvelope
+///
+/// **`View` because `bytes` borrows the field it was decoded from**, and this is
+/// returned by value from `DecodeCodecEnvelope`. The name is the warning the type
+/// used to lack ([#366](https://github.com/LASTRADA-Software/fastcached/issues/366)):
+/// a caller that lets the decoded buffer die before reading `bytes` has a
+/// use-after-free.
+///
+/// **It borrows rather than owning, and that is measured rather than assumed.**
+/// Its one production consumer is `OpenAs` in the launcher's `CodecEnvelope.cpp`,
+/// which reads it immediately and in the same scope -- and whose `Identity` branch
+/// hands `bytes` straight to the caller's container with a comment saying that an
+/// intermediate `std::vector<std::byte>` there "would be a second full copy of a
+/// preprocessed translation unit, on the path a build with compression configured
+/// out takes for every payload -- the one least able to afford it". Owning here
+/// would reinstate exactly that copy, to buy safety that consumer does not need.
+///
+/// Its sibling `CompileResultFields` owns for the opposite reason: `Dispatch` holds
+/// a decoded reply across statements and hands the object onward. The question is
+/// per type -- does anything depend on this not copying, and does the result outlive
+/// the buffer in practice -- not a preference for one shape.
+struct CodecEnvelopeView
 {
     std::uint8_t codec { IdentityCodec }; ///< `CompressionCodec` id.
     std::uint32_t rawLength { 0 };        ///< Size before compression.
@@ -1196,13 +1216,13 @@ struct CodecEnvelope
 /// Split a codec envelope into its tag, declared raw size, and bytes.
 /// @param field One length-prefixed field holding an envelope.
 /// @return The envelope, or nullopt when the field is too short to hold a header.
-[[nodiscard]] inline std::optional<CodecEnvelope> DecodeCodecEnvelope(std::span<std::byte const> field)
+[[nodiscard]] inline std::optional<CodecEnvelopeView> DecodeCodecEnvelope(std::span<std::byte const> field)
 {
     if (field.size() < CodecHeaderSize)
         return std::nullopt;
-    return CodecEnvelope { .codec = static_cast<std::uint8_t>(field[0]),
-                           .rawLength = ReadBigEndian<std::uint32_t>(field.subspan(1, sizeof(std::uint32_t))),
-                           .bytes = field.subspan(CodecHeaderSize) };
+    return CodecEnvelopeView { .codec = static_cast<std::uint8_t>(field[0]),
+                               .rawLength = ReadBigEndian<std::uint32_t>(field.subspan(1, sizeof(std::uint32_t))),
+                               .bytes = field.subspan(CodecHeaderSize) };
 }
 
 /// Encode a `u32` as its own length-prefixed field's contents.
@@ -2454,10 +2474,33 @@ struct CompileResult
         { std::span<std::byte const> { code }, result.object, result.stdoutText, result.stderrText, result.correlation });
 }
 
+/// A decoded COMPILE reply, owning every byte of it.
+///
+/// **The decode-side twin of `CompileResult`, and it OWNS where that one borrows.**
+/// `CompileResult` is an encoder INPUT: its spans are read inside the
+/// `EncodeCompileResult` call and never outlive it, which is what every encode-side
+/// struct in this header does (`LeaseGrant`, `CompileRequest`, `StoreRequest`).
+/// A decoder's result is different in kind -- it is returned **by value**, so a
+/// borrowing member outlives the call and dangles the moment the buffer goes
+/// ([#366](https://github.com/LASTRADA-Software/fastcached/issues/366)).
+///
+/// `*Fields` rather than `*View` because the name has to say which it is, and this
+/// header already uses that suffix for exactly this: `CapacityFields`, `LoadFields`
+/// and `CacheLoadFields` are all owning records a decoder returns, while the ten
+/// `*View` types borrow and say so.
+struct CompileResultFields
+{
+    std::uint32_t exitCode { 0 };
+    std::vector<std::byte> object; ///< Codec envelope; empty on a failed compile.
+    std::vector<std::byte> stdoutText;
+    std::vector<std::byte> stderrText;
+    std::vector<std::byte> correlation; ///< @see `CompileResult::correlation`.
+};
+
 /// Split a COMPILE reply payload.
 /// @param payload The reply body.
 /// @return The result, or nullopt when malformed.
-[[nodiscard]] inline std::optional<CompileResult> DecodeCompileResult(std::span<std::byte const> payload)
+[[nodiscard]] inline std::optional<CompileResultFields> DecodeCompileResult(std::span<std::byte const> payload)
 {
     auto const fields = SplitFields(payload, 5);
     if (!fields.has_value())
@@ -2465,11 +2508,14 @@ struct CompileResult
     auto const code = DecodeU32Field((*fields)[0]);
     if (!code.has_value())
         return std::nullopt;
-    return CompileResult { .exitCode = *code,
-                           .object = (*fields)[1],
-                           .stdoutText = (*fields)[2],
-                           .stderrText = (*fields)[3],
-                           .correlation = (*fields)[4] };
+    auto const own = [](std::span<std::byte const> f) {
+        return std::vector<std::byte> { f.begin(), f.end() };
+    };
+    return CompileResultFields { .exitCode = *code,
+                                 .object = own((*fields)[1]),
+                                 .stdoutText = own((*fields)[2]),
+                                 .stderrText = own((*fields)[3]),
+                                 .correlation = own((*fields)[4]) };
 }
 
 } // namespace FastCache::CompileCacheWire

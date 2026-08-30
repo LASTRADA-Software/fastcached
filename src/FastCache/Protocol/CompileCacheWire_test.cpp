@@ -690,6 +690,82 @@ TEST_CASE("A build with compression disabled still interoperates")
     CHECK(ChooseCodec({ 2, 1 }, none) == IdentityCodec);
 }
 
+TEST_CASE("A decoder's result outlives the buffer it was decoded from")
+{
+    // #366, and #355's acceptance criterion for it: `Decode(Encode(x))` must not
+    // compile, or must be SAFE. This takes the second branch -- the spelling is made
+    // safe -- which is also what the rule concluded for `CapacityFields`.
+    //
+    // The first branch was available and was not taken. A deleted
+    // `std::vector<std::byte>&&` overload would reject the temporary, and it can be
+    // probed from a dependent context. It is not used because the ten `*View` types
+    // in this header carry the identical trap, so guarding one alone would be
+    // inconsistent, and it would reject three call sites in this file that use the
+    // spelling safely inside a single full expression.
+    //
+    // **Written as the trap spelling on purpose.** The encoded vector is a temporary
+    // that dies at the end of each full expression below, so every one of these
+    // reads is a use-after-free if the decoded struct ever goes back to borrowing --
+    // which the ASan leg then reports. Naming the payload in a local, as every
+    // production call site does, would make the case pass either way and prove
+    // nothing.
+    //
+    // `CodecEnvelopeView` is deliberately absent from this case. It BORROWS, says so
+    // in its name, and is meant to: its production consumer reads it in scope, and
+    // owning there would reinstate a full copy of a preprocessed translation unit on
+    // the path a compression-less build takes for every payload. Asserting that it
+    // outlives its buffer would be asserting the opposite of its design.
+    //
+    // **The payload size is load-bearing and must not be shrunk.** Measured, not
+    // assumed: with a four-byte object this case passes under ASan even when the
+    // decoder borrows -- the freed block is small enough that reading it back still
+    // returns the right bytes, so the case would prove nothing. At 64 KiB the read
+    // is reported immediately. Somebody tidying these into short literals would
+    // disarm the test without changing a single assertion.
+    static constexpr std::size_t detectableSize = 64 * 1024;
+
+    SECTION("a COMPILE result")
+    {
+        std::vector<std::byte> const object(detectableSize, std::byte { 0xAB });
+        auto const decoded = DecodeCompileResult(EncodeCompileResult(CompileResult { .exitCode = 3,
+                                                                                     .object = object,
+                                                                                     .stdoutText = AsBytes("out"),
+                                                                                     .stderrText = AsBytes("err"),
+                                                                                     .correlation = AsBytes("c0") }));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).exitCode == 3);
+        CHECK(std::ranges::equal(Unwrap(decoded).object, object));
+        CHECK(AsStringView(Unwrap(decoded).stdoutText) == "out");
+        CHECK(AsStringView(Unwrap(decoded).stderrText) == "err");
+        CHECK(AsStringView(Unwrap(decoded).correlation) == "c0");
+    }
+
+    SECTION("with the buffer explicitly scoped away")
+    {
+        // The second shape `SchedulerProtocol_test` uses for this same rule, and it
+        // is not a duplicate of the sections above: a temporary dies at a semicolon,
+        // which several things could hide, while this puts a scope boundary between
+        // the decode and every read. Both are kept for the reason that file gives --
+        // a rule this shape cannot be left to a case that happens to exercise it.
+        std::vector<std::byte> const object(detectableSize, std::byte { 0xEF });
+        std::optional<CompileResultFields> decoded;
+        {
+            auto const encoded = EncodeCompileResult(CompileResult { .exitCode = 7,
+                                                                     .object = object,
+                                                                     .stdoutText = AsBytes("gone"),
+                                                                     .stderrText = {},
+                                                                     .correlation = AsBytes("c1") });
+            decoded = DecodeCompileResult(encoded);
+        }
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).exitCode == 7);
+        CHECK(std::ranges::equal(Unwrap(decoded).object, object));
+        CHECK(AsStringView(Unwrap(decoded).stdoutText) == "gone");
+        CHECK(Unwrap(decoded).stderrText.empty());
+        CHECK(AsStringView(Unwrap(decoded).correlation) == "c1");
+    }
+}
+
 TEST_CASE("A LEASE grant and a COMPILE result round-trip")
 {
     SECTION("grant")
