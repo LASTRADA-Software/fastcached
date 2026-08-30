@@ -919,13 +919,15 @@ symptom was that they were slow.
   translation unit per hop discovering it. Two hops is one more than a correct fleet
   needs, and running out is an ordinary local compile — which is what every other lease
   refusal already means.
-- **This is the CLIENT half, and saying so is part of the rule.** A node still
-  registers only with its own `--scheduler` (`main.cpp`'s heartbeat round, through
-  `WorkerRegistrar`, which special-cases `UnknownLease` and nothing else), so a
-  `NotLeader` there is logged and retried against the same address forever. A launcher
-  that follows its redirect perfectly then reaches a leader whose registry every worker
-  has expired out of, and gets `NoWorker` — the same outage one layer down. Do not
-  write "a fleet survives an election" anywhere until both halves redirect.
+- **This is the CLIENT half, and one half alone is not a fix.** A node used to
+  register only with its own `--scheduler` (`main.cpp`'s heartbeat round, through
+  `WorkerRegistrar`, which special-cased `UnknownLease` and nothing else), so a
+  `NotLeader` there was logged and retried against the same address forever. A launcher
+  that follows its redirect perfectly then reached a leader whose registry every worker
+  had expired out of, and got `NoWorker` — the same outage one layer down, which is why
+  fixing one half moves where it is observed rather than whether it happens. Closed by
+  the worker-half section below; "a fleet survives an election" became sayable only
+  when both halves redirected, and not before.
 - **The RELEASE follows the lease, not the configuration.** A lease issued by the leader
   the client was redirected to must be resolved there: sent to the configured endpoint it
   resolves nothing, and the key stays marked in flight on the machine that actually holds
@@ -942,6 +944,58 @@ symptom was that they were slow.
   `CacheProtocol_test` drives the empty case through the REAL `EncodeErrorReply` to fix
   what an empty one becomes on the wire. The premise the parse rests on is asserted
   there rather than asserted about here.
+
+**A WORKER follows that redirect too, or the client's half of it arrives at an empty
+fleet.** `SchedulerService::Gate()` refuses **every** verb off the leader, `Register`
+included — leadership and membership are one gate and it runs for reads as well. So
+while the heartbeat thread dialled the configured `--scheduler` unconditionally and
+merely *logged* the refusal, an election did this: every worker went on announcing
+itself to the demoted node, expired out of the new leader's `WorkerRegistry` inside
+the 90 s heartbeat timeout, and the leader answered every lease `NoWorker`. A
+launcher that now correctly follows the redirect then arrived at a leader that knew
+of no workers and compiled locally — the same #237 outage, one layer down, behind a
+green build and a fleet whose counters all read zero. Fixing one half without the
+other moves where the outage is observed and not whether it happens.
+
+- **One rule, one implementation.** The worker reads its redirect through the same
+  `RedirectTarget` the launcher does, so what counts as one — a host, a colon, a
+  numeric port, and never prose or a bare port — is decided in a single place for
+  both. A second copy on the node would be a second thing to be wrong, and the two
+  would drift in the direction the tests did not cover.
+- **A refusal has to reach the caller as an ENDPOINT, not as a phrase.**
+  `Register` returned `expected<void, std::string>` and `Heartbeat` a bare `bool`,
+  so the redirect was already being thrown away one frame after it arrived, and no
+  amount of loop in the caller could have followed it. `AnnounceRefusal` carries the
+  words and the endpoint separately because they answer different questions: the
+  words are for the operator and are always set, the endpoint is for the node and is
+  set only when there is one.
+- **A leader is committed only once a round has been ACCEPTED there.** An endpoint
+  some scheduler *named* is a lead; an endpoint that took this node's registration is
+  a leader. Remembering on the name alone lets one bad redirect become the endpoint
+  every future round starts at, outlasting the election that caused it — and an
+  endpoint that answered but refused every registrar for its own reasons (not a
+  member, a fingerprint it will not take) is exactly that case.
+- **A remembered leader that stops answering falls back inside the SAME round.** Not
+  a heartbeat interval later: this machine is missing from the fleet for as long as
+  it takes, and the configured `--scheduler` is both the endpoint an operator can
+  actually fix and the one still standing after an election the remembered leader
+  lost. Arriving back at the configured endpoint *forgets* the remembered one rather
+  than storing it as a value equal to the default, or every diagnostic that says
+  which endpoint this node is following becomes a lie.
+- **`NotLeader` must not clear the worker id; `UnknownLease` must.** They are
+  different sentences: one says *this scheduler is the wrong one to ask*, the other
+  *the fleet has forgotten you*. The registry is replicated, so the leader a redirect
+  names may well be holding the very registration that id belongs to — clearing it on
+  a redirect turns every election into a fleet-wide re-registration storm.
+- **The budget is per round, not per process.** A fleet that re-elects once an hour
+  should spend one redirect an hour. A lifetime ceiling would follow redirects for a
+  while and then silently stop, which is the same outage as never following one,
+  arriving later and harder to see.
+- **The policy is a testable object; `main.cpp` gets only the dialling.**
+  `SchedulerLink` is pure — no socket, no clock, no logger — because the alternative
+  home for it is `main.cpp`, which is in no test target. Same reasoning that moved
+  `MakeWorkerLeaseValidator` out of `main`: a decision that lives there is a decision
+  nothing can assert, and this list already records what that costs.
 
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node
