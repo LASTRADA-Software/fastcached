@@ -258,11 +258,16 @@ struct NodeConfig
     /// `CacheResponder` admits only this machine and this cluster's members.
     ///
     /// A port already taken is fatal when the operator **named** it and a warning when
-    /// it is this default -- the same distinction the admin endpoint draws between an
-    /// endpoint asked for and one got anyway. Typed, it is a promise, and a broken
-    /// promise is fatal; defaulted, a node sharing a machine with `fastcached` would
-    /// otherwise refuse to start over a convenience nobody requested, and the launcher
-    /// reaches the daemon on that port instead. Never silently, either way.
+    /// it is this default. Typed, it is a promise, and a broken promise is fatal;
+    /// defaulted, a node sharing a machine with `fastcached` would otherwise refuse to
+    /// start over a convenience nobody requested, and the launcher reaches the daemon
+    /// on that port instead. Never silently, either way.
+    ///
+    /// Which of the two applies is `cacheListenExplicit`, and it has to be: comparing
+    /// this value against the default cannot see the operator who typed the default.
+    /// `--admin-listen` needs no such bit and draws no such distinction -- its default
+    /// is *empty*, so there is no address to arrive at without asking, and every bind
+    /// failure on it is unconditionally fatal.
     std::string cacheListen { "127.0.0.1:6674" };
 
     /// The shared `fastcached` this node reads through to, or empty for none.
@@ -412,6 +417,15 @@ struct NodeConfig
     ///
     /// So what is emitted follows whether they said it, not whether it differs.
     bool cacheMemoryExplicit { false };
+
+    /// Whether `--listen-cache` was typed rather than defaulted.
+    ///
+    /// **Provenance, not value**, like `cacheMemoryExplicit` above -- and here it
+    /// decides whether the node STARTS at all. What the two answers are, and why they
+    /// differ, is on `cacheListen`; this is the bit that picks between them, and it
+    /// has to be a bit, because `--listen-cache=127.0.0.1:6674` is a promise whose
+    /// value equals the default (#286).
+    bool cacheListenExplicit { false };
 
     /// Whether the admin surface also serves the fleet dashboard.
     ///

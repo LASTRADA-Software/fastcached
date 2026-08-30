@@ -758,6 +758,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=[<address>:]<port>",
           .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
+          .explicitBit = &NodeConfig::cacheListenExplicit,
           .description = "serve cache verbs to local clients here (default\n"
                          "127.0.0.1:6674, where fastcache-cc already looks;\n"
                          "empty turns it off). A bare port binds LOOPBACK,\n"
@@ -878,6 +879,27 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
             argv.emplace_back(std::format("--{}={}", flag, value));
     };
 
+    /// Emit `--flag=value` when the operator TYPED it, whatever its value.
+    ///
+    /// A named sibling of `emitIfSet` rather than an `if` per flag, because reaching
+    /// for `emitIfSet` IS the mistake: it compares the value against the default, and
+    /// the two answers part company on the one input that matters -- an operator
+    /// typing the default, which is what somebody does after reading the value off
+    /// the startup line to pin it. That value is then dropped from the registration
+    /// and the service re-derives it at every start.
+    ///
+    /// Which flags need this is not a matter of taste. `--cache-memory`'s default is
+    /// a share of host RAM, so a pinned budget moves under a VM resize; and
+    /// `--listen-cache` decides on provenance whether a bind failure is FATAL, so a
+    /// registration that lost the bit warns past a taken port forever and the node
+    /// comes up healthy serving no cache (#286). `NodeConfig_test` walks
+    /// `NodeOptions()` and requires every row carrying an `explicitBit` to arrive
+    /// here, so a new one cannot go back to `emitIfSet` by omission.
+    auto const emitIfExplicit = [&argv](std::string_view flag, auto const& value, bool wasTyped) {
+        if (wasTyped)
+            argv.emplace_back(std::format("--{}={}", flag, value));
+    };
+
     /// Emit a path flag, made absolute.
     ///
     /// A service does not inherit the installing shell's working directory, so a
@@ -919,14 +941,9 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
     emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
     emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
-    // On whether they SAID it, not on whether it differs. This default is a share of
-    // host RAM, so the value an operator reads off the startup line and types back to
-    // pin it is the one value `emitIfSet` would drop -- leaving the service to
-    // re-derive from RAM at every start, and the budget to move under a VM resize.
-    if (cfg.cacheMemoryExplicit)
-        argv.emplace_back(std::format("--cache-memory={}", cfg.cacheMemoryBytes));
+    emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
-    emitIfSet("listen-cache", cfg.cacheListen, defaults.cacheListen);
+    emitIfExplicit("listen-cache", cfg.cacheListen, cfg.cacheListenExplicit);
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
     emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());

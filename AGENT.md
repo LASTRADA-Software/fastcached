@@ -408,6 +408,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - Whatever reaches a supervisor must survive this project's own parser round trip
   — including the flags the *installer itself* adds, which are the daemon's only
   when the spec names an application.
+- Whether the operator **named** a setting is provenance, recorded by the parse in
+  `OptionSpec::explicitBit` — never recovered by comparing the value to the default,
+  which cannot see the operator who typed the default. Both sides of such a flag ask
+  it: the startup decision AND what the service registration emits, which is
+  `emitIfExplicit`, never `emitIfSet`. A flag whose default is empty needs no bit;
+  there is nothing to arrive at without asking.
 - A config the operator named is strict; one the daemon found is skipped when
   absent, unreadable or untrusted.
 - A machine-wide config is obeyed only when only an administrator could have

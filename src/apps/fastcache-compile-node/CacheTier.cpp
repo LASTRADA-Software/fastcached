@@ -323,12 +323,12 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     if (started.has_value())
         return std::move(*started);
 
-    // Fatal only when the operator NAMED this address -- the same distinction the
-    // admin endpoint draws between an endpoint asked for and one got anyway. It
-    // matters because this port is on by default: a node sharing a machine with
-    // `fastcached` would otherwise refuse to start over a convenience nobody
-    // requested. Typed, it is a promise, and a broken promise is fatal.
-    if (cfg.cacheListen != NodeConfig {}.cacheListen)
+    // Fatal only when the operator NAMED this address -- the rule and its reasons are
+    // on `NodeConfig::cacheListen`. On the PROVENANCE bit, never on the value:
+    // comparing against the default reads `--listen-cache=127.0.0.1:6674` as a
+    // convenience nobody asked for, and the node came up healthy serving no cache
+    // (#286).
+    if (cfg.cacheListenExplicit)
         return std::unexpected { std::format("--listen-cache {}", started.error()) };
 
     // Never silent. The launcher will reach whatever else holds that port -- very

@@ -59,6 +59,10 @@ struct Fixture
     {
         auto probe = BlockingListener::Bind("127.0.0.1", 0);
         REQUIRE(probe);
+        // Asked of the SOCKET, not of the pointer: `Bind` returns a listener in an
+        // errored state rather than nothing, so a null check passes on a bind that
+        // failed and the port below comes back 0.
+        REQUIRE(probe->IsBound());
         auto const port = probe->BoundPort();
         probe.reset();
 
@@ -269,6 +273,59 @@ TEST_CASE("A cache directory that cannot be opened is fatal when it was named", 
     // the operator as "--listen-cache ..." and send them to check a port.
     CHECK(started.error().contains("--cache-dir"));
     CHECK_FALSE(started.error().contains("--listen-cache"));
+}
+
+TEST_CASE("A cache port already taken is fatal exactly when the operator named it", "[node][cache-tier]")
+{
+    // The acceptance of #286, both halves. Which one applies is decided by
+    // PROVENANCE and not by the value: it used to be `cfg.cacheListen !=
+    // NodeConfig{}.cacheListen`, so an operator who read the startup line and typed
+    // the port back to pin it produced a value equal to the default and had their
+    // promise read as a convenience -- the node started, reported healthy, and
+    // served no cache.
+    //
+    // The port is held for the duration rather than probed and released, which is
+    // what makes the bind actually fail; and it is an ephemeral one rather than the
+    // default 6674, because a case may not depend on what else is running on the
+    // machine. Only the bit differs between the two sections.
+    Fixture fixture;
+    auto const held = BlockingListener::Bind("127.0.0.1", 0);
+    // `IsBound`, not the pointer: `Bind` hands back a listener in an ERRORED state
+    // rather than nothing, so a null check proves only that it allocated. An
+    // unbound one reports port 0, `--listen-cache=127.0.0.1:0` is refused by
+    // `ParseTcpPort` before any bind is attempted, and both sections below then
+    // pass on that refusal instead of on a port conflict -- green, and testing
+    // nothing.
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+
+    NodeConfig cfg;
+    cfg.cacheListen = std::format("127.0.0.1:{}", held->BoundPort());
+    cfg.cacheMemoryBytes = 1024 * 1024;
+
+    SECTION("named, so a broken promise stops startup")
+    {
+        cfg.cacheListenExplicit = true;
+
+        auto const started = fixture.Start(cfg);
+        REQUIRE_FALSE(started.has_value());
+        // Naming the flag, because the two failures this function reports leave
+        // through one string and an operator sent to the wrong flag is sent nowhere.
+        CHECK(started.error().contains("--listen-cache"));
+    }
+
+    SECTION("defaulted, so a convenience nobody asked for is warned past")
+    {
+        // A node sharing a machine with `fastcached` must not refuse to start over a
+        // port it was never told to take -- the launcher reaches the daemon there
+        // instead. Never silently, though.
+        cfg.cacheListenExplicit = false;
+
+        auto started = fixture.Start(cfg);
+        REQUIRE(started.has_value());
+        CHECK(*started == nullptr);
+        CHECK(Logged(fixture.logger, "continuing without a local cache tier"));
+    }
 }
 
 TEST_CASE("A tier says whether it has a shared cache behind it", "[node][cache-tier]")

@@ -549,6 +549,19 @@ refuse to start over a convenience nobody requested, while an address an operato
 typed is a promise and a broken promise is fatal. Neither is silent. Give one of
 them a port of its own if you want the node's tier as well.
 
+**"Named by you" means you typed the flag, not that you typed something unusual.**
+`--listen-cache=127.0.0.1:6674` — reading the address off the startup line and
+typing it back to pin it — is a named address, and a port already held is fatal for
+it. Until #286 the node decided this by comparing your value against the default,
+so pinning the default port was indistinguishable from never mentioning it: the node
+started, logged a warning, reported healthy on `/healthz`, and served no cache.
+
+The distinction survives `--install-service`. The registration records
+`--listen-cache` when you typed it, whatever its value, so a service installed with
+a port you named refuses to start when something else holds it — rather than warning
+past it at every boot. A port you never named is left out of the registration, so
+the service picks up a changed default rather than one frozen at install time.
+
 ### Who may use it
 
 **Local clients and cluster members. Nobody else, by default.**
