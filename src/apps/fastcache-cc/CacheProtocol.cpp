@@ -190,7 +190,14 @@ std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
 {
     if (outcome.kind != CacheOutcomeKind::Rejected || outcome.code != Wire::ErrorCode::NotLeader)
         return std::nullopt;
-    if (!SplitHostPort(outcome.message).has_value())
+    // Not `SplitHostPort` alone: it takes the LAST colon and hands back whatever
+    // follows, so "no leader: try again" splits into a host and a port of
+    // " try again". Both halves have to be usable, or this is prose.
+    //
+    // Not `ParseEndpoint` either, close as it looks: a bare port means loopback
+    // there, so a scheduler answering "6675" would send the client back to itself.
+    auto const split = SplitHostPort(outcome.message);
+    if (!split.has_value() || split->first.empty() || !ParseTcpPort(split->second).has_value())
         return std::nullopt;
     return outcome.message;
 }

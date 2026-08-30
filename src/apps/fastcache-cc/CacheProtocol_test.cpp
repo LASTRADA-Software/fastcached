@@ -4,9 +4,11 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -519,4 +521,89 @@ TEST_CASE("An uncredentialed exchange never reports an ignored credential")
     ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Miss, {}) };
     auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
     CHECK_FALSE(outcome.credentialIgnored);
+}
+
+TEST_CASE("An empty NotLeader message reaches the wire as prose, not as nothing")
+{
+    // The premise the whole redirect rests on, pinned against the REAL encoder
+    // rather than against a comment. `SchedulerService` hands `Refuse` an empty
+    // string when no election has concluded (`SchedulerService_test`, "an undecided
+    // node refuses, and names nobody") -- but `EncodeErrorReply` substitutes the
+    // error table's default sentence for an empty message, so what a client
+    // actually receives is "this node does not lead the cluster".
+    //
+    // If this ever stopped being true, testing `message.empty()` would become a
+    // correct way to spot an election and `RedirectTarget`'s parse would be
+    // needless ceremony. It is the reason the parse exists, so it is asserted here
+    // and not merely asserted about.
+    ScriptedTcpClient client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, {}) };
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
+
+    REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
+    REQUIRE(outcome.code == Wire::ErrorCode::NotLeader);
+    CHECK_FALSE(outcome.message.empty());
+    CHECK(RedirectTarget(outcome) == std::nullopt);
+}
+
+TEST_CASE("RedirectTarget returns the endpoint a NotLeader names")
+{
+    // The other half of the same round trip: a follower names the leader, and that
+    // string is what the client must dial. Driven through the encoder for the same
+    // reason as above -- a hand-built `CacheOutcome` would prove only that the
+    // struct can hold an endpoint.
+    ScriptedTcpClient client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.1:7000") };
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
+
+    REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(RedirectTarget(outcome) == std::optional<std::string> { "10.0.0.1:7000" });
+}
+
+TEST_CASE("RedirectTarget parses an endpoint rather than merely splitting one")
+{
+    // `SplitHostPort` takes the LAST colon and hands back whatever follows it, so a
+    // sentence containing a colon splits perfectly happily. `ClusterAdminCli` only
+    // ever PRINTED this message; since #237 a launcher DIALS it, which is the moment
+    // the message stopped being a note for a person and became data a machine acts
+    // on -- and the point at which "it splits" stopped being a sufficient test.
+    //
+    // Every row here splits. None of them is an address.
+    auto const prose = GENERATE(as<std::string_view> {},
+                                "this node does not lead the cluster", // the table's default: no colon at all
+                                "no leader: try again",                // splits; the port is not a number
+                                "leader is at host",                   // no colon
+                                ":7000",                               // splits; no host
+                                "[]:7000",                             // splits; no host, bracketed form
+                                "10.0.0.1:",                           // splits; no port
+                                "10.0.0.1:99999");                     // splits; the port does not fit
+
+    CAPTURE(prose);
+    ScriptedTcpClient client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, prose) };
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
+
+    REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(RedirectTarget(outcome) == std::nullopt);
+}
+
+TEST_CASE("Only NotLeader is an instruction, whatever else a refusal carries")
+{
+    // A refusal that happens to name an address is still an answer about the fleet.
+    // `NoWorker` with a message that parses must not become a redirect, or a client
+    // would follow a diagnostic somewhere no scheduler is listening.
+    ScriptedTcpClient client { Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, "10.0.0.1:7000") };
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
+
+    REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(RedirectTarget(outcome) == std::nullopt);
+}
+
+TEST_CASE("A served object is not a redirect")
+{
+    // The `kind` test, which costs one branch and rules out every non-refusal
+    // outcome: a served object whose bytes happened to read as `host:port` must
+    // never be mistaken for somewhere else to ask.
+    ScriptedTcpClient client { Wire::EncodeReply(Wire::Status::Ok, Wire::AsBytes(std::string_view { "10.0.0.1:7000" })) };
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential {}));
+
+    REQUIRE(outcome.kind == CacheOutcomeKind::Hit);
+    CHECK(RedirectTarget(outcome) == std::nullopt);
 }
