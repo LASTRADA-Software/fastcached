@@ -810,6 +810,16 @@ symptom was that they were slow.
   A launcher DIALS it, so it became a dependency record in that same moment — the
   bullet below says *"the moment something did, it would stop being diagnostics and
   this bullet would be wrong"*, and this is that moment, for a different field.
+- **`NotLeader` is the one code whose message is DATA, and that is not an exception
+  to the table rule.** `wire-and-protocol.md` says a refusal's wire code and its
+  message are one fact and therefore one table row, because a ternary picking the code
+  beside a separate call picking the text made them disagree. `NotLeader` obeys it from
+  the other side: the table supplies its default sentence, and `Gate()` overrides that
+  in the one place it refuses (`Refuse(NotLeader, LeaderEndpoint())`), so the code and
+  the endpoint are still chosen together. The override is *why* the empty case has to be
+  parsed rather than tested for empty -- the table's sentence is what fills the gap when
+  there is no endpoint to name.
+
 - **The chain is bounded.** Two nodes with a stale `_knownLeader`, or a partition
   healing, name each other indefinitely; without a ceiling a build spends one connect per
   translation unit per hop discovering it. Two hops is one more than a correct fleet
