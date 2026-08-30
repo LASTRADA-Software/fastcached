@@ -197,7 +197,7 @@ same on both — the same defect with no MSVC anywhere near it.
   paths, named a file that is gone. That is worse than a miss, because Ninja records the
   dependency, cannot stat it, rebuilds, hits the same value, and never converges — with a
   successful exit code every time. The dependency path set is therefore part of the key
-  (`objkey-v5`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
+  (`objkey-v6`, `KeyInputs::dependencyPaths`), captured on the preprocess run the launcher
   already makes rather than in a second probe: measured at **+1.5% on a 45 ms preprocess**,
   because the compiler has already opened every one of those files. A move is a different
   key by construction, so the *pre-move* entry survives the move rather than being

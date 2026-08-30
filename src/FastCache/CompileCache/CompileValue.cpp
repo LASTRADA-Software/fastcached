@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
+#include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <array>
+#include <optional>
 #include <ranges>
 #include <utility>
 
@@ -198,6 +200,24 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
         return Malformed("trailing bytes after compile-value frame");
 
     return value;
+}
+
+std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte const> value,
+                                                           std::string_view sourceRoot,
+                                                           std::string_view buildTree)
+{
+    auto decoded = DecodeCompileValue(value);
+    if (!decoded.has_value())
+        return std::nullopt;
+
+    PathCanon::Layout const producer { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
+
+    // The object blob is never a region and is never rewritten: it is machine code,
+    // and a byte sequence inside it that happens to look like a path is not one.
+    for (auto& region: decoded->textRegions)
+        region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
+
+    return EncodeCompileValue(*decoded);
 }
 
 } // namespace FastCache

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
-#include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
@@ -162,23 +161,6 @@ namespace
         Abort,    ///< Connection is finished (EOF, framing error, or write failure).
     };
 
-    /// Canonicalize every text region of `value` in place using the producer's
-    /// layout. The object blob is never touched.
-    ///
-    /// Cannot fail, and says so by returning nothing: a path under neither root is
-    /// echoed verbatim rather than refused, which is what lets a toolchain path
-    /// survive the round trip. This used to return `bool` and answer a false with
-    /// wire status `CanonicalizationFailed`, which no server could ever send
-    /// (issues #59, #69).
-    ///
-    /// @param value    The decoded compile-value to rewrite.
-    /// @param producer The producing machine's roots.
-    void CanonicalizeRegions(CompileValue& value, PathCanon::Layout const& producer)
-    {
-        for (auto& region: value.textRegions)
-            region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
-    }
-
     /// Handle one STORE command: canonicalize with the producer's layout, store
     /// the canonical value, and record prefetch group membership.
     ///
@@ -201,18 +183,21 @@ namespace
         if (!fields.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
 
-        auto decoded = DecodeCompileValue(fields->value);
-        if (!decoded.has_value())
+        // `CompileCache/CompileValue`'s recipe, not a copy here. Decoding, building
+        // the layout from the two root fields, rewriting the regions and re-encoding
+        // were spelled out in this function and nowhere else -- so when a compile node
+        // became a second server for this wire it had none of them (#319). Sharing
+        // only the rewrite would have left the ORDER here to be remembered twice.
+        auto const canonicalBytes =
+            CanonicalStoredValue(fields->value, BytesToString(fields->srcRoot), BytesToString(fields->buildTree));
+        if (!canonicalBytes.has_value())
+            // This server speaks the whole protocol and says so; a node's cache tier
+            // stores an opaque value verbatim instead. One policy each, above the one
+            // they now share.
             co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
-
-        PathCanon::Layout const producer { .sourceRoot = BytesToString(fields->srcRoot),
-                                           .buildTree = BytesToString(fields->buildTree) };
-        CanonicalizeRegions(*decoded, producer);
-
-        auto const canonicalBytes = EncodeCompileValue(*decoded);
         auto const keyStr = BytesToString(fields->key);
         auto const groupStr = BytesToString(fields->prefetchGroup);
-        auto const stored = engine->Set(keyStr, canonicalBytes, /*flags=*/0, /*exptime=*/0);
+        auto const stored = engine->Set(keyStr, *canonicalBytes, /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 

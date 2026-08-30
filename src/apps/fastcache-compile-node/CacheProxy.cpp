@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
 
+#include <FastCache/CompileCache/CompileValue.hpp>
+
 #include <format>
 
 namespace FastCache::Node
@@ -54,12 +56,27 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             if (!fields.has_value())
                 co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
 
-            // The roots the client sent are deliberately ignored. Canonicalization is
-            // the SHARED cache's job -- it is what makes a stored object layout-neutral
-            // for every machine -- and doing it here as well would rewrite a value
-            // twice against two different layouts. What this tier stores is what this
-            // machine will replay, and what it forwards is what the client produced.
-            if (!co_await _cache.Store(Wire::AsStringView(fields->key), fields->value))
+            // Canonicalized against the roots the client sent, through the one
+            // recipe both servers on this wire share.
+            //
+            // This block used to ignore those roots, on the reasoning that
+            // canonicalization is "the SHARED cache's job" and that "what this tier
+            // stores is what this machine will replay". Both were true when a node
+            // was a private tier in front of `fastcached`. #229 made a node the
+            // shared cache, and "this machine" is not one layout -- every checkout on
+            // it is a different one -- so a value stored here kept its producer's
+            // absolute paths and every consumer replayed them into its build system's
+            // dependency graph (#319).
+            //
+            // A value that does not decode is stored VERBATIM rather than refused,
+            // which is where this server's policy differs from the daemon's: an
+            // opaque value is not this tier's business to reject. `CanonicalStoredValue`
+            // answers `nullopt` and each server says what it wants to.
+            auto const canonical = CanonicalStoredValue(
+                fields->value, Wire::AsStringView(fields->srcRoot), Wire::AsStringView(fields->buildTree));
+            auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
+
+            if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Wire::EncodeErrorReply(Wire::ErrorCode::StorageWriteFailed);
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }

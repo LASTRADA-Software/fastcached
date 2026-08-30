@@ -266,7 +266,17 @@ std::string ComputeKey(KeyInputs const& inputs)
     // asymmetry it cites is real but it is an argument about THIS invalidation
     // event, weighed once; the tags-apart hazard is carried by every reader of
     // this file afterwards, and unlike a cold rebuild it does not expire.
-    KeyDigest digest { "objkey-v5" };
+    // v6 retires every value stored before #319. A compile node served this wire
+    // without canonicalizing a stored value's text regions, so those values carry
+    // the producing checkout's absolute paths -- and a consumer replaying them
+    // hands its build system dependencies naming a tree it will never edit, which
+    // no later build can invalidate. The bytes are wrong rather than merely old,
+    // and nothing in a value says which kind it is, so the tag is what makes them
+    // unreachable. Bumped rather than sniffed: a reader that tried to tell a
+    // poisoned region from a sound one would have to call a path with no
+    // `<SRCROOT>` sentinel suspect, and 92 of the 93 paths a trivial translation
+    // unit reports are toolchain headers that correctly have none.
+    KeyDigest digest { "objkey-v6" };
     digest.Field(inputs.compilerId);
     digest.Field(inputs.preprocessed);
     for (auto const& arg: inputs.relativizedArgs)

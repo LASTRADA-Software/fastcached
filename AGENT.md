@@ -235,6 +235,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   preprocessed TU cross the network uncompressed while every object arrived intact and
   every counter read normally. What a test must separate is the two ends **disagreeing**;
   "it round-trips" passes under the bug.
+- A stored value's text regions are canonicalized by **every** server on this wire,
+  through the one `CanonicalStoredValue` beside `CompileValue` — a node serves it
+  too since #229, and the copy it lacked left every value it stored carrying the
+  producing checkout's absolute paths. A replayed region becomes the object's
+  dependency record, so those never invalidate. A path with no `<SRCROOT>` sentinel is
+  ordinary (92 of 93 in a trivial TU are toolchain headers), so retirement is a schema
+  bump, never a sniff.
+- A manifest naming the TU and no header revalidates forever: `IsToolchainHeader` calls
+  every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
+  exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
+  reported and none survived; `ValidateManifest` refuses an empty set rather than
+  letting `all_of` pass vacuously.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - A `FETCH` outcome decides whether the daemon is worth a second command

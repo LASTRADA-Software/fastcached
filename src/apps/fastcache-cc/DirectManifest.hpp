@@ -115,6 +115,9 @@ enum class ManifestFault : std::uint8_t
                    ///< against a `/x/build` root. A root spelled almost right.
     Unreadable,    ///< Could not be read, so it could not be hashed. A manifest entry
                    ///< is only worth recording if its content hash is real.
+    NoProjectDeps, ///< The compile reported dependencies and every one of them was
+                   ///< dropped as toolchain, so the manifest would revalidate the TU
+                   ///< and nothing else -- and would keep doing so forever.
     Last,          ///< Not a fault, and has no row: the table's length.
 };
 
@@ -146,6 +149,7 @@ inline constexpr EnumTable<ManifestFault, FaultRow> FaultTable { {
     { .fault = ManifestFault::ToolchainLike, .label = "matches a toolchain marker" },
     { .fault = ManifestFault::Uncanonical, .label = "no canonical form" },
     { .fault = ManifestFault::Unreadable, .label = "unreadable" },
+    { .fault = ManifestFault::NoProjectDeps, .label = "every reported dependency was dropped as toolchain" },
 } };
 
 static_assert(RowsInEnumeratorOrder(FaultTable, &FaultRow::fault),
@@ -512,19 +516,45 @@ struct ManifestInputs
 ///               object key.
 /// @param layout This build's roots.
 /// @return The manifest, or a ManifestFailure naming the offending path and which
-///         of the four faults it was.
+///         of `FaultTable`'s faults it was.
 [[nodiscard]] std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs,
                                                                            PathCanon::Layout const& layout);
+
+/// Whether a manifest asserts nothing at all about the files it was recorded from.
+///
+/// One owner for a rule two places have to act on: `ValidateManifest` refuses such a
+/// manifest, and the launcher names the refusal in its note. Spelling the predicate
+/// at both sites would let the rule and the sentence explaining it drift apart --
+/// which is the shape of the defect this guard exists for.
+///
+/// `all_of` over no entries is true, so an empty manifest does not pass a check, it
+/// skips one, and the object it points at is then served however the sources move.
+/// `BuildManifest` cannot produce one -- the TU is always entry one and its presence
+/// is that function's own precondition (issue #49 / issue #51) -- so an empty entry
+/// set is a decode artefact or an older format, and a matching toolchain stamp says
+/// nothing about the sources.
+///
+/// Deliberately `empty()` and not "fewer than two": a manifest holding only the TU is
+/// what a translation unit including nothing legitimately records, and after
+/// `BuildManifest`'s `NoProjectDeps` refusal it is the only way one gets written.
+/// @param manifest The manifest to judge.
+/// @return True when it has no entries.
+[[nodiscard]] bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept;
 
 /// Re-check every entry against the filesystem.
 ///
 /// Localizes each canonical path to this machine and compares a fresh content
 /// hash with the recorded one. Any mismatch, missing file, or stamp change means
 /// the cached object may not correspond to today's headers.
+///
+/// A manifest that `ManifestAssertsNothing` reports on is refused before either
+/// question is asked: `all_of` over no entries is true, so such a manifest does not
+/// pass the filesystem check, it skips it.
 /// @param manifest       The recorded manifest.
 /// @param layout         This machine's roots.
 /// @param toolchainStamp This machine's current toolchain identity.
-/// @return True when every entry still matches and the stamp agrees.
+/// @return True when the manifest asserts something, every entry still matches and
+///         the stamp agrees.
 [[nodiscard]] bool ValidateManifest(DirectManifest const& manifest,
                                     PathCanon::Layout const& layout,
                                     std::string_view toolchainStamp);

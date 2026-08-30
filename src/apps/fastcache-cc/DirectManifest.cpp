@@ -712,6 +712,11 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     if (auto const stored = record(*sourceToken, resolvedSource); !stored.has_value())
         return std::unexpected(stored.error());
 
+    // How many reported dependencies survived classification. Counted because
+    // dropping ALL of them is not a thin manifest, it is a broken one -- see the
+    // refusal below.
+    std::size_t recorded = 0;
+
     for (auto const& rawPath: inputs.includePaths)
     {
         auto const resolved = ResolveAgainst(rawPath, inputs.workingDirectory, layout);
@@ -734,10 +739,34 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
                     return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = resolved });
                 if (auto const stored = record(*std::move(token), resolved); !stored.has_value())
                     return std::unexpected(stored.error());
+                ++recorded;
                 break;
             }
         }
     }
+
+    // A compile that reported dependencies and kept none of them is refused, and
+    // this is the guard that turns #319 from a wrong object into a miss.
+    //
+    // `IsToolchainHeader` reports every path outside both roots as toolchain, so a
+    // path belonging to ANOTHER checkout classifies exactly as an SDK header does
+    // and is dropped by the `continue` above. That is how the hollow manifest is
+    // built: a hit replaying a value whose regions were never canonicalized names
+    // the producing tree's headers, `RecordManifest` feeds those paths here, all of
+    // them drop, and what is recorded is the TU and nothing else. `ValidateManifest`
+    // then re-hashes the TU, finds it unchanged, and serves the object however the
+    // headers change -- in this checkout and, because the manifest key is portable,
+    // in any other that computes it.
+    //
+    // The refusal costs a legitimate case: a TU whose only includes are genuinely
+    // toolchain headers now loses direct mode, and its manifest was sound. That is
+    // the same trade `Unanchored` above already makes and for the same reason --
+    // the ordinary preprocessed key still serves the compile, so the cost is a
+    // preprocess and the alternative is a wrong object. `recorded`, not
+    // `entries.size()`: the TU is always entry one (issue #49 / #51), so a size
+    // test would be asking a question about the source rather than the headers.
+    if (!inputs.includePaths.empty() && recorded == 0)
+        return std::unexpected(ManifestFailure { .fault = ManifestFault::NoProjectDeps, .path = inputs.sourcePath });
 
     // Deduplicate then sort: `/showIncludes` repeats a header once per inclusion
     // site, a GNU depfile names the TU among its own dependencies, and two machines
@@ -750,11 +779,21 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     return manifest;
 }
 
+bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept
+{
+    return manifest.entries.empty();
+}
+
 bool ValidateManifest(DirectManifest const& manifest, PathCanon::Layout const& layout, std::string_view toolchainStamp)
 {
     // A different toolchain invalidates the whole manifest: its headers are not
     // listed individually, so nothing else here would notice they changed.
     if (manifest.toolchainStamp != toolchainStamp)
+        return false;
+
+    // Refused rather than accepted on the stamp alone; the reasoning is on
+    // `ManifestAssertsNothing`, which the launcher's note asks the same question of.
+    if (ManifestAssertsNothing(manifest))
         return false;
 
     // HashFileContents returns empty for a deleted or unreadable header, which
@@ -829,7 +868,13 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // is what closes it, and it retires exactly the pre-#104 population: a launcher
     // carrying the refusal never records such a manifest at all, so nothing writes
     // a v5 entry with the defect in it.
-    KeyDigest digest { "manifest-v5" };
+    // v6 is the lock-step half of `objkey-v6` (#319): a manifest points at an
+    // object key BY VALUE, so leaving this tag behind would keep resolving to
+    // pre-bump objects the object tag has just retired. It also retires the hollow
+    // manifests that defect produced -- ones recorded from an uncanonicalized hit,
+    // naming the translation unit and not one header, which revalidate on the TU
+    // alone and serve their object however the headers move.
+    KeyDigest digest { "manifest-v6" };
     digest.Field(toolchainStamp);
     digest.Field(canonicalSource);
     for (auto const& arg: relativizedArgs)

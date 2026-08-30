@@ -88,11 +88,20 @@ Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::b
 
     auto const bound = ArmExchangeDeadline(_reactor, _ioTimeout, client.get());
 
-    // The roots travel empty. A node is forwarding an object another machine already
-    // canonicalized -- the launcher rewrote its own layout out of the value before it
-    // ever reached this node -- so naming THIS node's roots would ask the daemon to
-    // canonicalize a second time against paths that were never in the value. Storing
-    // it verbatim is what keeps a relayed object identical to a directly stored one.
+    // The roots travel empty, and what makes that correct is NOT what this comment
+    // used to say. It claimed "the launcher rewrote its own layout out of the value
+    // before it ever reached this node", which is false: a launcher sends its roots
+    // and lets the server canonicalize. While that premise stood, a node forwarded a
+    // value carrying the producer's absolute paths under empty roots -- so the
+    // daemon's own canonicalization matched nothing and the poison reached the shared
+    // cache intact (#319).
+    //
+    // It is correct now because `CacheProxy` canonicalizes at the STORE that reaches
+    // this node, so what is forwarded is already tokens, and empty roots ask the
+    // daemon to rewrite nothing rather than to rewrite against the wrong layout. That
+    // is the invariant this seam depends on and it is one call away, so state it
+    // here: anything else that reaches `LocalCache::Store` must have gone through
+    // `CanonicalStoredValue` first, or this forward relays the same defect again.
     //
     // The request is a LOCAL rather than a temporary in the call expression:
     // `CacheStore` takes it by reference and its frame outlives the expression, so
