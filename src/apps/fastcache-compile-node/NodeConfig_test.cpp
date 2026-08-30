@@ -2141,6 +2141,54 @@ TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[n
     }
 }
 
+TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", "[node][policy][lease][service]")
+{
+    // The one genuinely new interaction between #282 and #286, and it is new in one
+    // direction only: `emitIfExplicit` makes a TYPED DEFAULT reach the supervisor
+    // where it used to be dropped, so a registration now carries flags a startup rule
+    // never had to see before. A rule that refused one of them would turn a working
+    // install into a service that registers cleanly and refuses at every boot.
+    //
+    // Asserted rather than reasoned about. The lease rule reads `clusterKeyFile`,
+    // `bindAddress` and the membership fields and none of the cache ones, so by
+    // inspection it cannot refuse these -- but "by inspection" is what this file
+    // exists to replace, and the next rule added to either table gets this case for
+    // free.
+    auto cfg = Installable();
+    cfg.fleetMembers = { "10.0.0.1:6676" };
+    cfg.clusterKeyFile = "cluster.key"; // the lease rule's own requirement (#282)
+
+    // Both provenance-bearing flags typed at exactly their defaults, which is the
+    // whole point of `explicitBit`: the value says nothing, the fact that it was
+    // typed says everything.
+    NodeConfig const defaults;
+    cfg.cacheListen = defaults.cacheListen;
+    cfg.cacheListenExplicit = true;
+    cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
+    cfg.cacheMemoryExplicit = true;
+
+    // It installs.
+    CHECK_FALSE(NodeInstallRejection(cfg).has_value());
+
+    // And the registration really does carry them -- otherwise this case would pass
+    // for the wrong reason, having asserted a rule permits flags that were never
+    // emitted.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--listen-cache="); }));
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--cache-memory="); }));
+
+    // The half that actually bites: what a supervisor replays has to pass the
+    // startup rules at every boot, not merely at install time.
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK_FALSE(StartupPolicyRejection((*reparsed)).has_value());
+
+    // And provenance survives the round trip, or the second boot silently drops what
+    // the first one was told.
+    CHECK((*reparsed).cacheListenExplicit);
+    CHECK((*reparsed).cacheMemoryExplicit);
+}
+
 TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check their grants", "[node][policy][lease]")
 {
     // The scheduler signs a grant; a worker with no key cannot check the signature,
