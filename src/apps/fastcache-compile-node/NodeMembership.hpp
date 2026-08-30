@@ -3,9 +3,12 @@
 
 #include "NodeConfig.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 
+#include <algorithm>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache::Node
@@ -39,6 +42,51 @@ namespace FastCache::Node
 /// letting either publisher speak for the other. Each is still replaced wholesale by
 /// whoever owns it, which is right: a publisher holds the whole truth about *its*
 /// question.
+/// Whether this configuration admits a machine that is not this one.
+///
+/// The same three routes `NodeMembership`'s constructor composes, asked of the
+/// configuration instead of a caller, and it lives HERE for that reason: when the
+/// fourth route lands -- the rulebook says it will, and that it will be a credential
+/// rather than a host list -- it is added a few lines below, and a reader adding it
+/// has this function in front of them. Left in `NodeConfig.cpp` it was a second
+/// reader of the same policy with nothing pointing at it, and a new route would
+/// silently stop the startup rule firing: an open compile port, every refusal counter
+/// at zero, and a fleet green from both ends.
+///
+/// It cannot be answered by asking the oracle, which is why it is a separate function
+/// rather than a method. `Oracle()` answers "is this caller admitted" in the present
+/// tense; this asks whether the admitted set will EVER contain another machine, and
+/// `_cluster` is empty at construction by design. The `raftJoin` / `raftPeers` half
+/// predicts what consensus will later `Publish()` into this object, which no runtime
+/// query can see.
+///
+/// Only the host is looked at, matching what the oracle itself compares: a peer
+/// arrives from an ephemeral source port, so a port was never something a connection
+/// could be matched on.
+/// @param cfg The parsed configuration.
+/// @return Whether the policy admits anything but this machine.
+[[nodiscard]] inline bool AdmitsRemotePeers(NodeConfig const& cfg)
+{
+    auto const remote = [](std::string_view endpoint) {
+        return !IsLoopbackHost(HostOfEndpoint(endpoint));
+    };
+
+    // `--fleet-open` first: it admits every machine there is, and says so as a flag
+    // rather than as an empty list, so nothing here has to infer it.
+    if (cfg.fleetOpen)
+        return true;
+    if (std::ranges::any_of(cfg.fleetMembers, remote))
+        return true;
+
+    // A node waiting to be admitted has an EMPTY member set by construction and is
+    // about to be handed one -- so the absence of peers here is the strongest signal
+    // that remote ones are coming, not the weakest.
+    if (cfg.raftJoin)
+        return true;
+    return std::ranges::any_of(cfg.raftPeers,
+                               [&](Cluster::ClusterMember const& member) { return remote(member.raftEndpoint); });
+}
+
 class NodeMembership
 {
   public:

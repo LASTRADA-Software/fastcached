@@ -31,12 +31,20 @@ namespace FastCache::Cc
 /// signature" and "accept anything", and which one a node builds is a startup
 /// decision it announces rather than a per-request fallback.
 ///
-/// **Returns a REASON, not a `bool`.** Three refusals are distinguishable on the
+/// **Returns a REFUSAL, not a `bool`.** Three refusals are distinguishable on the
 /// wire and counted apart (`LeaseUnauthorized`, `LeaseEndpointMismatch`,
 /// `LeaseExpired`), so a boolean would collapse exactly the distinction an operator
 /// needs: somebody probing the port, a worker whose advertised endpoint is not the
 /// one clients dial, and a machine whose clock has drifted are three different
 /// things to go and do.
+///
+/// The whole `LeaseRefusal` rather than its `reason` alone, because the other member
+/// is a diagnostic built FOR this caller: `VerifyLeaseToken` formats "this lease was
+/// issued for X; this worker answers on Y" and "this lease expired N seconds ago",
+/// and returning the enum on its own allocated those strings and dropped them. They
+/// are safe to send precisely because `detail` is only ever populated after the MAC
+/// verified -- everything it names is already in the token the caller is holding, in
+/// the clear -- so a refusal an operator can act on costs nothing extra.
 ///
 /// **It does not take the endpoint.** The endpoint a grant is checked against is
 /// the WORKER's own advertised address, which is fixed for the life of the process
@@ -50,7 +58,7 @@ namespace FastCache::Cc
 /// @param fingerprint The toolchain the client says it compiled against.
 /// @return Nothing when the job may run, or why it may not.
 using LeaseValidator =
-    std::function<std::optional<Distributed::LeaseRefusalReason>(std::string_view leaseToken, std::string_view fingerprint)>;
+    std::function<std::optional<Distributed::LeaseRefusal>(std::string_view leaseToken, std::string_view fingerprint)>;
 
 /// The validator a worker holding the cluster's key builds.
 ///
@@ -114,7 +122,12 @@ class WorkerProtocol
 {
   public:
     /// @param jobs Runs the compiles; must outlive this.
-    /// @param validator Decides whether a lease token authorizes a job.
+    /// @param validator Decides whether a lease token authorizes a job. **Required**,
+    ///        and never left empty: an empty `std::function` would be a third lease
+    ///        policy -- "refuse nothing" -- reachable by omission, unnamed, untested
+    ///        and absent from the startup log. That is the exact shape of the defect
+    ///        this seam was built to close, so a node with no key passes
+    ///        `UncheckedLeaseValidator()` and says so out loud instead.
     /// @param acceptedCodecs What this worker can produce and decode, most-preferred
     ///        first — normally `AvailableCodecs()`. It is one list because it is one
     ///        negotiation: the same value is registered with the scheduler, relayed to

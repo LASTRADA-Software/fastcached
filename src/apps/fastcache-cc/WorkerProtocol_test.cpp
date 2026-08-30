@@ -102,19 +102,21 @@ struct Fixture
 /// The endpoint the worker under test advertises, and the one grants must name.
 inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
 
-/// A wall clock every lease case reads, fixed so an expiry is arithmetic.
+/// What a lease case compiles. Its content is irrelevant to every one of them; it is
+/// named only so the calls that vary the lease do not each restate it.
+inline constexpr std::string_view DefaultSource = "int main(){return 0;}";
+
+/// The wall clock every lease case reads, at `2024-01-01T00:00:00Z`.
 ///
 /// `ManualWallClock`, never the system one: an expiry compared against real time is
 /// a test whose meaning changes while it runs, and the skew slack is five minutes --
 /// long enough that a case using `now()` would pass for the wrong reason.
-/// @return The clock; one per process, borrowed by the validators built from it.
-[[nodiscard]] ManualWallClock& LeaseClock()
-{
-    // `2024-01-01T00:00:00Z` as a count of seconds, so every expiry in this file is
-    // stated relative to one instant nothing can move.
-    static ManualWallClock clock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
-    return clock;
-}
+///
+/// `const`, and that is the point of it not being an accessor around a mutable
+/// static. Nothing here advances it, and a shared non-const clock invites the next
+/// case to -- at which point every other lease case's expiry arithmetic silently
+/// depends on the order they ran in.
+ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
 
 /// A grant, signed the way a scheduler signs one.
 ///
@@ -135,14 +137,14 @@ inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
                                               .endpoint = std::string { endpoint },
                                               .fingerprint = std::string { fingerprint },
                                               .key = "obj-abc",
-                                              .expiresAt = LeaseClock().Now() + validFor });
+                                              .expiresAt = LeaseClock.Now() + validFor });
 }
 
 /// A worker that holds the cluster key and therefore checks what it is handed.
 /// @return The production validator, built the way `main.cpp` builds it.
 [[nodiscard]] LeaseValidator VerifyingValidator()
 {
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock());
+    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock);
 }
 
 /// A COMPILE frame carrying `source` as its source field, already enveloped.
@@ -155,12 +157,19 @@ inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
 /// @param fingerprint The toolchain to claim.
 /// @param accepted What the client says it can decode; what the reply is negotiated
 ///        against.
+/// @param leaseToken The grant to present. Defaulted, because most cases here are
+///        about codecs, framing and fingerprints and run against a validator that
+///        refuses nothing; the lease cases pass a real one. A parameter rather than a
+///        second frame builder -- this doc comment already claims that everything
+///        around the source field "is boilerplate no case varies, so it lives here
+///        once", and a copy would have made that false.
 /// @return The framed request.
 [[nodiscard]] std::vector<std::byte> FrameWithSource(std::span<std::byte const> source,
                                                      std::string_view fingerprint = "gcc-13",
-                                                     Wire::CodecList accepted = { Wire::IdentityCodec })
+                                                     Wire::CodecList accepted = { Wire::IdentityCodec },
+                                                     std::string_view leaseToken = "l1")
 {
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = leaseToken,
                                                       .fingerprint = fingerprint,
                                                       .args = {},
                                                       .source = source,
@@ -173,14 +182,16 @@ inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
 /// @param source The preprocessed translation unit, sent verbatim.
 /// @param accepted What the client says it can decode; what the reply is negotiated
 ///        against.
+/// @param leaseToken The grant to present; see `FrameWithSource`.
 /// @return The framed request.
 [[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13",
                                                   std::string_view source = "int main(){return 0;}",
-                                                  Wire::CodecList accepted = { Wire::IdentityCodec })
+                                                  Wire::CodecList accepted = { Wire::IdentityCodec },
+                                                  std::string_view leaseToken = "l1")
 {
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(source.size()), Wire::AsBytes(source));
-    return FrameWithSource(enveloped, fingerprint, std::move(accepted));
+    return FrameWithSource(enveloped, fingerprint, std::move(accepted), leaseToken);
 }
 
 /// Decode a reply frame into its status and payload.
@@ -486,29 +497,6 @@ TEST_CASE("A foreign magic is the one case that closes rather than replies", "[w
     Fixture fix;
     std::vector<std::byte> const junk { std::byte { 'G' }, std::byte { 'E' }, std::byte { 'T' } };
     CHECK_FALSE(fix.worker.Answer(junk).has_value());
-}
-
-TEST_CASE("An unauthorized lease is refused before the payload is even decoded", "[worker-protocol]")
-{
-    // Checked before decompression, let alone compilation: an unauthorized peer
-    // must not be able to make this worker do the expensive part.
-    //
-    // The refusal comes from the PRODUCTION validator refusing a string no scheduler
-    // signed. It used to come from a `[](auto, auto) { return false; }` handed in by
-    // this case, which proved the seam CAN refuse and nothing about whether anything
-    // ever asks it to -- and for as long as that was the only lease test, nothing
-    // did: `main.cpp` passed an accept-all lambda and every compile port in the fleet
-    // was open to whoever could reach it (#282).
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
-
-    auto const answer = fix.worker.Answer(CompileFrame());
-    REQUIRE(answer.has_value());
-
-    // `LeaseUnauthorized`, not `UnknownLease`. The latter is the SCHEDULER's code --
-    // "a lease I issued and have since forgotten" -- and a worker answering with it
-    // sent an operator to the scheduler to look for a fault that is local.
-    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseUnauthorized);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized) == 1);
 }
 
 TEST_CASE("A fingerprint this worker does not serve is refused as a mismatch", "[worker-protocol]")
@@ -934,28 +922,16 @@ TEST_CASE("AvailableCodecsCoverEveryCodec", "[worker-protocol][codec]")
     }
 }
 
-namespace
-{
-/// A COMPILE frame presenting `token`, otherwise well-formed.
-/// @param token The lease the client presents.
-/// @param fingerprint The toolchain the client claims to have compiled against.
-/// @return The framed request.
-[[nodiscard]] std::vector<std::byte> FrameWithLease(std::string_view token, std::string_view fingerprint = "gcc-13")
-{
-    auto const source = std::string_view { "int main(){return 0;}" };
-    auto const enveloped =
-        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(source.size()), Wire::AsBytes(source));
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = token,
-                                                      .fingerprint = fingerprint,
-                                                      .args = {},
-                                                      .source = enveloped,
-                                                      .acceptedCodecs = { Wire::IdentityCodec },
-                                                      .sourceName = "a.cpp" });
-}
-} // namespace
-
 TEST_CASE("A lease nobody signed buys no compile", "[worker-protocol][lease]")
 {
+    // This absorbed a second case, "an unauthorized lease is refused before the
+    // payload is even decoded", which after the rework built the same fixture, sent
+    // the same junk token and made a subset of these assertions. Two cases pinning
+    // one scenario are two places to edit when a code or a counter moves, and no way
+    // for a reader to tell what distinguishes them.
+    //
+    // What that case's name was worth keeping is the LAST assertion here: the refusal
+    // lands before any compiler runs.
     // #281 made the scheduler SIGN its grants and nothing checked the signature, so
     // a compile port's boundary was reachability plus membership -- and "admitted to
     // the fleet" is not "granted this compile". Any admitted machine could spend any
@@ -965,7 +941,8 @@ TEST_CASE("A lease nobody signed buys no compile", "[worker-protocol][lease]")
     // is the same frame; only the expected answer moved.
     Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
 
-    auto const answer = fix.worker.Answer(FrameWithLease("not-a-lease-at-all"));
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, "not-a-lease-at-all"));
     REQUIRE(answer.has_value());
     auto const reply = Decode(Unwrap(answer));
 
@@ -994,7 +971,8 @@ TEST_CASE("A lease signed for ANOTHER worker is refused here", "[worker-protocol
     // worker trusting the same key.
     Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
 
-    auto const answer = fix.worker.Answer(FrameWithLease(GrantFor("some-other-worker:6675")));
+    auto const answer = fix.worker.Answer(
+        CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor("some-other-worker:6675")));
     REQUIRE(answer.has_value());
     auto const reply = Decode(Unwrap(answer));
 
@@ -1020,7 +998,7 @@ TEST_CASE("A lease that has expired past the skew slack is refused", "[worker-pr
 
     auto const stale =
         GrantFor(ThisWorker, "gcc-13", -(FastCache::Distributed::LeaseTokenClockSkewSlack + std::chrono::seconds { 1 }));
-    auto const answer = fix.worker.Answer(FrameWithLease(stale));
+    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, stale));
     REQUIRE(answer.has_value());
 
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseExpired);
@@ -1036,7 +1014,7 @@ TEST_CASE("A lease that lapsed within the skew slack still compiles", "[worker-p
     Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
 
     auto const barely = GrantFor(ThisWorker, "gcc-13", -std::chrono::seconds { 1 });
-    auto const answer = fix.worker.Answer(FrameWithLease(barely));
+    auto const answer = fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, barely));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
@@ -1051,7 +1029,8 @@ TEST_CASE("A grant for one toolchain does not pay for another's compile", "[work
     // is the LEASE that disagrees.
     Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
 
-    auto const answer = fix.worker.Answer(FrameWithLease(GrantFor(ThisWorker, "clang-18"), "gcc-13"));
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker, "clang-18")));
     REQUIRE(answer.has_value());
 
     // `FingerprintMismatch` rather than a code of its own: a client already answers
@@ -1069,7 +1048,8 @@ TEST_CASE("An authentic grant naming this worker compiles", "[worker-protocol][l
     // refusal assertion in this file and break the entire fleet.
     Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
 
-    auto const answer = fix.worker.Answer(FrameWithLease(GrantFor(ThisWorker)));
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
@@ -1091,7 +1071,8 @@ TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole po
     // elsewhere, which is what makes this safe rather than a hole with a comment.
     Fixture fix { { Wire::IdentityCodec }, UncheckedLeaseValidator() };
 
-    auto const answer = fix.worker.Answer(FrameWithLease("not-a-lease-at-all"));
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, "not-a-lease-at-all"));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);

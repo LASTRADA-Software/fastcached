@@ -20,6 +20,7 @@
 #include "NodeToolchains.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
+#include "WorkerLease.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -553,17 +554,17 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // machine -- `StartupPolicyRejection` refuses every other shape -- so by the time
     // this runs the decision has been made once and announced, rather than being
     // taken per request where nothing would ever say it had been.
-    // Wall-clock rather than steady, and its own rather than the scheduler's: an
-    // expiry is stamped on ANOTHER machine, so only a system-clock instant is
-    // comparable at all -- and the scheduler's is declared further down, for a tier
-    // this node may not even run. Declared here so it outlives the validator that
-    // borrows it.
-    SystemWallClock const workerWallClock;
-
     // The whole trust decision is one call, made and announced where a test can
     // reach it. `main` is the one translation unit that cannot be unit-tested, so it
     // holds none of the policy -- see `MakeWorkerLeaseValidator`.
-    auto validator = Node::MakeWorkerLeaseValidator(cfg, advertise, workerWallClock, logger);
+    //
+    // A **wall** clock, because the expiry it checks was stamped on another machine
+    // and a steady instant means nothing off the host that read it. The process
+    // singleton rather than a local: the validator borrows it for the rest of this
+    // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
+    // wants -- a local here was one more object whose outliving had to be reasoned
+    // about, for no gain.
+    auto validator = Node::MakeWorkerLeaseValidator(cfg, advertise, DefaultSystemWallClock(), logger);
     if (!validator.has_value())
     {
         logger.Logf(LogLevel::Error, "{}", validator.error());

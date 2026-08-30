@@ -641,6 +641,15 @@ Consequences that are each load-bearing:
   never `UnknownLease` — that is the SCHEDULER's code, meaning "a lease I issued and
   have since forgotten", and a worker answering with it sent an operator to the
   scheduler to look for a fault that is local.
+- **A fixture that carries the key and never dispatches proves only that a keyed node
+  STARTS.** `cluster-e2e` and `fleet-dashboard-e2e` were given `--cluster-key-file`
+  because they leave `--bind` at the wildcard, and neither compiles anything — so for
+  a while the only end-to-end evidence for the lease check was construction. Meanwhile
+  the fixtures that *do* dispatch bind loopback, slipped under the startup rule, and
+  ran `UncheckedLeaseValidator` for every one of their hundreds of compiles. Both
+  halves have to meet in one fixture, which is why `dist-compile-e2e` carries the key
+  on every node: an in-process test mints and verifies inside one process and cannot
+  show that the endpoint a worker ADVERTISED is the endpoint the scheduler signed.
 - **The trust decision does not live in `main()`.** It lived there, as
   `[](...){ return true; }`, through a fully passing suite — the shape this file
   already names as *a reclaimer nothing constructs is the bug it was written to

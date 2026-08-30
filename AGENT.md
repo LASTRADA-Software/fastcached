@@ -213,8 +213,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.
-- No key means unsigned grants and one bounded warning, never a silent fallback and
-  never a startup refusal that would break every single-machine install.
+- No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
+  never a silent fallback. Its startup refusal is still open (#303) and must take the
+  worker's shape above, or it breaks every single-machine install.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.

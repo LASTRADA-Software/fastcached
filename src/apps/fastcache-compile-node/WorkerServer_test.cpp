@@ -2,6 +2,7 @@
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
+#include "WorkerLease.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
@@ -1033,7 +1034,7 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
         // operator reading a local log can usefully tell "somebody sent us junk" from
         // "somebody signed with the wrong key", which is what a botched key rollout
         // looks like.
-        CHECK((*validator)("not-a-lease-at-all", "gcc-13") == std::optional { Distributed::LeaseRefusalReason::Malformed });
+        CHECK(Unwrap((*validator)("not-a-lease-at-all", "gcc-13")).reason == Distributed::LeaseRefusalReason::Malformed);
 
         // And the botched rollout: a structurally perfect grant, MACed with a key
         // this node does not hold.
@@ -1045,14 +1046,23 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
                                                                    .fingerprint = "gcc-13",
                                                                    .key = "obj-abc",
                                                                    .expiresAt = clock.Now() + std::chrono::minutes { 10 } });
-        CHECK((*validator)(forged, "gcc-13") == std::optional { Distributed::LeaseRefusalReason::Unauthorized });
+        CHECK(Unwrap((*validator)(forged, "gcc-13")).reason == Distributed::LeaseRefusalReason::Unauthorized);
 
         // An authentic grant for a different machine. That field is nowhere in the
         // request, so a validator built without this worker's advertised endpoint
         // could not refuse this at all -- which is why the endpoint is captured at
         // construction rather than passed per call.
-        CHECK((*validator)(grantFor("some-other-worker:6675"), "gcc-13")
-              == std::optional { Distributed::LeaseRefusalReason::EndpointMismatch });
+        auto const mismatch = (*validator)(grantFor("some-other-worker:6675"), "gcc-13");
+        REQUIRE(mismatch.has_value());
+        CHECK(Unwrap(mismatch).reason == Distributed::LeaseRefusalReason::EndpointMismatch);
+
+        // And it carries the diagnostic naming BOTH addresses, which is the whole
+        // reason the validator hands back a `LeaseRefusal` rather than its `reason`
+        // alone. The overwhelmingly common cause of this refusal is a worker
+        // advertising a name clients do not resolve -- a NAT or a hostname, not an
+        // attack -- and "endpoint mismatch" on its own tells an operator none of it.
+        CHECK(Unwrap(mismatch).detail.contains("some-other-worker:6675"));
+        CHECK(Unwrap(mismatch).detail.contains(Advertise));
 
         // And the grant this worker was actually issued.
         CHECK_FALSE((*validator)(grantFor(Advertise), "gcc-13").has_value());

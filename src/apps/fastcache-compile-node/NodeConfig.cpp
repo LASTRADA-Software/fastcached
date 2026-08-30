@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
+#include "NodeMembership.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -1083,58 +1084,16 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 
 /// Whether a machine that is not this one could dial this node's COMPILE port.
 ///
-/// The socket half of "can somebody else reach this". `--bind` defaults to the
-/// wildcard, so the answer is normally yes -- but a node bound to loopback is
-/// unreachable from the network whatever its membership policy says, and refusing
-/// one would break every single-machine harness in this repository to prevent
-/// nothing.
-///
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
-/// `getaddrinfo` as nullptr under AI_PASSIVE, which is the same third case
-/// `AdvertisesWildcard` exists for. So it is reachable, and `IsLoopbackHost("")`
-/// answering false is the behaviour this relies on rather than an accident.
+/// `getaddrinfo` as nullptr under AI_PASSIVE, the same third case `AdvertisesWildcard`
+/// exists for. So it is reachable, and `IsLoopbackHost("")` answering false is the
+/// behaviour this relies on rather than an accident. Why it is asked at all is on the
+/// rule that asks it.
 /// @param cfg The parsed configuration.
 /// @return Whether the compile port answers anywhere but this machine.
 [[nodiscard]] bool CompilePortFacesTheNetwork(NodeConfig const& cfg)
 {
     return !IsLoopbackHost(cfg.bindAddress);
-}
-
-/// Whether a machine that is not this one can be admitted to this node's surfaces.
-///
-/// The policy half. What `NodeMembership` will admit, folded down to "is any of it
-/// somewhere else": everything this node serves -- the compile port included --
-/// consults that one oracle, so this is the same set, read at startup.
-///
-/// Consensus counts because a clustered node's admitted set GROWS at runtime: the
-/// agreed member list is published into the same oracle, so a node that joins a
-/// cluster is a node whose compile port will admit machines nobody typed here. A
-/// bootstrap peer elsewhere and `--raft-join` are the two shapes that has, and both
-/// are visible in the parsed configuration.
-///
-/// Only the host is looked at, matching what the oracle itself compares: a peer
-/// arrives from an ephemeral source port, so a port was never something a connection
-/// could be matched on.
-/// @param cfg The parsed configuration.
-/// @return Whether the policy admits anything but this machine.
-[[nodiscard]] bool AdmitsRemotePeers(NodeConfig const& cfg)
-{
-    auto const remote = [](std::string_view endpoint) {
-        return !IsLoopbackHost(HostOfEndpoint(endpoint));
-    };
-
-    if (cfg.fleetOpen)
-        return true;
-    if (std::ranges::any_of(cfg.fleetMembers, remote))
-        return true;
-
-    // A node waiting to be admitted has an EMPTY member set by construction and is
-    // about to be handed one -- so the absence of peers here is the strongest signal
-    // that remote ones are coming, not the weakest.
-    if (cfg.raftJoin)
-        return true;
-    return std::ranges::any_of(cfg.raftPeers,
-                               [&](Cluster::ClusterMember const& member) { return remote(member.raftEndpoint); });
 }
 
 std::string AdmissionSummary(NodeConfig const& cfg)
