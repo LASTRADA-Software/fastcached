@@ -934,7 +934,15 @@ endif()
 # client, and asserts a RESP PING is answered +PONG over the encrypted channel
 # — end-to-end coverage of the TlsSocket handshake/pump. A missing runtime
 # prerequisite exits 77 (reported as skipped).
-if(FASTCACHED_ENABLE_TLS)
+#
+# The daemon target is part of the guard, not only the TLS option: a
+# `$<TARGET_FILE:>` naming a target that does not exist is a hard generate
+# error, so `-DFASTCACHED_BUILD_DAEMON=OFF` failed the configure outright
+# instead of skipping this. Every other daemon-starting block here already
+# tests `TARGET fastcached`; these two were the omissions.
+if(NOT TARGET fastcached)
+    message(STATUS "tls-smoke: daemon not built — skipping")
+elseif(FASTCACHED_ENABLE_TLS)
     if(WIN32)
         add_test(
             NAME "tls-smoke"
@@ -962,7 +970,9 @@ if(FASTCACHED_ENABLE_TLS)
     )
 endif()
 
-if(SCCACHE)
+if(NOT TARGET fastcached)
+    message(STATUS "sccache smoke tests: daemon not built — skipping")
+elseif(SCCACHE)
     set(FASTCACHED_SMOKE_PORT "11611" CACHE STRING "TCP port the sccache smoke tests bind fastcached to")
 
     if(WIN32)
