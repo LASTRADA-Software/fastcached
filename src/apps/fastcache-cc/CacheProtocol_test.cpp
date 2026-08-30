@@ -270,6 +270,33 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
     }
 }
 
+TEST_CASE("Only a daemon that answered is one worth sending a second command to")
+{
+    // What this predicate answers, and the far more important thing it does not,
+    // are in its own doc comment. Here it is only pinned: a daemon that answered
+    // -- with the value or without it -- is serving, and one that refused the
+    // command or was never reached is not.
+    SECTION("an answer about the key, with or without a value")
+    {
+        CHECK(CacheIsServing(CacheOutcomeKind::Hit));
+        CHECK(CacheIsServing(CacheOutcomeKind::Miss));
+    }
+
+    SECTION("no answer about the key at all")
+    {
+        CHECK_FALSE(CacheIsServing(CacheOutcomeKind::Rejected));
+        CHECK_FALSE(CacheIsServing(CacheOutcomeKind::Transport));
+    }
+
+    SECTION("the default-constructed outcome is not serving")
+    {
+        // `CacheOutcome` defaults to `Transport` precisely so a code path that
+        // forgot to fill one in fails safe. The predicate has to agree, or a
+        // never-completed exchange would be offered a store.
+        CHECK_FALSE(CacheIsServing(CacheOutcome {}.kind));
+    }
+}
+
 TEST_CASE("The store-size limit declines the pathological value and nothing else")
 {
     // A compiler cache must never fail a build, so the ceiling's job is to skip

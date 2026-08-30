@@ -4,10 +4,25 @@ A compiler launcher in the style of ccache and sccache, backed by a
 `fastcached` daemon over the [compile-cache protocol](../protocols/compile-cache.md).
 
 It fronts every compile: on a hit it writes the object file and replays the
-compiler's captured output; on a miss it runs the real compiler and stores the
-canonicalized result. On **any** cache error it falls back to a plain real
-compile. Caching is an optimization — an unreachable or broken cache slows a
-build down, it never breaks one.
+compiler's captured output; on a miss it has a worker compile it when
+`FASTCACHE_SCHEDULER` names one, otherwise runs the real compiler, and stores the
+canonicalized result. Caching is an optimization — an unreachable or broken cache
+slows a build down, it never breaks one.
+
+**A cache failure does not switch distribution off.** A cache and a compile fleet
+are two services, usually on two machines, so a daemon that refused this launcher
+or could not be reached says nothing about whether a worker can build the
+translation unit: the compile is still dispatched, and only the caching of it is
+lost. The reason is still reported and still counted under `unavailable`, and
+nothing further is offered to that daemon for the rest of the invocation — there
+is no point spending an object-sized transfer to be refused twice.
+
+What a build against a broken cache *does* pay is the dispatch itself: a
+translation unit that would have been a hit is now preprocessed a second time --
+dispatch sends `#line` markers, which the cache key deliberately suppresses -- and
+sent to a worker. That is the trade the fleet exists to make and it is still the
+right one, but it is not free, and it is the reason a wrong `FASTCACHE_ADDR` is
+worth fixing rather than living with.
 
 This page is the reference: every flag, every environment variable, every
 fall-back reason by name. For the story of what happens between your build system
@@ -196,7 +211,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_TIMEOUT_MS` | Deadline, in milliseconds, for one **whole** exchange with the daemon — or with a scheduler's `LEASE`/`RELEASE` — from the request to the last byte of the reply. `0` removes the bound. A daemon that accepts and then stalls, or dribbles one byte at a time, would otherwise block the compile forever. Bounds one exchange, not the whole invocation — see below — and **not** a remote compile. | `10000` |
 | `FASTCACHE_DISPATCH_TIMEOUT_MS` | Deadline, in milliseconds, for one whole **`COMPILE`** exchange with a worker. `0` removes the bound. Far larger than `FASTCACHE_TIMEOUT_MS` because it bounds a different shape of conversation: a worker writes nothing until the compiler has finished, so the client waits out the entire remote compile in one read. Ten minutes because that is the scheduler's own lease timeout — waiting longer means waiting on a lease it has already reclaimed. See [Distributed compilation](../getting-started/distributed-compilation.md). | `600000` (10 min) |
 | `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
-| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — some `fastcache-compile-node`'s `--listen-scheduler` port, never a cache port. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
+| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — some `fastcache-compile-node`'s `--listen-scheduler` port, never a cache port. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 
@@ -347,7 +362,7 @@ all prefetch groups
   misses       : 1
   unavailable  : 1  (25.0% of all compiles -- CACHE NOT REACHED)
   fall-back reasons
-    1x  connect failed
+    1x  fetch exchange failed
 
   hit latency    2 samples  p50 12ms  p95 70ms  max 70ms
     preprocess   1 samples  all 65ms
@@ -383,16 +398,27 @@ rejected STORE call for very different responses.
 
 Every reason that appears under `fall-back reasons`, and what to do about it:
 
+Every one of them still produces a correct object. Which of them leave
+distribution running is a narrower claim than that, and worth reading precisely:
+the two that describe a daemon **failing to serve the lookup** — an unreachable
+one (`fetch exchange failed`) and one that answered and refused (`rejected (…)`)
+— carry on and dispatch, which is the note at the top of this page. The rest end
+the invocation at a local compile, because each of them is a reason there is
+nothing to dispatch *with*: the key is not computed yet (the configuration and
+path reasons), the preprocess itself failed, the translation unit is one the
+launcher deliberately steps over, or the object could not be written on this
+machine. The ones marked *uncacheable* are the launcher's own refusals and are
+not about the daemon at all.
+
 | Reason | Meaning |
 |--------|---------|
-| `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted. |
-| `connect failed` | The daemon is unreachable at `FASTCACHE_ADDR`. |
+| `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted, and neither was a scheduler. Distribution is off here deliberately, and not merely for want of a key: `FASTCACHE_ADDR=` (set but empty) is how a build opts out of the launcher altogether, and without the two roots there is no portable key for a scheduler to suppress duplicates on. Set all three to use either. |
 | `preprocess failed` | The compiler rejected the preprocess probe; the line may use an unsupported option form. |
 | `uses __TIME__/__DATE__/__TIMESTAMP__` | Deliberate: the TU is non-deterministic and would never hit. Reported as *uncacheable*, not as an error. |
 | `a command-line path is drive-relative under no root`, `a reported dependency path is drive-relative under no root` | Deliberate, and Windows-only. A path like `C:foo\bar.hpp` resolves against drive `C:`'s **own** current directory, which no cache entry records — so the launcher can neither key it (a header moved inside it would not re-key) nor check it on replay (there is no directory to `stat` it against). Caching such a compile could serve a stale dependency record under a zero exit code, so it is not cached at all. Reported as *uncacheable*, not as an error. Spell the path absolutely (`C:\foo\bar.hpp`), make it relative, or bring it under `FASTCACHE_SOURCE_DIR`/`FASTCACHE_BINARY_DIR`. The first is the rule applied to the command line, the second to what the compiler reported; `FASTCACHE_VERBOSE` names the offending path itself. |
 | `daemon does not support authentication; the configured credential was ignored` | `FASTCACHE_TOKEN` is set but the daemon predates the AUTH verb. Caching works normally — the daemon steps over the verb it does not know and serves the command — but this traffic is **not** authenticated. Said once per invocation rather than per exchange. Upgrade the daemon, or unset the token if it was not meant to apply here. |
-| `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the compile still runs locally and the build succeeds; only the caching is lost. |
-| `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. |
+| `rejected (unauthenticated): ...` | The daemon requires a credential. `authentication required` means none was sent — set `FASTCACHE_TOKEN`. `authentication failed` means one was sent and was wrong. The two are deliberately different messages because they are different mistakes. Either way the build succeeds and only the caching is lost — the compile is still dispatched if `FASTCACHE_SCHEDULER` names a scheduler, and runs locally otherwise. |
+| `fetch exchange failed`, `fetch decoded malformed` | Transport or protocol trouble mid-request. Also how a `FASTCACHE_TIMEOUT_MS` expiry surfaces: a daemon that accepted the connection and then went quiet. If these appear in bulk and each compile stalls for the full timeout first, suspect a wedged daemon rather than a flaky network. `fetch exchange failed` is also what a plainly wrong `FASTCACHE_ADDR` looks like — every compile, at once, with the fleet still doing the work. The two differ in what happens next: `fetch exchange failed` carries on and dispatches, while `fetch decoded malformed` — a daemon that answered with a value this launcher cannot read, which in practice means a mixed install — ends the invocation at a local compile. |
 | `rejected (unsupported-version): …` | The daemon answered and declined: it does not speak this launcher's wire version. **The two binaries ship together, so this means a mixed install** — an old daemon still running against a new `fastcache-cc`, or vice versa. The message names the range the daemon does support. Restart the daemon from the same package as the launcher. |
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |
 | `rejected (…)` (other codes) | The daemon refused the command and said why; see [the error-code table](../protocols/compile-cache.md#error-codes). |

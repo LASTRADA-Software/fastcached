@@ -63,6 +63,33 @@ struct CacheOutcome
 /// @return A short human-readable phrase; empty for a hit.
 [[nodiscard]] std::string DescribeOutcome(CacheOutcome const& outcome);
 
+/// Whether the daemon is serving this launcher, judged by one completed exchange.
+///
+/// `Hit` and `Miss` are both a working daemon answering about a key. `Rejected`
+/// and `Transport` are not answers about the key at all — one is a daemon that
+/// declined the command (a version mismatch, a credential it will not take), the
+/// other a daemon that was never reached — and neither is going to answer the
+/// *next* command in this invocation either.
+///
+/// The launcher acts on that in one place: a `STORE` after a fetch that was
+/// refused or that never arrived spends the whole encoded value — an object file,
+/// so megabytes, on the hot path of a parallel build — to be told the same thing
+/// again. It is the argument `IsStorableSize` makes below, reached from the other
+/// side: do not pay a transfer to be refused.
+///
+/// **It deliberately says nothing about whether the invocation continues.** A
+/// cache and a compile fleet are two services, usually on two machines, and an
+/// answer about one is not an answer about the other — `RunCached` used to return
+/// on a fetch that failed at the transport, so an unreachable `FASTCACHE_ADDR`
+/// took a perfectly healthy fleet down with it and every build went local while
+/// staying green (issue #236).
+/// @param kind How the exchange ended.
+/// @return True when a further command to the same daemon is worth sending.
+[[nodiscard]] constexpr bool CacheIsServing(CacheOutcomeKind kind) noexcept
+{
+    return kind == CacheOutcomeKind::Hit || kind == CacheOutcomeKind::Miss;
+}
+
 /// The credential this launcher presents, if any.
 ///
 /// An empty `secret` means "no credential configured", and every exchange below

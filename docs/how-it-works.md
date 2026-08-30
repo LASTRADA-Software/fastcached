@@ -57,15 +57,28 @@ flowchart TD
     key --> fetch{"5. FETCH the key"}
     fetch -->|"hit"| hit["6. Write the object,<br/>rebuild the depfile,<br/>replay the diagnostics"]
     fetch -->|"miss"| dispatch{"7. Is a scheduler<br/>configured?"}
+    fetch -->|"unreachable,<br/>or refused"| dispatch
     dispatch -->|"no"| local["8b. Compile locally"]
     dispatch -->|"yes"| lease["8a. Ask for a worker"]
     lease -->|"refused, for any reason"| local
     lease -->|"granted"| remote["Send preprocessed text<br/>to that worker"]
     remote --> store
-    local --> store["9. STORE the object<br/>under the key"]
+    local --> store["9. STORE the object<br/>under the key<br/>(skipped when the cache<br/>did not answer step 5)"]
     hit --> done["exit 0"]
     store --> done
 ```
+
+Note where the two "the cache did not serve this" edges go. A **miss** and a
+**cache that could not be reached, or that refused** both arrive at step 7, and
+that is the point rather than a shortcut: the cache and the scheduler are separate
+services on separate machines, so a failure of one says nothing about the other.
+Sending a miss to step 7 and a transport failure straight to step 8b is what made
+a mistyped `FASTCACHE_ADDR` turn every build on an estate local while the fleet
+sat idle and healthy, with the build green throughout
+([#236](https://github.com/LASTRADA-Software/fastcached/issues/236)). What the
+launcher does *not* do afterwards is push the result at a daemon that just failed
+to answer — step 9 is skipped in that case, so reaching step 7 costs a wrong
+`FASTCACHE_ADDR` no more connections than it cost before.
 
 ### 1. Identify the compiler
 
@@ -318,7 +331,7 @@ Start with `fastcache-cc --show-stats`, which is a per-machine tally:
   uncacheable  : 8
   unavailable  : 100  (5% of all compiles -- CACHE NOT REACHED)
   fall-back reasons
-    100x  connect failed
+    100x  fetch exchange failed
 ```
 
 ### 1. Was the cache reached at all?
@@ -330,8 +343,10 @@ rate is meaningless. The reasons under it name the cause. The two usual ones:
   non-empty. `FASTCACHE_ADDR` has a default (`127.0.0.1:6674`), so in practice it
   is the two roots that are missing — and if you are using this project's own
   CMake module, it sets them for you.
-- **`connect failed`.** Nothing is listening at that address. Start the daemon or
-  the node.
+- **`fetch exchange failed`.** Nothing answered at that address — usually nothing
+  is listening. Start the daemon or the node. Note that this is a report about the
+  *cache*: the compiles themselves were still dispatched if `FASTCACHE_SCHEDULER`
+  names a fleet, so a build can show 100% `unavailable` and still have been fast.
 
 ### 2. The cache is reached, but everything is a miss
 
@@ -368,6 +383,10 @@ Otherwise it is a fingerprint mismatch. Compare the two machines as above; if th
 differ, their toolchains genuinely differ, and the fix is to make them the same
 rather than to loosen the match — an over-loose match produces a wrong object that
 every other machine then fetches.
+
+What is **not** a reason is the cache being down. `cache unavailable (…)` names a
+wrong or unreachable `FASTCACHE_ADDR`, and a `DISPATCHED` line follows it — see
+[the two edges out of step 5](#one-compile-start-to-finish).
 
 ---
 
@@ -537,9 +556,12 @@ the launcher must state the language of the preprocessed text it sends and would
 otherwise silently override yours.
 
 **Caching never breaks a build.** Every error path — an unreachable daemon, a
-refused lease, a malformed value, a stale dependency record — ends in the real
-compiler running. Run with `FASTCACHE_VERBOSE=1` to see which path a translation
-unit took.
+refused lease, a malformed value, a stale dependency record — ends in the
+translation unit being compiled anyway. A refused lease or an absent fleet makes
+that the real compiler here; a daemon that could not be reached or that refused
+does **not**, and the compile is still dispatched — see
+[the two edges out of step 5](#one-compile-start-to-finish). Run with
+`FASTCACHE_VERBOSE=1` to see which path a translation unit took.
 
 ---
 

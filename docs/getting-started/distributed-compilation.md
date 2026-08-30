@@ -12,6 +12,12 @@ It is **opt-in at both ends** and cannot break a build: every refusal, every
 unreachable worker, every mismatch falls back to the local compile that would
 have happened anyway.
 
+It also does not depend on the cache being up: the setup below deliberately puts
+the shared cache and the scheduler on different machines, and a cache that is
+unreachable or that refuses this client costs the lookup and the store, nothing
+more. Why that is worth stating is in
+[How it works](../how-it-works.md#one-compile-start-to-finish).
+
 This page is how to set it up and run it. If you want the model first — what the
 pieces are and how one compile flows through them — read
 [How it works](../how-it-works.md), which is a shorter read and makes everything
@@ -330,6 +336,12 @@ cmake -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc ...
 node on this machine already answers, so a developer running a node needs only
 the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out.
 
+Getting it **wrong** costs the cache and nothing else: a daemon that cannot be
+reached, or that answers and refuses, is reported (`cache unavailable (…)`,
+counted under `unavailable` by `--show-stats`) and the translation unit is
+dispatched anyway. The `FASTCACHE_ADDR=` opt-out above is different, and turns
+both off — it is how a build says it wants no launcher at all.
+
 `FASTCACHE_SCHEDULER` is the **scheduler**, which is some node's
 `--listen-scheduler`, never the cache port. Unset it and every miss compiles
 locally again — the behaviour without this feature, and the way to turn it off
@@ -402,7 +414,11 @@ unit:
 fastcache-cc: HIT key=…                                          served from cache
 fastcache-cc: DISPATCHED to worker-01.internal:6676 key=…        compiled remotely
 fastcache-cc: not dispatched (rejected (no-worker)); compiling locally
+fastcache-cc: cache unavailable (fetch exchange failed); compiling this translation unit anyway
 ```
+
+The last of those is a **cache** problem, not a fleet one, and the line says so
+by not ending at the compiler: a `DISPATCHED` line normally follows it.
 
 The scheduler is a compile node, so its `/metrics` endpoint is the node's:
 start it with `--admin-listen` and these count the outcomes.
