@@ -12,6 +12,33 @@ spins on a condition a regression never satisfies hangs instead of failing, and 
 defect — this repository has already paid for that once
 (`dist-compile-e2e ***Timeout 900.10 sec`).
 
+And the next clause of the same rule: **a bound is an assumption about the
+machine.** A budget that passes on a warm developer laptop encodes that laptop — a
+cold two-core runner doing the same work is the machine the test actually has to
+survive. Write the budget for the slower machine, and make the wait name **which**
+participant it is waiting for, because "saw 1 of 3" says the fleet is short without
+saying which process never came up.
+
+`node-scratch-isolation-e2e` cost a CI cycle proving it. It started two compile
+nodes at once, each given a bare `--toolchain` — which makes a node compute a
+fingerprint by walking the compiler's entire include tree. Warm, that is seconds and
+the fixture passed every local run. Cold, on a two-core runner, two of those racing
+did not both finish inside 90 seconds, and the fixture failed having never reached a
+compile. The one node that did register was the scheduler, because
+`--toolchain=scheduler-only=<cc>` names its fingerprint explicitly and is therefore
+never probed — and *that* asymmetry, visible only in the log, is what identified the
+cause. The budget was not careless; it was measured on the wrong machine.
+
+Two things fixed it, and the second is the one that generalises: the nodes are
+started one at a time, and each wait names the node it is waiting for and dumps that
+node's log when it expires. Serialising cost the fixture nothing, because what it
+exists to catch happens when two workers *compile* at once, not when they start.
+
+One corollary, because reorganising a fixture is how its teeth get quietly pulled:
+**a fixture that has been restructured and not re-falsified is a fixture nobody has
+checked.** After that change the defect was reintroduced and the fixture confirmed to
+still fail for its original reason before the change was believed.
+
 ## A case name is an ARGUMENT, so it may not begin with `-`
 
 `catch_discover_tests` registers each case as
