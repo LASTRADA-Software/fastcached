@@ -72,46 +72,45 @@ TEST_CASE("A surface's grammar accepts what its shape advertises", "[node][surfa
     // surface from a beacon.
     for (auto const& row: NodeSurfaceTable())
     {
-        if (row.parses == nullptr)
+        if (row.grammar.parses == nullptr)
             continue;
 
-        INFO("surface: " << row.name << ", shape: " << row.shape);
-        CHECK(row.parses("10.11.12.13:6699"));
-        CHECK_FALSE(row.parses("not-an-endpoint"));
+        INFO("surface: " << row.name << ", shape: " << row.grammar.shape);
+        CHECK(row.grammar.parses("10.11.12.13:6699"));
+        CHECK_FALSE(row.grammar.parses("not-an-endpoint"));
 
         // `[<address>:]<port>` promises a bare port is accepted; `<address>:<port>`
         // promises it is not. The shape is what an operator reads, so it is the
         // thing the predicate has to agree with.
-        auto const bracketed = row.shape.starts_with("[");
-        CHECK(row.parses("6699") == bracketed);
+        auto const bracketed = row.grammar.shape.starts_with("[");
+        CHECK(row.grammar.parses("6699") == bracketed);
     }
 }
 
-TEST_CASE("A default host is present exactly when a bare port could take one", "[node][surfaces]")
+TEST_CASE("A surface resolving from its own spec has a default host to resolve against", "[node][surfaces]")
 {
-    // Being off until named and taking loopback for a bare port are independent
-    // facts, and this keeps them so. Three surfaces are BOTH -- served only once an
-    // operator names an address, and on loopback or the wildcard the moment that
-    // address is a bare port -- so a reader who collapses them loses the second,
-    // which for the admin row is the input to its credential rule rather than a
-    // firewall detail. The first half is `resolve`'s to answer; only the second is
-    // a column, which is why there is no `presence` beside `hostOrigin`.
+    // What survives of a deleted column. There WAS a `HostOrigin` enum naming which of
+    // three mechanisms supplied each row's host; nothing in production read it, its
+    // only test asserted it agreed with the column it was derived from, and its own
+    // doc had gone stale against its own table. That is the third column here to fail
+    // the same test, after `presence` and the `explicitBit` never added.
+    //
+    // The fact worth keeping is narrower and is a build failure rather than a case: a
+    // row that resolves from its spec needs a spec and a default host, which
+    // `NodeSurfaces.cpp` `static_assert`s. What is left for runtime is that the two
+    // rows carrying neither are exactly the two whose resolution is their own code.
     for (auto const& row: NodeSurfaceTable())
     {
         INFO("surface: " << row.name);
-        switch (row.hostOrigin)
-        {
-            case HostOrigin::DefaultConstant:
-            case HostOrigin::Fixed:
-                CHECK_FALSE(row.defaultHost.empty());
-                break;
-            case HostOrigin::OperatorFlag:
-                // Its host is a flag, so there is no fallback to record and an empty
-                // column is the honest answer rather than a missing one.
-                CHECK(row.defaultHost.empty());
-                break;
-        }
+        if (row.defaultHost.empty())
+            // Only the compile port, whose host is `--bind` -- a flag an operator
+            // sets, never a fallback a bare port takes. An empty column is the honest
+            // answer there rather than a missing one.
+            CHECK(row.surface == NodeSurface::Compile);
     }
+
+    CHECK(RowFor(NodeSurface::Compile).defaultHost.empty());
+    CHECK_FALSE(RowFor(NodeSurface::Discovery).defaultHost.empty());
 }
 
 TEST_CASE("A default configuration serves the two surfaces that are on", "[node][surfaces]")
@@ -126,19 +125,19 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
 
     std::vector<std::string_view> served;
     for (auto const& row: NodeSurfaceTable())
-        if (!row.resolve(cfg).empty())
+        if (!row.Resolve(cfg).empty())
             served.push_back(row.name);
 
     CHECK(served == std::vector<std::string_view> { "compile", "cache" });
 
-    auto const compile = RowFor(NodeSurface::Compile).resolve(cfg);
+    auto const compile = RowFor(NodeSurface::Compile).Resolve(cfg);
     REQUIRE(compile.size() == 1);
     CHECK(compile.front().host == "0.0.0.0");
     CHECK(compile.front().port == 6676);
 
     // The default an operator reads off the startup line, and the address
     // `fastcache-cc` looks for when nobody sets `FASTCACHE_ADDR`.
-    auto const cache = RowFor(NodeSurface::Cache).resolve(cfg);
+    auto const cache = RowFor(NodeSurface::Cache).Resolve(cfg);
     REQUIRE(cache.size() == 1);
     CHECK(cache.front().host == "127.0.0.1");
     CHECK(cache.front().port == 6674);
@@ -159,7 +158,7 @@ TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]"
     cfg.nodeId = "n1";
 
     auto const hostOf = [&cfg](NodeSurface surface) {
-        auto const endpoints = RowFor(surface).resolve(cfg);
+        auto const endpoints = RowFor(surface).Resolve(cfg);
         REQUIRE(endpoints.size() == 1);
         return endpoints.front().host;
     };
@@ -177,7 +176,7 @@ TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[nod
     NodeConfig cfg;
     cfg.discoveryAddress = "255.255.255.255:6681";
 
-    auto const beaconOnly = RowFor(NodeSurface::Discovery).resolve(cfg);
+    auto const beaconOnly = RowFor(NodeSurface::Discovery).Resolve(cfg);
     REQUIRE(beaconOnly.size() == 1);
     // NOT 255.255.255.255. The address is where beacons are sent; the socket binds
     // the wildcard unconditionally, and reading the announce address as a bind
@@ -190,7 +189,7 @@ TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[nod
     // challenges on a port only it holds, so an operator who opened the beacon port
     // and not this one hears every beacon and completes no handshake.
     cfg.discoveryReplyPort = 6682;
-    auto const both = RowFor(NodeSurface::Discovery).resolve(cfg);
+    auto const both = RowFor(NodeSurface::Discovery).Resolve(cfg);
     REQUIRE(both.size() == 2);
     CHECK(both[1].port == 6682);
     CHECK(both[1].role == "reply");
@@ -216,10 +215,10 @@ TEST_CASE("Raft binds nothing until consensus is turned on", "[node][surfaces]")
     NodeConfig cfg;
     cfg.raftListen = "0.0.0.0:6680";
 
-    CHECK(RowFor(NodeSurface::Raft).resolve(cfg).empty());
+    CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
 
     cfg.nodeId = "n1";
-    CHECK(RowFor(NodeSurface::Raft).resolve(cfg).size() == 1);
+    CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).size() == 1);
 }
 
 TEST_CASE("The worksheet describes this configuration, not the defaults", "[node][surfaces]")

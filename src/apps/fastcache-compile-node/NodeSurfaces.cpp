@@ -33,14 +33,15 @@ namespace
 
     /// Whether text names an address a beacon can be sent to.
     ///
-    /// A host and a port, both required. Moved here with the rows that use it: it
-    /// existed to serve `EndpointFlags`, and that table is now these rows.
+    /// `ParseDialEndpoint`'s question, asked through `ParseDialEndpoint`: a host
+    /// somebody wrote, plus a port. It was spelled out here, which made a fourth
+    /// author of a predicate whose own header says the three refusals it encodes have
+    /// each already cost a bug.
     /// @param text What the operator typed.
     /// @return True when it is `<address>:<port>`.
     [[nodiscard]] bool ParsesAsBeaconAddress(std::string_view text)
     {
-        auto const address = SplitHostPort(text);
-        return address.has_value() && !address->first.empty() && ParseTcpPort(address->second).has_value();
+        return ParseDialEndpoint(text).has_value();
     }
 
     /// Whether text names an address a listen surface can bind.
@@ -50,6 +51,10 @@ namespace
     /// terms of the other rather than beside it, because "an address, or just a port"
     /// is the whole of the difference and a second copy of the address half is how
     /// the two would come to disagree.
+    ///
+    /// NOT foldable into `ParseEndpoint`, which supplies a default host and therefore
+    /// accepts an empty one -- and `--listen-cache=:6674` binding every interface is
+    /// exactly what this refuses.
     /// @param text What the operator typed.
     /// @return True when it is `[<address>:]<port>`.
     [[nodiscard]] bool ParsesAsListenEndpoint(std::string_view text)
@@ -59,24 +64,35 @@ namespace
         return ParsesAsBeaconAddress(text);
     }
 
-    /// Resolve a `[<host>:]<port>` spec against the host a bare port falls back to.
+    /// `[<address>:]<port>`: an address, or a bare port taking the surface's own
+    /// default host.
+    constexpr Grammar ListenEndpointGrammar { .parses = ParsesAsListenEndpoint, .shape = "[<address>:]<port>" };
+
+    /// `<address>:<port>`: a beacon is SENT to an address, so a bare port names nobody
+    /// and no default host may stand in for one.
+    constexpr Grammar BeaconAddressGrammar { .parses = ParsesAsBeaconAddress, .shape = "<address>:<port>" };
+
+    /// Resolve a row's own `spec` against its own `defaultHost`.
+    ///
+    /// The whole of what cache, scheduler and admin do, so they share it rather than
+    /// each carrying a lambda naming the member pointer and constant their row
+    /// already holds. Raft delegates here too, after its `--node-id` gate.
     ///
     /// Through `ParseEndpoint` rather than `SplitHostPort`, and the difference is the
-    /// default host -- which is right for a BIND address an operator typed and wrong
-    /// for text naming somewhere else to ask. `Core/HostPort.hpp` states that
-    /// distinction where `ParseDialEndpoint` is defined; these are the bind side of
-    /// it.
+    /// default host -- right for a BIND address an operator typed, wrong for text
+    /// naming somewhere else to ask. `Core/HostPort.hpp` states that distinction where
+    /// `ParseDialEndpoint` is defined; this is the bind side of it.
     ///
-    /// An empty spec resolves to nothing, which is how four of the six surfaces spell
-    /// "not served". That is the same answer an unusable spec gives, deliberately:
-    /// the grammar refusal happens once at startup where it can name the flag, and a
-    /// port map has nothing to draw for either.
-    /// @param spec What the operator typed.
-    /// @param defaultHost The host a bare port takes.
+    /// An empty spec resolves to nothing, which is how the off-by-default surfaces
+    /// spell "not served". That is the same answer an unusable spec gives,
+    /// deliberately: the grammar refusal happens once at startup where it can name the
+    /// flag, and a port map has nothing to draw for either.
+    /// @param row The surface being resolved.
+    /// @param cfg What the operator asked for.
     /// @return The one endpoint, or none.
-    [[nodiscard]] SurfaceEndpoints ResolveSpec(std::string const& spec, std::string_view defaultHost)
+    [[nodiscard]] SurfaceEndpoints ResolveFromSpec(SurfaceRow const& row, NodeConfig const& cfg)
     {
-        auto const endpoint = ParseEndpoint(spec, defaultHost);
+        auto const endpoint = ParseEndpoint(cfg.*row.spec, row.defaultHost);
         if (!endpoint.has_value())
             return {};
         return SurfaceEndpoints { SurfaceEndpoint { .host = endpoint->first, .port = endpoint->second } };
@@ -95,14 +111,12 @@ namespace
             .name = "compile",
             .flags = { "--bind", "--port" },
             .protocol = SurfaceProtocol::Tcp,
-            .hostOrigin = HostOrigin::OperatorFlag,
             .defaultHost = {},
-            // No spec: the halves are a `std::string` and a `std::uint16_t` with
-            // their own value parsers, so there is no text for a grammar to judge.
+            // No spec: the halves are a `std::string` and a `std::uint16_t` with their
+            // own value parsers, so there is no text for a grammar to judge.
             .spec = nullptr,
-            .parses = nullptr,
-            .shape = {},
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
+            .grammar = {},
+            .resolve = [](SurfaceRow const& /*row*/, NodeConfig const& cfg) -> SurfaceEndpoints {
                 return SurfaceEndpoints { SurfaceEndpoint { .host = cfg.bindAddress, .port = cfg.port } };
             },
             .note = "a systemd .socket unit overrides --bind and --port entirely; the unit then owns the "
@@ -114,14 +128,10 @@ namespace
             .name = "cache",
             .flags = { "--listen-cache", {} },
             .protocol = SurfaceProtocol::Tcp,
-            .hostOrigin = HostOrigin::DefaultConstant,
             .defaultHost = CacheListenDefaultHost,
             .spec = &NodeConfig::cacheListen,
-            .parses = ParsesAsListenEndpoint,
-            .shape = "[<address>:]<port>",
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
-                return ResolveSpec(cfg.cacheListen, CacheListenDefaultHost);
-            },
+            .grammar = ListenEndpointGrammar,
+            .resolve = ResolveFromSpec,
             .note = "loopback for a bare port, the opposite of the scheduler and raft: this machine's whole "
                     "build output is served here, so widening it is a decision rather than a typo",
         },
@@ -130,14 +140,10 @@ namespace
             .name = "scheduler",
             .flags = { "--listen-scheduler", {} },
             .protocol = SurfaceProtocol::Tcp,
-            .hostOrigin = HostOrigin::DefaultConstant,
             .defaultHost = SchedulerListenDefaultHost,
             .spec = &NodeConfig::schedulerListen,
-            .parses = ParsesAsListenEndpoint,
-            .shape = "[<address>:]<port>",
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
-                return ResolveSpec(cfg.schedulerListen, SchedulerListenDefaultHost);
-            },
+            .grammar = ListenEndpointGrammar,
+            .resolve = ResolveFromSpec,
             .note = "answered only while this node LEADS; a follower redirects and an election in progress "
                     "refuses, so the port is open on every member whether or not it is answering today",
         },
@@ -146,14 +152,10 @@ namespace
             .name = "admin",
             .flags = { "--admin-listen", {} },
             .protocol = SurfaceProtocol::Tcp,
-            .hostOrigin = HostOrigin::DefaultConstant,
             .defaultHost = AdminListenDefaultHost,
             .spec = &NodeConfig::adminListen,
-            .parses = ParsesAsListenEndpoint,
-            .shape = "[<address>:]<port>",
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
-                return ResolveSpec(cfg.adminListen, AdminListenDefaultHost);
-            },
+            .grammar = ListenEndpointGrammar,
+            .resolve = ResolveFromSpec,
             // The one row whose default host is not a firewall detail.
             .note = "the loopback default is what the dashboard's credential rule turns on: reaching loopback "
                     "already means being on the machine, so a bare port needs no token while an address you "
@@ -164,17 +166,17 @@ namespace
             .name = "raft",
             .flags = { "--listen-raft", {} },
             .protocol = SurfaceProtocol::Tcp,
-            .hostOrigin = HostOrigin::DefaultConstant,
             .defaultHost = RaftListenDefaultHost,
             .spec = &NodeConfig::raftListen,
-            .parses = ParsesAsListenEndpoint,
-            .shape = "[<address>:]<port>",
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
-                // Consensus is what `--node-id` turns on, so a `--listen-raft` with
-                // no id binds nothing -- the surface is configured and not served.
+            .grammar = ListenEndpointGrammar,
+            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                // Consensus is what `--node-id` turns on, so a `--listen-raft` with no
+                // id binds nothing -- the surface is configured and not served. Then
+                // delegating rather than re-spelling the fallback, which is what
+                // taking the row buys.
                 if (cfg.nodeId.empty())
                     return {};
-                return ResolveSpec(cfg.raftListen, RaftListenDefaultHost);
+                return ResolveFromSpec(row, cfg);
             },
             .note = "the wildcard for a bare port: peers are on other machines by definition, so a loopback "
                     "default would be one that silently cannot work. Served only when --node-id is given",
@@ -184,30 +186,30 @@ namespace
             .name = "discovery",
             .flags = { "--discovery", "--discovery-reply-port" },
             .protocol = SurfaceProtocol::Udp,
-            .hostOrigin = HostOrigin::Fixed,
             .defaultHost = DiscoveryBindHost,
             .spec = &NodeConfig::discoveryAddress,
-            .parses = ParsesAsBeaconAddress,
-            .shape = "<address>:<port>",
-            .resolve = [](NodeConfig const& cfg) -> SurfaceEndpoints {
-                auto const beacon = SplitHostPort(cfg.discoveryAddress);
+            .grammar = BeaconAddressGrammar,
+            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                // NOT `ResolveFromSpec`: the host half of `--discovery` is where
+                // beacons are SENT, and both sockets bind the wildcard whatever it
+                // says. This is where that protection lives -- reading the announce
+                // address as a bind address would put a broadcast address on a
+                // firewall worksheet.
+                auto const beacon = ParseDialEndpoint(cfg.*row.spec);
                 if (!beacon.has_value())
-                    return {};
-                auto const port = ParseTcpPort(beacon->second);
-                if (!port.has_value())
                     return {};
 
                 // Two sockets, and the second is why this row could not be one
-                // endpoint: a node LISTENS on the beacon port, shared, and ANSWERS
-                // on a port only it holds. An operator who opened the first and not
-                // the second gets a fleet that hears every beacon and completes no
+                // endpoint: a node LISTENS on the beacon port, shared, and ANSWERS on
+                // a port only it holds. An operator who opened the first and not the
+                // second gets a fleet that hears every beacon and completes no
                 // handshake.
                 SurfaceEndpoints out;
                 out.push_back(
-                    SurfaceEndpoint { .host = std::string { DiscoveryBindHost }, .port = *port, .role = "beacon" });
+                    SurfaceEndpoint { .host = std::string { row.defaultHost }, .port = beacon->second, .role = "beacon" });
                 if (cfg.discoveryReplyPort != 0)
                     out.push_back(SurfaceEndpoint {
-                        .host = std::string { DiscoveryBindHost }, .port = cfg.discoveryReplyPort, .role = "reply" });
+                        .host = std::string { row.defaultHost }, .port = cfg.discoveryReplyPort, .role = "reply" });
                 return out;
             },
             .note = "UDP, and the only surface that is. The address you write is where beacons are SENT; the "
@@ -219,9 +221,9 @@ namespace
     static_assert(RowsInEnumeratorOrder(Surfaces, [](SurfaceRow const& row) { return row.surface; }),
                   "every NodeSurface needs a row, at its own index");
 
-    // A surface with no name could not be printed, and one with no first flag could
-    // not be configured. Checked at compile time because both are what a
-    // half-written row looks like.
+    // A surface with no name could not be printed, one with no first flag could not be
+    // configured, and one with no resolver could not be opened. Checked at compile time
+    // because all three are what a half-written row looks like.
     static_assert(std::ranges::all_of(Surfaces,
                                       [](SurfaceRow const& row) {
                                           return !row.name.empty() && !row.flags[0].empty() && row.resolve != nullptr;
@@ -230,13 +232,24 @@ namespace
 
     // A spec and its grammar travel together: text nothing validates is text an
     // operator can typo into a registration that replays forever, and a grammar with
-    // no text to judge is a row that lies about having one.
+    // no text to judge is a row that lies about having one. The grammar is one column,
+    // so this can no longer be satisfied by a predicate paired with the wrong shape.
     static_assert(std::ranges::all_of(Surfaces,
                                       [](SurfaceRow const& row) {
-                                          return (row.spec == nullptr) == (row.parses == nullptr)
-                                                 && (row.spec == nullptr) == row.shape.empty();
+                                          return (row.spec == nullptr) == (row.grammar.parses == nullptr)
+                                                 && (row.grammar.parses == nullptr) == row.grammar.shape.empty();
                                       }),
-                  "a row carries a spec, its grammar and its shape, or none of the three");
+                  "a row carries a spec and a grammar, or neither");
+
+    // Every row that resolves from its own columns needs both of them. The two that do
+    // not use `ResolveFromSpec` are exempt by construction, so this is asked of the
+    // table rather than of the shared function, which cannot see who called it.
+    static_assert(std::ranges::all_of(Surfaces,
+                                      [](SurfaceRow const& row) {
+                                          return row.resolve != ResolveFromSpec
+                                                 || (row.spec != nullptr && !row.defaultHost.empty());
+                                      }),
+                  "a row resolving from its spec needs a spec and a default host");
 } // namespace
 
 std::array<SurfaceRow, EnumeratorCount<NodeSurface>> const& NodeSurfaceTable() noexcept
@@ -253,69 +266,92 @@ std::vector<std::string_view> FlagsOf(SurfaceRow const& row)
     return out;
 }
 
+std::string_view PrimaryFlag(SurfaceRow const& row) noexcept
+{
+    return row.flags[0];
+}
+
 SurfaceRow const& RowFor(NodeSurface surface) noexcept
 {
     return Surfaces[static_cast<std::size_t>(surface)];
 }
 
+std::expected<SurfaceEndpoint, std::string> SoleEndpointOf(NodeSurface surface, NodeConfig const& cfg)
+{
+    auto const& row = RowFor(surface);
+    auto endpoints = row.Resolve(cfg);
+    if (endpoints.empty())
+        // Naming the flag, because an operator reading it has to know which surface
+        // went unserved. One sentence for one condition: this was three, so the same
+        // fault read differently depending on which port it happened to.
+        return std::unexpected { std::format("{} names no address to bind", PrimaryFlag(row)) };
+    return std::move(endpoints.front());
+}
+
 std::string RenderSurfaces(NodeConfig const& cfg)
 {
-    // Columns wide enough for the longest value, computed rather than guessed: a
-    // worksheet an operator reads down is one whose addresses line up, and a
-    // hard-coded width is one a longer surface name silently ragged.
-    // Over EVERY row, not only the served ones. Measuring what is printed is the
-    // whole point of computing a width, and the rows that print no address still
-    // print a name -- so widths taken over served endpoints alone left the longest
-    // names (`scheduler`, `discovery`, which are exactly the ones off by default)
-    // hanging past a column sized without them.
-    std::size_t nameWidth = 0;
-    std::size_t addressWidth = 1; // the "-" an unserved row shows.
-    for (auto const& row: Surfaces)
+    // Resolved ONCE per row and kept, rather than resolved again to print. Not for the
+    // six allocations -- this prints and exits -- but because a resolver reached twice
+    // could answer differently between the measuring pass and the printing pass, and
+    // would then rag the very columns the first pass exists to align.
+    struct Line
     {
-        nameWidth = std::max(nameWidth, row.name.size());
-        for (auto const& endpoint: row.resolve(cfg))
-        {
-            nameWidth = std::max(nameWidth, row.name.size() + endpoint.role.size() + (endpoint.role.empty() ? 0 : 1));
-            addressWidth = std::max(addressWidth, std::format("{}:{}", endpoint.host, endpoint.port).size());
-        }
-    }
+        std::string label;   ///< The surface, plus its endpoint's role when it has one.
+        std::string address; ///< `host:port`, or `-` when the surface is not served.
+        std::string trailer; ///< The protocol, or what would turn the surface on.
+    };
+    std::vector<Line> lines;
 
-    std::string out;
-    for (auto const& row: Surfaces)
+    for (auto const& row: NodeSurfaceTable())
     {
-        auto const endpoints = row.resolve(cfg);
+        auto const endpoints = row.Resolve(cfg);
         if (endpoints.empty())
         {
             // Named rather than omitted. A surface missing from the list reads as one
-            // this build does not have, and an operator cannot tell that from one
-            // they did not turn on -- so the flags that would turn it on are given.
-            auto flags = std::string {};
-            for (auto const& flag: FlagsOf(row))
-                flags += (flags.empty() ? "" : " ") + std::string { flag };
-            out += std::format("{:<{}}  {:<{}}  {}\n", row.name, nameWidth, "-", addressWidth, "not served; set " + flags);
+            // this build does not have, and an operator cannot tell that from one they
+            // did not turn on -- so the flags that would turn it on are given.
+            auto const flags = FlagsOf(row);
+            std::string names;
+            for (auto const& flag: flags)
+                names += (names.empty() ? "" : " ") + std::string { flag };
+            lines.push_back(Line {
+                .label = std::string { row.name }, .address = "-", .trailer = std::format("not served; set {}", names) });
             continue;
         }
 
         for (auto const& endpoint: endpoints)
-        {
-            auto const label =
-                endpoint.role.empty() ? std::string { row.name } : std::format("{} {}", row.name, endpoint.role);
-            out += std::format("{:<{}}  {:<{}}  {}\n",
-                               label,
-                               nameWidth,
-                               std::format("{}:{}", endpoint.host, endpoint.port),
-                               addressWidth,
-                               row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP");
-        }
+            lines.push_back(Line { .label = endpoint.role.empty() ? std::string { row.name }
+                                                                  : std::format("{} {}", row.name, endpoint.role),
+                                   // `FormatHostPort`, not a hand-rolled join: it brackets a v6
+                                   // host, so `--listen-cache [2001:db8::1]:6674` comes back as an
+                                   // address that reads back rather than as `2001:db8::1:6674`.
+                                   // This is the surface whose whole purpose is being transcribed.
+                                   .address = FormatHostPort(endpoint.host, endpoint.port),
+                                   .trailer = row.protocol == SurfaceProtocol::Udp ? "UDP" : "TCP" });
     }
 
-    // The notes last and separately, because they are prose and the table above is
-    // something an operator transcribes into firewall rules. Mixing them would make
-    // the columns ragged for the rows that carry one -- and the compile port's note
-    // is the one that says this list can be WRONG for that row, which is not
-    // something to bury in a column.
+    // Widths over what is actually PRINTED -- every line, not only the served ones.
+    // Measured over served endpoints alone, the longest names were `scheduler` and
+    // `discovery`, which are exactly the rows that are off by default and so were
+    // excluded from their own measurement.
+    std::size_t labelWidth = 0;
+    std::size_t addressWidth = 0;
+    for (auto const& line: lines)
+    {
+        labelWidth = std::max(labelWidth, line.label.size());
+        addressWidth = std::max(addressWidth, line.address.size());
+    }
+
+    std::string out;
+    for (auto const& line: lines)
+        out += std::format("{:<{}}  {:<{}}  {}\n", line.label, labelWidth, line.address, addressWidth, line.trailer);
+
+    // The notes last and separately, because they are prose while the table above is
+    // something an operator transcribes into firewall rules. Mixing them would rag the
+    // columns for the rows that carry one -- and the compile port's note says this list
+    // can be WRONG for that row, which is not something to bury in a column.
     out += "\nnotes:\n";
-    for (auto const& row: Surfaces)
+    for (auto const& row: NodeSurfaceTable())
         if (!row.note.empty())
             out += std::format("  {}: {}\n", row.name, row.note);
     return out;

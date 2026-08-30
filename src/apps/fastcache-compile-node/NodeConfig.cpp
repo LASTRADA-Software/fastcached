@@ -1198,7 +1198,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
             continue;
 
         auto const& text = cfg.*surface.spec;
-        if (text.empty() || surface.parses(text))
+        if (text.empty() || surface.grammar.parses(text))
             continue;
 
         // "cannot use" rather than "cannot bind": most of these are bound and
@@ -1206,9 +1206,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // operator looking for a listening socket discovery never opens.
         return std::format("{}={} is not {}. The surface it configures cannot use an address that was never one, so "
                            "this node refuses to start.",
-                           FlagsOf(surface).front(),
+                           PrimaryFlag(surface),
                            text,
-                           surface.shape);
+                           surface.grammar.shape);
     }
 
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
@@ -1290,7 +1290,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the text an operator typed.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, RaftListenDefaultHost).has_value();
+                  // Asked of the raft row, which is what `ConsensusTier::Start`
+                  // resolves through -- so this rule and the tier decide on one
+                  // answer. The row's own `--node-id` gate is why the id is tested
+                  // first: without it the row resolves to nothing for a reason that
+                  // is not this rule's.
+                  return !c.nodeId.empty() && RowFor(NodeSurface::Raft).Resolve(c).empty();
               },
           .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
                      "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
@@ -1408,12 +1413,16 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               [](NodeConfig const& c) {
                   if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
                       return false;
-                  // The same default host `AdminEndpoint::Start` binds with --
-                  // the constant, not a second copy of the literal -- so this rule
-                  // judges the address the endpoint will actually take rather than
-                  // the text an operator typed.
-                  auto const endpoint = ParseEndpoint(c.adminListen, AdminListenDefaultHost);
-                  return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
+                  // The address `AdminEndpoint::Start` will actually take, asked of
+                  // the surface's own row rather than derived here from the same
+                  // constant. This is the ONE security decision that hangs on the
+                  // loopback default, so a second author of the resolution is the
+                  // last place to keep one -- and the admin row could grow a
+                  // condition the way the raft row already has (`--node-id`), at
+                  // which point a copy would judge an address the surface no longer
+                  // binds and silently stop requiring a credential.
+                  auto const endpoints = RowFor(NodeSurface::Admin).Resolve(c);
+                  return !endpoints.empty() && !IsLoopbackHost(endpoints.front().host);
               },
           .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "
                      "map of every member's hostname, endpoint and capacity, and an operator who bound it to "

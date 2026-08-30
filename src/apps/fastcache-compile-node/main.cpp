@@ -239,17 +239,16 @@ void InstallNodeStopHandlers()
 /// @return The bound listener, or why it could not be served.
 [[nodiscard]] std::expected<std::unique_ptr<BlockingListener>, std::string> BindCompilePort(NodeConfig const& cfg)
 {
-    auto const compile = RowFor(NodeSurface::Compile).resolve(cfg);
-    // Guarded rather than asserted in a comment. It cannot be empty today -- the
-    // compile port is served unless a supervisor handed a listener over, and this is
-    // only reached when none was -- but a resolver that later grows a reason to return
-    // nothing would turn a comment into a crash, in the file least able to notice.
-    // Every other surface tests this because it can legitimately be off; this one
-    // tests it so that "cannot" stays checked rather than remembered.
-    if (compile.empty())
-        return std::unexpected { std::string { "--bind/--port name no address to bind" } };
-
-    auto const& endpoint = compile.front();
+    // Through the shared resolver, which refuses by name rather than leaving this
+    // caller to assert in a comment that the result cannot be empty. It cannot be
+    // today -- the compile port is served unless a supervisor handed a listener over,
+    // and this runs only when none was -- but a resolver that later grows a reason to
+    // return nothing would turn that comment into a crash, in the file least able to
+    // notice.
+    auto const resolved = SoleEndpointOf(NodeSurface::Compile, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
     auto bound = BlockingListener::Bind(endpoint.host, endpoint.port, /*backlog=*/128);
     // `IsBound()`, not a null check: `Bind` hands back a listener carrying the
     // diagnostic rather than nothing at all.

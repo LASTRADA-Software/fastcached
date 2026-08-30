@@ -246,10 +246,10 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // The asymmetry with `--listen-cache`'s loopback is the rule -- peers are on
     // other machines by definition -- and it is a column rather than a constant each
     // opener reaches for.
-    auto const endpoints = RowFor(NodeSurface::Raft).resolve(cfg);
-    if (endpoints.empty())
-        return std::unexpected { std::format("--listen-raft={} names no usable port", cfg.raftListen) };
-    auto const& endpoint = endpoints.front();
+    auto const resolved = SoleEndpointOf(NodeSurface::Raft, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
 
     // The listener is bound in `Launch` rather than here, because it binds against
     // the reactor and the reactor is a member of the object this has not built yet.

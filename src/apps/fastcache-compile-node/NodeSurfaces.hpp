@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,30 +50,6 @@ enum class SurfaceProtocol : std::uint8_t
     Udp,
 };
 
-/// Where a surface's host comes from when the operator wrote only a port.
-///
-/// Three mechanisms supply it across the six surfaces, and flattening them would be
-/// its own drift: a fallback a bare port takes and a value an operator sets are
-/// different facts that merely happen to both be strings.
-enum class HostOrigin : std::uint8_t
-{
-    /// A named constant this surface FALLS BACK to -- `CacheListenDefaultHost` and
-    /// its three siblings. The operator overrides it by writing a host.
-    DefaultConstant = 0,
-    /// A flag of its own. Only the compile port, whose host is `--bind`: there is no
-    /// bare-port case to fall back from, because the two halves are separate values
-    /// of separate types.
-    OperatorFlag,
-    /// Always this host, whatever the operator wrote. Only discovery, and the
-    /// distinction from `DefaultConstant` is not pedantry: `--discovery`'s host half
-    /// is the address this node ANNOUNCES to, while the socket binds the wildcard
-    /// unconditionally (`DiscoveryTier.cpp`). An operator who writes
-    /// `--discovery=255.255.255.255:6681` has changed where beacons go and not what
-    /// is bound, so reading that host as the bind address would put the wrong
-    /// address on a firewall worksheet.
-    Fixed,
-};
-
 /// One endpoint a surface would actually bind.
 ///
 /// Owning, deliberately. `role` points into the static table and outlives any call;
@@ -94,6 +71,17 @@ struct SurfaceEndpoint
 /// second port, opened as a shared listen socket and a private reply socket. A row
 /// built for two flags takes the first and not the second.
 using SurfaceEndpoints = std::vector<SurfaceEndpoint>;
+
+/// A listen-value grammar and the shape a refusal shows for it.
+///
+/// Together, never apart: the predicate decides and the string is what an operator is
+/// told to type, so a row pairing one surface's predicate with another's shape would
+/// refuse a value while advertising the spelling that produces it.
+struct Grammar
+{
+    bool (*parses)(std::string_view) = nullptr; ///< Whether the text is acceptable; null when a surface has no spec.
+    std::string_view shape {};                  ///< What it should have looked like.
+};
 
 /// One listening surface, described once.
 ///
@@ -138,11 +126,22 @@ struct SurfaceRow
     // enough to be an enumerator: raft's reason is knowable from the configuration
     // and the compile port's is not knowable at all. Each row says its own in `note`.
 
-    /// Where its host comes from for a bare port.
-    HostOrigin hostOrigin {};
-
-    /// The constant a bare port falls back to; empty when `hostOrigin` is not
-    /// `DefaultConstant`.
+    /// The host a bare port falls back to, and the only host discovery ever binds.
+    ///
+    /// There is deliberately **no** `HostOrigin` column beside it saying which of
+    /// those two this is. One was written -- `DefaultConstant` / `OperatorFlag` /
+    /// `Fixed` -- and nothing in production ever read it: it documented rather than
+    /// drove, its only test asserted it agreed with the column it was derived from,
+    /// and its own doc had already gone stale against its own table, claiming this
+    /// field is empty unless the origin is `DefaultConstant` while discovery was
+    /// `Fixed` with a non-empty one. That is the third column here to fail the same
+    /// test, after `presence` and the `explicitBit` that was never added.
+    ///
+    /// The distinction it tried to record is real and lives in `note`, where prose
+    /// belongs: `--discovery`'s host half is where beacons are SENT, and its sockets
+    /// bind this wildcard whatever the operator wrote. What ENFORCES that is
+    /// discovery's resolver, not an enumerator -- so the protection is in the code
+    /// that produces the address rather than in a label describing it.
     std::string_view defaultHost {};
 
     /// Where the raw `[<host>:]<port>` text lives, or null when there is none.
@@ -152,17 +151,29 @@ struct SurfaceRow
     /// there is nothing here for a grammar to check.
     std::string NodeConfig::* spec = nullptr;
 
-    /// The grammar `spec` must satisfy when given; null when `spec` is.
-    bool (*parses)(std::string_view) = nullptr;
-
-    /// What `spec` should have looked like, for a refusal an operator can act on.
-    std::string_view shape {};
-
-    /// What this configuration would actually bind.
+    /// The grammar `spec` must satisfy, and the shape a refusal shows for it.
     ///
-    /// The one column both the openers and `--print-surfaces` read, which is what
-    /// makes them incapable of disagreeing. Empty means the surface is not served.
-    SurfaceEndpoints (*resolve)(NodeConfig const&) = nullptr;
+    /// **One column, so a mismatch is unrepresentable.** They were two -- a predicate
+    /// and a `shape` string -- and nothing could check that the right shape sat beside
+    /// the right predicate: a row pairing the bare-port-accepting grammar with
+    /// `<address>:<port>` compiled, and told an operator to write something the parser
+    /// would then refuse. The `static_assert` could only ask whether both were present.
+    /// Paired in one constant, the wrong combination cannot be written down.
+    Grammar grammar {};
+
+    /// How this surface resolves.
+    ///
+    /// Every row has one; there is no "null means the default" case to get wrong. The
+    /// three whose resolution is entirely their own columns share `ResolveFromSpec`,
+    /// which reads `spec` and `defaultHost` off the row rather than naming them a
+    /// second time -- they used to carry a lambda restating the very member pointer and
+    /// constant the row already held, which is two copies of one fact inside the table
+    /// built to delete exactly that.
+    ///
+    /// It takes its own row, which is what makes that sharing possible, and is why raft
+    /// can gate on `--node-id` and then delegate rather than re-spelling the fallback.
+    /// Call it through `Resolve`.
+    SurfaceEndpoints (*resolve)(SurfaceRow const&, NodeConfig const&) = nullptr;
 
     /// What an operator has to know about this row that the columns cannot say.
     ///
@@ -189,6 +200,14 @@ struct SurfaceRow
     /// enumerator that cannot be computed truthfully where it is read would look
     /// authoritative and be wrong for exactly the deployed service it described.
     std::string_view note {};
+
+    /// What @p cfg would bind for this surface: none, one, or two endpoints.
+    /// @param cfg What the operator asked for.
+    /// @return The endpoints it would bind; empty when it is not served.
+    [[nodiscard]] SurfaceEndpoints Resolve(NodeConfig const& cfg) const
+    {
+        return resolve(*this, cfg);
+    }
 };
 
 /// Every listening surface, one row each, indexed by `NodeSurface`.
@@ -201,10 +220,32 @@ struct SurfaceRow
 /// @return One or two flag spellings.
 [[nodiscard]] std::vector<std::string_view> FlagsOf(SurfaceRow const& row);
 
+/// The flag a refusal about this surface should name.
+///
+/// `flags[0]`, which the table `static_assert`s non-empty -- so this is the invariant
+/// the build already proves rather than a vector materialised to read one entry.
+/// @param row The surface to read.
+/// @return Its primary flag spelling.
+[[nodiscard]] std::string_view PrimaryFlag(SurfaceRow const& row) noexcept;
+
 /// The row describing @p surface.
 /// @param surface Which surface.
 /// @return Its row.
 [[nodiscard]] SurfaceRow const& RowFor(NodeSurface surface) noexcept;
+
+/// The single endpoint @p surface would bind, or why it would bind none.
+///
+/// For the four surfaces served by exactly one socket, which is every one but
+/// discovery. Written once because it was written four times: each opener resolved
+/// the row, refused an empty result and took `front()`, and the three refusals said
+/// three different things about one condition -- so an operator met a different
+/// sentence per surface for an identical fault, and a fifth TCP surface would have
+/// re-derived it a fifth time. That is the shape this table exists to delete,
+/// reappearing at the table's own consumers.
+/// @param surface Which surface to open.
+/// @param cfg What the operator asked for.
+/// @return Its endpoint, or a message naming the flag that failed to supply one.
+[[nodiscard]] std::expected<SurfaceEndpoint, std::string> SoleEndpointOf(NodeSurface surface, NodeConfig const& cfg);
 
 /// Every port this configuration would open, as a firewall worksheet.
 ///

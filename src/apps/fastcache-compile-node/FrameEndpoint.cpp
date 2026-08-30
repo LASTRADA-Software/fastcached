@@ -646,20 +646,15 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     // today. The default host arrives with it, which is what stopped each caller
     // choosing its own -- the cache's loopback and the scheduler's wildcard are the
     // anti-leeching rule, and a rule spelled at two call sites is a rule that drifts.
+    // Not served means the spec is empty, or a companion flag that switches this
+    // surface on is unset. Never a malformed address -- `StartupPolicyRejection` walks
+    // the same rows and refuses that by name, echoing what the operator typed, long
+    // before any tier is built.
+    auto const resolved = SoleEndpointOf(surface, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
     auto const& row = RowFor(surface);
-    auto const endpoints = row.resolve(cfg);
-    if (endpoints.empty())
-        // Not served: the spec is empty, or a companion flag that switches this
-        // surface on is unset. Never a malformed address -- `StartupPolicyRejection`
-        // walks the same rows and refuses that by name, echoing what the operator
-        // typed, long before any tier is built.
-        return std::unexpected { std::format("{} names no address to bind", FlagsOf(row).front()) };
-
-    // One, and the assertion is cheap next to what a silent second endpoint would
-    // cost: discovery is the only surface resolving to two and it is UDP, so it
-    // never reaches this factory. A framed surface that grew a second endpoint would
-    // otherwise bind the first and serve nothing on the other.
-    auto const& endpoint = endpoints.front();
 
     auto listener = PlatformListener::Bind(io.Reactor(), endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())

@@ -99,13 +99,13 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
                                                                                 PeerObserver onPeers,
                                                                                 ILogger& logger)
 {
-    auto const beacon = SplitHostPort(cfg.discoveryAddress);
-    if (!beacon.has_value())
+    // The ANNOUNCE address -- where beacons are sent. Only its host is read here; the
+    // port and everything bound come from the row below, so the two cannot disagree.
+    // Through `ParseDialEndpoint` because that is exactly what this is: an address
+    // this node will send to, which must name a host and may not be a bare port.
+    auto const announce = ParseDialEndpoint(cfg.discoveryAddress);
+    if (!announce.has_value())
         return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
-
-    auto const port = ParseTcpPort(beacon->second);
-    if (!port.has_value())
-        return std::unexpected { std::format("--discovery={} names no usable port", cfg.discoveryAddress) };
 
     auto key = ReadClusterKey(cfg.clusterKeyFile);
     if (!key.has_value())
@@ -125,16 +125,25 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // Which socket takes which option is `OpenSharedPortUdpSocket`'s to know, not
     // this function's: there are four of them, each easy to put on the wrong half,
     // and every wrong pairing still starts and still passes a test suite.
-    // The bind host comes from this surface's row, not from a literal spelled here
-    // three times. It is `HostOrigin::Fixed` rather than a default a bare port falls
-    // back to, and the distinction is the one an operator's firewall list turns on:
-    // `--discovery`'s host half is where beacons are SENT, while both sockets bind
-    // the wildcard whatever it says. Reading the announce address as a bind address
-    // would put a broadcast address on a worksheet (#288).
-    auto const& row = RowFor(NodeSurface::Discovery);
-    auto const bindHost = std::string { row.defaultHost };
+    // BOTH sockets come from this surface's row, not from a literal spelled here three
+    // times and a reply port passed around it. The row resolves to exactly the two
+    // endpoints this opens -- beacon first, reply second when one is pinned -- so the
+    // addresses bound here and the ones `--print-surfaces` prints are one computation.
+    // Taking only the host from the row and re-deriving the ports would have left the
+    // resolver dead code for its only production consumer, on the surface with two
+    // endpoints, the only UDP one, and the one operators get wrong most.
+    //
+    // `--discovery`'s host half is where beacons are SENT; both sockets bind the
+    // wildcard whatever it says, and the resolver is where that is enforced.
+    auto const endpoints = RowFor(NodeSurface::Discovery).Resolve(cfg);
+    if (endpoints.empty())
+        return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
 
-    auto socket = OpenSharedPortUdpSocket(bindHost, *port, cfg.discoveryReplyPort);
+    auto const& beaconSocket = endpoints.front();
+    auto const& bindHost = beaconSocket.host;
+    auto const replyPort = endpoints.size() > 1 ? endpoints[1].port : std::uint16_t { 0 };
+
+    auto socket = OpenSharedPortUdpSocket(bindHost, beaconSocket.port, replyPort);
     if (socket == nullptr)
         // Both are named, because either can be the one that failed and this
         // cannot tell which. A message that blamed the beacon port alone would
@@ -142,21 +151,22 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
         return std::unexpected { std::format(
             "cannot bind the UDP sockets discovery needs: {}:{} to listen on, and {} to answer on",
             bindHost,
-            *port,
+            beaconSocket.port,
             cfg.discoveryReplyPort != 0 ? std::format("{}:{}", bindHost, cfg.discoveryReplyPort)
                                         : std::string { "a port of this node's own" }) };
 
     // The port the operator configured, which is NOT the one the pair reports:
     // that is where this node is answered. Both go in the startup line.
-    auto const listeningOn = FormatHostPort(bindHost, *port);
+    auto const listeningOn = FormatHostPort(bindHost, beaconSocket.port);
 
-    auto config = Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
-                                             .nodeId = cfg.nodeId,
-                                             .raftEndpoint = std::string { raftEndpoint },
-                                             .beaconAddress = DatagramAddress { .host = beacon->first, .port = *port },
-                                             .presharedKey = *std::move(key),
-                                             .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
-                                             .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
+    auto config =
+        Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
+                                   .nodeId = cfg.nodeId,
+                                   .raftEndpoint = std::string { raftEndpoint },
+                                   .beaconAddress = DatagramAddress { .host = announce->first, .port = beaconSocket.port },
+                                   .presharedKey = *std::move(key),
+                                   .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
+                                   .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
 
     auto tier = Over(std::move(socket), std::move(config), std::move(onPeers), logger);
 

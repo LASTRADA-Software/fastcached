@@ -116,10 +116,14 @@ namespace
         if (auto const& hostName = host.Facts().hostName; !hostName.empty())
             names.push_back(hostName);
 
-        if (auto const endpoint = ParseEndpoint(cfg.adminListen, AdminListenDefaultHost); endpoint.has_value())
+        // The address this surface will actually bind, from its own row. Derived here
+        // a second time, a certificate could name an address the surface no longer
+        // takes -- and a certificate naming the wrong host is the browser warning this
+        // function exists to avoid.
+        if (auto const endpoints = RowFor(NodeSurface::Admin).Resolve(cfg); !endpoints.empty())
         {
             constexpr std::array<std::string_view, 3> Wildcards { "0.0.0.0", "::", "[::]" };
-            auto const& bindHost = endpoint->first;
+            auto const& bindHost = endpoints.front().host;
             if (!std::ranges::contains(Wildcards, bindHost) && !std::ranges::contains(names, bindHost))
                 names.push_back(bindHost);
         }
@@ -839,11 +843,10 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
     // Resolved by the row, so the loopback default that decides whether a credential
     // is required is the same value this actually binds. A malformed address cannot
     // arrive: `StartupPolicyRejection` walks these rows and refuses it by name first.
-    auto const& row = RowFor(surface);
-    auto const endpoints = row.resolve(cfg);
-    if (endpoints.empty())
-        return std::unexpected { std::format("{} names no address to bind", FlagsOf(row).front()) };
-    auto const& endpoint = endpoints.front();
+    auto const resolved = SoleEndpointOf(surface, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
 
     auto listener = BlockingListener::Bind(endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())
