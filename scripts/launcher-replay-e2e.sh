@@ -240,15 +240,32 @@ if [ "$canary" = "1" ]; then
     # link, the binary runs, and the suite reports it. It does not simulate the
     # cache producing that object -- nothing external can arrange that without
     # forging a key -- so the injection is done where the effect is identical.
-    victim_src="$(python3 - "${workdir}/warm/compile_commands.json" <<'PY'
-import json, sys
+
+    # The link command comes first, because it is what decides which translation
+    # unit is worth poisoning. Picking the first `_test.cpp` in the compile
+    # database picked `src/CowTree/BasicCowTree_test.cpp` -- a unit of the
+    # `CowTreeTests` target, which `fastcache-cc-tests` does not link. The
+    # canary was then compiled, written and linked over nothing at all, the
+    # suite passed exactly as before with the same 537 cases, and the fixture
+    # reported "the suite PASSED with a wrong object linked in": a true
+    # observation attached to a false claim, since no wrong object was linked.
+    link_cmd="$(ninja -C "${workdir}/warm" -t commands "$target" | tail -1)"
+    [ -n "$link_cmd" ] || fail "canary: could not obtain the link command for ${target}"
+
+    victim_src="$(python3 - "${workdir}/warm/compile_commands.json" "$link_cmd" <<'PY'
+import json, re, sys
 db = json.load(open(sys.argv[1]))
+link = sys.argv[2]
 for entry in db:
-    if entry["file"].endswith("_test.cpp"):
+    if not entry["file"].endswith("_test.cpp"):
+        continue
+    cmd = entry.get("command") or " ".join(entry["arguments"])
+    m = re.search(r"-o\s+(\S+)", cmd)
+    if m and m.group(1) in link:
         print(entry["file"]); break
 PY
 )"
-    [ -n "$victim_src" ] || fail "canary: no test translation unit found in the compile database"
+    [ -n "$victim_src" ] || fail "canary: no test translation unit of ${target} found in the compile database"
 
     victim_cmd="$(python3 - "${workdir}/warm/compile_commands.json" "$victim_src" <<'PY'
 import json, sys
@@ -272,6 +289,7 @@ PY
 
     # A copy that differs from the source the object claims to be built from.
     # Appended rather than edited, so it cannot depend on the file's contents.
+    canary_marker="launcher-replay canary: this object does not match its source"
     cp "$victim_src" "${workdir}/canary.cpp"
     cat >> "${workdir}/canary.cpp" <<'EOF'
 
@@ -286,8 +304,22 @@ EOF
     # difference from the real object is the source it came from.
     canary_cmd="${victim_cmd/${victim_src}/${workdir}/canary.cpp}"
     canary_cmd="${canary_cmd//${launcher} /}"
+    # The copy compiles from the workdir, so a quoted include no longer resolves
+    # relative to the file that writes it -- `#include "CmdLine.hpp"` next to the
+    # original is a fatal error next to the copy. The unit's own directory joins
+    # the search path rather than the copy joining the source tree: this fixture
+    # writes nothing into the checkout it is testing.
+    canary_cmd="${canary_cmd} -I$(dirname "$victim_src")"
     (cd "${workdir}/warm" && eval "$canary_cmd") > "${workdir}/canary.compile" 2>&1 \
         || { tail -20 "${workdir}/canary.compile" >&2; fail "canary: the wrong object would not compile"; }
+
+    # The injection is asserted, not assumed. Every way of poisoning nothing --
+    # a substitution that did not fire, an `-o` that named a path this build
+    # does not use, a unit belonging to another target -- ends with a compile
+    # that succeeded and an object that is not the one under test, and the run
+    # that follows is then indistinguishable from a healthy one.
+    LC_ALL=C grep -qa "$canary_marker" "${workdir}/warm/${victim_obj}" \
+        || fail "canary: ${victim_obj} does not contain the canary case, so nothing was poisoned"
 
     # Linked directly, NOT through `cmake --build`, and this was found by probing
     # rather than reasoning: ninja records each output's mtime in `.ninja_log`, so
@@ -297,10 +329,10 @@ EOF
     # link command ninja would run and running only that bypasses the dirty check,
     # which is also the truer simulation: a wrong cached object is one the build
     # system has no reason to touch again.
-    link_cmd="$(ninja -C "${workdir}/warm" -t commands "$target" | tail -1)"
-    [ -n "$link_cmd" ] || fail "canary: could not obtain the link command for ${target}"
     (cd "${workdir}/warm" && eval "$link_cmd") > "${workdir}/canary.link" 2>&1 \
         || { tail -20 "${workdir}/canary.link" >&2; fail "canary: the relink failed, so the suite never ran"; }
+    LC_ALL=C grep -qa "$canary_marker" "$warm_bin" \
+        || fail "canary: the relinked ${target} does not contain the canary case, so the injected object did not reach the link"
 
     if "$warm_bin" > "${workdir}/canary.tests" 2>&1; then
         tail -20 "${workdir}/canary.tests" >&2
