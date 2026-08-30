@@ -12,6 +12,39 @@ determinism rests on.
 
 `scripts/local-gate.sh` is the gate. Run it before pushing.
 
+- **A hygiene script `ctest` runs is constrained to bash 3.2, because macOS ships
+  bash 3.2.** Apple has not shipped bash 4 since the licence change, so `/bin/bash`
+  on the macOS runner is from 2007. A script registered in the **default** ctest
+  set runs on every platform CI builds, and the constraint is invisible from the
+  Linux box such scripts are written on. The bash-4 constructs to avoid are few
+  and worth knowing by name:
+
+  | avoid | use |
+  |---|---|
+  | `mapfile` / `readarray` | `while IFS= read -r x; do a+=("$x"); done < <(...)` |
+  | `declare -A` | parallel arrays, or a `case` |
+  | `${var^^}` / `${var,,}` | `tr '[:lower:]' '[:upper:]'` |
+  | `local -n` | pass the value, or use a global with a stated name |
+
+  Keep the **process substitution** when replacing `mapfile`: a pipeline into the
+  loop reintroduces the `pipefail` trap recorded below, where a `grep` that matches
+  nothing takes the script down.
+
+  This is the section's own subject arriving through a door it did not name.
+  `merge-queue-contexts` used `mapfile`, passed everywhere it was developed, and
+  failed only on `macOS-clang-release` with `mapfile: command not found`. And the
+  constraint was **already known**: `scripts/coverage.sh` carries a comment saying
+  exactly this, in a place only a reader of `coverage.sh` would find it. A lesson
+  recorded where it cannot be reached by the next person who needs it has not been
+  recorded. `scripts/tidy-sweep.sh` uses `mapfile` and `declare -A` and is fine, but
+  only because the `clang-tidy` job pins `ubuntu-24.04` -- so moving that logic into
+  a script `ctest` runs would break it the same way. The same holds for the
+  `mapfile` and `declare -A` inside `pr-labels.yml`.
+
+  It is also a live instance of [#336](https://github.com/LASTRADA-Software/fastcached/issues/336):
+  `local-gate.sh` cannot run in an agent-created Windows worktree, so nothing
+  exercised this before CI did.
+
 - **A local gate cannot see a configuration it does not build, and advice nobody
   runs is not a gate.** `scripts/local-gate.sh` is that advice as a script:
   clang-format at the pinned version, then `clang-debug` and `gcc-release`, refusing
@@ -969,6 +1002,122 @@ and every heavy job is gated on it.
   asks whether a job ran, so a job that no-ops on a docs change still counts. The
   `changes` job is itself a row there. On a tag or a push the classifier answers
   `code=true` unconditionally, so nothing is ever skipped underneath a release.
+
+## A merge queue is a third door to the same never-arrives failure
+
+`strict_required_status_checks_policy: true` means every merge puts every other
+open branch behind, so the matrix is paid once per pull request **per merge that
+lands while it is open**. Measured: 77 `build.yml` runs to land about ten pull
+requests in one night, 25 of them cancelled. A merge queue is what that shape
+calls for.
+
+It is not a ruleset checkbox. **A merge queue dispatches the `merge_group` event,
+and a workflow that does not listen for it produces no check run at all** — so a
+required context never reports and a queued pull request does not fail, it sits
+there. Same failure as `paths-ignore` above, third door. And it presents as the
+feature working, right up until the first pull request enters the queue.
+
+- **Both workflows must trigger on it, not just the obvious one.** `Require a type
+  label` is required and lives in `pr-labels.yml`, which is `pull_request_target`
+  — an event a queue **does not produce at all**. That is not a missing row in an
+  `on:` list; the whole workflow is built around an event that is not there, for
+  the security reason its header states, which must not be undone. The gate job
+  therefore runs on both events and its queue leg says what it checked.
+- **What a queue leg may legitimately assert is narrower than what a pull-request
+  leg asserts, and it has to SAY so.** The queue branch is
+  `gh-readonly-queue/master/pr-<n>-<sha>`, so the pull request can usually be
+  recovered and the label re-checked for real — which catches the one thing entry
+  to the queue cannot, a label removed while the entry was waiting. When the ref
+  names none, that is stated and the leg passes on what entry proved. A leg that
+  passes because something else already checked is fine; a leg that passes and
+  does not say why is a stub, and reads exactly like a working gate.
+- **A skipped job REPORTS, and a skipped required context is read as passing.**
+  Measured here, on the head of the docs-only #356 (`b4777aa`): `Check C++ style`,
+  `clang-tidy` and `macOS-clang-release` — all three required — each produced a
+  check run with `conclusion: skipped`, and the pull request merged. The opposite
+  claim is *also* true, of a different situation, which is why both get made: a
+  skipped **matrix** job never expands, so its per-leg contexts never exist and
+  nothing reports at all. On that same commit `Linux-*` and `Windows-*` came back
+  `success`, because those are gated on their steps for exactly that reason. One
+  hangs, one passes; the difference is the matrix.
+- **So a dependency's failure must not be allowed to skip a required gate.**
+  `apply` is skipped inside a queue — there is no pull request to label — and a
+  skipped dependency skips its dependents by default, which by the above is not a
+  stall but a **stub**: green, and indistinguishable from a working gate. The same
+  holds when `apply` *fails*: a condition excluding that result skips the gate, the
+  skip reads green, and a pull request with no `type/` label becomes mergeable
+  because the labeler broke. `Apply derivable labels` is not itself required, so
+  nothing else closes it. The gate does not need `apply` to have succeeded — it
+  reads the labels **fresh** from the API, so a human-applied label is readable
+  either way — so the condition is `if: ${{ !cancelled() }}` and the gate checks
+  for real. `!cancelled()` and not `always()`, which runs even when the run is
+  being cancelled; any status function already overrides the `needs:` success
+  requirement.
+- **Check the concurrency key.** `pr-labels-${{ github.event.pull_request.number }}`
+  collapses to the constant `pr-labels-` on `merge_group`, and with
+  `cancel-in-progress` each queue entry then cancels the one before it. A
+  cancelled required context is not a reported one. `build.yml`'s key is
+  `github.ref`, which inside a queue is the temporary branch and is already unique
+  per entry — but that is now load-bearing rather than incidental.
+- **State the event in the scope classifier rather than letting it fall through.**
+  `merge_group` reached `code=true` through the `changes` job's non-pull-request
+  default. Correct, by accident, with nothing recording that anything depended on
+  it. A merge candidate builds everything **by design**: it could be scoped, since
+  `merge_group.base_sha...head_sha` is a real diff, but a batched group is built on
+  top of the entries ahead of it, and the saving is one matrix per *merged* pull
+  request — not the re-runs this queue exists to remove.
+- **A failing queue entry is ejected, not merged, and the branch is fine.** GitHub
+  removes the pull request from the queue, comments on it naming the failed check,
+  and deletes the temporary branch; the pull request's own head is untouched and it
+  can be fixed and re-queued. Nothing needs cleaning up by hand. The one thing to
+  know is that the failure is reported on the *queue* run, so a red check on a
+  merged-looking pull request wants the `merge_group` run, not the `pull_request`
+  one.
+- **Adding a JOB to `build.yml` for this would drag the release behind it**, since
+  `check-release-gate` asserts every job there appears in `release.needs`. So this
+  is triggers and existing jobs only — which is also why `pr-labels.yml` is a
+  separate workflow in the first place, as its own header records.
+- **And the workflow must not invert its own script's principle one level up.**
+  `ci-scope.sh` says every way of not knowing escalates to `code=true`. The
+  workflow reading it said `if: needs.changes.outputs.code == 'true'`, so a
+  `changes` job that **failed** published no output, the comparison was false,
+  sixteen jobs were skipped — and by the measurement above a skipped required
+  context reads as passing, while `changes` is not itself required. A green,
+  mergeable pull request that nothing had compiled: exactly what `ci-scope.sh`'s
+  own header warns about, arriving through the workflow rather than the script.
+  Every condition is now `!= 'false'`, so *did not answer* means build-everything,
+  and every job that consults the classifier carries `!cancelled()` so a failed
+  dependency cannot skip it before its condition is read.
+
+  **The repository had been relying on the matrix trap to save it here, and no
+  longer is.** With `linux` and `windows` step-gated and carrying no job-level
+  condition, a failed `changes` skipped them too — and being matrices their
+  per-leg contexts never existed, so the pull request *hung* instead of merging
+  green. That accident was the only thing standing between a dead classifier and
+  a merged, uncompiled change. Both matrix jobs now carry `if: ${{ !cancelled() }}`,
+  which is the one job-level condition on a matrix job that is safe: it is false
+  only while the run is being cancelled, so the matrix **always expands and every
+  leg reports under its real name** — the exact opposite of relying on
+  non-expansion. **The dependency on the accident is gone, not reduced.** Do not
+  reintroduce a job-level `if:` on either believing the accident is still there to
+  catch you — it is not, and it never should have been load-bearing.
+
+  `ctest -R gated-jobs-fail-safe` (`scripts/check-gated-jobs.sh`) asserts both
+  rules, derived from the workflow rather than tabulated, so the seventeenth job
+  cannot be added wrong. `release` needs `changes` too and is excluded by
+  construction: it never reads the classifier's output. What it proves is the
+  **shape** of the conditions — the `changes` job cannot be made to fail on
+  demand, so the behaviour it relies on is the `b4777aa` measurement above rather
+  than a demonstration.
+
+`ctest -R merge-queue-contexts` (`scripts/check-merge-queue-contexts.sh`) asserts
+all of it from the workflow files, because the property cannot be demonstrated
+before the fact: a `merge_group` event only exists once a queue is enabled, and a
+queue that stalls is the outcome being avoided. It derives which job produces
+which context rather than tabulating it — a second hand-written list is not a
+cross-check, it is a second thing to be wrong — and the only copied datum is the
+required-context list itself, whose provenance and the `gh api` call that reads
+the live one are in the script header.
 
 ## Open work
 

@@ -34,8 +34,27 @@ on:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
     branches: [master]
+  # The merge queue's event, and the whole reason #351 was not a ruleset
+  # checkbox. Without this row every required context in this file would simply
+  # never report inside a queue, and a queued pull request would sit there
+  # forever rather than fail -- the identical never-arrives failure as a
+  # `paths-ignore` filter on a required check, arriving through a different door.
+  # A queue that enables cleanly and then hangs on a context nothing produces
+  # presents as the feature working until the first pull request enters it.
+  #
+  # `branches:` filters on the queue's BASE ref, so this says the same "only for
+  # master" as the `pull_request` row above.
+  merge_group:
+    branches: [master]
 
 concurrency:
+  # Inside a queue `github.ref` is the temporary branch
+  # `refs/heads/gh-readonly-queue/master/pr-<n>-<sha>`, which is unique per queue
+  # entry -- so `cancel-in-progress` cannot make one entry cancel another. That
+  # is load-bearing rather than incidental: a group key that collapsed the
+  # entries together would cancel the very run the queue is waiting on, and a
+  # cancelled required context is not a reported one. Anything that changes this
+  # key has to keep queue entries apart.
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
@@ -72,7 +91,7 @@ jobs:
     name: "Check C++ style"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -161,34 +180,71 @@ jobs:
           # depth-1 clone does not contain.
           fetch-depth: 0
 
-      # A push or a tag has no pull-request base to diff against, and inventing
-      # one would be guessing. Those events build everything, which is also what
-      # makes the `release` job safe: on a tag nothing below is ever skipped.
+      # One arm per event, and `merge_group` has its own rather than falling
+      # through, because it reached the right answer here by accident and an
+      # accidentally-correct behaviour is one refactor away from being an
+      # accidentally-wrong one (#351).
       - id: classify
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            scripts/ci-scope.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
-          else
-            echo "not a pull request (${{ github.event_name }}); building everything" >&2
-            echo "code=true" | tee -a "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request)
+              scripts/ci-scope.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
+              ;;
+            merge_group)
+              # A merge candidate builds everything, deliberately.
+              #
+              # It COULD be scoped: `merge_group.base_sha...head_sha` is a real
+              # diff and this script would classify it. Two reasons not to.
+              #
+              # A batched group is built on top of the entries ahead of it, so a
+              # documentation-only entry stacked behind a code entry has a
+              # docs-only diff of its own -- scoping there means reasoning about
+              # a batch shape GitHub chooses and can change.
+              #
+              # And the saving is not the one this queue was added for. The
+              # churn #351 measured is the RE-runs forced on every other open
+              # branch by `strict_required_status_checks_policy`, not the single
+              # run that lands a change. Trading the queue's one guarantee --
+              # that what merges is what was tested, against the head it lands on
+              # -- for at most one matrix per merged pull request is a bad price.
+              echo "merge candidate ${{ github.event.merge_group.head_ref }}: building everything, by design (#351)" >&2
+              echo "code=true" | tee -a "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # A push or a tag has no pull-request base to diff against, and
+              # inventing one would be guessing. Those events build everything,
+              # which is also what makes the `release` job safe: on a tag nothing
+              # below is ever skipped.
+              echo "not a pull request (${{ github.event_name }}); building everything" >&2
+              echo "code=true" | tee -a "$GITHUB_OUTPUT"
+              ;;
+          esac
 
   linux:
     name: "Linux-${{ matrix.preset }}"
     runs-on: ubuntu-24.04
     needs: changes
+    # A job-level condition on a MATRIX job is the shape #300 warns about, and
+    # this is the one form of it that is safe: `!cancelled()` is false only while
+    # the RUN is being cancelled, so the matrix always expands and every leg
+    # reports under its real name. It is here so that a FAILED `changes` cannot
+    # skip this job -- which, being a matrix, would take its per-leg required
+    # contexts out of existence entirely. The step conditions below still decide
+    # whether any work happens.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
         preset: [clang-release, gcc-release]
     steps:
       - uses: actions/checkout@v4
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         with:
           fetch-depth: 0
 
       - name: "Cache CPM packages"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
@@ -196,7 +252,7 @@ jobs:
           restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
 
       - name: "ccache"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-${{ matrix.preset }}
@@ -205,13 +261,13 @@ jobs:
       # libssl-dev + openssl: TLS is built and tested (the tls-smoke CTest uses
       # the openssl CLI) in every platform job, not a dedicated one.
       - name: "Install build tools"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
-        if: needs.changes.outputs.code == 'true' && (startsWith(matrix.preset, 'clang'))
+        if: ${{ needs.changes.outputs.code != 'false' && (startsWith(matrix.preset, 'clang')) }}
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -221,7 +277,7 @@ jobs:
           sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
 
       - name: "Install GCC ${{ env.GCC_VERSION }}"
-        if: needs.changes.outputs.code == 'true' && (startsWith(matrix.preset, 'gcc'))
+        if: ${{ needs.changes.outputs.code != 'false' && (startsWith(matrix.preset, 'gcc')) }}
         run: |
           sudo apt-get install -y gcc-${{ env.GCC_VERSION }} g++-${{ env.GCC_VERSION }}
           sudo ln -sf /usr/bin/gcc-${{ env.GCC_VERSION }} /usr/local/bin/gcc
@@ -239,24 +295,24 @@ jobs:
       # flags (issue #84). A target nothing compiles is a target that rots, and
       # that is what it looks like when nobody notices.
       - name: "Configure"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: >-
           cmake --preset ${{ matrix.preset }} -DFASTCACHED_ENABLE_TLS=ON
           -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 
       - name: "Build"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: cmake --build --preset ${{ matrix.preset }}
 
       - name: "Test"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: ctest --preset ${{ matrix.preset }}
 
       # Both binaries the smoke jobs drive: the daemon every job starts, and the
       # launcher the compile-cache smoke job points at it. They share a parent
       # directory, so the artifact keeps them side by side at its root.
       - name: "Upload Linux binaries for the smoke jobs"
-        if: needs.changes.outputs.code == 'true' && (matrix.preset == 'clang-release')
+        if: ${{ needs.changes.outputs.code != 'false' && (matrix.preset == 'clang-release') }}
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-linux
@@ -292,7 +348,7 @@ jobs:
     name: "clang-tidy"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       # fetch-depth: 0 is load-bearing here for a second reason beyond the one
       # at the top of this file: the sweep diffs against the pull request's base
@@ -387,7 +443,7 @@ jobs:
     name: "clang-asan-ubsan"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -509,7 +565,7 @@ jobs:
     name: "clang-tsan"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # The gate bounds each test binary itself, which names the target that stalled;
     # this bounds the build as well, so a hang anywhere in the job stops in an hour
     # rather than at GitHub's six-hour default. Every wait is bounded.
@@ -635,7 +691,7 @@ jobs:
     name: "Code coverage"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Read here rather than in each step's `if`, because the `secrets` context is
     # not available in a step-level condition while `env` is. Empty on a pull
     # request from a fork, where GitHub withholds secrets — which is exactly the
@@ -768,7 +824,7 @@ jobs:
     name: "macOS-clang-release"
     runs-on: macos-14
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -828,7 +884,7 @@ jobs:
     name: "Docker image"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -866,7 +922,7 @@ jobs:
     name: "sccache smoke (memcached text)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -889,7 +945,7 @@ jobs:
     name: "sccache smoke (memcached binary)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -922,7 +978,7 @@ jobs:
     name: "sccache smoke (redis RESP2)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -952,7 +1008,7 @@ jobs:
     name: "fastcache-cc smoke (compile-cache 0xFC)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -982,6 +1038,14 @@ jobs:
     name: "Windows-${{ matrix.preset }}"
     runs-on: windows-2025
     needs: changes
+    # A job-level condition on a MATRIX job is the shape #300 warns about, and
+    # this is the one form of it that is safe: `!cancelled()` is false only while
+    # the RUN is being cancelled, so the matrix always expands and every leg
+    # reports under its real name. It is here so that a FAILED `changes` cannot
+    # skip this job -- which, being a matrix, would take its per-leg required
+    # contexts out of existence entirely. The step conditions below still decide
+    # whether any work happens.
+    if: ${{ !cancelled() }}
     # The Windows jobs were the second-biggest block in this workflow — 21.2 and
     # 15.7 minutes, of which 17.2 and 11.8 were the build — and they were paying
     # a full cold compile every single run. Measured on run 33243524509: sccache
@@ -1028,12 +1092,12 @@ jobs:
         preset: [cl-release, clangcl-release, cl-debug]
     steps:
       - uses: actions/checkout@v4
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         with:
           fetch-depth: 0
 
       - name: "Cache CPM packages"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: actions/cache@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
@@ -1046,11 +1110,11 @@ jobs:
       # SCCACHE_GHA_ENABLED set is the failure this whole block exists to stop —
       # a cache that is configured, announced, and inert.
       - name: "sccache"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: "Install ninja"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: choco install ninja --no-progress
 
       # Pin the MSVC toolset to 14.44. The windows-2025 image moved to VS 18 /
@@ -1060,7 +1124,7 @@ jobs:
       # toolset clang-cl 20.1.8 accepts and the version CI was green on before
       # the image bump; cl-release builds against it equally well.
       - name: "Setup MSVC dev environment"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: ilammy/msvc-dev-cmd@v1
         with:
           toolset: "14.44"
@@ -1069,14 +1133,14 @@ jobs:
       # (vcpkg is the local-dev path; CI uses the runner's OpenSSL to avoid a
       # from-source build). Quoted because the path contains a space.
       - name: "Configure"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: >
           cmake --preset ${{ matrix.preset }}
           -DFASTCACHED_ENABLE_TLS=ON
           "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
 
       - name: "Build"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: cmake --build --preset ${{ matrix.preset }}
 
       # A compiler cache that handled nothing is worse than one that is off,
@@ -1109,7 +1173,7 @@ jobs:
       # handled — the E2E job, which runs no ctest, reported 231 requests from the
       # same configuration. A number read after `Test` is somebody else's.
       - name: "Assert sccache actually handled the build"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         shell: pwsh
         run: |
           & $env:SCCACHE_PATH --show-stats
@@ -1128,11 +1192,11 @@ jobs:
           }
 
       - name: "Test"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: ctest --preset ${{ matrix.preset }}
 
       - name: "Upload fastcached.exe"
-        if: needs.changes.outputs.code == 'true'
+        if: ${{ needs.changes.outputs.code != 'false' }}
         uses: actions/upload-artifact@v4
         with:
           name: fastcached-windows-${{ matrix.preset }}
@@ -1155,7 +1219,7 @@ jobs:
     name: "compile-cache E2E (Linux)"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1219,7 +1283,7 @@ jobs:
     name: "compile-cache E2E (Windows)"
     runs-on: windows-2025
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Same backend, same version, same reasons as the `windows` job above, where
     # they are written out. This job builds the same cl-release configuration, so
     # it also hits entries that job stored.
@@ -1306,7 +1370,7 @@ jobs:
     name: "Package (Linux .deb/.rpm)"
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1606,7 +1670,7 @@ jobs:
     name: "Package (macOS .pkg)"
     runs-on: macos-15
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1887,7 +1951,7 @@ jobs:
     name: "Package (Windows .msi)"
     runs-on: windows-2025
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Same backend, same version, same reasons as the `windows` job above, where
     # they are written out.
     env:

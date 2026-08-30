@@ -35,6 +35,20 @@
 #
 # So: an unresolvable diff, an empty diff, an unreadable ref, a path with no
 # matching row — every one of them is `code=true`.
+#
+# ## Who asks, and who deliberately does not
+#
+# The `changes` job asks this only for a `pull_request`. A `merge_group` — the
+# merge queue's event — does NOT reach here: it has its own arm in that job, which
+# answers `code=true` without consulting this table.
+#
+# That is worth stating from this end too, because before #351 the queue's event
+# reached the right answer by falling through the job's non-pull-request default.
+# The answer was correct and nothing recorded that anything depended on it, so a
+# later tidy-up of that fallback would have silently made every heavy job skip
+# inside a queue. An accidentally-correct behaviour is one refactor away from an
+# accidentally-wrong one. `ctest -R merge-queue-contexts` now fails if that arm
+# goes away.
 
 set -euo pipefail
 

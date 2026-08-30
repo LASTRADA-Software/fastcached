@@ -561,6 +561,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
+  script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
+  process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
+  `coverage.sh`'s comments, where nobody looking at a new script would find it.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable
   declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
   boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy
@@ -620,6 +624,24 @@ what differs between compilers, standard libraries, hosts and tool versions.
   **job** level instead — a skipped job still reports, and `scripts/ci-scope.sh`
   (tested by `ctest -R ci-scope`) is what decides, escalating every way of not
   knowing to "build everything".
+- A **merge queue** is the third door to that same never-arrives failure: it dispatches `merge_group`, and a workflow
+  not listening for it produces no check run, so a queued PR *sits there*. `pr-labels.yml` is the sharp case —
+  `pull_request_target` does not fire on `merge_group` at all, so its gate needs a queue leg that STATES what it
+  checked, or it is a stub that reads like a working gate. Check the concurrency key too (a PR-number key collapses to
+  a constant and each entry cancels the last), state `merge_group` in the scope classifier rather than falling through,
+  and add no JOB to `build.yml` — `check-release-gate` would drag the release behind it.
+  `ctest -R merge-queue-contexts` asserts all eleven required contexts can report.
+- A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING — measured: three required contexts came
+  back `skipped` on `b4777aa`, which merged. A skipped **matrix** job is the opposite: it never expands, so its
+  per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.
+  So never let a dependency's failure skip a required gate — the skip reads green. `if: ${{ !cancelled() }}`, and
+  check for real. Not `always()`, which runs even while the run is being cancelled.
+- A workflow must not invert its own script's principle one level up: `ci-scope.sh` escalates every way of not
+  knowing to build-everything, and the workflow read it as `== 'true'` — so a FAILED `changes` published no
+  output, sixteen jobs skipped, and the skips read green. `!= 'false'` everywhere, plus `!cancelled()` on every
+  job that consults it. The matrix trap had been the only thing saving this (a skipped matrix job hangs rather
+  than passing); it is no longer load-bearing, so do not reintroduce a job-level `if:` on `linux`/`windows`
+  believing it will catch you. `ctest -R gated-jobs-fail-safe` asserts both rules, derived not tabulated.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
