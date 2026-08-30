@@ -736,7 +736,7 @@ absolute paths in its text regions
 follow, and each is a rule of its own:
 
 - **A policy every server must apply belongs with the thing it applies to, not with
-  one of the servers.** `CanonicalizeStoredRegions` now lives beside `CompileValue`
+  one of the servers.** `CanonicalStoredValue` now lives beside `CompileValue`
   and both servers call it. It had been a file-local helper in
   `Protocol/CompileCacheHandler`, so when a second server appeared there was one
   copy and no way to notice the other end lacked it — `grep` for the function

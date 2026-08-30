@@ -236,7 +236,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   every counter read normally. What a test must separate is the two ends **disagreeing**;
   "it round-trips" passes under the bug.
 - A stored value's text regions are canonicalized by **every** server on this wire,
-  through the one `CanonicalizeStoredRegions` beside `CompileValue` — a node serves it
+  through the one `CanonicalStoredValue` beside `CompileValue` — a node serves it
   too since #229, and the copy it lacked left every value it stored carrying the
   producing checkout's absolute paths. A replayed region becomes the object's
   dependency record, so those never invalidate. A path with no `<SRCROOT>` sentinel is

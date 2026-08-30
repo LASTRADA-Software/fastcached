@@ -516,19 +516,10 @@ struct ManifestInputs
 ///               object key.
 /// @param layout This build's roots.
 /// @return The manifest, or a ManifestFailure naming the offending path and which
-///         of the four faults it was.
+///         of `FaultTable`'s faults it was.
 [[nodiscard]] std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs,
                                                                            PathCanon::Layout const& layout);
 
-/// Re-check every entry against the filesystem.
-///
-/// Localizes each canonical path to this machine and compares a fresh content
-/// hash with the recorded one. Any mismatch, missing file, or stamp change means
-/// the cached object may not correspond to today's headers.
-/// @param manifest       The recorded manifest.
-/// @param layout         This machine's roots.
-/// @param toolchainStamp This machine's current toolchain identity.
-/// @return True when every entry still matches and the stamp agrees.
 /// Whether a manifest asserts nothing at all about the files it was recorded from.
 ///
 /// One owner for a rule two places have to act on: `ValidateManifest` refuses such a
@@ -550,6 +541,20 @@ struct ManifestInputs
 /// @return True when it has no entries.
 [[nodiscard]] bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept;
 
+/// Re-check every entry against the filesystem.
+///
+/// Localizes each canonical path to this machine and compares a fresh content
+/// hash with the recorded one. Any mismatch, missing file, or stamp change means
+/// the cached object may not correspond to today's headers.
+///
+/// A manifest that `ManifestAssertsNothing` reports on is refused before either
+/// question is asked: `all_of` over no entries is true, so such a manifest does not
+/// pass the filesystem check, it skips it.
+/// @param manifest       The recorded manifest.
+/// @param layout         This machine's roots.
+/// @param toolchainStamp This machine's current toolchain identity.
+/// @return True when the manifest asserts something, every entry still matches and
+///         the stamp agrees.
 [[nodiscard]] bool ValidateManifest(DirectManifest const& manifest,
                                     PathCanon::Layout const& layout,
                                     std::string_view toolchainStamp);

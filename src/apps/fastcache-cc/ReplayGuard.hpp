@@ -70,7 +70,7 @@ namespace FastCache::Cc
 ///   neither re-keyed nor probed; `Cc::IsDriveRelativeUnderNoRoot` refuses to cache
 ///   such a compile at all (issue #104), so no entry written since carries one.
 ///   Entries written BEFORE it were a residual in their own right, and closing that is
-///   what `manifest-v6` is for (issue #111): the authoritative refusal runs after
+///   what `manifest-v5` is for (issue #111): the authoritative refusal runs after
 ///   `TryDirectMode`, and the earlier command-line one can only see a path an argument
 ///   carries, so a pre-fix manifest for a TU whose drive-relative header arrived some
 ///   other way — an `#include "C:foo/x.h"` written out in the source, a fused flag

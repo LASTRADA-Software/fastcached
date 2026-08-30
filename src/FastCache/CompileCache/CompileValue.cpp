@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
+#include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <array>
+#include <optional>
 #include <ranges>
 #include <utility>
 
