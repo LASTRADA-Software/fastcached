@@ -35,17 +35,43 @@ on:
     # label it was complaining about, and nothing would ever re-run it.
     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
+  # `Require a type label` is a REQUIRED context, so it has to report inside a
+  # merge queue as well (#351) -- and this is not a matter of adding a row to an
+  # existing trigger list. `pull_request_target` does not fire on `merge_group`
+  # at all, so the whole workflow is built around an event the queue does not
+  # produce. The security note above is why it cannot simply become
+  # `pull_request`, and it stays true under this trigger too: a `merge_group` run
+  # takes the workflow from the base branch, and nothing here checks anything out.
+  #
+  # The gate could not be made a job in build.yml instead: `check-release-gate`
+  # asserts every job there appears in `release.needs`, so moving it would make
+  # cutting a release depend on pull-request labelling. That is the same reason
+  # this workflow exists separately at all, recorded above.
+  merge_group:
+    branches: [master]
+
 # Default to nothing; each job names what it needs.
 permissions: {}
 
 concurrency:
-  group: pr-labels-${{ github.event.pull_request.number }}
+  # Two keys because there are two events, and getting this wrong is silent: on
+  # `merge_group` there is no `github.event.pull_request`, so a key naming only
+  # its number would collapse to the constant `pr-labels-` for EVERY queue entry
+  # and `cancel-in-progress` would then have each entry cancel the one before it.
+  # A cancelled required context is not a reported one, and the queue would stall
+  # on exactly the check this trigger was added to deliver.
+  group: pr-labels-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:
   apply:
     name: "Apply derivable labels"
     runs-on: ubuntu-24.04
+    # There is no pull request to label inside a queue, and this job is not a
+    # required context, so it reports `skipped` there and the gate below runs
+    # anyway. It must not be reached by a `merge_group` run: every step here
+    # addresses `$PR`, which would be empty.
+    if: github.event_name == 'pull_request_target'
     permissions:
       contents: read
       pull-requests: write
@@ -221,6 +247,16 @@ jobs:
   gate:
     name: "Require a type label"
     needs: apply
+    # `apply` is skipped inside a queue, and a skipped dependency skips its
+    # dependents by default -- which would leave this REQUIRED context reporting
+    # `skipped` there. GitHub accepts that as passing, so the queue would not
+    # hang; it would report a stub, which is indistinguishable from a working
+    # gate and is exactly the shape this repository keeps a rulebook about. So
+    # the job runs, and its merge_group leg says what it checked.
+    #
+    # `always()` is scoped rather than blanket: a genuine `apply` failure or a
+    # cancellation still stops this.
+    if: ${{ always() && needs.apply.result != 'failure' && needs.apply.result != 'cancelled' }}
     runs-on: ubuntu-24.04
     permissions:
       pull-requests: read
@@ -230,26 +266,80 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          # `refs/heads/gh-readonly-queue/master/pr-358-<base sha>` inside a
+          # queue, empty otherwise.
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         run: |
           set -euo pipefail
 
-          # Read the labels fresh rather than from the event payload: `apply`
-          # may have added one seconds ago, and the payload is a snapshot taken
-          # before this workflow started.
-          mapfile -t found < <(gh pr view "$PR" --repo "$REPO" --json labels \
-            --jq '.labels[].name | select(startswith("type/"))')
-
           valid="type/bug type/feature type/refactor type/perf type/docs type/test type/chore"
-          case "${#found[@]}" in
-            1)
-              echo "type: ${found[0]}"
+
+          # Which pull requests this run is answering for. One on a
+          # `pull_request_target`; whatever the queue branch names on a
+          # `merge_group`, which is one entry today and is written to survive a
+          # batched ref naming several.
+          numbers=()
+          if [[ -n "$PR" ]]; then
+            numbers=("$PR")
+          elif [[ -n "$QUEUE_REF" ]]; then
+            # A merge candidate's label was already established as a condition of
+            # the pull request being mergeable at all, so the honest question here
+            # is not "is this labelled" but "can this run still SEE the pull
+            # request it is answering for". When it can -- and the queue branch
+            # names it -- the check is re-run for real, which catches the one
+            # thing entry cannot: a label removed while the entry sat in the
+            # queue. When it cannot, that is stated and the run passes on what
+            # entry proved, rather than inventing an assertion it cannot make.
+            #
+            # `mapfile < <(grep ...)` and not `grep | mapfile`: a `grep` that
+            # matches nothing exits 1, and in a PIPELINE under `pipefail` that
+            # would take the whole step down. Process substitution reports
+            # `mapfile`'s status, so "no match" arrives as an empty array, which
+            # is the case handled immediately below. (The inverse trap --
+            # `producer | grep -q` reporting the producer's SIGPIPE status -- is
+            # in .agent/rules/build-and-toolchain.md.)
+            mapfile -t numbers < <(grep -oE 'pr-[0-9]+' <<< "$QUEUE_REF" | cut -d- -f2)
+            if [[ ${#numbers[@]} -eq 0 ]]; then
+              echo "::notice::merge candidate '$QUEUE_REF' names no pull request, so the type label cannot be re-derived here. It was verified as a condition of entering the queue; this leg reports that and nothing more."
               exit 0
-              ;;
-            0)
-              echo "::error::This pull request carries no type/ label. Add exactly one of: $valid -- it decides which section of the release notes the change lands in (.github/release.yml). CI derives area/ and os/ from the changed paths, but not the type: a path says where a change landed, not what it was for."
-              ;;
-            *)
-              echo "::error::This pull request carries ${#found[@]} type/ labels (${found[*]}); exactly one is allowed. Release notes take the first matching category, so the others would be silently ignored."
-              ;;
-          esac
-          exit 1
+            fi
+            echo "merge candidate '$QUEUE_REF' -> re-checking #${numbers[*]}"
+          else
+            echo "::error::neither a pull request number nor a merge-queue ref is present on a '${{ github.event_name }}' event, so this gate cannot tell what it is gating. Refusing rather than passing."
+            exit 1
+          fi
+
+          failed=0
+          for number in "${numbers[@]}"; do
+            # Read the labels fresh rather than from the event payload: `apply`
+            # may have added one seconds ago, and the payload is a snapshot taken
+            # before this workflow started.
+            #
+            # The API call's status is captured rather than swallowed, so an
+            # unreachable API is reported as an unreachable API. Left to
+            # `mapfile`, a failed `gh` would arrive as zero labels and be reported
+            # as a missing one -- the right colour for the wrong reason, sending
+            # somebody to add a label that is already there.
+            if ! labels="$(gh pr view "$number" --repo "$REPO" --json labels \
+                            --jq '.labels[].name | select(startswith("type/"))')"; then
+              echo "::error::could not read the labels of #${number}. This is an API failure, not a missing label -- the type may well be set."
+              failed=1
+              continue
+            fi
+
+            mapfile -t found < <(printf '%s' "$labels" | grep -v '^$' || true)
+            case "${#found[@]}" in
+              1)
+                echo "#${number} type: ${found[0]}"
+                ;;
+              0)
+                echo "::error::Pull request #${number} carries no type/ label. Add exactly one of: $valid -- it decides which section of the release notes the change lands in (.github/release.yml). CI derives area/ and os/ from the changed paths, but not the type: a path says where a change landed, not what it was for."
+                failed=1
+                ;;
+              *)
+                echo "::error::Pull request #${number} carries ${#found[@]} type/ labels (${found[*]}); exactly one is allowed. Release notes take the first matching category, so the others would be silently ignored."
+                failed=1
+                ;;
+            esac
+          done
+          exit "$failed"

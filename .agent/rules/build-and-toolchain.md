@@ -970,6 +970,73 @@ and every heavy job is gated on it.
   `changes` job is itself a row there. On a tag or a push the classifier answers
   `code=true` unconditionally, so nothing is ever skipped underneath a release.
 
+## A merge queue is a third door to the same never-arrives failure
+
+`strict_required_status_checks_policy: true` means every merge puts every other
+open branch behind, so the matrix is paid once per pull request **per merge that
+lands while it is open**. Measured: 77 `build.yml` runs to land about ten pull
+requests in one night, 25 of them cancelled. A merge queue is what that shape
+calls for.
+
+It is not a ruleset checkbox. **A merge queue dispatches the `merge_group` event,
+and a workflow that does not listen for it produces no check run at all** — so a
+required context never reports and a queued pull request does not fail, it sits
+there. Same failure as `paths-ignore` above, third door. And it presents as the
+feature working, right up until the first pull request enters the queue.
+
+- **Both workflows must trigger on it, not just the obvious one.** `Require a type
+  label` is required and lives in `pr-labels.yml`, which is `pull_request_target`
+  — an event a queue **does not produce at all**. That is not a missing row in an
+  `on:` list; the whole workflow is built around an event that is not there, for
+  the security reason its header states, which must not be undone. The gate job
+  therefore runs on both events and its queue leg says what it checked.
+- **What a queue leg may legitimately assert is narrower than what a pull-request
+  leg asserts, and it has to SAY so.** The queue branch is
+  `gh-readonly-queue/master/pr-<n>-<sha>`, so the pull request can usually be
+  recovered and the label re-checked for real — which catches the one thing entry
+  to the queue cannot, a label removed while the entry was waiting. When the ref
+  names none, that is stated and the leg passes on what entry proved. A leg that
+  passes because something else already checked is fine; a leg that passes and
+  does not say why is a stub, and reads exactly like a working gate.
+- **`apply` is skipped in a queue, and a skipped dependency skips its
+  dependents.** GitHub accepts a `skipped` required check as passing, so the queue
+  would not stall — it would report a stub. `if: always() && needs.apply.result
+  != 'failure' && ...` keeps the gate running, scoped so a real failure still
+  stops it.
+- **Check the concurrency key.** `pr-labels-${{ github.event.pull_request.number }}`
+  collapses to the constant `pr-labels-` on `merge_group`, and with
+  `cancel-in-progress` each queue entry then cancels the one before it. A
+  cancelled required context is not a reported one. `build.yml`'s key is
+  `github.ref`, which inside a queue is the temporary branch and is already unique
+  per entry — but that is now load-bearing rather than incidental.
+- **State the event in the scope classifier rather than letting it fall through.**
+  `merge_group` reached `code=true` through the `changes` job's non-pull-request
+  default. Correct, by accident, with nothing recording that anything depended on
+  it. A merge candidate builds everything **by design**: it could be scoped, since
+  `merge_group.base_sha...head_sha` is a real diff, but a batched group is built on
+  top of the entries ahead of it, and the saving is one matrix per *merged* pull
+  request — not the re-runs this queue exists to remove.
+- **A failing queue entry is ejected, not merged, and the branch is fine.** GitHub
+  removes the pull request from the queue, comments on it naming the failed check,
+  and deletes the temporary branch; the pull request's own head is untouched and it
+  can be fixed and re-queued. Nothing needs cleaning up by hand. The one thing to
+  know is that the failure is reported on the *queue* run, so a red check on a
+  merged-looking pull request wants the `merge_group` run, not the `pull_request`
+  one.
+- **Adding a JOB to `build.yml` for this would drag the release behind it**, since
+  `check-release-gate` asserts every job there appears in `release.needs`. So this
+  is triggers and existing jobs only — which is also why `pr-labels.yml` is a
+  separate workflow in the first place, as its own header records.
+
+`ctest -R merge-queue-contexts` (`scripts/check-merge-queue-contexts.sh`) asserts
+all of it from the workflow files, because the property cannot be demonstrated
+before the fact: a `merge_group` event only exists once a queue is enabled, and a
+queue that stalls is the outcome being avoided. It derives which job produces
+which context rather than tabulating it — a second hand-written list is not a
+cross-check, it is a second thing to be wrong — and the only copied datum is the
+required-context list itself, whose provenance and the `gh api` call that reads
+the live one are in the script header.
+
 ## Open work
 
 - **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one

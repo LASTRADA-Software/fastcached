@@ -620,6 +620,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   **job** level instead — a skipped job still reports, and `scripts/ci-scope.sh`
   (tested by `ctest -R ci-scope`) is what decides, escalating every way of not
   knowing to "build everything".
+- A **merge queue** is the third door to that same never-arrives failure: it dispatches `merge_group`, and a workflow
+  not listening for it produces no check run, so a queued PR *sits there*. `pr-labels.yml` is the sharp case —
+  `pull_request_target` does not fire on `merge_group` at all, so its gate needs a queue leg that STATES what it
+  checked, or it is a stub that reads like a working gate. Check the concurrency key too (a PR-number key collapses to
+  a constant and each entry cancels the last), state `merge_group` in the scope classifier rather than falling through,
+  and add no JOB to `build.yml` — `check-release-gate` would drag the release behind it.
+  `ctest -R merge-queue-contexts` asserts all eleven required contexts can report.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the

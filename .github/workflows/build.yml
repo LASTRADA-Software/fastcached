@@ -34,8 +34,27 @@ on:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
     branches: [master]
+  # The merge queue's event, and the whole reason #351 was not a ruleset
+  # checkbox. Without this row every required context in this file would simply
+  # never report inside a queue, and a queued pull request would sit there
+  # forever rather than fail -- the identical never-arrives failure as a
+  # `paths-ignore` filter on a required check, arriving through a different door.
+  # A queue that enables cleanly and then hangs on a context nothing produces
+  # presents as the feature working until the first pull request enters it.
+  #
+  # `branches:` filters on the queue's BASE ref, so this says the same "only for
+  # master" as the `pull_request` row above.
+  merge_group:
+    branches: [master]
 
 concurrency:
+  # Inside a queue `github.ref` is the temporary branch
+  # `refs/heads/gh-readonly-queue/master/pr-<n>-<sha>`, which is unique per queue
+  # entry -- so `cancel-in-progress` cannot make one entry cancel another. That
+  # is load-bearing rather than incidental: a group key that collapsed the
+  # entries together would cancel the very run the queue is waiting on, and a
+  # cancelled required context is not a reported one. Anything that changes this
+  # key has to keep queue entries apart.
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
@@ -161,17 +180,46 @@ jobs:
           # depth-1 clone does not contain.
           fetch-depth: 0
 
-      # A push or a tag has no pull-request base to diff against, and inventing
-      # one would be guessing. Those events build everything, which is also what
-      # makes the `release` job safe: on a tag nothing below is ever skipped.
+      # One arm per event, and `merge_group` has its own rather than falling
+      # through, because it reached the right answer here by accident and an
+      # accidentally-correct behaviour is one refactor away from being an
+      # accidentally-wrong one (#351).
       - id: classify
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            scripts/ci-scope.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
-          else
-            echo "not a pull request (${{ github.event_name }}); building everything" >&2
-            echo "code=true" | tee -a "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request)
+              scripts/ci-scope.sh "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}"
+              ;;
+            merge_group)
+              # A merge candidate builds everything, deliberately.
+              #
+              # It COULD be scoped: `merge_group.base_sha...head_sha` is a real
+              # diff and this script would classify it. Two reasons not to.
+              #
+              # A batched group is built on top of the entries ahead of it, so a
+              # documentation-only entry stacked behind a code entry has a
+              # docs-only diff of its own -- scoping there means reasoning about
+              # a batch shape GitHub chooses and can change.
+              #
+              # And the saving is not the one this queue was added for. The
+              # churn #351 measured is the RE-runs forced on every other open
+              # branch by `strict_required_status_checks_policy`, not the single
+              # run that lands a change. Trading the queue's one guarantee --
+              # that what merges is what was tested, against the head it lands on
+              # -- for at most one matrix per merged pull request is a bad price.
+              echo "merge candidate ${{ github.event.merge_group.head_ref }}: building everything, by design (#351)" >&2
+              echo "code=true" | tee -a "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # A push or a tag has no pull-request base to diff against, and
+              # inventing one would be guessing. Those events build everything,
+              # which is also what makes the `release` job safe: on a tag nothing
+              # below is ever skipped.
+              echo "not a pull request (${{ github.event_name }}); building everything" >&2
+              echo "code=true" | tee -a "$GITHUB_OUTPUT"
+              ;;
+          esac
 
   linux:
     name: "Linux-${{ matrix.preset }}"
