@@ -82,6 +82,13 @@ jobs:
       # The two steps around the action are the repair, and they are compensating
       # actions rather than a cure: nothing here can stop the replacement, so this
       # notices what it destroyed and puts it back.
+      #
+      # They protect everything the config CANNOT produce, and deliberately leave
+      # `area/` and `os/` unprotected. That asymmetry is the point rather than an
+      # oversight: dropping a stale `area/` label once a branch stops touching that
+      # tree is the entire job `sync-labels` was added to do, so protecting those
+      # would restore the label the action had just correctly removed and break the
+      # feature this workflow wants.
       - name: "Remember the labels actions/labeler is about to overwrite"
         id: keep
         env:
