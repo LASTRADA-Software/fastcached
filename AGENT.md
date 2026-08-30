@@ -591,6 +591,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory
   of its own; `PATH` resolving to an older binary reports clean in the way that
   means nothing.
+- A script that NAMES a tool version must name it **everywhere that version matters**.
+  `local-gate.sh` pinned the formatter and handed the analyser to `PATH`, with the
+  paragraph explaining why that is wrong in its own header four lines above — an
+  argument carried one call short. And a cached `find_program` result outlives every
+  reason it was chosen: the gate configured only when `CMakeCache.txt` was ABSENT, so a
+  tree kept the first clang-tidy it ever found and re-running the gate could not repair
+  it. Check the pin against the cache, not only pass it. `ctest -R local-gate-selftest`.
 - Never silence clang-tidy with `NOLINT` — fix the source.
 - A return type is not part of a function's mangled name on Linux, so two
   functions differing only in return type silently collide.
@@ -895,9 +902,9 @@ caching problem and a cache would be the wrong fix for it.
 - **C-style loops are forbidden.** Use range-based `for`, `std::views::iota`, and other range views for generation/transformation.
 - **`std::span`** for arrays and contiguous sequences.
 - **`auto` type deduction** for readability; **structured bindings** for tuple-like returns.
-- **Run the local gate before pushing** — `scripts/local-gate.sh`: clang-format at
-  the pinned version, then `clang-debug` and `gcc-release`. The default agent
-  preset is one compiler at `-O0`; CI is four more, and defects invisible below a
+- **Run the local gate before pushing** — `scripts/local-gate.sh`: clang-format **and
+  clang-tidy** at the pinned version, then `clang-debug` and `gcc-release`. The default
+  agent preset is one compiler at `-O0`; CI is four more, and defects invisible below a
   release build or a second standard library are why the script exists. See
   [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
@@ -905,7 +912,7 @@ caching problem and a cache would be the wrong fix for it.
   releases disagree with each other, so a tree clean under whichever binary is on
   `PATH` can still be rejected. Name the version explicitly and use a build
   directory of its own; the `clang-debug` preset is **not** that sweep.
-- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically, at whatever version `PATH` resolves to — see the bullet above for why that is not the same as the one CI enforces.
+- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically at whatever version `PATH` resolves to — which is why **`scripts/local-gate.sh` passes it `-DCLANG_TIDY_EXE=clang-tidy-$V` and refuses to start when that binary is missing**, rather than letting the preset pick. Running the preset by hand still takes whatever `PATH` offers; see the bullet above for why that is not the same as the one CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.

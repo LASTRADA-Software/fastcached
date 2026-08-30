@@ -95,6 +95,36 @@ determinism rests on.
   project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
   build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
   used is printed nowhere. Configure a second build directory naming the version, and run that.
+- **A script that NAMES a tool version must name it everywhere that version matters, and
+  the gate that says so had the defect it documents.** `local-gate.sh` resolved
+  `clang-format-$V` by name, and then let the `clang-debug` preset take its analyser from
+  `PATH` -- with the paragraph above written in its own header, four lines from the code that
+  ignored it. An argument carried one call short is the shape to look for: the reasoning is
+  present, correct, and applied to one of the two tools it was written about. The gate now
+  resolves `clang-tidy-$V` to an absolute path, **before anything is built**, refuses by name
+  when it is absent rather than falling back, passes it to the configure, and prints which
+  binary it used -- and none of that is loosened by `--no-format`, which names the other tool.
+  - **A cached `find_program` result outlives every reason it was chosen**, so the pin has to
+    be checked against the build directory and not only passed to it. `find_program` never
+    revisits a filled cache entry, and the gate configured only when `CMakeCache.txt` was
+    ABSENT -- so a tree kept whichever `clang-tidy` it first found forever, and **re-running
+    the gate could not repair it, because re-running the gate is what skipped the configure.**
+    Measured on this repository's own WSL image: a `clang-debug` directory the gate itself had
+    created sat on `CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy`, which is 20, while every run
+    reported clean. The same shape as the stale `FASTCACHE_CC-NOTFOUND` that kept build trees
+    on sccache silently, and `CLANG_TIDY_EXE-NOTFOUND` is that shape exactly -- a value, which
+    compares unequal, never an absence to be tolerated.
+  - **`cmake/portable/ClangTidy.cmake` needs no change and must not get one.** It stays
+    generic and droppable into other repositories, and a pre-set `CLANG_TIDY_EXE` cache entry
+    already short-circuits its `find_program` -- verified, on a fresh directory and over an
+    existing entry, rather than assumed. `-D` on the configure line is the whole mechanism.
+  - **The gate tidies ONE of its two presets**, because `ENABLE_TIDY` is on in `clang-debug`
+    and off in `gcc-release`. That is a fact a reader would otherwise infer from the absence
+    of an argument, so it is a column of the script's preset table and a run prints it.
+  - `ctest -R local-gate-selftest` drives the decision against synthetic CMake caches -- a
+    directory on the wrong analyser, one that never found any, one with no entry, one already
+    correct -- because the gate itself builds two whole configurations and cannot be a test,
+    while the part that can be silently wrong is pure.
 - **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
   preset is the only one that runs ASan, and on a host where it cannot configure at
   all the tempting conclusion is that no sanitizer coverage is available locally. It

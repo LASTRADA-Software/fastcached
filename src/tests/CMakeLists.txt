@@ -313,6 +313,38 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# The local gate pins its analyser. Fails when `scripts/local-gate.sh` would run
+# clang-tidy at a version nobody chose, or would accept a build directory that
+# already caches one.
+#
+# The gate itself cannot be a test -- it builds two whole configurations -- but the
+# part that can be WRONG is a decision over a CMake cache file, and that part is
+# pure. `--self-test` drives it against synthetic caches: a directory on the wrong
+# analyser, one whose `find_program` never found any (`CLANG_TIDY_EXE-NOTFOUND`),
+# one with no entry at all, and one already correct.
+#
+# The failure it exists for reads exactly like success. `find_program` never
+# revisits a filled cache entry and the gate only configured when `CMakeCache.txt`
+# was ABSENT, so a build directory kept whichever clang-tidy it first found forever
+# and re-running the gate could not fix it -- re-running the gate is what skipped
+# the configure. The same shape as the stale `FASTCACHE_CC-NOTFOUND` that kept
+# build trees on sccache silently.
+#
+# Not labelled "smoke": it starts no daemon, opens no socket, and needs neither
+# cmake nor clang-tidy. `if(NOT WIN32)` for the reason `ci-scope` carries the same
+# guard -- the script is POSIX, and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "local-gate-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/local-gate.sh" --self-test
+    )
+    set_tests_properties("local-gate-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and
