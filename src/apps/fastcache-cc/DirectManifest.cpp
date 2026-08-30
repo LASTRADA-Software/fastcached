@@ -779,6 +779,11 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     return manifest;
 }
 
+bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept
+{
+    return manifest.entries.empty();
+}
+
 bool ValidateManifest(DirectManifest const& manifest, PathCanon::Layout const& layout, std::string_view toolchainStamp)
 {
     // A different toolchain invalidates the whole manifest: its headers are not
@@ -786,23 +791,9 @@ bool ValidateManifest(DirectManifest const& manifest, PathCanon::Layout const& l
     if (manifest.toolchainStamp != toolchainStamp)
         return false;
 
-    // An EMPTY entry set is refused rather than accepted on the stamp alone.
-    //
-    // `all_of` over nothing is true, so an empty manifest validates unconditionally
-    // -- not because anything was checked and passed, but because nothing was asked.
-    // That is a vacuous truth standing where a real one is required, and the object
-    // it green-lights is served however the sources move.
-    //
-    // `BuildManifest` cannot produce one: the TU is always entry one and its
-    // presence is that function's own precondition (issue #49 / issue #51). So an
-    // empty manifest is a decode artifact or an entry from an older format, and
-    // neither is something to trust. Refusing costs a preprocess.
-    //
-    // Deliberately `empty()` and not "fewer than two". A manifest holding only the
-    // TU is legitimate -- a translation unit that includes nothing has nothing else
-    // to record -- and after `BuildManifest`'s `NoProjectDeps` refusal it is the
-    // only way one gets written.
-    if (manifest.entries.empty())
+    // Refused rather than accepted on the stamp alone; the reasoning is on
+    // `ManifestAssertsNothing`, which the launcher's note asks the same question of.
+    if (ManifestAssertsNothing(manifest))
         return false;
 
     // HashFileContents returns empty for a deleted or unreadable header, which

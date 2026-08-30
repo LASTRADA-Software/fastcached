@@ -529,6 +529,27 @@ struct ManifestInputs
 /// @param layout         This machine's roots.
 /// @param toolchainStamp This machine's current toolchain identity.
 /// @return True when every entry still matches and the stamp agrees.
+/// Whether a manifest asserts nothing at all about the files it was recorded from.
+///
+/// One owner for a rule two places have to act on: `ValidateManifest` refuses such a
+/// manifest, and the launcher names the refusal in its note. Spelling the predicate
+/// at both sites would let the rule and the sentence explaining it drift apart --
+/// which is the shape of the defect this guard exists for.
+///
+/// `all_of` over no entries is true, so an empty manifest does not pass a check, it
+/// skips one, and the object it points at is then served however the sources move.
+/// `BuildManifest` cannot produce one -- the TU is always entry one and its presence
+/// is that function's own precondition (issue #49 / issue #51) -- so an empty entry
+/// set is a decode artefact or an older format, and a matching toolchain stamp says
+/// nothing about the sources.
+///
+/// Deliberately `empty()` and not "fewer than two": a manifest holding only the TU is
+/// what a translation unit including nothing legitimately records, and after
+/// `BuildManifest`'s `NoProjectDeps` refusal it is the only way one gets written.
+/// @param manifest The manifest to judge.
+/// @return True when it has no entries.
+[[nodiscard]] bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept;
+
 [[nodiscard]] bool ValidateManifest(DirectManifest const& manifest,
                                     PathCanon::Layout const& layout,
                                     std::string_view toolchainStamp);

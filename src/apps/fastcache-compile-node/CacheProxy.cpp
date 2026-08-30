@@ -2,10 +2,8 @@
 #include "CacheProxy.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
-#include <FastCache/CompileCache/PathCanon.hpp>
 
 #include <format>
-#include <string>
 
 namespace FastCache::Node
 {
@@ -58,8 +56,8 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             if (!fields.has_value())
                 co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
 
-            // Canonicalized HERE, against the roots the client sent, exactly as
-            // `Protocol/CompileCacheHandler` does and through the same function.
+            // Canonicalized against the roots the client sent, through the one
+            // recipe both servers on this wire share.
             //
             // This block used to ignore those roots, on the reasoning that
             // canonicalization is "the SHARED cache's job" and that "what this tier
@@ -70,22 +68,15 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             // absolute paths and every consumer replayed them into its build system's
             // dependency graph (#319).
             //
-            // A value that does not decode is stored verbatim rather than refused: an
-            // opaque value is not this tier's business to reject, and the daemon
-            // answers `MalformedValue` for the frames that are genuinely malformed.
-            auto decoded = DecodeCompileValue(fields->value);
-            if (!decoded.has_value())
-            {
-                if (!co_await _cache.Store(Wire::AsStringView(fields->key), fields->value))
-                    co_return Wire::EncodeErrorReply(Wire::ErrorCode::StorageWriteFailed);
-                co_return Wire::EncodeReply(Wire::Status::Ok, {});
-            }
+            // A value that does not decode is stored VERBATIM rather than refused,
+            // which is where this server's policy differs from the daemon's: an
+            // opaque value is not this tier's business to reject. `CanonicalStoredValue`
+            // answers `nullopt` and each server says what it wants to.
+            auto const canonical = CanonicalStoredValue(
+                fields->value, Wire::AsStringView(fields->srcRoot), Wire::AsStringView(fields->buildTree));
+            auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
 
-            PathCanon::Layout const producer { .sourceRoot = std::string { Wire::AsStringView(fields->srcRoot) },
-                                               .buildTree = std::string { Wire::AsStringView(fields->buildTree) } };
-            CanonicalizeStoredRegions(*decoded, producer);
-
-            if (!co_await _cache.Store(Wire::AsStringView(fields->key), EncodeCompileValue(*decoded)))
+            if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Wire::EncodeErrorReply(Wire::ErrorCode::StorageWriteFailed);
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }

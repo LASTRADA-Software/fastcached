@@ -1292,11 +1292,17 @@ void RecordManifest(Config const& cfg,
         return;
     }
 
-    // Both counts, for the reason the key's dependency-set note gives them: the
-    // pair is what distinguishes "this TU only includes toolchain headers" (fine,
-    // the stamp covers them) from "every path the driver reported was filtered
-    // out" — which is the shape of a misconfigured root, and which the recorded
-    // manifest cannot report on its own because it still validates.
+    // Both counts, for the reason the key's dependency-set note gives them: the pair
+    // is what distinguishes "this TU only includes toolchain headers" (fine, the
+    // stamp covers them) from "most of what the driver reported was filtered out",
+    // which is the shape of a misconfigured root.
+    //
+    // It no longer has to carry the WORST case. "Every reported path filtered out"
+    // used to reach here and record a manifest that still validated, which is what
+    // made the pair the only way to see it; `BuildManifest` now refuses that outright
+    // (`NoProjectDeps`, #319) and this line is not reached for it. What the pair is
+    // still for is the partial version -- nine paths dropped of ten -- which is a
+    // misconfigured root in every way but the one that trips the refusal.
     Note(std::format(
         "manifest: {} entries from {} reported dependency path(s) plus the source", manifest->entries.size(), reported));
 
@@ -1390,7 +1396,7 @@ void RecordManifest(Config const& cfg,
     //
     // `Note`, not `Warn`: this is a cache fact, and the compile carries on to its
     // ordinary preprocessed key rather than falling back to the real compiler.
-    if (manifest->entries.empty())
+    if (Cc::ManifestAssertsNothing(*manifest))
     {
         Note("direct-mode manifest has no entries; refusing it rather than validating on nothing");
         return giveUp();

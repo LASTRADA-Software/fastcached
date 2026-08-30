@@ -184,21 +184,21 @@ namespace
         if (!fields.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
 
-        auto decoded = DecodeCompileValue(fields->value);
-        if (!decoded.has_value())
+        // `CompileCache/CompileValue`'s recipe, not a copy here. Decoding, building
+        // the layout from the two root fields, rewriting the regions and re-encoding
+        // were spelled out in this function and nowhere else -- so when a compile node
+        // became a second server for this wire it had none of them (#319). Sharing
+        // only the rewrite would have left the ORDER here to be remembered twice.
+        auto const canonicalBytes =
+            CanonicalStoredValue(fields->value, BytesToString(fields->srcRoot), BytesToString(fields->buildTree));
+        if (!canonicalBytes.has_value())
+            // This server speaks the whole protocol and says so; a node's cache tier
+            // stores an opaque value verbatim instead. One policy each, above the one
+            // they now share.
             co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
-
-        PathCanon::Layout const producer { .sourceRoot = BytesToString(fields->srcRoot),
-                                           .buildTree = BytesToString(fields->buildTree) };
-        // `CompileCache/CompileValue`'s, not a copy here. It was a file-local helper
-        // until a compile node became a second server for this wire; one policy with
-        // two implementations is what #319 cost.
-        CanonicalizeStoredRegions(*decoded, producer);
-
-        auto const canonicalBytes = EncodeCompileValue(*decoded);
         auto const keyStr = BytesToString(fields->key);
         auto const groupStr = BytesToString(fields->prefetchGroup);
-        auto const stored = engine->Set(keyStr, canonicalBytes, /*flags=*/0, /*exptime=*/0);
+        auto const stored = engine->Set(keyStr, *canonicalBytes, /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 

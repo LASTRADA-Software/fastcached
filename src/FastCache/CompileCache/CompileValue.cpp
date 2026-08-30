@@ -129,7 +129,18 @@ namespace
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
+    // Reserved, not grown. The size is a one-pass fold and the buffer holds an
+    // OBJECT FILE: without this the `AppendU32` immediately after the blob insert
+    // below finds the vector exactly full, so it reallocates and memcpys the whole
+    // object a second time, with both buffers live at the peak. Cheap everywhere and
+    // load-bearing on a node, where this now runs once per cached object.
+    std::size_t needed =
+        sizeof(std::uint8_t) + WireFields::FieldPrefixSize + value.objectBlob.size() + WireFields::FieldPrefixSize;
+    for (auto const& region: value.textRegions)
+        needed += sizeof(std::uint8_t) + WireFields::FieldPrefixSize + region.bytes.size();
+
     std::vector<std::byte> out;
+    out.reserve(needed);
     out.push_back(static_cast<std::byte>(CompileValueVersion));
 
     AppendU32(out, static_cast<std::uint32_t>(value.objectBlob.size()));
@@ -200,12 +211,22 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     return value;
 }
 
-void CanonicalizeStoredRegions(CompileValue& value, PathCanon::Layout const& producer)
+std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte const> value,
+                                                           std::string_view sourceRoot,
+                                                           std::string_view buildTree)
 {
+    auto decoded = DecodeCompileValue(value);
+    if (!decoded.has_value())
+        return std::nullopt;
+
+    PathCanon::Layout const producer { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
+
     // The object blob is never a region and is never rewritten: it is machine code,
     // and a byte sequence inside it that happens to look like a path is not one.
-    for (auto& region: value.textRegions)
+    for (auto& region: decoded->textRegions)
         region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
+
+    return EncodeCompileValue(*decoded);
 }
 
 } // namespace FastCache
