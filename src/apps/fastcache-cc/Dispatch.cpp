@@ -247,7 +247,7 @@ namespace
             auto redirect = RedirectTarget(attempt.outcome);
             if (!redirect.has_value())
                 return attempt;
-            attempt.scheduler = *std::move(redirect);
+            attempt.scheduler = std::move(*redirect);
         }
         // Out of hops with the last answer still a redirect. Returned as it stands,
         // so the caller reports the scheduler's own words rather than inventing a

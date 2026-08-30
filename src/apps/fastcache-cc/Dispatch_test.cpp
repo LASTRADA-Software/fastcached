@@ -732,7 +732,7 @@ TEST_CASE("A lease refused with NotLeader is retried against the leader it names
     fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
 
     std::array<std::string, 1> const args { "-c" };
-    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+    auto const result = Dispatch(fleet, Request(args));
 
     REQUIRE(result.status == DispatchStatus::Compiled);
     CHECK(Wire::AsStringView(result.object) == "OBJECTBYTES");
@@ -774,7 +774,7 @@ TEST_CASE("A NotLeader naming no address is a refusal, not somewhere to dial", "
                 Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "the cluster has no leader right now"));
 
     std::array<std::string, 1> const args { "-c" };
-    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+    auto const result = Dispatch(fleet, Request(args));
 
     CHECK(result.status == DispatchStatus::Declined);
     // Exactly one dial: the configured scheduler, and nothing invented from prose.
@@ -799,7 +799,7 @@ TEST_CASE("Two schedulers naming each other stop at the redirect ceiling", "[dis
     fleet.Serve(std::string { Other }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Scheduler));
 
     std::array<std::string, 1> const args { "-c" };
-    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+    auto const result = Dispatch(fleet, Request(args));
 
     CHECK(result.status == DispatchStatus::Declined);
     // Three asks: the configured one, then two redirects, then the ceiling. It must

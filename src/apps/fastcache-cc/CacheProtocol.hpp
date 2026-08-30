@@ -161,6 +161,8 @@ struct ExchangeBudget
 /// @param frame A complete framed request.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome.
+[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential = {});
+
 /// Where a refusal says to ask instead, when it says so.
 ///
 /// `NotLeader` is not a refusal in the sense the others are: `NoWorker` and
@@ -169,23 +171,28 @@ struct ExchangeBudget
 /// distribution over a leader election it could simply have followed
 /// ([#237](https://github.com/LASTRADA-Software/fastcached/issues/237)).
 ///
-/// **Judged by SPLITTING the message, never by asking whether it is empty.** An
-/// empty message is replaced with the error table's default sentence before it
-/// reaches the wire, so "no leader is known" and "the leader is at h:p" arrive as
-/// the same shape -- a non-empty string either way. Only "does this parse as an
-/// address" separates them, and a client that dialled a sentence would report a
-/// scheduler endpoint no operator ever typed. `ClusterAdminCli` learned this the
-/// hard way and its comment says so; this is that test, given one owner.
+/// **Judged by PARSING the message, never by asking whether it is empty.** An empty
+/// message is replaced with the error table's default sentence before it reaches the
+/// wire, so "no leader is known" and "the leader is at h:p" arrive as the same shape
+/// -- a non-empty string either way. Only "does this parse as an address" separates
+/// them, and a client that dialled a sentence would report a scheduler endpoint no
+/// operator ever typed. `ClusterAdminCli` learned this the hard way; that call site
+/// now asks here, so the two cannot come to disagree.
+///
+/// Parsing means a host, a colon and a port that is a number -- not `SplitHostPort`
+/// alone, which takes the LAST colon and hands back whatever follows it, so
+/// "no leader: try again" splits happily into a host and a port of " try again".
+/// `ClusterAdminCli` only ever PRINTED such a message; a launcher dials it, and
+/// every hop spent there is one the real leader never hears.
 ///
 /// A redirect naming an address is therefore distinguishable from an election in
 /// progress, which names none and has nothing to offer but "try again shortly".
 ///
 /// @param outcome A completed exchange's outcome.
 /// @return The endpoint to retry against, or `std::nullopt` when this outcome is not
-///         a redirect -- including a `NotLeader` raised while no leader is known.
+///         a redirect -- a `NotLeader` raised while no leader is known included, and
+///         any message that does not parse as `host:port`.
 [[nodiscard]] std::optional<std::string> RedirectTarget(CacheOutcome const& outcome);
-
-[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential = {});
 
 /// FETCH one key over an already-connected client.
 ///

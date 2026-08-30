@@ -214,7 +214,10 @@ Consequences that are each load-bearing:
   that was never consulted. `NotLeader` carries the leader's endpoint **in the
   message**, so a client redirects instead of giving up; `SchedulerRole::Undecided`
   is the same code with an empty message, because an election in progress is a
-  different fact and there is nobody to name. Three roles rather than a `bool`, for
+  different fact and there is nobody to name. That "so a client redirects" was true of
+  the design and false of every client for the whole life of the code — the launcher
+  read it as an ordinary refusal until #237. Serving the endpoint is half a rule; the
+  half that makes it work is below, under *a refusal that names somewhere else*. Three roles rather than a `bool`, for
   exactly that third state.
 - **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
   writes objects exactly as before — the cache is a separate service this class
@@ -778,12 +781,27 @@ machines were re-pointed by hand
 healthy while it happened — the builds succeeded, the objects were correct, and the only
 symptom was that they were slow.
 
-- **The redirect is judged by SPLITTING the message, never by asking whether it is
-  empty.** An empty message is replaced with the error table's default sentence before it
-  reaches the wire, so "no leader is known" and "the leader is at `h:p`" arrive as the
-  same shape. Only "does this parse as an address" separates them, and a client that
-  skipped the test dials a sentence — which is a scheduler endpoint no operator ever
-  typed. `Cc::RedirectTarget` is the one owner of that question.
+- **The redirect is judged by PARSING the message, never by asking whether it is
+  empty.** An empty message is replaced with the error table's default sentence by
+  `EncodeErrorReply` before it reaches the wire, so "no leader is known" and "the leader
+  is at `h:p`" arrive as the same shape. Only "does this parse as an address" separates
+  them, and a client that skipped the test dials a sentence — which is a scheduler
+  endpoint no operator ever typed. `Cc::RedirectTarget` is the one owner of that
+  question, and `ClusterAdminCli` — which had the only previous copy — asks it rather
+  than keeping a second.
+- **Parsing is not splitting, and the difference is the whole rule above.**
+  `SplitHostPort` takes the LAST colon and returns whatever follows it, so
+  "no leader: try again" splits contentedly into a host and a port of `" try again"`. A
+  redirect needs a host, a colon and a port that is a number. Not `ParseEndpoint`
+  either, close as it looks: a bare port means loopback there, so a scheduler answering
+  `6675` would send the client back to itself.
+
+  This is the consumption test from the claim-record rule below, arriving at the
+  opposite answer. `NotLeader`'s message was diagnostics for as long as
+  `ClusterAdminCli` merely PRINTED it, and a loose test cost a confusing sentence.
+  A launcher DIALS it, so it became a dependency record in that same moment — the
+  bullet below says *"the moment something did, it would stop being diagnostics and
+  this bullet would be wrong"*, and this is that moment, for a different field.
 - **The chain is bounded.** Two nodes with a stale `_knownLeader`, or a partition
   healing, name each other indefinitely; without a ceiling a build spends one connect per
   translation unit per hop discovering it. Two hops is one more than a correct fleet
@@ -797,6 +815,14 @@ symptom was that they were slow.
 - **A fixture with one scheduler cannot fail.** If the first endpoint contacted is
   already the leader, a build that follows no redirect at all passes every assertion. The
   case has to have two, and the assertion is that the SECOND is reached.
+- **A scripted fleet proves the client, never the server.** `ScriptedFleet` hands the
+  launcher a `NotLeader` the test wrote, so on its own it shows that a stub can redirect
+  and nothing about whether a scheduler emits that shape. The two ends are pinned
+  separately and deliberately: `SchedulerService_test` fixes what `Gate()` puts in the
+  message (a follower names the leader, an undecided node names nobody), and
+  `CacheProtocol_test` drives the empty case through the REAL `EncodeErrorReply` to fix
+  what an empty one becomes on the wire. The premise the parse rests on is asserted
+  there rather than asserted about here.
 
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node
