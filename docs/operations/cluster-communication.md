@@ -168,8 +168,8 @@ compressing it.
     A node started with no `--cluster-key-file` cannot sign, and hands out the bare
     serial it always did. It says so in its log, once, at the first grant.
 
-    A worker does **not** verify the token yet — see
-    [The lease token, and what it does not yet buy](#the-lease-token-and-what-it-does-not-yet-buy).
+    The worker **verifies** it — see
+    [The lease token, and what it buys](#the-lease-token-and-what-it-buys).
 
 A refusal is one of four, and they are counted apart on purpose:
 
@@ -671,27 +671,47 @@ front of every port.
 The two credentials that are real and unaffected: `--dashboard-token-file` for the
 fleet page, and `fastcached`'s own `--requirepass` for the shared cache.
 
-### The lease token, and what it does not yet buy
+### The lease token, and what it buys
 
-A lease grant is now a **signed capability** rather than a serial number: with
+A lease grant is a **signed capability** rather than a serial number: with
 `--cluster-key-file` set, the scheduler MACs the granted endpoint, the toolchain,
 the object key and an expiry under the cluster's pre-shared key
-([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)). A token is
-therefore unforgeable, and one minted for one worker does not authenticate against
-another.
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)), and the
+worker checks that MAC before it decompresses anything, let alone compiles
+([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). A token is
+unforgeable, and one minted for one worker does not authenticate against another.
 
-**A worker does not check it yet.** The verification half is
-[#282](https://github.com/LASTRADA-Software/fastcached/issues/282), and until that
-lands a worker's validator accepts whatever arrives — so the compile port's real
-boundary today is still reachability plus membership, exactly as described above.
-Signing first is deliberate: the token format has to exist before anything can be
-written against it, and a worker that started refusing unsigned leases before every
-scheduler in a fleet could mint them would stop distributing mid-upgrade.
+The check costs a job nothing: it is a local HMAC over a few hundred bytes, with no
+round trip back to the scheduler. It happens **before** the payload is decompressed,
+so an unauthorized peer cannot make a worker do the expensive part.
 
-Once #282 lands, three refusals become reachable at the compile port —
-`lease-unauthorized`, `lease-endpoint-mismatch` and `lease-expired` — each with its
-own counter, because they are three different things for an operator to do. Until
-then those counters exist and stay at zero.
+Three refusals are now reachable at the compile port, each with its own counter,
+because they are three different things for an operator to do:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `lease-unauthorized` | The token is junk, or signed with a key this worker does not hold | Somebody is probing the port — or a key rollout is half-finished |
+| `lease-endpoint-mismatch` | An authentic grant, issued for a different address | This worker's `--advertise` is not what the scheduler registered it under |
+| `lease-expired` | An authentic grant, older than its expiry plus five minutes of slack | A clock on one of the two machines is wrong |
+
+#### Whether a worker checks at all is a startup decision
+
+**Not a per-request fallback.** A worker with no key cannot verify, and "no key, so
+skip the check" decided per request is the worst of both: the port is open, every
+refusal counter reads zero, and the fleet looks healthy from both ends. So the
+decision is made once, before anything is served:
+
+- A node that **another machine could dial** and has no `--cluster-key-file` is
+  refused at startup, by name. Both halves have to be true — a node bound to
+  loopback answers nobody else whatever `--fleet-member` or `--fleet-open` say, and
+  a node admitting only its own machine escalates nobody however it is bound.
+- A node that **nothing else can dial** runs without the check and logs a warning
+  saying so, once, at startup. This is the ordinary single-machine install: a
+  process on that host already has that host's compiler.
+
+So the upgrade order for a fleet is: provision the key on every node first, then
+roll the binary. A worker that has the key and a scheduler that does not will refuse
+every grant that scheduler hands out.
 
 Fuller treatment in
 [Distributed compilation § Security](../getting-started/distributed-compilation.md#security)

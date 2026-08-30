@@ -470,12 +470,11 @@ The refusals are split by reason for the same reason the scheduler's two are:
 a full worker and a misconfigured one are different problems with different
 fixes, and one number covering both tells you neither.
 
-The three `..._lease_*` counters are exported and stay at **zero** until
-[#282](https://github.com/LASTRADA-Software/fastcached/issues/282) lands: a
-scheduler signs its grants today, and a worker does not yet check them. They are
-here now rather than with the check because a refusal's wire code and its counter
-are one fact, and splitting them across two changes is how one of them gets
-forgotten.
+The three `..._lease_*` counters move only on a node that holds
+`--cluster-key-file`. Without one a worker cannot check a signature, and it says so
+at startup rather than leaving these at zero and looking healthy — a node that
+another machine could dial is refused outright without the key
+([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)).
 
 The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,
@@ -640,7 +639,8 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
 
 ## Security
 
-**Membership is what protects a fleet today, and it is the only thing that does.**
+**Two things protect a fleet: who a node admits, and whether the job was granted.**
+
 A node is closed by default: its compile port, its scheduler and its own cache tier
 all admit **this machine and `--fleet-member` peers only** (or every caller, once
 you say `--fleet-open`). Once a cluster exists, the agreed member set is **added** to
@@ -650,10 +650,38 @@ for the compile port, which binds `0.0.0.0` because peers have to dial it — an
 who could route to it would otherwise have your machine run their compiler on source
 they chose.
 
+Membership alone was never enough, because *admitted to the fleet* is not *granted
+this compile*: an admitted machine could spend any worker's CPU without ever asking
+the scheduler for a slot. So a lease grant is a **signed capability**. With
+`--cluster-key-file` set, the scheduler MACs the granted worker's endpoint, the
+toolchain, the object key and an expiry under the cluster's pre-shared key, and the
+worker checks that MAC before it decompresses anything
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281),
+[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). The endpoint is
+inside the MAC, so a token captured on the way to one machine cannot be replayed
+against the rest of the fleet.
+
+!!! warning "Set `--cluster-key-file` on every node, and set it first"
+
+    A node that another machine could dial — anything with `--fleet-member`,
+    `--fleet-open` or consensus, on a bind that is not loopback — **will not start**
+    without it. That refusal is deliberate and it is a startup one, not a
+    per-request fallback: a worker that quietly skipped the check would serve
+    whoever reached its port while every refusal counter read zero, which is a fleet
+    that looks healthy from both ends.
+
+    A node nothing else can dial — the ordinary one-machine install — needs no key
+    and logs a warning saying the check is off. A process on that host already has
+    that host's compiler.
+
+    **Provision the key everywhere before rolling the binary.** A worker that holds
+    the key and a scheduler that does not is a worker refusing every grant that
+    scheduler hands out.
+
 --8<-- "node-credential-gap.md"
 
-Until it closes, treat the fleet's boundary as **network reachability plus
-membership**, and size the network accordingly.
+Beyond the lease, the fleet's own traffic is unauthenticated, so treat its boundary
+as **network reachability plus membership** and size the network accordingly.
 
 So: keep `--listen-scheduler` off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
