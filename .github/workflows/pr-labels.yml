@@ -54,12 +54,92 @@ jobs:
       #
       # `sync-labels: true` removes an area label once a branch stops touching
       # that tree, so the label keeps stating what is true rather than what was
-      # true at the first push. It only ever touches labels named in the config,
-      # so type/, priority/ and status/ are out of its reach by construction.
+      # true at the first push.
+      #
+      # This block used to claim that type/, priority/ and status/ were "out of
+      # its reach by construction, since it only ever touches labels named in the
+      # config". The premise is true and the conclusion was false, and it cost
+      # three red gates in one evening before anyone read the timeline (#347).
+      #
+      # The deletion logic IS config-scoped:
+      #
+      #     if (checkMatchConfigs(...)) { allLabels.add(label) }
+      #     else if (syncLabels)        { allLabels.delete(label) }
+      #
+      # but the WRITE is not. actions/labeler seeds `allLabels` from the labels it
+      # read when the run started and finishes with `setLabels(...)`, a full
+      # REPLACEMENT of the label set -- unconditionally, whether or not
+      # `sync-labels` is set. So a label added between that read and that write is
+      # silently destroyed, whatever its prefix and whatever the config says.
+      # Turning `sync-labels` off would NOT fix this.
+      #
+      # That is a lost update, and it explains an intermittency that read as gate
+      # flakiness: the action only writes `if (!isEqual(labelsToAdd, preexisting))`,
+      # so the window only bites on runs that actually had a label to add. A pull
+      # request labelled by hand while such a run is in flight loses the label; one
+      # labelled when nothing is in flight keeps it.
+      #
+      # The two steps around the action are the repair, and they are compensating
+      # actions rather than a cure: nothing here can stop the replacement, so this
+      # notices what it destroyed and puts it back.
+      - name: "Remember the labels actions/labeler is about to overwrite"
+        id: keep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Everything the config cannot produce. `area/` and `os/` are the
+          # action's to manage -- removing a stale one is the job `sync-labels` is
+          # here for -- so they are deliberately NOT protected.
+          kept="$(gh pr view "$PR" --repo "$REPO" --json labels \
+            --jq '[.labels[].name | select((startswith("area/") or startswith("os/")) | not)] | join(",")')"
+          echo "protecting: ${kept:-<none>}"
+          echo "kept=${kept}" >> "$GITHUB_OUTPUT"
+
       - name: "Label the areas and platforms from the changed paths"
         uses: actions/labeler@v5
         with:
           sync-labels: true
+
+      - name: "Restore any label the replacement destroyed"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          KEPT: ${{ steps.keep.outputs.kept }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEPT" ]]; then
+            echo "nothing to protect"
+            exit 0
+          fi
+
+          now="$(gh pr view "$PR" --repo "$REPO" --json labels \
+            --jq '[.labels[].name] | join(",")')"
+
+          missing=()
+          IFS=',' read -ra before <<< "$KEPT"
+          for label in "${before[@]}"; do
+            [[ -n "$label" ]] || continue
+            case ",${now}," in
+              *",${label},"*) ;;
+              *) missing+=("$label") ;;
+            esac
+          done
+
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "no label was destroyed by the replacement"
+            exit 0
+          fi
+
+          # Loud on purpose. This is the only place the race is observable, and a
+          # silent repair would leave nobody knowing how often it fires -- which is
+          # how it survived being seen three times in one evening while reading as
+          # three different problems.
+          echo "::warning::actions/labeler's setLabels replacement destroyed ${#missing[@]} label(s) its own config cannot produce: ${missing[*]}. Restoring. See #347 and the comment above this step."
+          gh pr edit "$PR" --repo "$REPO" --add-label "$(IFS=,; printf '%s' "${missing[*]}")"
 
       # type/* and breaking-change, but only when the title states them.
       - name: "Infer the type from a conventional-commit title"

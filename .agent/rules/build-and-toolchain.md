@@ -213,6 +213,45 @@ determinism rests on.
     is why the gate sets `print_suppressions=1` on **every** run, canary included,
     and prints ThreadSanitizer's own `Matched N suppressions` line.
 
+## A comment can be true in its premise and false in its conclusion
+
+`pr-labels.yml` carried this, and every word before the comma was correct:
+
+> `sync-labels: true` ... only ever touches labels named in the config, so
+> `type/`, `priority/` and `status/` are out of its reach by construction.
+
+`.github/labeler.yml` genuinely contains no `type/` row, and the action's deletion
+logic genuinely is config-scoped. The conclusion was still false, and it cost three
+red `Require a type label` gates in one evening — presenting as three different
+problems, which is why it survived being seen repeatedly.
+
+- **The deletion is config-scoped; the WRITE is not.** `actions/labeler` seeds its
+  set from the labels it read when the run started, then finishes with
+  `setLabels(...)`, a full replacement of the pull request's labels —
+  **unconditionally, whether or not `sync-labels` is set**. So any label added
+  between that read and that write is destroyed regardless of prefix or config.
+  **Turning `sync-labels` off would not have fixed it**, which is worth stating
+  because that was the obvious fix and it was aimed at the wrong mechanism.
+- **It is a lost update, so it is intermittent, so it reads as flakiness.** The
+  action only writes `if (!isEqual(labelsToAdd, preexisting))`, so the window bites
+  only on runs that actually had a label to add. Labelled while such a run is in
+  flight: lost. Labelled when nothing is in flight: kept. Three pull requests in one
+  evening showed label-stripped, label-kept, and a `CANCELLED` gate — one defect,
+  three presentations, none of which looked like a labeller bug.
+- **Read the timeline before theorising.** `gh api .../issues/<n>/timeline` names the
+  actor and the second for every label event, and it settled in one query what two
+  rounds of plausible hypotheses had not. Both of the hypotheses on offer — "the
+  gate evaluated before the label landed" and "v5 removes unmatched labels" — were
+  wrong, and each was confident enough to have been acted on.
+- **Verify a third-party action against its source, not its README.** The behaviour
+  that matters here is one `setLabels` call that neither the input's name nor its
+  documentation suggests.
+- **The repair is a compensating action and says so.** Nothing in a workflow can
+  stop the replacement, so `pr-labels.yml` brackets the action: remember every
+  label the config cannot produce, and restore what the write destroyed. It emits a
+  `::warning::` when it fires, because a silent repair would leave nobody knowing
+  how often the race occurs — which is exactly how the original survived.
+
 ## What CI costs
 
 The workflow's *critical path* is the longest single job, and for a long time that
