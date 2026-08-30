@@ -650,6 +650,44 @@ Consequences that are each load-bearing:
   halves have to meet in one fixture, which is why `dist-compile-e2e` carries the key
   on every node: an in-process test mints and verifies inside one process and cannot
   show that the endpoint a worker ADVERTISED is the endpoint the scheduler signed.
+- **A flag that describes nothing under socket activation cannot answer whether a
+  port faces the network.** `--bind` is the obvious answer to "is this port local",
+  and it is wrong for a reason nothing in this tree stated until now. Under
+  activation the unit owns the address -- the shipped
+  `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
+  `--bind`/`--port` are read by nothing. The value is still *in* the configuration;
+  it has simply stopped describing anything. So a keyless node carrying a stale
+  `--bind=127.0.0.1` in `FASTCACHE_NODE_ARGS`, plus `--fleet-open` or a remote
+  `--fleet-member`, passed the startup table, built `UncheckedLeaseValidator` and
+  served an unauthenticated compile port to the network with all three
+  `worker_jobs_refused_lease_*` counters reading zero. #282 recurring inside the fix
+  for #282, and found by review rather than by CI.
+  - **The table's rule is INSUFFICIENT, not wrong, and that distinction is the whole
+    entry.** `--install-service` bakes `--bind` into a command line it replays at
+    every boot, so a startup-time check on it is right for the configuration it was
+    written about -- and it is the only check that can run before any tier exists.
+    What it cannot cover is a listener this process did not open. Hence two rules:
+    the table keeps `--bind`, and `MakeWorkerLeaseValidator` takes whether the
+    listener was inherited and refuses the activated case by name. Delete either as
+    redundant and one of the two shapes goes unguarded.
+  - **So the test asserts the PAIRING, not either half.** One case drives the same
+    `NodeConfig` through `StartupPolicyRejection`, checks it PASSES, and then checks
+    `MakeWorkerLeaseValidator` refuses it. That regresses the gap. A case asserting
+    only the guard regresses the rule, and leaves the next reader free to collapse
+    the two.
+  - **The family: a premise that is true and a conclusion that does not follow.** The
+    premise -- `--bind` records what this process asked for -- is true. The
+    conclusion -- therefore it says what the port faces -- does not follow, and only
+    under activation. This file already carries the same shape in the
+    `~WorkerServer` unbounded drain, whose defending comment was "right about its
+    premise and wrong about its conclusion". That one was in a comment; this one is
+    in a guard. Two instances make it a family rather than a coincidence: when a
+    premise is doing load-bearing work, check it still holds on every path that reads
+    it, not only on the path it was written for.
+  - **And the sibling is already known.** `--listen-scheduler` describes nothing under
+    activation for exactly the same reason, so the scheduler-side refusal (#303) will
+    have this hole the day it is written. Recorded on that issue from the other
+    direction.
 - **The trust decision does not live in `main()`.** It lived there, as
   `[](...){ return true; }`, through a fully passing suite — the shape this file
   already names as *a reclaimer nothing constructs is the bug it was written to
