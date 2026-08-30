@@ -220,7 +220,7 @@ does: a list of what is wrong today is maintained by the same person who
 introduces the next one. Put the flag anywhere but first — "Naming `--cache-dir`
 gives the node an on-disk tier" reads no worse and runs.
 
-## The shared helpers: `Unwrap` and `ScratchPath`
+## The shared helpers: `Unwrap`, `ScratchPath` and `ScriptedSocket`
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
 `ScratchPath.hpp` -- and they are there rather than beside one caller for the same
@@ -281,6 +281,72 @@ Tests that genuinely cannot share -- a daemon, a fixed port -- carry `RUN_SERIAL
 which `tls-smoke` was missing while every one of its neighbours had it. Measured
 on the full suite: 649s serial, 131s at `--parallel 8`, same 1965 tests; Windows
 65s to 37s.
+
+**A fake is a shared helper too, and the same rule caught it a third time.**
+`tests/ScriptedSocket.hpp` -- an `ISocket` replaying canned reply bytes, plus
+`Replies` and an all-paths-fail `FailingSocket` -- existed as three near-identical
+private copies, and **two of them carried the same defect**: `WriteVectored`
+answering `0`, a short write, which `SendAll` correctly reads as a failure. Nothing
+had tripped on it because `CacheProtocol::Exchange` is the first caller to send a
+vectored write and no case reached one. The second copy was found while writing
+#340; the first was still carrying it a day later and was found only by reading the
+three side by side (#362).
+
+Two of the arguments *for* keeping them separate had been written down, and both
+were wrong in an instructive way:
+
+- "Sharing would mean moving ninety lines to reuse thirty." That trades lines
+  against a bug fixed in one copy staying live in the others, which is what
+  happened. The trace machinery moved **with** the class rather than being dropped,
+  so the case that needs it still has it and the two that do not simply never call
+  it.
+- "These two binaries share nothing but the wire, so a fixture reaching across
+  would be the coupling the test denies." That is right about the two **binaries**
+  and does not reach the helper: `src/tests/` is neither binary's, includes nothing
+  from either app, and is already how both reach `Unwrap`.
+
+The general form is the one `ScratchPath` taught: a helper is shared only if it
+sits where everything needing it can include from -- and a fake nobody exercises
+does not report its own bugs, so copies of one drift silently and the drift is
+found by whichever case walks into it.
+
+## An in-process fleet, and what a harness has to earn
+
+`tests/FleetHarness.hpp` runs a compile fleet in one process: N `SchedulerService`
+instances addressed by endpoint, real `SchedulerProtocol` framing, the launcher's
+own `Cc::ExchangeFramed` on the client side, and `Cc::Dispatch` running unmodified.
+Time moves only in `Step`. It is the fleet's counterpart to
+`Consensus/RaftClusterHarness`, and the argument for it is the one that header
+makes: rules about a **sequence** across two machines are not reached by any amount
+of single-transition testing.
+
+Three things about it are load-bearing.
+
+**It is in `src/tests/`, not beside `RaftClusterHarness`.** That header lives in
+`Consensus/` because everything it touches lives in `Consensus/`. A fleet spans
+`Distributed/`, the node and the launcher's client sources, so the same placement
+would make a **library directory include an app header**. `ctest -R net-boundary`
+exists to stop the milder version of that; library-depending-on-app has no gate at
+all, which is a reason to be careful rather than a licence.
+
+**An interleaving has to be arrangeable, not hoped for.** `Cc::Dispatch` leases,
+compiles and releases in one call, so a test cannot get between the grant and the
+release from outside -- and that gap is exactly where leadership moving is
+interesting. `OnCompile` fires inside the compile exchange, on the caller's thread.
+This is the whole reason a script that spawns processes cannot assert these
+properties: it can wait for an election, but it cannot place one.
+
+**A harness earns its place by asserting something that can be shown red.** Per
+#355 a test that cannot fail for the reason it exists is not evidence, and a
+harness makes it easy to write a case that exercises a great deal and pins
+nothing. The first property here -- the RELEASE goes to whoever ISSUED the lease --
+was proven by pointing the release at the configured endpoint instead and watching
+four assertions fail, **including a second client's live lease being freed**: two
+schedulers number their leases independently and both start at one, so a misrouted
+release matches somebody else's. The straight no-redirect case stayed green under
+the same break, which is exactly why it is in the file: it cannot tell the two
+rules apart, and a suite containing only cases like it would have looked like
+coverage.
 
 ## Registering a script-driven test
 

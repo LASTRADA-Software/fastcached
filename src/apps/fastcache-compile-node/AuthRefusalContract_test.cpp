@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <tests/ScriptedSocket.hpp>
 
 using namespace FastCache;
 
@@ -29,65 +30,14 @@ namespace
 {
 namespace Wire = CompileCacheWire;
 
-/// A socket that replays a fixed byte stream and records what was written.
-///
-/// The launcher's own `ScriptedTcpClient`, minimally. It is duplicated rather than
-/// shared because the point of this file is that these two binaries share *nothing*
-/// but the wire: a fixture reaching across would be the coupling the test denies.
-class ScriptedSocket final: public ISocket
-{
-  public:
-    /// @param replies The bytes the "server" returns, in order.
-    explicit ScriptedSocket(std::vector<std::byte> replies):
-        _replies { std::move(replies) }
-    {
-    }
-
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
-    {
-        return IoAwaitable { IoResult { bytes.size() } };
-    }
-
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
-    {
-        auto const take = std::min(_replies.size() - _cursor, buffer.size());
-        std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
-        _cursor += take;
-        // Zero is EOF, which is how `RecvExactly` learns the peer ran out.
-        return IoAwaitable { IoResult { take } };
-    }
-
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
-    {
-        std::size_t total = 0;
-        for (auto const& segment: segments)
-            total += segment.size();
-        return IoAwaitable { IoResult { total } };
-    }
-
-    void Close() noexcept override {}
-
-    [[nodiscard]] bool IsClosed() const noexcept override
-    {
-        return false;
-    }
-
-  private:
-    std::vector<std::byte> _replies;
-    std::size_t _cursor = 0;
-};
-
-/// Concatenate reply frames into one scripted stream.
-/// @param frames The frames, in the order the server would send them.
-/// @return Their concatenation.
-[[nodiscard]] std::vector<std::byte> Replies(std::initializer_list<std::vector<std::byte>> frames)
-{
-    std::vector<std::byte> out;
-    for (auto const& frame: frames)
-        out.insert(out.end(), frame.begin(), frame.end());
-    return out;
-}
+// The scripted socket and `Replies` live in `src/tests/ScriptedSocket.hpp` (#362).
+//
+// The copy that used to sit here was deliberate, and its reason was that the point
+// of this file is that these two binaries share NOTHING but the wire, so a fixture
+// reaching across would be the coupling the test denies. That argument is about the
+// two BINARIES and it still holds: the shared header is neither one's -- it is test
+// infrastructure both borrow, exactly as they both borrow `Unwrap.hpp`, and it
+// includes nothing from either app.
 
 /// What a scheduler really answers an AUTH with.
 ///
@@ -129,7 +79,8 @@ TEST_CASE("A credentialled client reaches a scheduler that has no AUTH and still
     // request the client actually sent. Every LEASE was declined, every compile
     // happened locally, and the build went green while the fleet distributed nothing.
     auto const stored = std::vector<std::byte> { std::byte { 0x42 } };
-    ScriptedSocket socket { Replies({ SchedulerAuthRefusal(), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+    Testing::ScriptedSocket socket { Testing::Replies(
+        { SchedulerAuthRefusal(), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
     auto const outcome = SyncRun(Cc::CacheFetch(&socket, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
@@ -163,7 +114,7 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     REQUIRE_FALSE(refusal.empty());
 
     auto const stored = std::vector<std::byte> { std::byte { 0x9 } };
-    ScriptedSocket socket { Replies({ refusal, Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+    Testing::ScriptedSocket socket { Testing::Replies({ refusal, Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
     auto const outcome = SyncRun(Cc::CacheFetch(&socket, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 

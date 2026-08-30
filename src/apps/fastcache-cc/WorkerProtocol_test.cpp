@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -1113,80 +1114,15 @@ TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole po
 namespace
 {
 
-/// A scheduler that hands back canned replies, in order.
-///
-/// Deliberately not `CacheProtocol_test`'s `ScriptedTcpClient`: that one exists to
-/// assert the AUTH pipelining's write/read *interleaving* and carries the trace
-/// machinery to do it. This one only has to answer, so sharing would mean moving
-/// ninety lines into a common header to reuse thirty of them.
-class ScriptedScheduler final: public ISocket
-{
-  public:
-    /// @param replies Reply frames, concatenated, answered in order.
-    explicit ScriptedScheduler(std::vector<std::byte> replies):
-        _replies { std::move(replies) }
-    {
-    }
-
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
-    {
-        return IoAwaitable { IoResult { bytes.size() } };
-    }
-
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
-    {
-        auto const take = std::min(_replies.size() - _cursor, buffer.size());
-        std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
-        _cursor += take;
-        // Zero is EOF, which is how `RecvExactly` learns the peer ran out.
-        return IoAwaitable { IoResult { take } };
-    }
-
-    /// Reports what it accepted rather than zero.
-    ///
-    /// It answered `0` -- a short write, which `SendAll` treats as a failure -- while
-    /// nothing here wrote vectored. `CacheProtocol::Exchange` pipelines AUTH and the
-    /// command as two `SendAll` calls, and `SendAll` only ever calls `Write`, so the
-    /// zero was unreachable rather than harmless: the first case to drive a vectored
-    /// write would have died inside the fake, before the reply this fake exists to
-    /// give.
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
-    {
-        std::size_t total = 0;
-        for (auto const& segment: segments)
-            total += segment.size();
-        return IoAwaitable { IoResult { total } };
-    }
-
-    void Close() noexcept override
-    {
-        _closed = true;
-    }
-    [[nodiscard]] bool IsClosed() const noexcept override
-    {
-        return _closed;
-    }
-    [[nodiscard]] std::string PeerAddress() const override
-    {
-        return "scripted-scheduler";
-    }
-
-  private:
-    std::vector<std::byte> _replies;
-    std::size_t _cursor = 0;
-    bool _closed = false;
-};
-
-/// Concatenate reply frames into one script.
-[[nodiscard]] std::vector<std::byte> Replies(std::initializer_list<std::vector<std::byte>> frames)
-{
-    std::vector<std::byte> out;
-    for (auto const& frame: frames)
-        out.insert(out.end(), frame.begin(), frame.end());
-    return out;
-}
-
+// The scripted socket and `Replies` live in `src/tests/ScriptedSocket.hpp`.
+//
+// The comment that used to sit here said sharing would mean moving ninety lines to
+// reuse thirty, and preferred a second copy. That was answered by what happened
+// next: both copies carried the SAME `WriteVectored` defect -- a zero-byte success,
+// which `SendAll` reads as a short write -- and this one was found only because a
+// case here finally drove a vectored write through it, a day before the other was
+// noticed at all. The cost of a shared fake is lines; the cost of three is that a
+// bug fixed in one stays live in the others (#362).
 /// A registrar with the fields every case below shares.
 [[nodiscard]] WorkerRegistrar MakeRegistrar()
 {
@@ -1206,7 +1142,7 @@ TEST_CASE("A NotLeader refusal reaches the node as an endpoint, not as prose", "
     // Asserted as a value rather than "an error happened": the whole fix is that the
     // endpoint survives the trip from the wire to something the caller can dial.
     auto registrar = MakeRegistrar();
-    ScriptedScheduler scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") };
+    Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") };
 
     auto const outcome = registrar.Register(scheduler);
     REQUIRE_FALSE(outcome.has_value());
@@ -1222,7 +1158,7 @@ TEST_CASE("A refusal that is not a redirect names no leader", "[cc][registrar][n
     // `NotAMember` is not a routing fact and following it would send this node's
     // registration to a second scheduler over a fault the first one already stated.
     auto registrar = MakeRegistrar();
-    ScriptedScheduler scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not in this cluster") };
+    Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not in this cluster") };
 
     auto const outcome = registrar.Register(scheduler);
     REQUIRE_FALSE(outcome.has_value());
@@ -1235,7 +1171,7 @@ TEST_CASE("A NotLeader whose message is prose is not a redirect", "[cc][registra
     // is right -- `CacheProtocol_test` owns the grammar. A second reading of the same
     // refusal here is exactly the drift that rule exists to prevent.
     auto registrar = MakeRegistrar();
-    ScriptedScheduler scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "no leader: try again") };
+    Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "no leader: try again") };
 
     auto const outcome = registrar.Register(scheduler);
     REQUIRE_FALSE(outcome.has_value());
@@ -1252,8 +1188,9 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     // `UnknownLease` is the refusal that DOES clear it, and the two must not be
     // conflated: one is "go elsewhere", the other "start again".
     auto registrar = MakeRegistrar();
-    ScriptedScheduler scheduler { Replies({ Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
-                                            Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
 
     REQUIRE(registrar.Register(scheduler).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
@@ -1268,8 +1205,9 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
 TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no leader", "[cc][registrar][notleader]")
 {
     auto registrar = MakeRegistrar();
-    ScriptedScheduler scheduler { Replies({ Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
-                                            Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
 
     REQUIRE(registrar.Register(scheduler).has_value());
     auto const beat = registrar.Heartbeat(scheduler, 0);
@@ -1296,7 +1234,7 @@ TEST_CASE("A credentialled client reaches a worker that has no AUTH and still ge
     REQUIRE(refusal.has_value());
 
     auto const stored = std::vector<std::byte> { std::byte { 0x7 } };
-    ScriptedScheduler client { Replies({ Unwrap(refusal), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+    Testing::ScriptedSocket client { Testing::Replies({ Unwrap(refusal), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
     auto const outcome = SyncRun(CacheFetch(&client, "k", Credential { .username = {}, .secret = "s3cret" }));
 
