@@ -607,9 +607,56 @@ Consequences that are each load-bearing:
   most people run; doing it quietly is the failure class this repository keeps
   rediscovering — a fleet that is green and is not doing the thing it claims. So the
   fallback is the bare serial exactly as before, plus one bounded warning line at the
-  first grant. The flag's startup rule moved with it: it used to be refused unless
-  `--discovery` was set, on the stated premise that discovery was its only reader,
-  and a refusal whose premise has become false is worse than no refusal.
+  first grant. #303 is the open question of whether that should become a refusal;
+  the worker's answer below is the shape it should take.
+- **Whether a worker CHECKS a lease is a startup decision, never a per-request
+  fallback.** The two are not the same rule written twice. "No key, so skip the
+  check" taken per request is silent degradation of exactly the kind this file
+  exists to name: the compile port is open, all three `worker_jobs_refused_lease_*`
+  counters read zero, and the fleet looks healthy from both ends — indistinguishable
+  from a fleet where nobody ever presented a bad lease. Taken once, before anything
+  is served, it is a node that states what it cannot do. So a node another machine
+  could dial and holding no key is refused **by name** at startup, and a node
+  nothing else can dial runs unchecked and warns once, loudly.
+- **The question is "can a machine that is not this one reach the surface", never
+  "is a key configured".** Keying the refusal on the key alone breaks every
+  single-machine install to prevent nothing — a process on this host already has
+  this host's compiler, so a lease check there escalates nobody. "Could reach it"
+  has **two halves and either one closes it**: the socket (a loopback `--bind`
+  answers no other machine whatever the policy says — which is what keeps this
+  repository's own `--fleet-open` e2e fleets working) and the policy
+  (`--fleet-open`, a non-loopback `--fleet-member`, or consensus). **Consensus
+  counts**, because a clustered node's admitted set GROWS at runtime: the agreed
+  member list is published into the same oracle the compile port consults, so such a
+  node admits machines nobody typed. `CompilePortFacesTheNetwork` and
+  `AdmitsRemotePeers` in `NodeConfig.cpp` (#282).
+- **A validator returns a REASON, not a `bool`, and it does not take the endpoint.**
+  Three refusals are distinguishable on the wire and counted apart, so a boolean
+  collapses the one distinction an operator needs — somebody probing the port, a
+  worker whose advertised endpoint is not the one clients dial, and a machine whose
+  clock has drifted are three different things to go and do. The endpoint checked
+  against is the WORKER's own advertised address, captured at construction: a
+  parameter would invite a caller to pass something the *request* supplied, which is
+  the whole failure the endpoint is inside the MAC to prevent. And the refusal is
+  never `UnknownLease` — that is the SCHEDULER's code, meaning "a lease I issued and
+  have since forgotten", and a worker answering with it sent an operator to the
+  scheduler to look for a fault that is local.
+- **The trust decision does not live in `main()`.** It lived there, as
+  `[](...){ return true; }`, through a fully passing suite — the shape this file
+  already names as *a reclaimer nothing constructs is the bug it was written to
+  fix*. `main` is the one translation unit no test can reach, so the choice is
+  `Node::MakeWorkerLeaseValidator`, exercised directly from a `NodeConfig` and a real
+  key file, and `main` is left with a call. A key file that cannot be READ stops the
+  node; falling back to checking nothing is the failure this whole rule is about.
+- **A `--cluster-key-file` rule keyed on "does anything read it" has been wrong
+  twice and is gone.** It began as *unless `--discovery`*; #281 made the scheduler a
+  reader and the rule refused the correct scheduler. It was widened to name the
+  scheduler; #282 made the worker a reader, and a plain worker runs neither of the
+  other two surfaces — so the rule refused the configuration the lease rule above
+  *requires*. There is no third narrowing: whether a worker tier exists depends on
+  what `--toolchain` and discovery resolve to on the machine, which the config table
+  cannot see. A refusal whose premise has become false is worse than no refusal, and
+  one that cannot state its premise without guessing has no business firing.
 - **A resolve answers on liveness, never on presence, and an unknown token is
   refused.** Nothing visits an expired token but an `Acquire` for the same key, so
   an expired entry is still sitting in the table when its holder finally reports —

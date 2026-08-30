@@ -197,6 +197,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A lease has three transitions and expiry is the third: the **client** resolves it,
   on every path out of the compile, over a fresh connection. Expiry is the safety net
   for a client that died.
+- Whether a worker **checks** a lease is a startup decision, never a per-request
+  fallback — skipped per request, the port is open and every refusal counter reads
+  zero. The question is "can a machine that is not this one reach the compile
+  surface", not "is a key configured": a loopback bind and a loopback-only policy
+  each close it on their own. A validator returns a REASON rather than a `bool`,
+  captures the worker's own endpoint rather than taking one, and never answers
+  `UnknownLease` — that is the scheduler's code.
 - A resolve answers on liveness, not presence — an unknown token is refused, because
   that is the only place "this job outlived its lease" can be observed.
 - A lease token is a credential, and its MAC covers the granted **endpoint** or it is
