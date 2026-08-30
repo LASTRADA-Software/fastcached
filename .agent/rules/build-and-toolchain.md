@@ -950,6 +950,41 @@ PDB is a second artefact no hit can reproduce).
   and the next page pitching it is written by someone who never saw the caveat on
   the other four.
 
+## Running the launcher is not testing it
+
+`compile-cache-e2e` and the `fastcache-cc smoke` job compile synthetic single files
+and never execute what came out, so they prove the launcher **runs** and produces
+**an** object — not that it is the **right** object. That gap is why #319 (a
+cache-backed build segfaulting while the same commit at `-DUSE_COMPILER_CACHE=OFF`
+passed) could only be found by a developer noticing a crash, and why #368 could
+recur with nothing reporting it.
+
+`scripts/launcher-replay-e2e.sh` closes it by building a real target three times —
+a cache-off **control**, a **cold** build that stores, a **warm** build that
+REPLAYS — and running the replayed binary's own tests. Replay is where a wrong
+object comes from, so a fixture that only builds cold tests nothing.
+
+- **Objects are compared cold-against-warm, never control-against-warm.**
+  `CompileCache.cmake` disables PCH and module scanning when a launcher is active,
+  so a cache-on and a cache-off build are configured differently and their objects
+  legitimately differ. Cold against warm is the only apples-to-apples comparison
+  available, and it is the one that matters. The control participates at the level
+  it can: its suite result must agree.
+- **Two guards make a green run mean anything.** The cold build must be observed
+  USING the launcher (`LAUNCHER = ` in `build.ninja` — the same check the standing
+  `-DUSE_COMPILER_CACHE=OFF` rule is verified by from the other side), and the warm
+  build must be observed HITTING. A warm build that missed everything compiles
+  correctly, passes every assertion, and has replayed nothing.
+- **Injecting a wrong object needs the linker, not `touch`.** The obvious staging —
+  replace the `.o`, touch it so it looks newer than its source, rebuild — does not
+  work under ninja: ninja records each output's mtime in `.ninja_log`, so a replaced
+  object reads as **dirty** and is **rebuilt**, silently undoing the injection and
+  leaving a canary that always passes. The first version of that canary did exactly
+  that, and a throwaway probe on a five-line project caught it in seconds. Take the
+  link command (`ninja -C <dir> -t commands <target> | tail -1`) and run only that.
+  It bypasses the dirty check and is also the truer simulation: a wrong cached
+  object is one the build system has no reason to touch again.
+
 ## Code coverage
 
 `cmake --preset clang-coverage`, build, then `--target coverage`. That target runs the

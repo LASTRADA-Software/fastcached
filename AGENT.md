@@ -716,6 +716,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   cannot catch it: a changed file with no compile command is dropped silently, and
   must be, since that is also what a platform-specific TU looks like. Account for
   every file in the diff the sweep did not reach, before trusting its count.
+- **Running the launcher is not testing it.** The synthetic fixtures prove it RUNS and produces AN object; only
+  building a REAL target through it and running that target's tests catches a WRONG one (#319, #320).
+  `scripts/launcher-replay-e2e.sh` builds three times — cache-off control, cold (stores), warm (REPLAYS) — and
+  runs the replayed binary. Compare cold-against-warm, never control-against-warm: a launcher-active configure
+  disables PCH and module scanning, so those objects legitimately differ. Guards: the cold build must be seen
+  USING the launcher, the warm one must be seen HITTING — a warm build that missed replayed nothing and passes
+  everything. And staging a wrong object needs the LINK command (`ninja -t commands`), never `touch`: ninja
+  records output mtimes, so a replaced object reads as dirty and is rebuilt, undoing the injection silently.
 - A compiler cache that reads like success is worse than none: the Windows sccache
   was running into a directory the runner deletes, so the jobs are asserted to be
   backed by the Actions cache — before `ctest`, which restarts the sccache server
