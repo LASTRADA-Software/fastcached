@@ -295,7 +295,17 @@ namespace
                 }
                 auto const reclaimed = existed && EmptyDirectory(root);
 
-                RecordOwnership(*held);
+                // Discarded deliberately, and named so rather than left as an
+                // unchecked write. The record is DIAGNOSTICS: the lock decides
+                // ownership and the record never does, exactly as its version field
+                // never does -- so a claim whose record could not be written is still
+                // a claim, and this root is still exclusively ours.
+                //
+                // Stated because the tempting repairs are both wrong. Turning it into
+                // a refusal makes a node that cannot write one line fail to start,
+                // which is a diagnostics failure escalated into an outage. Leaving the
+                // return unchecked makes it look like nobody thought about it.
+                (void) RecordOwnership(*held);
                 return std::make_unique<LockFileScratchClaim>(root, reclaimed, *held);
             }
             return std::unexpected(ScratchClaimRefusal::InUse);
@@ -311,14 +321,23 @@ namespace
         }
 
         /// Write who owns this root, for an operator reading the directory.
+        ///
+        /// Diagnostics only, and a failure here is deliberately NOT fatal -- see the
+        /// call site, which states the decision rather than leaving it to an
+        /// unchecked return.
         /// @param handle The held handle.
-        static void RecordOwnership(HANDLE handle)
+        /// @return Whether the record was actually written.
+        [[nodiscard]] static bool RecordOwnership(HANDLE handle)
         {
             auto const text = OwnershipRecord(static_cast<unsigned long long>(::GetCurrentProcessId()));
-            ::SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
+            if (::SetFilePointer(handle, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+                return false;
             DWORD written = 0;
-            (void) ::WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-            (void) ::SetEndOfFile(handle);
+            if (::WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) == 0)
+                return false;
+            if (::SetEndOfFile(handle) == 0)
+                return false;
+            return written == static_cast<DWORD>(text.size());
         }
 #else
         /// Release a claim taken but not handed out.
@@ -329,13 +348,26 @@ namespace
         }
 
         /// Write who owns this root, for an operator reading the directory.
+        ///
+        /// Diagnostics only, and a failure here is deliberately NOT fatal -- see the
+        /// call site, which states the decision rather than leaving it to an
+        /// unchecked return.
+        ///
+        /// The results are checked rather than cast to `void`: glibc marks
+        /// `ftruncate` and `write` `warn_unused_result`, and GCC deliberately ignores
+        /// a `(void)` cast on those -- so the cast would not even silence it, which is
+        /// the compiler being right. An ignored write here is not a decision.
         /// @param descriptor The held descriptor.
-        static void RecordOwnership(int descriptor)
+        /// @return Whether the record was actually written.
+        [[nodiscard]] static bool RecordOwnership(int descriptor)
         {
             auto const text = OwnershipRecord(static_cast<unsigned long long>(::getpid()));
-            (void) ::ftruncate(descriptor, 0);
-            (void) ::lseek(descriptor, 0, SEEK_SET);
-            (void) ::write(descriptor, text.data(), text.size());
+            if (::ftruncate(descriptor, 0) != 0)
+                return false;
+            if (::lseek(descriptor, 0, SEEK_SET) < 0)
+                return false;
+            auto const written = ::write(descriptor, text.data(), text.size());
+            return written >= 0 && static_cast<std::size_t>(written) == text.size();
         }
 #endif
 
