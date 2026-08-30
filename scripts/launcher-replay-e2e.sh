@@ -100,7 +100,14 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 echo "== the daemon this build will cache through"
-"$fastcached" --bind 127.0.0.1 --port "$port" --memory-limit 2048mb \
+# The flag spellings come from `CliOptions()` rather than from memory. An
+# unknown flag makes the daemon print usage and exit, and this script would
+# then report `never accepted a connection` for what is really a typo --
+# `--memory-limit` was exactly that, the option being `--max-memory`. Its
+# suffix is a single character, so `2048mb` is an unknown unit where `2048m`
+# is the spelling, and `--log-level=info` makes daemon.log worth catting when
+# the readiness loop does give up.
+"$fastcached" --bind=127.0.0.1 --port="$port" --max-memory=2048m --log-level=info \
     > "${workdir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
