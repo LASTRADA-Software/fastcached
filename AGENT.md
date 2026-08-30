@@ -218,6 +218,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   a credential for every worker that trusts the key. Fields length-prefixed, never
   joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
   proofs.
+- Its MAC also covers WHICH FLEET and WHICH EPOCH, or one key file is one fleet: two
+  clusters from one `--cluster-key-file` honoured each other's grants, and a grant from
+  before a leadership change stayed good (#322). The identity is MINTED — a configured
+  one is copied by the same `cp` that causes the bug — then persisted and replicated;
+  the epoch is the consensus term and `SetRole` only RAISES it. A worker LEARNS both
+  from grants that passed every check; the window that leaves is bounded by the expiry.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.

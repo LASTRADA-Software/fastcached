@@ -10,6 +10,8 @@
 #include <array>
 #include <chrono>
 #include <expected>
+#include <memory>
+#include <mutex>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -96,12 +98,59 @@ namespace
                   "a refusal row for COMPILE is dead: the lookup never reaches it");
 } // namespace
 
+/// What a worker has learnt about the fleet it serves, across compiles.
+///
+/// **Two facts a worker is never configured with and cannot ask for.** There is
+/// deliberately no `--cluster-id` flag -- a configured identity is copied by the same
+/// act that causes #322 -- and no way to ask who leads without a dependency on
+/// cluster state. So both are learnt from grants that have already authenticated,
+/// which is the only source a worker has that an attacker cannot supply.
+///
+/// Shared by `shared_ptr` because the validator is a `std::function` copied into
+/// `WorkerProtocol` and called from the compile pool, so several threads reach it at
+/// once. Guarded rather than atomic: the identity is a string, and the two fields are
+/// read together as one expectation.
+class FleetMemory
+{
+  public:
+    /// What to check the next grant against.
+    /// @return The pinned identity and the epoch high-water mark.
+    [[nodiscard]] Distributed::LearntFleet Learnt() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return Distributed::LearntFleet { .clusterId = _clusterId, .minEpoch = _minEpoch };
+    }
+
+    /// Record what an authenticated grant said about the fleet.
+    ///
+    /// First writer wins for the identity, which is what "pin" means: a later grant
+    /// naming a different fleet is refused by the caller before it ever reaches here.
+    /// The epoch only rises, so a grant from an older term cannot lower the bar for
+    /// the next one.
+    /// @param clusterId The fleet the grant named. Empty is not pinned.
+    /// @param epoch The term it was minted under.
+    void Learn(std::string_view clusterId, std::uint64_t epoch)
+    {
+        std::scoped_lock const guard { _mutex };
+        if (_clusterId.empty() && !clusterId.empty())
+            _clusterId.assign(clusterId);
+        _minEpoch = std::max(_minEpoch, epoch);
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::string _clusterId;
+    std::uint64_t _minEpoch { 0 };
+};
+
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     IWallClock const& clock)
 {
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock](
-               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+    return [key = std::move(signingKey),
+            endpoint = std::move(advertisedEndpoint),
+            fleet = std::make_shared<FleetMemory>(),
+            &clock](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -110,10 +159,23 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // toolchain's lease from paying for another's compile; neither does it alone,
         // which is why the grant's fingerprint check is not redundant with the
         // worker's.
-        auto verified = Distributed::VerifyLeaseToken(
-            key, token, Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint }, clock.Now());
+        auto const learnt = fleet->Learnt();
+        auto verified = Distributed::VerifyLeaseToken(key,
+                                                      token,
+                                                      Distributed::LeaseExpectation { .endpoint = endpoint,
+                                                                                      .fingerprint = fingerprint,
+                                                                                      .clusterId = learnt.clusterId,
+                                                                                      .minEpoch = learnt.minEpoch },
+                                                      clock.Now());
         if (verified.has_value())
+        {
+            // Learnt only from a grant that passed EVERY check, so a token that was
+            // authentic but wrong for this worker teaches nothing. The alternative --
+            // learning at the point the MAC verifies -- would let a grant this worker
+            // then refused still move its high-water mark.
+            fleet->Learn(verified->clusterId, verified->epoch);
             return std::nullopt;
+        }
 
         // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
         // permission, and the object key inside it is the SCHEDULER's bookkeeping, so

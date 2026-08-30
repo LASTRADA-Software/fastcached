@@ -260,6 +260,20 @@ class IMetricsSink
         /// and nowhere else is that machine's clock drifting, which is why the check
         /// carries skew slack and why this is worth seeing per node.
         WorkerJobsRefusedLeaseExpired,
+        /// Jobs refused because an AUTHENTIC lease came from a different fleet.
+        ///
+        /// The one refusal here that means two fleets share a `--cluster-key-file`.
+        /// A sustained rise on a worker that is otherwise healthy is a configuration
+        /// that was copied between sites, not an attack and not a network fault --
+        /// and it is the only counter that can say so, because every other signal in
+        /// that situation looks like a fleet working normally.
+        WorkerJobsRefusedLeaseForeignCluster,
+        /// Jobs refused because an AUTHENTIC lease predates a leadership change.
+        ///
+        /// Expected to blip at an election and then stop: clients holding grants from
+        /// the old leader present them once and are refused. A rise that does NOT
+        /// subside is a scheduler that lost leadership and is still handing out work.
+        WorkerJobsRefusedLeaseStaleEpoch,
 
         /// Scratch roots this worker took over from a node that died without
         /// cleaning up.

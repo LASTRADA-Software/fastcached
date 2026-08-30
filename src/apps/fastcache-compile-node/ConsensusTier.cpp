@@ -759,11 +759,10 @@ void ConsensusTier::Republish()
     // different questions. A node campaigning round after round without winning is
     // `Undecided` with no endpoint every time, so a single test leaves the one
     // condition somebody reads a dump to find completely silent; a term that moved
-    // is therefore worth a line even when the announcement did not change. The
-    // scheduler still hears only real changes -- it has no use for a term, and
-    // re-announcing an unchanged role is what the paragraph above forbids.
+    // is therefore worth a line even when the announcement did not change.
     auto const announcementMoved = !_published || scheduled != _publishedRole || leaderEndpoint != _publishedEndpoint;
-    if (!announcementMoved && _lastTerm == _publishedTerm)
+    auto const termMoved = _lastTerm != _publishedTerm;
+    if (!announcementMoved && !termMoved)
         return;
 
     _published = true;
@@ -771,7 +770,15 @@ void ConsensusTier::Republish()
 
     _logger.Log(LogLevel::Info, DescribeRole(scheduled, _lastTerm, leaderEndpoint));
 
-    if (!announcementMoved)
+    // The scheduler now hears a term change even when the announcement did not move,
+    // and that is a correction rather than added noise. This comment used to say the
+    // scheduler "has no use for a term"; it has one since #322 -- the term is the
+    // EPOCH signed into every grant, so a leader whose term advanced while it kept
+    // leading must sign under the new one, and a callback withheld because the role
+    // looked unchanged would leave it minting grants under a term the fleet has
+    // moved past. `SetRole` raises the epoch and never lowers it, so a repeat with an
+    // unchanged term is a no-op rather than something to suppress here.
+    if (!announcementMoved && !termMoved)
         return;
 
     _publishedRole = scheduled;
@@ -779,7 +786,7 @@ void ConsensusTier::Republish()
     _leads.store(scheduled == Distributed::SchedulerRole::Leader, std::memory_order_relaxed);
 
     if (_onRole)
-        _onRole(scheduled, leaderEndpoint);
+        _onRole(scheduled, leaderEndpoint, _lastTerm.value);
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
@@ -799,13 +806,13 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     auto tier = ConsensusTier::Start(
         cfg,
         schedulerBound,
-        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint) {
+        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch) {
             // Null when this node runs no scheduler surface, which is a legitimate
             // shape: a member that contributes CPU and consensus without handing out
             // anybody's work. It still votes, and its leadership -- if it wins -- is
             // simply not exercised through a port nobody can reach.
             if (schedulerTier != nullptr)
-                schedulerTier->SetRole(role, leaderEndpoint);
+                schedulerTier->SetRole(role, leaderEndpoint, epoch);
         },
         [&membership](std::vector<std::string> const& endpoints) {
             // The replicated member set joins the fleet's admission policy, so a node

@@ -749,6 +749,8 @@ because they are three different things for an operator to do:
 | `lease-unauthorized` | The token is junk, or signed with a key this worker does not hold | Somebody is probing the port — or a key rollout is half-finished |
 | `lease-endpoint-mismatch` | An authentic grant, issued for a different address | This worker's `--advertise` is not what the scheduler registered it under |
 | `lease-expired` | An authentic grant, older than its expiry plus five minutes of slack | A clock on one of the two machines is wrong |
+| `lease-foreign-cluster` | An authentic grant, from another fleet that holds the same key | **Two clusters share one `--cluster-key-file`.** Give each fleet its own key, or accept that they are one fleet |
+| `lease-stale-epoch` | An authentic grant, issued before a leadership change | Expected to blip at an election and stop. A rise that does not subside is a scheduler still handing out work after losing leadership |
 
 #### Whether a worker checks at all is a startup decision
 

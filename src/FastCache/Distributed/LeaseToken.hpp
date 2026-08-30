@@ -74,6 +74,28 @@ namespace FastCache::Distributed
 /// stable to borrow from in the first place.
 struct LeaseClaims
 {
+    /// WHICH FLEET issued this grant.
+    ///
+    /// Minted, never configured, and that is the whole of why it works. The failure
+    /// it closes is a *copied configuration* -- the ordinary result of standing up a
+    /// second site from a working one, or cloning staging from production -- so an
+    /// identity that lives in a config file is copied by the same `cp` that causes
+    /// the bug, and one derived from the pre-shared key is identical by construction
+    /// in exactly the case that matters. See `Cluster/ClusterIdentity.hpp`.
+    ///
+    /// Empty is legal and means a scheduler with no identity to state. A verifier
+    /// treats it as an unknown fleet rather than as a match: an empty claim must
+    /// never be the one value that satisfies every worker.
+    std::string clusterId;
+
+    /// HOW FRESH the grant is: the scheduler term it was minted under.
+    ///
+    /// A separate field from `clusterId` rather than folded into it, because they
+    /// answer different questions -- *which fleet* and *how fresh* -- and a value
+    /// answering both answers neither the moment they disagree. Zero means a
+    /// scheduler with no consensus, which has exactly one term for its whole life.
+    std::uint64_t epoch { 0 };
+
     /// The scheduler's own `LeaseTable` handle, carried inside the token.
     ///
     /// Which is what keeps `LeaseTable` pure: it mints and resolves a serial and
@@ -119,6 +141,14 @@ enum class LeaseRefusalReason : std::uint8_t
     Malformed = 0,
     /// A lease token this cluster's key does not authenticate.
     Unauthorized,
+    /// An authentic lease, minted by a different fleet.
+    ///
+    /// Directly after `Unauthorized` because it is the same question one level in:
+    /// the MAC verified, so both fleets hold the same key, and that is the finding
+    /// rather than an aside.
+    ForeignCluster,
+    /// An authentic lease, minted under an epoch this worker has already seen past.
+    StaleEpoch,
     /// An authentic lease, for a different worker.
     EndpointMismatch,
     /// An authentic lease, for a different toolchain.
@@ -166,6 +196,12 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
+    { .reason = LeaseRefusalReason::ForeignCluster,
+      .code = CompileCacheWire::ErrorCode::LeaseForeignCluster,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseForeignCluster },
+    { .reason = LeaseRefusalReason::StaleEpoch,
+      .code = CompileCacheWire::ErrorCode::LeaseStaleEpoch,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch },
     { .reason = LeaseRefusalReason::EndpointMismatch,
       .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseEndpointMismatch },
@@ -209,14 +245,17 @@ struct LeaseRefusal
 /// two constructions is how a tag produced for one purpose comes to be accepted for
 /// the other. The differing field arity makes that implausible on its own; this
 /// makes it impossible, for eighteen bytes on a message that is being hashed anyway.
-inline constexpr std::string_view LeaseTokenDomain = "fastcache-lease-v1";
+/// The version tracks the LAYOUT, so bump both together or neither: a domain that
+/// disagrees with `LeaseTokenVersion` is a comment that has outlived its code, and
+/// the two are four lines apart precisely so that cannot happen unnoticed.
+inline constexpr std::string_view LeaseTokenDomain = "fastcache-lease-v2";
 
 /// The token layout this build emits.
 ///
 /// Carried as a field of its own rather than inferred, so a future layout is a
 /// refusal by name in an old build rather than a mis-parse: the fields are
 /// length-prefixed, so a different arity would otherwise decode as *something*.
-inline constexpr std::uint8_t LeaseTokenVersion = 1;
+inline constexpr std::uint8_t LeaseTokenVersion = 2;
 
 /// How far a verifier's wall clock may trail the minting scheduler's.
 ///
@@ -259,10 +298,13 @@ namespace Detail
     [[nodiscard]] inline std::vector<std::byte> PackClaims(std::uint8_t version, LeaseClaims const& claims)
     {
         auto const versionField = std::array { static_cast<std::byte>(version) };
+        auto const epoch = WireFields::ToBigEndian<std::uint64_t>(claims.epoch);
         auto const expiry = WireFields::ToBigEndian<std::uint64_t>(static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(claims.expiresAt.time_since_epoch()).count()));
         return WireFields::Encode({
             std::span<std::byte const> { versionField },
+            WireFields::AsBytes(claims.clusterId),
+            std::span<std::byte const> { epoch },
             WireFields::AsBytes(claims.serial),
             WireFields::AsBytes(claims.endpoint),
             WireFields::AsBytes(claims.fingerprint),
@@ -286,7 +328,7 @@ namespace Detail
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
     /// How many fields the packed claims hold.
-    inline constexpr std::size_t ClaimFieldCount = 6;
+    inline constexpr std::size_t ClaimFieldCount = 8;
 
     /// The largest expiry this host's wall clock can represent, in milliseconds.
     ///
@@ -365,7 +407,10 @@ namespace Detail
         return std::unexpected { LeaseRefusalReason::Malformed };
     if ((*fields)[0].size() != 1 || std::to_integer<std::uint8_t>((*fields)[0][0]) != LeaseTokenVersion)
         return std::unexpected { LeaseRefusalReason::Malformed };
-    auto const expiryMillis = WireFields::FromBigEndian<std::uint64_t>((*fields)[5]);
+    auto const epoch = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
+    if (!epoch.has_value())
+        return std::unexpected { LeaseRefusalReason::Malformed };
+    auto const expiryMillis = WireFields::FromBigEndian<std::uint64_t>((*fields)[7]);
     if (!expiryMillis.has_value() || *expiryMillis > static_cast<std::uint64_t>(Detail::MaxExpiryMillis))
         return std::unexpected { LeaseRefusalReason::Malformed };
 
@@ -380,19 +425,53 @@ namespace Detail
     if (!ConstantTimeEquals(Detail::ExpectedTag(signingKey, packed), presented))
         return std::unexpected { LeaseRefusalReason::Unauthorized };
 
-    return LeaseClaims { .serial = std::string { WireFields::AsStringView((*fields)[1]) },
-                         .endpoint = std::string { WireFields::AsStringView((*fields)[2]) },
-                         .fingerprint = std::string { WireFields::AsStringView((*fields)[3]) },
-                         .key = std::string { WireFields::AsStringView((*fields)[4]) },
+    return LeaseClaims { .clusterId = std::string { WireFields::AsStringView((*fields)[1]) },
+                         .epoch = *epoch,
+                         .serial = std::string { WireFields::AsStringView((*fields)[3]) },
+                         .endpoint = std::string { WireFields::AsStringView((*fields)[4]) },
+                         .fingerprint = std::string { WireFields::AsStringView((*fields)[5]) },
+                         .key = std::string { WireFields::AsStringView((*fields)[6]) },
                          .expiresAt = std::chrono::system_clock::time_point {
                              std::chrono::milliseconds { static_cast<std::int64_t>(*expiryMillis) } } };
 }
+
+/// What a worker has learnt about its fleet, owned.
+///
+/// The owning counterpart of the two learnt fields of `LeaseExpectation`, which are
+/// `string_view`s like everything else on that struct. A verifier holds this between
+/// calls and builds an expectation from it per call, so the views never outlive their
+/// storage -- the same rule `LeaseClaims` states about not borrowing from the bytes it
+/// decoded, applied one layer out.
+struct LearntFleet
+{
+    std::string clusterId;        ///< The pinned fleet, or empty before the first grant.
+    std::uint64_t minEpoch { 0 }; ///< The freshest epoch seen, or zero.
+};
 
 /// What a verifier expects a grant to say about itself.
 struct LeaseExpectation
 {
     std::string_view endpoint;    ///< The endpoint this worker registered under.
     std::string_view fingerprint; ///< The toolchain this worker is about to run.
+
+    /// The fleet this worker belongs to, or empty when it does not know yet.
+    ///
+    /// **Empty means "accept and learn", not "accept anything forever."** A worker
+    /// has no configured fleet identity -- there is deliberately nowhere to put one,
+    /// since a configured value is copied by the same act that causes the bug -- so
+    /// it pins the first identity it authenticates and refuses every other one after
+    /// that. The residual that leaves is stated where the pin lives.
+    std::string_view clusterId;
+
+    /// The oldest epoch this worker will still honour.
+    ///
+    /// A high-water mark the worker raises as it verifies grants, never a term it was
+    /// told. That is what keeps this check free of any dependency on cluster state: a
+    /// worker needs no way to ask who leads, only a memory of the freshest grant it
+    /// has already seen. Both that and the pin above are bounded by the token expiry:
+    /// a worker that has not yet seen the new epoch, or that has just restarted and
+    /// forgotten, still refuses anything older than what it has seen since.
+    std::uint64_t minEpoch { 0 };
 };
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
@@ -420,6 +499,33 @@ struct LeaseExpectation
     auto authentic = AuthenticateLeaseToken(signingKey, token);
     if (!authentic.has_value())
         return std::unexpected { LeaseRefusal { .reason = authentic.error(), .detail = {} } };
+
+    // Fleet first among the post-MAC checks, because it is the most fundamental
+    // thing that can be wrong: every check below asks whether an authentic grant is
+    // right for THIS worker, and that question is meaningless when the grant came
+    // from a scheduler this worker does not serve.
+    //
+    // An empty expectation matches nothing rather than everything -- it means the
+    // worker has not pinned a fleet yet, and its caller decides what to do about
+    // that. An empty *claim* is likewise never a match: a scheduler with no identity
+    // must not be the one value that satisfies every worker.
+    if (!expected.clusterId.empty() && authentic->clusterId != expected.clusterId)
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::ForeignCluster,
+            // Both ids, because the operator's next question is "which two fleets",
+            // and both are already inside a token the caller is holding in the clear.
+            .detail = std::format("this lease was issued by fleet {}; this worker serves fleet {} -- two clusters "
+                                  "sharing one --cluster-key-file authenticate each other's grants",
+                                  authentic->clusterId.empty() ? std::string { "<none>" } : authentic->clusterId,
+                                  expected.clusterId) } };
+
+    if (authentic->epoch < expected.minEpoch)
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::StaleEpoch,
+            .detail =
+                std::format("this lease was issued under scheduler epoch {}; this worker has already served epoch {}",
+                            authentic->epoch,
+                            expected.minEpoch) } };
 
     if (authentic->endpoint != expected.endpoint)
         return std::unexpected { LeaseRefusal {

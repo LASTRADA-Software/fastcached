@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cluster/ClusterIdentity.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -274,22 +275,97 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
     // anywhere; one that died first would have a worker refusing work whose key this
     // scheduler is still suppressing.
     return MintLeaseToken(_signingKey,
-                          LeaseClaims { .serial = lease.token,
+                          LeaseClaims { .clusterId = ClusterId(),
+                                        .epoch = _epoch.load(std::memory_order_relaxed),
+                                        .serial = lease.token,
                                         .endpoint = std::string { endpoint },
                                         .fingerprint = std::string { fingerprint },
                                         .key = lease.key,
                                         .expiresAt = _wallClock.Now() + _leases.Timeout() });
 }
 
-void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint)
+void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
 {
     {
         std::scoped_lock const guard { _leaderMutex };
         _leaderEndpoint.assign(leaderEndpoint);
     }
+
+    // Raised, never set. Terms only increase, so a lower one is either a stale
+    // callback arriving out of order or a caller that does not know the term -- and
+    // both are answered by keeping what we have. Obeying a decrease would let this
+    // scheduler mint grants under an epoch its own workers have already refused past,
+    // which is indistinguishable from the attack the epoch exists to stop.
+    auto known = _epoch.load(std::memory_order_relaxed);
+    while (epoch > known && !_epoch.compare_exchange_weak(known, epoch, std::memory_order_relaxed))
+    {
+    }
+
+    ReconcileClusterId(role);
+
     // Published after the endpoint it describes, so a reader that sees `Leader`
     // has already been able to see the address that came with it.
     _role.store(role, std::memory_order_release);
+}
+
+void SchedulerService::ReconcileClusterId(SchedulerRole role)
+{
+    // Only where there is a cluster. Without consensus this node's own persisted
+    // identity is the fleet's identity, and there is nothing to reconcile it with.
+    if (_admin == nullptr)
+        return;
+
+    // The REPLICATED value wins, because every member must sign under one identity:
+    // a cluster whose members each signed their own would refuse its own work at
+    // every leadership change, which is the failure this whole field exists to
+    // report and would be far worse than the bug it closes.
+    if (auto const agreed = _admin->ClusterState().SettingOf(std::string { Cluster::ClusterIdSetting });
+        agreed.has_value() && !agreed->empty())
+    {
+        SetClusterId(*agreed);
+        return;
+    }
+
+    // Nothing agreed yet, so the first leader offers its own. A follower proposes
+    // nothing -- `ProposeToCluster` would refuse it anyway, and asking is how a
+    // refusal becomes a log line nobody can act on.
+    if (role != SchedulerRole::Leader)
+        return;
+
+    auto const mine = ClusterId();
+    if (mine.empty())
+        return;
+
+    // Once per process. A proposal is appended, not committed, so the state will not
+    // show it immediately and an unguarded call would re-propose on every role change
+    // until it lands.
+    if (_proposedClusterId.exchange(true, std::memory_order_relaxed))
+        return;
+
+    if (auto const offered = _admin->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                                                        .key = std::string { Cluster::ClusterIdSetting },
+                                                                        .value = mine,
+                                                                        .schedulerEndpoint = {} });
+        !offered.has_value())
+        // Not fatal: this node keeps signing under its own identity, which is right
+        // for a single-member cluster and is what a worker has pinned anyway. Said
+        // out loud because a fleet whose members never agree on an identity refuses
+        // work after every election, and this line is the only warning of it.
+        _logger.Logf(LogLevel::Warn,
+                     "cluster: could not publish this fleet's identity ({}); members may not agree on it",
+                     offered.error().context);
+}
+
+void SchedulerService::SetClusterId(std::string_view clusterId)
+{
+    std::scoped_lock const guard { _leaderMutex };
+    _clusterId.assign(clusterId);
+}
+
+std::string SchedulerService::ClusterId() const
+{
+    std::scoped_lock const guard { _leaderMutex };
+    return _clusterId;
 }
 
 SchedulerReply SchedulerService::Offer(Cluster::Command const& command)

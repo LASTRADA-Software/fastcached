@@ -63,9 +63,26 @@ namespace
 /// the layout the header documents.
 constexpr std::size_t VersionByteOffset = 2 * sizeof(std::uint32_t);
 
-/// Where the first byte of the serial sits: past the version field's prefix and
-/// value, then past the serial's own length prefix.
-constexpr std::size_t SerialByteOffset = VersionByteOffset + 1 + sizeof(std::uint32_t);
+/// Where the LAST claim byte sits, counted back from the end.
+///
+/// The envelope is `[u32 claimsLength][claims][u32 tagLength][tag]`, so the final
+/// claim byte is the tag, its length prefix, and one more, back from the end.
+///
+/// Counted from the END rather than forward to a named field, and that is the point
+/// of the change that replaced it: this used to be `SerialByteOffset`, an offset
+/// walked forward past the version to the serial, and adding two covered claims in
+/// front of the serial (#322) silently re-aimed it at a different field -- which the
+/// case caught, because a flip landing in a length prefix is `Malformed` rather than
+/// `Unauthorized`. Counting back is independent of how many fields there are and of
+/// how long any of them is, so the next covered field cannot move it.
+/// @param token The minted token.
+/// @return The offset of the last byte the MAC covers.
+[[nodiscard]] std::size_t LastClaimByteOffset(std::string const& token)
+{
+    auto const raw = Base64Decode(token);
+    REQUIRE(raw.has_value());
+    return Unwrap(raw).size() - sizeof(std::uint32_t) - Sha256::DigestSize - 1;
+}
 
 /// Overwrite one byte of the decoded envelope and re-encode it.
 /// @param token The token to damage.
@@ -168,10 +185,10 @@ TEST_CASE("A forged or tampered lease is refused and tells the forger nothing", 
 
     SECTION("a tampered claim, which the MAC covers")
     {
-        // The serial, which is a CLAIM rather than the tag. The MAC is recomputed
-        // over the claim bytes as received, so this is `Unauthorized` and not a
-        // successful decode of different claims.
-        auto const refusal = VerifyLeaseToken(key, FlipByteAt(token, SerialByteOffset), Worker(), Noon());
+        // A CLAIM byte rather than the tag. The MAC is recomputed over the claim
+        // bytes as received, so this is `Unauthorized` and not a successful decode of
+        // different claims.
+        auto const refusal = VerifyLeaseToken(key, FlipByteAt(token, LastClaimByteOffset(token)), Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Unauthorized);
     }
@@ -437,4 +454,132 @@ TEST_CASE("An empty key authenticates nothing", "[distributed][lease][token]")
     // And a real key does not accept it either, so nothing minted without a secret
     // is ever good anywhere.
     CHECK_FALSE(AuthenticateLeaseToken(Key(), unsignedToken).has_value());
+}
+
+
+TEST_CASE("A grant from one fleet is refused by the other's worker, on the same key", "[distributed][lease][token]")
+{
+    // **The acceptance of #322, and the whole point is the key is SHARED.** Both
+    // fleets were provisioned from one `--cluster-key-file` -- the ordinary result
+    // of copying a working configuration to a second site -- so every check that
+    // existed before this passes: the MAC verifies, the endpoint matches, the
+    // fingerprint matches, the expiry is in the future. Nothing was wrong and the
+    // worker compiled another fleet's work.
+    auto const shared = Key();
+
+    auto claims = Grant();
+    claims.clusterId = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+    auto const token = MintLeaseToken(shared, claims);
+
+    // It authenticates. That is not the question being asked, and asserting it is
+    // what stops this case passing for the wrong reason -- a token that failed the
+    // MAC would be refused for a reason that has nothing to do with fleets.
+    REQUIRE(AuthenticateLeaseToken(shared, token).has_value());
+
+    auto foreign = Worker();
+    foreign.clusterId = "cccccccccccccccceeeeeeeeeeeeeeee";
+    auto const refusal = VerifyLeaseToken(shared, token, foreign, Noon());
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::ForeignCluster);
+
+    // The sentence an operator gets is the highest-value text in this change: they
+    // have just cloned a configuration and been handed a security-flavoured refusal,
+    // and without the cause named they will look at the network.
+    CHECK(refusal.error().detail.contains("--cluster-key-file"));
+    CHECK(refusal.error().detail.contains(claims.clusterId));
+    CHECK(refusal.error().detail.contains(std::string { foreign.clusterId }));
+
+    // And its own fleet's worker still runs it, or the check would be refusing
+    // everything rather than refusing the right thing.
+    auto own = Worker();
+    own.clusterId = claims.clusterId;
+    CHECK(VerifyLeaseToken(shared, token, own, Noon()).has_value());
+}
+
+TEST_CASE("A worker that has pinned no fleet accepts, and a scheduler that names none is refused",
+          "[distributed][lease][token]")
+{
+    auto const key = Key();
+
+    // Empty on the WORKER means "not pinned yet" and accepts, which is what lets a
+    // worker learn its fleet from the first grant it authenticates.
+    auto claims = Grant();
+    claims.clusterId = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+    CHECK(VerifyLeaseToken(key, MintLeaseToken(key, claims), Worker(), Noon()).has_value());
+
+    // Empty in the GRANT is the opposite: it must not be the one value that matches
+    // every worker. A scheduler with no identity to state is refused by a worker that
+    // has one, rather than satisfying it.
+    auto pinned = Worker();
+    pinned.clusterId = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+    auto const anonymous = VerifyLeaseToken(key, MintLeaseToken(key, Grant()), pinned, Noon());
+    REQUIRE_FALSE(anonymous.has_value());
+    CHECK(anonymous.error().reason == LeaseRefusalReason::ForeignCluster);
+    CHECK(anonymous.error().detail.contains("<none>"));
+}
+
+TEST_CASE("A grant minted before a leadership change is refused after it", "[distributed][lease][token]")
+{
+    // The second acceptance of #322. The token is well inside its expiry -- that is
+    // deliberate, and it is what makes this a different fact from `Expired`: what
+    // makes the grant stale is that the fleet moved on, not that time passed.
+    auto const key = Key();
+
+    auto old = Grant();
+    old.epoch = 6;
+    auto const stale = MintLeaseToken(key, old);
+
+    auto worker = Worker();
+    worker.minEpoch = 7; // this worker has already served a grant from the new leader
+
+    auto const refusal = VerifyLeaseToken(key, stale, worker, Noon());
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::StaleEpoch);
+    CHECK(refusal.error().detail.contains("6"));
+    CHECK(refusal.error().detail.contains("7"));
+
+    // Not expiry, and the token proves it: the same token is honoured by a worker
+    // that has not seen the newer epoch, at the same instant.
+    CHECK(VerifyLeaseToken(key, stale, Worker(), Noon()).has_value());
+
+    // The same epoch is fresh enough -- the bar is "not older", not "newer".
+    auto current = Grant();
+    current.epoch = 7;
+    CHECK(VerifyLeaseToken(key, MintLeaseToken(key, current), worker, Noon()).has_value());
+}
+
+TEST_CASE("The fleet and the epoch are inside the MAC, not merely beside it", "[distributed][lease][token]")
+{
+    // The property both acceptances rest on, asserted directly: a field a forger can
+    // edit is decoration. Substituting an equal-length value leaves every length
+    // prefix intact, so the result is a structurally perfect token that differs in
+    // exactly the field under test -- and it must fail to authenticate at all rather
+    // than decode into different claims.
+    auto const key = Key();
+
+    auto claims = Grant();
+    claims.clusterId = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+    claims.epoch = 6;
+    auto const token = MintLeaseToken(key, claims);
+
+    auto const reFleeted = Substitute(token, claims.clusterId, "cccccccccccccccceeeeeeeeeeeeeeee");
+    auto const forged = AuthenticateLeaseToken(key, reFleeted);
+    REQUIRE_FALSE(forged.has_value());
+    CHECK(forged.error() == LeaseRefusalReason::Unauthorized);
+
+    // The epoch as well, and it needs a different instrument: it is eight raw
+    // big-endian bytes rather than text, so there is no string to substitute. A
+    // flipped byte inside it is the same question asked the only way that reaches it.
+    //
+    // This half was added after the coverage experiment showed the case passing with
+    // the epoch removed from the signed claims -- it named two fields and checked
+    // one, which is the shape of a test that reports on work it did not do.
+    constexpr std::size_t claimsLengthPrefix = sizeof(std::uint32_t);
+    constexpr std::size_t versionField = sizeof(std::uint32_t) + 1;
+    auto const clusterIdField = sizeof(std::uint32_t) + claims.clusterId.size();
+    auto const epochFirstByte = claimsLengthPrefix + versionField + clusterIdField + sizeof(std::uint32_t);
+
+    auto const reEpoched = AuthenticateLeaseToken(key, FlipByteAt(token, epochFirstByte));
+    REQUIRE_FALSE(reEpoched.has_value());
+    CHECK(reEpoched.error() == LeaseRefusalReason::Unauthorized);
 }

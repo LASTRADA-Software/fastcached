@@ -177,7 +177,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// A `string_view` rather than a `std::string`: every consumer forwards it
     /// straight to `SchedulerService::SetRole`, which takes a view, so a by-value
     /// parameter here would be a copy made once per role change purely to be read.
-    using RoleObserver = std::function<void(Distributed::SchedulerRole role, std::string_view leaderEndpoint)>;
+    ///
+    /// The term travels too, because it is the EPOCH a grant is signed under (#322):
+    /// a worker refuses a grant minted before a leadership change, and it can only do
+    /// that if the scheduler knows which term it is minting in. Dropping it here was
+    /// the kind of gap that only shows when something finally needs the value.
+    using RoleObserver =
+        std::function<void(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)>;
 
     /// Told the cluster's member endpoints whenever they change.
     using MembersObserver = std::function<void(std::vector<std::string> const& endpoints)>;

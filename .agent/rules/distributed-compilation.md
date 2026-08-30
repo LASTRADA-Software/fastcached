@@ -638,6 +638,50 @@ Consequences that are each load-bearing:
   serial rather than replacing it, which is what keeps that component pure — no key,
   no wall clock, no crypto in the thing whose whole job is a deterministic unit
   test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
+- **The MAC covers WHICH FLEET and WHICH EPOCH, or one key file is one fleet.** The
+  endpoint stops a grant being replayed against another *worker*; it does nothing
+  about another *cluster*. Two fleets provisioned from one `--cluster-key-file` — the
+  ordinary result of copying a working configuration to a second site, or cloning
+  staging from production — authenticated each other's grants perfectly: the MAC
+  verified, the endpoint matched, the fingerprint matched, the expiry was in the
+  future, and nothing said which fleet issued it (#322). The same gap admitted a grant
+  from before a leadership change, because no epoch travelled either.
+
+  **The identity is MINTED, never configured, and that is the whole of why it works.**
+  The act that causes the bug is copying a config file, so a `--cluster-id` in one is
+  copied by the same `cp`; an identity derived from the key is identical by
+  construction in exactly the case that matters; and one derived from the member set
+  changes as members are added, which would silently re-identify a live fleet. What is
+  left is a draw from `IRandomSource` on first start, **persisted** so a scheduler
+  restart is ordinary, and **replicated** as a `SettingTable` row so every member of
+  one cluster signs under one value. Without consensus — a node with no `--node-id`,
+  which `SchedulerTier` calls "what most people run" — a lone scheduler owns a file.
+  State the residual rather than papering over it: cloning a whole machine image,
+  state directory included, still copies the identity. Copying a *configuration* is
+  what this closes.
+
+  **The epoch stays a separate field.** Identity and freshness answer different
+  questions — *which fleet* and *how fresh* — and a value answering both answers
+  neither the moment they disagree. It is the consensus term, which `ConsensusTier`
+  had been dropping on the floor; `SetRole` only ever RAISES it, because a scheduler
+  talked backwards into minting under an old term is indistinguishable from the attack
+  the epoch exists to stop.
+
+  **A worker learns both rather than being told either.** There is deliberately
+  nowhere to configure a fleet identity on a worker, and no way for it to ask who
+  leads without a dependency on cluster state, so it pins the first identity it
+  authenticates and keeps a high-water mark of the freshest epoch — both learnt only
+  from grants that passed *every* check, so a token that was authentic but wrong for
+  this worker teaches it nothing. What that leaves open is a worker which has verified
+  nothing yet, and the expiry is what bounds it. Closing it properly means the worker
+  learning its fleet from its own registration, which is a wire change and is filed
+  rather than assumed.
+
+  A refusal is `LeaseForeignCluster` or `LeaseStaleEpoch` — never a generic MAC
+  failure, and never `UnknownLease`, which is the scheduler's code. The foreign-cluster
+  message names the shared `--cluster-key-file` explicitly: an operator who has just
+  cloned a configuration and been handed a security-flavoured refusal will otherwise
+  spend a day on the network, and that day is the real cost of this bug.
 - **The MAC is verified BEFORE any other claim is reported on, and the expiry is not
   a capacity bound.** Checking the plaintext endpoint first would be cheaper and
   would turn a diagnostic into an oracle: `EndpointMismatch` and `Expired` are only

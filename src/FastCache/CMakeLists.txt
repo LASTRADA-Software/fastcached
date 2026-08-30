@@ -44,6 +44,7 @@ target_sources(FastCache
         Core/Crc32c.cpp
         Core/PathKind.cpp
         Core/Sha256.cpp
+        Cluster/ClusterIdentity.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
         Cluster/DiscoveryService.cpp

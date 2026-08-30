@@ -208,7 +208,32 @@ class SchedulerService
     /// configuration-at-construction, not an exception to it.
     /// @param role What this node may do.
     /// @param leaderEndpoint Where the leader is, when one is known; empty otherwise.
-    void SetRole(SchedulerRole role, std::string_view leaderEndpoint);
+    /// @param epoch The consensus term this standing was decided in, signed into every
+    ///        grant minted under it so a worker can tell a fresh grant from one issued
+    ///        before a leadership change. Zero for a scheduler with no consensus, which
+    ///        has exactly one epoch for its whole life. **Only ever raised**: a caller
+    ///        that reports a lower one is ignored rather than obeyed, because a grant
+    ///        minted under a term the fleet has moved past is the thing being refused
+    ///        and a scheduler must not be talked backwards into minting one.
+    void SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch = 0);
+
+    /// Tell this scheduler which fleet it belongs to.
+    ///
+    /// A setter for the reason `SetRole` is one, and a different one: where the
+    /// identity comes from is a decision about *deployment shape* -- a replicated
+    /// setting when consensus runs, a file beside this node's state when it does not
+    /// -- and that belongs to the tier that knows which shape this is, not to the
+    /// surface that signs with it. See `Cluster/ClusterIdentity.hpp`.
+    ///
+    /// Empty is legal and means a scheduler that cannot state a fleet. Its grants
+    /// then carry no identity and a worker that has pinned one refuses them, which is
+    /// the correct direction to fail.
+    /// @param clusterId The fleet's minted identity.
+    void SetClusterId(std::string_view clusterId);
+
+    /// The fleet this scheduler signs for.
+    /// @return The identity last set, or empty.
+    [[nodiscard]] std::string ClusterId() const;
 
     /// Give this scheduler a cluster to administer.
     ///
@@ -534,6 +559,27 @@ class SchedulerService
     /// interleaving is reachable by a heartbeat landing one instant later, so a
     /// lock spanning both would buy an atomicity the fleet does not have anyway.
     std::atomic<SchedulerRole> _role { SchedulerRole::Undecided };
+
+    /// Adopt the cluster's agreed identity, or offer this node's when it has none.
+    ///
+    /// Called from `SetRole` because that is when both inputs can have changed: a
+    /// node that just became leader is the one that may propose, and a node that just
+    /// applied entries may have learnt an identity it did not have.
+    /// @param role What this node now is.
+    void ReconcileClusterId(SchedulerRole role);
+
+    /// The term every grant is signed under. Monotonic; see `SetRole`.
+    std::atomic<std::uint64_t> _epoch { 0 };
+
+    /// Whether this process has already offered the cluster an identity.
+    std::atomic<bool> _proposedClusterId { false };
+
+    /// The fleet identity every grant is signed under. Guarded by `_leaderMutex`,
+    /// which already covers the other string this class publishes from one thread
+    /// and reads from another -- a second mutex for a second such string would be
+    /// two locks protecting one pattern.
+    std::string _clusterId {};
+
     mutable std::mutex _leaderMutex;
     std::string _leaderEndpoint {}; ///< Guarded by `_leaderMutex`.
 

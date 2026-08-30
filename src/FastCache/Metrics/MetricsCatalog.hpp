@@ -243,6 +243,18 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "machine and nowhere else is that machine's clock, not the fleet's "
               "leases.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseForeignCluster,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_foreign_cluster_total",
+      .help = "Jobs refused because an authentic lease was issued by a different "
+              "fleet. Means two clusters share one --cluster-key-file; every other "
+              "signal in that situation looks healthy.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_stale_epoch_total",
+      .help = "Jobs refused because an authentic lease predates a leadership change. "
+              "A blip at an election is expected; a sustained rise is a scheduler "
+              "still handing out work after losing leadership.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerScratchRootsReclaimed,
       .prometheusName = "fastcache_worker_scratch_roots_reclaimed_total",
       .help = "Scratch roots taken over from a node that exited without cleaning up. "

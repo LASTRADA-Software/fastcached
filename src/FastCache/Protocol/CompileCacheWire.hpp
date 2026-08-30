@@ -381,6 +381,27 @@ enum class ErrorCode : std::uint8_t
     /// Clock skew is real across a fleet, so the check carries slack; a rise here on
     /// one machine and nowhere else is that machine's clock, not the fleet's leases.
     LeaseExpired = 0x1B,
+
+    /// An authentic lease, minted by a scheduler belonging to a DIFFERENT fleet.
+    ///
+    /// Authentic and unauthorised at once, which is why it is neither
+    /// `LeaseUnauthorized` nor a mismatch code: the MAC verified, so both ends hold
+    /// the same pre-shared key -- and that is exactly the problem being reported. Two
+    /// fleets provisioned from one `--cluster-key-file`, which is the ordinary result
+    /// of copying a working configuration to a second site or cloning staging from
+    /// production, authenticate each other's grants perfectly.
+    ///
+    /// The message names that cause explicitly. An operator who has just cloned a
+    /// configuration and is handed a security-flavoured refusal will otherwise look
+    /// at the network, and the day that costs is the real price of this bug.
+    LeaseForeignCluster = 0x1C,
+
+    /// An authentic lease, minted under a scheduler epoch older than one already seen.
+    ///
+    /// A grant issued before a leadership change, presented after it. Distinct from
+    /// `LeaseExpired` because the token may be well inside its expiry: what makes it
+    /// stale is that the fleet has moved on, not that time has passed.
+    LeaseStaleEpoch = 0x1D,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -704,6 +725,17 @@ inline constexpr std::array ErrorTable {
                       .name = "lease-endpoint-mismatch",
                       .defaultMessage = "this lease was issued for another worker" },
     ErrorDescriptor { .code = ErrorCode::LeaseExpired, .name = "lease-expired", .defaultMessage = "this lease has expired" },
+    // The default message names the cause rather than the symptom, because the
+    // symptom -- an authentic grant refused -- reads as a network or key problem and
+    // is neither. A verifier that knows both fleet ids replaces this with a message
+    // naming them; this is what an operator sees when it does not.
+    ErrorDescriptor { .code = ErrorCode::LeaseForeignCluster,
+                      .name = "lease-foreign-cluster",
+                      .defaultMessage = "this lease was issued by a different fleet; check whether two clusters share "
+                                        "one --cluster-key-file" },
+    ErrorDescriptor { .code = ErrorCode::LeaseStaleEpoch,
+                      .name = "lease-stale-epoch",
+                      .defaultMessage = "this lease was issued before a leadership change" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.

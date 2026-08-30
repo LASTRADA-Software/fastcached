@@ -100,9 +100,17 @@ struct SettingSpec
 /// can differ per machine because the machines differ. `--slots` is the counter-
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
-inline constexpr std::array<SettingSpec, 2> SettingTable {
+inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = "upstream", .summary = "host:port of the shared fastcached every member reads through to" },
     SettingSpec { .name = "fleet-open", .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+    // Minted once by whichever member leads first, then never changed. It is a
+    // setting rather than a per-node value for the reason this table exists: every
+    // member must agree, because a lease signed under one identity is refused by a
+    // worker that pinned another, so a cluster whose members disagreed would refuse
+    // its own work at every leadership change. See `Cluster/ClusterIdentity.hpp`.
+    SettingSpec { .name = "cluster-id",
+                  .summary = "the fleet's minted identity, signed into every lease so two clusters sharing a "
+                             "--cluster-key-file do not honour each other's grants" },
 };
 
 /// Whether `name` is a setting this cluster replicates.
