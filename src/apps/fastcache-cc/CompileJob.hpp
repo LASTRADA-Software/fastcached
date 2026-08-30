@@ -105,6 +105,14 @@ struct CompileOutcome
     std::vector<std::byte> object; ///< The object, empty when the compile failed.
     std::string stdoutText;
     std::string stderrText;
+    /// What this worker actually compiled, tying the reply to its request (#280).
+    ///
+    /// Filled by the RUNNER from the values it used, never recomputed by the wire
+    /// layer from the decoded request: at the wire layer both of two crossed requests
+    /// are still pristine, so a digest taken there matches whatever it is compared
+    /// against and catches nothing. See `CompileCorrelation`, which also records the
+    /// half of the problem this cannot see.
+    std::string correlation;
 };
 
 /// Runs compile jobs on this worker.
