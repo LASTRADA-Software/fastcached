@@ -438,6 +438,57 @@ fault.
     refuse. It reaches an HTML page, so it is escaped like every other value that
     came off a wire.
 
+## Skipped, absent, unstarted and failed are four states, and tools collapse them
+
+`Absent is not zero` above is the metrics instance of a rule that is not about
+metrics. In one working session this project's own tooling collapsed at least two
+of these four states **five separate times, in four different instruments** — none
+of them a coding mistake, all of them a representation that could not tell two
+things apart:
+
+| instrument | what it reported | what was true |
+|---|---|---|
+| the e2e wait classifier | `WORKING`, from CPU spent | that CPU was *cumulative*; none of it was recent |
+| `build.yml`'s gated jobs | skip, from `code == 'true'` | the classifier had **failed**, so it answered nothing |
+| the required-checks reading | a skipped required check passes | a skipped **matrix** job never reports at all |
+| `pr-labels.yml`'s gate | skipped, therefore green | the labeller had **failed** |
+| a CI watcher (twice) | "settled", then "25 of 26 green" | the list was still being built; the 26th was correctly skipped |
+
+The four states, and why each pair is dangerous:
+
+- **Deliberately not done** (a skipped job, an unsampled reading). Legitimate, and
+  it must not be counted as an event or as a zero.
+- **Not done yet** (a queued check, an unpopulated list). Says nothing at all, and
+  reads as *finished* to anything that only counts what is pending.
+- **Could not be observed** (an unreadable file, an unsampleable process, a failed
+  classifier). This is the one that most often becomes a zero, and folding it into
+  a sum is how "we could not tell" becomes "there was nothing there".
+- **Observed and failed.** The only one anybody designs for.
+
+Three consequences worth applying before writing the check rather than after:
+
+**A count cannot carry this and neither can a `bool`.** `25 of 26 green` is
+arithmetic that is true and useless. An outcome that can be *not attempted* is an
+enum — the same conclusion the metrics rule reaches from the other end when it says
+`NoUpstream`'s honest `false` was read as a failed store.
+
+**Absence of the negative is not the positive.** "No pending checks" is not "all
+checks reported"; "no failures found" is not "the tool ran". Every check that
+concludes from a count of *bad* things needs a separate assertion that the good
+things exist — which is why `tsan-gate.sh` proves the sanitizer is live before it
+believes a clean run, and why `merge-queue-contexts` counts total references as
+well as safe ones.
+
+**Ask which state a silent tool is in, and make it say so.** Where the answer
+genuinely cannot be determined, report that as its own outcome rather than picking
+the nearest neighbour: `Get-WaitVerdict` reports `INCONCLUSIVE` and names which
+reading was unreadable, because a verdict it cannot support is worth less than an
+admission it cannot.
+
+The pattern is easy to recognise in someone else's code and nearly invisible in
+your own, because in your own the collapsed state is the one you were not thinking
+about when you chose the representation.
+
 ## Text a peer sent is text, or the fleet refuses it
 
 Every string a peer states about itself -- a toolchain fingerprint, an endpoint,

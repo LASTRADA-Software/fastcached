@@ -497,6 +497,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   committed, with nobody left to refuse it. Markup's rule is XML's `Char`
   production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
   illegal in an SVG.
+- **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five times in four
+  instruments in one session, none of them a coding mistake, all of them a representation that could not tell
+  two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
+  true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
+  reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
+  a separate assertion that the good things exist. Where the answer cannot be determined, report that as its own
+  outcome rather than the nearest neighbour.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - Its converse: an absence must not be counted as an event. `NoUpstream`'s honest
