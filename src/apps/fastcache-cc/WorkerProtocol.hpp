@@ -5,6 +5,8 @@
 #include "CodecEnvelope.hpp"
 #include "CompileJob.hpp"
 
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -23,16 +25,78 @@ namespace FastCache::Cc
 
 /// Decide whether a lease token authorizes a job.
 ///
-/// Injected rather than called directly, because "ask the scheduler" is I/O and
-/// this file has none. It is also the seam where a worker's trust model can change
-/// without touching the framing: today the plausible implementations are "accept
-/// any token" (a fleet on a trusted network, where the scheduler's reachability is
-/// the boundary) and "ask the scheduler", and a signed token would be a third.
+/// Injected rather than called directly, because reading a cluster key and a wall
+/// clock is I/O and this file has none. It is also the seam where a worker's trust
+/// model lives: today the two implementations are "verify the scheduler's
+/// signature" and "accept anything", and which one a node builds is a startup
+/// decision it announces rather than a per-request fallback.
+///
+/// **Returns a REASON, not a `bool`.** Three refusals are distinguishable on the
+/// wire and counted apart (`LeaseUnauthorized`, `LeaseEndpointMismatch`,
+/// `LeaseExpired`), so a boolean would collapse exactly the distinction an operator
+/// needs: somebody probing the port, a worker whose advertised endpoint is not the
+/// one clients dial, and a machine whose clock has drifted are three different
+/// things to go and do.
+///
+/// **It does not take the endpoint.** The endpoint a grant is checked against is
+/// the WORKER's own advertised address, which is fixed for the life of the process
+/// and is not the client's to state -- so a production implementation captures it,
+/// along with the signing key and the clock, and this signature carries only what
+/// arrives in the request. A parameter here would invite a caller to pass something
+/// the request supplied, which is the whole failure the endpoint is inside the MAC
+/// to prevent.
 ///
 /// @param leaseToken The token the client presented.
 /// @param fingerprint The toolchain the client says it compiled against.
-/// @return True when the job may run.
-using LeaseValidator = std::function<bool(std::string_view leaseToken, std::string_view fingerprint)>;
+/// @return Nothing when the job may run, or why it may not.
+using LeaseValidator =
+    std::function<std::optional<Distributed::LeaseRefusalReason>(std::string_view leaseToken, std::string_view fingerprint)>;
+
+/// The validator a worker holding the cluster's key builds.
+///
+/// The whole check, and it costs no round trip: a grant carries an HMAC over the
+/// worker's endpoint, the toolchain, the object key and an expiry, signed with the
+/// key both ends already have for discovery. So this is a local
+/// `Distributed::VerifyLeaseToken` and nothing else.
+///
+/// It lives HERE rather than beside the node's `main`, next to the only class that
+/// consults it, because that is the one place both binaries compile: `main.cpp` is
+/// not a unit-testable translation unit, and a trust decision that cannot be
+/// exercised directly gets exercised by nothing.
+///
+/// The endpoint is captured, never taken per request. A grant is signed FOR one
+/// worker, and that is what stops a token captured on the way to one machine from
+/// being replayed against every other machine trusting the same key -- so the
+/// address checked against has to be this worker's own, established once at startup.
+///
+/// @param signingKey The cluster's pre-shared key; copied, since it outlives no
+///        particular call.
+/// @param advertisedEndpoint This worker's address as clients are told to dial it --
+///        exactly the string it registered with the scheduler under, because that is
+///        the string the scheduler signed.
+/// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
+///        expiry was stamped on another machine, and a steady instant means nothing
+///        off the host that read it. Borrowed, so it must outlive the validator.
+/// @return The validator.
+[[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
+                                                  std::string advertisedEndpoint,
+                                                  IWallClock const& clock);
+
+/// The validator a worker with no cluster key builds: it refuses nothing.
+///
+/// A named function rather than a lambda written out at each call site, because it
+/// is a **policy** and deserves to be greppable -- and because a bare
+/// `[](auto, auto) { return std::nullopt; }` in production code reads as a stub
+/// somebody forgot to replace rather than as a decision.
+///
+/// Legitimate for exactly one shape of node: one that admits nothing but its own
+/// machine. A process on this host already has this host's compiler, so a lease
+/// check there escalates nobody. Every other shape is refused at startup by
+/// `NodeConfig`'s policy table rather than degraded to this quietly, which is the
+/// distinction that matters: a per-request fallback leaves the port open, every
+/// refusal counter at zero, and the node looking healthy from both ends.
+/// @return A validator that authorizes every job.
+[[nodiscard]] LeaseValidator UncheckedLeaseValidator();
 
 /// Turn one `0xFC` request into one reply, for a compile worker.
 ///

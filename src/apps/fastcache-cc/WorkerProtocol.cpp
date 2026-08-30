@@ -78,6 +78,36 @@ namespace
     }
 } // namespace
 
+LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
+                                    std::string advertisedEndpoint,
+                                    IWallClock const& clock)
+{
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock](
+               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusalReason> {
+        // The fingerprint is the one the REQUEST names. `WorkerProtocol` has already
+        // matched it against a toolchain this worker actually serves, so checking the
+        // grant against it is what stops one toolchain's lease from paying for
+        // another's compile.
+        auto const verified = Distributed::VerifyLeaseToken(
+            key, token, Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint }, clock.Now());
+        if (verified.has_value())
+            return std::nullopt;
+
+        // The claims are dropped deliberately. What a worker needs from a grant is
+        // permission, and the object key inside it is the SCHEDULER's bookkeeping --
+        // a worker that started comparing it against what it was asked to compile
+        // would be re-deriving a decision it is not the one making.
+        return verified.error().reason;
+    };
+}
+
+LeaseValidator UncheckedLeaseValidator()
+{
+    return [](std::string_view, std::string_view) {
+        return std::optional<Distributed::LeaseRefusalReason> {};
+    };
+}
+
 WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
@@ -169,8 +199,23 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 
     // Checked BEFORE the payload is decompressed, let alone compiled: an
     // unauthorized peer must not be able to make this worker do the expensive part.
-    if (_validator && !_validator(token, fingerprint))
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {});
+    //
+    // The reason is carried out rather than collapsed to a bool, and its wire code
+    // and its counter come from ONE row of `LeaseRefusalTable` -- one fact, two
+    // audiences, which is what that table was built for in #281.
+    //
+    // NOT `UnknownLease`. That is the SCHEDULER's code, meaning "a lease I issued
+    // and have since forgotten", and a worker answering with it sent an operator to
+    // the scheduler to look for a fault that is local.
+    if (_validator)
+    {
+        if (auto const refusal = _validator(token, fingerprint); refusal.has_value())
+        {
+            auto const& row = Distributed::DescribeLeaseRefusal(*refusal);
+            _metrics.Increment(row.workerCounter);
+            return Wire::EncodeErrorReply(row.code, {});
+        }
+    }
 
     // Opened AFTER the lease check and BEFORE any expensive work, and refused on the
     // DECLARED decompressed length rather than on what it expands to -- see

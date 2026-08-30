@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "DiscoveryTier.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/ResumeOn.hpp>
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -216,6 +218,31 @@ WorkerServer::~WorkerServer()
                 break;
         }
     }
+}
+
+std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
+                                                                        std::string_view advertise,
+                                                                        IWallClock const& clock,
+                                                                        ILogger& logger)
+{
+    if (cfg.clusterKeyFile.empty())
+    {
+        // Warn rather than Info, and said once at startup rather than per request:
+        // the configuration is legitimate for a node no other machine can dial, and
+        // an operator who did not intend it has exactly one chance to find out.
+        logger.Logf(LogLevel::Warn,
+                    "compiling WITHOUT verifying lease signatures: no --cluster-key-file is configured, so a "
+                    "grant cannot be checked. Nothing off this machine can dial the compile port -- the startup "
+                    "rules refuse every configuration where something could -- but no lease is being enforced");
+        return Cc::UncheckedLeaseValidator();
+    }
+
+    auto key = ReadClusterKey(cfg.clusterKeyFile);
+    if (!key.has_value())
+        return std::unexpected { key.error() };
+
+    logger.Logf(LogLevel::Info, "verifying lease signatures against the cluster key, for grants naming {}", advertise);
+    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, clock);
 }
 
 DrainAction NextDrainAction(std::size_t outstanding,

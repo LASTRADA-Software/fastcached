@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "WorkerServer.hpp"
@@ -6,6 +7,7 @@
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -273,7 +275,7 @@ struct Fixture
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } },
-        protocol { jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics }
+        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -510,9 +512,7 @@ TEST_CASE("A worker serves its slots at once, not one at a time", "[worker-serve
     HoldingRunner runner;
     Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
     AtomicMetricsSink metrics;
-    Cc::WorkerProtocol protocol {
-        jobs, [](std::string_view, std::string_view) { return true; }, { Wire::IdentityCodec }, metrics
-    };
+    Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
     Distributed::OpenMembership membership;
     NullLogger logger;
     ThreadPoolExecutor pool { 2 };
@@ -760,6 +760,13 @@ TEST_CASE("A worker admits whoever its operator's policy names, scheduler or not
         cfg.fleetMembers = row.members;
         cfg.fleetOpen = row.open;
 
+        // The key every row carries, because a worker admitting a machine other than
+        // its own has to be able to check the grants that machine presents (#282).
+        // Uniform across the rows rather than a column of its own: what varies here
+        // is the ORACLE, and a row differing in two things at once would not say
+        // which one the answer came from.
+        cfg.clusterKeyFile = "cluster.key";
+
         // The link that was broken: a worker naming who may spend its CPU, and
         // naming no scheduler of its own, is a configuration that has to START.
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
@@ -967,5 +974,112 @@ TEST_CASE("An expansion no worker could ever hold is the decoder's refusal, not 
         Fixture fix;
         CHECK(ErrorOf(ServeOne(fix, DeclaringEnvelopeFrame(row.declared), /*slots=*/2)) == row.expected);
         CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 0);
+    }
+}
+
+TEST_CASE("The lease check a node applies comes from its configuration", "[worker-server][lease]")
+{
+    // The wiring assertion, and this repository names the failure it exists to catch:
+    // a reclaimer nothing constructs is the bug it was written to fix. `WorkerProtocol`
+    // consults a validator, `SignedLeaseValidator` implements the check, and for as
+    // long as nothing asserted which one a NODE builds, `main.cpp` passed an
+    // accept-all lambda while every unit test around it passed (#282).
+    //
+    // So this drives the same function `main()` calls, from a `NodeConfig` an operator
+    // could have typed, and asks the validator it hands back.
+    ScratchDirectory const scratch { "fc-ws-lease" };
+    auto const keyFile = scratch.Path() / "cluster.key";
+    {
+        // Bytes, plus the trailing newline every ordinary way of producing one of
+        // these leaves behind -- `ReadClusterKey` strips it, and a case writing a
+        // tidier file than a real operator would is not testing the real path.
+        std::ofstream out { keyFile, std::ios::binary };
+        out << "a-shared-cluster-secret\n";
+    }
+
+    constexpr std::string_view Advertise = "worker-01.internal:6676";
+    ManualWallClock const clock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
+    NullLogger logger;
+
+    // The key as `ReadClusterKey` will hand it to the validator, so the scheduler half
+    // of this case signs with exactly what the worker half verifies with. Read through
+    // the production function rather than spelled a second time here: two spellings of
+    // one secret is how a minter and a verifier come to disagree.
+    auto const key = ReadClusterKey(keyFile);
+    REQUIRE(key.has_value());
+
+    auto const grantFor = [&](std::string_view endpoint) {
+        return Distributed::MintLeaseToken(
+            *key,
+            Distributed::LeaseClaims { .serial = "17",
+                                       .endpoint = std::string { endpoint },
+                                       .fingerprint = "gcc-13",
+                                       .key = "obj-abc",
+                                       .expiresAt = clock.Now() + std::chrono::minutes { 10 } });
+    };
+
+    SECTION("a configured key means the grants are checked")
+    {
+        NodeConfig cfg;
+        cfg.clusterKeyFile = keyFile;
+
+        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, clock, logger);
+        REQUIRE(validator.has_value());
+
+        // A string no scheduler signed. `Malformed` rather than `Unauthorized`, and
+        // the two are deliberately separate here while sharing one wire code: a
+        // receiver cannot tell a forgery from a random string, so reporting them
+        // apart on the wire would only tell an attacker how close they got -- but an
+        // operator reading a local log can usefully tell "somebody sent us junk" from
+        // "somebody signed with the wrong key", which is what a botched key rollout
+        // looks like.
+        CHECK((*validator)("not-a-lease-at-all", "gcc-13") == std::optional { Distributed::LeaseRefusalReason::Malformed });
+
+        // And the botched rollout: a structurally perfect grant, MACed with a key
+        // this node does not hold.
+        auto const wrongKey = std::vector<std::byte>(32, std::byte { 0x11 });
+        auto const forged =
+            Distributed::MintLeaseToken(wrongKey,
+                                        Distributed::LeaseClaims { .serial = "17",
+                                                                   .endpoint = std::string { Advertise },
+                                                                   .fingerprint = "gcc-13",
+                                                                   .key = "obj-abc",
+                                                                   .expiresAt = clock.Now() + std::chrono::minutes { 10 } });
+        CHECK((*validator)(forged, "gcc-13") == std::optional { Distributed::LeaseRefusalReason::Unauthorized });
+
+        // An authentic grant for a different machine. That field is nowhere in the
+        // request, so a validator built without this worker's advertised endpoint
+        // could not refuse this at all -- which is why the endpoint is captured at
+        // construction rather than passed per call.
+        CHECK((*validator)(grantFor("some-other-worker:6675"), "gcc-13")
+              == std::optional { Distributed::LeaseRefusalReason::EndpointMismatch });
+
+        // And the grant this worker was actually issued.
+        CHECK_FALSE((*validator)(grantFor(Advertise), "gcc-13").has_value());
+    }
+
+    SECTION("no key means no check, which is a whole policy rather than a stub")
+    {
+        // Legitimate for exactly one shape of node -- one nothing else can dial --
+        // and `StartupPolicyRejection` is what holds that true. Asserted here so the
+        // pairing is visible: this configuration is accepted at startup precisely
+        // because it admits nobody.
+        NodeConfig cfg;
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        auto validator = MakeWorkerLeaseValidator(cfg, Advertise, clock, logger);
+        REQUIRE(validator.has_value());
+        CHECK_FALSE((*validator)("not-a-lease-at-all", "gcc-13").has_value());
+    }
+
+    SECTION("a key file that cannot be read stops the node rather than opening it")
+    {
+        // The direction that matters. A node told to verify and unable to must not
+        // fall back to verifying nothing, which is what returning a validator anyway
+        // would have quietly permitted.
+        NodeConfig cfg;
+        cfg.clusterKeyFile = scratch.Path() / "no-such-file.key";
+
+        CHECK_FALSE(MakeWorkerLeaseValidator(cfg, Advertise, clock, logger).has_value());
     }
 }

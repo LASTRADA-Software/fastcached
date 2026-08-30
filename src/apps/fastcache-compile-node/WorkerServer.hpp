@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConfig.hpp"
+
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -14,13 +17,44 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 
 #include <WorkerProtocol.hpp>
 
 namespace FastCache::Node
 {
+
+/// Build the lease check this node's compile port applies, from its configuration.
+///
+/// **The node's trust decision, in one function.** It reads the cluster key, chooses
+/// between the two validators `WorkerProtocol` accepts, and says which one it chose.
+/// It lives here rather than inline in `main` for the reason this repository states
+/// as a rule: a reclaimer nothing constructs is the bug it was written to fix, and
+/// `main` is the one translation unit no test can reach. Lifted out, the decision is
+/// exercised directly and `main` is left with a call.
+///
+/// An absent `--cluster-key-file` yields `Cc::UncheckedLeaseValidator()` and a
+/// warning, and it is legitimate for exactly one shape of node: one no other machine
+/// can dial. `StartupPolicyRejection` refuses every other shape before this runs, so
+/// the choice is made once, in front of the operator, rather than per request where
+/// an open port and a zeroed counter look like a healthy fleet.
+///
+/// @param cfg What this node was told to be; `clusterKeyFile` is the field read.
+/// @param advertise This worker's address as clients are told to dial it -- exactly
+///        the string it registers under, because that is the string the scheduler
+///        signs into the grant.
+/// @param clock Where "now" comes from. Borrowed by the returned validator, so it
+///        must outlive it.
+/// @param logger Where the chosen mode is announced.
+/// @return The validator, or why the key file cannot serve as one.
+[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
+                                                                                      std::string_view advertise,
+                                                                                      IWallClock const& clock,
+                                                                                      ILogger& logger);
 
 /// What a stop should do next about the compiles still running.
 ///

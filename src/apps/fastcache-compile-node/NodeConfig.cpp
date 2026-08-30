@@ -1081,6 +1081,62 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return host.empty() || host == "0.0.0.0" || host == "::";
 }
 
+/// Whether a machine that is not this one could dial this node's COMPILE port.
+///
+/// The socket half of "can somebody else reach this". `--bind` defaults to the
+/// wildcard, so the answer is normally yes -- but a node bound to loopback is
+/// unreachable from the network whatever its membership policy says, and refusing
+/// one would break every single-machine harness in this repository to prevent
+/// nothing.
+///
+/// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
+/// `getaddrinfo` as nullptr under AI_PASSIVE, which is the same third case
+/// `AdvertisesWildcard` exists for. So it is reachable, and `IsLoopbackHost("")`
+/// answering false is the behaviour this relies on rather than an accident.
+/// @param cfg The parsed configuration.
+/// @return Whether the compile port answers anywhere but this machine.
+[[nodiscard]] bool CompilePortFacesTheNetwork(NodeConfig const& cfg)
+{
+    return !IsLoopbackHost(cfg.bindAddress);
+}
+
+/// Whether a machine that is not this one can be admitted to this node's surfaces.
+///
+/// The policy half. What `NodeMembership` will admit, folded down to "is any of it
+/// somewhere else": everything this node serves -- the compile port included --
+/// consults that one oracle, so this is the same set, read at startup.
+///
+/// Consensus counts because a clustered node's admitted set GROWS at runtime: the
+/// agreed member list is published into the same oracle, so a node that joins a
+/// cluster is a node whose compile port will admit machines nobody typed here. A
+/// bootstrap peer elsewhere and `--raft-join` are the two shapes that has, and both
+/// are visible in the parsed configuration.
+///
+/// Only the host is looked at, matching what the oracle itself compares: a peer
+/// arrives from an ephemeral source port, so a port was never something a connection
+/// could be matched on.
+/// @param cfg The parsed configuration.
+/// @return Whether the policy admits anything but this machine.
+[[nodiscard]] bool AdmitsRemotePeers(NodeConfig const& cfg)
+{
+    auto const remote = [](std::string_view endpoint) {
+        return !IsLoopbackHost(HostOfEndpoint(endpoint));
+    };
+
+    if (cfg.fleetOpen)
+        return true;
+    if (std::ranges::any_of(cfg.fleetMembers, remote))
+        return true;
+
+    // A node waiting to be admitted has an EMPTY member set by construction and is
+    // about to be handed one -- so the absence of peers here is the strongest signal
+    // that remote ones are coming, not the weakest.
+    if (cfg.raftJoin)
+        return true;
+    return std::ranges::any_of(cfg.raftPeers,
+                               [&](Cluster::ClusterMember const& member) { return remote(member.raftEndpoint); });
+}
+
 std::string AdmissionSummary(NodeConfig const& cfg)
 {
     if (cfg.fleetOpen)
@@ -1333,13 +1389,22 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "answers somewhere only it holds -- because just one of the sockets sharing a port is handed "
                      "a unicast. Pointing both at one port is the configuration that made two nodes on a host see "
                      "each other and never finish proving the key. Pick another, or leave it unset." },
-        { .refuses =
-              [](NodeConfig const& c) {
-                  return !c.clusterKeyFile.empty() && c.discoveryAddress.empty() && c.schedulerListen.empty();
-              },
-          .message = "--cluster-key-file is read by discovery and by the scheduler, and neither --discovery nor "
-                     "--listen-scheduler is set. A secret an operator went to the trouble of provisioning, being "
-                     "read by nobody, is exactly the silent no-op this list exists to refuse." },
+        // NOT here: a rule refusing `--cluster-key-file` when nothing reads it.
+        //
+        // It has been narrowed twice and is now gone, and each step is the same
+        // mistake caught later. It began as "unless --discovery"; the scheduler
+        // became a second reader when it started SIGNING grants (#281) and the rule
+        // turned a correct configuration into a node that would not start. It was
+        // widened to "unless --discovery or --listen-scheduler"; the worker became a
+        // third reader here (#282), and the rule immediately refused the configuration
+        // the rule below REQUIRES -- a plain worker admitting remote peers, which
+        // needs the key precisely and runs neither of the other two surfaces.
+        //
+        // There is no fourth narrowing to make. Whether a worker tier exists is not a
+        // fact about the configuration at all: it depends on what `--toolchain` and
+        // discovery resolve to on this machine, which happens long after this table
+        // runs. A refusal whose premise has become false is worse than no refusal, and
+        // one that cannot state its premise without guessing has no business firing.
         { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
           .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
                      "without one there is no port for it to answer on. It would start, log nothing wrong, "
@@ -1364,6 +1429,37 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
                      "TLS, and this node would otherwise start and serve the admin surface in the clear while "
                      "an operator believed it was encrypted." },
+        // A worker that admits OTHER machines must be able to check the grants they
+        // present. The scheduler signs a lease; without the cluster key this node
+        // cannot verify that signature, so its compile port would serve whoever can
+        // reach it -- the fleet's CPU spent on an unauthenticated request (#282).
+        //
+        // A STARTUP refusal rather than a per-request fallback, and that distinction
+        // is the rule rather than an implementation detail. "No key, so skip the
+        // check" decided per request is silent degradation of exactly the kind this
+        // list exists to refuse: the surface is open, every refusal counter reads
+        // zero, and the fleet looks healthy from both ends. Decided once, before
+        // anything is served, it is a node that states what it cannot do.
+        //
+        // Scoped to the reachable-and-admitted node rather than to "is a key
+        // configured", because that is the question -- can a machine that is not this
+        // one reach the compile surface. It has two halves and EITHER closes it: a
+        // node bound to loopback answers nobody else whatever its policy says, and a
+        // node admitting only its own machine escalates nobody however it is bound. A
+        // process on this host already has this host's compiler, so refusing either
+        // shape would break every single-machine install to prevent nothing.
+        //
+        // See #303, which asks the same question of the scheduler and should take
+        // this shape rather than "is a key configured".
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return c.clusterKeyFile.empty() && CompilePortFacesTheNetwork(c) && AdmitsRemotePeers(c);
+              },
+          .message = "a node that admits peers on other machines needs --cluster-key-file: the scheduler signs "
+                     "the lease a client presents to a worker, and without the key this node cannot check that "
+                     "signature -- so it would compile for anybody who can reach its port, and report nothing "
+                     "wrong while doing it. A node admitting only its own machine needs no key, because a "
+                     "process on this host already has this host's compiler." },
         // The rule that keeps a fleet map off an open port. Loopback needs no
         // credential -- reaching it already means being on the machine -- but a
         // bind an operator deliberately exposed does, and HTTPS alone does not
