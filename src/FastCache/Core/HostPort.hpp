@@ -234,6 +234,41 @@ namespace FastCache
     return std::pair { std::string { defaultHost }, *port };
 }
 
+/// Parse an endpoint that is about to be DIALLED.
+///
+/// Stricter than `SplitHostPort` and narrower than `ParseEndpoint`, and each of the
+/// three refusals has already been a bug somewhere in this tree:
+///
+/// - **Splitting is not parsing.** `SplitHostPort` takes the LAST colon and hands
+///   back whatever follows it, so `no leader: try again` splits contentedly into a
+///   host and a port of `" try again"`. That matters because a `NotLeader` refusal
+///   carries the leader's endpoint *as its message*, and a client follows it (#237)
+///   -- so a sentence that merely splits would be dialled as an address.
+/// - **An empty host is the same misconfiguration by a different spelling.**
+///   `:6674` and `[]:6674` both split cleanly and name nobody.
+/// - **A bare port is not an endpoint here.** `ParseEndpoint` supplies a default
+///   host, which is right for a *bind* address an operator typed and wrong for text
+///   naming somewhere else to ask: a scheduler answering `6675` would send the
+///   client back to itself.
+///
+/// One author rather than two, which is this header's own argument. "May I dial
+/// this?" (`Cc::DialEndpoint`) and "is this refusal an instruction?"
+/// (`Cc::RedirectTarget`) must answer identically: a redirect the second accepts and
+/// the first refuses spends a hop on a guaranteed transport failure, and the reverse
+/// is a leader the client can reach and declines to.
+/// @param text `host:port`, or `[v6]:port`.
+/// @return `(host, port)`, or nullopt when this is not something to dial.
+[[nodiscard]] inline std::optional<std::pair<std::string, std::uint16_t>> ParseDialEndpoint(std::string_view text)
+{
+    auto const split = SplitHostPort(text);
+    if (!split.has_value() || split->first.empty())
+        return std::nullopt;
+    auto const port = ParseTcpPort(split->second);
+    if (!port.has_value())
+        return std::nullopt;
+    return std::pair { split->first, *port };
+}
+
 /// Join a host and a port into text `SplitHostPort` reads back.
 ///
 /// The inverse of the parser, and it lives beside it for the reason the parser
