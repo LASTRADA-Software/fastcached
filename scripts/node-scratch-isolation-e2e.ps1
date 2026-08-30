@@ -138,11 +138,18 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
             Write-Host ("VERDICT: the process was still WORKING when the budget ran out ({0}). That is a budget or contention problem, not a hang -- raise the budget or reduce what runs beside it." `
                         -f $(if ($busy) { "it consumed CPU throughout" } else { "its log was still growing" }))
         } elseif ($cpuUsed -ne $null) {
-            Write-Host ("VERDICT: the process is alive, wrote nothing new, and consumed essentially no CPU. That is a BLOCKED process -- suspect a hang and do not simply raise the timeout.")
+            # Deliberately hedged, and the hedge is for whoever reads this at 2am.
+            # Low CPU HERE does not mean nothing is working: this wait covers an
+            # operation that spawns a compiler, and a spawned `cl` charges its own
+            # process. So the first move is to look for a live child, not to go
+            # hunting a deadlock that may not exist.
+            Write-Host ("VERDICT: the process is alive, wrote nothing new, and consumed essentially no CPU ITSELF ({0:N1}s)." -f $cpuUsed)
+            Write-Host ("  Before concluding it is hung: this step SPAWNS a compiler, and a spawned process charges CPU to itself, not to its parent.")
+            Write-Host ("  So check for a live child first -- `Get-Process cl,clang,clang-cl -ErrorAction SilentlyContinue` -- and if one is running and busy, this is a SLOW MACHINE, not a hang.")
+            Write-Host ("  Only with no busy child does this read as BLOCKED, and then do not simply raise the timeout.")
         } else {
             Write-Host ("VERDICT: INCONCLUSIVE -- the process is alive and quiet, but its CPU could not be sampled, and this wait covers an operation that logs nothing while it runs. Do not read this as either a hang or a slow machine without more evidence.")
         }
-        Write-Host ("  note: a spawned compiler charges CPU to its own process, so a LOW figure here is weaker evidence than a high one.")
     } elseif ($proc) {
         Write-Host ("VERDICT: the process exited with code {0} before the deadline." -f $proc.ExitCode)
     }
