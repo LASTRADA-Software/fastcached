@@ -855,6 +855,15 @@ quickly.
 
 **Then, if it is safe:**
 
+- **A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost separately.**
+  `ProbeToolchainFiles` recorded "about 2 s warm" — honestly measured, condition attached — and two other
+  sites then cited it as "the 2-second full walk" and "about 2 seconds over 288 MB". Both dropped the `warm`,
+  and the design was reasoned from the citations, so an operation observed exceeding **300 s** cold was
+  treated as costing two seconds. Attaching conditions is necessary and **not sufficient: the citation is
+  where they get lost**, so a figure others will refer to lives in ONE place they point at, never restated.
+  And a figure can be current, correctly measured and still **the wrong quantity** — quoting the warm cost as
+  the price of MISSING a cache is circular, since the cache is what makes the warm case warm. Record a table
+  of conditions, not a number; a spread states its own uncertainty and forces a citer to pick a row.
 - **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs
   ~2.09 ms on Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart.
   A design that looks free on the platform you develop on can be the dominant cost

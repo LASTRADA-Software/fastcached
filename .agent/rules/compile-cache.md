@@ -1080,6 +1080,53 @@ without reopening the argument:
   page is an entry no other machine can canonicalize, which is the whole of what
   this cache is for. `chcp 65001` makes the two identical.
 
+## A performance figure is a quantity under conditions, and both halves get lost separately
+
+`ProbeToolchainFiles` walks a toolchain's include roots and hashes **every byte** of
+every file. Its header recorded the cost as **"about 2 s warm"** — measured
+honestly, correctly attributed, with the condition attached. That figure then
+appeared twice more:
+
+- `ComputeToolchainStamp`: *"the alternative is the 2-second full walk this exists
+  to avoid"*
+- `CachedToolchainFingerprint`: *"The full walk costs about 2 seconds over 288 MB"*
+
+**Both dropped the `warm`.** And the design downstream was reasoned from the
+citations rather than from the measurement, so a walk that is seconds warm and was
+observed exceeding **300 s** cold on a Windows runner was treated as a two-second
+operation for as long as anybody remembered it.
+
+Two separate failures, and neither is staleness — the number was never wrong.
+
+**Attaching the conditions is necessary and not sufficient, because the citation
+is where they get lost.** The original was exemplary; it did not survive being
+quoted twice. So a figure that is going to be *referred to* elsewhere belongs in
+**one** place that the other sites point at, rather than being restated — the same
+reasoning `check-tsan-scope.cmake` follows for reading a tag expression instead of
+copying it. A second copy of a measurement is not a cross-check, it is a second
+thing to drift.
+
+**And a figure can be current, correctly measured, correctly attributed, and still
+be the wrong quantity.** That is a distinct failure and it deserves naming
+separately. Here it was *circular*: the warm cost was quoted as the price of
+**missing the cache** — but the cache is the mechanism that makes the warm case
+warm. What a miss costs is by definition the cold number. Nobody was quoting a
+stale figure; they were quoting the right figure for the wrong question, which no
+amount of re-measuring would have caught.
+
+The corrected form is one table at the measurement site, showing the spread rather
+than a number, with the conditions as rows:
+
+| condition | per file |
+|---|---|
+| warm page cache, local SSD | 0.21 ms |
+| cold, local SSD, anti-malware active | **5.00 ms** |
+| Linux (gcc 14), cold | 0.26 ms |
+
+A spread also states its own uncertainty, which a single number cannot. Anyone
+citing it has to pick a row, and picking a row is the moment the question "under
+which conditions?" gets asked.
+
 ## Open work
 
 - **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
