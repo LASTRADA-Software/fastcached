@@ -190,14 +190,17 @@ std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
 {
     if (outcome.kind != CacheOutcomeKind::Rejected || outcome.code != Wire::ErrorCode::NotLeader)
         return std::nullopt;
-    // Not `SplitHostPort` alone: it takes the LAST colon and hands back whatever
-    // follows, so "no leader: try again" splits into a host and a port of
-    // " try again". Both halves have to be usable, or this is prose.
+    // `ParseDialEndpoint`, which is where the reasoning lives: splitting is not
+    // parsing, an empty host names nobody, and a bare port would send the client
+    // back to itself. Asked through that helper rather than re-derived here because
+    // it is also what `DialEndpoint` asks of this very string a moment later -- two
+    // spellings of "is this an address" would eventually disagree, and the hop is
+    // wasted either way round.
     //
-    // Not `ParseEndpoint` either, close as it looks: a bare port means loopback
-    // there, so a scheduler answering "6675" would send the client back to itself.
-    auto const split = SplitHostPort(outcome.message);
-    if (!split.has_value() || split->first.empty() || !ParseTcpPort(split->second).has_value())
+    // The message itself is returned rather than the parse: the endpoint travels on
+    // to `DialEndpoint`, which splits it again, and handing back a re-joined form
+    // would be this layer normalising text the scheduler chose.
+    if (!ParseDialEndpoint(outcome.message).has_value())
         return std::nullopt;
     return outcome.message;
 }

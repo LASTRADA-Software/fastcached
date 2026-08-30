@@ -217,8 +217,8 @@ Consequences that are each load-bearing:
   different fact and there is nobody to name. That "so a client redirects" was true of
   the design and false of every client for the whole life of the code — the launcher
   read it as an ordinary refusal until #237. Serving the endpoint is half a rule; the
-  half that makes it work is below, under *a refusal that names somewhere else*. Three roles rather than a `bool`, for
-  exactly that third state.
+  half that makes it work is below, under *a refusal that names somewhere else*.
+  Three roles rather than a `bool`, for exactly that third state.
 - **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
   writes objects exactly as before — the cache is a separate service this class
   cannot reach — and is refused only the fleet's CPU time, which is the thing
@@ -793,8 +793,16 @@ symptom was that they were slow.
   `SplitHostPort` takes the LAST colon and returns whatever follows it, so
   "no leader: try again" splits contentedly into a host and a port of `" try again"`. A
   redirect needs a host, a colon and a port that is a number. Not `ParseEndpoint`
-  either, close as it looks: a bare port means loopback there, so a scheduler answering
-  `6675` would send the client back to itself.
+  either, close as it looks: a bare port there takes the caller's default host, which
+  for every caller in this tree is loopback -- so a scheduler answering `6675` would
+  send the client back to itself.
+
+  Those three refusals are `Core/HostPort.hpp`'s `ParseDialEndpoint`, and they are one
+  function because `Cc::DialEndpoint` asks the identical question of the identical
+  string a moment later. Two spellings of "is this an address" cost a hop whichever way
+  they came to disagree: one the redirect accepts and the dial refuses is a connect
+  that could never succeed, and one the dial would have taken is a leader the client
+  can reach and declines to.
 
   This is the consumption test from the claim-record rule below, arriving at the
   opposite answer. `NotLeader`'s message was diagnostics for as long as
@@ -807,6 +815,13 @@ symptom was that they were slow.
   translation unit per hop discovering it. Two hops is one more than a correct fleet
   needs, and running out is an ordinary local compile — which is what every other lease
   refusal already means.
+- **This is the CLIENT half, and saying so is part of the rule.** A node still
+  registers only with its own `--scheduler` (`main.cpp`'s heartbeat round, through
+  `WorkerRegistrar`, which special-cases `UnknownLease` and nothing else), so a
+  `NotLeader` there is logged and retried against the same address forever. A launcher
+  that follows its redirect perfectly then reaches a leader whose registry every worker
+  has expired out of, and gets `NoWorker` — the same outage one layer down. Do not
+  write "a fleet survives an election" anywhere until both halves redirect.
 - **The RELEASE follows the lease, not the configuration.** A lease issued by the leader
   the client was redirected to must be resolved there: sent to the configured endpoint it
   resolves nothing, and the key stays marked in flight on the machine that actually holds

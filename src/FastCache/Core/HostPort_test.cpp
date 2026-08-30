@@ -90,6 +90,44 @@ TEST_CASE("A bare port binds the default host rather than the wildcard", "[core]
     CHECK_FALSE(ParseEndpoint("", "127.0.0.1").has_value());
 }
 
+TEST_CASE("Something to dial is parsed, not merely split", "[core][hostport]")
+{
+    // The predicate `Cc::DialEndpoint` and `Cc::RedirectTarget` share. It exists as
+    // one function because a `NotLeader` refusal carries the leader's endpoint as
+    // its message and a launcher DIALS that text (#237): two spellings of "is this
+    // an address" would eventually disagree, and either direction costs a hop.
+    auto const plain = ParseDialEndpoint("10.0.0.1:7000");
+    REQUIRE(plain.has_value());
+    CHECK(Unwrap(plain).first == "10.0.0.1");
+    CHECK(Unwrap(plain).second == 7000);
+
+    auto const v6 = ParseDialEndpoint("[::1]:6674");
+    REQUIRE(v6.has_value());
+    CHECK(Unwrap(v6).first == "::1");
+    CHECK(Unwrap(v6).second == 6674);
+
+    // Splitting is not parsing. Every one of these splits, and none is an address:
+    // `SplitHostPort` takes the LAST colon and hands back whatever follows it.
+    CHECK_FALSE(ParseDialEndpoint("no leader: try again").has_value());
+    CHECK_FALSE(ParseDialEndpoint("10.0.0.1:").has_value());
+    CHECK_FALSE(ParseDialEndpoint("10.0.0.1:99999").has_value());
+    CHECK_FALSE(ParseDialEndpoint("10.0.0.1:0").has_value());
+
+    // An empty host names nobody, in either spelling.
+    CHECK_FALSE(ParseDialEndpoint(":7000").has_value());
+    CHECK_FALSE(ParseDialEndpoint("[]:7000").has_value());
+
+    // Prose with no colon at all -- the error table's default `NotLeader` sentence
+    // is exactly this shape, which is what an election in progress puts on the wire.
+    CHECK_FALSE(ParseDialEndpoint("this node does not lead the cluster").has_value());
+    CHECK_FALSE(ParseDialEndpoint("").has_value());
+
+    // And a bare port is NOT this machine here, which is the one place this differs
+    // from `ParseEndpoint`: a scheduler answering `6675` would otherwise redirect a
+    // client straight back to itself.
+    CHECK_FALSE(ParseDialEndpoint("6675").has_value());
+}
+
 TEST_CASE("An IPv4-mapped host folds to the address it maps", "[core][hostport]")
 {
     // One machine, two spellings, and which one a caller sees depends on how the

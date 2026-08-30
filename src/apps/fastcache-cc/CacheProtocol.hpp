@@ -179,11 +179,12 @@ struct ExchangeBudget
 /// operator ever typed. `ClusterAdminCli` learned this the hard way; that call site
 /// now asks here, so the two cannot come to disagree.
 ///
-/// Parsing means a host, a colon and a port that is a number -- not `SplitHostPort`
-/// alone, which takes the LAST colon and hands back whatever follows it, so
-/// "no leader: try again" splits happily into a host and a port of " try again".
-/// `ClusterAdminCli` only ever PRINTED such a message; a launcher dials it, and
-/// every hop spent there is one the real leader never hears.
+/// Parsing means a host, a colon and a port that is a number, which is
+/// `Core/HostPort.hpp`'s `ParseDialEndpoint` and not a test spelled again here --
+/// `DialEndpoint` asks that helper the same question about the same string a moment
+/// later, and a second author would eventually answer differently. `ClusterAdminCli`
+/// only ever PRINTED such a message; a launcher dials it, and every hop spent on
+/// prose is one the real leader never hears.
 ///
 /// A redirect naming an address is therefore distinguishable from an election in
 /// progress, which names none and has nothing to offer but "try again shortly".

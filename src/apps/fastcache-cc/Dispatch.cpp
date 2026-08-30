@@ -2,6 +2,7 @@
 #include "Dispatch.hpp"
 
 #include <format>
+#include <ranges>
 #include <utility>
 
 namespace FastCache::Cc
@@ -236,7 +237,7 @@ namespace
                                               ExchangeBudget budget)
     {
         LeaseAttempt attempt { .outcome = {}, .scheduler = std::string { start } };
-        for (int hop = 0; hop <= MaxLeaseRedirects; ++hop)
+        for (auto const hop: std::views::iota(0, MaxLeaseRedirects + 1))
         {
             // Rebuilt per attempt: `Exchange` takes the frame by value and moves it,
             // so the second ask cannot reuse the first one's bytes.
@@ -245,15 +246,22 @@ namespace
             attempt.outcome = exchange.Exchange(attempt.scheduler, std::move(frame), credential, budget);
 
             auto redirect = RedirectTarget(attempt.outcome);
-            if (!redirect.has_value())
+            // The ceiling is tested BEFORE the endpoint is advanced, and that is the
+            // whole of what `scheduler` promises: it names whoever ANSWERED. Running
+            // out of hops while still being redirected would otherwise leave it
+            // naming a machine nobody asked -- harmless only for as long as every
+            // caller happens to check `IsHit()` first, which is exactly the shape of
+            // trap the RELEASE rule above exists to close.
+            //
+            // Out of hops, the outcome is returned as it stands so the caller reports
+            // the scheduler's own words rather than inventing a reason. `Declined` is
+            // right: the fleet said something ordinary and this compile happens
+            // locally, which is what every other lease refusal already means.
+            if (!redirect.has_value() || hop == MaxLeaseRedirects)
                 return attempt;
             attempt.scheduler = std::move(*redirect);
         }
-        // Out of hops with the last answer still a redirect. Returned as it stands,
-        // so the caller reports the scheduler's own words rather than inventing a
-        // reason -- and `DispatchStatus::Declined` is exactly right: the fleet said
-        // something ordinary and this compile happens locally.
-        return attempt;
+        return attempt; // unreachable: the last turn of the loop always returns
     }
 
 } // namespace
