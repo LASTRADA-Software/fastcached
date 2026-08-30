@@ -27,4 +27,18 @@ if [ -d /run/systemd/system ]; then
     fi
 fi
 
+# A `compile-node.env` left over from before #291 is INERT now: the unit
+# no longer reads it, so an operator who edits it gets silence. Silence is
+# the failure this whole change is about, arriving from the other side, so
+# say it once -- here, at the upgrade that stops reading it, on exactly the
+# machines that have one. Whether rpm removes a %config(noreplace) file that a
+# newer version stops shipping is #383's question and deliberately not answered
+# here; this is the message, not the scrub, and it is correct either way -- if
+# rpm did remove it, the test below simply does not fire.
+if [ -f "/@FASTCACHED_SYSCONF_DIR@/compile-node.env" ]; then
+    echo "fastcache-compile-node: /@FASTCACHED_SYSCONF_DIR@/compile-node.env is no longer read." >&2
+    echo "  Its settings now live in /@FASTCACHED_SYSCONF_DIR@/fastcache-compile-node.yaml." >&2
+    echo "  The old file is left in place; nothing reads it and it can be removed." >&2
+fi
+
 exit 0
