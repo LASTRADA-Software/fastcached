@@ -66,6 +66,45 @@ if(ENABLE_SANITIZER_THREAD)
 endif()
 
 # ---------------------------------------------------------------------------
+# The MSVC checked-iterator canary: the Windows Debug counterpart of the one
+# above, and deliberately the same shape rather than a second idiom.
+#
+# A Windows Debug leg is worth running for `_ITERATOR_DEBUG_LEVEL=2` -- it traps
+# invalidated iterators, out-of-range indexing and mismatched container iterators
+# at the point they happen, which is exactly what a Release build tolerates in
+# silence. But nothing here STATES that level: it follows from `_DEBUG`, which
+# follows from the runtime library, which follows from `CMAKE_BUILD_TYPE` and
+# `CMAKE_MSVC_RUNTIME_LIBRARY`. Any of those moving takes the checks away with no
+# warning, and the leg would still build, still run the whole suite, and still
+# report green while checking nothing it was added to check.
+#
+# So it is asserted at run time by a program that must die (#315).
+#
+# Unlike `tsan-canary` this one IS registered as a ctest, and the difference is
+# worth stating: the TSan canary has to be read BEFORE the suite is believed, so a
+# shell gate sequences the two. Here the canary answers a question about the
+# BUILD, not about a suite run, so it is just another check -- and registering it
+# means it runs for anyone building `cl-debug` locally rather than only in CI,
+# which is where this defect would otherwise be found.
+#
+# `scripts/iterator-debug-gate.ps1` and not `WILL_FAIL`, because a bare inversion
+# cannot say WHY a green result is meaningless, and because a non-zero exit is not
+# proof on its own -- the gate requires the runtime's own "subscript out of range"
+# diagnostic, the same way the TSan gate requires "data race".
+if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(iterator-debug-canary IteratorDebugCanary.cpp)
+    add_test(
+        NAME "iterator-debug-canary"
+        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/iterator-debug-gate.ps1"
+                -Canary "$<TARGET_FILE:iterator-debug-canary>"
+    )
+    set_tests_properties("iterator-debug-canary" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it

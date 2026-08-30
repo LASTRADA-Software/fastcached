@@ -1006,7 +1006,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [cl-release, clangcl-release]
+        # cl-debug is the third leg and it is here for the RUNTIME, not the
+        # compiler: MSVC's Debug CRT sets `_ITERATOR_DEBUG_LEVEL=2`, which traps
+        # invalidated iterators, out-of-range indexing and mismatched container
+        # iterators at the point they happen. That was the one configuration on
+        # Windows nobody ran, while being the default Windows preset every
+        # developer here debugs with — so a `cl-debug`-only defect could live on
+        # master indefinitely with every status check green (#315).
+        #
+        # A third leg rather than replacing a Release one, and that is measured
+        # rather than assumed. Windows costs ~9 and ~7 minutes today (it was 21.2
+        # and 15.7 before `SCCACHE_GHA_ENABLED`, which is what `build.yml` still
+        # said in prose), and neither leg is anywhere near the critical path —
+        # `clang-tidy` runs ~20 minutes and finishes last. So this leg costs about
+        # eight runner-minutes and no wall clock at all, which is cheaper than
+        # giving up a Release configuration to buy it.
+        #
+        # It runs `ctest` like its siblings, because a Debug leg that only
+        # compiles exercises none of the runtime it was added for. The
+        # `iterator-debug-canary` test is what refuses to believe it did.
+        preset: [cl-release, clangcl-release, cl-debug]
     steps:
       - uses: actions/checkout@v4
         if: needs.changes.outputs.code == 'true'
