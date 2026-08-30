@@ -174,6 +174,14 @@ function Get-WaitVerdict($readings) {
     $lines.Add(("  evidence: descendants now={0}, most seen in the window={1}, their cpu in the last {2}s={3}" `
                 -f $(if ($null -ne $readings.ChildrenNow) { $readings.ChildrenNow } else { "unknown" }), `
                    $readings.ChildrenSeen, $window, (& $show $childRecent)))
+    # The WHOLE wait, beside the window. The verdict never reads these -- it is a
+    # question about now and the window answers it -- but a reader deciding
+    # BETWEEN the verdict's alternatives needs them. "No descendant in the last
+    # 75s" and "no descendant at any point in 300s" are different facts with
+    # different causes, and only the second rules out a driver spawn.
+    $lines.Add(("  evidence: over the WHOLE wait: descendants most seen={0}, their cpu={1} (a spawn before the window is invisible to the line above)" `
+                -f $(if ($null -ne $readings.ChildrenEver) { $readings.ChildrenEver } else { "unknown" }), `
+                   (& $show $readings.ChildTotal)))
     $lines.Add(("  evidence: a recent figure at or below {0:N2}s reads as idle and at or above {1:N2}s as working; between them this cannot tell." `
                 -f $idleFloor, $clearlyBusy))
 
@@ -377,18 +385,35 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     # differencing the endpoints -- a child ending is activity too, but it is not
     # activity this can measure, and it must never be subtracted from a sibling's
     # real work.
+    #
+    # Accumulated TWICE, over the recent window and over the whole wait, and the
+    # second is not decoration. The verdict is drawn from the window and that is
+    # correct -- a question about now needs a recent answer. But the EVIDENCE must
+    # be able to support the verdict's alternatives, and windowed-only descendant
+    # figures cannot: this step spawns the driver two or three times
+    # (`CompilerBanner`, then `DiscoverIncludePaths` twice), and a spawn that
+    # happened before the window opened is invisible. Twice now that blindness has
+    # stood between a reading and a diagnosis -- once as an over-claim that had to
+    # be retracted, and once on #354, where it left "did the 300s go into a `cl`
+    # spawn or into the in-process walk" unanswerable from a log that had otherwise
+    # measured everything needed to say.
     $childRecent = $null
+    $childTotal = $null
     $childrenNow = $null
     $childrenSeen = 0
+    $childrenEver = 0
     if ($treeSamples.Count -ge 2) {
         $childRecent = 0.0
+        $childTotal = 0.0
         foreach ($index in 1..($treeSamples.Count - 1)) {
-            if ($treeSamples[$index].At -lt $cutoff) { continue }
             $step = $treeSamples[$index].Cpu - $treeSamples[$index - 1].Cpu
+            if ($step -gt 0) { $childTotal += $step }
+            if ($treeSamples[$index].At -lt $cutoff) { continue }
             if ($step -gt 0) { $childRecent += $step }
         }
         $childrenNow = $treeSamples[$treeSamples.Count - 1].Count
         foreach ($sample in $treeSamples) {
+            if ($sample.Count -gt $childrenEver) { $childrenEver = $sample.Count }
             if ($sample.At -ge $cutoff -and $sample.Count -gt $childrenSeen) { $childrenSeen = $sample.Count }
         }
     }
@@ -404,8 +429,10 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
             OwnTotal     = $ownTotal
             OwnRecent    = $ownRecent
             ChildRecent  = $childRecent
+            ChildTotal   = $childTotal
             ChildrenNow  = $childrenNow
             ChildrenSeen = $childrenSeen
+            ChildrenEver = $childrenEver
             Window       = $window
             IdleFloor    = $idleFloor
             ClearlyBusy  = $clearlyBusy
@@ -476,8 +503,10 @@ function Invoke-SelfTest {
         OwnTotal     = 0.0
         OwnRecent    = 0.0
         ChildRecent  = 0.0
+        ChildTotal   = 0.0
         ChildrenNow  = 0
         ChildrenSeen = 0
+        ChildrenEver = 0
         Window       = 75
         IdleFloor    = 0.15
         ClearlyBusy  = 0.50
@@ -580,6 +609,38 @@ function Invoke-SelfTest {
             Expect = "VERDICT: BLOCKED"
             Forbid = @("WORKING", "INCONCLUSIVE") },
 
+        @{  # #354's real blindness, as a row. A driver spawn that happened before
+            # the window opened leaves the windowed descendant figures at zero, and
+            # the run then cannot say whether the wait went into a `cl` spawn or
+            # into the in-process walk. The whole-wait figures answer that; the
+            # VERDICT must not move, because it is still a question about now.
+            Name = "a driver spawn before the window is still reported"
+            Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildRecent = 0.0
+                          ChildrenNow = 0; ChildrenSeen = 0
+                          ChildTotal = 42.0; ChildrenEver = 1 }
+            # Asserted on the COUNT and not on the formatted seconds: `{0:N2}` is
+            # locale-formatted, so this machine renders "42,00s" and a CI runner
+            # renders "42.00s". A case that pinned the decimal separator would
+            # pass here and fail there, which is a test asserting the locale.
+            Expect = "WHOLE wait: descendants most seen=1"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # And the converse, so the two can never be conflated: a wait in which
+            # nothing was EVER spawned reports zero on both, which is the reading
+            # that actually rules a driver spawn out.
+            Name = "no descendant at any point is a different fact from none recently"
+            Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildTotal = 0.0; ChildrenEver = 0 }
+            Expect = "WHOLE wait: descendants most seen=0"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # And an unsampled whole-wait figure must read as unknown rather than
+            # zero, for the reason the windowed one already does: "could not see"
+            # folded into "saw nothing" is the failure this file exists about.
+            Name = "an unsampled whole-wait figure is not a zero"
+            Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildTotal = $null; ChildrenEver = 2 }
+            Expect = "WHOLE wait: descendants most seen=2, their cpu=unknown"
+            Forbid = @() },
+
         @{  Name = "a process that died rather than hanging"
             Readings = @{ Alive = $false; ExitCode = 3 }
             Expect = "the process exited with code 3 before the deadline"
@@ -594,7 +655,8 @@ function Invoke-SelfTest {
     # What a verdict must SHOW, not just claim. A conclusion whose numbers are not
     # on the page cannot be argued with, and being arguable is the whole value --
     # it is why #354's wrong verdict could be challenged at all.
-    $evidenceLines = @("evidence: alive=", "evidence: own cpu", "evidence: descendants", "evidence: a recent figure")
+    $evidenceLines = @("evidence: alive=", "evidence: own cpu", "evidence: descendants",
+                       "evidence: over the WHOLE wait", "evidence: a recent figure")
 
     $failures = 0
     foreach ($case in $cases) {
