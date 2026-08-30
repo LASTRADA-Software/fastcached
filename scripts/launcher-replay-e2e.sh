@@ -142,6 +142,29 @@ done
 note "daemon up on 127.0.0.1:${port}"
 
 # ---------------------------------------------------------------------------
+# Which unit a HIT or MISS belongs to decides whether the number is a defect, and
+# the launcher's line carries only the key. Reading the `[n/m] Building CXX
+# object ...` line above it is not sound: ninja interleaves the output of
+# concurrent edges, and two runs of the same build attributed one unit
+# differently (74/41 against 75/40 across the project/third-party split), which
+# is a guard that would fail a build for a scheduling accident.
+#
+# So the launcher is asked instead. This wrapper writes the unit on the same
+# stderr, from the same process, inside the same edge, immediately before
+# handing over -- the two lines cannot be separated by anything. It `exec`s, so
+# the launcher under test is the launcher that runs, and it is named
+# `fastcache-cc` so nothing downstream sees a different program.
+mkdir -p "${workdir}/wrap"
+launcher_wrapper="${workdir}/wrap/fastcache-cc"
+cat > "$launcher_wrapper" <<WRAP
+#!/bin/sh
+for _fc_arg in "\$@"; do _fc_last="\$_fc_arg"; done
+printf 'fastcache-cc-fixture: unit=%s\n' "\$_fc_last" >&2
+exec "${launcher}" "\$@"
+WRAP
+chmod +x "$launcher_wrapper"
+
+# ---------------------------------------------------------------------------
 # One place that knows how to configure and build, so the three builds cannot
 # drift apart in anything but the one variable under test.
 configure_and_build() {
@@ -153,7 +176,7 @@ configure_and_build() {
                 -DFASTCACHED_BUILD_NODE=OFF
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
                 "-DUSE_COMPILER_CACHE=${cache}")
-    [ "$cache" = "ON" ] && args+=("-DFASTCACHE_CC=${launcher}")
+    [ "$cache" = "ON" ] && args+=("-DFASTCACHE_CC=${launcher_wrapper}")
     cmake "${args[@]}" > "${log}.configure" 2>&1 \
         || { tail -40 "${log}.configure" >&2; fail "configure failed for ${dir}"; }
     cmake --build "$dir" --target "$target" > "${log}" 2>&1 \
@@ -186,23 +209,74 @@ echo "== cold: every unit misses, so every object is really compiled and stored"
 configure_and_build "${workdir}/cold" ON "${workdir}/cold.build"
 grep -q "LAUNCHER = " "${workdir}/cold/build.ninja" \
     || fail "the cold build has NO compiler launcher: nothing was cached and this fixture verified nothing"
-cold_hits="$(grep -c "fastcache-cc: HIT" "${workdir}/cold.build" || true)"
-cold_misses="$(grep -c "fastcache-cc: MISS" "${workdir}/cold.build" || true)"
+# Where a unit's source lives decides whether a miss is a defect. Third-party
+# sources sit UNDER the build directory, so `cold/_deps/catch2-src/...` and
+# `warm/_deps/catch2-src/...` are genuinely different files and a miss there is
+# ordinary. A miss on a source of this project is not: the two builds differ in
+# nothing but the build directory, which is exactly what the launcher's path
+# canonicalization exists to absorb.
+#
+# An unattributed line is counted as neither and reported, rather than being
+# folded into whichever bucket happens to be adjacent.
+attribute() {
+    python3 - "$1" <<'PY'
+import collections, sys
+
+current = None
+counts = collections.Counter()
+for line in open(sys.argv[1], errors="replace").read().splitlines():
+    marker = line.find("fastcache-cc-fixture: unit=")
+    if marker >= 0:
+        current = line[marker + len("fastcache-cc-fixture: unit="):].strip()
+        continue
+    if "fastcache-cc: HIT" in line or "fastcache-cc: MISS" in line:
+        outcome = "hit" if "fastcache-cc: HIT" in line else "miss"
+        if current is None:
+            counts["unattributed"] += 1
+        else:
+            counts[("deps" if "/_deps/" in current else "project") + "_" + outcome] += 1
+        current = None
+
+print("%d %d %d %d %d" % (counts["project_hit"], counts["project_miss"],
+                          counts["deps_hit"], counts["deps_miss"],
+                          counts["unattributed"]))
+PY
+}
+
+read -r cold_project_hits cold_project_misses cold_deps_hits cold_deps_misses cold_unattributed \
+    < <(attribute "${workdir}/cold.build")
+[ "$cold_unattributed" = "0" ] \
+    || fail "cold: ${cold_unattributed} launcher outcome(s) could not be attributed to a unit; the split below would be a guess"
+cold_hits=$((cold_project_hits + cold_deps_hits))
+cold_misses=$((cold_project_misses + cold_deps_misses))
 note "cold: ${cold_misses} miss(es), ${cold_hits} hit(s)"
 [ "$cold_misses" -gt 0 ] || fail "the cold build missed nothing; the cache was not empty and nothing was stored from this source"
 
 echo "== warm: every unit hits, so every object is REPLAYED"
 configure_and_build "${workdir}/warm" ON "${workdir}/warm.build"
-warm_hits="$(grep -c "fastcache-cc: HIT" "${workdir}/warm.build" || true)"
-warm_misses="$(grep -c "fastcache-cc: MISS" "${workdir}/warm.build" || true)"
-note "warm: ${warm_hits} hit(s), ${warm_misses} miss(es)"
+read -r warm_project_hits warm_project_misses warm_deps_hits warm_deps_misses warm_unattributed \
+    < <(attribute "${workdir}/warm.build")
+[ "$warm_unattributed" = "0" ] \
+    || fail "warm: ${warm_unattributed} launcher outcome(s) could not be attributed to a unit; the split below would be a guess"
+warm_hits=$((warm_project_hits + warm_deps_hits))
+warm_misses=$((warm_project_misses + warm_deps_misses))
+note "warm, this project's sources: ${warm_project_hits} hit(s), ${warm_project_misses} miss(es)"
+note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_misses} miss(es)"
 
 # THE guard. A warm build that missed compiles correctly, passes everything
 # below, and has replayed nothing -- a green run proving only that the compiler
 # works. Replay is the entire subject of this fixture.
-[ "$warm_hits" -gt 0 ] || fail "the warm build replayed NOTHING (${warm_hits} hits); every assertion below would have tested the compiler rather than the cache"
-if [ "$warm_misses" -gt 0 ]; then
-    note "note: ${warm_misses} unit(s) missed on the warm build; the replay is partial"
+[ "$warm_project_hits" -gt 0 ] || fail "the warm build replayed NONE of this project's units; every assertion below would have tested the compiler rather than the cache"
+
+# Stricter than "something hit", and deliberately so. An unattributed total hides
+# the case this fixture is for: 106 of 221 units missing looks alarming and was
+# entirely Catch2, while a single project unit missing would have been invisible
+# inside the same number and is the actual regression shape.
+[ "$warm_project_misses" = "0" ] \
+    || fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
+
+if [ "$warm_deps_misses" -gt 0 ]; then
+    note "note: ${warm_deps_misses} third-party unit(s) missed; their sources live UNDER the build directory, so the two builds really do compile different paths"
 fi
 
 echo "== the replayed objects must be the objects that were compiled"
@@ -303,6 +377,7 @@ EOF
     # Compiled with the build's own command line, minus the launcher, so the only
     # difference from the real object is the source it came from.
     canary_cmd="${victim_cmd/${victim_src}/${workdir}/canary.cpp}"
+    canary_cmd="${canary_cmd//${launcher_wrapper} /}"
     canary_cmd="${canary_cmd//${launcher} /}"
     # The copy compiles from the workdir, so a quoted include no longer resolves
     # relative to the file that writes it -- `#include "CmdLine.hpp"` next to the
