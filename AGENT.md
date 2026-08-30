@@ -552,6 +552,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   not repair that file. A known race lives in `.tsan-suppressions` with its issue
   number; deleting the entry is part of closing the issue, never part of going
   green.
+- An edit script asserts its anchor **matched** — `assert count == 1`, count rather
+  than presence, so "missing" and "not unique" both fire — and a generator that
+  produced nothing fails instead of printing success. Three separate tools reported
+  success for work they did not do in one night: an edit that matched no anchor, a
+  test fixture whose writer wrote nothing, and a YAML `if:` silently discarded as a
+  duplicate key. Report what changed, not that the script finished.
 - `producer | grep -q` is a false **negative** under `set -o pipefail`, and it
   fails on the SUCCESS path: `grep -q` exits at the first match, the producer dies
   of SIGPIPE, and `pipefail` reports the producer's status. `nm "$b" | grep -q

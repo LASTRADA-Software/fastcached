@@ -165,6 +165,27 @@ determinism rests on.
     itself, which is the script written to catch exactly this class of thing, and
     that is the first time here that the *checking mechanism* produced the false
     reading rather than the thing being checked.
+  - **An edit script asserts its anchor MATCHED, and a generator that produced
+    nothing fails rather than reporting success.** The same family as the two above,
+    reached from the authoring side rather than the checking side, and it happened
+    three times in one night here:
+
+    - a `sed`/Python edit that added compiler defines matched no anchor, changed
+      nothing, and printed its success message anyway — found only because the same
+      compile failed identically twice;
+    - a PowerShell test fixture whose writer process silently wrote no lines, so the
+      case it was written to exercise never ran and the test passed;
+    - and a step-level `if:` inserted above an existing one, silently discarded by
+      YAML's last-key-wins.
+
+    Every one of them *reported success for work it did not do*, which is the thing
+    this whole file is about. So: `assert t.count(old) == 1` before every
+    replacement — **count, not presence**, because `>= 1` hides an ambiguous anchor
+    that then edits the wrong occurrence, and `== 1` catches "missing" and "not
+    unique" in one line. Print what was changed (how many, and which) rather than
+    that the script finished; a run that reports `patched 0 of 3` is a run whose
+    author notices, and `done` is not. The assertion earns itself the first time an
+    anchor drifts under a rebase, which is not a rare event here.
   - **A tool given a path that does not exist reports nothing, which is what "absent"
     also looks like.** `nm` on a missing file prints no symbols, so a grep for one
     counts zero -- character-for-character identical to a binary that was built
