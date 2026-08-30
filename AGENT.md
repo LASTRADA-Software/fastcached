@@ -652,6 +652,14 @@ it afterwards. CI derives `area/` and `os/` from the changed paths and reads
 most of this repository's are, means setting the label by hand.
 [`CONTRIBUTING.md`](CONTRIBUTING.md) carries the taxonomy and the reasoning.
 
+A label applied by hand can be **destroyed by CI seconds later**, and the gate
+then fails for a pull request that was labelled correctly. `actions/labeler`
+finishes with `setLabels(...)` — a full replacement computed from the labels it
+read when its run started — *whatever* `sync-labels` is set to, so a label added
+between that read and that write is lost. `pr-labels.yml` brackets the action with
+a remember/restore pair and warns when it fires; if a `type/` label vanishes,
+re-apply it and read that warning rather than assuming the gate is flaky (#347).
+
 Deferred work is a GitHub issue linked from the matching rulebook file's
 `## Open work` section, never a residual recorded only in prose.
 

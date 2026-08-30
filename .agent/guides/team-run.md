@@ -126,13 +126,25 @@ show red while a queued run is already on its way to fixing it.
 gh pr checks <n> --json name,state
 ```
 
-The decisive signal is **why** it cancelled, not that it cancelled:
+The decisive signal is **why** it is red, not that it is red — and one of the three
+causes below is not a cancellation at all:
 
 - Red **immediately after a multi-label create or edit** — self-inflicted by the
   concurrency group, and a queued run is already on its way to clearing it. **Wait.**
   Firing another label event cancels the survivor and starts the cycle over.
 - Red on a PR whose **labels have been stable for minutes**, nothing queued — genuinely
   stuck. Re-apply **one** accurate missing `area/*` label to fire a fresh event.
+- Red while the PR **visibly has its `type/` label** — `actions/labeler` destroyed a
+  correctly-applied one. It finishes with an unconditional `setLabels()` seeded from
+  the labels it read when its run started, so anything applied between that read and
+  that write is lost, whatever `sync-labels` says and whatever the config names
+  (#347). This is the one you will meet most often, and it does not look like either
+  case above: the label may be gone, or applied-destroyed-restored so that
+  `gh pr view <n> --json labels` shows it present while the gate is still red from
+  the moment it was not. `--json name,state` says `FAILURE`, not `CANCELLED`.
+  Re-apply the label. Since #350 the workflow restores what the replacement
+  destroyed and emits a `::warning::` naming it — if that warning is in the run log,
+  this is your cause and there is nothing further to diagnose.
 - Never `gh run rerun` — it races the concurrency group and makes it worse.
 
 ## Review gates
