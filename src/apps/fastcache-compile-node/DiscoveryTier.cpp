@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DiscoveryTier.hpp"
+#include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/SharedPortDatagram.hpp>
@@ -124,20 +125,30 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // Which socket takes which option is `OpenSharedPortUdpSocket`'s to know, not
     // this function's: there are four of them, each easy to put on the wrong half,
     // and every wrong pairing still starts and still passes a test suite.
-    auto socket = OpenSharedPortUdpSocket("0.0.0.0", *port, cfg.discoveryReplyPort);
+    // The bind host comes from this surface's row, not from a literal spelled here
+    // three times. It is `HostOrigin::Fixed` rather than a default a bare port falls
+    // back to, and the distinction is the one an operator's firewall list turns on:
+    // `--discovery`'s host half is where beacons are SENT, while both sockets bind
+    // the wildcard whatever it says. Reading the announce address as a bind address
+    // would put a broadcast address on a worksheet (#288).
+    auto const& row = RowFor(NodeSurface::Discovery);
+    auto const bindHost = std::string { row.defaultHost };
+
+    auto socket = OpenSharedPortUdpSocket(bindHost, *port, cfg.discoveryReplyPort);
     if (socket == nullptr)
         // Both are named, because either can be the one that failed and this
         // cannot tell which. A message that blamed the beacon port alone would
         // send an operator to look at a port that bound perfectly.
         return std::unexpected { std::format(
-            "cannot bind the UDP sockets discovery needs: 0.0.0.0:{} to listen on, and {} to answer on",
+            "cannot bind the UDP sockets discovery needs: {}:{} to listen on, and {} to answer on",
+            bindHost,
             *port,
-            cfg.discoveryReplyPort != 0 ? std::format("0.0.0.0:{}", cfg.discoveryReplyPort)
+            cfg.discoveryReplyPort != 0 ? std::format("{}:{}", bindHost, cfg.discoveryReplyPort)
                                         : std::string { "a port of this node's own" }) };
 
     // The port the operator configured, which is NOT the one the pair reports:
     // that is where this node is answered. Both go in the startup line.
-    auto const listeningOn = FormatHostPort("0.0.0.0", *port);
+    auto const listeningOn = FormatHostPort(bindHost, *port);
 
     auto config = Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
                                              .nodeId = cfg.nodeId,

@@ -40,6 +40,40 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
+/// A configuration that would start, so a refusal names the thing under test.
+///
+/// The startup rules are a table of cross-flag invariants, so a bare `NodeConfig`
+/// can be refused for a reason having nothing to do with the surface a case is
+/// about -- and the case would then pass on the wrong refusal. This gives every one
+/// of them a node that is otherwise fine.
+/// @return A worker that would start.
+[[nodiscard]] NodeConfig Installable()
+{
+    NodeConfig cfg;
+    cfg.scheduler = "cache.internal:6675";
+    cfg.advertise = "worker-01.internal:6676";
+    cfg.toolchains = { "/usr/bin/g++" };
+    return cfg;
+}
+
+/// A configuration serving the admin surface at @p spec.
+///
+/// Through the surface's own row rather than by naming `cfg.adminListen`, so a test
+/// cannot reach this port by a route production code no longer has -- the same
+/// reason `FrameEndpoint_test`'s helper is written this way. A helper that named the
+/// field would be a second copy of the surface-to-field mapping.
+/// @param spec The address the admin surface should serve.
+/// @return A configuration that would start, serving admin there.
+[[nodiscard]] NodeConfig AdminOn(std::string spec)
+{
+    auto const& row = RowFor(NodeSurface::Admin);
+    REQUIRE(row.spec != nullptr);
+
+    auto cfg = Installable();
+    cfg.*row.spec = std::move(spec);
+    return cfg;
+}
+
 /// A snapshot provider standing in for the worker's, with no worker behind it.
 /// @return A worker-shaped snapshot: no storage, a machine, an uptime.
 AdminHttpServer::SnapshotProvider WorkerShapedSnapshot()
@@ -89,13 +123,37 @@ TEST_CASE("An unparseable --admin-listen is refused, not guessed at", "[node][ad
     AtomicMetricsSink metrics;
     NullLogger logger;
 
-    for (auto const* const spelling: { "", "not-a-port", "127.0.0.1", "6674x", "0", "70000", "[::1]6674" })
+    // Asked of `StartupPolicyRejection`, which is where this check went when the
+    // surface table took over the port map (#288). The endpoint no longer parses --
+    // it takes a surface and asks the row -- so the refusal that ECHOES what the
+    // operator typed has to come from the walk over those rows, which happens once,
+    // at startup, before any tier exists and before `--install-service` writes a
+    // command line it will replay forever. The message moved with the check, and this
+    // case followed the message.
+    for (auto const* const spelling: { "not-a-port", "127.0.0.1", "6674x", "0", "70000", "[::1]6674" })
     {
         INFO("spelling '" << spelling << "'");
-        auto const started = AdminEndpoint::Start(spelling, "127.0.0.1", metrics, WorkerShapedSnapshot(), logger);
-        REQUIRE_FALSE(started.has_value());
-        CHECK(started.error().contains(spelling));
+        auto cfg = Installable();
+        cfg.adminListen = spelling;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--admin-listen"));
+        CHECK(Unwrap(refusal).contains(spelling));
     }
+
+    // Empty is not malformed: it is how an operator says this node serves no admin
+    // surface at all, so it is the one spelling above that must be ACCEPTED.
+    auto off = Installable();
+    off.adminListen = "";
+    CHECK_FALSE(StartupPolicyRejection(off).has_value());
+
+    // And what the factory itself still refuses: a surface it was asked to serve
+    // that resolves to no address. Naming the flag, because an operator has to know
+    // which surface went unserved.
+    auto const started = AdminEndpoint::Start(NodeSurface::Admin, off, metrics, WorkerShapedSnapshot(), logger);
+    REQUIRE_FALSE(started.has_value());
+    CHECK(started.error().contains("--admin-listen"));
 }
 
 TEST_CASE("A bare port binds loopback rather than the wildcard", "[node][admin]")
@@ -107,18 +165,24 @@ TEST_CASE("A bare port binds loopback rather than the wildcard", "[node][admin]"
     AtomicMetricsSink metrics;
     NullLogger logger;
 
-    auto const started = AdminEndpoint::Start("0", "127.0.0.1", metrics, WorkerShapedSnapshot(), logger);
-    // Port 0 is refused outright -- "any free port" is an address nobody can be
-    // told in advance -- so bind an ephemeral one the ordinary way instead.
-    REQUIRE_FALSE(started.has_value());
-
+    // Port 0 is refused outright -- "any free port" is an address nobody can be told
+    // in advance -- so bind an ephemeral one the ordinary way instead.
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
     auto const port = probe->BoundPort();
     probe.reset();
 
-    auto const bare = AdminEndpoint::Start(std::to_string(port), "127.0.0.1", metrics, WorkerShapedSnapshot(), logger);
+    // The loopback default comes from the ROW now, not from an argument this call
+    // site passes -- which is the point: it used to be a caller's choice, and a
+    // caller free to pass a different default host was a caller free to move the
+    // rule this surface's credential requirement turns on. Asserted end to end,
+    // through the address the endpoint reports, because that is what an operator
+    // reads back off the log line.
+    auto cfg = Installable();
+    cfg.adminListen = std::to_string(port);
+
+    auto const bare = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
     REQUIRE(bare.has_value());
     CHECK((*bare)->BoundEndpoint() == std::format("127.0.0.1:{}", port));
 }
@@ -139,7 +203,8 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][admin]")
     NullLogger logger;
 
     auto const unreachable = std::string { "192.0.2.1:6674" };
-    auto const started = AdminEndpoint::Start(unreachable, "127.0.0.1", metrics, WorkerShapedSnapshot(), logger);
+    auto const started =
+        AdminEndpoint::Start(NodeSurface::Admin, AdminOn(unreachable), metrics, WorkerShapedSnapshot(), logger);
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
 }
@@ -165,7 +230,8 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     // naming nothing, which this repository has already paid for once. It fails in
     // seconds instead, saying what it waited for.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started = AdminEndpoint::Start(std::to_string(port), "127.0.0.1", metrics, WorkerShapedSnapshot(), logger);
+        auto started =
+            AdminEndpoint::Start(NodeSurface::Admin, AdminOn(std::to_string(port)), metrics, WorkerShapedSnapshot(), logger);
         return started.has_value();
     });
 
@@ -447,7 +513,21 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
             cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, logger);
         REQUIRE_FALSE(surface.has_value());
         CHECK(surface.error().contains("--admin-listen"));
-        CHECK(surface.error().contains("not-a-port"));
+
+        // The VALUE is no longer echoed here, and that is the relocation rather than
+        // a loss: since #288 the surface table owns the grammar, so a spelling that
+        // is not an endpoint is refused by `StartupPolicyRejection` -- once, at
+        // startup, in front of the person who typed it, and before
+        // `--install-service` bakes it into a command line replayed at every boot.
+        // Reaching this tier at all means the value already parsed, so a tier-level
+        // echo would be describing a state that can no longer occur.
+        //
+        // Asserted here rather than only where it moved to, because "the check went
+        // somewhere" is exactly what a reader of this case needs to know, and a
+        // deleted assertion tells them nothing.
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("not-a-port"));
     }
 
     SECTION("a credential file that cannot be read")

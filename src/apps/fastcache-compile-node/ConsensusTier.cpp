@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -240,9 +241,15 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // the command line -- an install included -- rather than here. What survives is
     // the message that names the text they typed, which a row of static prose
     // cannot, and the answer for a `NodeConfig` no argv produced (#168).
-    auto const endpoint = ParseEndpoint(cfg.raftListen, RaftListenDefaultHost);
-    if (!endpoint.has_value())
+    // Through the surface's row, so the wildcard a bare port takes here is the same
+    // value `--print-surfaces` prints and the same one the startup grammar judged.
+    // The asymmetry with `--listen-cache`'s loopback is the rule -- peers are on
+    // other machines by definition -- and it is a column rather than a constant each
+    // opener reaches for.
+    auto const endpoints = RowFor(NodeSurface::Raft).resolve(cfg);
+    if (endpoints.empty())
         return std::unexpected { std::format("--listen-raft={} names no usable port", cfg.raftListen) };
+    auto const& endpoint = endpoints.front();
 
     // The listener is bound in `Launch` rather than here, because it binds against
     // the reactor and the reactor is a member of the object this has not built yet.
@@ -263,12 +270,12 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 
     auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { std::move(announced),
                                                                      *std::move(storage),
-                                                                     std::format("{}:{}", endpoint->first, endpoint->second),
+                                                                     std::format("{}:{}", endpoint.host, endpoint.port),
                                                                      std::move(onRole),
                                                                      std::move(onMembers),
                                                                      logger } };
 
-    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint->first, endpoint->second); !started.has_value())
+    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port); !started.has_value())
         return std::unexpected { started.error() };
 
     logger.Logf(LogLevel::Info,

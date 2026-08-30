@@ -219,16 +219,57 @@ class Conversation
         return std::nullopt;
     return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
 }
+/// A configuration serving @p surface at @p spec.
+///
+/// Written THROUGH the surface's own row rather than by naming the config field, so
+/// a test cannot reach a port by a route production code no longer has. The row
+/// already knows where each surface's text lives; a helper that hard-coded
+/// `cfg.schedulerListen` would be a second copy of that mapping, which is the fifth
+/// place again in test form.
+/// @param surface Which surface to configure.
+/// @param spec The address it should serve.
+/// @return A configuration serving exactly that.
+[[nodiscard]] NodeConfig ConfigFor(NodeSurface surface, std::string spec)
+{
+    auto const& row = RowFor(surface);
+    // Every surface these cases drive carries spec text; the compile port is the one
+    // that does not, and it is not served through `FrameEndpoint`.
+    REQUIRE(row.spec != nullptr);
+
+    NodeConfig cfg;
+    cfg.*row.spec = std::move(spec);
+    return cfg;
+}
+
+/// A configuration serving @p surface on loopback at @p port.
+///
+/// Loopback is spelled out rather than left to the surface's own default, and that
+/// is deliberate: the scheduler's default host is the WILDCARD, so a bare port here
+/// would bind every interface on a developer's machine and on CI.
+/// @param surface Which surface to configure.
+/// @param port The port it should serve.
+/// @return A configuration serving that surface on loopback.
+[[nodiscard]] NodeConfig LoopbackFor(NodeSurface surface, std::uint16_t port)
+{
+    return ConfigFor(surface, std::format("127.0.0.1:{}", port));
+}
 } // namespace
 
-TEST_CASE("An unparseable --listen-scheduler is refused, not guessed at", "[node][scheduler]")
+TEST_CASE("A surface with no address to bind is refused, not guessed at", "[node][scheduler]")
 {
+    // `Start` no longer parses -- it takes a surface and asks the row. A malformed
+    // address is refused by `StartupPolicyRejection`, which walks the same rows and
+    // echoes what the operator typed; that is asserted in `NodeConfig_test`, where
+    // the message lives. What is left here is the shape this factory still has to
+    // refuse: a surface it was asked to serve that resolves to no address at all.
     Fleet fleet;
     auto const started =
-        FrameEndpoint::Start(fleet.io, "not-a-port", "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Scheduler, NodeConfig {}, fleet.responder, fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
-    CHECK(started.error().contains("not-a-port"));
+    // Naming the flag, because an operator reading it has to know which surface went
+    // unserved -- the endpoint knows, and a bare "no address" would not say.
+    CHECK(started.error().contains("--listen-scheduler"));
 }
 
 TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
@@ -240,8 +281,8 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     // it is set, and is asserted there (SocketAddress_test.cpp, issue #85).
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
-    auto const started =
-        FrameEndpoint::Start(fleet.io, unreachable, "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto const started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, ConfigFor(NodeSurface::Scheduler, unreachable), fleet.responder, fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
@@ -259,8 +300,8 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     auto const port = probe->BoundPort();
     probe.reset();
 
-    auto started =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
     fleet.Serve();
 
@@ -292,8 +333,8 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     // host reaches the oracle, and that a reply comes back framed.
     Fleet fleet;
     auto const port = FreePort();
-    auto started =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -328,8 +369,8 @@ TEST_CASE("This machine is admitted whatever the member list says", "[node][sche
     fleet.membership.Publish({ "10.0.0.1:7000" });
 
     auto const port = FreePort();
-    auto started =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -373,8 +414,8 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     // the DECLARED length, so the bytes are never taken.
     Fleet fleet;
     auto const port = FreePort();
-    auto started =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto started = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -493,7 +534,8 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     responder.Hold(true);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -536,8 +578,8 @@ TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
     // only implementation to break.
     Fleet fleet;
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -562,8 +604,8 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     // the length the header carries bought nothing.
     Fleet fleet;
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -607,7 +649,8 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -653,7 +696,8 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -687,7 +731,8 @@ TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
     responder.Limit(/*concurrent*/ 0, /*budget*/ 1);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", responder, "cache", fleet.logger);
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -713,8 +758,8 @@ TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
     // this into an infinite one.
     Fleet fleet;
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, std::to_string(port), "127.0.0.1", fleet.responder, "scheduler", fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 

@@ -192,11 +192,11 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     auto tier =
         std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), membership, clock, metrics } };
 
-    // Loopback for a bare port, the OPPOSITE of the scheduler's wildcard, and why is
-    // on `CacheListenDefaultHost`. Named rather than spelled here so that whatever
-    // else comes to judge this value is judging the address this tier will actually
-    // take.
-    auto started = FrameEndpoint::Start(io, cfg.cacheListen, CacheListenDefaultHost, tier->_responder, "cache", logger);
+    // The surface, not an address. Loopback for a bare port, the OPPOSITE of the
+    // scheduler's wildcard, and that asymmetry is now a column of this surface's row
+    // rather than an argument this call site chooses -- so nothing here can open a
+    // port the operator's firewall worksheet does not list.
+    auto started = FrameEndpoint::Start(io, NodeSurface::Cache, cfg, tier->_responder, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 

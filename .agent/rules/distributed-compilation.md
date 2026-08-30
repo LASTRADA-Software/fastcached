@@ -1065,6 +1065,45 @@ Six more about what the tier IS and who gets to see it:
   cache port is logged as a warning and stepped over, and the error names
   `--listen-cache` while pointing at a directory.
 
+- **A port this node LISTENS on is a row of `NodeSurfaceTable()`, and an opener takes
+  the `NodeSurface` rather than an address.** The port map lived in five places --
+  `EndpointFlags`' install-time grammar (four surfaces), a `StartupPolicyRejection`
+  row (raft), four `*ListenDefaultHost` constants, the six opener call sites, and the
+  operator documentation -- and an operator's firewall list was the sixth
+  ([#288](https://github.com/LASTRADA-Software/fastcached/issues/288)). They are one
+  table now, and the guard is the **type system**: `FrameEndpoint::Start` and
+  `AdminEndpoint::Start` take an enumerator, so there is no argument to pass a bare
+  string to and a port cannot be opened without a row. A guard that fails the build
+  beats one that fails a suite.
+
+  What that removes is subtler than the duplication. **The default host used to be a
+  caller's argument**, so the cache's loopback and the scheduler's wildcard -- which
+  exist for a security reason, not a preference -- were mechanically whatever the call
+  site passed. A test binding a bare port with an explicit `"127.0.0.1"` default
+  against a wildcard-defaulting surface would have bound every interface and gone
+  green.
+
+  Three columns carry what the openers cannot: **protocol** (discovery is UDP and the
+  other five are TCP, so a worksheet without it yields five correct firewall rules and
+  one wrong one), **`HostOrigin`** (a constant a bare port falls *back* to, a flag of
+  its own for `--bind`, or a *fixed* host -- discovery's, whose `--discovery` address
+  is where beacons are SENT while its sockets always bind the wildcard), and a
+  free-form **note** for what a column cannot say.
+
+  There is deliberately **no `presence` column**: `resolve` already answers it, and a
+  column restating it was wrong for raft, whose address an operator can name while
+  `--node-id` is what actually binds it. And no `explicitBit`: that is `OptionSpec`'s,
+  and copying it here would create the fifth place while removing it.
+
+  `--print-surfaces` renders the **resolved** configuration, never the defaults --
+  a worksheet claiming `127.0.0.1` for a node started with `--listen-cache 0.0.0.0:6674`
+  is a security misstatement rather than an untidy one -- so it parses the whole
+  command line (`ParseFlow::Continue`, unlike `--help`) or it describes a machine
+  nobody configured.
+
+  **`--advertise` is not a surface.** It is what this node tells others to dial, not a
+  socket it opens.
+
   **"The operator typed it" is `cfg.cacheListenExplicit`, never a comparison against
   the default** ([#286](https://github.com/LASTRADA-Software/fastcached/issues/286)).
   Why a comparison cannot answer it, and why the registration side of the same flag

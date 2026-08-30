@@ -210,6 +210,9 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // decision forever, on a store that after the first run has nothing
         // left to convert.
         "--migrate-cache",
+        // Reports on a configuration and exits; a service that printed its ports at
+        // every boot instead of serving them would be one that never starts.
+        "--print-surfaces",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.
@@ -736,7 +739,35 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     // and no port installed cleanly and then exited at every boot. The rule asks
     // the tier's own question, the way the `--dashboard` row asks
     // `AdminEndpoint`'s.
-    for (auto const* const listen: { "", "nope", "0", "10.0.0.1" })
+    // Every one of these is refused and names the flag -- but WHICH rule answers
+    // changed with #288, and asserting only "refused, and names --listen-raft" would
+    // pass under both behaviours and so pin neither.
+    //
+    // `--listen-raft` is now in the surface table's grammar loop, because that table
+    // holds every surface and leaving one out would need a column meaning "somebody
+    // else checks this one". So a MALFORMED address is answered there, echoing what
+    // the operator typed; an ABSENT one still reaches the consensus rule below, which
+    // is the input that rule was written about. Both still fire, for their own
+    // inputs, which is what made the move safe.
+    struct RaftCase
+    {
+        char const* listen;  ///< What the operator wrote.
+        char const* expects; ///< Text only the answering rule produces.
+    };
+
+    for (auto const& [listen, expects]: std::to_array<RaftCase>({
+             // Nothing to judge, so the grammar loop skips it and the cross-flag rule
+             // answers: the surface is configured and cannot be served.
+             { .listen = "", .expects = "needs a usable" },
+             // Text that is not an address, answered where the value can be echoed.
+             { .listen = "nope", .expects = "is not [<address>:]<port>" },
+             // Zero is not a port anyone can dial, so it is a malformed address
+             // rather than an absent one.
+             { .listen = "0", .expects = "is not [<address>:]<port>" },
+             // A host with no port. Same rule, and the one an operator most often
+             // reaches by forgetting the colon.
+             { .listen = "10.0.0.1", .expects = "is not [<address>:]<port>" },
+         }))
     {
         INFO("--listen-raft=" << listen);
         auto cfg = Installable();
@@ -747,6 +778,7 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--listen-raft"));
+        CHECK(Unwrap(refusal).contains(expects));
         CHECK(NodeInstallRejection(cfg).has_value());
     }
 

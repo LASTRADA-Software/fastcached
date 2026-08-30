@@ -2,6 +2,7 @@
 #pragma once
 
 #include "NodeConfig.hpp"
+#include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
@@ -463,17 +464,25 @@ class AdminEndpoint
     /// picking one enum would buy nothing and mislabel half the failures. What the
     /// caller *does* need is the text, because the flag may have been a bare port
     /// and the message has to say what that resolved to.
-    /// @param listenSpec `port`, `host:port` or `[v6]:port`.
-    /// @param defaultHost What a bare port binds to; loopback for a scrape surface.
+    /// **A surface, never an address**, for the reason `FrameEndpoint::Start` is:
+    /// the listen spec and the host a bare port falls back to were two arguments a
+    /// caller chose, which made this opener a place the port map lived. Here it also
+    /// carried a rule that is not a firewall detail at all -- the loopback default is
+    /// what the dashboard's credential rule turns on, since reaching loopback already
+    /// means being on the machine -- and a caller free to pass a different default
+    /// host was a caller free to move that rule without touching it.
+    /// @param surface Which surface to serve; its row supplies the address and the
+    ///        host a bare port takes.
+    /// @param cfg What the operator asked for; the row resolves the endpoint from it.
     /// @param metrics The sink to render.
     /// @param snapshot What to report per scrape.
     /// @param logger Where to announce the bound address.
-    /// @return The running endpoint, or why it could not be served.
     /// @param routes Routes beyond `/metrics` and `/healthz`; may be empty.
     /// @param tls Server TLS context, or nullptr to serve plaintext.
+    /// @return The running endpoint, or why it could not be served.
     [[nodiscard]] static std::expected<std::unique_ptr<AdminEndpoint>, std::string> Start(
-        std::string_view listenSpec,
-        std::string_view defaultHost,
+        NodeSurface surface,
+        NodeConfig const& cfg,
         IMetricsSink& metrics,
         AdminHttpServer::SnapshotProvider snapshot,
         ILogger& logger,
