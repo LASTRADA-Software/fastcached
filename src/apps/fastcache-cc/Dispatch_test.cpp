@@ -712,3 +712,106 @@ TEST_CASE("DecodeArgs round-trips an empty list and an empty argument", "[dispat
     REQUIRE(compile.has_value());
     CHECK(DecodeArgs(Unwrap(compile).args) == args);
 }
+
+TEST_CASE("A lease refused with NotLeader is retried against the leader it names", "[dispatch][redirect]")
+{
+    // Issue #237. `SchedulerService` already answers a non-leader with the leader's
+    // endpoint, and this client threw it away: `NotLeader` fell into the same branch
+    // as `NoWorker` and `NoCapacity`, so one election took every launcher out of
+    // distribution until somebody re-pointed them by hand.
+    //
+    // TWO schedulers, because a fixture with one cannot fail. If the first endpoint
+    // contacted is already the leader, a build that follows no redirect at all still
+    // passes -- so what this pins is that the SECOND scheduler is reached, and that
+    // the client goes where it was sent rather than guessing at an endpoint.
+    constexpr std::string_view Leader = "leader:6675";
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader));
+    fleet.Serve(std::string { Leader }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply("OBJECTBYTES"));
+
+    std::array<std::string, 1> const args { "-c" };
+    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+
+    REQUIRE(result.status == DispatchStatus::Compiled);
+    CHECK(Wire::AsStringView(result.object) == "OBJECTBYTES");
+
+    // The order is the assertion: the demoted scheduler first, then the one it
+    // named, then the worker that one granted.
+    REQUIRE(fleet.Dialled().size() >= 3);
+    CHECK(fleet.Dialled()[0] == Scheduler);
+    CHECK(fleet.Dialled()[1] == Leader);
+    CHECK(fleet.Dialled()[2] == Worker);
+
+    // And the lease is resolved against the scheduler that ISSUED it. Releasing to
+    // the configured endpoint would leave the key marked in flight on the machine
+    // that actually holds it for the whole lease timeout -- the rulebook's "a resolve
+    // answers on liveness" reached from the client's side.
+    auto const toLeader = FramesTo(fleet, Leader);
+    REQUIRE(toLeader.size() == 2);
+    CHECK(OpOf(toLeader[0]) == Wire::Op::Lease);
+    CHECK(OpOf(toLeader[1]) == Wire::Op::Release);
+
+    // Nothing beyond the refusal is sent to the demoted one.
+    auto const toDemoted = FramesTo(fleet, Scheduler);
+    REQUIRE(toDemoted.size() == 1);
+    CHECK(OpOf(toDemoted[0]) == Wire::Op::Lease);
+}
+
+TEST_CASE("A NotLeader naming no address is a refusal, not somewhere to dial", "[dispatch][redirect]")
+{
+    // An election in progress. `SchedulerService` answers `NotLeader` with nothing
+    // when it knows of no leader -- but "nothing" does not reach the wire as an empty
+    // string: the error table substitutes its default sentence, so this arrives
+    // looking exactly like a redirect until somebody tries to split it.
+    //
+    // A client that dialled the message would report a scheduler endpoint no operator
+    // ever typed, which is the failure `ClusterAdminCli`'s comment records. Here it
+    // must decline and compile locally, having dialled nobody else.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler },
+                Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "the cluster has no leader right now"));
+
+    std::array<std::string, 1> const args { "-c" };
+    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+
+    CHECK(result.status == DispatchStatus::Declined);
+    // Exactly one dial: the configured scheduler, and nothing invented from prose.
+    CHECK(fleet.Dialled() == std::vector<std::string> { std::string { Scheduler } });
+}
+
+TEST_CASE("Two schedulers naming each other stop at the redirect ceiling", "[dispatch][redirect]")
+{
+    // A partition healing, or a stale `_knownLeader` on both sides: each node is
+    // certain the other leads. The chain is not this client's to trust, so it is
+    // bounded -- without a ceiling a build would spend one connect per translation
+    // unit per hop discovering that nobody leads.
+    //
+    // The ceiling is what makes this an ordinary local compile, which is what every
+    // other lease refusal already means. Asserted as a COUNT rather than "it
+    // returned", because a fix that stopped after one hop and a fix that never
+    // followed one at all both return `Declined`.
+    constexpr std::string_view Other = "other:6675";
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Other));
+    fleet.Serve(std::string { Other }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Scheduler));
+
+    std::array<std::string, 1> const args { "-c" };
+    auto const result = Dispatch(fleet, Request(args), DispatchBudgets {}, Credential {}, {});
+
+    CHECK(result.status == DispatchStatus::Declined);
+    // Three asks: the configured one, then two redirects, then the ceiling. It must
+    // both follow more than one hop and stop.
+    CHECK(fleet.Dialled().size() == 3);
+    CHECK(fleet.Dialled()[0] == Scheduler);
+    CHECK(fleet.Dialled()[1] == Other);
+    CHECK(fleet.Dialled()[2] == Scheduler);
+
+    // Nothing was leased, so nothing is released: a RELEASE here would resolve a
+    // token no scheduler ever issued.
+    for (auto const& endpoint: { Scheduler, Other })
+        for (auto const& frame: FramesTo(fleet, endpoint))
+            CHECK(OpOf(frame) == Wire::Op::Lease);
+}

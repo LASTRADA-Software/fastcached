@@ -2,6 +2,7 @@
 #include "CacheProtocol.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/TcpClient.hpp>
 
 #include <format>
@@ -183,6 +184,15 @@ namespace
 Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential)
 {
     co_return co_await Exchange(client, std::move(frame), std::move(credential));
+}
+
+std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
+{
+    if (outcome.kind != CacheOutcomeKind::Rejected || outcome.code != Wire::ErrorCode::NotLeader)
+        return std::nullopt;
+    if (!SplitHostPort(outcome.message).has_value())
+        return std::nullopt;
+    return outcome.message;
 }
 
 std::string DescribeOutcome(CacheOutcome const& outcome)
