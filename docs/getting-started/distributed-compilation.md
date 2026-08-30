@@ -463,6 +463,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by this cluster. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating signed leases, which is told apart by whether the rise tracks a rollout. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
+| `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
 The refusals are split by reason for the same reason the scheduler's two are:

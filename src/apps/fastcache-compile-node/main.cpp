@@ -19,6 +19,7 @@
 #include "NodeMembership.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerTier.hpp"
+#include "ScratchClaim.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -330,6 +331,50 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                       round.registrars.size());
 }
 
+/// Claim this worker's private scratch root, or say why the node must not start.
+///
+/// A function rather than a block inside `WorkerBody` because it is a startup
+/// decision with its own vocabulary -- and because `WorkerBody` is already at the
+/// cognitive-complexity ceiling the build enforces, which is the honest reason a
+/// reader deserves rather than a silenced warning.
+///
+/// @param servesCompiles Whether this node runs a worker tier at all.
+/// @param base Where the candidate roots live.
+/// @param logger Where the outcome is announced.
+/// @return The held claim; a NULL claim when there is no worker tier and none is
+///         needed; or nothing at all when the node must refuse to start.
+[[nodiscard]] std::optional<std::unique_ptr<Node::IScratchClaim>> ClaimWorkerScratchRoot(bool servesCompiles,
+                                                                                         std::filesystem::path const& base,
+                                                                                         ILogger& logger)
+{
+    if (!servesCompiles)
+        return std::unique_ptr<Node::IScratchClaim> {};
+
+    auto const claimant = Node::MakeLockFileScratchClaimant();
+    auto claimed = claimant->Claim(base, Node::DefaultMaxScratchRoots);
+    if (!claimed.has_value())
+    {
+        // Named, and never a fallback to an unclaimed root. Carrying on without the
+        // claim would reintroduce #279 on exactly the machines least able to
+        // diagnose it, and would do so while every test passed.
+        auto const& row = Node::DescribeScratchClaimRefusal(claimed.error());
+        logger.Logf(LogLevel::Error, "{}: {}; refusing to start", row.name, row.remedy);
+        return std::nullopt;
+    }
+
+    auto claim = std::move(*claimed);
+    if (claim->Reclaimed())
+        // A root whose lock was free but whose contents were not: its owner died
+        // without running its cleanup. The COUNTER for it is raised by the caller,
+        // where the metrics sink exists -- the claim has to happen before that
+        // because the job runner takes the root at construction.
+        logger.Logf(LogLevel::Warn,
+                    "reclaimed the scratch root {} from a node that exited without cleaning up",
+                    claim->Root().string());
+    logger.Logf(LogLevel::Info, "scratch root {} claimed exclusively", claim->Root().string());
+    return claim;
+}
+
 /// Serve until asked to stop.
 ///
 /// Everything `main` does once it has decided this process is going to BE a
@@ -416,7 +461,29 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
 
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
-    auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
+    // The scratch root is claimed EXCLUSIVELY, and it is the worker tier's alone.
+    //
+    // It used to be `temp_directory_path() / "fastcache-compile-node"` with jobs
+    // numbered beneath it from a counter starting at 1 in every process, so a second
+    // node on this host derived the identical `job-1` -- and `create_directories`
+    // succeeds on a directory that already exists, so it was told nothing (#279).
+    // One node's cleanup then removed the directory under the other's compile, or
+    // the two shared `tu.o` and one answered with the other's object.
+    //
+    // `servesCompiles` rather than an unconditional claim: a machine scheduling for
+    // a fleet and compiling nothing has no use for a scratch root and must not fail
+    // to start for want of one. Every node serves compiles today, so this is always
+    // true -- named anyway, so that when a node can offer zero slots (#206) the
+    // claim is already conditional rather than something somebody has to remember.
+    // With no toolchains every job is refused on the fingerprint lookup, which
+    // happens before `CompileJobRunner::Run` touches any path at all.
+    auto const servesCompiles = !toolchains.empty();
+    auto const scratchBase = std::filesystem::temp_directory_path() / "fastcache-compile-node";
+    auto scratchClaimOrRefusal = ClaimWorkerScratchRoot(servesCompiles, scratchBase, logger);
+    if (!scratchClaimOrRefusal.has_value())
+        return ExitUsage;
+    auto const scratchClaim = std::move(*scratchClaimOrRefusal);
+    auto const scratch = scratchClaim ? scratchClaim->Root() : scratchBase;
     // Projected to what the runner needs, by a lambda rather than in place, because
     // the re-survey below builds the identical map from a different set of
     // toolchains -- and a projection written twice is one that drifts.
@@ -435,6 +502,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // signature rather than anything reaching the scheduler; `LeaseValidator` exists
     // so #282 is a substitution and not a rewrite.
     AtomicMetricsSink metrics;
+    // Raised here rather than at the claim above, which runs before this sink exists.
+    // Counted as well as logged because it is otherwise visible nowhere: a rise means
+    // nodes are dying rather than stopping.
+    if (scratchClaim != nullptr && scratchClaim->Reclaimed())
+        metrics.Increment(IMetricsSink::Counter::WorkerScratchRootsReclaimed);
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
     // this peer one of ours" differently at two of its surfaces would admit a peer to

@@ -243,6 +243,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "machine and nowhere else is that machine's clock, not the fleet's "
               "leases.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerScratchRootsReclaimed,
+      .prometheusName = "fastcache_worker_scratch_roots_reclaimed_total",
+      .help = "Scratch roots taken over from a node that exited without cleaning up. "
+              "A rise means nodes are dying rather than stopping; the work itself is "
+              "correct, because a root is only reclaimed once its owner's lock is free.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerBytesReceived,
       .prometheusName = "fastcache_worker_bytes_received_total",
       .help = "Request payload bytes read from clients.",

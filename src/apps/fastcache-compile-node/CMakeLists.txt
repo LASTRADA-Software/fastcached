@@ -44,6 +44,7 @@ add_executable(fastcache-compile-node
     ConsensusTier.cpp
     DiscoveryTier.cpp
     SchedulerTier.cpp
+    ScratchClaim.cpp
     LocalCache.cpp
     NodeConfig.cpp
     NodeToolchains.cpp
@@ -87,6 +88,8 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         SchedulerTier.cpp
+        ScratchClaim.cpp
+        ScratchClaim_test.cpp
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp

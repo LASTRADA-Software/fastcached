@@ -261,6 +261,21 @@ class IMetricsSink
         /// carries skew slack and why this is worth seeing per node.
         WorkerJobsRefusedLeaseExpired,
 
+        /// Scratch roots this worker took over from a node that died without
+        /// cleaning up.
+        ///
+        /// A worker claims its scratch root exclusively at startup and holds the
+        /// claim for the life of the process, so a root whose lock is free but whose
+        /// contents are not is one whose owner is gone -- including via the
+        /// abandoned-drain `_Exit`, which by design bypasses every destructor.
+        /// Reclaiming it is correct and needs no reasoning about staleness.
+        ///
+        /// Counted because it is otherwise invisible. The startup REFUSAL to claim a
+        /// root at all is deliberately not counted: that path exits the process, so
+        /// nothing would ever scrape the number -- an operator learns about it by the
+        /// node not starting, and the log line names which of the two refusals it was.
+        WorkerScratchRootsReclaimed,
+
         /// Bytes of request payload read from clients, and of reply written back.
         /// The pair is what says whether a codec negotiation is doing anything:
         /// preprocessed text in against object bytes out.
