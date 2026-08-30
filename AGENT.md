@@ -282,6 +282,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   the decoder, because `EndpointBusy` on an idle worker is a retry loop.
 - Anything a worker derives per job is derived per THREAD: two compiles sharing a
   scratch number shared `tu.o`, and one answered with the other's object.
+- And per PROCESS across machines: a scratch root is CLAIMED exclusively, never
+  merely named uniquely. Claiming is the liveness check, so there is no race and a
+  root whose lock is free is one whose owner is gone — `_Exit` included. `flock`,
+  never `fcntl`, which is per process and would pass the two-runner test written to
+  catch it. The lock file sits BESIDE the root, because emptying the root is what
+  both reclamation and ordinary cleanup do. No unclaimed fallback: `TEMP` is the
+  relocation mechanism and a refusal is named.
 - A child inherits what the PROCESS has, not what the call set up. Windows names the
   handles it may inherit; POSIX marks both pipe ends close-on-exec, under the lock that
   covers the spawn.

@@ -1573,6 +1573,42 @@ did not choose.
 What the counters mean is tabulated under
 [Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works).
 
+## The scratch root, and running two nodes on one machine
+
+A worker compiles into a scratch directory of its own, beneath a root under the
+system temporary directory. **That root is claimed exclusively for the life of the
+process**, so two compile nodes on one machine get different ones.
+
+They used to get the same one. The root carried nothing per process and each node
+numbered its jobs from 1, so a second node derived the identical `job-1` — and
+creating a directory that already exists succeeds, so it was told nothing. One
+node's cleanup then removed the directory out from under the other's compile, or
+the two shared an object file and one answered with the other's
+([#279](https://github.com/LASTRADA-Software/fastcached/issues/279)).
+
+**`TEMP` (or `TMPDIR`) relocates the root**, and that is the supported way to give a
+node its own — there is deliberately no separate flag, because the environment
+already says this and two ways to say one thing is how they come to disagree. The
+fixture that proves the isolation uses exactly this mechanism as its control.
+
+A node that cannot claim a root **refuses to start**, by name, rather than sharing
+one:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `scratch-roots-exhausted` | Every candidate root is held by another running node. | Stop one, or give this node its own `TEMP`. |
+| `scratch-unavailable` | The directory could not be created, or the filesystem cannot lock. | Check the disk and its permissions. Point `TEMP` at a local filesystem if this one is a network mount. |
+
+There is no unclaimed fallback. Carrying on without the claim would restore the
+defect above on exactly the machines least able to diagnose it, and would do so
+while everything looked healthy.
+
+A root left behind by a node that died — the abandoned-drain path exits without
+running its cleanup, by design — is **reclaimed** by the next node that takes it,
+and counted as `fastcache_worker_scratch_roots_reclaimed_total`. Reclaiming is safe
+without any staleness guess: the claim is an operating-system lock, so a root whose
+lock is free is one whose owner is gone, however it went.
+
 ## What a worker will not do
 
 - **Run a program a client named.** The compiler comes from `--toolchain`.

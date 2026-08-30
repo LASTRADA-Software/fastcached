@@ -1424,6 +1424,58 @@ one, and a client that accepts only `Identity` being answered in `Identity` — 
 object that actually compresses, or the shrink-check makes both cases `Identity` and
 the pair is indistinguishable again.
 
+- **A scratch root is CLAIMED, not merely named — and claiming is the liveness
+  check.** A worker's root came from `temp_directory_path() /
+  "fastcache-compile-node"` with jobs numbered from a counter starting at 1 in every
+  process, so a second node on one host derived the identical `job-1` and everything
+  beneath it. `create_directories` succeeds on a directory that already exists, so
+  nothing was told anything (#279). Two outcomes, and the quiet one is worse: one
+  node's `ScratchGuard` removes the shared directory under the other, whose compile
+  fails and whose client falls back to compiling locally — the build stays correct
+  and **distribution silently stops**, which is #232's shape again. Or the two share
+  `tu.o` and one answers with the other's object, which its client caches under its
+  own key.
+
+  The fix is an **OS-level exclusive claim held for the process's lifetime**, and
+  three properties follow that a pid-inspecting design would not have. There is no
+  race, because acquiring the lock IS the answer rather than something checked before
+  taking it. `_Exit` stops being special: `WorkerServer`'s abandoned drain (#239)
+  bypasses every destructor, but the OS releases the lock however the process died,
+  so a leaked root is one whose lock is FREE — which is exactly what "reclaimable"
+  should mean, with no staleness to infer. And a recycled pid cannot confuse it,
+  because nothing reads a pid.
+
+  Consequences that are each load-bearing:
+
+  - **`flock`, never `fcntl`.** The rulebook already says this for the CoW store
+    because an fcntl lock is per process. Here it bites twice: two claimants inside
+    ONE process would both take an fcntl lock and both succeed, which is the
+    in-process form `a22e056` fixed — and it would **pass the two-runner model this
+    defect was reproduced with**. A guard that its own test cannot fail is worse than
+    no guard.
+  - **The lock file lives BESIDE the root, never inside it.** Reclaiming empties the
+    root, and so does ordinary success. On POSIX it is worse than untidy: deleting an
+    `flock`'d file is legal, and a second process may then create a fresh file at that
+    path and lock *that*, giving two live owners of one root.
+  - **The lock decides ownership; the record never does.** The claim file carries a
+    versioned diagnostic record, and on a root whose lock we hold an unknown version
+    is stale data to overwrite rather than a refusal — `FleetHistory`'s rule that no
+    state of a file may keep a node from starting. Making the version load-bearing
+    would mean a bump left every root unclaimable and no node able to start.
+  - **No unclaimed fallback.** `FilePageStore` opens unguarded when a filesystem
+    cannot lock, because refusing would stop a working deployment and a second opener
+    is only a possibility. The reverse holds here: an unclaimed root IS the defect and
+    two nodes collide by construction. `TEMP`/`TMPDIR` relocates the root, so the
+    escape hatch exists without a flag — which is also what the end-to-end fixture
+    uses as its control.
+  - **The claim belongs to the WORKER tier.** A machine that schedules and compiles
+    nothing has no use for a root and must not fail to start for want of one (#206),
+    so the claim is conditional on serving compiles and says so.
+  - **Counted where a counter can be read.** Reclamation gets
+    `WorkerScratchRootsReclaimed`; the refusal to claim does not, because that path
+    exits the process and nothing would ever scrape it — an operator learns of it by
+    the node not starting, and the log names which refusal it was.
+
 ## Open work
 
 - **[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)** — the worker

@@ -19,6 +19,7 @@
 #include "NodeMembership.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerTier.hpp"
+#include "ScratchClaim.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -416,7 +417,50 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
 
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
 
-    auto const scratch = std::filesystem::temp_directory_path() / "fastcache-compile-node";
+    // The scratch root is claimed EXCLUSIVELY, and it is the worker tier's alone.
+    //
+    // It used to be `temp_directory_path() / "fastcache-compile-node"` with jobs
+    // numbered beneath it from a counter starting at 1 in every process, so a second
+    // node on this host derived the identical `job-1` -- and `create_directories`
+    // succeeds on a directory that already exists, so it was told nothing (#279).
+    // One node's cleanup then removed the directory under the other's compile, or
+    // the two shared `tu.o` and one answered with the other's object.
+    //
+    // `servesCompiles` rather than an unconditional claim: a machine scheduling for
+    // a fleet and compiling nothing has no use for a scratch root and must not fail
+    // to start for want of one. Every node serves compiles today, so this is always
+    // true -- named anyway, so that when a node can offer zero slots (#206) the
+    // claim is already conditional rather than something somebody has to remember.
+    // With no toolchains every job is refused on the fingerprint lookup, which
+    // happens before `CompileJobRunner::Run` touches any path at all.
+    auto const servesCompiles = !toolchains.empty();
+    auto const scratchBase = std::filesystem::temp_directory_path() / "fastcache-compile-node";
+    auto const scratchClaimant = Node::MakeLockFileScratchClaimant();
+    std::unique_ptr<Node::IScratchClaim> scratchClaim;
+    if (servesCompiles)
+    {
+        auto claimed = scratchClaimant->Claim(scratchBase, Node::DefaultMaxScratchRoots);
+        if (!claimed.has_value())
+        {
+            // Named, and never a fallback to an unclaimed root. Carrying on without
+            // the claim would reintroduce #279 on exactly the machines least able to
+            // diagnose it, and would do so while every test passed.
+            auto const& row = Node::DescribeScratchClaimRefusal(claimed.error());
+            logger.Logf(LogLevel::Error, "{}: {}; refusing to start", row.name, row.remedy);
+            return ExitUsage;
+        }
+        scratchClaim = std::move(*claimed);
+        if (scratchClaim->Reclaimed())
+            // A root whose lock was free but whose contents were not: its owner died
+            // without running its cleanup. The COUNTER for it is raised below, where
+            // the metrics sink exists -- the claim has to happen up here because the
+            // job runner takes the root at construction.
+            logger.Logf(LogLevel::Warn,
+                        "reclaimed the scratch root {} from a node that exited without cleaning up",
+                        scratchClaim->Root().string());
+        logger.Logf(LogLevel::Info, "scratch root {} claimed exclusively", scratchClaim->Root().string());
+    }
+    auto const scratch = servesCompiles ? scratchClaim->Root() : scratchBase;
     // Projected to what the runner needs, by a lambda rather than in place, because
     // the re-survey below builds the identical map from a different set of
     // toolchains -- and a projection written twice is one that drifts.
@@ -435,6 +479,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // signature rather than anything reaching the scheduler; `LeaseValidator` exists
     // so #282 is a substitution and not a rewrite.
     AtomicMetricsSink metrics;
+    // Raised here rather than at the claim above, which runs before this sink exists.
+    // Counted as well as logged because it is otherwise visible nowhere: a rise means
+    // nodes are dying rather than stopping.
+    if (scratchClaim != nullptr && scratchClaim->Reclaimed())
+        metrics.Increment(IMetricsSink::Counter::WorkerScratchRootsReclaimed);
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
     // the cache below -- and it outlives every one of them. A node that answered "is
     // this peer one of ours" differently at two of its surfaces would admit a peer to

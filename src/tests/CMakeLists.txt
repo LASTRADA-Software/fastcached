@@ -590,6 +590,43 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Two compile-node PROCESSES on one host must not share a scratch root (#279).
+#
+# Registered here rather than beside the node for the reason `dist-compile-e2e` is:
+# it names three executables, and `src/apps` walks its app table in order, so a test
+# registered beside one binary cannot name another.
+#
+# What it covers that `ScratchClaim_test.cpp` cannot: those cases prove the claim
+# MECHANISM, this proves the WIRING -- that a node actually claims a root before it
+# compiles. The defect was never a broken mechanism; there was none, and every unit
+# test in the tree passed.
+#
+# Windows-only for now, the way `fleet-dashboard-e2e` records for itself. The claim
+# path for both platforms is covered by the unit tests, which run everywhere; what is
+# missing here is the POSIX half of the ORCHESTRATION, not of the guard.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
+    message(STATUS "node-scratch-isolation-e2e: daemon, compile node or launcher not built — skipping")
+elseif(NOT WIN32)
+    message(STATUS "node-scratch-isolation-e2e: Windows-only fixture — skipping")
+else()
+    add_test(
+        NAME "node-scratch-isolation-e2e"
+        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1"
+            -Fastcached "$<TARGET_FILE:fastcached>"
+            -Node "$<TARGET_FILE:fastcache-compile-node>"
+            -Launcher "$<TARGET_FILE:fastcache-cc>"
+    )
+    # Starts three nodes and a daemon twice over and drives real compiles, so it must
+    # not race the other server-starting smoke tests for ports or for CPU.
+    set_tests_properties("node-scratch-isolation-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 900
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()
