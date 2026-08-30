@@ -50,6 +50,7 @@
 #include "Dispatch.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
+#include "ParallelFor.hpp"
 #include "PathResolve.hpp"
 #include "ReactorExchange.hpp"
 #include "ReplayGuard.hpp"
@@ -958,8 +959,12 @@ struct SourceProbe
 {
     auto const banner = CompilerId(compiler);
     auto const flavor = Cc::ClassifyCompiler(compiler);
+    // Constructed here because this is a composition root: `--print-toolchain
+    // -fingerprint` is a one-shot command and the walk it forces is the whole point
+    // of it, so the width is not something a caller further in should be choosing.
+    Cc::ThreadedParallelFor parallel;
     auto const identity = Cc::CachedToolchainFingerprint(
-        ProcessRunner(), ToolchainHost(), compiler, banner, Cc::DriverOf(flavor), /*forceRefresh=*/true);
+        ProcessRunner(), ToolchainHost(), compiler, banner, Cc::DriverOf(flavor), parallel, /*forceRefresh=*/true);
 
     std::cout << identity.fingerprint << '\n';
 
@@ -1511,8 +1516,9 @@ void RecordManifest(Config const& cfg,
     // dispatch-configured path only: it is a cache read in the steady state, but
     // several seconds the first time a machine sees a toolchain, and a build that
     // never dispatches must not pay that at all.
+    Cc::ThreadedParallelFor parallel;
     auto const identity = Cc::CachedToolchainFingerprint(
-        ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor));
+        ProcessRunner(), ToolchainHost(), cmd.compiler, compilerBanner, Cc::DriverOf(cmd.flavor), parallel);
 
     // A digest that does not identify this toolchain is not dispatched with. The
     // outcome either way is a local compile -- a scheduler cannot match a value no
