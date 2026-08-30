@@ -3,8 +3,13 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
+#include <FastCache/Cache/StreamCodec.hpp>
+#include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
@@ -12,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -266,4 +272,144 @@ TEST_CASE("SetCodec round-trips, and its per-member minimum tracks the encoder",
     std::vector<std::string> const none {};
     std::vector<std::string> const one { "" };
     CHECK(SetCodec::Encode(one).size() - SetCodec::Encode(none).size() == SetCodec::MinMemberBytes);
+}
+
+// ---------------------------------------------------------------------------
+// #296: a client's malformed value is not a failing disk.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+/// One engine with the two decorators an operator's dashboard is actually fed from.
+///
+/// `WriteErrorReportingStorage` is what publishes `fastcached_write_errors_total`
+/// and writes the "storage write failed" line, and the metrics sink is what
+/// publishes the counters. Both are here because the whole of #296 is a claim about
+/// what those two SHOW -- asserting the error code alone would leave the operator-
+/// visible half untested, and the operator-visible half is the ticket.
+struct Observed
+{
+    ManualClock clock;
+    InMemoryLruStorage raw;
+    NullLogger logger;
+    WriteErrorReportingStorage storage { raw, logger };
+    AtomicMetricsSink metrics;
+    CacheEngine engine { storage, clock, DefaultSystemWallClock(), &metrics };
+    MemcachedTextHandler text;
+
+    /// Plant `blob` under `key` tagged with `flags`, as an ordinary memcached client.
+    void Plant(std::string_view key, std::uint32_t flags, std::string_view blob)
+    {
+        auto const command = "set " + std::string { key } + " " + std::to_string(flags) + " 0 " + std::to_string(blob.size())
+                             + "\r\n" + std::string { blob } + "\r\n";
+        auto pair = InMemorySocketPair::Create();
+        REQUIRE(SyncRun(WriteString(pair.client.get(), command)));
+        pair.client->ShutdownWrite();
+        SyncRun(text.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
+        pair.server->Close();
+        REQUIRE(SyncRun(ReadAvailable(pair.client.get())) == "STORED\r\n");
+    }
+
+    [[nodiscard]] std::uint64_t Malformed() const
+    {
+        return metrics.Read(IMetricsSink::Counter::CacheMalformedValues);
+    }
+
+    /// What `fastcached_write_errors_total` would export.
+    [[nodiscard]] std::uint64_t WriteErrors() const
+    {
+        return storage.Snapshot().writeErrors;
+    }
+};
+} // namespace
+
+TEST_CASE("(#296) a malformed set from a client is not reported as disk corruption",
+          "[cache][setcodec][security][malformed-value]")
+{
+    // THE TICKET. `SetCodec::Decode` returned `bool` and every caller collapsed it
+    // into `StorageErrorCode::Corrupt` -- documented in this tree as "on-disk record
+    // failed CRC32C verification". So six bytes from an unprivileged client made the
+    // daemon report a failing disk against a store whose every record still verified,
+    // and `Corrupt` is what gets a healthy cache deleted by whoever is on call.
+    //
+    // The blob below is planted the way the reachability case above establishes: an
+    // ordinary memcached `set` choosing the flags word that tags a value as a set.
+    Observed fix;
+    fix.Plant("bad-set", SetCodec::FcTypeSet, SetBlob(/*count=*/4, /*trailing=*/0));
+
+    REQUIRE(fix.Malformed() == 0);
+    REQUIRE(fix.WriteErrors() == 0);
+
+    SECTION("the read path")
+    {
+        auto const members = fix.engine.SetMembers("bad-set");
+        REQUIRE_FALSE(members.has_value());
+
+        // The whole ticket, in one line.
+        CHECK(members.error().code == StorageErrorCode::MalformedValue);
+        CHECK(members.error().code != StorageErrorCode::Corrupt);
+
+        // And it says WHICH claim the bytes did not honour, which `Corrupt` could
+        // not: the code was the entire diagnosis and it was the wrong one.
+        CHECK(members.error().context.contains("set value blob"));
+
+        CHECK(fix.Malformed() == 1);
+    }
+
+    SECTION("the write path, which is the one an operator's dashboard sees")
+    {
+        std::array<std::string, 1> const add { "member" };
+        auto const added = fix.engine.SetAdd("bad-set", add);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error().code == StorageErrorCode::MalformedValue);
+        CHECK(fix.Malformed() == 1);
+
+        // The half that made this priority/high rather than an error-string fix.
+        // `MalformedValue` is not a persistence failure, so it moves neither the
+        // write-error counter nor the "storage write failed" log line. Before #296
+        // this was 1, and an unprivileged client could drive it at will -- the
+        // disk-failure signal, on demand, on a healthy store.
+        CHECK(fix.WriteErrors() == 0);
+    }
+}
+
+TEST_CASE("(#296) a malformed STREAM is the same answer, because it was the same bug",
+          "[cache][streamcodec][security][malformed-value]")
+{
+    // `StreamCodec::Decode` had the identical shape -- `bool` in, `Corrupt` chosen by
+    // the caller -- and is reachable identically, because a stream is also just a
+    // value blob tagged by a flags word a memcached client may choose. A fix that
+    // covered only the set codec would be one somebody would reasonably believe
+    // covered both.
+    Observed fix;
+
+    // Magic and type byte, then nothing: a header that cannot supply the ids the
+    // walk immediately reads.
+    std::string blob;
+    blob.push_back(static_cast<char>(StreamCodec::Magic));
+    blob.push_back(static_cast<char>(StreamCodec::TypeStream));
+    fix.Plant("bad-stream", StreamCodec::FcTypeStream, blob);
+
+    auto const length = fix.engine.StreamLen("bad-stream");
+    REQUIRE_FALSE(length.has_value());
+    CHECK(length.error().code == StorageErrorCode::MalformedValue);
+    CHECK(length.error().context.contains("stream value blob"));
+    CHECK(fix.Malformed() == 1);
+    CHECK(fix.WriteErrors() == 0);
+}
+
+TEST_CASE("(#296) a well-formed value moves neither counter", "[cache][setcodec][malformed-value]")
+{
+    // The control. Without it, a "fix" that reported MalformedValue for everything --
+    // or that counted on every decode -- would pass both cases above, and the counter
+    // an operator is meant to alert on would be noise from the first request.
+    Observed fix;
+    std::vector<std::string> const members { "alpha", "beta" };
+    fix.Plant("good-set", SetCodec::FcTypeSet, AsStringView(SetCodec::Encode(members)));
+
+    auto const read = fix.engine.SetMembers("good-set");
+    REQUIRE(read.has_value());
+    CHECK(*read == members);
+    CHECK(fix.Malformed() == 0);
+    CHECK(fix.WriteErrors() == 0);
 }

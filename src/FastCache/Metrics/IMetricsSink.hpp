@@ -342,6 +342,26 @@ class IMetricsSink
         /// `expired` events for the excess are being lost.
         ExpiryKeysReclaimed,
 
+        /// Stored values that did not decode as the type their flags claim (#296).
+        ///
+        /// **Its own counter because the alternative is a lie or a silence.** These
+        /// used to be reported as `StorageErrorCode::Corrupt`, so a client planting a
+        /// malformed set moved `fastcached_write_errors_total` and wrote a "storage
+        /// write failed" line -- an unprivileged client driving the disk-failure
+        /// signal on a healthy store. Taking the code away without adding this would
+        /// have traded a wrong signal for no signal at all: the operator would then
+        /// see nothing while clients sent nonsense.
+        ///
+        /// Read it as "clients are sending malformed sets or streams", never as a
+        /// statement about the disk -- what says the disk is failing is
+        /// `fastcached_write_errors_total` beside a `Corrupt` in the log, and this
+        /// counter exists precisely so those two never share a line again.
+        ///
+        /// Both the read and the write path count here: a malformed value is found by
+        /// whichever verb decodes it first, and SMEMBERS reaches it as readily as
+        /// SADD.
+        CacheMalformedValues,
+
         Last,
     };
 

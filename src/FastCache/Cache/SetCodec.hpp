@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <span>
 #include <string>
 #include <vector>
@@ -98,14 +100,35 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
 }
 
 /// Decode a set value blob into its sorted member list.
+///
+/// **Returns the error rather than a `bool`, and that is the whole of #296.** A
+/// `bool` cannot carry an outcome with more than two meanings, so every caller chose
+/// one -- and three of them chose `StorageErrorCode::Corrupt`, which this project
+/// documents as "on-disk record failed CRC32C verification". These bytes are a
+/// CLIENT's and the store is healthy, so that told an operator their disk was
+/// failing, on demand, from an unprivileged connection. Handing back a code the
+/// caller cannot pick is what stops the next caller picking again.
+///
+/// It is never `Corrupt` from here, and it could not honestly be: integrity is
+/// verified BELOW this, by `CowTreeStorage`'s CRC32C and by the compression codec,
+/// both of which report `Corrupt` themselves before a byte reaches this function. A
+/// failure here is always "these bytes are not a well-formed set".
+///
 /// @param blob The stored value bytes.
 /// @param out  Receives the decoded members (cleared first).
-/// @return True on a well-formed blob; false if it is truncated/corrupt.
-[[nodiscard]] inline bool Decode(std::span<std::byte const> blob, std::vector<std::string>& out)
+/// @return Nothing on a well-formed blob; `MalformedValue` naming what it refused.
+[[nodiscard]] inline std::expected<void, StorageError> Decode(std::span<std::byte const> blob, std::vector<std::string>& out)
 {
+    /// The refusal, spelled once so every path out carries the same code and a
+    /// reason an operator can act on. `Corrupt` used to erase all four reasons.
+    /// @param why What the bytes did not honour.
+    auto const malformed = [](std::string_view why) {
+        return std::unexpected(MakeMalformedValueError(std::string { "set value blob: " } + std::string { why }));
+    };
+
     out.clear();
     if (blob.size() < HeaderSize || blob[0] != Magic || blob[1] != TypeSet)
-        return false;
+        return malformed("not a set blob (short, or wrong magic/type tag)");
 
     // The count is a CLAIM about bytes this blob must already carry, checked before
     // anything is sized from it. `ByteCursor::ReadCount` is where that check lives now
@@ -121,7 +144,7 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     ByteCursor cursor { blob, TagBytes };
     std::uint32_t count = 0;
     if (!cursor.ReadCount(count, MinMemberBytes))
-        return false;
+        return malformed("member count claims more members than the remaining bytes could hold");
 
     // NOT reserved, and that is deliberate -- but the reason is narrower than "it
     // would be an amplifier", so state it exactly. A blob whose count survives the
@@ -140,10 +163,10 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     {
         std::string member;
         if (!cursor.ReadField(member))
-            return false;
+            return malformed("truncated: a member's length prefix overruns the blob");
         out.push_back(std::move(member));
     }
-    return true;
+    return {};
 }
 
 /// Re-establish the sorted-unique invariant after mutation.

@@ -474,6 +474,13 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - An old store is `UnsupportedFormatVersion`, never `Corrupt` — the code is what
   monitoring sees, and `Corrupt` is what makes somebody delete a healthy cache.
+- `Corrupt` means the BYTES ARE DAMAGED, and nothing a client sends may reach it. A set
+  or a stream is a value blob tagged by a `flags` word the memcached verbs let a client
+  choose, so a planted blob reported disk corruption against a healthy store — the rule
+  above, reachable on demand rather than at a migration. `SetCodec`/`StreamCodec` return
+  `MalformedValue` themselves, so no caller picks; it is not a persistence failure; and
+  `CacheMalformedValues` keeps it visible, because removing a wrong signal without adding
+  a right one is the other way to get this wrong.
 - A format is convertible exactly as long as its reader is in `RecordFormats()`.
   Bumping the version without adding a row is the decision to discard every store.
 - "No marker" is an INFERENCE. Validate every record before writing any of them:

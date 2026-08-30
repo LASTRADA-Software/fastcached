@@ -26,6 +26,36 @@ caller sees, so the distinction cannot live only in the message text. It was
 `Corrupt` once, and `Corrupt` is what tells somebody to `rm -rf` a cache that was
 fine.
 
+**`Corrupt` means the BYTES ARE DAMAGED, and nothing a client can send may reach
+it** (#296). The rule above was written about a rare migration edge; the same code
+was also reachable **on demand, by an unprivileged client**, which is strictly
+worse. A set or a stream is an ordinary value blob distinguished only by its `flags`
+word, and the memcached text verbs let a client choose that word -- so six planted
+bytes read back with SMEMBERS reported disk corruption against a store whose every
+record still verified.
+
+- **A `bool` cannot carry an outcome with more than two meanings.** `SetCodec::Decode`
+  and `StreamCodec::Decode` both returned one, and each of the four callers picked a
+  code; three picked `Corrupt`. The codecs now return
+  `std::expected<void, StorageError>` carrying `MalformedValue` and a reason, so the
+  fifth caller has nothing left to pick. Fixed at the seam, never at the call site
+  that noticed -- a per-caller correction leaves the next caller free to choose again.
+- **`Corrupt` from a codec would be dishonest anyway.** Integrity is verified BELOW
+  them -- `CowTreeStorage`'s CRC32C, and the compression codec -- both of which report
+  `Corrupt` themselves before a byte reaches a value decoder. A failure there is
+  always "these bytes are not a well-formed value of that type".
+- **Taking the code away is half the fix; the other half is that something still
+  counts.** `MalformedValue` is deliberately not a persistence failure, so it no
+  longer moves `fastcached_write_errors_total` nor writes a `storage write failed`
+  warning -- which on its own would trade a wrong signal for **no** signal.
+  `CacheMalformedValues` is the row that keeps "clients are sending nonsense"
+  visible and separate from "this disk is failing".
+- **The regression test has two halves and the second is the one that gets
+  forgotten.** A malformed client value must report `MalformedValue`, AND genuine
+  damage must still report `Corrupt`. Widening the new code until real corruption
+  stops being reported is worse than the original bug, so `CowTreeStorage_test`
+  asserts the damaged-marker case is `Corrupt` *and not* `MalformedValue`.
+
 **The refusal names the remedy.** An operator reading a refusal with no next step
 reaches for deletion. The sentence says the store is intact and names the
 conversion.

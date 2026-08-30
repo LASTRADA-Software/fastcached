@@ -32,8 +32,13 @@ namespace
 
 struct RespFixture
 {
-    FastCache::ManualClock clock;
+    // `storage` FIRST, and that is the analyzer's ordering rather than the reading
+    // one: `InMemoryLruStorage` is cache-line aligned, so anything ahead of it pays
+    // up to 63 bytes of padding -- which went over clang-tidy's budget the moment
+    // `CacheEngine` gained a member (#296). `clock` still precedes `engine`, which
+    // holds a reference to it.
     FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
     FastCache::RedisRespHandler handler;
@@ -1751,8 +1756,9 @@ class RecordingSubscriber: public FastCache::ISubscriber
 
 struct KeyspaceFixture
 {
-    FastCache::ManualClock clock;
+    // Cache-line-aligned member first; see `RespFixture` for why the analyzer cares.
     FastCache::InMemoryLruStorage storage;
+    FastCache::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::PubSubRegistry pubsub;
     // Subscribed to capture published events. Constructed AFTER pubsub so the

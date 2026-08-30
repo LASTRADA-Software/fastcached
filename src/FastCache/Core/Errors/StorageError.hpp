@@ -58,6 +58,49 @@ enum class StorageErrorCode : std::uint8_t
     /// ordinal, so moving an existing enumerator would retroactively change
     /// what those lines appear to say.
     InUse,
+
+    /// A stored value did not decode as the type its flags claim.
+    ///
+    /// **Deliberately not `Corrupt`, and this one is reachable on demand.** A set or
+    /// a stream is an ordinary value blob distinguished only by its `flags` word, and
+    /// the memcached text verbs let any client choose that word -- so a client can
+    /// plant six bytes, tag them as a set, and read them back with SMEMBERS. Reporting
+    /// that as `Corrupt` told an operator their DISK had failed, on a store whose every
+    /// record still verified: the rule `.agent/rules/storage.md` records about an old
+    /// store applies here with more force, because this is an INPUT rather than a rare
+    /// migration edge, and `Corrupt` is what gets a healthy cache deleted.
+    ///
+    /// The remedies are opposite, which is the test for whether two conditions may
+    /// share a code. `Corrupt` means the bytes on disk are damaged and there is
+    /// nothing to recover. This means the bytes are exactly what somebody wrote and
+    /// they are not a well-formed value of that type -- nothing is wrong with the
+    /// store, and the thing to look at is the client.
+    ///
+    /// **A value codec could never honestly report `Corrupt` in the first place**,
+    /// and that is the sentence to keep: integrity is verified BELOW those codecs.
+    /// `CowTreeStorage` checks CRC32C and `Core/Compression` checks its own framing,
+    /// and each returns `Corrupt` itself before a byte reaches a decoder. So by the
+    /// time `SetCodec::Decode` or `StreamCodec::Decode` runs, the bytes are known to
+    /// be the bytes somebody stored -- the only remaining question is whether they
+    /// are a well-formed value, which is this code and nothing else.
+    ///
+    /// It is also **not** a persistence failure, and that omission is load-bearing
+    /// rather than incidental. `Corrupt` IS one, so a malformed set moved
+    /// `fastcached_write_errors_total` and wrote a `storage write failed` warning --
+    /// an unprivileged client driving the disk-failure signal at will, which is the
+    /// mechanism that would actually walk an operator to deleting a healthy cache.
+    /// `WriteErrorReportingStorage::IsPersistenceFailure` therefore leaves this code
+    /// out, deliberately. It has a counter of its own (`CacheMalformedValues`)
+    /// because an absence of signal would be the other way to get this wrong.
+    ///
+    /// Distinct from `WrongType`, which is the neighbouring answer and a different
+    /// question: `WrongType` is "the flags say string and you asked for a set", while
+    /// this is "the flags say set and the bytes are not one".
+    ///
+    /// Appended rather than slotted in beside `Corrupt`, for the reason the two
+    /// enumerators above record: no existing enumerator's value may move, because a log
+    /// line written by an older build carries an ordinal.
+    MalformedValue,
 };
 
 /// Stable name for a StorageErrorCode, suitable for diagnostic logging.
@@ -101,6 +144,8 @@ enum class StorageErrorCode : std::uint8_t
             return "InfiniteOrNaN";
         case StorageErrorCode::UnsupportedFormatVersion:
             return "UnsupportedFormatVersion";
+        case StorageErrorCode::MalformedValue:
+            return "MalformedValue";
     }
     return "Unknown";
 }
@@ -129,6 +174,20 @@ struct StorageError
 [[nodiscard]] inline StorageError MakeStorageError(StorageErrorCode code) noexcept
 {
     return StorageError { .code = code, .systemCode = 0, .context = {} };
+}
+
+/// A value that did not decode as the type its flags claim.
+///
+/// Spelled once, here, rather than at each codec: the whole of #296 was four call
+/// sites each choosing a code for an outcome a `bool` could not carry, and three of
+/// them choosing `Corrupt`. A factory that already knows the code is what stops the
+/// fifth site choosing again.
+/// @param context What failed to decode and why -- shown to an operator, so name the
+///        format and the specific claim the bytes did not honour.
+/// @return A `StorageError` carrying `MalformedValue`.
+[[nodiscard]] inline StorageError MakeMalformedValueError(std::string context) noexcept
+{
+    return StorageError { .code = StorageErrorCode::MalformedValue, .systemCode = 0, .context = std::move(context) };
 }
 
 } // namespace FastCache

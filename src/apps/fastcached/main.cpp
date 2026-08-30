@@ -764,7 +764,13 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     notifyingStorage.SetReclaimLog(&reclaimLog);
     storagePtr = &notifyingStorage;
 
-    FastCache::CacheEngine engine { *storagePtr, clock };
+    // The sink is handed to the engine, not only to the server loop: a value that
+    // will not decode is known at THIS layer and nowhere else -- the storage below
+    // has already verified what it returned, and the protocol above has no single
+    // seam where a storage error becomes a reply. Without it
+    // `fastcache_cache_malformed_values_total` would stay at zero on the one process
+    // that can observe the event (#296).
+    FastCache::CacheEngine engine { *storagePtr, clock, FastCache::DefaultSystemWallClock(), &metrics };
 
     auto const durabilityName = [&] {
         switch (effective.storageDurability)

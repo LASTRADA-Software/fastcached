@@ -1296,6 +1296,13 @@ TEST_CASE("A format marker too short to hold a version is damage, and keeps sayi
     auto const opened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE_FALSE(opened.has_value());
     REQUIRE(opened.error().code == FastCache::StorageErrorCode::Corrupt);
+
+    // And NOT the code #296 introduced. That ticket split "a client sent bytes that
+    // are not a well-formed value" out of `Corrupt`, and the easy way to get it wrong
+    // is to widen the new code until real damage stops reporting as damage -- which
+    // is worse than the bug, because this is the one condition where telling an
+    // operator the store is broken is the correct thing to do.
+    REQUIRE(opened.error().code != FastCache::StorageErrorCode::MalformedValue);
 }
 
 // ============================================================================

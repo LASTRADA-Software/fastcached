@@ -27,10 +27,11 @@ namespace
 
 } // namespace
 
-CacheEngine::CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock) noexcept:
+CacheEngine::CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock, IMetricsSink* metrics) noexcept:
     _storage { storage },
     _clock { clock },
-    _wallClock { wallClock }
+    _wallClock { wallClock },
+    _metrics { metrics }
 {
 }
 
@@ -295,20 +296,42 @@ std::expected<CasToken, StorageError> CacheEngine::Update(
 
 namespace
 {
+    /// Count a value that did not decode as the type its flags claim, and hand the
+    /// codec's own error straight back.
+    ///
+    /// The ONE place this layer turns "these bytes did not decode" into an outcome,
+    /// and therefore the one place it is counted. Until #296 each of the four decode
+    /// sites below chose a code for itself and three chose
+    /// `StorageErrorCode::Corrupt` -- so a client planting a malformed set was
+    /// reported as a failing disk. The codecs now return the code, this records that
+    /// it happened, and no site is left with a choice to get wrong.
+    /// @param metrics Where to count, or null.
+    /// @param error   The codec's error, returned unchanged.
+    /// @return @p error.
+    [[nodiscard]] StorageError CountedMalformed(IMetricsSink* metrics, StorageError error)
+    {
+        if (metrics != nullptr)
+            metrics->Increment(IMetricsSink::Counter::CacheMalformedValues);
+        return error;
+    }
+
     /// Decode the current entry as a set into `members`. Returns WrongType when
     /// the entry exists but is not a set, KeyNotFound when absent (the caller
     /// decides whether absence is an error or an empty set).
+    /// @param engine  The owning engine, for its metrics sink.
     /// @param current The guarded read of the entry.
     /// @param members Receives the decoded members.
-    [[nodiscard]] std::expected<bool, StorageError> LoadSet(GetResult const& current, std::vector<std::string>& members)
+    [[nodiscard]] std::expected<bool, StorageError> LoadSet(CacheEngine const& engine,
+                                                            GetResult const& current,
+                                                            std::vector<std::string>& members)
     {
         members.clear();
         if (!current.found)
             return false; // absent — treat as empty set.
         if (!SetCodec::IsSet(current.entry.flags))
             return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
-        if (!SetCodec::Decode(current.entry.ValueBytes(), members))
-            return std::unexpected(MakeStorageError(StorageErrorCode::Corrupt));
+        if (auto decoded = SetCodec::Decode(current.entry.ValueBytes(), members); !decoded.has_value())
+            return std::unexpected(CountedMalformed(engine.Metrics(), std::move(decoded.error())));
         return true;
     }
 
@@ -327,8 +350,8 @@ namespace
         {
             if (!SetCodec::IsSet(peek->entry.flags))
                 return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
-            if (!SetCodec::Decode(peek->entry.ValueBytes(), members))
-                return std::unexpected(MakeStorageError(StorageErrorCode::Corrupt));
+            if (auto decoded = SetCodec::Decode(peek->entry.ValueBytes(), members); !decoded.has_value())
+                return std::unexpected(CountedMalformed(engine.Metrics(), std::move(decoded.error())));
         }
         return consume(members);
     }
@@ -341,7 +364,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::SetAdd(std::string_view k
     std::int64_t added = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
-        auto const loaded = LoadSet(current, existing);
+        auto const loaded = LoadSet(*this, current, existing);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         // Build a hash-membership view of `existing` so per-member tests are
@@ -379,7 +402,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::SetRemove(std::string_vie
     std::int64_t removed = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
-        auto const loaded = LoadSet(current, existing);
+        auto const loaded = LoadSet(*this, current, existing);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         removed = 0;
@@ -443,7 +466,7 @@ std::expected<std::vector<std::string>, StorageError> CacheEngine::SetPop(std::s
     std::vector<std::string> popped;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
-        auto const loaded = LoadSet(current, existing);
+        auto const loaded = LoadSet(*this, current, existing);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         popped.clear();
@@ -482,15 +505,17 @@ namespace
     /// @param current The guarded read of the entry.
     /// @param stream  Receives the decoded stream.
     /// @return True if a stream was present and decoded; false if absent.
-    [[nodiscard]] std::expected<bool, StorageError> LoadStream(GetResult const& current, Stream& stream)
+    [[nodiscard]] std::expected<bool, StorageError> LoadStream(CacheEngine const& engine,
+                                                               GetResult const& current,
+                                                               Stream& stream)
     {
         stream = Stream {};
         if (!current.found)
             return false;
         if (!StreamCodec::IsStream(current.entry.flags))
             return std::unexpected(MakeStorageError(StorageErrorCode::WrongType));
-        if (!StreamCodec::Decode(current.entry.ValueBytes(), stream))
-            return std::unexpected(MakeStorageError(StorageErrorCode::Corrupt));
+        if (auto decoded = StreamCodec::Decode(current.entry.ValueBytes(), stream); !decoded.has_value())
+            return std::unexpected(CountedMalformed(engine.Metrics(), std::move(decoded.error())));
         return true;
     }
 
@@ -517,8 +542,8 @@ namespace
         if (!StreamCodec::IsStream(peek->entry.flags))
             return Result { std::unexpect, MakeStorageError(StorageErrorCode::WrongType) };
         Stream stream;
-        if (!StreamCodec::Decode(peek->entry.ValueBytes(), stream))
-            return Result { std::unexpect, MakeStorageError(StorageErrorCode::Corrupt) };
+        if (auto decoded = StreamCodec::Decode(peek->entry.ValueBytes(), stream); !decoded.has_value())
+            return Result { std::unexpect, CountedMalformed(engine.Metrics(), std::move(decoded.error())) };
         return consume(&stream);
     }
 
@@ -607,7 +632,7 @@ std::expected<StreamId, StorageError> CacheEngine::StreamAdd(std::string_view ke
     StreamId assigned {};
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         if (!*loaded && noMkStream)
@@ -720,7 +745,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamDelete(std::string_
     std::int64_t removed = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         removed = 0;
@@ -750,7 +775,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamTrimTo(std::string_
     std::int64_t evicted = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         evicted = ApplyTrim(stream, trim);
@@ -771,7 +796,7 @@ std::expected<void, StorageError> CacheEngine::StreamSetId(std::string_view key,
     FC_ZONE_SCOPED_N("CacheEngine::StreamSetId");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         if (!*loaded)
@@ -826,7 +851,7 @@ std::expected<void, StorageError> CacheEngine::StreamGroupCreate(
     FC_ZONE_SCOPED_N("CacheEngine::StreamGroupCreate");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         if (!*loaded && !mkStream)
@@ -853,7 +878,7 @@ std::expected<void, StorageError> CacheEngine::StreamGroupSetId(std::string_view
     FC_ZONE_SCOPED_N("CacheEngine::StreamGroupSetId");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
@@ -873,7 +898,7 @@ std::expected<bool, StorageError> CacheEngine::StreamGroupDestroy(std::string_vi
     bool removed = false;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         // XGROUP DESTROY (like every XGROUP subcommand except CREATE ... MKSTREAM)
@@ -900,7 +925,7 @@ std::expected<bool, StorageError> CacheEngine::StreamConsumerCreate(std::string_
     bool created = false;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
@@ -924,7 +949,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamConsumerDelete(std:
     std::int64_t dropped = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
@@ -955,7 +980,7 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         out.clear();
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         if (!*loaded)
@@ -1028,7 +1053,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamAck(std::string_vie
     std::int64_t acked = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
@@ -1178,7 +1203,7 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         claimed = ClaimResult {};
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
@@ -1252,7 +1277,7 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamAutoCla
         claimed = ClaimResult {};
         claimed.cursor = StreamId::Min();
         Stream stream;
-        auto const loaded = LoadStream(current, stream);
+        auto const loaded = LoadStream(*this, current, stream);
         if (!loaded.has_value())
             return std::unexpected(loaded.error());
         auto* const g = FindGroup(stream, group);
