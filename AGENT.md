@@ -561,6 +561,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
+  script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
+  process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
+  `coverage.sh`'s comments, where nobody looking at a new script would find it.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable
   declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
   boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy

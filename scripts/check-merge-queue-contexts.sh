@@ -131,7 +131,18 @@ EmitJobContexts() {
 
 # ---------------------------------------------------------------------------
 # Every workflow named in the table must listen for the event.
-mapfile -t workflows < <(printf '%s\n' "${RequiredContexts[@]}" | cut -d'|' -f2 | sort -u)
+#
+# A read loop and not `mapfile`: that is bash 4+, and macOS still ships 3.2 as
+# /bin/bash. This script is registered in the DEFAULT ctest set, so it runs on
+# every platform CI builds -- and the constraint is invisible from the Linux box
+# it was written on, where `local-gate.sh` would have run it. `scripts/coverage.sh`
+# carries the same note for the same reason. Still process substitution rather than
+# a pipeline, so a producer whose `grep` matches nothing cannot take the script
+# down under `pipefail`.
+workflows=()
+while IFS= read -r line; do
+    workflows+=("$line")
+done < <(printf '%s\n' "${RequiredContexts[@]}" | cut -d'|' -f2 | sort -u)
 for workflow in "${workflows[@]}"; do
     if [[ ! -f "$workflow" ]]; then
         Fail "$workflow does not exist, but the table says a required context comes from it"

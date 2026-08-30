@@ -12,6 +12,39 @@ determinism rests on.
 
 `scripts/local-gate.sh` is the gate. Run it before pushing.
 
+- **A hygiene script `ctest` runs is constrained to bash 3.2, because macOS ships
+  bash 3.2.** Apple has not shipped bash 4 since the licence change, so `/bin/bash`
+  on the macOS runner is from 2007. A script registered in the **default** ctest
+  set runs on every platform CI builds, and the constraint is invisible from the
+  Linux box such scripts are written on. The bash-4 constructs to avoid are few
+  and worth knowing by name:
+
+  | avoid | use |
+  |---|---|
+  | `mapfile` / `readarray` | `while IFS= read -r x; do a+=("$x"); done < <(...)` |
+  | `declare -A` | parallel arrays, or a `case` |
+  | `${var^^}` / `${var,,}` | `tr '[:lower:]' '[:upper:]'` |
+  | `local -n` | pass the value, or use a global with a stated name |
+
+  Keep the **process substitution** when replacing `mapfile`: a pipeline into the
+  loop reintroduces the `pipefail` trap recorded below, where a `grep` that matches
+  nothing takes the script down.
+
+  This is the section's own subject arriving through a door it did not name.
+  `merge-queue-contexts` used `mapfile`, passed everywhere it was developed, and
+  failed only on `macOS-clang-release` with `mapfile: command not found`. And the
+  constraint was **already known**: `scripts/coverage.sh` carries a comment saying
+  exactly this, in a place only a reader of `coverage.sh` would find it. A lesson
+  recorded where it cannot be reached by the next person who needs it has not been
+  recorded. `scripts/tidy-sweep.sh` uses `mapfile` and `declare -A` and is fine, but
+  only because the `clang-tidy` job pins `ubuntu-24.04` -- so moving that logic into
+  a script `ctest` runs would break it the same way. The same holds for the
+  `mapfile` and `declare -A` inside `pr-labels.yml`.
+
+  It is also a live instance of [#336](https://github.com/LASTRADA-Software/fastcached/issues/336):
+  `local-gate.sh` cannot run in an agent-created Windows worktree, so nothing
+  exercised this before CI did.
+
 - **A local gate cannot see a configuration it does not build, and advice nobody
   runs is not a gate.** `scripts/local-gate.sh` is that advice as a script:
   clang-format at the pinned version, then `clang-debug` and `gcc-release`, refusing
