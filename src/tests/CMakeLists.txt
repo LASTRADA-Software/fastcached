@@ -195,6 +195,35 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Target-file guard hygiene. Fails when a `$<TARGET_FILE:>` names an executable
+# the app table can gate off, without any enclosing condition asking whether
+# that target exists.
+#
+# Such a reference is not a test that gets skipped -- it is a hard error at
+# GENERATE time, so the whole configure fails and the message names CMake rather
+# than the option the operator set. #390: `tls-smoke` was guarded on
+# `FASTCACHED_ENABLE_TLS` and the sccache smokes on `SCCACHE`, so
+# `-DFASTCACHED_BUILD_DAEMON=OFF` could not be configured at all.
+#
+# It ran green for everyone who does not have sccache installed, because the
+# sccache rows are themselves gated on finding the binary. That is why this
+# belongs in CI rather than in a reviewer's head: the tree alone does not say
+# whether the bug is reachable, the developer's machine does.
+#
+# In the default set, for the reason test-name-hygiene gives above: it reads
+# source files and reports.
+add_test(
+    NAME "target-file-guards"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-target-file-guards.cmake"
+)
+set_tests_properties("target-file-guards" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
 # directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
 # is enforced rather than merely asserted.
@@ -934,7 +963,15 @@ endif()
 # client, and asserts a RESP PING is answered +PONG over the encrypted channel
 # — end-to-end coverage of the TlsSocket handshake/pump. A missing runtime
 # prerequisite exits 77 (reported as skipped).
-if(FASTCACHED_ENABLE_TLS)
+#
+# The daemon target is part of the guard, not only the TLS option: a
+# `$<TARGET_FILE:>` naming a target that does not exist is a hard generate
+# error, so `-DFASTCACHED_BUILD_DAEMON=OFF` failed the configure outright
+# instead of skipping this. Every other daemon-starting block here already
+# tests `TARGET fastcached`; these two were the omissions.
+if(NOT TARGET fastcached)
+    message(STATUS "tls-smoke: daemon not built — skipping")
+elseif(FASTCACHED_ENABLE_TLS)
     if(WIN32)
         add_test(
             NAME "tls-smoke"
@@ -962,7 +999,9 @@ if(FASTCACHED_ENABLE_TLS)
     )
 endif()
 
-if(SCCACHE)
+if(NOT TARGET fastcached)
+    message(STATUS "sccache smoke tests: daemon not built — skipping")
+elseif(SCCACHE)
     set(FASTCACHED_SMOKE_PORT "11611" CACHE STRING "TCP port the sccache smoke tests bind fastcached to")
 
     if(WIN32)
