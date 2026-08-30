@@ -1458,10 +1458,24 @@ the pair is indistinguishable again.
     `flock`'d file is legal, and a second process may then create a fresh file at that
     path and lock *that*, giving two live owners of one root.
   - **The lock decides ownership; the record never does.** The claim file carries a
-    versioned diagnostic record, and on a root whose lock we hold an unknown version
-    is stale data to overwrite rather than a refusal — `FleetHistory`'s rule that no
-    state of a file may keep a node from starting. Making the version load-bearing
-    would mean a bump left every root unclaimable and no node able to start.
+    versioned record, and on a root whose lock we hold an unknown version is stale
+    data to overwrite rather than a refusal — `FleetHistory`'s rule that no state of
+    a file may keep a node from starting. Making the version load-bearing would mean
+    a bump left every root unclaimable and no node able to start.
+
+    Calling that record *diagnostics* is earned here rather than asserted, because
+    the rule above says a replayed region is **not** diagnostics but a dependency
+    record. The test is whether anything consumes it: a `/showIncludes` region is
+    handed to a build system as the object's dependencies, while nothing reads this
+    one but a person looking at the directory. Nothing branches on it, so it decides
+    nothing — and the moment something did, it would stop being diagnostics and this
+    bullet would be wrong.
+
+    The `objkey-v6` / `manifest-v6` bump above is not a counter-example either. That
+    version identifies stored VALUES that must not be reused, so it has to be
+    load-bearing; this one labels the format of a note attached to a resource whose
+    ownership the operating system decides. A version is load-bearing exactly when
+    something downstream would otherwise trust bad data.
   - **No unclaimed fallback.** `FilePageStore` opens unguarded when a filesystem
     cannot lock, because refusing would stop a working deployment and a second opener
     is only a possibility. The reverse holds here: an unclaimed root IS the defect and
