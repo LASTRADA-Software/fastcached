@@ -129,6 +129,14 @@ namespace
     class LockFileScratchClaim final: public IScratchClaim
     {
       public:
+        // Spelled out rather than inherited. The destructor releases an OS handle, so
+        // a copy would release it twice -- freeing a root this process is still
+        // compiling into -- and a move would leave a released handle behind.
+        LockFileScratchClaim(LockFileScratchClaim const&) = delete;
+        LockFileScratchClaim(LockFileScratchClaim&&) = delete;
+        LockFileScratchClaim& operator=(LockFileScratchClaim const&) = delete;
+        LockFileScratchClaim& operator=(LockFileScratchClaim&&) = delete;
+
         /// @param root The claimed directory.
         /// @param reclaimed Whether it held a dead owner's leftovers.
         /// @param handle The OS handle carrying the claim.

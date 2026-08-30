@@ -331,6 +331,50 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                       round.registrars.size());
 }
 
+/// Claim this worker's private scratch root, or say why the node must not start.
+///
+/// A function rather than a block inside `WorkerBody` because it is a startup
+/// decision with its own vocabulary -- and because `WorkerBody` is already at the
+/// cognitive-complexity ceiling the build enforces, which is the honest reason a
+/// reader deserves rather than a silenced warning.
+///
+/// @param servesCompiles Whether this node runs a worker tier at all.
+/// @param base Where the candidate roots live.
+/// @param logger Where the outcome is announced.
+/// @return The held claim; a NULL claim when there is no worker tier and none is
+///         needed; or nothing at all when the node must refuse to start.
+[[nodiscard]] std::optional<std::unique_ptr<Node::IScratchClaim>> ClaimWorkerScratchRoot(bool servesCompiles,
+                                                                                         std::filesystem::path const& base,
+                                                                                         ILogger& logger)
+{
+    if (!servesCompiles)
+        return std::unique_ptr<Node::IScratchClaim> {};
+
+    auto const claimant = Node::MakeLockFileScratchClaimant();
+    auto claimed = claimant->Claim(base, Node::DefaultMaxScratchRoots);
+    if (!claimed.has_value())
+    {
+        // Named, and never a fallback to an unclaimed root. Carrying on without the
+        // claim would reintroduce #279 on exactly the machines least able to
+        // diagnose it, and would do so while every test passed.
+        auto const& row = Node::DescribeScratchClaimRefusal(claimed.error());
+        logger.Logf(LogLevel::Error, "{}: {}; refusing to start", row.name, row.remedy);
+        return std::nullopt;
+    }
+
+    auto claim = std::move(*claimed);
+    if (claim->Reclaimed())
+        // A root whose lock was free but whose contents were not: its owner died
+        // without running its cleanup. The COUNTER for it is raised by the caller,
+        // where the metrics sink exists -- the claim has to happen before that
+        // because the job runner takes the root at construction.
+        logger.Logf(LogLevel::Warn,
+                    "reclaimed the scratch root {} from a node that exited without cleaning up",
+                    claim->Root().string());
+    logger.Logf(LogLevel::Info, "scratch root {} claimed exclusively", claim->Root().string());
+    return claim;
+}
+
 /// Serve until asked to stop.
 ///
 /// Everything `main` does once it has decided this process is going to BE a
@@ -435,32 +479,11 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // happens before `CompileJobRunner::Run` touches any path at all.
     auto const servesCompiles = !toolchains.empty();
     auto const scratchBase = std::filesystem::temp_directory_path() / "fastcache-compile-node";
-    auto const scratchClaimant = Node::MakeLockFileScratchClaimant();
-    std::unique_ptr<Node::IScratchClaim> scratchClaim;
-    if (servesCompiles)
-    {
-        auto claimed = scratchClaimant->Claim(scratchBase, Node::DefaultMaxScratchRoots);
-        if (!claimed.has_value())
-        {
-            // Named, and never a fallback to an unclaimed root. Carrying on without
-            // the claim would reintroduce #279 on exactly the machines least able to
-            // diagnose it, and would do so while every test passed.
-            auto const& row = Node::DescribeScratchClaimRefusal(claimed.error());
-            logger.Logf(LogLevel::Error, "{}: {}; refusing to start", row.name, row.remedy);
-            return ExitUsage;
-        }
-        scratchClaim = std::move(*claimed);
-        if (scratchClaim->Reclaimed())
-            // A root whose lock was free but whose contents were not: its owner died
-            // without running its cleanup. The COUNTER for it is raised below, where
-            // the metrics sink exists -- the claim has to happen up here because the
-            // job runner takes the root at construction.
-            logger.Logf(LogLevel::Warn,
-                        "reclaimed the scratch root {} from a node that exited without cleaning up",
-                        scratchClaim->Root().string());
-        logger.Logf(LogLevel::Info, "scratch root {} claimed exclusively", scratchClaim->Root().string());
-    }
-    auto const scratch = servesCompiles ? scratchClaim->Root() : scratchBase;
+    auto scratchClaimOrRefusal = ClaimWorkerScratchRoot(servesCompiles, scratchBase, logger);
+    if (!scratchClaimOrRefusal.has_value())
+        return ExitUsage;
+    auto const scratchClaim = std::move(*scratchClaimOrRefusal);
+    auto const scratch = scratchClaim ? scratchClaim->Root() : scratchBase;
     // Projected to what the runner needs, by a lambda rather than in place, because
     // the re-survey below builds the identical map from a different set of
     // toolchains -- and a projection written twice is one that drifts.

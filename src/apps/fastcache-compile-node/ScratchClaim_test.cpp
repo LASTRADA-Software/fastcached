@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileJob.hpp"
 #include "ScratchClaim.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <memory>
 #include <ranges>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -263,5 +267,128 @@ TEST_CASE("The seam lets a caller rehearse a live owner and a dead one", "[node]
         auto refused = claimant.Claim(base.Path(), DefaultMaxScratchRoots);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error() == ScratchClaimRefusal::Unavailable);
+    }
+}
+
+namespace
+{
+/// A process runner that echoes each invocation's own SOURCE back as its object,
+/// and does not return until both jobs are inside it at once.
+///
+/// Both halves are the test. The echo makes "this job got the other's bytes"
+/// visible, where a canned object would look identical either way; the barrier
+/// makes the overlap a fact rather than a hope. Without it one job finishes before
+/// the other starts, nothing is contended, and the case passes having tested
+/// nothing -- which is how the defect survived in the first place.
+class OverlappingEchoRunner final: public FastCache::Cc::IProcessRunner
+{
+  public:
+    static constexpr std::size_t Overlap = 2;
+
+    FastCache::Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    FastCache::Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        std::string source;
+        std::string object;
+        for (auto const& arg: argv)
+        {
+            if (arg.starts_with("-o") && arg.size() > 2)
+                object = arg.substr(2);
+            else if (arg.ends_with(".cpp"))
+                source = arg;
+        }
+
+        {
+            auto guard = std::unique_lock { _mutex };
+            ++_inside;
+            _changed.notify_all();
+            // Bounded, and it says what it waited for: the other job reaching the
+            // compiler. Unbounded here would hang the suite rather than fail it.
+            (void) _changed.wait_for(guard, std::chrono::seconds { 5 }, [this] { return _inside >= Overlap; });
+        }
+
+        std::ifstream in { source, std::ios::binary | std::ios::ate };
+        auto const size = in.tellg();
+        std::string text;
+        if (size > 0)
+        {
+            text.resize(static_cast<std::size_t>(size));
+            in.seekg(0, std::ios::beg);
+            in.read(text.data(), size);
+        }
+        std::ofstream { object, std::ios::binary } << text;
+        return FastCache::Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+  private:
+    std::mutex _mutex;
+    std::condition_variable _changed;
+    std::size_t _inside { 0 };
+};
+} // namespace
+
+TEST_CASE("Two nodes compiling at once, each on its own claimed root, keep their own objects", "[node][scratch-claim]")
+{
+    // #279's acceptance criterion at unit level, wired the way `main` wires it: a
+    // claim per node, and the job runner handed the root that claim covers.
+    //
+    // The two runners are two node PROCESSES: each has its own job counter starting
+    // at 1, so both derive `job-1` beneath their own root. Before the claim those
+    // roots were the same directory and this collided every time -- deterministically,
+    // because there is no lost update to lose. It is the claim, not the numbering,
+    // that separates them.
+    ScratchDirectory base { "fc-scratchclaim-compile" };
+
+    auto const claimantA = MakeLockFileScratchClaimant();
+    auto const claimantB = MakeLockFileScratchClaimant();
+    auto rootA = claimantA->Claim(base.Path(), DefaultMaxScratchRoots);
+    auto rootB = claimantB->Claim(base.Path(), DefaultMaxScratchRoots);
+    REQUIRE(rootA.has_value());
+    REQUIRE(rootB.has_value());
+    REQUIRE((*rootA)->Root() != (*rootB)->Root());
+
+    OverlappingEchoRunner runner;
+    FastCache::Cc::CompileJobRunner first { runner, (*rootA)->Root(), { { "gcc-13", "/opt/real/g++" } } };
+    FastCache::Cc::CompileJobRunner second { runner, (*rootB)->Root(), { { "gcc-13", "/opt/real/g++" } } };
+    std::array<FastCache::Cc::CompileJobRunner*, OverlappingEchoRunner::Overlap> const runners { &first, &second };
+
+    // Same source NAME, different source TEXT: two machines compiling their own
+    // `main.cpp` against one host.
+    std::array<std::string, OverlappingEchoRunner::Overlap> const texts { "int a = 1;", "long b = 2;" };
+
+    auto const asText = [](std::vector<std::byte> const& bytes) {
+        std::string out;
+        out.reserve(bytes.size());
+        for (auto const byte: bytes)
+            out.push_back(static_cast<char>(byte));
+        return out;
+    };
+
+    std::array<std::expected<FastCache::Cc::CompileOutcome, FastCache::Cc::JobError>, OverlappingEchoRunner::Overlap>
+        results {};
+    std::latch start { static_cast<std::ptrdiff_t>(OverlappingEchoRunner::Overlap) };
+    {
+        std::vector<std::jthread> threads;
+        for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+            threads.emplace_back([&, index] {
+                auto job = FastCache::Cc::CompileJob {
+                    .fingerprint = "gcc-13", .args = { "-O2" }, .preprocessed = texts.at(index), .sourceName = "a.cpp"
+                };
+                start.arrive_and_wait();
+                // No Catch2 macro on this thread: the assertion macros are not
+                // thread-safe, so the answer is carried back and checked below.
+                results.at(index) = runners.at(index)->Run(job);
+            });
+    } // joined
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+    {
+        INFO("node " << index);
+        REQUIRE(results.at(index).has_value());
+        REQUIRE(asText(results.at(index)->object) == texts.at(index));
     }
 }
