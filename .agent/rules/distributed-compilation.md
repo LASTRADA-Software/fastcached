@@ -1085,15 +1085,18 @@ Six more about what the tier IS and who gets to see it:
 
   Three columns carry what the openers cannot: **protocol** (discovery is UDP and the
   other five are TCP, so a worksheet without it yields five correct firewall rules and
-  one wrong one), **`HostOrigin`** (a constant a bare port falls *back* to, a flag of
-  its own for `--bind`, or a *fixed* host -- discovery's, whose `--discovery` address
-  is where beacons are SENT while its sockets always bind the wildcard), and a
-  free-form **note** for what a column cannot say.
+  one wrong one), **`defaultHost`** (the host a bare port falls *back* to -- empty for
+  the compile port, whose host is `--bind`, a flag of its own), and a free-form
+  **note** for what a column cannot say.
 
   There is deliberately **no `presence` column**: `resolve` already answers it, and a
   column restating it was wrong for raft, whose address an operator can name while
-  `--node-id` is what actually binds it. And no `explicitBit`: that is `OptionSpec`'s,
-  and copying it here would create the fifth place while removing it.
+  `--node-id` is what actually binds it. No `explicitBit`: that is `OptionSpec`'s, and
+  copying it here would create the fifth place while removing it. And **no
+  `HostOrigin`** naming which mechanism supplied the host -- it documented rather than
+  drove, and what it tried to record is enforced by code instead: discovery's sockets
+  bind the wildcard whatever `--discovery` says because its *resolver* says so, never
+  because a label described it.
 
   `--print-surfaces` renders the **resolved** configuration, never the defaults --
   a worksheet claiming `127.0.0.1` for a node started with `--listen-cache 0.0.0.0:6674`

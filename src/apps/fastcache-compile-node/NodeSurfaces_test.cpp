@@ -271,6 +271,38 @@ TEST_CASE("A surface that is off is named, with what would turn it on", "[node][
     // the documentation: its flags describe nothing under socket activation, which is
     // the one way this list can be wrong about a port it does print.
     CHECK(sheet.contains(".socket"));
+
+    // The PRIMARY flag alone, never every flag the row carries. Discovery is the row
+    // where that matters: `--discovery-reply-port` is optional, and printing it beside
+    // `--discovery` reads as two flags an operator must set to hear a beacon at all.
+    CHECK(sheet.contains("not served; set --discovery\n"));
+}
+
+TEST_CASE("A surface that is configured and still off is not answered 'set the flag'", "[node][surfaces]")
+{
+    // The two ways a row goes unserved that are NOT "you did not ask for it", and the
+    // two an operator actually meets -- because `--print-surfaces` runs before
+    // `StartupPolicyRejection`, deliberately, so the map is available exactly while a
+    // port is still wrong. Told to "set --listen-raft", somebody who had just written
+    // it goes looking at the flag rather than at `--node-id`.
+    NodeConfig raft;
+    raft.raftListen = "6680";
+
+    auto const waiting = RenderSurfaces(raft);
+    CHECK_FALSE(waiting.contains("set --listen-raft"));
+    CHECK(waiting.contains("see the raft note below"));
+    // And the note it points at is the one that names the switch.
+    CHECK(RowFor(NodeSurface::Raft).note.contains("--node-id"));
+
+    // A malformed value is echoed in the shape the row advertises -- the same sentence
+    // `StartupPolicyRejection` produces from the same columns a moment later, rather
+    // than an instruction to set a flag that is already set.
+    NodeConfig typo;
+    typo.cacheListen = "not-a-port";
+
+    auto const wrong = RenderSurfaces(typo);
+    CHECK(wrong.contains("--listen-cache=not-a-port is not [<address>:]<port>"));
+    CHECK_FALSE(wrong.contains("set --listen-cache"));
 }
 
 TEST_CASE("The compile port's note says what its flags stop describing", "[node][surfaces]")

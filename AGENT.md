@@ -233,7 +233,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   the `NodeSurface` — not a listen spec, a default host and a name. The port map lived
   in five places plus the docs; the guard is the type system, since there is no
   argument to pass a bare string to. Protocol is a column (discovery is the only UDP
-  surface), so is which mechanism supplies the host. `--print-surfaces` prints the
+  surface), so is the host a bare port falls back to. `--print-surfaces` prints the
   RESOLVED configuration. `--advertise` is not a surface — it is told, not opened.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.

@@ -232,9 +232,10 @@ void InstallNodeStopHandlers()
 ///
 /// Through the surface's row, like every other port this node opens. It is the one
 /// whose host is a FLAG rather than a fallback a bare port takes -- `--bind` and
-/// `--port` are separate values of separate types -- which the row records as
-/// `HostOrigin::OperatorFlag`, so what an operator's firewall worksheet shows for this
-/// surface is what this binds.
+/// `--port` are separate values of separate types -- which is why its row carries an
+/// empty `defaultHost` and a resolver reading those two fields instead of a spec, and
+/// why what an operator's firewall worksheet shows for this surface is what this
+/// binds.
 /// @param cfg What the operator asked for.
 /// @return The bound listener, or why it could not be served.
 [[nodiscard]] std::expected<std::unique_ptr<BlockingListener>, std::string> BindCompilePort(NodeConfig const& cfg)

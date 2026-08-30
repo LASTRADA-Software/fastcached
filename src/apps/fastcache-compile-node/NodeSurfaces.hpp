@@ -235,7 +235,7 @@ struct SurfaceRow
 
 /// The single endpoint @p surface would bind, or why it would bind none.
 ///
-/// For the four surfaces served by exactly one socket, which is every one but
+/// For the five surfaces served by exactly one socket, which is every one but
 /// discovery. Written once because it was written four times: each opener resolved
 /// the row, refused an empty result and took `front()`, and the three refusals said
 /// three different things about one condition -- so an operator met a different

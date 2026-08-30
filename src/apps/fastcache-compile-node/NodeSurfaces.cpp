@@ -33,10 +33,10 @@ namespace
 
     /// Whether text names an address a beacon can be sent to.
     ///
-    /// `ParseDialEndpoint`'s question, asked through `ParseDialEndpoint`: a host
-    /// somebody wrote, plus a port. It was spelled out here, which made a fourth
-    /// author of a predicate whose own header says the three refusals it encodes have
-    /// each already cost a bug.
+    /// Exactly `ParseDialEndpoint`'s question, so it is asked through it: a host
+    /// somebody wrote, plus a port. It used to be spelled out here, which made a
+    /// fourth author of a predicate whose own header says the three refusals it
+    /// encodes have each already cost a bug.
     /// @param text What the operator typed.
     /// @return True when it is `<address>:<port>`.
     [[nodiscard]] bool ParsesAsBeaconAddress(std::string_view text)
@@ -131,9 +131,21 @@ namespace
             .defaultHost = CacheListenDefaultHost,
             .spec = &NodeConfig::cacheListen,
             .grammar = ListenEndpointGrammar,
-            .resolve = ResolveFromSpec,
+            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
+                // A port with nothing behind it is not a served surface. `--cache-memory 0`
+                // with no `--cache-dir` leaves the tier nothing to keep objects in, so
+                // `StartCacheTierOrExplain` returns before binding -- and a worksheet that
+                // listed the port anyway would have an operator open their build output to
+                // the network for a socket that is never created. The same shape as raft's
+                // `--node-id` gate: a surface can be configured and still not served.
+                if (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty())
+                    return {};
+                return ResolveFromSpec(row, cfg);
+            },
             .note = "loopback for a bare port, the opposite of the scheduler and raft: this machine's whole "
-                    "build output is served here, so widening it is a decision rather than a typo",
+                    "build output is served here, so widening it is a decision rather than a typo. Not served "
+                    "at all without somewhere to keep objects -- --cache-memory 0 and no --cache-dir is a node "
+                    "that compiles for others and caches nothing",
         },
         SurfaceRow {
             .surface = NodeSurface::Scheduler,
@@ -250,6 +262,41 @@ namespace
                                                  || (row.spec != nullptr && !row.defaultHost.empty());
                                       }),
                   "a row resolving from its spec needs a spec and a default host");
+
+    /// Why a surface resolved to nothing, in words an operator can act on.
+    ///
+    /// Three answers rather than one, because "set the flags this row names" is only
+    /// the first of them and it is *wrong* for the other two. A row's flags are what
+    /// would turn the surface on, so printing them unconditionally told an operator
+    /// who wrote `--listen-raft=6680` -- and got no port, because `--node-id` is what
+    /// switches consensus on -- to set the flag they had just set. The same line met
+    /// somebody whose address was malformed, which is a state `--print-surfaces` is
+    /// deliberately reachable in: it runs BEFORE `StartupPolicyRejection`, precisely
+    /// so the map is available while a port is still wrong, and "set --listen-cache"
+    /// then describes the wrong problem in the one situation the flag exists for.
+    ///
+    /// Only the PRIMARY flag is named for a surface that is off, never every flag the
+    /// row carries: `--discovery-reply-port` is optional, and listing it beside
+    /// `--discovery` reads as two flags that are both required.
+    /// @param row The surface that resolved to no endpoint.
+    /// @param cfg What the operator asked for.
+    /// @return What to print in that line's trailing column.
+    [[nodiscard]] std::string WhyNotServed(SurfaceRow const& row, NodeConfig const& cfg)
+    {
+        if (row.spec == nullptr || (cfg.*row.spec).empty())
+            return std::format("not served; set {}", PrimaryFlag(row));
+
+        if (!row.grammar.parses(cfg.*row.spec))
+            // Echoed, and in the shape the row itself advertises -- the same sentence
+            // `StartupPolicyRejection` will produce a moment later for a node that is
+            // actually starting, rather than a second author of it.
+            return std::format("not served; {}={} is not {}", PrimaryFlag(row), cfg.*row.spec, row.grammar.shape);
+
+        // Configured, well-formed, and still nothing bound -- today that is raft
+        // waiting on `--node-id`. Why is not uniform enough to be a column, so the
+        // row's own note carries it and this points at it rather than guessing.
+        return row.note.empty() ? std::string { "not served" } : std::format("not served; see the {} note below", row.name);
+    }
 } // namespace
 
 std::array<SurfaceRow, EnumeratorCount<NodeSurface>> const& NodeSurfaceTable() noexcept
@@ -298,7 +345,7 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     {
         std::string label;   ///< The surface, plus its endpoint's role when it has one.
         std::string address; ///< `host:port`, or `-` when the surface is not served.
-        std::string trailer; ///< The protocol, or what would turn the surface on.
+        std::string trailer; ///< The protocol, or why the surface is not served.
     };
     std::vector<Line> lines;
 
@@ -309,13 +356,10 @@ std::string RenderSurfaces(NodeConfig const& cfg)
         {
             // Named rather than omitted. A surface missing from the list reads as one
             // this build does not have, and an operator cannot tell that from one they
-            // did not turn on -- so the flags that would turn it on are given.
-            auto const flags = FlagsOf(row);
-            std::string names;
-            for (auto const& flag: flags)
-                names += (names.empty() ? "" : " ") + std::string { flag };
-            lines.push_back(Line {
-                .label = std::string { row.name }, .address = "-", .trailer = std::format("not served; set {}", names) });
+            // did not turn on -- so the line says why, which is `WhyNotServed`'s to
+            // answer because "set the flag" is only right for one of the three ways a
+            // surface goes unserved.
+            lines.push_back(Line { .label = std::string { row.name }, .address = "-", .trailer = WhyNotServed(row, cfg) });
             continue;
         }
 
