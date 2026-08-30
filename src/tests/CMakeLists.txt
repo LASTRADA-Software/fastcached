@@ -284,6 +284,35 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# The scope gate fails safe. Fails when a job gated on `scripts/ci-scope.sh`
+# would be SKIPPED, rather than run, if the classifier itself failed.
+#
+# `ci-scope.sh` states at length that every way of not knowing escalates to
+# `code=true`, because "we could not tell what changed" must never read as
+# "nothing did". The workflow reading it inverted that one level up: sixteen jobs
+# were gated `== 'true'`, so a `changes` job that FAILED published no output, the
+# comparison was false, the jobs were skipped -- and a skipped required context is
+# read by the ruleset as PASSING. A green, mergeable pull request that nothing had
+# compiled.
+#
+# Sixteen hand-edits with nothing asserting them is how that comes back. Both
+# rules are derived from the workflow rather than tabulated, so the SEVENTEENTH
+# job cannot be added wrong; `release` needs `changes` too and is excluded by
+# construction, because it never reads the classifier's output.
+#
+# `if(NOT WIN32)` for the reason `ci-scope` carries the same guard.
+if(NOT WIN32)
+    add_test(
+        NAME "gated-jobs-fail-safe"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh"
+    )
+    set_tests_properties("gated-jobs-fail-safe" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and

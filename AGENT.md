@@ -632,6 +632,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.
   So never let a dependency's failure skip a required gate — the skip reads green. `if: ${{ !cancelled() }}`, and
   check for real. Not `always()`, which runs even while the run is being cancelled.
+- A workflow must not invert its own script's principle one level up: `ci-scope.sh` escalates every way of not
+  knowing to build-everything, and the workflow read it as `== 'true'` — so a FAILED `changes` published no
+  output, sixteen jobs skipped, and the skips read green. `!= 'false'` everywhere, plus `!cancelled()` on every
+  job that consults it. The matrix trap had been the only thing saving this (a skipped matrix job hangs rather
+  than passing); it is no longer load-bearing, so do not reintroduce a job-level `if:` on `linux`/`windows`
+  believing it will catch you. `ctest -R gated-jobs-fail-safe` asserts both rules, derived not tabulated.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
