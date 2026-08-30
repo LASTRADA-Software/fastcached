@@ -161,6 +161,32 @@ here"*, which is not the same question as *"can I bind here"* — and the gap be
 the two is exactly where a smoke test fails for a reason that has nothing to do
 with what it tests.
 
+## A reproduction models the wiring as it is
+
+**A fix at a different layer invalidates the reproduction that found the bug — and
+the failing test is the signal, not the nuisance.**
+
+#279's reproduction ran two `CompileJobRunner`s over one scratch root, which is what
+two node processes were: each has its own job counter starting at 1, so both derived
+`job-1` and everything beneath it. It failed deterministically, which is exactly what
+was wanted from it.
+
+The fix claims the root a layer **above**, in the node. `CompileJobRunner` still does
+not isolate anything — hand it a shared root and it still collides, because its
+*caller* isolates and it does not. So the moment the fix landed, the reproduction
+asserted a property the class does not have and never will, and could only ever fail.
+
+The tempting response to a test that fails after a correct fix is to weaken the test.
+The right one is to ask **which layer now carries the property**, and move the case
+there: the same scenario now sits beside `ScratchClaim`, wired the way `main` wires
+it — a claim per node, each runner handed the root its own claim covers, the same
+barrier holding both inside the compiler at once. It still fails without the claim,
+for the original reason.
+
+A reproduction is therefore a statement about a *design*, not only about a defect.
+When the design moves, the reproduction moves with it or it is deleted — never
+relaxed until it passes.
+
 ## What `cluster-e2e` covers
 
 `cluster-e2e` is the consensus counterpart, and what it covers is deliberately
