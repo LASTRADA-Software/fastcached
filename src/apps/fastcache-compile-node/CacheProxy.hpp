@@ -31,6 +31,13 @@ namespace FastCache::Node
 /// belong to `SchedulerProtocol` and `Compile` to `WorkerProtocol`; each refuses
 /// the others with `DispatchNotPermitted`, as a reply rather than a close, so a
 /// client that reached the wrong port learns which.
+///
+/// `Auth` is the exception, and refusing it correctly is a **wire contract**: it
+/// is answered with `UnknownOpcode`, because that is the one refusal
+/// `Cc::CacheProtocol` reads as "this endpoint implements no credential" and
+/// proceeds past. Any other code makes the launcher treat the exchange as fatal
+/// and miss every subsequent compile in silence. See `RefusedVerbs` in the
+/// implementation for why that is a table row rather than a comment.
 class CacheProxy
 {
   public:

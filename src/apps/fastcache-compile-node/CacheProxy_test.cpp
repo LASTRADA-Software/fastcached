@@ -179,6 +179,34 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
 }
 
+TEST_CASE("A node refuses AUTH with the one code the launcher steps over", "[node][cacheproxy]")
+{
+    // A wire contract between two binaries that do not link each other. The only
+    // thing they share is the enumerator this test and `Cc::CacheProtocol`'s
+    // "unsupported AUTH is stepped over" case both name, which is what keeps them
+    // from drifting apart.
+    //
+    // `Cc::CacheProtocol` tolerates exactly one refusal for a verb an endpoint does
+    // not implement -- `UnknownOpcode` -- and on it proceeds unauthenticated, which
+    // is right against a tier that has no credential to check. Answered with
+    // anything else the launcher treats the exchange as a hard error, and then every
+    // compile for the life of the process is a miss reported as `rejected`.
+    //
+    // So the code is not cosmetic and it is not "more accurate as
+    // `DispatchNotPermitted`": with that code, every `FASTCACHE_TOKEN`-configured
+    // launcher pointed at a node had a permanent 0% hit rate, presenting exactly as
+    // a cache that is merely cold. This asserts the value, not the category.
+    Fixture fix;
+
+    auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(auth))) == Wire::ErrorCode::UnknownOpcode);
+
+    // And an empty username, which is how a bare `FASTCACHE_TOKEN` with no user
+    // reaches the wire, takes the same answer.
+    auto const tokenOnly = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(tokenOnly))) == Wire::ErrorCode::UnknownOpcode);
+}
+
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[node][cacheproxy]")
 {
     Fixture fix;
