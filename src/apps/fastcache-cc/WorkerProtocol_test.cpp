@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -469,6 +470,46 @@ TEST_CASE("A source in an undecodable codec is refused, not compiled as garbage"
     // honest processes packaged differently. An operator reading a rise here goes to
     // the build of the two binaries, not to the network and not to the firewall.
     CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::UnsupportedCodec }));
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+}
+
+TEST_CASE("A payload that does not expand to its declared size is refused as corrupt", "[worker-protocol]")
+{
+    // The fourth envelope refusal, and the only one of them that implicates the
+    // TRANSPORT: framing this build parsed, a codec it has, and bytes that then
+    // failed to expand. It was the one reason with no case of its own -- the table
+    // proved its row is distinct and nothing proved the worker ever reaches it, so
+    // "answered `malformed-frame`, counted as corrupt" was a claim rather than an
+    // assertion.
+    //
+    // Needs a codec that actually decompresses: a build with compression configured
+    // out reaches `Corrupt` on no path at all, because Identity's length
+    // disagreement is `Malformed` and is covered above.
+    auto const codecs = AvailableCodecs();
+    if (codecs.size() < 2)
+        SKIP("this build offers no codec but Identity");
+
+    Fixture fix;
+
+    // Well inside the ceiling, so `DeclaredTooLarge` cannot answer first, and not a
+    // valid frame for any codec, so the decompressor is what refuses it. Most
+    // preferred first, so `front()` is never Identity here.
+    std::array<std::byte, 16> const garbage { std::byte { 0x7F } };
+    auto const rotten = Wire::EncodeCodecEnvelope(codecs.front(), 64, garbage);
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = rotten,
+                                                                  .acceptedCodecs = { Wire::IdentityCodec },
+                                                                  .sourceName = "a.cpp" });
+    auto const answer = fix.worker.Answer(frame);
+    REQUIRE(answer.has_value());
+
+    // The same wire code a malformed envelope gets -- all the peer can act on either
+    // way -- and a counter of its own, because an operator seeing this rise is
+    // looking at the link rather than at a version skew.
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::MalformedFrame);
+    CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::Corrupt }));
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
 }
 
