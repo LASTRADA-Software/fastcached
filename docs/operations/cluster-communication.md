@@ -525,14 +525,19 @@ exchange and the key.
 
 ## Who a node admits
 
-Every one of a node's three surfaces — the scheduler, the compile port and the
-cache tier — asks the same question of a caller, and the answer comes from two
-independent lists. A host on **either** is admitted:
+**Two** of a node's three surfaces — the scheduler and the compile port — ask
+membership of a caller, and the answer comes from two independent lists. A host on
+**either** is admitted:
 
 | List | Set by | Answers |
 |---|---|---|
-| What the operator listed | `--fleet-member`, repeatable | Who may spend this node's CPU and read its cache tier |
+| What the operator listed | `--fleet-member`, repeatable | Who may spend this node's CPU |
 | What the cluster agreed | consensus, on every committed membership change | Who is in the cluster |
+
+The **cache tier is not one of them** and asks a different question entirely —
+"is this caller on this machine" — which neither list can answer and neither is
+consulted for. That is
+[#287](https://github.com/LASTRADA-Software/fastcached/issues/287), below.
 
 They are separate because they answer different questions. Cluster members are
 **peers**; the machines that spend a fleet's capacity are mostly not — a
@@ -570,6 +575,20 @@ questions are:
 - **`--listen-cache`** — where it *answers*, defaulting to `127.0.0.1:6674`
   because that is where `fastcache-cc` already looks. Loopback by default: this
   tier holds the machine's own build output.
+
+    It is served to **this machine and to nothing else**, always
+    ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). Not to
+    `--fleet-member` hosts and not to cluster members, both of which used to be
+    admitted here: a peer that may spend this machine's CPU is not thereby entitled
+    to read everything it has ever compiled. The rule belongs to the **verb**, so
+    widening the bind does not widen who is served, and every off-box `FETCH` is
+    refused `not-a-member` and counted in
+    `fastcache_node_cache_requests_refused_not_local_total`.
+
+    A cache several machines share is `--upstream` pointed at a `fastcached`. That
+    one is shared infrastructure somebody operates and serves non-members on
+    purpose; a node's tier is a developer's private one, and the two are different
+    things that happen to speak one protocol.
 - **`--upstream`** — the shared `fastcached` it *reads through to*, if any. May be
   empty, which is an ordinary configuration rather than a broken one.
 

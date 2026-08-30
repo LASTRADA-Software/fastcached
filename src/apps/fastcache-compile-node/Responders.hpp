@@ -6,6 +6,8 @@
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 
 namespace FastCache::Node
 {
@@ -73,26 +75,41 @@ class SchedulerResponder final: public IFrameResponder
     Distributed::IMembershipOracle const& _membership;
 };
 
-/// Serves this node's own cache tier to clients on this machine.
+/// Serves this node's own cache tier to clients on this machine, and to nobody else.
 ///
-/// **Local callers and cluster members only.** The bind already answers most of it
-/// -- this surface is loopback by default -- but a bind is not a policy: an operator
-/// who widens it to share the tier with their peers would otherwise be sharing it
-/// with everybody who can route to the port, and the objects in it are this
-/// machine's whole build output.
+/// **This machine only, always** (#287). Not "this machine and the members an
+/// operator listed", which is what it was until the locality rule landed, and not
+/// "whatever the bind lets through".
 ///
-/// This is deliberately *stricter* than `fastcached`'s own cache, which serves
-/// non-members on purpose. That one is shared infrastructure somebody operates; this
-/// is a developer's private tier, and the two are different things that happen to
-/// speak one protocol.
+/// The bind is not the policy and never was. A tier reachable only over loopback is
+/// closed by accident rather than by decision, and the accident evaporates the moment
+/// somebody widens `--listen-cache` -- or, once the cache, scheduler and compile
+/// surfaces share one wildcard listener, the moment they stop being separately
+/// bindable at all. Making locality a property of the **verb** is what survives that
+/// merge; "it is only bound to loopback" does not.
+///
+/// Membership is *not* consulted here, and its absence is the fix. A
+/// `--fleet-member` names a machine that may spend this node's CPU and be leased its
+/// slots; it does not name a machine that may read this node's whole build output,
+/// which is what a cache tier is. Those were one list answering two questions, and
+/// the second answer was wrong: a peer could `FETCH` every object this machine had
+/// ever compiled. The compile surface still asks membership, because "may you run a
+/// job here" is the question membership is actually about.
+///
+/// Deliberately *stricter* than `fastcached`'s own cache, which serves non-members on
+/// purpose. That one is shared infrastructure somebody operates; this is a
+/// developer's private tier, and the two are different things that happen to speak
+/// one protocol.
 class CacheResponder final: public IFrameResponder
 {
   public:
     /// @param proxy Answers each request; must outlive this.
-    /// @param membership Decides who may read this machine's tier; must outlive this.
-    CacheResponder(CacheProxy& proxy, Distributed::IMembershipOracle const& membership) noexcept:
+    /// @param locality Decides whether a caller is on this machine; must outlive this.
+    /// @param metrics Where a refusal is counted.
+    CacheResponder(CacheProxy& proxy, ILocalityOracle const& locality, IMetricsSink& metrics) noexcept:
         _proxy { proxy },
-        _membership { membership }
+        _locality { locality },
+        _metrics { metrics }
     {
     }
 
@@ -103,11 +120,21 @@ class CacheResponder final: public IFrameResponder
         // refusal from a dead host retries forever and reports a flaky network, which
         // is the failure the declared frame length exists to make avoidable.
         //
-        // Answered before any suspension, deliberately: a stranger must not be able
-        // to make this node dial its upstream.
-        if (_membership.Classify(peer) != Distributed::Membership::Member)
+        // Answered before any suspension, deliberately: a caller that is not on this
+        // machine must not be able to make this node dial its upstream.
+        //
+        // `NotAMember` rather than a code of its own, and that is a decision about
+        // the client rather than about the wording. `fastcache-cc` reads a FETCH
+        // outcome as "is this daemon worth a second command", steps over the refusal
+        // and compiles; a new code would be an unknown one to every launcher already
+        // deployed, and an unknown refusal is the one shape that has cost this tree a
+        // permanent 0% hit rate before. The sentence carries what changed.
+        if (!_locality.IsThisMachine(peer))
+        {
+            _metrics.Increment(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
             co_return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
-                                                         "this node serves its cache to its own machine and its cluster");
+                                                         "this node serves its cache to its own machine only");
+        }
         co_return co_await _proxy.Answer(frame);
     }
 
@@ -152,7 +179,8 @@ class CacheResponder final: public IFrameResponder
 
   private:
     CacheProxy& _proxy;
-    Distributed::IMembershipOracle const& _membership;
+    ILocalityOracle const& _locality;
+    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Node

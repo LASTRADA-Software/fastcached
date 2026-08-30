@@ -148,21 +148,21 @@ namespace
 
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
-                     Distributed::IMembershipOracle const& membership,
+                     ILocalityOracle const& locality,
                      IClock& clock,
                      IMetricsSink& metrics):
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
     _cache { *_storage, *_upstream, clock, metrics },
     _proxy { _cache },
-    _responder { _proxy, membership }
+    _responder { _proxy, locality, metrics }
 {
 }
 
 std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
                                                                         NodeConfig const& cfg,
                                                                         std::unique_ptr<IStorage> storage,
-                                                                        Distributed::IMembershipOracle const& membership,
+                                                                        ILocalityOracle const& locality,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)
@@ -190,7 +190,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
                                                     UpstreamIoTimeout);
 
     auto tier =
-        std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), membership, clock, metrics } };
+        std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };
 
     // Loopback for a bare port, the OPPOSITE of the scheduler's wildcard, and why is
     // on `CacheListenDefaultHost`. Named rather than spelled here so that whatever
@@ -266,13 +266,12 @@ Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const
     return out;
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
-    NodeIoLoop& io,
-    NodeConfig const& cfg,
-    Distributed::IMembershipOracle const& membership,
-    IClock& clock,
-    IMetricsSink& metrics,
-    ILogger& logger)
+std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
+                                                                               NodeConfig const& cfg,
+                                                                               ILocalityOracle const& locality,
+                                                                               IClock& clock,
+                                                                               IMetricsSink& metrics,
+                                                                               ILogger& logger)
 {
     // Emptied deliberately. A node that only compiles for others wants no cache port
     // at all, and saying so must not be an error.
@@ -319,7 +318,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
     if (!storage.has_value())
         return std::unexpected { std::format("--cache-dir {}", storage.error()) };
 
-    auto started = CacheTier::Start(io, cfg, std::move(*storage), membership, clock, metrics, logger);
+    auto started = CacheTier::Start(io, cfg, std::move(*storage), locality, clock, metrics, logger);
     if (started.has_value())
         return std::move(*started);
 

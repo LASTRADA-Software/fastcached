@@ -85,6 +85,7 @@ target_sources(FastCache
         Platform/HostLoad.cpp
         Platform/HostMemory.cpp
         Platform/InheritedListener.cpp
+        Platform/LocalAddresses.cpp
         Platform/NarrowText.cpp
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp

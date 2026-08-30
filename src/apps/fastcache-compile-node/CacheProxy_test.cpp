@@ -6,8 +6,11 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -225,36 +228,119 @@ TEST_CASE("An unknown opcode is stepped over, not fatal", "[node][cacheproxy]")
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnknownOpcode);
 }
 
-TEST_CASE("The node's cache answers this machine and refuses a stranger", "[node][cache][membership]")
+TEST_CASE("The node's cache answers this machine and refuses every other one", "[node][cache][cache-locality]")
 {
-    // The bind already answers most of this -- the cache surface is loopback by
-    // default -- but a bind is not a policy. An operator who widens it to share the
-    // tier with their peers would otherwise be sharing this machine's entire build
-    // output with everybody who can route to the port.
+    // #287. This surface serves THIS MACHINE, always -- not "this machine and the
+    // members an operator listed", and not "whatever the bind lets through".
     //
-    // Deliberately stricter than `fastcached`'s own cache, which serves non-members
-    // on purpose: that one is shared infrastructure somebody operates, this is a
-    // developer's private tier, and the two are different things that happen to speak
-    // one protocol.
+    // Making locality a property of the verb is what survives the surfaces being
+    // merged onto one wildcard listener: after that, "it is only bound to loopback"
+    // stops being available as an argument, and a rule that depended on it would
+    // quietly stop being a rule.
     Fixture fixture;
-    Distributed::ClusterMembership membership { { "10.0.0.1:7000" } };
-    CacheResponder responder { fixture.proxy, membership };
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7", "fe80::1" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder responder { fixture.proxy, locality, fixture.metrics };
 
     auto const fetch = Wire::EncodeFetch("some-key");
+    auto const ask = [&](std::string peer) {
+        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, std::move(peer))));
+    };
 
-    // A stranger is refused as a *reply*, never by closing: a client that cannot tell
-    // a policy refusal from a dead host retries forever and reports a flaky network.
-    auto const refused = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "10.9.9.9")));
-    REQUIRE(refused.has_value());
-    CHECK(Unwrap(refused).status == Wire::Status::Error);
+    SECTION("over loopback, which is every ordinary fastcache-cc on this box")
+    {
+        // A miss, since nothing is stored: the request reached the tier and was
+        // answered on its merits, which is what "served" looks like here.
+        auto const reply = ask("127.0.0.1");
+        REQUIRE(reply.has_value());
+        CHECK(Unwrap(reply).status == Wire::Status::Miss);
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 0);
+    }
 
-    // This machine gets the cache's own answer -- a miss, since nothing is stored.
-    auto const local = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "127.0.0.1")));
-    REQUIRE(local.has_value());
-    CHECK(Unwrap(local).status == Wire::Status::Miss);
+    SECTION("over this machine's own routable address, on a widened bind")
+    {
+        // Loopback is not the whole of "this machine". A client on this host
+        // dialling the node at the address the node advertises is still local, and
+        // refusing it would break the deployment this tightening is supposed to
+        // leave alone.
+        auto const reply = ask("10.0.0.7");
+        REQUIRE(reply.has_value());
+        CHECK(Unwrap(reply).status == Wire::Status::Miss);
+    }
 
-    // And so does a listed peer, which is what makes widening the bind usable at all.
-    auto const peer = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "10.0.0.1")));
-    REQUIRE(peer.has_value());
-    CHECK(Unwrap(peer).status == Wire::Status::Miss);
+    SECTION("over the IPv4-mapped spelling of that same address")
+    {
+        // A surface bound to `::` reports an IPv4 caller as `::ffff:10.0.0.7` while
+        // the machine's interface list says `10.0.0.7`. A raw string compare would
+        // refuse this machine's own clients on exactly the dual-stack bind this rule
+        // was written for -- the failure #180 already paid for once on the member
+        // list.
+        auto const reply = ask("::ffff:10.0.0.7");
+        REQUIRE(reply.has_value());
+        CHECK(Unwrap(reply).status == Wire::Status::Miss);
+    }
+
+    SECTION("and refuses a machine that is not this one")
+    {
+        // Refused as a *reply*, never by closing: a client that cannot tell a policy
+        // refusal from a dead host retries forever and reports a flaky network.
+        auto const reply = ask("10.9.9.9");
+        REQUIRE(reply.has_value());
+        CHECK(Unwrap(reply).status == Wire::Status::Error);
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
+    }
+
+    SECTION("and refuses a peer it cannot name at all")
+    {
+        // What `FormatPeerAddress` answers for a family it does not know or a
+        // `getpeername` that failed. Two unanswerable questions are not a match, and
+        // an empty entry in the address set must not become a wildcard.
+        auto const reply = ask("");
+        REQUIRE(reply.has_value());
+        CHECK(Unwrap(reply).status == Wire::Status::Error);
+    }
+}
+
+TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or not",
+          "[node][cache][membership][cache-locality]")
+{
+    // THE HOLE THIS CLOSED. `CacheResponder` used to gate on `Membership::Member`,
+    // and a Member is any machine the operator listed -- so a peer on ANOTHER host
+    // read this machine's entire build output. The docs promised exactly that
+    // ("its own machine and its cluster"), which is why #287 is a deliberate
+    // tightening rather than a bug fix, and why it shipped as a breaking change.
+    //
+    // The peer here is ADMITTED by the member list, and that is the whole point of
+    // the fixture: a case whose caller was refused for some OTHER reason would pass
+    // under the bug and prove nothing about locality.
+    Fixture fixture;
+    Distributed::ClusterMembership const membership { { "10.0.0.1:7000" } };
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder responder { fixture.proxy, locality, fixture.metrics };
+
+    // Stated first, so a later change to the membership vocabulary cannot turn this
+    // case green by quietly reclassifying the peer: it IS a member, and it is
+    // refused anyway.
+    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+
+    // And it is not this machine, by either of the two properties that could make
+    // it one.
+    REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
+    REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
+
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), "10.0.0.1"));
+    auto const header = Wire::DecodeReplyHeader(refused);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).status == Wire::Status::Error);
+
+    // `NotAMember` rather than a code of its own: `fastcache-cc` reads a FETCH
+    // outcome as "is this daemon worth a second command" and steps over this one, so
+    // a peer whose access was withdrawn compiles locally rather than failing. A new
+    // code would be an unknown one to every launcher already deployed.
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
+
+    // And it is countable. The tightening withdrew access a fleet peer had, so an
+    // operator whose peers stopped getting hits needs one number that says why.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
 }

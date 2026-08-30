@@ -4,9 +4,10 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -45,7 +46,13 @@ struct Fixture
     ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
+
+    /// A machine with no addresses of its own, which is not a limitation here: the
+    /// tier is dialled over loopback, and loopback is answered before the set is
+    /// consulted at all. Cases about WHO is admitted live in `CacheProxy_test`,
+    /// where the peer address is an argument rather than whatever the kernel says.
+    Testing::ScriptedHostAddresses hostAddresses;
+    CachedLocalityOracle locality { hostAddresses, clock };
     NodeIoLoop io;
 
     /// A config bound to a port found at run time, so cases never collide.
@@ -76,7 +83,7 @@ struct Fixture
     /// @return The tier, a null tier meaning "carry on without one", or the reason.
     [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeConfig const& cfg)
     {
-        return StartCacheTierOrExplain(io, cfg, membership, clock, metrics, logger);
+        return StartCacheTierOrExplain(io, cfg, locality, clock, metrics, logger);
     }
 };
 

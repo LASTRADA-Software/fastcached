@@ -219,6 +219,57 @@ Consequences that are each load-bearing:
   read it as an ordinary refusal until #237. Serving the endpoint is half a rule; the
   half that makes it work is below, under *a refusal that names somewhere else*.
   Three roles rather than a `bool`, for exactly that third state.
+- **A node's cache tier serves THIS MACHINE, always — locality is a property of the
+  VERB, never of the bind and never of a member list** (#287). `CacheResponder` used
+  to admit `Membership::Member`, and a Member is any machine the operator listed, so
+  a fleet peer could `FETCH` every object this machine had ever compiled. The docs
+  promised exactly that ("its own machine and its cluster"), which is why the fix is
+  a breaking change rather than a bug fix.
+  - **The two lists were one list answering two questions.** `--fleet-member` names a
+    machine that may spend this node's **CPU** and be leased its slots. The cache
+    tier is this machine's entire **build output**. Contributing capacity does not
+    make another host entitled to read it, and there is no configuration in which it
+    should — so the responder does not take an `IMembershipOracle` at all. Its
+    absence is the fix; a flag it consulted would be a flag somebody could set wrong.
+  - **"It is only bound to loopback" is not a policy and stops being available at
+    all.** The default bind closes this by accident, and the accident evaporates the
+    moment `--listen-cache` is widened — or, once cache, scheduler and compile share
+    one wildcard listener (#290), the moment there is no per-surface bind left to
+    reason about. A rule on the verb survives that merge; a rule on the bind does not.
+    This ticket is that merge's hard prerequisite for exactly that reason.
+  - **The question is ambient, so it arrives through a seam with a clock**:
+    `Platform/ILocalityOracle`, over `IHostAddressSource` (`getifaddrs` /
+    `GetAdaptersAddresses`). Not a syscall in the responder — a security decision
+    nothing can substitute for is one no test can present a non-local caller to.
+  - **Fast by construction before it is fast by cache.** `IsLoopbackHost` is asked
+    first and takes no lock, so essentially every real caller — the surface binds
+    loopback — never touches the address set, and the cache bounds only the rare
+    path. Loopback is NOT the whole answer, though: a local client dialling this node
+    at its own routable address on a widened bind is still this machine.
+  - **Refreshed on an INTERVAL, never on a miss.** A miss-triggered refresh hands a
+    remote peer a free amplifier: one probe per request, just by asking, and
+    `GetAdaptersAddresses` measured **2.04 ms** against `getifaddrs`' **0.0086 ms** —
+    238×, so a design that is free on Linux dominates a request on Windows. Nothing
+    about the *answers* distinguishes the two designs, so the test counts probes.
+  - **Both staleness directions are named in the header, because one of them alone is
+    how a longer interval gets talked into being fine.** An address just GAINED is
+    refused for at most one interval — fails closed, self-heals, costs one local
+    compile. An address just LOST stays admitted for at most one interval, which
+    needs a DHCP reassignment racing the refresh to exploit. Neither is a wrong
+    answer served confidently, which is the line the project's caching rule draws.
+  - **Folded with `SameHost`, never compared raw.** A surface bound to `::` reports
+    an IPv4 caller as `::ffff:10.0.0.7` while the interface list says `10.0.0.7`, so
+    a raw compare refuses this machine's own clients on exactly the dual-stack bind
+    the rule was written for — the failure #180 already paid for once on the member
+    list. It also refuses an unnameable peer against an empty entry, which a raw
+    compare admitted.
+  - **`NotAMember`, not a code of its own.** `fastcache-cc` reads a FETCH outcome as
+    "is this daemon worth a second command" and steps over this one, so a peer whose
+    access was withdrawn compiles locally. A new code would be an unknown one to
+    every launcher already deployed, and an unknown refusal is what cost this tree a
+    permanent 0% hit rate before. `NodeCacheRequestsRefusedNotLocal` carries the
+    operator's half: the tightening removed access somebody had, and a peer whose hit
+    rate fell needs one number that says why.
 - **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
   writes objects exactly as before — the cache is a separate service this class
   cannot reach — and is refused only the fleet's CPU time, which is the thing

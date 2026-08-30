@@ -230,16 +230,22 @@ refuses every caller, which is the right default and not a working configuration
 so it is refused at startup rather than left to be discovered as a fleet that
 silently distributes nothing.
 
-Membership gates **all three** of a node's surfaces — its scheduler, its compile
-port, and its own cache tier — and this machine is always a member of its own
-fleet whatever the list says. What it does not gate is the shared `fastcached`: a
-non-member reads and writes objects there exactly as before, because that is
-infrastructure somebody operates while a node's tier is a developer's own build
-output. What membership pays for on a node is CPU time.
+Membership gates **two** of a node's surfaces — its scheduler and its compile port
+— and this machine is always a member of its own fleet whatever the list says.
+What membership pays for on a node is CPU time, and those two are where it is
+spent.
 
-Because it gates all three, **every node needs one of the two flags, not only the
-scheduler.** A worker without one admits its own machine and refuses the network,
-which is the right default for a developer's laptop and cannot receive a
+It does not gate the node's own **cache tier**, which serves this machine and
+nothing else however either list reads
+([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)): that tier is
+a developer's whole build output, and contributing capacity does not entitle
+another machine to read it. Nor does it gate the shared `fastcached`, where a
+non-member reads and writes objects exactly as before — that one is infrastructure
+somebody operates, and it is what a cache several machines share looks like.
+
+Because it gates the compile port, **every node needs one of the two flags, not
+only the scheduler.** A worker without one admits its own machine and refuses the
+network, which is the right default for a developer's laptop and cannot receive a
 dispatched compile.
 
 ### The workers
@@ -651,14 +657,20 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
 
 **Two things protect a fleet: who a node admits, and whether the job was granted.**
 
-A node is closed by default: its compile port, its scheduler and its own cache tier
-all admit **this machine and `--fleet-member` peers only** (or every caller, once
-you say `--fleet-open`). Once a cluster exists, the agreed member set is **added** to
-that list rather than replacing it, and all three surfaces follow the union — so a
-host stops being admitted only when the operator stops listing it. That matters most
-for the compile port, which binds `0.0.0.0` because peers have to dial it — anybody
-who could route to it would otherwise have your machine run their compiler on source
-they chose.
+A node is closed by default. Its compile port and its scheduler admit **this machine
+and `--fleet-member` peers only** (or every caller, once you say `--fleet-open`);
+once a cluster exists the agreed member set is **added** to that list rather than
+replacing it, and both surfaces follow the union — so a host stops being admitted
+only when the operator stops listing it. That matters most for the compile port,
+which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
+would otherwise have your machine run their compiler on source they chose.
+
+Its **own cache tier admits this machine and nothing else**, whatever those lists
+say and whatever it is bound to
+([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). A peer that
+may spend this machine's CPU is not thereby entitled to read everything it has ever
+compiled, and the tier is exactly that. A cache several machines share is a
+`fastcached` behind `--upstream`.
 
 Membership alone was never enough, because *admitted to the fleet* is not *granted
 this compile*: an admitted machine could spend any worker's CPU without ever asking

@@ -64,8 +64,9 @@ src/FastCache/
                 HostMemory, HostInfo, ServiceControl (ServiceSpec), Terminal,
                 InheritedListener (systemd socket activation),
                 Environment (the one place the environment is read), FileTrust,
-                NarrowText (what a `char` is on this host, and reading text
-                something else wrote)
+                LocalAddresses (which addresses are THIS machine's, behind an
+                interval-refreshed oracle), NarrowText (what a `char` is on this
+                host, and reading text something else wrote)
   Config/       Config, CliParser + CliOptions (the one flag table), ByteSize,
                 YamlReader, ConfigReloader, EnvExpand, DefaultConfigPath
   Metrics/      IMetricsSink + AtomicMetricsSink, MetricsCatalog (the counter
@@ -296,6 +297,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   already let this one in. The fix is a credential, as discovery's `(node, endpoint)` MAC is.
 - `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided
   from it. It carries no port; a peer dials from an ephemeral one.
+- A node's cache tier serves **this machine**, always: locality is a property of the
+  VERB, never of the bind and never of a member list. `--fleet-member` names who may
+  spend this machine's CPU; the tier is its entire build output, and a peer read every
+  object it had ever compiled. `CacheResponder` therefore takes no membership oracle —
+  its absence IS the fix. The question is ambient, so it arrives through
+  `Platform/ILocalityOracle`: `IsLoopbackHost` first and lock-free, then an address set
+  refreshed on an INTERVAL — a miss-triggered refresh is one 2 ms `GetAdaptersAddresses`
+  per request that any stranger can bill this machine for. Folded with `SameHost`, or a
+  `::`-bound surface refuses its own clients.
 - Cluster membership is one ROUTE to admission, never the whole policy. `--fleet-member`
   admits *clients* — laptops, CI runners — which never join consensus, so what the
   cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`

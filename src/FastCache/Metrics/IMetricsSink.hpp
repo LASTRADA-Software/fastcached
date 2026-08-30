@@ -314,6 +314,18 @@ class IMetricsSink
         NodeCacheUpstreamStores,
         NodeCacheUpstreamStoreFailures,
 
+        /// Cache requests refused because the caller is not on this machine (#287).
+        ///
+        /// The node's tier is this machine's entire build output, so it is served to
+        /// this machine and to nothing else -- a rule of the **verb**, independent of
+        /// what the surface is bound to and of any member list. Counted because the
+        /// tightening withdrew access a fleet peer used to have: an operator whose
+        /// peers stopped getting hits needs one number that says so, and without it
+        /// the only evidence is a client-side hit rate that fell for no visible
+        /// reason. On a loopback bind it stays at zero forever, which is the answer
+        /// to "is this happening to me".
+        NodeCacheRequestsRefusedNotLocal,
+
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those
         /// keys were never published.
