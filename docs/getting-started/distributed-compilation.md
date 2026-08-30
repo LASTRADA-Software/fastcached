@@ -167,6 +167,27 @@ translation unit, so it would stop rebuilding when those headers change.
 A dispatched compile is then shaped to look exactly like a local one, so the
 STORE, the manifest and the statistics all take one path.
 
+### 6. And the client checks that the reply belongs to its request
+
+Every step above is upstream of the reply. The cache key covers the inputs, the
+fingerprint covers the toolchain, the lease covers the authorization — and none of
+them says anything about whether *this* object answers *this* job. So the worker
+digests what it actually compiled and sends that digest back, and the client
+recomputes it from what it asked for and **refuses** a reply that does not match,
+before the object is even decompressed.
+
+Getting that wrong in the other direction is the worst failure this system has: a
+crossed reply accepted as an answer is a wrong object under a correct key, which
+succeeds, gets stored, and is then served to every other machine that fetches that
+key. There is nothing else in the pipeline that would notice. The refusal is
+therefore a refusal — the translation unit is compiled locally and the launcher
+prints a line naming the worker, whether or not `FASTCACHE_VERBOSE` is set.
+
+It is integrity against **accident** — a connection reused wrongly, a scratch
+collision, a worker answering out of order — not against a hostile worker: the
+digest is unkeyed, so a worker that can return a wrong object can return a wrong
+digest as well.
+
 ---
 
 ## Setting it up

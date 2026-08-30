@@ -1417,3 +1417,181 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     CHECK(Wire::AsStringView(Unwrap(result).correlation)
           == CompileCorrelation(Source, std::span<std::string const> {}, "gcc-13", "a.cpp"));
 }
+
+namespace
+{
+
+/// Produces the reply to one whole framed request.
+///
+/// The seam that lets a scripted socket answer with something COMPUTED rather than
+/// canned, which is the whole point of the case below: a worker's reply depends on
+/// the request, so a fixture that replays fixed bytes cannot show the two ends
+/// agreeing about anything.
+class IFrameResponder
+{
+  public:
+    IFrameResponder() = default;
+    virtual ~IFrameResponder() = default;
+    IFrameResponder(IFrameResponder const&) = delete;
+    IFrameResponder& operator=(IFrameResponder const&) = delete;
+    IFrameResponder(IFrameResponder&&) = delete;
+    IFrameResponder& operator=(IFrameResponder&&) = delete;
+
+    /// @param request One complete request frame, exactly as it was written.
+    /// @return The reply frame.
+    [[nodiscard]] virtual std::vector<std::byte> Answer(std::span<std::byte const> request) = 0;
+};
+
+/// A socket that collects what is written to it and answers through a responder.
+///
+/// The reply is produced on the first READ, by which point the whole request has
+/// been written -- so nothing here has to know where a frame ends, and the framing
+/// stays entirely under test rather than being reimplemented by the fixture.
+class AnsweringPeer final: public ISocket
+{
+  public:
+    /// @param responder Turns the written request into a reply; must outlive this.
+    explicit AnsweringPeer(IFrameResponder& responder):
+        _responder { responder }
+    {
+    }
+
+    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    {
+        _request.insert(_request.end(), bytes.begin(), bytes.end());
+        return IoAwaitable { IoResult { bytes.size() } };
+    }
+
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    {
+        std::size_t written = 0;
+        for (auto const& segment: segments)
+        {
+            _request.insert(_request.end(), segment.begin(), segment.end());
+            written += segment.size();
+        }
+        return IoAwaitable { IoResult { written } };
+    }
+
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    {
+        if (!_answered)
+        {
+            _reply = _responder.Answer(_request);
+            _answered = true;
+        }
+        // A read of zero is EOF, which is how a peer that has said everything it has
+        // to say tells `RecvExactly` the frame is over.
+        auto const take = std::min(_reply.size() - _cursor, buffer.size());
+        std::copy_n(_reply.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
+        _cursor += take;
+        return IoAwaitable { IoResult { take } };
+    }
+
+    void Close() noexcept override {}
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return false;
+    }
+    [[nodiscard]] std::string PeerAddress() const override
+    {
+        return "answering";
+    }
+
+  private:
+    IFrameResponder& _responder;
+    std::vector<std::byte> _request;
+    std::vector<std::byte> _reply;
+    std::size_t _cursor { 0 };
+    bool _answered { false };
+};
+
+constexpr std::string_view SchedulerEndpoint = "sched:6675";
+constexpr std::string_view WorkerEndpoint = "worker:6676";
+
+/// A fleet of two: a minimal scheduler, and a REAL `WorkerProtocol` as the worker.
+///
+/// Everything between the client and the compiler is production code here -- the
+/// request encoding, the codec envelope, the argument list's framing, the source
+/// name, the worker's decode, the runner, and the reply's encoding. That is what
+/// this fixture is for: a correlation is one value computed twice at two ends, and
+/// the failure it must rule out is the two ends DISAGREEING. Both halves tested
+/// separately against the same helper agree by construction and prove nothing.
+class LiveFleet final: public IEndpointExchange, public IFrameResponder
+{
+  public:
+    /// @param worker The worker every COMPILE is handed to; must outlive this.
+    explicit LiveFleet(WorkerProtocol& worker):
+        _worker { worker }
+    {
+    }
+
+    CacheOutcome Exchange(std::string_view hostPort,
+                          std::vector<std::byte> frame,
+                          Credential const& credential,
+                          ExchangeBudget /*budget*/) override
+    {
+        _current = std::string { hostPort };
+        AnsweringPeer peer { *this };
+        return SyncRun(ExchangeFramed(&peer, std::move(frame), credential));
+    }
+
+    [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> request) override
+    {
+        if (_current == WorkerEndpoint)
+            return _worker.Answer(request).value_or(std::vector<std::byte> {});
+
+        auto const header = Wire::DecodeRequestHeader(request);
+        if (!header.has_value())
+            return {};
+        auto const* const descriptor = Wire::FindOp(header->opRaw);
+        if (descriptor != nullptr && descriptor->code == Wire::Op::Lease)
+            return Wire::EncodeReply(Wire::Status::Ok,
+                                     Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = WorkerEndpoint,
+                                                                               .leaseToken = "l1",
+                                                                               .workerCodecs = { Wire::IdentityCodec } }));
+        // The RELEASE, which `Dispatch` sends on every path out of a compile and
+        // whose answer it deliberately ignores.
+        return Wire::EncodeReply(Wire::Status::Ok, {});
+    }
+
+  private:
+    WorkerProtocol& _worker;
+    std::string _current;
+};
+
+} // namespace
+
+TEST_CASE("A worker's reply is accepted by the client that asked for it", "[worker-protocol][correlation]")
+{
+    // The two ends meeting, end to end and in one process. The client encodes the
+    // request, a real worker decodes it, compiles it and digests what it compiled,
+    // and the client recomputes that digest from what it asked for.
+    //
+    // **This is the case that would catch the two ends disagreeing**, which is the
+    // failure a correlation can fail with and no half-fixture can see: the worker
+    // digests `job.args` as DECODED from the wire and the source name as SENT, while
+    // the client digests what it holds. Anything that changes on the way -- an
+    // argument list encoding that drops an empty element, a source name reduced to
+    // its base name at one end only -- makes every honest compile refuse, which is a
+    // fleet that silently stops distributing rather than a fleet that mis-serves.
+    // Hence the deliberately awkward arguments and the path-shaped source name.
+    Fixture fixture { { Wire::IdentityCodec } };
+    LiveFleet fleet { fixture.worker };
+
+    std::vector<std::string> const args { "", "-O2", "-DMSG=hello world" };
+    auto const request = DispatchRequest { .schedulerEndpoint = SchedulerEndpoint,
+                                           .fingerprint = "gcc-13",
+                                           .objectKey = "objkey",
+                                           .args = args,
+                                           .preprocessed = "int main(){return 0;}",
+                                           .sourceName = "/home/dev/checkout/src/Widget.cpp" };
+
+    auto const result = Dispatch(fleet, request);
+
+    INFO("dispatch said: " << result.detail);
+    REQUIRE(result.status == DispatchStatus::Compiled);
+    CHECK(result.exitCode == 0);
+    CHECK_FALSE(result.object.empty());
+}

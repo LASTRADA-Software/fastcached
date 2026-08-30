@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
+#include <algorithm>
 #include <format>
 #include <ranges>
+#include <string>
 #include <utility>
 
 namespace FastCache::Cc
@@ -27,6 +30,30 @@ namespace
     {
         auto const slash = path.find_last_of("/\\");
         return slash == std::string_view::npos ? path : path.substr(slash + 1);
+    }
+
+    /// How to name the correlation a worker sent back, in a message an operator reads.
+    ///
+    /// **The peer's bytes are never echoed unless they are a correlation.** Text a
+    /// worker sent is text, and a mismatching reply is by definition one this client
+    /// has no reason to trust: quoting it raw is how a terminal escape sequence
+    /// reaches an operator's screen from a machine that just proved it is misbehaving.
+    /// A correlation is exactly `KeyDigest::HexLength` lowercase hex characters, so
+    /// anything else is described by its shape instead. The two cases an operator
+    /// actually meets read differently and that is the point: an empty field means a
+    /// peer that never filled one in, a digest means two honest ends that disagree.
+    /// @param claimed The reply's correlation field.
+    /// @return The digest itself when it is one, otherwise a description of what
+    ///         arrived instead.
+    [[nodiscard]] std::string DescribeCorrelation(std::span<std::byte const> claimed)
+    {
+        auto const text = Wire::AsStringView(claimed);
+        auto const isDigest =
+            text.size() == KeyDigest::HexLength
+            && std::ranges::all_of(text, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+        if (isDigest)
+            return std::string { text };
+        return text.empty() ? std::string { "none" } : std::format("{} bytes that are not a correlation", text.size());
     }
 
     /// Build a `DispatchResult` that carries only a reason.
@@ -100,6 +127,11 @@ namespace
     [[nodiscard]] DispatchResult CompileOnWorker(IEndpointExchange& exchange, LeasedJob const& job)
     {
         auto const argsField = EncodeArgs(job.request.args);
+        // Derived ONCE and used for both the request and the correlation below. The
+        // worker digests the name it was SENT, so a client that sent one spelling and
+        // verified another would refuse every honest reply -- and two `BaseName` calls
+        // beside each other is exactly how that comes about.
+        auto const sourceName = BaseName(job.request.sourceName);
         // Compressed against the WORKER's codecs, which the grant relayed -- not
         // against this client's. The two need not agree, and guessing wrong would
         // only be discovered after the whole preprocessed payload had crossed the
@@ -113,7 +145,7 @@ namespace
                                                                        .args = argsField,
                                                                        .source = sourceField,
                                                                        .acceptedCodecs = job.accepted,
-                                                                       .sourceName = BaseName(job.request.sourceName) });
+                                                                       .sourceName = sourceName });
         auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
             // Unreachable, broken mid-reply, or out of budget. The three are one
@@ -131,6 +163,29 @@ namespace
         auto const result = Wire::DecodeCompileResult(compileOutcome.value);
         if (!result.has_value())
             return Refused(DispatchStatus::Unavailable, "malformed compile result");
+
+        // --- is this a reply to THIS request? ---------------------------------
+        //
+        // Asked before the object is expanded, and before any of it is looked at, so
+        // a reply about somebody else's compile costs this client a comparison and
+        // never a decompression.
+        //
+        // Recomputed from what this client ASKED FOR, against what the worker says it
+        // actually compiled -- the digest on the reply was taken inside the runner,
+        // from the vector it spawned and the text it wrote, so the two agree only when
+        // the worker did the work this request describes. A `Refused`, never a
+        // best-effort match and never a fallback to using the object anyway: that is
+        // the whole ticket. A crossed reply accepted here is a wrong object under a
+        // correct key, which is silent, cached, and shared with every other machine
+        // that later fetches that key (#280).
+        auto const expected =
+            CompileCorrelation(job.request.preprocessed, job.request.args, job.request.fingerprint, sourceName);
+        if (Wire::AsStringView(result->correlation) != expected)
+            return Refused(DispatchStatus::Mismatched,
+                           std::format("{} answered about a different compile (expected {}, got {})",
+                                       job.endpoint,
+                                       expected,
+                                       DescribeCorrelation(result->correlation)));
 
         // The worker's declared decompressed size is checked before a byte of it is
         // expanded -- see `Unenvelope`. The reason travels, because "distribution

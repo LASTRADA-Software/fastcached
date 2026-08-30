@@ -410,6 +410,13 @@ launcher deliberately steps over, or the object could not be written on this
 machine. The ones marked *uncacheable* are the launcher's own refusals and are
 not about the daemon at all.
 
+One reason in the table is not about the daemon **or** about a fleet declining to
+help, and it is the only one worth interrupting somebody for: `a worker answered
+about a different compile`. It is printed on stderr **whether or not
+`FASTCACHE_VERBOSE` is set**, because it means a machine in the fleet produced an
+object for work nobody asked it to do. Every other reason here is quiet unless you
+ask.
+
 | Reason | Meaning |
 |--------|---------|
 | `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR` | Configuration incomplete — the cache was never contacted, and neither was a scheduler. Distribution is off here deliberately, and not merely for want of a key: `FASTCACHE_ADDR=` (set but empty) is how a build opts out of the launcher altogether, and without the two roots there is no portable key for a scheduler to suppress duplicates on. Set all three to use either. |
@@ -423,6 +430,7 @@ not about the daemon at all.
 | `rejected (payload-too-large): …` | The object exceeded the daemon's `--storage-max-value`. Raise it, or accept that this TU will not cache. |
 | `rejected (…)` (other codes) | The daemon refused the command and said why; see [the error-code table](../protocols/compile-cache.md#error-codes). |
 | `could not write object on hit` | The object output path was not writable. |
+| `a worker answered about a different compile` | **A defect somewhere in the fleet, not a fleet declining to help.** The worker's reply did not belong to the request that asked for it — see [`correlation`](../protocols/compile-cache.md#distributed-execution). The object is refused unread and the translation unit is compiled locally, so the build is correct and the caching of it is unaffected (the outcome is still a miss). This is the one reason printed unconditionally rather than only under `FASTCACHE_VERBOSE`, and the line names the worker, the correlation this client expected and the one that arrived. Accepting such a reply would store a wrong object under a correct key and serve it to every other machine that fetches it, so there is no configuration that relaxes this. If it appears at all, find the machine the line names. |
 | `a reported dependency path is not text this host can read`, `a captured region names a path that is not text this host can read` | Deliberate, and Windows-only. `cl.exe` writes the paths in `/showIncludes` in the **console output** code page, while this launcher's own roots arrive as UTF-8 -- so a header under a non-ASCII directory can reach it as bytes it cannot read as text. Such a path prefix-matches no root, which would key a project header as toolchain content and serve a stale object under a zero exit code, so the compile is not cached at all. Reported as *uncacheable*, not as an error. The fix is the console: `chcp 65001` makes `cl` emit UTF-8 and this stops appearing. |
 
 ## Known limitations
