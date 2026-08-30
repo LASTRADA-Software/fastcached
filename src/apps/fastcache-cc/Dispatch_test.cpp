@@ -612,8 +612,9 @@ TEST_CASE("A worker's reply may not declare an expansion above the launcher's ce
     // Correlated honestly, because this case is about the CEILING: a reply that is
     // also crossed is refused for that instead, one check earlier, and the assertion
     // below would be about the wrong guard.
-    fleet.Serve(std::string { Worker },
-                ReplyFrom(ReplyFields { .objectField = bomb, .correlation = HonestCorrelation(request) }));
+    fleet.Serve(
+        std::string { Worker },
+        ReplyFrom(ReplyFields { .objectField = bomb, .correlation = HonestCorrelation(request), .err = {}, .exitCode = 0 }));
 
     auto const result = Dispatch(fleet, request);
 
@@ -981,7 +982,7 @@ TEST_CASE("A crossed reply is refused whichever part of the job differs", "[disp
         void (*apply)(DispatchRequest& other); ///< How it differs from the job asked for.
     };
 
-    static constexpr std::array<Mutation, 4> Mutations { {
+    static constexpr std::array<Mutation, 4> mutations { {
         { .what = "fingerprint", .apply = [](DispatchRequest& other) { other.fingerprint = "clang-19-def"; } },
         { .what = "source text", .apply = [](DispatchRequest& other) { other.preprocessed = "int other() { return 9; }"; } },
         { .what = "source name", .apply = [](DispatchRequest& other) { other.sourceName = "other.cpp"; } },
@@ -995,7 +996,7 @@ TEST_CASE("A crossed reply is refused whichever part of the job differs", "[disp
     std::vector<std::string> const otherArgs { "-O2", "-DNDEBUG" };
     auto const request = Request(args);
 
-    for (auto const& mutation: Mutations)
+    for (auto const& mutation: mutations)
     {
         INFO("differing in " << mutation.what);
 
@@ -1030,7 +1031,8 @@ TEST_CASE("A reply carrying no correlation at all is refused", "[dispatch][corre
     fleet.Serve(std::string { Scheduler }, GrantReply());
 
     auto const enveloped = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 3, Wire::AsBytes("OBJ"));
-    fleet.Serve(std::string { Worker }, ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = {} }));
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = {}, .err = {}, .exitCode = 0 }));
 
     std::vector<std::string> const args { "-O2" };
     auto const result = Dispatch(fleet, Request(args));
@@ -1050,7 +1052,8 @@ TEST_CASE("A correlation that is not a digest is described rather than quoted", 
 
     constexpr std::string_view Hostile = "\x1b]0;pwned\x07";
     auto const enveloped = Wire::EncodeCodecEnvelope(Wire::IdentityCodec, 3, Wire::AsBytes("OBJ"));
-    fleet.Serve(std::string { Worker }, ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = Hostile }));
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = enveloped, .correlation = Hostile, .err = {}, .exitCode = 0 }));
 
     std::vector<std::string> const args { "-O2" };
     auto const result = Dispatch(fleet, Request(args));
@@ -1073,7 +1076,8 @@ TEST_CASE("A crossed reply is refused before its object is expanded", "[dispatch
     constexpr std::uint32_t FourGiB = 0xFFFFFFFFU;
     std::array<std::byte, 16> const payload { std::byte { 0x41 } };
     auto const bomb = Wire::EncodeCodecEnvelope(/*codec=*/1, FourGiB, payload);
-    fleet.Serve(std::string { Worker }, ReplyFrom(ReplyFields { .objectField = bomb, .correlation = {} }));
+    fleet.Serve(std::string { Worker },
+                ReplyFrom(ReplyFields { .objectField = bomb, .correlation = {}, .err = {}, .exitCode = 0 }));
 
     std::vector<std::string> const args { "-O2" };
     auto const result = Dispatch(fleet, Request(args));

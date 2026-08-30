@@ -1370,9 +1370,7 @@ TEST_CASE("A reply carries the runner's own correlation, not one recomputed here
 
     LyingRunner runner { std::string { Sentinel } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker {
-        runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics
-    };
+    WorkerProtocol worker { runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
 
     auto const answer = worker.Answer(CompileFrame());
     REQUIRE(answer.has_value());
@@ -1399,9 +1397,7 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
     AtomicMetricsSink metrics;
-    WorkerProtocol worker {
-        jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics
-    };
+    WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
 
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const answer = worker.Answer(CompileFrame("gcc-13", Source));

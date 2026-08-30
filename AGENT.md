@@ -278,6 +278,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `DialEndpoint` asks the same of the same string a moment later. Bounded, because two
   nodes with a stale `_knownLeader` name each other forever. That is the CLIENT half;
   the worker half is the bullet above, and neither works alone.
+- A COMPILE reply is tied to its request or REFUSED (`Mismatched`), before the object
+  envelope is opened — a crossed reply served is a wrong object under a correct key,
+  which is silent, stored and shared. The digest is taken in `CompileJobRunner::Run`
+  from what is about to be spawned, never folded in `WorkerProtocol` from the decoded
+  request: at that layer both crossed requests are pristine, so such a digest agrees
+  with whatever it is compared against and passes the ticket's own acceptance test
+  while catching nothing. A field is covered exactly when the client knows it before
+  sending AND the runner observes it at execution. The base name is derived ONCE, or
+  the fleet refuses every honest compile instead. It has no counter and can have none
+  — only the client can see it, and the client is a per-TU process with no sink — so
+  the alarm is an UNCONDITIONAL stderr line plus a `--show-stats` reason, and the
+  outcome stays a MISS. Input side only: #279's scratch claim is the output side and
+  neither alone is sufficient.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - A `FETCH` outcome decides whether the daemon is worth a second command
