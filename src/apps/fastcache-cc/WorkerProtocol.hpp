@@ -134,6 +134,31 @@ class WorkerProtocol
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
 /// *initiates*: everything else answers. Split out so the answering half stays pure
 /// and this half can be driven against a scripted `ISocket`.
+/// Why an announcement did not land, and where to take it instead.
+///
+/// Two fields because they answer two different questions and a caller acts on
+/// them separately. `reason` is for the operator and is always set; `leader` is
+/// for the node itself and is set only when the scheduler refused `NotLeader`
+/// while naming a usable `host:port`.
+///
+/// A refusal used to be a phrase (`Register`) or a bare `false` (`Heartbeat`),
+/// which is why the worker half of
+/// [#237](https://github.com/LASTRADA-Software/fastcached/issues/237) existed:
+/// `NotLeader` reached this node as text nothing could act on, so it logged the
+/// redirect and dialled the demoted scheduler again on the next round, forever.
+/// Meanwhile the launcher followed the same refusal correctly and arrived at a
+/// leader whose registry this node had expired out of, so every lease answered
+/// `NoWorker` and the fleet distributed nothing while every counter read zero.
+struct AnnounceRefusal
+{
+    /// The scheduler's own words, ready to log.
+    std::string reason;
+    /// Where to announce instead, when this was a redirect. Filled from
+    /// `RedirectTarget`, so the rule about what counts as one lives in exactly
+    /// one place for both the launcher's lease chain and this.
+    std::optional<std::string> leader;
+};
+
 class WorkerRegistrar
 {
   public:
@@ -168,9 +193,10 @@ class WorkerRegistrar
     /// @param scheduler Connected transport; not owned.
     /// @param credential Credential to present.
     /// @return Nothing when the scheduler accepted, and the assigned id is kept
-    ///         internally; otherwise a phrase naming the refusal or the transport
-    ///         failure, ready to log.
-    [[nodiscard]] std::expected<void, std::string> Register(ISocket& scheduler, Credential const& credential = {});
+    ///         internally; otherwise the refusal, carrying both the phrase to log
+    ///         and -- when this was a `NotLeader` naming somewhere else -- the
+    ///         endpoint to announce to instead.
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(ISocket& scheduler, Credential const& credential = {});
 
     /// Report liveness and current load.
     ///
@@ -182,11 +208,13 @@ class WorkerRegistrar
     /// @param inFlight Jobs running right now.
     /// @param load What else this machine has to say about itself right now.
     /// @param credential Credential to present.
-    /// @return True when accepted; false means "register again".
-    [[nodiscard]] bool Heartbeat(ISocket& scheduler,
-                                 std::uint32_t inFlight,
-                                 CompileCacheWire::LoadFields const& load = {},
-                                 Credential const& credential = {});
+    /// @return Nothing when accepted; otherwise the refusal. An empty `WorkerId()`
+    ///         afterwards is the "register again" signal; a set `leader` is the
+    ///         "announce somewhere else" one, and the two are independent.
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(ISocket& scheduler,
+                                                                 std::uint32_t inFlight,
+                                                                 CompileCacheWire::LoadFields const& load = {},
+                                                                 Credential const& credential = {});
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept

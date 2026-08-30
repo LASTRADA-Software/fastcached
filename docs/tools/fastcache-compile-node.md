@@ -321,6 +321,37 @@ The commonest way to produce one is a `--toolchain=<fingerprint>=...` label
 typed in a shell whose encoding is not UTF-8. A computed fingerprint is hex and
 cannot hit this.
 
+### After an election, a node re-points itself
+
+`--scheduler` names **a** member of the fleet, not the current leader. A
+scheduler that is not leading refuses every verb — registration included — and
+says where the leader is, so a node follows that and announces itself there
+instead:
+
+```
+scheduler scheduler.internal:6675 is not the leader; announcing to 10.0.0.7:6675 instead
+```
+
+At `info`, and once — the endpoint that answered is remembered, so a fleet in
+steady state does not pay a redirect on every heartbeat. Nothing has to be
+re-pointed by hand, and `--scheduler` can keep naming a machine that has not led
+for months.
+
+Two things follow that are worth knowing when reading logs:
+
+- A remembered leader that stops answering is dropped immediately and the
+  configured `--scheduler` is tried again **in the same heartbeat**, not the next
+  one. That is the `falling back to the configured endpoint` line, and it means
+  the node was out of the fleet for a connect timeout rather than for a whole
+  interval.
+- The chain is bounded at two hops. Two schedulers that disagree about who leads
+  — a partition healing — produce `gave up following leader redirects` and the
+  node simply tries again next heartbeat. Seeing that line *repeatedly* is worth
+  investigating; seeing it once around an election is not.
+
+A node whose own registration is refused for any other reason still reports it
+per heartbeat, as above — a redirect is the one refusal that is not a problem.
+
 ### A change the leader will not record
 
 The flags above are refused by the binary an operator typed them into. The

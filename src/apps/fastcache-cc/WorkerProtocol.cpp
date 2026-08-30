@@ -270,7 +270,7 @@ WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
 {
 }
 
-std::expected<void, std::string> WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
 {
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
@@ -283,30 +283,43 @@ std::expected<void, std::string> WorkerRegistrar::Register(ISocket& scheduler, C
         // reason this is not a bool: "not a member of this cluster" and "fingerprint
         // is not valid UTF-8" call for opposite actions from an operator, and this
         // node cannot tell them apart from its own side.
-        return std::unexpected { DescribeOutcome(outcome) };
+        //
+        // `RedirectTarget` rather than a second reading of the same refusal: a
+        // `NotLeader` whose message is prose, or names a bare port, is not a
+        // redirect, and that judgement belongs in one place for the launcher's
+        // lease chain and this alike.
+        return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 
     _workerId = std::string { Wire::AsStringView(outcome.value) };
     if (_workerId.empty())
         // Accepted and unusable: every later heartbeat needs the id, so a worker
         // that kept going here would heartbeat nothing into a fleet that thinks it
         // is registered. Reported as a refusal because that is what it costs.
-        return std::unexpected { std::string { "accepted, and assigned no worker id" } };
+        // No `leader`: this scheduler accepted, so it is not telling this node to
+        // go elsewhere. Following a redirect here would send a working registration
+        // to a second scheduler over a fault that is this one's to fix.
+        return std::unexpected { AnnounceRefusal { .reason = "accepted, and assigned no worker id",
+                                                   .leader = std::nullopt } };
 
     return {};
 }
 
-bool WorkerRegistrar::Heartbeat(ISocket& scheduler,
-                                std::uint32_t inFlight,
-                                Wire::LoadFields const& load,
-                                Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
+                                                                std::uint32_t inFlight,
+                                                                Wire::LoadFields const& load,
+                                                                Credential const& credential)
 {
     if (_workerId.empty())
-        return false; // never registered; nothing to refresh
+        // Never registered; nothing to refresh. Named rather than silent, because
+        // the caller's next move -- register -- is the same either way, and a
+        // diagnostic that cannot say which of the two happened is one an operator
+        // cannot act on.
+        return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
     auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
     if (outcome.IsHit())
-        return true;
+        return {};
 
     // A scheduler that does not know this worker is telling it to register again --
     // it restarted, or expired this entry. Forgetting the id here is what makes the
@@ -314,7 +327,13 @@ bool WorkerRegistrar::Heartbeat(ISocket& scheduler,
     // forever while the fleet runs without it.
     if (outcome.kind == CacheOutcomeKind::Rejected && outcome.code == Wire::ErrorCode::UnknownLease)
         _workerId.clear();
-    return false;
+
+    // The id is NOT cleared for a redirect. A `NotLeader` says this scheduler is
+    // the wrong one to ask, not that the fleet has forgotten this worker -- and the
+    // leader it names may well be holding the very registration this id belongs to,
+    // since the registry is replicated. Clearing it here would turn every election
+    // into a re-registration storm across the whole fleet.
+    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
 } // namespace FastCache::Cc

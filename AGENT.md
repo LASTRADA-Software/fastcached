@@ -247,6 +247,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
   reported and none survived; `ValidateManifest` refuses an empty set rather than
   letting `all_of` pass vacuously.
+- A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet:
+  `Gate()` refuses `Register` as well, so a heartbeat that only LOGGED the redirect kept
+  announcing to the demoted node, expired out of the new leader's registry, and every
+  lease answered `NoWorker` behind a green build. A leader is remembered only once a
+  round was ACCEPTED there — an endpoint that merely named one is a lead, not a leader —
+  and a remembered one that stops answering falls back to `--scheduler` in the SAME
+  round. `NotLeader` must not clear the worker id; `UnknownLease` must.
 - `NotLeader` is an instruction, not an answer about the fleet: a client follows it to
   the endpoint it names (`RedirectTarget`, which `ClusterAdminCli` asks too), and the
   RELEASE goes to whoever ISSUED the lease, never to the configured address. Judged by
@@ -256,9 +263,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   "no leader: try again" splits into a host and a port of " try again", and a launcher
   DIALS what the admin CLI only printed — one predicate, `ParseDialEndpoint`, because
   `DialEndpoint` asks the same of the same string a moment later. Bounded, because two
-  nodes with a stale `_knownLeader` name each other forever. The CLIENT half only: a
-  node still registers with its configured `--scheduler` and retries a `NotLeader`
-  there forever, so a redirected launcher reaches a leader with an empty registry.
+  nodes with a stale `_knownLeader` name each other forever. That is the CLIENT half;
+  the worker half is the bullet above, and neither works alone.
 - A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
   a cache field across `LiveWorkers()` counts one machine once per toolchain.
 - A `FETCH` outcome decides whether the daemon is worth a second command

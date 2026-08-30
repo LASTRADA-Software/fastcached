@@ -43,6 +43,7 @@ add_executable(fastcache-compile-node
     ClusterAdminCli.cpp
     ConsensusTier.cpp
     DiscoveryTier.cpp
+    SchedulerLink.cpp
     SchedulerTier.cpp
     ScratchClaim.cpp
     LocalCache.cpp
@@ -87,6 +88,8 @@ if(FASTCACHED_BUILD_TESTS)
         ConsensusTier_test.cpp
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
+        SchedulerLink.cpp
+        SchedulerLink_test.cpp
         SchedulerTier.cpp
         ScratchClaim.cpp
         ScratchClaim_test.cpp

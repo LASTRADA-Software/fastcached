@@ -18,6 +18,7 @@
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
 #include "NodeToolchains.hpp"
+#include "SchedulerLink.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerServer.hpp"
@@ -247,6 +248,19 @@ struct HeartbeatRound
     ILogger& logger;                              ///< Where a refusal is named.
 };
 
+/// What one announcement learned, beyond how many entries landed.
+struct AnnounceOutcome
+{
+    /// Registrars this scheduler accepted.
+    std::size_t accepted = 0;
+    /// Where it said the leader is, when it refused `NotLeader` naming somewhere
+    /// usable. The caller redials rather than waiting a whole heartbeat interval:
+    /// `SchedulerService::Gate()` refuses **every** verb off the leader, `Register`
+    /// included, so a node that merely logged this would keep announcing itself to
+    /// a demoted scheduler and expire out of the real one's registry.
+    std::optional<std::string> leader;
+};
+
 /// Announce this machine to every scheduler entry it serves, once.
 ///
 /// Registration and heartbeating are one concern: a worker is registered exactly as
@@ -255,7 +269,11 @@ struct HeartbeatRound
 /// halves to agree about which owns recovery.
 /// @param round What to announce and where to read it from.
 /// @param client A connected scheduler.
-void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
+/// @param endpoint Where `client` is connected, for the diagnostics -- which must
+///        name the endpoint actually reached, not the configured one, once a
+///        redirect can have moved it.
+/// @return What landed, and where to go next if anywhere.
+AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint)
 {
     // Counted rather than short-circuited: one toolchain the scheduler refuses must
     // not stop the others from being announced, or a single bad entry silently
@@ -297,13 +315,25 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // one re-register succeeded would step the cursor over a batch never sent.
     auto handedOver = false;
 
+    // The first leader any entry was pointed at. One per round rather than one per
+    // registrar: every entry here describes the same machine talking to the same
+    // scheduler, so they either all get redirected or none does, and following the
+    // first is what lets the whole round move together.
+    std::optional<std::string> leader;
+
     for (auto& registrar: round.registrars)
     {
-        if (!registrar.WorkerId().empty() && registrar.Heartbeat(client, inFlight, load, round.credential))
+        if (!registrar.WorkerId().empty())
         {
-            ++accepted;
-            handedOver = true;
-            continue;
+            auto const beat = registrar.Heartbeat(client, inFlight, load, round.credential);
+            if (beat.has_value())
+            {
+                ++accepted;
+                handedOver = true;
+                continue;
+            }
+            if (!leader.has_value())
+                leader = beat.error().leader;
         }
 
         // The scheduler's own reason, logged per toolchain. The summary below can
@@ -314,21 +344,30 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
         if (auto const registered = registrar.Register(client, round.credential); registered.has_value())
             ++accepted;
         else
+        {
+            if (!leader.has_value())
+                leader = registered.error().leader;
             round.logger.Logf(LogLevel::Warn,
                               "scheduler {} did not register {}: {}",
-                              round.cfg.scheduler,
+                              endpoint,
                               registrar.Fingerprint(),
-                              registered.error());
+                              registered.error().reason);
+        }
     }
     if (handedOver && !outbox.empty())
         round.sampler.HistoryHandedThrough(outbox.back().startMillis);
 
+    // Not logged as a failure when a leader was named: nothing is wrong with a
+    // fleet that has just elected, and the caller is about to follow the redirect
+    // inside this same round. Reporting "0 of 1 registered" at Warn on every
+    // election would train an operator to ignore the line that matters.
     bool const ok = accepted == round.registrars.size();
-    round.logger.Logf(ok ? LogLevel::Debug : LogLevel::Warn,
+    round.logger.Logf(ok || leader.has_value() ? LogLevel::Debug : LogLevel::Warn,
                       "scheduler {}: {} of {} toolchain(s) registered",
-                      round.cfg.scheduler,
+                      endpoint,
                       accepted,
                       round.registrars.size());
+    return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
 }
 
 /// Claim this worker's private scratch root, or say why the node must not start.
@@ -879,6 +918,14 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
     // writes it.
     std::uint64_t beat = 0;
 
+    // Where this node believes the scheduler's leader is. Declared out here so it
+    // survives across rounds -- remembering the leader is the whole reason a
+    // steady-state fleet does not spend a redirect on every heartbeat -- and, like
+    // `beat`, touched by this one thread only, which is what makes it safe without
+    // a lock of its own. It outlives the `jthread` below, which joins in its
+    // destructor before any of this goes.
+    Node::SchedulerLink link { cfg.scheduler };
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         while (!stop.stop_requested())
         {
@@ -928,11 +975,62 @@ void AnnounceOnce(HeartbeatRound const& round, ISocket& client)
                                 "this machine now has no usable toolchain; serving nothing until one returns");
             }
 
-            auto client = Cc::DialEndpointBlocking(heartbeatConnector, cfg.scheduler, HeartbeatConnectTimeout);
-            if (client == nullptr)
-                logger.Logf(LogLevel::Warn, "scheduler {} unreachable", cfg.scheduler);
-            else
-                AnnounceOnce(round, *client);
+            // One round, following `NotLeader` to wherever it points. Every decision
+            // here -- which endpoint, whether the chain is spent, whether to fall
+            // back -- belongs to `SchedulerLink`, which is testable; this loop is
+            // only the dialling, because `main.cpp` is in no test target.
+            for (link.BeginRound();;)
+            {
+                auto client = Cc::DialEndpointBlocking(heartbeatConnector, link.Target(), HeartbeatConnectTimeout);
+                if (client == nullptr)
+                {
+                    logger.Logf(LogLevel::Warn,
+                                "scheduler {} unreachable{}",
+                                link.Target(),
+                                link.Following() ? "; falling back to the configured endpoint" : "");
+                    // A remembered leader that stopped answering is retried against
+                    // the configured endpoint now rather than a heartbeat interval
+                    // from now: this machine is out of the fleet for as long as it
+                    // takes, and the configured endpoint is the one still standing
+                    // after an election the remembered leader lost.
+                    if (!link.Lost().has_value())
+                        break;
+                    continue;
+                }
+
+                auto const outcome = AnnounceOnce(round, *client, link.Target());
+                if (!outcome.leader.has_value())
+                {
+                    // Committed only when this endpoint actually took an entry. It
+                    // answered either way, but an endpoint that refused every
+                    // registrar for its own reasons -- not a member, a fingerprint
+                    // it will not have -- is not a leader worth starting the next
+                    // round at, and pinning to it would outlast the election that
+                    // caused it.
+                    if (outcome.accepted > 0)
+                    {
+                        link.Accepted();
+                        break;
+                    }
+                    if (!link.Lost().has_value())
+                        break;
+                    continue;
+                }
+
+                logger.Logf(LogLevel::Info,
+                            "scheduler {} is not the leader; announcing to {} instead",
+                            link.Target(),
+                            *outcome.leader);
+                if (!link.Redirect(*outcome.leader))
+                {
+                    // Two schedulers naming each other, or a leader that moved
+                    // again mid-chain. Costs this round rather than the thread.
+                    logger.Logf(LogLevel::Warn,
+                                "gave up following leader redirects after {} hop(s); retrying next heartbeat",
+                                MaxAnnounceRedirects);
+                    break;
+                }
+            }
 
             // Slept in slices so a stop request is observed promptly: a worker that
             // took a full heartbeat interval to exit would hold its port that long
