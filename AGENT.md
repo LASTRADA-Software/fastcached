@@ -796,6 +796,14 @@ and what they may assume.
   refused by name. And an unattributed total hides the only column that means anything: 106 of 221
   units missing was alarming and was entirely third-party, while one project unit missing is the
   actual regression shape and is invisible inside the same number.
+- A `$<TARGET_FILE:x>` naming a target that was NOT built is a hard error at **generate** time, not a skipped
+  test, so the whole configure fails and the message names CMake rather than the option the operator set. Guard
+  the block on `TARGET x` as well as on whatever feature makes the test interesting — the two are independent.
+  `-DFASTCACHED_BUILD_DAEMON=OFF` could not be configured at all (#390), and only on machines that HAVE sccache,
+  since the sccache rows are gated on finding the binary. The rule was already written out four lines above the
+  block that obeys it in `fastcache-cc/CMakeLists.txt` while two blocks one directory away did not, which is a
+  rule that needs a check rather than a better comment: `ctest -R target-file-guards`, in the default set,
+  reading the optional targets from `src/apps/CMakeLists.txt` rather than restating them.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the

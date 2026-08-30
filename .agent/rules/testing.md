@@ -458,8 +458,9 @@ translation rather than new coverage.
 `launcher-replay-e2e` was reviewed, reasoned about and merged into a CI job, and
 its first execution anywhere died on the first line that starts a process. Four
 defects sat behind that line, each hidden by the one in front of it. Three are
-below; the fourth was a repository bug the fixture merely reached first, recorded
-separately as #390. They are recorded together because the shape repeats:
+below; the fourth was a repository bug the fixture merely reached first, and has
+its own section two below this one (#390). They are recorded together because the
+shape repeats:
 **a fixture that has never completed has told you nothing, however carefully it
 was read.**
 
@@ -517,6 +518,43 @@ writes the unit to the same stream, from the same process, inside the same edge,
 and then `exec`s the real program cannot be separated from the output it
 labels — and an outcome that arrives with no label is counted as *neither* and
 refused by name, rather than folded into whichever bucket was adjacent.
+
+## A registration names a binary that may not have been built
+
+**`$<TARGET_FILE:x>` naming a target that was not built is not a test that gets
+skipped. It is a hard error at GENERATE time**, so the whole configure fails:
+
+```
+CMake Error at src/tests/CMakeLists.txt:943 (add_test):
+  Error evaluating generator expression: $<TARGET_FILE:fastcached>
+  No target "fastcached"
+```
+
+That is #390. A block registering a test that starts a binary is guarded on
+**`TARGET x`** as well as on whatever feature makes the test interesting; the two
+conditions are independent, because a feature can be enabled while the binary it
+needs is not built. `tls-smoke` asked only `FASTCACHED_ENABLE_TLS` and the sccache
+smokes only `SCCACHE`, so `-DFASTCACHED_BUILD_DAEMON=OFF` could not be configured
+at all.
+
+**It was conditional on the developer's machine rather than on the tree**, which is
+why it survived. The sccache rows are themselves gated on finding sccache, so a
+checkout without sccache installed never reaches the broken reference and the flag
+appears to work. The error then names CMake rather than the option, on some
+machines and not others — so the natural conclusion is "my checkout is broken".
+
+And the rule was already written down. `src/apps/fastcache-cc/CMakeLists.txt`
+spells it out in four lines directly above the block that obeys it, while two
+blocks one directory away did not. A rule one file explains and another ignores is
+a rule that needs a check, not a better comment: `ctest -R target-file-guards`
+(`scripts/check-target-file-guards.cmake`), in the default set. It reads which
+targets are optional from `src/apps/CMakeLists.txt`'s app table rather than
+restating them, so a new app comes under the guard by existing.
+
+Three ways it refuses to pass vacuously, because each is how such a check reports
+success for work it did not do: an app table it could not read, a scan that found
+no reference at all, and a file whose `if` nesting it could not follow to the end.
+All three are named failures.
 
 ## Open work
 
