@@ -453,6 +453,71 @@ replaces all four. It is POSIX-only for now: the properties are
 platform-independent and the fixture is not, so a Windows counterpart would be a
 translation rather than new coverage.
 
+## The first real run of a fixture is where its defects are
+
+`launcher-replay-e2e` was reviewed, reasoned about and merged into a CI job, and
+its first execution anywhere died on the first line that starts a process. Four
+defects sat behind that line, each hidden by the one in front of it. Three are
+below; the fourth was a repository bug the fixture merely reached first, recorded
+separately as #390. They are recorded together because the shape repeats:
+**a fixture that has never completed has told you nothing, however carefully it
+was read.**
+
+**A flag spelling is checked against the table, not remembered.** The daemon was
+started with `--memory-limit 2048mb`. There is no such option — the only
+occurrence of that spelling anywhere in the tree was the line that used it — and
+the byte suffix is a single character, so `2048mb` would be an unknown unit under
+the right name too. The daemon printed usage and exited, and the fixture reported
+`the daemon never accepted a connection`: a true sentence about the wrong thing.
+Two spellings of the same start-up already existed in `scripts/`; the one that
+worked was the one nobody had invented.
+
+**`exit` inside a subshell ends the subshell.** A `fail` helper called from a
+`( ... )` group — here the control build, running in one so it can unset the
+launcher environment — does not stop the script. It then reported two further
+failures about the artefacts the first one explains, so a reader working upward
+from the last line starts on the wrong question. Fixed at the helper, not the
+call site, because the next subshell will not remember: signal the top-level
+shell, and test with `BASHPID` rather than `$$` — bash keeps `$$` at the parent's
+value inside a subshell, so the guard would always hold and silently do nothing.
+
+**A guard that proves a fixture bites can itself fail to bite.** The canary
+compiled a deliberately wrong object over the object of the first `_test.cpp` in
+the compile database — a unit of a *different target*, which the binary under
+test does not link. The suite passed with exactly the case count it had passed
+with a minute earlier, and the fixture announced `the suite PASSED with a wrong
+object linked in`. No wrong object was linked. The observation was true and the
+claim attached to it was false, which is worse than either alone: it names the
+subject as broken when the instrument is.
+
+So an injection is **asserted**, in the artefact and again in the thing that
+consumes it. Every way of poisoning nothing — a substitution that did not fire,
+an output path this build does not use, a unit belonging to another target — now
+stops with a sentence about the injection rather than a verdict about the cache.
+
+## Attribution by adjacency is a guess, and a guard built on one is a lottery
+
+The same fixture reported `115 hit(s), 106 miss(es)` on a build of identical
+source and passed, on the strength of "something hit". Either reading of that
+number was available and nothing could choose between them: over half a build
+missing is alarming, and it is also exactly what a correct cache does when the
+third-party sources live *inside* the build directory and the two build
+directories differ. Attributed, all 106 were third-party and all 74 of this
+project's own units hit. The total had buried the only column that meant
+anything.
+
+The attribution is the part worth remembering. Reading the `[n/m] Building CXX
+object ...` line above each outcome is the obvious move and is unsound: ninja
+interleaves the output of concurrent edges, and two runs of the same build split
+one unit differently — 74/41 against 75/40. A guard resting on that fails a build
+for a scheduling accident, and would have been believed the first time it did.
+
+**Ask the process, do not infer from its neighbours.** A one-line wrapper that
+writes the unit to the same stream, from the same process, inside the same edge,
+and then `exec`s the real program cannot be separated from the output it
+labels — and an outcome that arrives with no label is counted as *neither* and
+refused by name, rather than folded into whichever bucket was adjacent.
+
 ## Open work
 
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two

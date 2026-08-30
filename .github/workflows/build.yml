@@ -1279,6 +1279,32 @@ jobs:
             --compiler clang++ \
             --port 21715 || { c=$?; [ "$c" = 77 ] && echo "::error::E2E skipped, nothing verified"; exit "$c"; }
 
+      # The only shape that catches a WRONG object: build a real target through
+      # the launcher and run that target's own tests (#320). The two fixtures
+      # above prove the launcher runs and produces AN object; neither runs what
+      # came out, which is why #319 -- a cache-backed build that segfaulted while
+      # the same commit with -DUSE_COMPILER_CACHE=OFF passed -- could only be
+      # found by a developer noticing it.
+      #
+      # Costs three builds of one test target: a cache-off control, a cold build
+      # that stores, and a warm build that replays. Only the warm one is the
+      # subject; the other two are what make its green mean something. It runs
+      # whenever this job runs, which `ci-scope.sh` already limits to changes that
+      # can reach a build -- a docs-only pull request skips the whole job.
+      #
+      # `--canary` is not optional: it puts a deliberately wrong object into the
+      # replayed build and requires the suite to go red. Without it a green run
+      # here would be indistinguishable from a fixture that cannot fail.
+      - name: "A real target, replayed from cache, passes its own tests"
+        run: |
+          bash scripts/launcher-replay-e2e.sh \
+            --fastcached out/build/gcc-release/target/fastcached \
+            --launcher out/build/gcc-release/target/fastcache-cc \
+            --compiler g++-14 \
+            --target fastcache-cc-tests \
+            --canary \
+            --port 21717 || { c=$?; [ "$c" = 77 ] && echo "::error::replay E2E skipped, nothing verified"; exit "$c"; }
+
   compile-cache-e2e-windows:
     name: "compile-cache E2E (Windows)"
     runs-on: windows-2025
