@@ -61,6 +61,21 @@ function Get-FreePort {
     throw "could not allocate a free port below the ephemeral range"
 }
 
+function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what) {
+    # Bounded, and it says what it waited for. Reading the node's OWN log rather than
+    # the scheduler's counters, because this wait is about one process reaching a
+    # state -- the fleet-level wait comes after and asks a different question.
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $deadline) {
+        $text = Get-Content -Raw $log -ErrorAction SilentlyContinue
+        if ($text -and $text -match $pattern) { return $true }
+        Start-Sleep -Milliseconds 400
+    }
+    Write-Host "waited ${seconds}s for $what"
+    Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
+    return $false
+}
+
 function ConvertTo-QuotedArgs([string[]]$arguments) {
     # -ArgumentList joins an array with spaces into ONE command line, so an element
     # CONTAINING a space arrives at the child as two. `cl.exe` lives under
@@ -170,22 +185,42 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
 
         # ONE slot each, so the second lease cannot land on the machine already busy
         # -- which is what puts a compile on both processes at the same time.
+        # Each worker is started and waited for BEFORE the next one, and that is a
+        # deliberate reduction in what this fixture asks of the machine. A bare
+        # `--toolchain` makes a node compute a fingerprint by walking the compiler's
+        # whole include tree, which is seconds when warm and much longer cold; two of
+        # those racing on a two-core CI runner exceeded the budget and the fixture
+        # failed having never reached a compile.
+        #
+        # Serialising costs nothing this test is about. The collision it exists to
+        # catch happens when two workers COMPILE at once, which is arranged below --
+        # not when they start.
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "sched.err.log") "compile node ready" 180 "the scheduler node to come up")) {
+            throw "the scheduler node did not start"
+        }
+
         $procs += Start-NodeIn "workerA" @(
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$workerA", "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 300 "worker A to compute its toolchain fingerprint and bind")) {
+            throw "worker A did not start"
+        }
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $procs += Start-NodeIn "workerB" @(
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$workerB", "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 300 "worker B to compute its toolchain fingerprint and bind")) {
+            throw "worker B did not start"
+        }
 
         # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
         # logging "compile node ready" says its own port is bound, not that the
         # scheduler has heard from it -- dispatching on that races the first
         # heartbeat and is refused NoWorker.
-        $deadline = (Get-Date).AddSeconds(90); $regs = 0
+        $deadline = (Get-Date).AddSeconds(120); $regs = 0
         while ((Get-Date) -lt $deadline -and $regs -lt 3) {
             Start-Sleep -Milliseconds 700
             try {
@@ -196,7 +231,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             } catch { }
         }
         if ($regs -lt 3) {
-            Write-Host "waited 90s for three worker registrations at the scheduler; saw $regs"
+            Write-Host "waited 120s for three worker registrations at the scheduler; saw $regs (all three nodes were already up, so this is heartbeats, not startup)"
             foreach ($n in @("sched", "workerA", "workerB")) {
                 Write-Host "--- $n"; Get-Content (Join-Path $phaseDir "$n.err.log") -Tail 20 -ErrorAction SilentlyContinue
             }
