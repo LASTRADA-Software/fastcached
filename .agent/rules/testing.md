@@ -133,12 +133,67 @@ and it cannot.** "Raise the budget" is sound general advice, was printed by the
 branch that fires most often, and is exactly what [#354](https://github.com/LASTRADA-Software/fastcached/issues/354)
 refuses -- that budget has been raised twice already. State the finding and stop.
 
-And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`, which drives
-`Wait-ForLogLine` against six synthetic processes -- a growing log, a self-spinner,
-a quiet parent with a spinning child, a sleeper, a trickle-then-silence, and one
-that dies. The fourth is the point: **a classifier that cannot be made to say
-BLOCKED cannot report a hang**, and the original could not. Each case also asserts
-that no verdict prescribes a remedy.
+And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`. **A classifier
+that cannot be made to say BLOCKED cannot report a hang**, and the original could
+not.
+
+## Do not measure a stand-in through an instrument as costly as the thing measured
+
+The first version of that test drove real processes. Six stand-ins, each arranged
+to exhibit one reading -- a growing log, a self-spinner, a quiet parent with a
+spinning child, a sleeper, a trickle-then-silence, one that dies -- and it read the
+classifier's answer back. Five of the six were robust, because they target a
+*presence*, an *absence* or a *death*, and those do not depend on how fast the box
+is.
+
+The sixth had to land a **magnitude** strictly inside the classifier's
+`(0.15s, 0.50s)` band. It burned until its own consumed process CPU had risen by
+250 ms -- already closing the loop on the right quantity rather than spinning for a
+duration -- and it still could not be made reliable:
+
+- it passed three consecutive local runs and failed on `Windows-clangcl-release` at
+  **0.52s against a 0.50s bound**, because leftover interpreter startup landed
+  inside the measured window;
+- tightened, it then put the deliberate burn at the recent window's cutoff edge,
+  where **0.16s of a measured 0.25s** counted.
+
+Neither was a bound being wrong. **The band is 0.35s wide and a PowerShell
+process's own startup costs 0.2-0.5s** -- the instrument's overhead and the
+quantity under test were the same magnitude, so there is no stand-in construction
+that fixes it. The noise *is* the interpreter the stand-in is made of.
+
+The fix is a seam, not a stand-in. `Get-WaitVerdict` is now pure -- it takes a
+record of readings (own recent CPU, descendant recent CPU, counts, log growth and
+stall age, alive, exit code, both bounds) and returns the lines to print. It opens
+no socket, reads no clock, spawns nothing. Acquisition keeps doing exactly what it
+did.
+
+Three things follow, and they are the reason to reach for this shape early rather
+than after a red CI leg:
+
+- **Branches that could not be staged become one line each.** The
+  could-not-sample-CPU verdict needs a live process whose CPU the script may not
+  read, which cannot be arranged; as a record it is `OwnRecent = $null`.
+- **Every bound gets pinned on both sides**, not demonstrated once from the middle
+  -- at the floor and just above it, at the working bound and just below it. That
+  is where an `-and`/`-or` mistake actually lives.
+- **It is instant**, so the sweep that proves each branch load-bearing is cheap
+  enough to actually run. Mutating each of the seven verdicts and each of the five
+  comparisons turns exactly the expected cases red; `EverGrew -and` weakened to
+  `-or` -- the original defect's own shape -- turns 14 of 17 red. 53 seconds and a
+  `RUN_SERIAL` became 0.3 seconds and neither.
+
+What deliberately stayed untested is **acquisition**: `Win32_Process`, the
+parentage walk, the pid-reuse guard by creation time, the locked-log read. All
+three real defects here were in that half, and it is exactly as hard to exercise
+wherever it lives -- but it now contains no decisions, so nothing silently right or
+wrong is hiding in it.
+
+The general rule, which is not about PowerShell: **a decision worth several named
+outcomes is worth separating from the ambient facts it reads**, and a fixture that
+must exhibit a magnitude must not be measured through machinery whose own cost is
+comparable to that magnitude. Both halves of this file got that wrong once, in the
+same direction -- towards a confident wrong answer.
 
 ## A case name is an ARGUMENT, so it may not begin with `-`
 

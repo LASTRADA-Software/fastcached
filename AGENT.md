@@ -669,7 +669,12 @@ and what they may assume.
   is not evidence. And an instrument that prints a **remedy** cannot know when the remedy is under dispute — "raise the
   budget" is what #354 refuses. State the finding and stop.
 - A classifier that cannot be made to say BLOCKED cannot report a hang. `ctest -R node-scratch-isolation-e2e-selftest`
-  drives each verdict against a synthetic process, in the default set.
+  drives each verdict against a synthesised **readings record**, in the default set.
+- A stand-in built to exhibit a MAGNITUDE must not be measured through an instrument whose own overhead is comparable
+  to it: the verdict band is 0.35s wide and a PowerShell process's startup costs 0.2–0.5s, so a stand-in that burned
+  exactly 250ms still read 0.52s on CI and 0.16s when moved. No arrangement fixes that — the noise IS the interpreter.
+  Split the DECISION out as a pure function over a record; leave acquisition alone. Branches that could not be staged
+  become one line, every bound gets pinned on BOTH sides, and 53s + RUN_SERIAL becomes 0.3s.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the
