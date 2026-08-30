@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeToolchains.hpp"
 
-#include <ParallelFor.hpp>
-
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -13,6 +11,7 @@
 #include <vector>
 
 #include <CmdLine.hpp>
+#include <ParallelFor.hpp>
 #include <ToolchainProbe.hpp>
 
 namespace FastCache::Node

@@ -31,26 +31,29 @@ using namespace FastCache::Cc::Testing;
 
 namespace
 {
-    /// The walk under a deterministic, single-threaded implementation.
-    ///
-    /// Every case below asserts a property of the WALK -- which files are covered,
-    /// what clears `complete`, that the digest ignores install prefixes -- and none
-    /// of them is about the parallelism, so they run serially and stay reproducible.
-    /// The threaded implementation and the AND across slices have their own cases.
-    [[nodiscard]] ToolchainFileScan WalkSerially(std::span<std::string const> roots)
-    {
-        SerialParallelFor serial;
-        return ProbeToolchainFiles(roots, serial);
-    }
+/// The walk under a deterministic, single-threaded implementation.
+///
+/// Every case below asserts a property of the WALK -- which files are covered,
+/// what clears `complete`, that the digest ignores install prefixes -- and none
+/// of them is about the parallelism, so they run serially and stay reproducible.
+/// The threaded implementation and the AND across slices have their own cases.
+[[nodiscard]] ToolchainFileScan WalkSerially(std::span<std::string const> roots)
+{
+    SerialParallelFor serial;
+    return ProbeToolchainFiles(roots, serial);
+}
 
-    /// `CachedToolchainFingerprint` with a serial walk, for the same reason.
-    [[nodiscard]] ToolchainIdentity CachedFingerprintSerially(
-        IProcessRunner& runner, IToolchainHost& host, std::string const& compiler,
-        std::string_view banner, DriverSpec const& spec, bool forceRefresh = false)
-    {
-        SerialParallelFor serial;
-        return CachedToolchainFingerprint(runner, host, compiler, banner, spec, serial, forceRefresh);
-    }
+/// `CachedToolchainFingerprint` with a serial walk, for the same reason.
+[[nodiscard]] ToolchainIdentity CachedFingerprintSerially(IProcessRunner& runner,
+                                                          IToolchainHost& host,
+                                                          std::string const& compiler,
+                                                          std::string_view banner,
+                                                          DriverSpec const& spec,
+                                                          bool forceRefresh = false)
+{
+    SerialParallelFor serial;
+    return CachedToolchainFingerprint(runner, host, compiler, banner, spec, serial, forceRefresh);
+}
 
 /// Real `clang -E -v -x c++ /dev/null` stderr, trimmed to the shape that matters.
 ///
@@ -1524,8 +1527,7 @@ TEST_CASE("A header that could not be read leaves the walk incomplete and uncach
     CountingRunner runner { VerboseNaming(includeDir.string()) };
     ScriptedToolchainHost host;
 
-    auto const identity =
-        CachedFingerprintSerially(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
+    auto const identity = CachedFingerprintSerially(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
 
     CHECK_FALSE(identity.Usable());
     CHECK(identity.defect == IdentityDefect::PartialTree);

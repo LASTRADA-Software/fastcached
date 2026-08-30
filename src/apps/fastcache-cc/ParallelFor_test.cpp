@@ -5,8 +5,8 @@
 
 #include <atomic>
 #include <cstddef>
-#include <set>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 

@@ -36,7 +36,8 @@ std::size_t DefaultParallelWidth()
     return std::clamp(cores * 4, static_cast<std::size_t>(4), static_cast<std::size_t>(32));
 }
 
-ThreadedParallelFor::ThreadedParallelFor(std::size_t width): _width { std::max<std::size_t>(1, width) }
+ThreadedParallelFor::ThreadedParallelFor(std::size_t width):
+    _width { std::max<std::size_t>(1, width) }
 {
 }
 

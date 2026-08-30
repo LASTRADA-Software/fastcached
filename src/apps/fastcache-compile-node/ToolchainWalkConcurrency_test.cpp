@@ -22,43 +22,42 @@
 // races nothing.
 #include "NodeToolchains.hpp"
 
-#include <ParallelFor.hpp>
-#include <ToolchainProbe.hpp>
-
 #include <catch2/catch_test_macros.hpp>
-
-#include <tests/ScratchPath.hpp>
 
 #include <cstddef>
 #include <filesystem>
-#include <functional>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
+
+#include <ParallelFor.hpp>
+#include <ToolchainProbe.hpp>
+#include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cc;
 
 namespace
 {
-    /// A root with `files` distinct files, each with distinct contents.
-    ///
-    /// Distinct contents on purpose: identical files would hash identically, so a
-    /// slice that wrote another slice's result would be invisible.
-    void PopulateRoot(std::filesystem::path const& root, std::size_t files)
+/// A root with `files` distinct files, each with distinct contents.
+///
+/// Distinct contents on purpose: identical files would hash identically, so a
+/// slice that wrote another slice's result would be invisible.
+void PopulateRoot(std::filesystem::path const& root, std::size_t files)
+{
+    std::filesystem::create_directories(root);
+    for (std::size_t index = 0; index < files; ++index)
     {
-        std::filesystem::create_directories(root);
-        for (std::size_t index = 0; index < files; ++index)
-        {
-            // Nested a little, so the walk recurses rather than reading one flat
-            // directory -- the relative spelling is part of the digest.
-            auto const dir = root / ("d" + std::to_string(index % 7));
-            std::filesystem::create_directories(dir);
-            std::ofstream out { dir / ("h" + std::to_string(index) + ".hpp"), std::ios::binary };
-            out << "// header " << index << '\n' << std::string(index % 64, 'x') << '\n';
-        }
+        // Nested a little, so the walk recurses rather than reading one flat
+        // directory -- the relative spelling is part of the digest.
+        auto const dir = root / ("d" + std::to_string(index % 7));
+        std::filesystem::create_directories(dir);
+        std::ofstream out { dir / ("h" + std::to_string(index) + ".hpp"), std::ios::binary };
+        out << "// header " << index << '\n' << std::string(index % 64, 'x') << '\n';
     }
 }
+} // namespace
 
 TEST_CASE("A concurrent walk yields the same fingerprint as a serial one", "[toolchain][concurrency]")
 {
@@ -104,8 +103,7 @@ TEST_CASE("Repeating a concurrent walk is stable", "[toolchain][concurrency]")
 
     REQUIRE(first.complete);
     REQUIRE(second.complete);
-    CHECK(ComputeToolchainFingerprint("cc 1.0", first.files)
-          == ComputeToolchainFingerprint("cc 1.0", second.files));
+    CHECK(ComputeToolchainFingerprint("cc 1.0", first.files) == ComputeToolchainFingerprint("cc 1.0", second.files));
 }
 
 TEST_CASE("A slice that does not finish clears complete", "[toolchain][concurrency]")
