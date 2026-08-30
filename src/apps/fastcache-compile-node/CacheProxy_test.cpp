@@ -3,6 +3,8 @@
 #include "Responders.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/CompileCache/CompileValue.hpp>
+#include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -83,6 +85,71 @@ TEST_CASE("A node stores and serves an object over the cache wire", "[node][cach
     REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
     auto const payload = PayloadOf(fetched);
     CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("object-one"));
+}
+
+TEST_CASE("A node canonicalizes a stored value's regions against the producer's roots", "[node][cacheproxy]")
+{
+    // #319. This tier used to store the value bytes verbatim and ignore the roots
+    // the client sent, on the reasoning that canonicalization is "the shared cache's
+    // job" and that "what this tier stores is what this machine will replay". Both
+    // held while a node was a private tier in front of `fastcached`. #229 made a
+    // node the shared cache, and "this machine" is not one layout -- every checkout
+    // on it is a different one.
+    //
+    // What that cost is not a missed optimization. A `/showIncludes` region is
+    // replayed to the build system as the object's dependency list, so a region
+    // still naming the PRODUCING checkout hands this build dependencies on files it
+    // will never edit -- which no later edit here can invalidate. It also feeds
+    // `RecordManifest`, where every foreign path classifies as toolchain and is
+    // dropped, leaving a manifest that revalidates on the TU alone and serves its
+    // object however the headers move.
+    Fixture fix;
+
+    CompileValue value;
+    value.objectBlob = Bytes("OBJECT");
+    value.textRegions.push_back(
+        { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = "Note: including file: /producer/src/dep.hpp\n" });
+
+    auto const stored =
+        SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "k-canon",
+                                                                        .prefetchGroup = {},
+                                                                        .srcRoot = "/producer/src",
+                                                                        .buildTree = "/producer/build",
+                                                                        .value = EncodeCompileValue(value) })));
+    REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-canon")));
+    REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+    auto const decoded = DecodeCompileValue(PayloadOf(fetched));
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->textRegions.size() == 1);
+
+    // The producer's root is gone and a token stands in its place, which is what
+    // lets any other checkout localize it to its own.
+    CHECK(decoded->textRegions.front().bytes == "Note: including file: <SRCROOT>/dep.hpp\n");
+    CHECK_FALSE(decoded->textRegions.front().bytes.contains("/producer/"));
+
+    // The object blob is never a region and is never rewritten: it is machine code,
+    // and a byte run inside it that looks like a path is not one.
+    CHECK(decoded->objectBlob == Bytes("OBJECT"));
+}
+
+TEST_CASE("A value the node cannot decode is stored verbatim rather than refused", "[node][cacheproxy]")
+{
+    // Canonicalization must not turn this tier into a validator. An opaque value is
+    // not a malformed one -- this endpoint is a cache, and deciding what a value may
+    // contain belongs to the client that wrote it and the daemon that speaks the
+    // whole protocol.
+    Fixture fix;
+
+    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+        .key = "k-opaque", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("not-a-value") })));
+    REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-opaque")));
+    REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+    auto const payload = PayloadOf(fetched);
+    CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("not-a-value"));
 }
 
 TEST_CASE("A miss is Miss, never Error", "[node][cacheproxy]")

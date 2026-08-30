@@ -115,6 +115,9 @@ enum class ManifestFault : std::uint8_t
                    ///< against a `/x/build` root. A root spelled almost right.
     Unreadable,    ///< Could not be read, so it could not be hashed. A manifest entry
                    ///< is only worth recording if its content hash is real.
+    NoProjectDeps, ///< The compile reported dependencies and every one of them was
+                   ///< dropped as toolchain, so the manifest would revalidate the TU
+                   ///< and nothing else -- and would keep doing so forever.
     Last,          ///< Not a fault, and has no row: the table's length.
 };
 
@@ -146,6 +149,7 @@ inline constexpr EnumTable<ManifestFault, FaultRow> FaultTable { {
     { .fault = ManifestFault::ToolchainLike, .label = "matches a toolchain marker" },
     { .fault = ManifestFault::Uncanonical, .label = "no canonical form" },
     { .fault = ManifestFault::Unreadable, .label = "unreadable" },
+    { .fault = ManifestFault::NoProjectDeps, .label = "every reported dependency was dropped as toolchain" },
 } };
 
 static_assert(RowsInEnumeratorOrder(FaultTable, &FaultRow::fault),

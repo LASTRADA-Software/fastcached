@@ -358,11 +358,73 @@ TEST_CASE("ValidateManifest rejects entries whose files do not exist")
     CHECK_FALSE(ValidateManifest(SampleManifest(), layout, "cl 19.51.36231 x64"));
 }
 
-TEST_CASE("ValidateManifest accepts an empty manifest with a matching stamp")
+TEST_CASE("A compile whose every reported dependency was dropped records no manifest")
 {
-    // No entries means nothing to invalidate; the stamp alone decides.
+    // The guard that turns #319 from a wrong object into a miss.
+    //
+    // `IsToolchainHeader` reports every path outside both roots as toolchain, so a
+    // header belonging to ANOTHER checkout classifies exactly as an SDK header does
+    // and is dropped. When a hit replays a value whose regions were never
+    // canonicalized, every path fed to BuildManifest is such a path -- so what would
+    // be recorded is the translation unit and nothing else, and ValidateManifest
+    // would then re-hash the TU, find it unchanged, and serve the object however the
+    // headers move.
+    //
+    // Refused by name rather than recorded thin. The refusal costs direct mode for
+    // this compile, exactly as `Unanchored` already does, and the ordinary
+    // preprocessed key still serves it.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-direct-hollow" };
+    auto const& root = scratch.Path();
+    std::filesystem::create_directories(root / "src");
+
+    auto const sourcePath = root / "src" / "u.cpp";
+    {
+        std::ofstream out { sourcePath, std::ios::binary };
+        out << "int main() { return 0; }\n";
+    }
+
+    FastCache::PathCanon::Layout const layout { .sourceRoot = (root / "src").string(),
+                                                .buildTree = (root / "bld").string() };
+
+    // A path under neither root -- another checkout's header, which is exactly what
+    // an uncanonicalized region replays.
+    auto const refused = BuildManifest({ .sourcePath = sourcePath.string(),
+                                         .includePaths = { R"(D:\some\other\checkout\src\dep.hpp)" },
+                                         .workingDirectory = root.string(),
+                                         .toolchainStamp = "cl-19.51",
+                                         .objectKey = "objkey-1" },
+                                       layout);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().fault == ManifestFault::NoProjectDeps);
+
+    // A TU that reported nothing is NOT refused: it has no headers to drop, so the
+    // source alone is the whole truth about it. The guard asks whether reported
+    // dependencies were dropped, never how few entries came out -- a count test
+    // would refuse this one too.
+    auto const kept = BuildManifest({ .sourcePath = sourcePath.string(),
+                                      .includePaths = {},
+                                      .workingDirectory = root.string(),
+                                      .toolchainStamp = "cl-19.51",
+                                      .objectKey = "objkey-1" },
+                                    layout);
+    REQUIRE(kept.has_value());
+    CHECK(kept->entries.size() == 1);
+}
+
+TEST_CASE("ValidateManifest refuses an empty manifest rather than validating on nothing")
+{
+    // This case used to assert the opposite -- "no entries means nothing to
+    // invalidate; the stamp alone decides" -- and that reading is the vacuous truth
+    // #319 turned into a wrong object. `all_of` over no entries is true, so such a
+    // manifest does not pass a check, it skips one, and the object it points at is
+    // served however the sources move.
+    //
+    // `BuildManifest` cannot produce one: the TU is always entry one and its
+    // presence is that function's own precondition (issue #49 / issue #51). So an
+    // empty entry set is a decode artifact or an older format, and a matching stamp
+    // says nothing at all about the sources.
     DirectManifest const empty { .toolchainStamp = "cl-19.51", .objectKey = "k", .entries = {} };
-    CHECK(ValidateManifest(empty, WindowsLayout(), "cl-19.51"));
+    CHECK_FALSE(ValidateManifest(empty, WindowsLayout(), "cl-19.51"));
     CHECK_FALSE(ValidateManifest(empty, WindowsLayout(), "cl-20.00"));
 }
 
@@ -1304,7 +1366,7 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // to disagree about what was hashed.
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };
     auto const manifestKey = ComputeManifestKey("<SRCROOT>/src/a.cpp", args, "cl-19.51");
-    CHECK(manifestKey == "72ed897f5c3dd9ec9fc2b4607aafdc96");
+    CHECK(manifestKey == "2f8e995262b738bea0d31e062b6d4682");
 
     // And the generations it has retired stay retired. This is the half the vector
     // above cannot cover: a v5 manifest is only safe because no launcher carrying
@@ -1314,6 +1376,7 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     constexpr auto Retired = std::to_array<RetiredGeneration>({
         { .tag = "manifest-v3", .digest = "76b19c2b7caf3e0db4dcc1efcecb76aa" },
         { .tag = "manifest-v4", .digest = "8221eaeac6f3f8e52e523507780ed186" },
+        { .tag = "manifest-v5", .digest = "72ed897f5c3dd9ec9fc2b4607aafdc96" },
     });
     RequireNoRetiredGeneration(manifestKey, Retired);
 

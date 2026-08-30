@@ -69,7 +69,7 @@ class SplitMix64
 /// A golden vector alone does not stop a schema bump from being reverted. The tag
 /// and the golden that pins it are one edit two hunks apart, so moving both back
 /// leaves the suite green and every entry the bump retired reachable again — which
-/// for `manifest-v5` means a pre-#104 manifest direct-hitting a drive-relative
+/// for `manifest-v6` means a pre-#104 manifest direct-hitting a drive-relative
 /// compile once more, the exact defect that bump exists to close. These rows are
 /// what makes that fail: the live key must equal none of them, so restoring an old
 /// tag reproduces a retired digest and is caught whatever the golden says.

@@ -1378,7 +1378,25 @@ void RecordManifest(Config const& cfg,
         envelope.has_value() ? std::span<std::byte const> { envelope->objectBlob } : std::span<std::byte const> {};
     auto const manifest =
         Cc::DecodeManifest(std::string_view { reinterpret_cast<char const*>(manifestSpan.data()), manifestSpan.size() });
-    if (!manifest.has_value() || manifest->objectKey.empty() || !Cc::ValidateManifest(*manifest, layout, toolchainStamp))
+    if (!manifest.has_value() || manifest->objectKey.empty())
+        return giveUp();
+
+    // Said by name, because this one is not an ordinary direct-mode miss. An empty
+    // manifest validates on nothing at all -- `all_of` over no entries is true --
+    // so it would serve its object however the sources move. `BuildManifest` cannot
+    // write one, which makes it a decode artifact or an older format, and an
+    // operator watching a miss rate move needs to see which of those it is rather
+    // than a cache that merely looks cold.
+    //
+    // `Note`, not `Warn`: this is a cache fact, and the compile carries on to its
+    // ordinary preprocessed key rather than falling back to the real compiler.
+    if (manifest->entries.empty())
+    {
+        Note("direct-mode manifest has no entries; refusing it rather than validating on nothing");
+        return giveUp();
+    }
+
+    if (!Cc::ValidateManifest(*manifest, layout, toolchainStamp))
         return giveUp();
 
     invocation.directMs = MsSince(directStarted);

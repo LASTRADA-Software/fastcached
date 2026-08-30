@@ -430,7 +430,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     // to disagree about what was hashed, and the retirement check would go vacuous
     // in the one edit it exists to catch.
     auto const key = ComputeKey(inputs);
-    CHECK(key == "b89cce126e819bbb6868c7a6065e01cb");
+    CHECK(key == "e7d074ee4bda35d76e6bf65eba71e7b1");
 
     // What the vector alone cannot say: that the tag has not been put BACK. See
     // RetiredGeneration -- reverting the tag and re-pasting the vector is one edit
@@ -439,6 +439,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     constexpr auto Retired = std::to_array<RetiredGeneration>({
         { .tag = "objkey-v3", .digest = "65a330c5e6541bf33b2682d642717669" },
         { .tag = "objkey-v4", .digest = "a38a64d1e6e4c72f555c7e97ba26bd16" },
+        { .tag = "objkey-v5", .digest = "b89cce126e819bbb6868c7a6065e01cb" },
     });
     RequireNoRetiredGeneration(key, Retired);
 }

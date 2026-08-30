@@ -200,4 +200,12 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     return value;
 }
 
+void CanonicalizeStoredRegions(CompileValue& value, PathCanon::Layout const& producer)
+{
+    // The object blob is never a region and is never rewritten: it is machine code,
+    // and a byte sequence inside it that happens to look like a path is not one.
+    for (auto& region: value.textRegions)
+        region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
+}
+
 } // namespace FastCache

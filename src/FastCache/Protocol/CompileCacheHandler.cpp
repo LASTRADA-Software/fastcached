@@ -162,23 +162,6 @@ namespace
         Abort,    ///< Connection is finished (EOF, framing error, or write failure).
     };
 
-    /// Canonicalize every text region of `value` in place using the producer's
-    /// layout. The object blob is never touched.
-    ///
-    /// Cannot fail, and says so by returning nothing: a path under neither root is
-    /// echoed verbatim rather than refused, which is what lets a toolchain path
-    /// survive the round trip. This used to return `bool` and answer a false with
-    /// wire status `CanonicalizationFailed`, which no server could ever send
-    /// (issues #59, #69).
-    ///
-    /// @param value    The decoded compile-value to rewrite.
-    /// @param producer The producing machine's roots.
-    void CanonicalizeRegions(CompileValue& value, PathCanon::Layout const& producer)
-    {
-        for (auto& region: value.textRegions)
-            region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
-    }
-
     /// Handle one STORE command: canonicalize with the producer's layout, store
     /// the canonical value, and record prefetch group membership.
     ///
@@ -207,7 +190,10 @@ namespace
 
         PathCanon::Layout const producer { .sourceRoot = BytesToString(fields->srcRoot),
                                            .buildTree = BytesToString(fields->buildTree) };
-        CanonicalizeRegions(*decoded, producer);
+        // `CompileCache/CompileValue`'s, not a copy here. It was a file-local helper
+        // until a compile node became a second server for this wire; one policy with
+        // two implementations is what #319 cost.
+        CanonicalizeStoredRegions(*decoded, producer);
 
         auto const canonicalBytes = EncodeCompileValue(*decoded);
         auto const keyStr = BytesToString(fields->key);

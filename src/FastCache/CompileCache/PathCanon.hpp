@@ -26,7 +26,7 @@
 /// **There is deliberately no version here either.** Canonical text only ever
 /// travels inside a CompileValue, whose container carries `CompileValueVersion` and
 /// is rejected on mismatch, so a change to the canonicalization spec is expressed by
-/// bumping that — and by the `objkey-v5` schema tag in the launcher's ComputeKey,
+/// bumping that — and by the `objkey-v6` schema tag in the launcher's ComputeKey,
 /// which re-keys the cache so stale entries miss rather than being localized under
 /// rules they were not written by. A version here was declared once and never
 /// referenced by anything, because it had no work to do; `header-state-v1` is the

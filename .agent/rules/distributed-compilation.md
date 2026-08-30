@@ -719,6 +719,55 @@ the other. Three parts of that are each load-bearing:
   for a manifest before the object fetch runs at all, so the ceiling is two either
   way, and `TryDirectMode` is what would have to change for it to be one.
 
+**A premise can be correct when it is written and false when it is read, and
+nothing connects the two.** `CacheProxy`'s STORE handler ignored the roots the
+client sent, with a comment saying why: *"Canonicalization is the SHARED cache's
+job ... What this tier stores is what this machine will replay."* Both halves were
+true. A node was a private tier in front of `fastcached`, which canonicalized every
+store, and doing it twice would have been the redundancy the comment refused. Then
+[#229](https://github.com/LASTRADA-Software/fastcached/issues/229) made a node the
+shared cache in its own right, and neither half survived: there was no longer a
+daemon behind it doing the job, and "this machine" is not one layout, because every
+checkout on it is a different one. Nothing failed at the moment the premise did.
+
+The result was that a value stored through a node kept the producing checkout's
+absolute paths in its text regions
+([#319](https://github.com/LASTRADA-Software/fastcached/issues/319)). Three things
+follow, and each is a rule of its own:
+
+- **A policy every server must apply belongs with the thing it applies to, not with
+  one of the servers.** `CanonicalizeStoredRegions` now lives beside `CompileValue`
+  and both servers call it. It had been a file-local helper in
+  `Protocol/CompileCacheHandler`, so when a second server appeared there was one
+  copy and no way to notice the other end lacked it — `grep` for the function
+  answered "one caller" and that read as normal.
+- **A replayed region is not diagnostics; it is a dependency record.** `/showIncludes`
+  notes are handed to the build system as the object's dependencies, so a region
+  naming another checkout gives this build dependencies on files it will never
+  edit — and no edit here can then invalidate that object. Wrongness that arrives
+  once persists indefinitely.
+- **A path with no `<SRCROOT>` sentinel is NOT evidence of corruption, so do not
+  build a reader that treats it that way.** 92 of the 93 paths a trivial translation
+  unit reports are toolchain headers, which correctly have no token; a consumer
+  refusing sentinel-less paths would refuse essentially every hit. What distinguishes
+  a poisoned region from a sound one is not visible in any single path, which is why
+  the retirement is a schema-tag bump (`objkey-v6` / `manifest-v6`) rather than a
+  heuristic.
+
+**A manifest that revalidates nothing revalidates forever, and `all_of` is how it
+gets written.** `BuildManifest` drops a reported dependency classified as toolchain,
+because `toolchainStamp` covers those collectively. `IsToolchainHeader` reports every
+path outside both roots as toolchain — so a header belonging to ANOTHER checkout is
+classified exactly as an SDK header is, and dropped. Feed it the paths from an
+uncanonicalized region and every one of them drops, leaving a manifest naming the
+translation unit and not one header. `ValidateManifest` then re-hashes the TU, finds
+it unchanged, and serves the object however the headers move — on a first build, in a
+fresh directory, with no stale ninja graph anywhere in the story. Both sides now
+refuse: `BuildManifest` answers `NoProjectDeps` when dependencies were reported and
+none survived, and `ValidateManifest` refuses an empty entry set rather than passing
+`all_of` vacuously. The refusal costs direct mode for that compile and the ordinary
+preprocessed key still serves it, which is the same trade `Unanchored` already makes.
+
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node
 looks redundant — it is not, because a developer who rebuilds one tree twenty times a
