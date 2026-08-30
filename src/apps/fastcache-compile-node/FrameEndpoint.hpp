@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeSurfaces.hpp"
+
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/IListener.hpp>
@@ -245,23 +247,31 @@ class FrameEndpoint
     /// fails in two ways belonging to two taxonomies -- a malformed listen spec is a
     /// `ConfigError`, an address that will not bind is a `NetError` -- the caller's
     /// response is identical either way, and what it needs is the text.
-    /// @param listenSpec `port`, `host:port` or `[v6]:port`.
-    /// @param defaultHost What a bare port binds to. Differs per surface and is the
-    ///        caller's decision: a scheduler no peer can dial does nothing, while a
-    ///        node's private cache reachable from the network is a decision.
-    /// @param responder Answers each request; must outlive the endpoint.
-    /// @param what Names this surface in log lines.
-    /// @param logger Where to announce the bound address.
-    /// @return The running endpoint, or why it could not be served.
+    /// **A surface, never an address.** This used to take the listen spec, the host a
+    /// bare port falls back to and the surface's name as three loose arguments, and
+    /// every caller supplied its own -- so the port map lived here as well as in the
+    /// four other places #288 found it, and a new surface could be opened without
+    /// appearing on the map an operator is told to build a firewall from.
+    ///
+    /// Taking the enumerator makes that impossible rather than merely discouraged:
+    /// there is no argument to pass a bare string to, so a port cannot be opened
+    /// without a row, and a row cannot exist without `RowsInEnumeratorOrder`
+    /// accepting it. A guard that fails the build beats one that fails a suite.
     /// @param io The loop this endpoint accepts and answers on. It must be
     ///        `Start()`ed after every endpoint has been created, so the listener is
     ///        bound and adopted before anything begins accepting.
-    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(NodeIoLoop& io,
-                                                                                          std::string_view listenSpec,
-                                                                                          std::string_view defaultHost,
-                                                                                          IFrameResponder& responder,
-                                                                                          std::string_view what,
-                                                                                          ILogger& logger);
+    /// @param surface Which surface to serve. Its row supplies the address, the host
+    ///        a bare port takes and the name used in log lines -- including the
+    ///        asymmetry between them, which is the anti-leeching rule rather than a
+    ///        caller's preference: a scheduler no peer can dial does nothing, while a
+    ///        node's private cache reachable from the network is this machine's whole
+    ///        build output served to strangers.
+    /// @param cfg What the operator asked for; the row resolves the endpoint from it.
+    /// @param responder Answers each request; must outlive the endpoint.
+    /// @param logger Where to announce the bound address.
+    /// @return The running endpoint, or why it could not be served.
+    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(
+        NodeIoLoop& io, NodeSurface surface, NodeConfig const& cfg, IFrameResponder& responder, ILogger& logger);
 
     /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
     ~FrameEndpoint();

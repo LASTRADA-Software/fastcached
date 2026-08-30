@@ -638,22 +638,29 @@ FrameEndpoint::~FrameEndpoint()
     _server->Shutdown();
 }
 
-std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(NodeIoLoop& io,
-                                                                                std::string_view listenSpec,
-                                                                                std::string_view defaultHost,
-                                                                                IFrameResponder& responder,
-                                                                                std::string_view what,
-                                                                                ILogger& logger)
+std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
+    NodeIoLoop& io, NodeSurface surface, NodeConfig const& cfg, IFrameResponder& responder, ILogger& logger)
 {
-    auto const endpoint = ParseEndpoint(listenSpec, defaultHost);
-    if (!endpoint.has_value())
-        return std::unexpected { std::format("'{}' is not [<address>:]<port>", listenSpec) };
+    // The row resolves it, so the address this binds and the address
+    // `--print-surfaces` prints are the same computation rather than two that agree
+    // today. The default host arrives with it, which is what stopped each caller
+    // choosing its own -- the cache's loopback and the scheduler's wildcard are the
+    // anti-leeching rule, and a rule spelled at two call sites is a rule that drifts.
+    // Not served means the spec is empty, or a companion flag that switches this
+    // surface on is unset. Never a malformed address -- `StartupPolicyRejection` walks
+    // the same rows and refuses that by name, echoing what the operator typed, long
+    // before any tier is built.
+    auto const resolved = SoleEndpointOf(surface, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
+    auto const& row = RowFor(surface);
 
-    auto listener = PlatformListener::Bind(io.Reactor(), endpoint->first, endpoint->second);
+    auto listener = PlatformListener::Bind(io.Reactor(), endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())
         return std::unexpected { std::format("cannot bind {}:{} ({})",
-                                             endpoint->first,
-                                             endpoint->second,
+                                             endpoint.host,
+                                             endpoint.port,
                                              listener ? listener->BindError() : std::string_view { "null listener" }) };
 
     // No accept-poll timeout to apply any more, and its absence is the change rather
@@ -666,14 +673,14 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     // The port the listener ACTUALLY bound, not the one asked for. `0` means "pick a
     // free one", and an endpoint that echoed `:0` back could not tell an operator --
     // or a test -- where it ended up.
-    auto bound = std::format("{}:{}", endpoint->first, listener->BoundPort());
-    logger.Logf(LogLevel::Info, "{} listening on {}", what, bound);
+    auto bound = std::format("{}:{}", endpoint.host, listener->BoundPort());
+    logger.Logf(LogLevel::Info, "{} listening on {}", row.name, bound);
 
     // `new` rather than `make_unique` because the constructor is private: the two ways
     // to reach it are this factory, which has already proved the listener is bound,
     // and nothing else.
     return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, what, std::move(bound), logger } };
+        io, std::move(listener), responder, row.name, std::move(bound), logger } };
 }
 
 } // namespace FastCache::Node

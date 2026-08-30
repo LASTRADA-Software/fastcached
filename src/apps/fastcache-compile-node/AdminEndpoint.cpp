@@ -116,10 +116,14 @@ namespace
         if (auto const& hostName = host.Facts().hostName; !hostName.empty())
             names.push_back(hostName);
 
-        if (auto const endpoint = ParseEndpoint(cfg.adminListen, AdminListenDefaultHost); endpoint.has_value())
+        // The address this surface will actually bind, from its own row. Derived here
+        // a second time, a certificate could name an address the surface no longer
+        // takes -- and a certificate naming the wrong host is the browser warning this
+        // function exists to avoid.
+        if (auto const endpoints = RowFor(NodeSurface::Admin).Resolve(cfg); !endpoints.empty())
         {
             constexpr std::array<std::string_view, 3> Wildcards { "0.0.0.0", "::", "[::]" };
-            auto const& bindHost = endpoint->first;
+            auto const& bindHost = endpoints.front().host;
             if (!std::ranges::contains(Wildcards, bindHost) && !std::ranges::contains(names, bindHost))
                 names.push_back(bindHost);
         }
@@ -761,8 +765,8 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     if (cfg.dashboard && fleet.has_value())
         routes = MakeFleetRoutes(*fleet, credential, DashboardRefreshSeconds, sampler);
 
-    auto started = AdminEndpoint::Start(cfg.adminListen,
-                                        AdminListenDefaultHost,
+    auto started = AdminEndpoint::Start(NodeSurface::Admin,
+                                        cfg,
                                         metrics,
                                         std::move(snapshot),
                                         logger,
@@ -828,23 +832,27 @@ AdminEndpoint::~AdminEndpoint()
     _server->Shutdown();
 }
 
-std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(std::string_view listenSpec,
-                                                                                std::string_view defaultHost,
+std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(NodeSurface surface,
+                                                                                NodeConfig const& cfg,
                                                                                 IMetricsSink& metrics,
                                                                                 AdminHttpServer::SnapshotProvider snapshot,
                                                                                 ILogger& logger,
                                                                                 std::vector<AdminRoute> routes,
                                                                                 TlsContext* tls)
 {
-    auto const endpoint = ParseEndpoint(listenSpec, defaultHost);
-    if (!endpoint.has_value())
-        return std::unexpected { std::format("'{}' is not [<address>:]<port>", listenSpec) };
+    // Resolved by the row, so the loopback default that decides whether a credential
+    // is required is the same value this actually binds. A malformed address cannot
+    // arrive: `StartupPolicyRejection` walks these rows and refuses it by name first.
+    auto const resolved = SoleEndpointOf(surface, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
 
-    auto listener = BlockingListener::Bind(endpoint->first, endpoint->second);
+    auto listener = BlockingListener::Bind(endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())
         return std::unexpected { std::format("cannot bind {}:{} ({})",
-                                             endpoint->first,
-                                             endpoint->second,
+                                             endpoint.host,
+                                             endpoint.port,
                                              listener ? listener->BindError() : std::string_view { "null listener" }) };
 
     // The endpoint's own values, not this caller's: the daemon serves the same
@@ -857,7 +865,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
     return std::unique_ptr<AdminEndpoint> { new AdminEndpoint { std::move(listener),
                                                                 metrics,
                                                                 std::move(snapshot),
-                                                                std::format("{}:{}", endpoint->first, endpoint->second),
+                                                                std::format("{}:{}", endpoint.host, endpoint.port),
                                                                 logger,
                                                                 std::move(routes),
                                                                 tls } };

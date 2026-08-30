@@ -503,6 +503,19 @@ struct NodeConfig
     bool help { false };
     bool version { false };
 
+    /// List every port this configuration would open, and exit.
+    ///
+    /// A mode rather than a serving option, like `--version` -- and deliberately
+    /// absent from a service registration, since a worker that printed its ports at
+    /// every boot instead of serving them would be a service that never starts.
+    ///
+    /// It renders the RESOLVED configuration rather than the defaults, which is what
+    /// makes it worth having: an operator building a firewall list needs the ports
+    /// this invocation would bind, and a list showing `127.0.0.1` for a node started
+    /// with `--listen-cache 0.0.0.0:6674` would tell them a surface is loopback-only
+    /// when it is open to the network.
+    bool printSurfaces { false };
+
     /// What to do to the cluster instead of serving, when anything.
     ///
     /// A mode rather than a serving option, like `--install-service`: the process

@@ -17,6 +17,7 @@
 #include "NodeConfig.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
+#include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerTier.hpp"
@@ -221,6 +222,44 @@ void InstallNodeStopHandlers()
 
     logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
     return std::move(inherited.front());
+}
+
+/// Bind the compile port this configuration names.
+///
+/// Separated from `WorkerBody` for the reason `AdoptActivatedListener` is: `main.cpp`
+/// is in no test target, so logic left there has no coverage at all -- and this is the
+/// one surface whose address is resolved and bound in the same breath, since the
+/// compile port is served by a plain listener rather than by an endpoint class.
+///
+/// Through the surface's row, like every other port this node opens. It is the one
+/// whose host is a FLAG rather than a fallback a bare port takes -- `--bind` and
+/// `--port` are separate values of separate types -- which is why its row carries an
+/// empty `defaultHost` and a resolver reading those two fields instead of a spec, and
+/// why what an operator's firewall worksheet shows for this surface is what this
+/// binds.
+/// @param cfg What the operator asked for.
+/// @return The bound listener, or why it could not be served.
+[[nodiscard]] std::expected<std::unique_ptr<BlockingListener>, std::string> BindCompilePort(NodeConfig const& cfg)
+{
+    // Through the shared resolver, which refuses by name rather than leaving this
+    // caller to assert in a comment that the result cannot be empty. It cannot be
+    // today -- the compile port is served unless a supervisor handed a listener over,
+    // and this runs only when none was -- but a resolver that later grows a reason to
+    // return nothing would turn that comment into a crash, in the file least able to
+    // notice.
+    auto const resolved = SoleEndpointOf(NodeSurface::Compile, cfg);
+    if (!resolved.has_value())
+        return std::unexpected { resolved.error() };
+    auto const& endpoint = *resolved;
+    auto bound = BlockingListener::Bind(endpoint.host, endpoint.port, /*backlog=*/128);
+    // `IsBound()`, not a null check: `Bind` hands back a listener carrying the
+    // diagnostic rather than nothing at all.
+    if (bound == nullptr || !bound->IsBound())
+        return std::unexpected { std::format("could not bind {}:{} ({})",
+                                             endpoint.host,
+                                             endpoint.port,
+                                             bound ? bound->BindError() : std::string_view { "null listener" }) };
+    return bound;
 }
 
 /// What `main` returns when the operator's configuration is wrong.
@@ -542,16 +581,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     std::unique_ptr<BlockingListener> bound;
     if (activated == nullptr)
     {
-        bound = BlockingListener::Bind(cfg.bindAddress, cfg.port, /*backlog=*/128);
-        if (bound == nullptr || !bound->IsBound())
+        auto listener = BindCompilePort(cfg);
+        if (!listener.has_value())
         {
-            logger.Logf(LogLevel::Error,
-                        "could not bind {}:{} ({})",
-                        cfg.bindAddress,
-                        cfg.port,
-                        bound ? bound->BindError() : std::string_view { "null listener" });
+            logger.Logf(LogLevel::Error, "{}", listener.error());
             return 1;
         }
+        bound = std::move(*listener);
     }
 
     // Without this the accept loop cannot be stopped on Linux at all, and the way
@@ -1217,6 +1253,15 @@ int main(int argc, char** argv)
     if (cfg.version)
     {
         std::cout << "fastcache-compile-node " << FASTCACHE_NODE_VERSION << '\n';
+        return 0;
+    }
+    if (cfg.printSurfaces)
+    {
+        // Before the startup rules below, deliberately. An operator reaches for this
+        // BECAUSE a port is wrong, and refusing to show the map until the
+        // configuration is already valid would withhold it exactly when it is wanted.
+        // It opens nothing and changes nothing, so there is no state to protect.
+        std::cout << RenderSurfaces(cfg);
         return 0;
     }
 

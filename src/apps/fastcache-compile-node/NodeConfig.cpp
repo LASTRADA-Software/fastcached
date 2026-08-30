@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
+#include "NodeSurfaces.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -282,41 +283,6 @@ namespace
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
-    }
-
-    /// Whether text names an address, with a host somebody wrote.
-    ///
-    /// `SplitHostPort` and `ParseTcpPort`, which is what `DiscoveryTier::Start` asks
-    /// -- plus the host, which it does not. An empty one is refused because both
-    /// tiers that would receive it treat it as something the operator did not say:
-    /// `UdpSocket::Send` rejects an empty destination outright, and an empty BIND
-    /// host reaches `getaddrinfo` as nullptr under `AI_PASSIVE`
-    /// (`SocketAddress.cpp:163`), which is the wildcard on every platform. So
-    /// `--listen-cache=:6674` would quietly bind every interface -- the exposure
-    /// `CacheListenDefaultHost`'s loopback exists to make a decision rather than a
-    /// typo -- and `--discovery=:6681` would announce to nobody.
-    /// @param text The value as an operator wrote it.
-    /// @return Whether it names a host and a port.
-    [[nodiscard]] bool ParsesAsBeaconAddress(std::string_view text)
-    {
-        auto const address = SplitHostPort(text);
-        return address.has_value() && !address->first.empty() && ParseTcpPort(address->second).has_value();
-    }
-
-    /// Whether text names an address a listen surface can bind.
-    ///
-    /// The grammar above, plus the one thing a bound surface takes and a beacon
-    /// cannot: a bare port, which binds that surface's own `*ListenDefaultHost`.
-    /// Written in terms of the other rather than beside it, because "an address, or
-    /// just a port" is the whole of the difference and a second copy of the address
-    /// half is how the two would come to disagree.
-    /// @param text The value as an operator wrote it.
-    /// @return Whether the tier could bind it.
-    [[nodiscard]] bool ParsesAsListenEndpoint(std::string_view text)
-    {
-        if (!SplitHostPort(text).has_value())
-            return ParseTcpPort(text).has_value();
-        return ParsesAsBeaconAddress(text);
     }
 
     /// One cluster member, from the `<id>=<host>:<port>` an operator typed.
@@ -834,6 +800,23 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .apply = SetTrue<&NodeConfig::help>(),
           .flow = ParseFlow::Stop,
           .description = "show this help and exit" },
+        // `ParseFlow::Continue`, unlike `--help` and `--version`, and the difference
+        // is the whole point of the flag. Those two ignore the rest of the command
+        // line; this one REPORTS on it. With `Stop`, `--print-surfaces
+        // --listen-scheduler 6675` parsed nothing after the first flag and printed
+        // the defaults -- a worksheet that silently describes a different node from
+        // the one the operator asked about, which is the misleading-document failure
+        // this flag exists to prevent.
+        { .primary = "--print-surfaces",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::printSurfaces>(),
+          .description = "list every port this configuration would open,\n"
+                         "with its protocol, and exit. Generated from the\n"
+                         "node's own port map rather than from prose, so a\n"
+                         "firewall list comes from the binary that binds\n"
+                         "them. Pass the flags you would run with: it\n"
+                         "prints what THIS configuration serves, not the\n"
+                         "defaults." },
         { .primary = "--version",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::version>(),
@@ -1168,67 +1151,64 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     // `--install-service` returns long before reaching -- so a typo registered
     // cleanly and then exited at every boot into a log nobody reads (#186).
     //
-    // A table because the four differ only in the flag's name, where its text lives
-    // and which grammar it takes; written out as four rules they would be the
-    // copy-paste-differing-by-a-constant this codebase keeps a list about. Each row
-    // asks its OWN tier's question, which is why `--discovery` carries a different
-    // one: a beacon is sent TO an address, so no bare port may default to a host,
-    // and a shared "is this an endpoint" test would accept `6681` here and leave
-    // the tier to refuse it at every boot.
+    // Walked off `NodeSurfaceTable()`, which is the port map. This used to be an
+    // `EndpointFlags` table of its own, four rows carrying a flag spelling, a member
+    // pointer, a grammar and a shape -- the same four columns for the same flags the
+    // surface rows carry, which made it the fifth place the port map lived and the
+    // one closest in shape to the table replacing it. Two tables with two member
+    // pointers for one concept do not merely drift, they drift *silently*: the half
+    // an operator is refused by and the half `--print-surfaces` prints them from
+    // would have been different sets, so a worksheet could name a surface whose
+    // spelling was never validated (#288).
     //
-    // `--listen-raft` is deliberately absent: its own rows already refuse it both
-    // absent and unusable, and a second row would answer in their place.
-    struct EndpointFlag
-    {
-        std::string_view flag;            ///< The flag, as an operator types it.
-        std::string NodeConfig::* value;  ///< Where its text lives.
-        bool (*parses)(std::string_view); ///< Its tier's own grammar.
-        std::string_view shape;           ///< What it should have looked like.
-    };
-
-    constexpr auto EndpointFlags = std::to_array<EndpointFlag>({
-        { .flag = "--listen-scheduler",
-          .value = &NodeConfig::schedulerListen,
-          .parses = ParsesAsListenEndpoint,
-          .shape = "[<address>:]<port>" },
-        { .flag = "--admin-listen",
-          .value = &NodeConfig::adminListen,
-          .parses = ParsesAsListenEndpoint,
-          .shape = "[<address>:]<port>" },
-        { .flag = "--listen-cache",
-          .value = &NodeConfig::cacheListen,
-          .parses = ParsesAsListenEndpoint,
-          .shape = "[<address>:]<port>" },
-        { .flag = "--discovery",
-          .value = &NodeConfig::discoveryAddress,
-          .parses = ParsesAsBeaconAddress,
-          .shape = "<address>:<port>" },
-    });
-
-    // "Parses when GIVEN", never "must parse". Empty is how three of these say the
-    // surface is off, and `--listen-cache` carries a non-empty default every
-    // ordinary node runs with -- so a rule spelled the other way would refuse the
-    // default deployment outright.
+    // Each row asks its OWN surface's question, which is why `--discovery` carries a
+    // different grammar: a beacon is sent TO an address, so no bare port may default
+    // to a host, and a shared "is this an endpoint" test would accept `6681` here and
+    // leave the tier to refuse it at every boot.
+    //
+    // **`--listen-raft` is now in this loop, and its absence used to be correct.**
+    // The old comment said its own rules already refuse it absent and unusable, and
+    // that a second row would answer in their place -- true while this table held
+    // four hand-picked flags, and falsified by one that holds every surface. Leaving
+    // it out would now need a column meaning "somebody else checks this one", which
+    // is a column encoding an exception, in the table written to delete exceptions.
+    //
+    // What makes the coexistence safe is that both narrower rules still fire for the
+    // inputs they were written about: `--node-id` with an EMPTY `--listen-raft` still
+    // reaches the first, and a WELL-FORMED `--listen-raft` with no `--node-id` still
+    // reaches the second. Only a malformed address moves here -- and it is better
+    // answered here, because this message echoes what the operator typed and the
+    // consensus prose can name a flag but not a value.
+    //
+    // "Parses when GIVEN", never "must parse". Empty is how five of the six say the
+    // surface is off, and `--listen-cache` carries a non-empty default every ordinary
+    // node runs with -- so a rule spelled the other way would refuse the default
+    // deployment outright.
     //
     // Asked before the rules below, because a value that is not an address is a typo
     // and answering it with a policy rule about the flag it was typed on describes
     // the wrong problem. Unlike those rules, whose messages are static prose, this
     // one echoes what the operator wrote -- which is the half a table row cannot do
-    // and the half that matters when four ports were typed and one is wrong.
-    for (auto const& endpoint: EndpointFlags)
+    // and the half that matters when five ports were typed and one is wrong.
+    for (auto const& surface: NodeSurfaceTable())
     {
-        auto const& text = cfg.*endpoint.value;
-        if (text.empty() || endpoint.parses(text))
+        // The compile port has no spec text: its halves are `--bind` and `--port`,
+        // each validated by its own value parser, so there is nothing here to judge.
+        if (surface.spec == nullptr)
             continue;
 
-        // "cannot use" rather than "cannot bind": three of these are bound and the
-        // fourth is sent to, and a message that named the wrong verb would send an
+        auto const& text = cfg.*surface.spec;
+        if (text.empty() || surface.grammar.parses(text))
+            continue;
+
+        // "cannot use" rather than "cannot bind": most of these are bound and
+        // discovery is sent to, and a message that named the wrong verb would send an
         // operator looking for a listening socket discovery never opens.
         return std::format("{}={} is not {}. The surface it configures cannot use an address that was never one, so "
                            "this node refuses to start.",
-                           endpoint.flag,
+                           PrimaryFlag(surface),
                            text,
-                           endpoint.shape);
+                           surface.grammar.shape);
     }
 
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
@@ -1310,7 +1290,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the text an operator typed.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.nodeId.empty() && !ParseEndpoint(c.raftListen, RaftListenDefaultHost).has_value();
+                  // Asked of the raft row, which is what `ConsensusTier::Start`
+                  // resolves through -- so this rule and the tier decide on one
+                  // answer. The row's own `--node-id` gate is why the id is tested
+                  // first: without it the row resolves to nothing for a reason that
+                  // is not this rule's.
+                  return !c.nodeId.empty() && RowFor(NodeSurface::Raft).Resolve(c).empty();
               },
           .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
                      "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
@@ -1428,12 +1413,16 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               [](NodeConfig const& c) {
                   if (!c.dashboard || c.adminListen.empty() || !c.dashboardTokenFile.empty())
                       return false;
-                  // The same default host `AdminEndpoint::Start` binds with --
-                  // the constant, not a second copy of the literal -- so this rule
-                  // judges the address the endpoint will actually take rather than
-                  // the text an operator typed.
-                  auto const endpoint = ParseEndpoint(c.adminListen, AdminListenDefaultHost);
-                  return endpoint.has_value() && !IsLoopbackHost(endpoint->first);
+                  // The address `AdminEndpoint::Start` will actually take, asked of
+                  // the surface's own row rather than derived here from the same
+                  // constant. This is the ONE security decision that hangs on the
+                  // loopback default, so a second author of the resolution is the
+                  // last place to keep one -- and the admin row could grow a
+                  // condition the way the raft row already has (`--node-id`), at
+                  // which point a copy would judge an address the surface no longer
+                  // binds and silently stop requiring a credential.
+                  auto const endpoints = RowFor(NodeSurface::Admin).Resolve(c);
+                  return !endpoints.empty() && !IsLoopbackHost(endpoints.front().host);
               },
           .message = "--dashboard on a non-loopback --admin-listen needs --dashboard-token-file: the page is a "
                      "map of every member's hostname, endpoint and capacity, and an operator who bound it to "

@@ -221,11 +221,39 @@ readable and silently ignored. Every rule below has already been one of them.
   `--discovery` were the same defect one tier along
   ([#186](https://github.com/LASTRADA-Software/fastcached/issues/186)): each names an
   address, each grammar was checked where the surface is opened, and a typo therefore
-  registered cleanly and killed the node at every boot. They are one `EndpointFlag`
-  table now, because four rules differing only in a flag name and a grammar are the
+  registered cleanly and killed the node at every boot. They were one `EndpointFlag`
+  table, because four rules differing only in a flag name and a grammar are the
   repetition a table exists to remove -- and `--listen-cache` is in it, which is easy
   to miss: its failure is fatal only once the address is *named*, and a value that
   does not parse is named by construction.
+
+  **Since [#288](https://github.com/LASTRADA-Software/fastcached/issues/288) that
+  table is `NodeSurfaceTable()`, and `--listen-raft` is in it. The old exclusion was
+  CORRECT and stopped being so.** `EndpointFlags` deliberately left raft out, on the
+  reasoning that its own rules already refuse it both absent and unusable and a second
+  row would answer in their place. That was true of a table holding four hand-picked
+  flags. It is false of one holding every surface: leaving raft out would need a
+  column meaning *"somebody else checks this one"*, which is a column encoding an
+  exception, in the table written to delete exceptions. Do not re-derive the old rule
+  from the old reasoning -- the premise moved, not the logic.
+
+  **The general form, which is the part worth keeping: a narrower rule and a table
+  rule coexist as long as the narrower one still fires for the inputs it was written
+  about.** That is the check to run before repointing any rule loop, and it is what
+  made this move safe rather than a behaviour change with unknown blast radius: with
+  raft in the loop, `--node-id` plus an *empty* `--listen-raft` still reaches the
+  cross-flag rule, and a *well-formed* `--listen-raft` with no `--node-id` still
+  reaches the other. Only a malformed address moves -- and it moves to the better
+  answer, because the table's message echoes what the operator typed while the
+  cross-flag prose can name a flag but not a value.
+
+  **And when a check moves to where the table is walked, its message moves with it,
+  and the test follows the message.** Three checks relocated in one change --
+  raft's grammar into the surface loop, `FrameEndpoint::Start`'s parse out to
+  `StartupPolicyRejection`, and `AdminEndpoint`'s with it -- so a test asserting only
+  "it was refused" now passes under both behaviours and pins neither. The raft case
+  did exactly that and had to be rewritten to pair each input with text only the
+  answering rule produces. **Assert the message, not merely the refusal.**
 
   What stayed out needs stating carefully, because the easy reason is the wrong one.
   `--bind`, `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are

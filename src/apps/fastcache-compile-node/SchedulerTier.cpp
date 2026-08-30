@@ -67,12 +67,12 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     auto tier =
         std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, wallClock, metrics, logger, signingKey } };
 
-    // A bare port binds the WILDCARD here, the opposite of the cache surface's
-    // loopback, and why is on `SchedulerListenDefaultHost`. Named rather than spelled
-    // here so that whatever else comes to judge this value is judging the address
-    // this tier will actually take.
-    auto started =
-        FrameEndpoint::Start(io, cfg.schedulerListen, SchedulerListenDefaultHost, tier->_responder, "scheduler", logger);
+    // The surface, not an address. A bare port binds the WILDCARD here, the opposite
+    // of the cache's loopback, and that asymmetry is now a column of this surface's
+    // row rather than an argument this call site chooses -- so the address bound
+    // here, the one an install-time refusal judges and the one `--print-surfaces`
+    // prints are one computation instead of three that agree today.
+    auto started = FrameEndpoint::Start(io, NodeSurface::Scheduler, cfg, tier->_responder, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 

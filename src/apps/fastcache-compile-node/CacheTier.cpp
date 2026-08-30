@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeSurfaces.hpp"
 #include "RemoteUpstream.hpp"
 
 #include <FastCache/Cache/CowTreeStorage.hpp>
@@ -192,11 +193,11 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     auto tier =
         std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };
 
-    // Loopback for a bare port, the OPPOSITE of the scheduler's wildcard, and why is
-    // on `CacheListenDefaultHost`. Named rather than spelled here so that whatever
-    // else comes to judge this value is judging the address this tier will actually
-    // take.
-    auto started = FrameEndpoint::Start(io, cfg.cacheListen, CacheListenDefaultHost, tier->_responder, "cache", logger);
+    // The surface, not an address. Loopback for a bare port, the OPPOSITE of the
+    // scheduler's wildcard, and that asymmetry is now a column of this surface's row
+    // rather than an argument this call site chooses -- so nothing here can open a
+    // port the operator's firewall worksheet does not list.
+    auto started = FrameEndpoint::Start(io, NodeSurface::Cache, cfg, tier->_responder, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -283,22 +284,26 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // beside it, went on reading as though they meant something. It names them
     // when they did, because a flag silently doing nothing is the shape this
     // codebase keeps a list about.
-    if (cfg.cacheListen.empty())
+    // **Whether** this surface is served is the row's answer -- the same one
+    // `--print-surfaces` reads -- so a worksheet cannot name a port this function then
+    // declines to bind. **Which sentence** an operator gets is this function's own,
+    // because a row resolving to nothing cannot say which of two reasons applied, and
+    // the two send an operator to different flags.
+    if (RowFor(NodeSurface::Cache).Resolve(cfg).empty())
     {
-        auto const configured = cfg.cacheMemoryExplicit || !cfg.cacheDir.empty();
-        logger.Logf(LogLevel::Info,
-                    "--listen-cache is empty; serving no local cache tier{}",
-                    configured ? " (--cache-memory/--cache-dir have no effect without a port)" : "");
-        return std::unique_ptr<CacheTier> {};
-    }
-
-    // Neither half configured, which is what `--cache-memory 0` means without a
-    // `--cache-dir` beside it: there is nothing to keep objects in, so there is no
-    // tier. Said out loud rather than left to produce a cache port answering out of
-    // nothing.
-    if (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty())
-    {
-        logger.Logf(LogLevel::Info, "--cache-memory 0 and no --cache-dir; serving no local cache tier");
+        if (cfg.cacheListen.empty())
+        {
+            auto const configured = cfg.cacheMemoryExplicit || !cfg.cacheDir.empty();
+            logger.Logf(LogLevel::Info,
+                        "--listen-cache is empty; serving no local cache tier{}",
+                        configured ? " (--cache-memory/--cache-dir have no effect without a port)" : "");
+        }
+        else
+            // A port with neither half configured, which is what `--cache-memory 0`
+            // means without a `--cache-dir` beside it: nothing to keep objects in, so
+            // no tier. Said out loud rather than left to produce a cache port
+            // answering out of nothing.
+            logger.Logf(LogLevel::Info, "--cache-memory 0 and no --cache-dir; serving no local cache tier");
         return std::unique_ptr<CacheTier> {};
     }
 

@@ -49,6 +49,7 @@ add_executable(fastcache-compile-node
     ScratchClaim.cpp
     LocalCache.cpp
     NodeConfig.cpp
+    NodeSurfaces.cpp
     NodeToolchains.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
@@ -102,6 +103,8 @@ if(FASTCACHED_BUILD_TESTS)
         AuthRefusalContract_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
+        NodeSurfaces.cpp
+        NodeSurfaces_test.cpp
         NodeMembership_test.cpp
         NodeToolchains.cpp
         NodeToolchains_test.cpp

@@ -7,13 +7,20 @@ It is the fleet's one binary, and it wears several hats. Compiling is the only o
 it always wears; the rest are surfaces you switch on, and every section below is
 about one of them:
 
-| Surface | Flag | Default |
+| Role | What switches it on | Default |
 |---|---|---|
-| Compile worker | `--port` | on, `6676` |
+| Compile worker | `--bind`, `--port` | on, `0.0.0.0:6676` |
 | [A cache tier of its own](#a-cache-of-its-own) | `--listen-cache` | on, `127.0.0.1:6674` |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--listen-scheduler` | **off** |
-| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id` | **off** — a lone node leads itself |
+| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id`, `--listen-raft` | **off** — a lone node leads itself |
+| [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
+
+That is the list of **roles**, and it is not a firewall list — `--node-id` switches
+consensus on but is not a port, and a role's default here is not the address it binds
+for a given command line. For the ports, see
+[Every port it opens](#every-port-it-opens) below, or generate the list from the
+binary with `--print-surfaces`.
 
 What it never does is **write to the shared cache**. A worker is given no
 credentials for it: the object it produces goes back to the client that asked for
@@ -40,6 +47,78 @@ other.
 another client already compiling this key, an unreachable worker — all of them
 fall back. Distribution cannot fail a build; that is what makes it safe to leave
 switched on in a fleet where machines come and go.
+
+## Every port it opens
+
+**Ask the binary, not this page.** `--print-surfaces` lists every port a given
+configuration would bind, with its protocol, and exits without opening anything:
+
+```console
+$ fastcache-compile-node --print-surfaces --listen-scheduler 6675 \
+      --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
+compile           0.0.0.0:6676    TCP
+cache             127.0.0.1:6674  TCP
+scheduler         0.0.0.0:6675    TCP
+admin             -               not served; set --admin-listen
+raft              0.0.0.0:6680    TCP
+discovery beacon  0.0.0.0:6681    UDP
+
+notes:
+  compile: a systemd .socket unit overrides --bind and --port entirely; …
+  cache: loopback for a bare port, the opposite of the scheduler and raft; …
+  …
+```
+
+The `notes:` block is part of the output, not an afterthought: it carries the facts a
+column cannot, including the one that says this list can be **wrong** for the compile
+port. Do not clip it when pasting the worksheet to somebody.
+
+Pass the flags you would actually run with. It prints what **that** configuration
+serves rather than the defaults, so a widened `--listen-cache 0.0.0.0:6674` shows
+as the wildcard and a surface you never turned on says so and names the flag that
+would. The node opens its ports from the same table this prints, so the list and
+the sockets cannot disagree — which is the whole reason to generate a firewall
+worksheet from the binary rather than transcribe one from documentation.
+
+The six surfaces, and what each is for:
+
+| Surface | Flags | Default | Protocol |
+|---|---|---|---|
+| Compile worker | `--bind` + `--port` | `0.0.0.0:6676` — **on** | TCP |
+| Cache tier | `--listen-cache` | `127.0.0.1:6674` — **on** | TCP |
+| Scheduler | `--listen-scheduler` | off; a bare port takes the **wildcard** | TCP |
+| Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
+| Consensus peer | `--listen-raft` | off; a bare port takes the **wildcard**, and needs `--node-id` | TCP |
+| Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
+
+Three things on that table are easy to get wrong and expensive to get wrong:
+
+- **Discovery is UDP.** Five TCP rules and one wrong one leaves a beacon that
+  reaches nobody, and that presents as a fleet that never forms rather than as a
+  firewall mistake.
+- **`--discovery`'s address is where beacons are *sent*, not where they are heard.**
+  Both of its sockets bind the wildcard whatever you write, so
+  `--discovery=255.255.255.255:6681` opens `0.0.0.0:6681` — do not put the broadcast
+  address in a firewall rule. It also takes a **second** port for replies: without
+  `--discovery-reply-port` that one is kernel-chosen, which a restrictive host
+  firewall has to allow as outbound, and a node that can hear beacons but not answer
+  challenges completes no handshake.
+- **A bare port does not mean the same thing on every flag.** `--listen-cache 6674`
+  is loopback because a node's cache is this machine's entire build output;
+  `--listen-scheduler 6675` is the wildcard because a scheduler no peer can dial does
+  nothing. `--admin-listen`'s loopback is the sharpest of the three: it is what the
+  dashboard's credential rule turns on, so widening that address is what makes a
+  token required.
+
+**One caveat `--print-surfaces` states and cannot compute.** Under systemd socket
+activation the `.socket` unit owns the compile port, `--bind` and `--port` are read
+by nothing, and this process is never told which port it got — so `--advertise`
+becomes required and is what names where clients actually go. The command is run by
+hand, never under the supervisor, so it cannot detect this; it prints the note
+instead of guessing.
+
+`--advertise` is deliberately **not** a surface. It is what this node tells other
+machines to dial, not a socket it opens.
 
 ## Quick start
 

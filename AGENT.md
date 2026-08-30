@@ -230,6 +230,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   past and the three standalone-LLVM rows never reached — so those builds were cached
   and could never be dispatched. One installation, two rows; `vswhere`'s answer is
   memoized across them, empty answers included.
+- A port this node LISTENS on is a row of `NodeSurfaceTable()`, and an opener takes
+  the `NodeSurface` — not a listen spec, a default host and a name. The port map lived
+  in five places plus the docs; the guard is the type system, since there is no
+  argument to pass a bare string to. Protocol is a column (discovery is the only UDP
+  surface), so is the host a bare port falls back to. `--print-surfaces` prints the
+  RESOLVED configuration. `--advertise` is not a surface — it is told, not opened.
 - `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - What a node holds back from compiles is what its tier **built**, never what a flag
