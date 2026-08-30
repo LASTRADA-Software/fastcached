@@ -768,6 +768,36 @@ none survived, and `ValidateManifest` refuses an empty entry set rather than pas
 `all_of` vacuously. The refusal costs direct mode for that compile and the ordinary
 preprocessed key still serves it, which is the same trade `Unanchored` already makes.
 
+**A refusal that names somewhere else is an instruction, and reading it as an answer
+takes the whole fleet out of distribution.** `SchedulerService` has always answered a
+non-leader with the leader's endpoint. Only the interactive `--cluster-*` CLI ever read
+it: the launcher dropped it into the same branch as `NoWorker` and `NoCapacity` and
+compiled locally, so a single election removed every client from the fleet until forty
+machines were re-pointed by hand
+([#237](https://github.com/LASTRADA-Software/fastcached/issues/237)). Everything looked
+healthy while it happened — the builds succeeded, the objects were correct, and the only
+symptom was that they were slow.
+
+- **The redirect is judged by SPLITTING the message, never by asking whether it is
+  empty.** An empty message is replaced with the error table's default sentence before it
+  reaches the wire, so "no leader is known" and "the leader is at `h:p`" arrive as the
+  same shape. Only "does this parse as an address" separates them, and a client that
+  skipped the test dials a sentence — which is a scheduler endpoint no operator ever
+  typed. `Cc::RedirectTarget` is the one owner of that question.
+- **The chain is bounded.** Two nodes with a stale `_knownLeader`, or a partition
+  healing, name each other indefinitely; without a ceiling a build spends one connect per
+  translation unit per hop discovering it. Two hops is one more than a correct fleet
+  needs, and running out is an ordinary local compile — which is what every other lease
+  refusal already means.
+- **The RELEASE follows the lease, not the configuration.** A lease issued by the leader
+  the client was redirected to must be resolved there: sent to the configured endpoint it
+  resolves nothing, and the key stays marked in flight on the machine that actually holds
+  it for the whole lease timeout. That is the `already-in-flight` outage #212 records,
+  reached from the client's side.
+- **A fixture with one scheduler cannot fail.** If the first endpoint contacted is
+  already the leader, a build that follows no redirect at all passes every assertion. The
+  case has to have two, and the assertion is that the SECOND is reached.
+
 **A node caches for itself, and what that saves is the round trip rather than the
 compile.** The shared `fastcached` holds every object, so a second copy on the node
 looks redundant — it is not, because a developer who rebuilds one tree twenty times a
