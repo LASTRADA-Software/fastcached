@@ -931,3 +931,67 @@ TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[co
     REQUIRE_FALSE(after.Argv().empty());
     CHECK(after.Argv().front() == "/opt/after/g++");
 }
+
+TEST_CASE("Two node PROCESSES on one host do not share a scratch directory", "[compile-job][scratch-root]")
+{
+    // #279, and the cross-PROCESS half of what a22e056 closed in-process. A worker
+    // derives its scratch root from `temp_directory_path() / "fastcache-compile-node"`
+    // (`fastcache-compile-node/main.cpp`), which is one path per user per machine, and
+    // its job counter starts at 1 in every process. So a second node on the same host
+    // -- a service plus a hand-started debug run, two instances an operator started,
+    // a container sharing a mount -- derives the IDENTICAL `job-1`, and every path
+    // below it: the source, and the hard-coded `tu.o`.
+    //
+    // Two runners over one root is exactly that, and it is a faithful model rather
+    // than an approximation: everything else `CompileJobRunner` reads is fixed at
+    // construction, so a second process differs from a second runner in nothing this
+    // defect touches. `_nextJob` is per instance and starts at 1 in both.
+    //
+    // Unlike the in-process case this is NOT a race and does not need rounds to
+    // catch: there is no lost update to lose. Both runners take `job-1` with
+    // certainty, so the collision is structural and this fails every run.
+    ScratchDirectory scratch { "fc-jobtest-crossproc" };
+    OverlappingEchoRunner runner;
+
+    // Two runners, one root -- two processes, one machine.
+    CompileJobRunner first { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner second { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    std::array<CompileJobRunner*, OverlappingEchoRunner::Overlap> const runners { &first, &second };
+
+    // Same source NAME, different source TEXT: what two machines compiling their own
+    // `main.cpp` against one host look like.
+    std::array<std::string, OverlappingEchoRunner::Overlap> const texts { "int a = 1;", "long b = 2;" };
+
+    auto const asText = [](std::vector<std::byte> const& bytes) {
+        std::string out;
+        out.reserve(bytes.size());
+        for (auto const byte: bytes)
+            out.push_back(static_cast<char>(byte));
+        return out;
+    };
+
+    std::array<std::expected<CompileOutcome, JobError>, OverlappingEchoRunner::Overlap> results {};
+    std::latch start { static_cast<std::ptrdiff_t>(OverlappingEchoRunner::Overlap) };
+    {
+        std::vector<std::jthread> threads;
+        for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+            threads.emplace_back([&, index] {
+                auto job = Job();
+                job.preprocessed = texts.at(index);
+                start.arrive_and_wait();
+                // No Catch2 macro on this thread: the assertion macros are not
+                // thread-safe, so the answer is carried back and checked below.
+                results.at(index) = runners.at(index)->Run(job);
+            });
+    } // joined
+
+    for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
+    {
+        INFO("process " << index);
+        // Either failure mode is this defect: one runner answering with the other's
+        // object, or one runner's ScratchGuard deleting the directory under the
+        // other and the job being blamed on the disk as ScratchUnavailable.
+        REQUIRE(results.at(index).has_value());
+        REQUIRE(asText(results.at(index)->object) == texts.at(index));
+    }
+}
