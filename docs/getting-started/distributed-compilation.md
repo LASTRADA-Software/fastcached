@@ -355,7 +355,11 @@ cmake -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc ...
 `FASTCACHE_ADDR` is the **cache** — a `fastcached`, or the local node's own
 `--listen-cache`. It defaults to `127.0.0.1:6674` when unset, which is where a
 node on this machine already answers, so a developer running a node needs only
-the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out.
+the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out -- on a POSIX shell. PowerShell cannot
+express a set-but-empty variable: `$env:FASTCACHE_ADDR = ""` looks set from inside
+PowerShell and reaches the child process as *unset*, so the launcher takes its default
+and goes on caching. Use `-DFASTCACHE_ADDR=` or `-DUSE_COMPILER_CACHE=OFF` there; see
+[the launcher's note](../tools/fastcache-cc.md#the-empty-opt-out-does-not-work-from-powershell).
 
 Getting it **wrong** costs the cache and nothing else: a daemon that cannot be
 reached, or that answers and refuses, is reported (`cache unavailable (…)`,

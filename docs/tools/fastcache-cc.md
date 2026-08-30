@@ -200,7 +200,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
-| `FASTCACHE_ADDR` | `host:port` of the cache — a `fastcached`, or a `fastcache-compile-node`'s `--listen-cache`. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. Set but **empty** is the opt-out and means no caching. | `127.0.0.1:6674` |
+| `FASTCACHE_ADDR` | `host:port` of the cache — a `fastcached`, or a `fastcache-compile-node`'s `--listen-cache`. Hostnames, IPv4 literals, and bracketed IPv6 (`[::1]:6674`) all resolve. Set but **empty** is the opt-out and means no caching -- but see the PowerShell note below, where that spelling does not reach the launcher. | `127.0.0.1:6674` |
 | `FASTCACHE_SOURCE_DIR` | Checkout source root, used for keying and path canonicalization. | unset — **no caching** |
 | `FASTCACHE_BINARY_DIR` | Build output root. | unset — **no caching** |
 | `FASTCACHE_PREFETCH_GROUP` | Prefetch grouping id. **Not** part of the cache key, so it never partitions the cache. | `default` |
@@ -233,6 +233,23 @@ missing when nothing caches — the build still succeeds, which is exactly why t
 is worth checking before concluding the cache does not help. With
 `FASTCACHE_VERBOSE` set, that case reports
 `missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR`.
+
+### The empty opt-out does not work from PowerShell
+
+`export FASTCACHE_ADDR=` is a genuine set-but-empty entry on a POSIX shell, and the
+launcher reads it as the opt-out. **PowerShell cannot express it.** `$env:FASTCACHE_ADDR
+= ""` leaves the name present in PowerShell's own view -- `Test-Path Env:FASTCACHE_ADDR`
+answers `True` and `$env:FASTCACHE_ADDR` prints empty, exactly as an operator expects --
+while the child process never receives the variable at all. `fastcache-cc` therefore sees
+it **unset**, falls back to the `127.0.0.1:6674` default, and keeps caching. Nothing
+reports this: the opt-out silently does not happen, and the one place anybody would check
+agrees that it did.
+
+`[Environment]::SetEnvironmentVariable('FASTCACHE_ADDR', '', 'Process')` behaves the same
+way, so it is not a spelling problem with a workaround. From PowerShell, opt out at
+configure time instead -- `-DFASTCACHE_ADDR=` (the deliberate form, which wins over the
+environment) or `-DUSE_COMPILER_CACHE=OFF` -- both of which travel as command-line
+arguments rather than through an environment block.
 
 `FASTCACHE_ADDR` defaults to `127.0.0.1:6674` rather than to nothing, so the
 launcher caches with no configuration at all against whichever of `fastcached` or
