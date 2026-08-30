@@ -147,6 +147,7 @@ set(_fc_cc_sources
     DependencyOutput.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
+    ParallelFor.cpp
     PathResolve.cpp
     ReplayGuard.cpp
     RootReconciler.cpp
@@ -256,6 +257,7 @@ if(FASTCACHED_BUILD_TESTS)
         CompileJob_test.cpp
         LauncherCli_test.cpp
         CacheKey_test.cpp
+        ParallelFor_test.cpp
         CacheProtocol_test.cpp
         ReactorExchange_test.cpp
         # Test infrastructure, and on THIS target only: the shipped launcher must

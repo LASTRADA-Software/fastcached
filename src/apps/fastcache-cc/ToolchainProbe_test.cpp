@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "ParallelFor.hpp"
 #include "ToolchainHostTestUtils.hpp"
 #include "ToolchainProbe.hpp"
 
@@ -17,7 +18,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -28,6 +31,27 @@ using namespace FastCache::Cc::Testing;
 
 namespace
 {
+    /// The walk under a deterministic, single-threaded implementation.
+    ///
+    /// Every case below asserts a property of the WALK -- which files are covered,
+    /// what clears `complete`, that the digest ignores install prefixes -- and none
+    /// of them is about the parallelism, so they run serially and stay reproducible.
+    /// The threaded implementation and the AND across slices have their own cases.
+    [[nodiscard]] ToolchainFileScan WalkSerially(std::span<std::string const> roots)
+    {
+        SerialParallelFor serial;
+        return ProbeToolchainFiles(roots, serial);
+    }
+
+    /// `CachedToolchainFingerprint` with a serial walk, for the same reason.
+    [[nodiscard]] ToolchainIdentity CachedFingerprintSerially(
+        IProcessRunner& runner, IToolchainHost& host, std::string const& compiler,
+        std::string_view banner, DriverSpec const& spec, bool forceRefresh = false)
+    {
+        SerialParallelFor serial;
+        return CachedToolchainFingerprint(runner, host, compiler, banner, spec, serial, forceRefresh);
+    }
+
 /// Real `clang -E -v -x c++ /dev/null` stderr, trimmed to the shape that matters.
 ///
 /// Captured rather than invented: the surrounding noise is what the parser has to
@@ -214,7 +238,7 @@ TEST_CASE("Probing records every file relative to its own root", "[toolchain-pro
     tree.Write("a/nested/y.hpp", "content-y");
 
     std::vector<std::string> const roots { (tree / "a").string() };
-    auto const scan = ProbeToolchainFiles(roots);
+    auto const scan = WalkSerially(roots);
     auto const& files = scan.files;
 
     CHECK(scan.complete);
@@ -244,8 +268,8 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     std::vector<std::string> const rootsOne { (one / "inc").string() };
     std::vector<std::string> const rootsTwo { (two / (std::string { deeper } + "/inc")).string() };
 
-    auto const first = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsOne).files);
-    auto const second = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(rootsTwo).files);
+    auto const first = ComputeToolchainFingerprint("cc 1.0", WalkSerially(rootsOne).files);
+    auto const second = ComputeToolchainFingerprint("cc 1.0", WalkSerially(rootsTwo).files);
     CHECK(first == second);
     CHECK(!first.empty());
 }
@@ -255,10 +279,10 @@ TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
     std::vector<std::string> const roots { (tree / "inc").string() };
-    auto const before = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
+    auto const before = ComputeToolchainFingerprint("cc 1.0", WalkSerially(roots).files);
 
     tree.Write("inc/a.hpp", "edited!");
-    auto const after = ComputeToolchainFingerprint("cc 1.0", ProbeToolchainFiles(roots).files);
+    auto const after = ComputeToolchainFingerprint("cc 1.0", WalkSerially(roots).files);
 
     CHECK(before != after);
 }
@@ -272,7 +296,7 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
     tree.Write("inc/a.hpp", "x");
 
     std::vector<std::string> const roots { (tree / "does-not-exist").string(), (tree / "inc").string() };
-    auto const scan = ProbeToolchainFiles(roots);
+    auto const scan = WalkSerially(roots);
 
     REQUIRE(scan.files.size() == 1);
     CHECK(HasPath(scan.files, "a.hpp"));
@@ -285,8 +309,8 @@ TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
 
 TEST_CASE("Probing nothing yields nothing", "[toolchain-probe]")
 {
-    CHECK(ProbeToolchainFiles({}).files.empty());
-    CHECK(ProbeToolchainFiles({}).complete);
+    CHECK(WalkSerially({}).files.empty());
+    CHECK(WalkSerially({}).complete);
 }
 
 // --- discovery over the driver table ----------------------------------------
@@ -781,7 +805,7 @@ TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]
     auto const digestOf = [&](std::string const& compiler) {
         auto const roots = MsvcToolsetIncludeRoots(host, compiler);
         REQUIRE_FALSE(roots.empty());
-        auto const scan = ProbeToolchainFiles(roots);
+        auto const scan = WalkSerially(roots);
         // Not vacuous: two empty walks would digest equal and the check below would
         // pass having compared nothing.
         REQUIRE(scan.files.size() == 2);
@@ -1121,8 +1145,8 @@ TEST_CASE("A cached fingerprint is reused rather than rewalked", "[toolchain-pro
 
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    auto const first = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
-    auto const second = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const first = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const second = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     CHECK(!first.empty());
     CHECK(first == second);
@@ -1163,9 +1187,9 @@ TEST_CASE("A compiler invoked by bare name still caches its fingerprint", "[tool
     // would leave this case unable to say which of the two effects it had caught.
     auto const fullPath = ScriptedToolchainHost::Normalize(compiler);
 
-    auto const viaBareName = CachedToolchainFingerprint(runner, host, "cc", "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const viaBareName = CachedFingerprintSerially(runner, host, "cc", "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
     auto const viaFullPath =
-        CachedToolchainFingerprint(runner, host, fullPath, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+        CachedFingerprintSerially(runner, host, fullPath, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     CHECK_FALSE(viaBareName.empty());
     CHECK(viaBareName == viaFullPath);
@@ -1196,7 +1220,7 @@ TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-
 
     CountingRunner runner { VerboseNaming(includeDir.string()) };
     ScriptedToolchainHost host;
-    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const before = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     // Change the content AND move the directory clock, which is what a toolchain
     // upgrade does. Content alone would not restamp -- that is the documented
@@ -1208,7 +1232,7 @@ TEST_CASE("A changed toolchain invalidates the cached fingerprint", "[toolchain-
     std::filesystem::last_write_time(includeDir, original + std::chrono::hours { 1 }, ec);
     REQUIRE(!ec);
 
-    auto const after = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const after = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
     CHECK(before != after);
 }
 
@@ -1228,14 +1252,14 @@ TEST_CASE("A forced refresh ignores a cached value", "[toolchain-probe]")
 
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    auto const before = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const before = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
 
     // Content changed, clock untouched: the stamp cannot see this, so an
     // unforced call would return the stale value.
     tree.Write("inc/a.hpp", "edited in place");
-    auto const stale = CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
+    auto const stale = CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint;
     auto const forced =
-        CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang), true).fingerprint;
+        CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang), true).fingerprint;
 
     CHECK(stale == before);
     CHECK(forced != before);
@@ -1254,7 +1278,7 @@ TEST_CASE("No state directory still yields a fingerprint", "[toolchain-probe]")
     FastCache::Testing::ScopedEnv const env { StateVariable, "" };
     CountingRunner runner { VerboseNaming(root) };
     ScriptedToolchainHost host;
-    CHECK(!CachedToolchainFingerprint(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint.empty());
+    CHECK(!CachedFingerprintSerially(runner, host, compiler, "cc 1.0", DriverOf(Flavor::Clang)).fingerprint.empty());
 }
 
 // --- an identity that must not be served --------------------------------------
@@ -1406,12 +1430,12 @@ TEST_CASE("A fingerprint from a probe that never ran is refused, not returned as
     // A REAL version line throughout, which is what took this past the existing
     // guard: `NoEvidence` needs the banner to be the fallback name, and it is not.
     constexpr std::string_view banner = "clang version 20.1.8";
-    auto const first = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const first = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
     CHECK(first.Usable());
     CHECK_FALSE(first.fingerprint.empty());
 
-    auto const failed = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
-    auto const failedAgain = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const failed = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const failedAgain = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
 
     // Named, so both surfaces can say WHICH way the identity is unusable.
     CHECK_FALSE(failed.Usable());
@@ -1430,7 +1454,7 @@ TEST_CASE("A fingerprint from a probe that never ran is refused, not returned as
     CHECK(StoredFingerprint(state) == first.fingerprint);
 
     // And a probe that works again is the same toolchain it always was.
-    auto const recovered = CachedToolchainFingerprint(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+    auto const recovered = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
     CHECK(recovered.Usable());
     CHECK(recovered.fingerprint == first.fingerprint);
 }
@@ -1453,7 +1477,7 @@ TEST_CASE("A driver that answered with no roots is still cached", "[toolchain-pr
     ScriptedToolchainHost host;
 
     // The banner is the fallback name, which is the third condition.
-    auto const identity = CachedToolchainFingerprint(runner, host, compiler, "cc", DriverOf(Flavor::Clang));
+    auto const identity = CachedFingerprintSerially(runner, host, compiler, "cc", DriverOf(Flavor::Clang));
 
     CHECK(identity.defect == IdentityDefect::NoEvidence);
     CHECK(StoredFingerprint(state) == identity.fingerprint);
@@ -1487,7 +1511,7 @@ TEST_CASE("A header that could not be read leaves the walk incomplete and uncach
     REQUIRE(held.Held());
 
     std::vector<std::string> const roots { includeDir.string() };
-    auto const scan = ProbeToolchainFiles(roots);
+    auto const scan = WalkSerially(roots);
 
     // The readable header still arrives -- one bad file must not cost the rest.
     CHECK(scan.files.size() == 1);
@@ -1501,7 +1525,7 @@ TEST_CASE("A header that could not be read leaves the walk incomplete and uncach
     ScriptedToolchainHost host;
 
     auto const identity =
-        CachedToolchainFingerprint(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
+        CachedFingerprintSerially(runner, host, compiler, "clang version 20.1.8", DriverOf(Flavor::Clang));
 
     CHECK_FALSE(identity.Usable());
     CHECK(identity.defect == IdentityDefect::PartialTree);

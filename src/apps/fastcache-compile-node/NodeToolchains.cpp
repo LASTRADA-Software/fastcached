@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeToolchains.hpp"
 
+#include <ParallelFor.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -103,6 +105,21 @@ namespace
         std::vector<SurveyedToolchain> fingerprints(entries.size());
         std::atomic<std::size_t> next { 0 };
 
+        // One instance shared by every identifying thread, and that is safe: `Run`
+        // holds no state across calls -- it creates and joins its own threads each
+        // time -- and the only member is a width nobody writes.
+        //
+        // Constructed here rather than injected from `main` because this function is
+        // already where the survey's own parallelism is decided, immediately below.
+        // How the walk underneath is spread is the same decision in the same place;
+        // the SEAM lives one layer down at `ProbeToolchainFiles`, which is where the
+        // correctness requirement is and where tests substitute a serial one.
+        //
+        // The nesting is bounded and lopsided: this fans out over toolchains, of
+        // which there is normally one, while the inner one fans out over thousands
+        // of files. The inner is the work.
+        Cc::ThreadedParallelFor parallel;
+
         auto identify = [&] {
             for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
             {
@@ -134,7 +151,8 @@ namespace
                 auto const banner = Cc::CompilerBanner(runner, entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
                 auto const& spec = Cc::DriverOf(flavor);
-                fingerprints[index].identity = Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec);
+                fingerprints[index].identity =
+                    Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec, parallel);
 
                 // The evidence this identity rests on, kept so that noticing it has
                 // moved costs no spawn at all (#238). It is the same banner, the same

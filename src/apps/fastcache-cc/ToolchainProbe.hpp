@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CmdLine.hpp"
+#include "IParallelFor.hpp"
 #include "IProcessRunner.hpp"
 #include "ToolchainFingerprint.hpp"
 #include "ToolchainHost.hpp"
@@ -106,13 +107,36 @@ struct ToolchainFileScan
 /// failing: a driver lists search paths it would use if they existed, and a
 /// missing one is normal (`/usr/local/include` on a machine that has none).
 ///
-/// Cost is the reason the caller must cache this. Measured on an Xcode
-/// toolchain: 14,600 files and 288 MB, about 2 s warm — per launcher invocation
-/// that would dwarf the compile it is trying to accelerate.
+/// **Cost is the reason the caller must cache this, and the reason it is
+/// parallel.** A figure here once read "about 2 s warm", which was measured
+/// honestly and then cited elsewhere without the word `warm` — and the design
+/// downstream was reasoned from the citation. Warm is not the condition that
+/// matters: a first touch on a fresh machine reads every byte, and that is when
+/// this runs.
+///
+/// | toolchain | files | bytes | per file |
+/// |---|---|---|---|
+/// | Xcode, warm | 14,600 | 288 MB | ~0.14 ms |
+/// | MSVC 14.4x + SDK 10.0.26100, warm | 4,771 | 345 MB | 0.21 ms |
+/// | the same, cold, with anti-malware active | 4,771 | 345 MB | **5.00 ms** |
+/// | gcc 14 on Linux, cold | 12,192 | 145 MB | 0.26 ms |
+///
+/// So one Windows toolchain is ~24 s of walking on a fast local box and was
+/// measured exceeding **300 s** on a CI runner, against ~3 s for the same
+/// operation on Linux. The cost is per-file OPEN latency rather than bytes, which
+/// is why the hashing is spread across `IParallelFor` — overlapping the waiting is
+/// the entire win, and it is a Windows defect with a portable mechanism rather
+/// than a throughput improvement.
+///
+/// Enumeration stays serial. Only the content hashing is parallel, and the digest
+/// sorts, so the fingerprint does not depend on the order slices finish in.
 ///
 /// @param roots Include search paths, as a driver reported them.
-/// @return The files, and whether every root was walked to the end.
-[[nodiscard]] ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots);
+/// @param parallel Runs the hashing slices; a `SerialParallelFor` is legal and
+///        yields an identical result.
+/// @return The files, and whether every root was walked to the end AND every
+///         file's bytes arrived AND every slice finished.
+[[nodiscard]] ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots, IParallelFor& parallel);
 
 /// How this compiler is invoked to learn what it is.
 ///
@@ -436,8 +460,16 @@ struct IncludeSearchRoots
 /// Each search root's own mtime catches headers being added or removed. Neither
 /// catches a header edited IN PLACE without changing any directory -- accepted,
 /// because a system toolchain's headers are installed rather than edited, and the
-/// alternative is the 2-second full walk this exists to avoid. `--print-toolchain
+/// alternative is the full walk this exists to avoid. `--print-toolchain
 /// -fingerprint` recomputes unconditionally for when someone needs to be sure.
+///
+/// That alternative used to be described here as "the 2-second full walk". The
+/// figure came from `ProbeToolchainFiles`, where it was recorded WITH its
+/// condition -- "about 2 s warm" -- and arrived here without it. See the table
+/// there: cold, on Windows, it is minutes. A number is not portable away from the
+/// conditions it was taken under, and this cache is exactly the mechanism that
+/// makes the warm case warm, so quoting the warm cost as the price of missing it
+/// was circular as well as wrong.
 ///
 /// @param banner The compiler's version line.
 /// @param compiler Path to the compiler binary.
@@ -576,10 +608,12 @@ struct ToolchainIdentity
 
 /// A toolchain fingerprint, computed once per machine and remembered.
 ///
-/// The full walk costs about 2 seconds over 288 MB on an ordinary Xcode
-/// toolchain. The launcher runs once per translation unit, so without this cache
-/// the fingerprint would cost far more than the compile it exists to distribute
-/// -- which is why the cache is part of the design rather than an optimization.
+/// The full walk is expensive enough that the launcher -- which runs once per
+/// translation unit -- would spend far more on the fingerprint than on the compile
+/// it exists to distribute. That is why the cache is part of the design rather
+/// than an optimization. `ProbeToolchainFiles` carries the measurements; this is
+/// the THIRD place the old "about 2 seconds over 288 MB" figure appeared, and the
+/// second to drop the `warm` it was originally recorded with.
 ///
 /// Concurrency is handled by tolerating it rather than locking: a cold cache and
 /// `-j16` means sixteen launchers all walk the tree and all write the answer.
@@ -592,6 +626,7 @@ struct ToolchainIdentity
 /// @param compiler Path to the compiler.
 /// @param banner Its version line, already obtained by the caller.
 /// @param spec The driver's table row.
+/// @param parallel Runs the walk's hashing slices when the cache misses.
 /// @param forceRefresh Skip the cached value and rewrite it.
 /// @return The fingerprint and whether it means anything; the digest is never
 ///         empty (it degrades to a banner-only one).
@@ -600,6 +635,7 @@ struct ToolchainIdentity
                                                            std::string const& compiler,
                                                            std::string_view banner,
                                                            DriverSpec const& spec,
+                                                           IParallelFor& parallel,
                                                            bool forceRefresh = false);
 
 } // namespace FastCache::Cc

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DirectManifest.hpp"
+#include "IParallelFor.hpp"
 #include "KeyDigest.hpp"
 #include "Stats.hpp"
 #include "ToolchainProbe.hpp"
@@ -118,9 +119,22 @@ std::vector<std::string> ParseIncludeEnvironment(std::string_view value)
     return paths;
 }
 
-ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots)
+ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots, IParallelFor& parallel)
 {
     ToolchainFileScan scan;
+
+    // Two phases, and the split is what keeps this reviewable. Enumeration stays
+    // exactly as it was -- serial, single-threaded, every completeness signal
+    // unchanged -- and only the CONTENT HASHING is spread out. That is also where
+    // the cost is: 4,771 files and 345 MB for one Windows toolchain, at 5.00 ms per
+    // file cold against 0.21 ms warm, so what is being overlapped is the per-file
+    // open, not the digesting.
+    struct Pending
+    {
+        std::string absolute; ///< What to open.
+        std::string spelling; ///< Its `/`-separated path relative to its root.
+    };
+    std::vector<Pending> pending;
 
     for (auto const& root: roots)
     {
@@ -216,31 +230,64 @@ ToolchainFileScan ProbeToolchainFiles(std::span<std::string const> roots)
                 continue;
             }
 
-            auto hash = HashFileContents(it->path().string());
-            if (hash.empty())
-            {
-                // Unreadable. Skipped rather than recorded as empty: an entry whose
-                // hash is "" would make two DIFFERENT unreadable files look
-                // identical, which is a false match in the one direction that
-                // dispatches to the wrong toolchain.
-                //
-                // And reported, because this is a REGULAR FILE that is there and
-                // whose bytes did not arrive -- a scanner holding a header, a
-                // permission, a share violation. It is the likeliest of these on
-                // Windows and the one a stamp is blindest to.
-                scan.complete = false;
-                continue;
-            }
-
             // `/`-separated, always. The relative path is part of the digest, and
             // `std::filesystem` spells it with the HOST's preferred separator --
             // so a Windows machine and a POSIX machine holding byte-identical
             // toolchains would otherwise derive different fingerprints and refuse
             // to share work, which is the exact failure this relativization exists
             // to prevent.
-            auto spelling = relative.generic_string();
-            scan.files.emplace_back(ToolchainFile { .relativePath = std::move(spelling), .contentHash = std::move(hash) });
+            // Recorded now, hashed below. Nothing about WHICH files are covered
+            // changes here -- only when their bytes are read.
+            pending.emplace_back(Pending { .absolute = it->path().string(), .spelling = relative.generic_string() });
         }
+    }
+
+    // `char` and not `bool`: `std::vector<bool>` is bit-packed, so two slices
+    // writing adjacent entries would write the same word. That is a genuine data
+    // race rather than a theoretical one, and it is invisible in the result.
+    std::vector<ToolchainFile> hashed(pending.size());
+    std::vector<char> unreadable(pending.size(), 0);
+
+    // One slice per file rather than per root. The roots are wildly unequal -- an
+    // MSVC `include` against `/usr/local/include` -- so a slice per root would leave
+    // one thread holding the SDK while the rest had finished.
+    auto const everySliceRan = parallel.Run(pending.size(), [&](std::size_t index) {
+        auto hash = HashFileContents(pending[index].absolute);
+        if (hash.empty())
+        {
+            // Unreadable. Skipped rather than recorded as empty: an entry whose
+            // hash is "" would make two DIFFERENT unreadable files look identical,
+            // which is a false match in the one direction that dispatches to the
+            // wrong toolchain.
+            //
+            // And reported, because this is a REGULAR FILE that is there and whose
+            // bytes did not arrive -- a scanner holding a header, a permission, a
+            // share violation. It is the likeliest of these on Windows and the one
+            // a stamp is blindest to.
+            unreadable[index] = 1;
+            return;
+        }
+        hashed[index] = ToolchainFile { .relativePath = pending[index].spelling, .contentHash = std::move(hash) };
+    });
+
+    // `complete` is the AND of three things, and dropping any one of them writes a
+    // TRUNCATED identity under a stamp that still validates -- forever, because the
+    // stamp folds each root's path and mtime and never its contents. Enumeration
+    // already cleared it for a root that could not be read or a walk that stopped;
+    // this adds the files whose bytes did not arrive, and the slices that did not
+    // finish at all.
+    if (!everySliceRan)
+        scan.complete = false;
+
+    scan.files.reserve(pending.size());
+    for (std::size_t index = 0; index < pending.size(); ++index)
+    {
+        if (unreadable[index] != 0)
+        {
+            scan.complete = false;
+            continue;
+        }
+        scan.files.emplace_back(std::move(hashed[index]));
     }
 
     return scan;
@@ -1122,6 +1169,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
                                              std::string const& compiler,
                                              std::string_view banner,
                                              DriverSpec const& spec,
+                                             IParallelFor& parallel,
                                              bool forceRefresh)
 {
     auto const discovered = DiscoverIncludePaths(runner, host, compiler, spec);
@@ -1186,7 +1234,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
-    auto scan = ProbeToolchainFiles(roots);
+    auto scan = ProbeToolchainFiles(roots, parallel);
     auto const complete = scan.complete;
     auto const fingerprint = ComputeToolchainFingerprint(banner, std::move(scan.files));
 
