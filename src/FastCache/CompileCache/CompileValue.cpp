@@ -131,18 +131,7 @@ namespace
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
-    // Reserved, not grown. The size is a one-pass fold and the buffer holds an
-    // OBJECT FILE: without this the `AppendU32` immediately after the blob insert
-    // below finds the vector exactly full, so it reallocates and memcpys the whole
-    // object a second time, with both buffers live at the peak. Cheap everywhere and
-    // load-bearing on a node, where this now runs once per cached object.
-    std::size_t needed =
-        sizeof(std::uint8_t) + WireFields::FieldPrefixSize + value.objectBlob.size() + WireFields::FieldPrefixSize;
-    for (auto const& region: value.textRegions)
-        needed += sizeof(std::uint8_t) + WireFields::FieldPrefixSize + region.bytes.size();
-
     std::vector<std::byte> out;
-    out.reserve(needed);
     out.push_back(static_cast<std::byte>(CompileValueVersion));
 
     AppendU32(out, static_cast<std::uint32_t>(value.objectBlob.size()));
