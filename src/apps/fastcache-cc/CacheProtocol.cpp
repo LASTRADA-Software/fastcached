@@ -164,7 +164,11 @@ namespace
         // an operator who set a token believes this traffic is authenticated, and
         // it is not. A cache that silently does less than it was told to is the
         // failure mode this codebase keeps a list about.
-        if (authOutcome.kind == CacheOutcomeKind::Rejected && authOutcome.code == Wire::ErrorCode::UnknownOpcode)
+        // `Wire::UnimplementedVerb`, the same name every surface's refusal table
+        // spells. Written as the enumerator on one side and the constant on the
+        // other, the two ends of this contract would be free to drift -- which is
+        // precisely what happened across three surfaces (#283, #340).
+        if (authOutcome.kind == CacheOutcomeKind::Rejected && authOutcome.code == Wire::UnimplementedVerb)
         {
             commandOutcome.credentialIgnored = true;
             co_return commandOutcome;

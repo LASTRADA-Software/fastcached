@@ -3,6 +3,7 @@
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 
+#include <algorithm>
 #include <array>
 #include <format>
 #include <string_view>
@@ -14,38 +15,25 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// A verb this tier does not serve, and what to answer it with.
-    struct RefusedVerb
-    {
-        Wire::Op op;          ///< The verb.
-        Wire::ErrorCode code; ///< What the client acts on.
-        std::string_view why; ///< Why, in words a person can follow.
+    /// This surface's rows. The shape, the lookup and why they exist are on
+    /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
+    ///
+    /// `Auth`, because a `FASTCACHE_TOKEN` launcher had a permanent 0% hit rate that
+    /// presented exactly as a cache that is merely cold.
+    constexpr std::array RefusedVerbs {
+        Wire::RefusedVerb { .op = Wire::Op::Auth,
+                            .code = Wire::UnimplementedVerb,
+                            .why = "this endpoint is the node's cache and checks no credential" },
     };
 
-    /// Verbs whose refusal is something other than the generic "wrong port".
-    ///
-    /// A **table** rather than a special case in the `switch`, for the same reason
-    /// `CompileCacheHandler::RelocatedVerbs` is one: as soon as there are two
-    /// answers, the next verb added has to *state* which of them it is instead of
-    /// inheriting whichever the catch-all happens to give.
-    ///
-    /// `Auth` is here because its refusal is a **wire contract with a binary that
-    /// does not link this library**. `Cc::CacheProtocol` tolerates exactly one
-    /// refusal for a verb an endpoint does not implement -- `UnknownOpcode` -- and
-    /// on it proceeds unauthenticated, which is the correct outcome against a tier
-    /// that has no credential to check. Answered with anything else,
-    /// `DispatchNotPermitted` included, it treats the exchange as a hard error and
-    /// every subsequent compile is a miss reported as `rejected`. That is
-    /// indistinguishable from a cold cache, so a `FASTCACHE_TOKEN`-configured
-    /// launcher pointed at a node had a permanent 0% hit rate and no signal saying
-    /// so. Serving AUTH properly is a different question and a different ticket;
-    /// this row is what makes its *absence* behave the way the client already
-    /// expects.
-    constexpr std::array RefusedVerbs {
-        RefusedVerb { .op = Wire::Op::Auth,
-                      .code = Wire::ErrorCode::UnknownOpcode,
-                      .why = "this endpoint is the node's cache and checks no credential" },
-    };
+    // The table is consulted from the `default:` arm only, so a row naming FETCH or
+    // STORE would sit there looking like a decision and change nothing. Refused at
+    // compile time rather than left to be noticed.
+    static_assert(std::ranges::none_of(
+                      RefusedVerbs,
+                      [](Wire::Op op) { return op == Wire::Op::Fetch || op == Wire::Op::Store; },
+                      &Wire::RefusedVerb::op),
+                  "a refusal row for a verb this tier serves is dead: the lookup never reaches it");
 } // namespace
 
 Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame)
@@ -116,9 +104,8 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }
         default:
-            for (auto const& row: RefusedVerbs)
-                if (row.op == descriptor->code)
-                    co_return Wire::EncodeErrorReply(row.code, row.why);
+            if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
+                co_return Wire::EncodeErrorReply(row->code, row->why);
 
             // A scheduler or worker verb at the cache port. Answered rather than
             // dropped, so a client that reached the wrong one of this node's ports

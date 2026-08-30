@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheProtocol.hpp"
 #include "Dispatch.hpp"
 #include "StubObjectTestSupport.hpp"
 #include "WorkerProtocol.hpp"
@@ -326,6 +327,36 @@ TEST_CASE("A worker refuses every verb but COMPILE", "[worker-protocol]")
         REQUIRE(answer.has_value());
         CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::DispatchNotPermitted);
     }
+}
+
+TEST_CASE("A worker refuses AUTH with the one code the client steps over", "[worker-protocol]")
+{
+    // NOT `DispatchNotPermitted`, which is what the neighbouring case above asserts
+    // for a verb served on a DIFFERENT port. The two are different sentences: that
+    // one says "this endpoint does not do that job", a routing fact a client acts on;
+    // this says "I do not implement this verb", which is what an absent capability
+    // is.
+    //
+    // `Cc::CacheProtocol::Exchange` tolerates exactly `Wire::UnimplementedVerb` and
+    // proceeds unauthenticated -- right against a worker with no credential to check.
+    // Answered anything else, a `FASTCACHE_TOKEN`-configured worker was refused at
+    // REGISTER and never joined the fleet at all (#340).
+    //
+    // Asserted by VALUE: the enumerator both ends name is the only thing holding this
+    // contract together, and `fastcache-cc` links none of `FastCache`.
+    Fixture fix;
+
+    auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+    auto const answer = fix.worker.Answer(auth);
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::UnimplementedVerb);
+
+    // A bare token with no username, which is how `FASTCACHE_TOKEN` alone reaches the
+    // wire, takes the same answer.
+    auto const tokenOnly = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+    auto const bare = fix.worker.Answer(tokenOnly);
+    REQUIRE(bare.has_value());
+    CHECK(ErrorOf(Unwrap(bare)) == Wire::UnimplementedVerb);
 }
 
 TEST_CASE("A codec envelope declaring more than the cap is refused before it is decompressed", "[worker-protocol]")
@@ -1111,10 +1142,21 @@ class ScriptedScheduler final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    /// Reports what it accepted rather than zero.
+    ///
+    /// It answered `0` -- a short write, which `SendAll` treats as a failure -- while
+    /// nothing here wrote vectored. `CacheProtocol::Exchange` pipelines AUTH and the
+    /// command as two `SendAll` calls, and `SendAll` only ever calls `Write`, so the
+    /// zero was unreachable rather than harmless: the first case to drive a vectored
+    /// write would have died inside the fake, before the reply this fake exists to
+    /// give.
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
-        return IoAwaitable { IoResult { 0 } };
+        std::size_t total = 0;
+        for (auto const& segment: segments)
+            total += segment.size();
+        return IoAwaitable { IoResult { total } };
     }
 
     void Close() noexcept override
@@ -1234,4 +1276,35 @@ TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no l
     REQUIRE_FALSE(beat.has_value());
     CHECK_FALSE(beat.error().leader.has_value());
     CHECK(registrar.WorkerId().empty());
+}
+
+TEST_CASE("A credentialled client reaches a worker that has no AUTH and still gets its answer", "[worker-protocol]")
+{
+    // **The acceptance of #340, and deliberately not "the refusal code changed".**
+    // That assertion passes the moment a constant is edited; this one fails unless
+    // the two halves actually agree, because the refusal bytes come out of the real
+    // `WorkerProtocol` and go into the real `Cc::CacheProtocol::Exchange`.
+    //
+    // What it regresses: with `FASTCACHE_TOKEN` set, a worker answering AUTH with
+    // `DispatchNotPermitted` had that refusal returned in place of the answer to the
+    // request the client actually sent -- so a credentialled worker was refused at
+    // REGISTER and never joined the fleet at all. The machine was absent rather than
+    // idle, which is harder to notice.
+    Fixture fix;
+
+    auto const refusal = fix.worker.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" }));
+    REQUIRE(refusal.has_value());
+
+    auto const stored = std::vector<std::byte> { std::byte { 0x7 } };
+    ScriptedScheduler client { Replies({ Unwrap(refusal), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+
+    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential { .username = {}, .secret = "s3cret" }));
+
+    // The command behind the credential is served. This is the half that was broken.
+    REQUIRE(outcome.IsHit());
+    CHECK(outcome.value == stored);
+
+    // And the operator is still told their token went unchecked. Restoring the answer
+    // must not also swallow the fact that nothing checked the credential.
+    CHECK(outcome.credentialIgnored);
 }

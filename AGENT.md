@@ -374,10 +374,23 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   the gate runs before the payload is buffered.
 - A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one
   cannot reopen the hole by omission.
-- An unimplemented verb is refused `UnknownOpcode`, never `DispatchNotPermitted`. The
-  launcher steps over the first and proceeds unauthenticated; the second it treats as
-  fatal, so a `FASTCACHE_TOKEN` client got a permanent 0% hit rate that presented as a
-  cold cache. The choice is a `(op, code, why)` table row, not a `switch` special case.
+- An unimplemented verb is refused `Wire::UnimplementedVerb`, never
+  `DispatchNotPermitted`. The launcher steps over the first and proceeds
+  unauthenticated; the second it treats as fatal, so a `FASTCACHE_TOKEN` client got a
+  permanent 0% hit rate that presented as a cold cache, every `LEASE` declined behind
+  a green build, and a credentialled worker that never joined. The choice is a
+  `(op, code, why)` table row, not a `switch` special case — and the code is ONE named
+  constant every surface and the client spell, because three surfaces naming the
+  enumerator separately is exactly how they drifted (#283, #340). *Unimplemented* is
+  not *served elsewhere*: a verb another port answers stays `DispatchNotPermitted`,
+  because `UnknownOpcode` there tells a client this daemon is too OLD when it is in
+  fact too new. A row for a verb the surface does serve is dead — `static_assert` it
+  cannot be added.
+- A wire constant has TWO facts, its name and its value, and a symbol both ends spell
+  can only test the first. Pin the **byte** as well: change the alias consistently and
+  every in-tree test still agrees while every deployed launcher breaks, because they
+  tolerate `0x02` and nobody here can recompile them. Keep one test on the raw
+  enumerator — it is the anchor, not the code smell it looks like.
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
@@ -659,6 +672,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A compile database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF`
   named explicitly. `CompileCache.cmake` sets it only when it picks a launcher, and
   without it every unit fails to parse and the sweep reports clean.
+- And it must be configured with the same TARGET SET CI builds. A sweep whose scope
+  comes from a database is only as complete as that database's targets, and a target
+  gated off by default is invisible to it rather than absent from CI — 15 units where
+  CI tidies 20, every one of the five missing ones inside the change. The script
+  cannot catch it: a changed file with no compile command is dropped silently, and
+  must be, since that is also what a platform-specific TU looks like. Account for
+  every file in the diff the sweep did not reach, before trusting its count.
 - A compiler cache that reads like success is worse than none: the Windows sccache
   was running into a directory the runner deletes, so the jobs are asserted to be
   backed by the Actions cache — before `ctest`, which restarts the sccache server

@@ -391,16 +391,26 @@ also how long a genuinely dead worker takes to be noticed.
     still counts the job. That is also #245: a worker that learns its client is
     gone can abandon the compile and free the slot.
 
-!!! danger "Do not set `FASTCACHE_TOKEN` on a client that dispatches"
+!!! note "`FASTCACHE_TOKEN` against a node is accepted and ignored"
 
-    A node's scheduler, compile and cache ports serve no `AUTH` verb, so a
-    credential presented to them is refused `dispatch-not-permitted` — and the
-    launcher surfaces that in place of the answer to the request it actually sent.
-    Every `LEASE` is then declined and every compile happens locally, with a green
-    build and nothing but a `FASTCACHE_VERBOSE` line to say so. The same applies
-    to `--requirepass` on a worker: its `REGISTER` is refused and it never joins
-    the fleet. Tracked as
-    [#198](https://github.com/LASTRADA-Software/fastcached/issues/198); see
+    A node's scheduler, compile and cache ports serve no `AUTH` verb, so there is
+    nothing for a credential to authenticate against. All three refuse it
+    `unknown-opcode`, which the launcher steps over before carrying on
+    unauthenticated, so leases, compiles and registrations all work normally.
+
+    The launcher says `credential ignored` for its **cache** exchanges. It does not
+    say it for a lease, a compile, a release or a worker's registration: those paths
+    carry the same fact back and drop it, so an operator who set a token there is
+    told nothing at all.
+
+    Two of the three used to answer `dispatch-not-permitted` instead, which the
+    launcher treats as fatal and returns in place of the answer to the request it
+    actually sent — so every `LEASE` was declined and every compile happened
+    locally, behind a green build
+    ([#340](https://github.com/LASTRADA-Software/fastcached/issues/340)).
+
+    What a credential would *mean* here is still open
+    ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)); see
     [Security](#security) for what does protect a fleet today.
 
 ---

@@ -407,10 +407,13 @@ A worker answers `COMPILE` and nothing else. `fastcached` answers the cache verb
 and nothing else. A node's cache tier answers `FETCH` and `STORE` and nothing
 else.
 
-Anything else is refused as a **reply** — `dispatch-not-permitted`, naming where
-the verb should have gone — and never by dropping the connection, which a caller
-cannot tell from a dead host. If something is pointed at the wrong port, it will
-say so.
+Anything else is refused as a **reply** — never by dropping the connection, which a
+caller cannot tell from a dead host. A verb served on a *different* port is
+`dispatch-not-permitted`, naming where it should have gone; a verb the surface does
+not **implement** at all — `AUTH`, on all three of a node's — is `unknown-opcode`,
+which is what a client is built to step over. `fastcached` is the exception: it does
+implement `AUTH`, and answers a bad credential `unauthenticated`. If something is
+pointed at the wrong port, it will say so.
 
 ## What a worker tells the scheduler
 

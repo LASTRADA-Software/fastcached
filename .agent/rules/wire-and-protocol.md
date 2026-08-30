@@ -356,6 +356,45 @@ Every rule below has already been a bug.
   catch-all happens to give. Three surfaces answering this question in three
   hand-written ways is how they drifted apart to begin with.
 
+  **The code itself is ONE named constant -- `Wire::UnimplementedVerb` -- that every
+  surface's table and the client's tolerance spell.** #283 fixed the cache tier
+  because that is what its acceptance named; the scheduler and compile ports kept
+  answering `DispatchNotPermitted` for another two weeks, so a `FASTCACHE_TOKEN`
+  client had every `LEASE` declined behind a green build and a `--requirepass` worker
+  never joined the fleet at all (#340). Three tables each naming
+  `ErrorCode::UnknownOpcode` would have fixed those two and left the *next* surface
+  free to drift again; a constant in `CompileCacheWire.hpp` -- the one header the
+  launcher compiles in and the library also uses -- makes every party spell one name,
+  which is the strongest form available given they link nothing in common. The struct
+  and the lookup are shared for the same reason: four hand-written copies of
+  `(op, code, why)` is the answer to "if a sixth case showed up tomorrow, how many
+  places would I edit".
+
+  **A wire constant has TWO facts -- its name and its value -- and a symbol shared by
+  both ends can only test the first.** This is the trap that "one name every party
+  spells" *creates* while closing the drift it was written for, and it is worse than
+  what it fixes because it looks green from inside the tree: change the alias
+  consistently, and every in-tree assertion still agrees while **every deployed
+  launcher breaks**, because the binaries in the field tolerate `0x02` and nothing
+  else. Nobody in this repository can recompile the other end of this wire.
+
+  So something must pin the **number**: `static_assert` on the byte, plus at least one
+  test asserting the raw enumerator. Those are not redundancy with the shared-name
+  assertions -- the raw one is the *anchor*, and the shared-name ones are tautologies
+  under a consistent change. Discovered by flipping the alias and **counting** what
+  went red: three of five stayed green, including the behavioural contract tests,
+  because both ends name the constant. A reviewer read the raw-enumerator assertion as
+  the weak one and it was the only one that could fail; the instinct that a literal is
+  a code smell is usually right and was exactly wrong here.
+
+  **And the test for it is a behavioural one, not "the code changed".** Asserting the
+  enumerator passes the moment somebody edits a constant. What regresses the defect is
+  a credentialled client reaching a surface that does not implement `AUTH` and *still
+  getting its request answered* -- driven by the bytes the real server produces, so the
+  two ends have to actually agree. `AuthRefusalContract_test` does that for the
+  scheduler (the node's test target is the only one holding both parties) and
+  `WorkerProtocol_test` for the compile port.
+
 ## The Net boundary
 
 - **`Net/` is meant to be lifted out of this tree, so what it may include is a

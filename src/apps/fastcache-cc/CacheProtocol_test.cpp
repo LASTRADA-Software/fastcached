@@ -63,10 +63,29 @@ class ScriptedTcpClient final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    /// Reports what it accepted, and records it like `Write` does.
+    ///
+    /// It answered `0` -- a short write, which `SendAll` correctly treats as a
+    /// failure. Nothing reaches it today: `CacheProtocol::Exchange` pipelines AUTH and
+    /// the command as two `SendAll` calls rather than one concatenated buffer (a
+    /// STORE frame carries a whole object file, and joining them would copy it), and
+    /// `SendAll` only ever calls `Write`. So this is latent rather than absent --
+    /// the first case to drive a vectored write would have failed *inside the fake*,
+    /// with nothing pointing at the fake. The identical defect sat in
+    /// `WorkerProtocol_test`'s copy of this class, which is the argument for one
+    /// shared fake rather than three.
+    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
-        return IoAwaitable { IoResult { 0 } };
+        ++_sendCalls;
+        _trace.push_back('S');
+        std::size_t total = 0;
+        for (auto const& segment: segments)
+        {
+            _sent.insert(_sent.end(), segment.begin(), segment.end());
+            total += segment.size();
+        }
+        return IoAwaitable { IoResult { total } };
     }
 
     void Close() noexcept override
@@ -138,10 +157,17 @@ class FailingTcpClient final: public ISocket
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted read failure" }) };
     }
+    /// Fails the way the other two do, rather than reporting a zero-byte success.
+    ///
+    /// `SendAll` reads both as failure, so today the two are indistinguishable -- but
+    /// this class's whole contract is "every call fails", and a caller that asks
+    /// `has_value()` (which is how a transport failure is told from a short write)
+    /// would have been handed a success by the one method that did not honour it.
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
-        return IoAwaitable { IoResult { 0 } };
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted write failure" }) };
     }
     void Close() noexcept override {}
     [[nodiscard]] bool IsClosed() const noexcept override

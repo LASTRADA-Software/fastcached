@@ -76,6 +76,24 @@ namespace
     {
         return RefusalTable[static_cast<std::size_t>(refusal)];
     }
+
+    /// This surface's rows. The shape, the lookup and why they exist are on
+    /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
+    ///
+    /// `Auth`, because a `--requirepass` worker was refused at `REGISTER` and never
+    /// joined the fleet at all -- absent rather than idle, which is harder to notice.
+    constexpr std::array RefusedVerbs {
+        Wire::RefusedVerb { .op = Wire::Op::Auth,
+                            .code = Wire::UnimplementedVerb,
+                            .why = "this endpoint compiles and checks no credential" },
+    };
+
+    // The table is consulted only on the path a verb other than COMPILE takes, so a
+    // row naming COMPILE would sit there looking like a decision and change nothing.
+    // Refused at compile time rather than left to be noticed.
+    static_assert(std::ranges::none_of(
+                      RefusedVerbs, [](Wire::Op op) { return op == Wire::Op::Compile; }, &Wire::RefusedVerb::op),
+                  "a refusal row for COMPILE is dead: the lookup never reaches it");
 } // namespace
 
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
@@ -185,11 +203,16 @@ std::optional<std::vector<std::byte>> WorkerProtocol::Answer(std::span<std::byte
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, {});
 
     if (descriptor->code != Wire::Op::Compile)
+    {
+        if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
+            return Wire::EncodeErrorReply(row->code, row->why);
+
         // A worker is not a scheduler and not a cache. Refused with a reply rather
         // than a close, so a client that sent the wrong verb to the wrong port
         // learns which -- a dropped connection is indistinguishable from a dead host.
         return Wire::EncodeErrorReply(Wire::ErrorCode::DispatchNotPermitted,
                                       "this endpoint compiles; it does not schedule or cache");
+    }
 
     return Compile(payload);
 }

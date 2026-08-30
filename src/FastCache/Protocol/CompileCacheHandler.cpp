@@ -38,14 +38,6 @@ namespace
     /// drop name the same thing.
     constexpr std::string_view ProtocolLabel = "compile-cache";
 
-    /// One verb this daemon does not serve, and what its client is told instead.
-    struct RelocatedVerb
-    {
-        Wire::Op op;          ///< The verb.
-        Wire::ErrorCode code; ///< What the client acts on.
-        std::string_view why; ///< Where the work went, in words a person can follow.
-    };
-
     /// Every verb that lives somewhere else now.
     ///
     /// A **table** rather than a conditional chain, and it earns that as soon as
@@ -60,42 +52,42 @@ namespace
     /// A client told the first would go looking for a scheduler; told the second, it
     /// knows the question does not apply.
     constexpr std::array RelocatedVerbs {
-        RelocatedVerb { .op = Wire::Op::Register,
-                        .code = Wire::ErrorCode::DispatchNotPermitted,
-                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                               "fastcache-compile-node --listen-scheduler and point clients at it" },
-        RelocatedVerb { .op = Wire::Op::Heartbeat,
-                        .code = Wire::ErrorCode::DispatchNotPermitted,
-                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                               "fastcache-compile-node --listen-scheduler and point clients at it" },
-        RelocatedVerb { .op = Wire::Op::Lease,
-                        .code = Wire::ErrorCode::DispatchNotPermitted,
-                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                               "fastcache-compile-node --listen-scheduler and point clients at it" },
-        RelocatedVerb { .op = Wire::Op::Compile,
-                        .code = Wire::ErrorCode::DispatchNotPermitted,
-                        .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
-                               "endpoint the lease named" },
-        RelocatedVerb { .op = Wire::Op::Release,
-                        .code = Wire::ErrorCode::DispatchNotPermitted,
-                        .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                               "fastcache-compile-node --listen-scheduler and point clients at it" },
-        RelocatedVerb { .op = Wire::Op::ClusterStatus,
-                        .code = Wire::ErrorCode::NoCluster,
-                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                               "fastcache-compile-node --listen-scheduler instead" },
-        RelocatedVerb { .op = Wire::Op::ClusterSet,
-                        .code = Wire::ErrorCode::NoCluster,
-                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                               "fastcache-compile-node --listen-scheduler instead" },
-        RelocatedVerb { .op = Wire::Op::ClusterForget,
-                        .code = Wire::ErrorCode::NoCluster,
-                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                               "fastcache-compile-node --listen-scheduler instead" },
-        RelocatedVerb { .op = Wire::Op::ClusterAdmit,
-                        .code = Wire::ErrorCode::NoCluster,
-                        .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                               "fastcache-compile-node --listen-scheduler instead" },
+        Wire::RefusedVerb { .op = Wire::Op::Register,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+        Wire::RefusedVerb { .op = Wire::Op::Heartbeat,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+        Wire::RefusedVerb { .op = Wire::Op::Lease,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+        Wire::RefusedVerb { .op = Wire::Op::Compile,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
+                                   "endpoint the lease named" },
+        Wire::RefusedVerb { .op = Wire::Op::Release,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+        Wire::RefusedVerb { .op = Wire::Op::ClusterStatus,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                                   "fastcache-compile-node --listen-scheduler instead" },
+        Wire::RefusedVerb { .op = Wire::Op::ClusterSet,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                                   "fastcache-compile-node --listen-scheduler instead" },
+        Wire::RefusedVerb { .op = Wire::Op::ClusterForget,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                                   "fastcache-compile-node --listen-scheduler instead" },
+        Wire::RefusedVerb { .op = Wire::Op::ClusterAdmit,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                                   "fastcache-compile-node --listen-scheduler instead" },
     };
 
     /// What to answer `op` with.
@@ -105,12 +97,11 @@ namespace
     /// same reason the command loop's `switch` carries no `default:`.
     /// @param op The verb.
     /// @return The refusal.
-    [[nodiscard]] constexpr RelocatedVerb RefusalFor(Wire::Op op) noexcept
+    [[nodiscard]] constexpr Wire::RefusedVerb RefusalFor(Wire::Op op) noexcept
     {
-        for (auto const& row: RelocatedVerbs)
-            if (row.op == op)
-                return row;
-        return RelocatedVerb { .op = op, .code = Wire::ErrorCode::DispatchNotPermitted, .why = {} };
+        if (auto const* const row = Wire::FindRefusal(RelocatedVerbs, op); row != nullptr)
+            return *row;
+        return Wire::RefusedVerb { .op = op, .code = Wire::ErrorCode::DispatchNotPermitted, .why = {} };
     }
 
     /// Interpret a byte span as a UTF-8/ASCII string (copying).
