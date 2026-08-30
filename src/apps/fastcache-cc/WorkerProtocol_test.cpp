@@ -5,6 +5,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -863,4 +864,89 @@ TEST_CASE("AvailableCodecsCoverEveryCodec", "[worker-protocol][codec]")
         INFO("codec " << Compression::NameOf(Unwrap(codec)) << " is compiled in but not advertised");
         CHECK(std::ranges::find(advertised, id) != advertised.end());
     }
+}
+
+TEST_CASE("REPRODUCTION (#282): a worker compiles for a lease nobody signed", "[worker-protocol][lease-hole]")
+{
+    // #281 made the scheduler SIGN its grants. Nothing checks the signature, so a
+    // compile port's boundary is still reachability plus membership -- which is what
+    // #282 exists to close, and what this case exists to prove is currently open.
+    //
+    // `Fixture` wires the PRODUCTION validator verbatim -- the same
+    // `[](std::string_view, std::string_view) { return true; }` that
+    // `fastcache-compile-node/main.cpp` passes -- so this asserts what a real worker
+    // does rather than what a test double was told to do. The existing
+    // "unauthorized lease is refused" case hands the seam a `return false` of its
+    // own, which proves the seam CAN refuse and nothing about whether anything ever
+    // asks it to: the shape this repository already names as a reclaimer nothing
+    // constructs.
+    Fixture fix;
+
+    auto const source = std::string_view { "int main(){return 0;}" };
+    auto const enveloped =
+        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(source.size()), Wire::AsBytes(source));
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "not-a-lease-at-all",
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = enveloped,
+                                                                  .acceptedCodecs = { Wire::IdentityCodec },
+                                                                  .sourceName = "a.cpp" });
+
+    auto const answer = fix.worker.Answer(frame);
+    REQUIRE(answer.has_value());
+    auto const reply = Decode(Unwrap(answer));
+
+    // THE HOLE. A string no scheduler ever issued buys a compile.
+    //
+    // When #282 lands this becomes `Status::Error` carrying `LeaseUnauthorized`, and
+    // the three `WorkerJobsRefusedLease*` counters -- exported since #313 and reading
+    // zero ever since, by design -- start moving. A green run where they still read
+    // zero is a finding, not a pass.
+    CHECK(reply.status == Wire::Status::Ok);
+}
+
+TEST_CASE("REPRODUCTION (#282): a lease signed for ANOTHER worker is accepted here", "[worker-protocol][lease-hole]")
+{
+    // Two actors, because a credential is granted by one party and presented to
+    // another. A fixture where the same process signs and verifies proves the MAC
+    // round-trips and nothing about whether the check is reachable.
+    //
+    // Actor one is the SCHEDULER, minting a genuine grant with the cluster key:
+    // every field authentic, the MAC valid, and the endpoint naming a different
+    // machine. Actor two is THIS worker, which is not that machine.
+    //
+    // The endpoint is the load-bearing field. It is inside the MAC precisely so a
+    // token captured on the way to one worker cannot be replayed against every other
+    // worker trusting the same key -- the property #281 built and this case shows is
+    // currently unenforced.
+    auto const clusterKey = std::vector<std::byte>(32, std::byte { 0x5A });
+    auto const forAnotherWorker = FastCache::Distributed::MintLeaseToken(
+        clusterKey,
+        FastCache::Distributed::LeaseClaims { .serial = "17",
+                                              .endpoint = "some-other-worker:6675",
+                                              .fingerprint = "gcc-13",
+                                              .key = "obj-abc",
+                                              .expiresAt = std::chrono::system_clock::now() + std::chrono::minutes { 10 } });
+
+    Fixture fix;
+    auto const source = std::string_view { "int main(){return 0;}" };
+    auto const enveloped =
+        Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(source.size()), Wire::AsBytes(source));
+    auto const frame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = forAnotherWorker,
+                                                                  .fingerprint = "gcc-13",
+                                                                  .args = {},
+                                                                  .source = enveloped,
+                                                                  .acceptedCodecs = { Wire::IdentityCodec },
+                                                                  .sourceName = "a.cpp" });
+
+    auto const answer = fix.worker.Answer(frame);
+    REQUIRE(answer.has_value());
+    auto const reply = Decode(Unwrap(answer));
+
+    // THE HOLE. An authentic grant for a DIFFERENT machine compiles here.
+    //
+    // When #282 lands this becomes `LeaseEndpointMismatch` -- which also requires
+    // telling the worker its own endpoint, something `LeaseValidator`'s present
+    // signature `(leaseToken, fingerprint)` cannot express at all.
+    CHECK(reply.status == Wire::Status::Ok);
 }
