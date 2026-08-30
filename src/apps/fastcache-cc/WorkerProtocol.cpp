@@ -132,7 +132,7 @@ LeaseValidator UncheckedLeaseValidator()
     };
 }
 
-WorkerProtocol::WorkerProtocol(CompileJobRunner& jobs,
+WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
                                IMetricsSink& metrics,
@@ -334,7 +334,10 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         Wire::EncodeCompileResult(Wire::CompileResult { .exitCode = static_cast<std::uint32_t>(outcome->exitCode),
                                                         .object = enveloped,
                                                         .stdoutText = Wire::AsBytes(outcome->stdoutText),
-                                                        .stderrText = Wire::AsBytes(outcome->stderrText) }));
+                                                        .stderrText = Wire::AsBytes(outcome->stderrText),
+                                                        // Carried through from the runner, never recomputed from
+                                                        // `fields` here -- see `ICompileJobRunner` (#280).
+                                                        .correlation = Wire::AsBytes(outcome->correlation) }));
 }
 
 WorkerRegistrar::WorkerRegistrar(std::string fingerprint,

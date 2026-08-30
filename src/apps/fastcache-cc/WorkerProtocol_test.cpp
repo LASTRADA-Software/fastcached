@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
+#include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 #include "StubObjectTestSupport.hpp"
 #include "WorkerProtocol.hpp"
@@ -1307,4 +1308,112 @@ TEST_CASE("A credentialled client reaches a worker that has no AUTH and still ge
     // And the operator is still told their token went unchecked. Restoring the answer
     // must not also swallow the fact that nothing checked the credential.
     CHECK(outcome.credentialIgnored);
+}
+
+namespace
+{
+
+/// A runner that reports compiling something other than what it was handed.
+///
+/// The fixture #280 needs, and the one the tree could not previously build. A fake at
+/// `IProcessRunner` sits BELOW the point where `CompileJobRunner` records what it is
+/// about to compile, so it can produce a wrong object but never a wrong report -- that
+/// is #279's half. Substituting the runner itself is the only way to make the
+/// execution diverge from the record, which is the event a correlation exists to catch.
+class LyingRunner final: public ICompileJobRunner
+{
+  public:
+    /// @param correlation What this runner will claim it compiled.
+    explicit LyingRunner(std::string correlation):
+        _correlation { std::move(correlation) }
+    {
+    }
+
+    /// @param job Recorded, then otherwise ignored.
+    /// @return A successful compile carrying the claimed correlation.
+    [[nodiscard]] std::expected<CompileOutcome, JobError> Run(CompileJob const& job) override
+    {
+        _saw = job;
+        return CompileOutcome { .exitCode = 0,
+                                .object = { std::byte { 'O' }, std::byte { 'B' }, std::byte { 'J' } },
+                                .stdoutText = {},
+                                .stderrText = {},
+                                .correlation = _correlation };
+    }
+
+    /// @return The job this runner was actually asked for.
+    [[nodiscard]] CompileJob const& Saw() const noexcept
+    {
+        return _saw;
+    }
+
+  private:
+    std::string _correlation;
+    CompileJob _saw;
+};
+
+} // namespace
+
+TEST_CASE("A reply carries the runner's own correlation, not one recomputed here", "[worker-protocol][correlation]")
+{
+    // The discriminating case for #280, and the reason `WorkerProtocol` takes the
+    // INTERFACE rather than the concrete runner. The sentinel could not have been
+    // derived from the request by any computation, so a `WorkerProtocol` that folded
+    // the digest itself from `fields` would overwrite it and this goes red -- while
+    // every other case in this file, and the ticket's own acceptance criterion, would
+    // still pass under that bug.
+    //
+    // That is the whole point. At this layer two crossed requests are both still
+    // pristine, so a digest taken here agrees with whatever it is compared against and
+    // catches nothing.
+    constexpr std::string_view Sentinel = "ffffffffffffffffffffffffffffffff";
+
+    LyingRunner runner { std::string { Sentinel } };
+    AtomicMetricsSink metrics;
+    WorkerProtocol worker {
+        runner, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics
+    };
+
+    auto const answer = worker.Answer(CompileFrame());
+    REQUIRE(answer.has_value());
+
+    auto const reply = Decode(Unwrap(answer));
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const result = Wire::DecodeCompileResult(reply.payload);
+    REQUIRE(result.has_value());
+    CHECK(Wire::AsStringView(Unwrap(result).correlation) == Sentinel);
+
+    // And the runner really was asked for the job the frame described, so the sentinel
+    // is the only artificial thing about this exchange.
+    CHECK(runner.Saw().fingerprint == "gcc-13");
+    CHECK(runner.Saw().preprocessed == "int main(){return 0;}");
+}
+
+TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol][correlation]")
+{
+    // The wiring assertion. An interface whose only implementation is reached through a
+    // test is the reclaimer-nothing-constructs shape in a new costume, so this drives
+    // the REAL `CompileJobRunner` end to end and recomputes the digest the way a client
+    // will -- from what it asked for, against what came back.
+    StubRunner runner;
+    FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    AtomicMetricsSink metrics;
+    WorkerProtocol worker {
+        jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics
+    };
+
+    constexpr std::string_view Source = "int main(){return 0;}";
+    auto const answer = worker.Answer(CompileFrame("gcc-13", Source));
+    REQUIRE(answer.has_value());
+
+    auto const reply = Decode(Unwrap(answer));
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const result = Wire::DecodeCompileResult(reply.payload);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(Unwrap(result).correlation.empty());
+
+    // `FrameWithSource` sends no arguments and names the file `a.cpp`.
+    CHECK(Wire::AsStringView(Unwrap(result).correlation)
+          == CompileCorrelation(Source, std::span<std::string const> {}, "gcc-13", "a.cpp"));
 }

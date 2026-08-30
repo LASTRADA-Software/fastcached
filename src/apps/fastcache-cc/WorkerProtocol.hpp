@@ -109,9 +109,15 @@ using LeaseValidator =
 /// Turn one `0xFC` request into one reply, for a compile worker.
 ///
 /// **Pure**: bytes in, bytes out. It opens no socket and spawns nothing itself —
-/// spawning is `CompileJobRunner`'s, which is injected. That is what lets the whole
+/// spawning is an `ICompileJobRunner`'s, which is injected. That is what lets the whole
 /// worker protocol be tested by handing it a frame and reading the answer, with no
 /// listener and no compiler installed.
+///
+/// The runner arrives as the INTERFACE rather than as `CompileJobRunner`, and the
+/// difference is testable rather than stylistic: substituting the concrete class only
+/// at `IProcessRunner` puts the fake below the point where the runner records what it
+/// compiled, so such a fake can produce a wrong object but never a wrong REPORT. See
+/// `ICompileJobRunner` (#280).
 ///
 /// A worker answers exactly one verb, `Compile`. Everything else — including the
 /// scheduler's own verbs — is refused with `DispatchNotPermitted`, because a worker
@@ -121,7 +127,8 @@ using LeaseValidator =
 class WorkerProtocol
 {
   public:
-    /// @param jobs Runs the compiles; must outlive this.
+    /// @param jobs Runs the compiles; must outlive this. The interface, never the
+    ///        concrete runner — see the class note above.
     /// @param validator Decides whether a lease token authorizes a job. **Required**,
     ///        and never left empty: an empty `std::function` would be a third lease
     ///        policy -- "refuse nothing" -- reachable by omission, unnamed, untested
@@ -149,7 +156,7 @@ class WorkerProtocol
     ///        the frame length, so a listener with a smaller cap has to say so or the
     ///        two disagree about how much memory one request may cost. The default is
     ///        the figure every framed surface here uses.
-    WorkerProtocol(CompileJobRunner& jobs,
+    WorkerProtocol(ICompileJobRunner& jobs,
                    LeaseValidator validator,
                    CompileCacheWire::CodecList acceptedCodecs,
                    IMetricsSink& metrics,
@@ -166,7 +173,7 @@ class WorkerProtocol
     /// Handle a decoded COMPILE payload.
     [[nodiscard]] std::vector<std::byte> Compile(std::span<std::byte const> payload);
 
-    CompileJobRunner& _jobs;
+    ICompileJobRunner& _jobs;
     LeaseValidator _validator;
     CompileCacheWire::CodecList _acceptedCodecs;
     IMetricsSink& _metrics;
