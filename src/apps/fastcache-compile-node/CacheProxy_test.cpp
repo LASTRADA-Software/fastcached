@@ -6,6 +6,7 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -257,4 +258,42 @@ TEST_CASE("The node's cache answers this machine and refuses a stranger", "[node
     auto const peer = Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, "10.0.0.1")));
     REQUIRE(peer.has_value());
     CHECK(Unwrap(peer).status == Wire::Status::Miss);
+}
+
+TEST_CASE("REPRODUCTION (#287): a fleet peer reads another machine's cache tier",
+          "[node][cache][membership][cache-locality]")
+{
+    // THE HOLE. `CacheResponder` gates on `Membership::Member`, and a Member is any
+    // machine the operator listed -- so a peer on ANOTHER host reads this machine's
+    // entire build output. The docs promise exactly that today ("its own machine and
+    // its cluster"), which is why #287 is a deliberate tightening rather than a bug
+    // fix, and why it ships as a breaking change.
+    //
+    // The peer here is ADMITTED, not unknown, and that distinction is the whole point
+    // of the fixture: a reproduction whose caller is refused for some other reason
+    // would pass under the bug and prove nothing about locality.
+    Fixture fixture;
+    Distributed::ClusterMembership membership { { "10.0.0.1:7000" } };
+    CacheResponder responder { fixture.proxy, membership };
+
+    // Stated first, so a later change to the membership vocabulary cannot turn this
+    // case green by quietly reclassifying the peer.
+    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+
+    // And it is not this machine, which is the property the fix will key on.
+    REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
+
+    auto const served = Wire::DecodeReplyHeader(SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), "10.0.0.1")));
+    REQUIRE(served.has_value());
+
+    // `Miss` rather than `Error`: the request reached the tier and was answered on
+    // its merits. A stranger gets `Error`/`NotAMember` and never gets this far, so
+    // this status IS the admission -- an empty cache is what makes it a miss rather
+    // than a hit.
+    //
+    // When #287 lands this becomes `Status::Error` carrying `NotAMember`, and the
+    // existing case above -- "and so does a listed peer, which is what makes widening
+    // the bind usable at all" -- inverts with it. That sentence is the promise being
+    // withdrawn.
+    CHECK(Unwrap(served).status == Wire::Status::Miss);
 }
