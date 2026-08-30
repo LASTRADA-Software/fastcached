@@ -7,13 +7,20 @@ It is the fleet's one binary, and it wears several hats. Compiling is the only o
 it always wears; the rest are surfaces you switch on, and every section below is
 about one of them:
 
-| Surface | Flag | Default |
+| Role | What switches it on | Default |
 |---|---|---|
-| Compile worker | `--port` | on, `6676` |
+| Compile worker | `--bind`, `--port` | on, `0.0.0.0:6676` |
 | [A cache tier of its own](#a-cache-of-its-own) | `--listen-cache` | on, `127.0.0.1:6674` |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--listen-scheduler` | **off** |
-| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id` | **off** — a lone node leads itself |
+| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id`, `--listen-raft` | **off** — a lone node leads itself |
+| [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
+
+That is the list of **roles**, and it is not a firewall list — `--node-id` switches
+consensus on but is not a port, and a role's default here is not the address it binds
+for a given command line. For the ports, see
+[Every port it opens](#every-port-it-opens) below, or generate the list from the
+binary with `--print-surfaces`.
 
 What it never does is **write to the shared cache**. A worker is given no
 credentials for it: the object it produces goes back to the client that asked for
@@ -55,7 +62,16 @@ scheduler         0.0.0.0:6675    TCP
 admin             -               not served; set --admin-listen
 raft              0.0.0.0:6680    TCP
 discovery beacon  0.0.0.0:6681    UDP
+
+notes:
+  compile: a systemd .socket unit overrides --bind and --port entirely; …
+  cache: loopback for a bare port, the opposite of the scheduler and raft; …
+  …
 ```
+
+The `notes:` block is part of the output, not an afterthought: it carries the facts a
+column cannot, including the one that says this list can be **wrong** for the compile
+port. Do not clip it when pasting the worksheet to somebody.
 
 Pass the flags you would actually run with. It prints what **that** configuration
 serves rather than the defaults, so a widened `--listen-cache 0.0.0.0:6674` shows

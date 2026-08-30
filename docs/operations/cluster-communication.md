@@ -606,7 +606,35 @@ nothing replicates, and a guessed URL is one your browser cannot use.
 
 ## What to open on a firewall
 
-Three shapes, in the order fleets tend to grow into them.
+**Ask the binary first.** `fastcache-compile-node --print-surfaces`, given the flags
+that machine actually runs with, lists every port it would bind and the protocol of
+each, then exits without opening anything:
+
+```console
+$ fastcache-compile-node --print-surfaces --listen-scheduler 6675 \
+      --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
+compile           0.0.0.0:6676    TCP
+cache             127.0.0.1:6674  TCP
+scheduler         0.0.0.0:6675    TCP
+admin             -               not served; set --admin-listen
+raft              0.0.0.0:6680    TCP
+discovery beacon  0.0.0.0:6681    UDP
+
+notes:
+  …
+```
+
+The node opens its ports from the same table that prints, so the list and the sockets
+cannot disagree — which is the point of generating a worksheet rather than
+transcribing one. It also prints a `notes:` block, which is where the two facts a
+column cannot carry live: that a systemd `.socket` unit overrides `--bind`/`--port`
+entirely, and that `--discovery`'s address is where beacons are *sent* while its
+sockets bind the wildcard. [The node's own page](../tools/fastcache-compile-node.md#every-port-it-opens)
+carries the full six-surface table.
+
+The three shapes below are the *deployments*, in the order fleets tend to grow into
+them — what to open for each machine's role, rather than what a given command line
+serves.
 
 === "One machine"
 
@@ -640,6 +668,12 @@ Three shapes, in the order fleets tend to grow into them.
 
     Discovery peers that are *seen and never admitted* is the signature of a
     firewall passing the beacon port and dropping the reply port.
+
+**The admin surface is absent from all three on purpose.** `--admin-listen` is off
+unless set, and a bare port binds loopback — so it needs no rule until you widen it,
+and widening it is what makes `--dashboard-token-file` required. If you did widen it,
+`--print-surfaces` shows the address rather than a `-`, and that address is the one to
+open.
 
 !!! warning "Keep the scheduler off any network you would not run a compiler for"
 
