@@ -121,6 +121,18 @@ determinism rests on.
   and this is the same class as the `USE_COMPILER_CACHE` configure probe -- a tool
   that silently does nothing is worse than one that is off, because the second is
   visible.
+  - **A guard written above an existing one can be silently discarded, and it
+    disappears from exactly the cases that already needed thinking about.** Adding
+    a step-level `if:` to `.github/workflows/build.yml` inserted a second `if:` key
+    above three steps that already carried
+    `if: startsWith(matrix.preset, 'clang')`. YAML keeps the **last** duplicate key,
+    so the new gate evaporated on precisely the conditional steps -- the ones a
+    reader is least likely to re-check, because they visibly have a condition. No
+    warning from YAML, none from Actions, and the workflow ran. Same family as the
+    sanitizer above: the knob reads set, and nothing it names is in effect. Merge
+    into one expression (`gate && (original)`) rather than stacking, and scan for
+    adjacent `if:` lines afterwards -- `awk` over the file is enough, and it is the
+    only thing that distinguishes "gated" from "gated on paper".
   - **So a sanitizer job proves the tree only once something proves the sanitizer.**
     `scripts/tsan-gate.sh` will not report clean until it has answered two separate
     questions, because they fail separately: `__tsan_init` in the **test binaries**
@@ -796,6 +808,67 @@ is >90% and raising it is separate work — a threshold added before anyone has 
 chance to move the number only teaches everyone to ignore the signal. A failing suite
 still gets its report rendered, to read while debugging, and then re-raises so no number
 measured from a red build is published.
+
+## Scoping the matrix to what a change can affect
+
+**A `paths-ignore` filter on a workflow whose checks are REQUIRED converts "slow"
+into "unmergeable".** Master here is protected by a ruleset (`default-master`,
+enforcement `active`), not by classic branch protection — so the
+`/branches/master/protection` endpoint answers `404 Branch not protected`, and
+anything reasoning from that endpoint is reading a lie. Its required contexts are
+`Windows-cl-release`, `Windows-clangcl-release`, `Linux-clang-release`,
+`Linux-gcc-release`, `macOS-clang-release`, `clang-tidy`, the three
+`sccache smoke (...)` jobs, `Check C++ style` and `Require a type label`. A
+workflow-level path filter stops the workflow from triggering, so no check run is
+ever created for any of those, and the pull request waits on a context that will
+never arrive.
+
+A **job-level** `if:` is a different mechanism: the job is created and reports a
+`skipped` conclusion, which a required check accepts. That is what
+`.github/workflows/build.yml` does — one `changes` job publishes `code=true|false`
+and every heavy job is gated on it.
+
+- **The classification is `scripts/ci-scope.sh`, not a YAML glob**, so it is
+  testable without a runner: `ctest -R ci-scope` runs its table against a
+  throwaway git repository, in both directions. A glob living only in workflow
+  YAML is a rule nobody can exercise until it is wrong in production.
+- **Every way of not knowing escalates to "build everything".** An unresolvable
+  ref, a failed diff, an empty diff, a path matching no row — all `code=true`,
+  for the reason `tidy-sweep.sh` states about its own base ref: *we could not tell
+  what changed* must never read as *nothing did*. The cost of being wrong that way
+  is a matrix run nobody needed; the cost of being wrong the other way is a merge
+  no job ever compiled, with every required check green.
+- **`mkdocs.yml` is code and `.agent/**` is not**, which is the kind of judgement
+  that has to be written down: the Documentation workflow builds the former
+  `--strict`, while the rulebook is read by people and sessions rather than by any
+  job. If a rule file ever generates something, it stops being documentation.
+- **The cost this removes is not one matrix run per pull request.** The ruleset
+  sets `strict_required_status_checks_policy: true` — branches must be up to date
+  before merging — so every merge puts every other open pull request behind and
+  forces a rebase and a full re-run. The matrix is therefore paid once per pull
+  request *per merge that lands while it is open*, and that multiplier is the
+  larger half of the argument.
+- **A skipped MATRIX job never expands, so its per-leg contexts never exist.**
+  This is the trap inside the fix, and it was found by probing rather than by
+  reading: with a job-level `if:` on `linux` and `windows`, a docs-only run
+  reported one context literally named `Linux-${{ matrix.preset }}` and another
+  named `Windows-${{ matrix.preset }}` — while the four names the ruleset actually
+  requires (`Linux-clang-release`, `Linux-gcc-release`, `Windows-cl-release`,
+  `Windows-clangcl-release`) reported nothing at all. That is the same
+  never-arrives failure as `paths-ignore`, reintroduced one level down, and every
+  non-matrix job skipping correctly is what makes it easy to miss. So a matrix job
+  is gated on its **steps**: the job starts, the matrix expands, each leg reports
+  under its real name, and no step does any work. It costs one runner start per
+  leg and buys the only thing that matters.
+- **Three of those steps already carried an `if:`, and the gate silently vanished
+  from them.** That is the duplicate-key trap recorded under the local gate above,
+  met here for the first time: YAML keeps the last of two `if:` keys, so merge into
+  `gate && (original)` rather than stacking, and scan for adjacent `if:` lines.
+- **A gated job must still gate the release.** `check-release-gate` asserts
+  statically, with `yq`, that every job key appears in `release.needs`; it never
+  asks whether a job ran, so a job that no-ops on a docs change still counts. The
+  `changes` job is itself a row there. On a tag or a push the classifier answers
+  `code=true` unconditionally, so nothing is ever skipped underneath a release.
 
 ## Open work
 

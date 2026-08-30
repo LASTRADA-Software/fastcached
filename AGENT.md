@@ -540,6 +540,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
   test file in `Async`, `Consensus` or `Distributed` carries no tag that
   expression selects.
+- A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
+  request unmergeable, not fast: the workflow never triggers, so no check run is
+  created and the required context never reports. Master is guarded by a *ruleset*,
+  so `/branches/master/protection` answers `404` and tells you nothing. Gate at the
+  **job** level instead — a skipped job still reports, and `scripts/ci-scope.sh`
+  (tested by `ctest -R ci-scope`) is what decides, escalating every way of not
+  knowing to "build everything".
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the

@@ -184,6 +184,38 @@ set_tests_properties("tsan-scope-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# CI scope classification. `scripts/ci-scope.sh` decides whether a pull request
+# compiles anything at all: the `changes` job in .github/workflows/build.yml reads
+# its `code=` output, and every heavy job is gated on it.
+#
+# That makes a wrong answer in one direction very expensive and completely silent.
+# `code=false` for a path that does reach a build is a change merged with every
+# required check reporting green and no job having compiled it -- the failure this
+# repository keeps a list about, arriving through the workflow rather than through
+# the code. So the test asserts BOTH directions and, separately, that every way of
+# not knowing (an unresolvable ref, a failed diff, an empty diff, a path matching
+# no row) escalates to `code=true`.
+#
+# Not labelled "smoke": it starts no daemon, opens no socket and needs no
+# compiler. It builds a throwaway git repository in a scratch directory, so it
+# asserts nothing about the tree it runs in and works from an exported tarball --
+# and, unlike `repository-hygiene`, needs no readable git worktree of its own.
+#
+# `if(NOT WIN32)` for the reason `cluster-e2e` carries the same guard: the script
+# is POSIX and a Windows counterpart would be a translation rather than new
+# coverage. The rule it protects is platform-independent and the Linux jobs run it.
+if(NOT WIN32)
+    add_test(
+        NAME "ci-scope"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh"
+    )
+    set_tests_properties("ci-scope" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and
