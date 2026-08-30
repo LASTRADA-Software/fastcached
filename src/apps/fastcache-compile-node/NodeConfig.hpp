@@ -255,7 +255,10 @@ struct NodeConfig
     /// anti-leeching rule rather than a preference: a scheduler no peer can dial does
     /// nothing, while a cache any host can dial is this machine's entire build output
     /// served to strangers. Widening it is an operator's decision, and even then
-    /// `CacheResponder` admits only this machine and this cluster's members.
+    /// `CacheResponder` admits only THIS MACHINE (#287) -- not this cluster's members,
+    /// which is what it admitted until locality became a property of the verb. So
+    /// widening this address buys reaching the tier from this host under another
+    /// address, and nothing else.
     ///
     /// A port already taken is fatal when the operator **named** it and a warning when
     /// it is this default. Typed, it is a promise, and a broken promise is fatal;

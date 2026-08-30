@@ -47,6 +47,7 @@
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
@@ -788,7 +789,20 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // `--raft-peer` list an operator typed, which is the ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
 
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, membership.Oracle(), cacheClock, metrics, logger);
+    // Who may read this machine's build output is "this machine", full stop (#287)
+    // -- not the member list beside it, which names peers that may spend this node's
+    // CPU. The two questions were one list until a fleet peer could FETCH every
+    // object this machine had ever compiled.
+    //
+    // The answer is ambient, so it arrives through a seam with a clock, and the set
+    // is refreshed on an interval rather than per request: `GetAdaptersAddresses`
+    // costs milliseconds on Windows, and a probe a stranger could provoke by asking
+    // is a probe a stranger can bill this machine for. `CachedLocalityOracle`
+    // carries both failure directions.
+    auto const hostAddresses = MakeSystemHostAddresses();
+    CachedLocalityOracle const cacheLocality { *hostAddresses, cacheClock };
+
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, cacheLocality, cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         // No flag prefix here, unlike its neighbours: this tier can fail over two

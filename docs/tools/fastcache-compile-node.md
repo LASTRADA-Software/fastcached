@@ -507,7 +507,7 @@ tier caches locally and never tries to reach a fleet.
 
 ### Reading it
 
-Seven counters on `/metrics`, and the splits are the point:
+Eight counters on `/metrics`, and the splits are the point:
 
 | Series | Says |
 |---|---|
@@ -518,6 +518,7 @@ Seven counters on `/metrics`, and the splits are the point:
 | `fastcache_node_cache_store_failures_total` | A local write failed — this one is reported to the client. |
 | `fastcache_node_cache_upstream_stores_total` | The fleet accepted an object this node offered. |
 | `fastcache_node_cache_upstream_store_failures_total` | The fleet would not take it. Zero on a node with no shared cache — see below. |
+| `fastcache_node_cache_requests_refused_not_local_total` | A caller that is not on this machine asked this tier for something. Zero forever on the default loopback bind; on a widened one it is your peers, whose access [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) withdrew — give them a shared `fastcached` via `--upstream`. |
 | `fastcache_node_upstream_configured` | `1` when this node has a shared cache to read through to, `0` when it does not. Absent on a node running no cache at all. |
 
 Read the two upstream counters beside the gauge, never on their own. They are
@@ -595,13 +596,43 @@ the service picks up a changed default rather than one frozen at install time.
 
 ### Who may use it
 
-**Local clients and cluster members. Nobody else, by default.**
+**The cache is this machine's. The other two surfaces are this machine's and your
+fleet's.**
 
 | Caller | Cache (`--listen-cache`) | Fleet (`--listen-scheduler`) | Compile (`--port`) |
 | --- | --- | --- | --- |
 | A process on this machine | always | always | always |
-| A `--fleet-member` peer | yes | yes | yes |
+| A `--fleet-member` peer | **refused** | yes | yes |
+| A cluster member | **refused** | yes | yes |
 | Anyone else | refused | refused | refused |
+
+The cache column changed in
+[#287](https://github.com/LASTRADA-Software/fastcached/issues/287), and it is the
+one breaking change on this page: a fleet peer used to be served this tier and no
+longer is. The two questions were never the same one. `--fleet-member` names a
+machine that may spend this node's **CPU**; the cache tier is this machine's entire
+**build output**, and nothing about contributing capacity makes another host
+entitled to read it.
+
+The rule is a property of the **verb**, not of the bind: a `FETCH` or `STORE` whose
+peer address is not one of this host's own addresses is refused whatever
+`--listen-cache` was widened to. That is what keeps it true once the surfaces share
+one listener, where "it is only bound to loopback" stops being available as an
+argument. "This host's own addresses" is loopback plus every address on its
+interfaces, so a local client dialling the node at its routable address is still
+local; the set is re-read every 30 seconds, so an address the machine has just been
+given is refused for at most that long and then works.
+
+Refusals are counted, because this withdrew access somebody may have been relying
+on:
+
+```
+fastcache_node_cache_requests_refused_not_local_total
+```
+
+Zero forever on the default loopback bind. If your peers stopped getting cache hits
+after an upgrade, that counter is where it says so — give them a shared `fastcached`
+via `--upstream`, which is what a cache several machines read is for.
 
 The flags are the node's, not the scheduler's. `--fleet-member` and `--fleet-open`
 are accepted on **any** node and read by all three columns above, so a plain worker
@@ -617,16 +648,23 @@ before the request payload is read — a caller with no claim on this machine mu
 be able to make it buffer a multi-megabyte translation unit first, which would be a
 memory-exhaustion hole opened by the check meant to close one.
 
-Two mechanisms, and both are needed:
+Two mechanisms, and only one of them is a policy:
 
-- **The bind.** `--listen-cache` takes loopback for a bare port, the opposite of
-  `--listen-scheduler`'s wildcard. A scheduler no peer can dial does nothing, while
-  a cache any host can dial is this machine's entire build output served to
-  strangers.
-- **The membership check.** A bind is not a policy. If you widen the cache to share
-  the tier with your peers — `--listen-cache 0.0.0.0:6674` — only this machine and
-  your `--fleet-member` hosts are still admitted; everyone else gets a typed
-  `not-a-member` refusal rather than a dropped connection.
+- **The locality check** is the policy, and it is the whole of it for the cache.
+  Every caller that is not on this machine gets a typed `not-a-member` refusal
+  rather than a dropped connection — member or not, and whatever the surface is
+  bound to. A refusal, so a misconfigured client learns which it is instead of
+  seeing a connection it cannot tell from a dead host.
+- **The bind** is defence in depth and nothing more. `--listen-cache` still takes
+  loopback for a bare port, the opposite of `--listen-scheduler`'s wildcard, so a
+  packet from another machine does not reach the process at all. Widening it —
+  `--listen-cache 0.0.0.0:6674` — is therefore only useful for reaching the tier
+  from *this* host under another address; it does not widen who is served.
+
+Until [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) the bind
+carried more than that: the policy admitted members, so widening the address really
+did hand the tier to your peers. It no longer does, and the flag is now a
+reachability decision rather than a trust one.
 
 **This machine is always a member of its own fleet**, whatever `--fleet-member`
 says. Anti-leeching exists to stop *other* machines spending capacity they do not
@@ -634,10 +672,10 @@ contribute; a process here already has this machine's CPU. Without that rule a n
 whose operator had listed their peers would refuse their own builds — a fleet that
 looks configured and serves nobody locally.
 
-It is deliberately stricter than `fastcached`'s own cache, which serves non-members
-on purpose. That one is shared infrastructure somebody operates; this is a
-developer's private tier. The two are different things that happen to speak one
-protocol.
+The cache tier is deliberately stricter than `fastcached`'s own cache, which serves
+non-members on purpose. That one is shared infrastructure somebody operates; this is
+a developer's private tier. The two are different things that happen to speak one
+protocol, and `--upstream` is how a node reaches the first one.
 
 On a shared multi-user machine, "local" means every account on it. That is the same
 trust level the daemon assumes, and there is currently no way to narrow it: a node
@@ -741,8 +779,10 @@ a replicated log entry, and that is what makes a node admitted at runtime surviv
 restart without anybody editing a config file on every other machine.
 
 The agreed member set joins the fleet's admission policy directly, so a node the
-cluster admitted is served by all three surfaces at once — its compile port, the
-scheduler, and every member's cache tier.
+cluster admitted is served by the two surfaces membership governs — its compile
+port and the scheduler. Not the cache tier: since
+[#287](https://github.com/LASTRADA-Software/fastcached/issues/287) that one serves
+its own machine and nothing else, whatever any member list says.
 
 It **adds** to `--fleet-member` and never replaces it. The two lists answer
 different questions: cluster members are peers, while most of the machines that

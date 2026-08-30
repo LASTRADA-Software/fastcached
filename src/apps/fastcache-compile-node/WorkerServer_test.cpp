@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheProxy.hpp"
 #include "DiscoveryTier.hpp"
+#include "LocalCache.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
+#include "Responders.hpp"
 #include "WorkerLease.hpp"
 #include "WorkerServer.hpp"
 
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -1122,4 +1129,46 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
 
         CHECK_FALSE(MakeWorkerLeaseValidator(cfg, Advertise, SocketActivation::No, clock, logger).has_value());
     }
+}
+
+TEST_CASE("(#287) one peer, two surfaces: its compile is served and its FETCH is refused",
+          "[node][cache-locality][worker][membership]")
+{
+    // The acceptance case for #287, and the only one that proves the rule SURVIVED
+    // the split rather than merely existing in one file. Both surfaces are on this
+    // node, both see the same caller, and they must disagree:
+    //
+    //   - the **compile** port asks membership, because "may you spend this
+    //     machine's CPU" is the question a `--fleet-member` list answers;
+    //   - the **cache** port asks locality, because what it holds is this machine's
+    //     entire build output and no member list makes another host entitled to it.
+    //
+    // The bind plays no part in either answer, deliberately. Once the surfaces share
+    // one wildcard listener there is no per-surface bind left to reason about, so a
+    // peer address only a widened bind could deliver is exactly what this presents.
+    std::string const peer { "10.0.0.1" };
+    Distributed::ClusterMembership const listed { { peer + ":6676" } };
+    REQUIRE(listed.Classify(peer) == Distributed::Membership::Member);
+
+    Fixture fix;
+    auto const compiled = ServeOneFrom(fix, listed, peer, CompileFrame());
+    CHECK(StatusOf(compiled) == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 0);
+
+    // The same node's cache tier, the same caller, the opposite answer. This machine
+    // answers on 10.0.0.7; the peer is not it.
+    InMemoryLruStorage storage { 64 * 1024 };
+    NoUpstream upstream;
+    ManualClock clock;
+    AtomicMetricsSink cacheMetrics;
+    LocalCache cache { storage, upstream, clock, cacheMetrics };
+    CacheProxy proxy { cache };
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, clock };
+    CacheResponder responder { proxy, locality, cacheMetrics };
+
+    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), peer));
+    CHECK(StatusOf(refused) == Wire::Status::Error);
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
+    CHECK(cacheMetrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
 }

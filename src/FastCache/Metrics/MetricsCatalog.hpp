@@ -293,6 +293,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "this node is broken. Zero on a node with no shared cache at all, which "
               "fastcache_node_upstream_configured is what distinguishes.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal,
+      .prometheusName = "fastcache_node_cache_requests_refused_not_local_total",
+      .help = "Cache requests refused because the caller is not on this machine. A node's tier "
+              "is this machine's build output and is served to this machine only, whatever the "
+              "surface is bound to and whatever the member list says. Stays at zero on the "
+              "default loopback bind; a rise means something off-box is asking.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
       .help = "Reclaimed keys whose expired/evicted keyspace event was never published, because "

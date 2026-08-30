@@ -160,6 +160,10 @@ src/FastCache/
                 rather than the caller's job),
                 Environment (the one place the process environment is read),
                 FileTrust (could only an administrator have put a file here?),
+                LocalAddresses (is this caller on THIS machine? -- the probe
+                behind an ILocalityOracle whose set is refreshed on an interval,
+                because a refresh a stranger can provoke is a syscall a stranger
+                can bill this machine for, and on Windows it costs ~2 ms),
                 NarrowText (what code page this process transcodes narrow text
                 through, whether a path built from bytes decodes as UTF-8, and
                 the two total conversions for text something ELSE wrote)

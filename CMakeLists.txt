@@ -390,7 +390,11 @@ configure_file(
 )
 
 if(WIN32)
-    target_link_libraries(FastCache PUBLIC ws2_32)
+    # iphlpapi: GetAdaptersAddresses, behind Platform/LocalAddresses. PUBLIC for the
+    # same reason ws2_32 is -- every executable that links FastCache asks the cache
+    # surface who a caller is, and a private link would leave that unresolved in each
+    # of them.
+    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi)
     target_compile_definitions(FastCache PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX

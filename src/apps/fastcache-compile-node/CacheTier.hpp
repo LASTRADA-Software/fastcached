@@ -13,6 +13,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <expected>
 #include <memory>
@@ -57,19 +58,20 @@ class CacheTier
     /// would be logged as a warning and stepped over.
     /// @param cfg The parsed configuration.
     /// @param storage Where this tier keeps objects; already opened.
-    /// @param membership Decides who may read this tier; must outlive it.
+    /// @param locality Decides whether a caller is on this machine -- the whole of
+    ///        who may read this tier, since #287; must outlive it.
     /// @param clock Time source for the tier's expiry; must outlive the tier.
-    /// @param metrics Where hits, misses and upstream outcomes are counted.
+    /// @param metrics Where hits, misses, upstream outcomes and locality refusals
+    ///        are counted.
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
-    [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(
-        NodeIoLoop& io,
-        NodeConfig const& cfg,
-        std::unique_ptr<IStorage> storage,
-        Distributed::IMembershipOracle const& membership,
-        IClock& clock,
-        IMetricsSink& metrics,
-        ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeIoLoop& io,
+                                                                                      NodeConfig const& cfg,
+                                                                                      std::unique_ptr<IStorage> storage,
+                                                                                      ILocalityOracle const& locality,
+                                                                                      IClock& clock,
+                                                                                      IMetricsSink& metrics,
+                                                                                      ILogger& logger);
 
     ~CacheTier() = default;
 
@@ -122,7 +124,7 @@ class CacheTier
   private:
     CacheTier(std::unique_ptr<IStorage> storage,
               std::unique_ptr<ICacheUpstream> upstream,
-              Distributed::IMembershipOracle const& membership,
+              ILocalityOracle const& locality,
               IClock& clock,
               IMetricsSink& metrics);
 
@@ -181,18 +183,17 @@ class CacheTier
 /// `AdminEndpoint.cpp` were each extracted for. It also kept `WorkerBody` under
 /// clang-tidy's cognitive-complexity limit, which is the symptom that said so.
 /// @param cfg The parsed configuration.
-/// @param membership Decides who may read the tier; must outlive it.
+/// @param locality Decides whether a caller is on this machine; must outlive it.
 /// @param clock Time source for the tier's expiry; must outlive it.
 /// @param metrics Where hits, misses and upstream outcomes are counted.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
-    NodeIoLoop& io,
-    NodeConfig const& cfg,
-    Distributed::IMembershipOracle const& membership,
-    IClock& clock,
-    IMetricsSink& metrics,
-    ILogger& logger);
+[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
+                                                                                             NodeConfig const& cfg,
+                                                                                             ILocalityOracle const& locality,
+                                                                                             IClock& clock,
+                                                                                             IMetricsSink& metrics,
+                                                                                             ILogger& logger);
 
 /// Convert the on-disk half of the tier to this build's record layout, and say
 /// what happened.
