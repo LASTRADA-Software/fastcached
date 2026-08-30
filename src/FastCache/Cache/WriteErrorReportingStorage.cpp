@@ -33,6 +33,16 @@ namespace
             case StorageErrorCode::Corrupt:
             case StorageErrorCode::ReadOnly:
                 return true;
+            // `MalformedValue` is deliberately NOT here, and its absence is the
+            // whole operator-visible half of #296. It reaches this function on the
+            // SADD path, because a set decode happens inside `Update` -- so while a
+            // malformed client value was reported as `Corrupt`, which IS listed
+            // above, every planted blob moved `fastcached_write_errors_total` and
+            // wrote a "storage write failed" warning. An unprivileged client could
+            // drive the disk-failure signal at will, on a store whose every record
+            // still verified, which is the mechanism that walks an operator to
+            // deleting a healthy cache. It is counted by `CacheMalformedValues`
+            // instead; nothing about it means a write could not be persisted.
             default:
                 return false;
         }

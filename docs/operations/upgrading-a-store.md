@@ -23,6 +23,30 @@ is distinguishable from `Corrupt` by something other than reading English. If yo
 are alerting on storage errors, alert on the two differently: `Corrupt` means the
 bytes are damaged, this means they were written by a different build.
 
+!!! warning "`Corrupt` used to mean a third thing, and it does not any more"
+
+    A set or a stream is an ordinary value distinguished only by its flags word,
+    and the memcached text verbs let any client choose that word — so until
+    [#296](https://github.com/LASTRADA-Software/fastcached/issues/296) a client
+    could plant a few bytes, tag them as a set, read them back, and make the
+    daemon report **`Corrupt` against a store whose every record still verified**.
+    It moved `fastcached_write_errors_total` and wrote a `storage write failed`
+    line, so an unprivileged client could drive the disk-failure signal at will.
+
+    That condition is now `MalformedValue`, counted by
+
+    ```
+    fastcached_cache_malformed_values_total
+    ```
+
+    and it is **not** a persistence failure: it moves no write-error counter and
+    writes no warning. Read a rise as *clients are sending malformed values*, and
+    look at the client. `Corrupt` beside a rising `fastcached_write_errors_total`
+    is what still means the disk.
+
+    If you were alerting on `Corrupt` before this release, that alert was
+    reachable from the network. Keep it — it is now only reachable by real damage.
+
 ## Converting
 
 Stop the daemon, then run the conversion with **the same storage options the

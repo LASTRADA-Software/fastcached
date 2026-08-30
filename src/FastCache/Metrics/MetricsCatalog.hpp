@@ -316,6 +316,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Entries the active expiry cycle reclaimed -- keys that lapsed and that nothing would "
               "have touched again, so no other path would ever have freed them.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheMalformedValues,
+      .prometheusName = "fastcached_cache_malformed_values_total",
+      .help = "Stored values that did not decode as the type their flags claim -- a client wrote "
+              "bytes that are not a well-formed set or stream. NOT a disk signal: the store is "
+              "intact and every record still verifies. These were reported as Corrupt until #296, "
+              "which moved fastcached_write_errors_total and told operators their disk had failed.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

@@ -3,12 +3,14 @@
 
 #include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <optional>
 #include <span>
@@ -281,68 +283,97 @@ namespace detail
 /// Decode a stream value blob.
 /// @param blob The stored value bytes.
 /// @param out  Receives the decoded stream (cleared first).
-/// @return True on a well-formed blob; false if it is truncated/corrupt.
-[[nodiscard]] inline bool Decode(std::span<std::byte const> blob, Stream& out)
+/// @return Nothing on a well-formed blob; `MalformedValue` naming what it refused.
+///
+/// **Returns the error rather than a `bool`, for the reason `SetCodec::Decode`
+/// spells out** (#296): a stream is an ordinary value blob tagged by a `flags` word
+/// an ordinary memcached client may choose, so a decode failure here is a client's
+/// bytes and not a failing disk. It was reported as `StorageErrorCode::Corrupt`,
+/// which is what gets a healthy cache deleted -- and, because `Corrupt` counts as a
+/// persistence failure, it moved `fastcached_write_errors_total` and wrote a
+/// "storage write failed" warning while it did so.
+///
+/// `Corrupt` was never honest from here in any case: integrity is verified BELOW
+/// this, by `CowTreeStorage`'s CRC32C and by the compression codec, each of which
+/// reports `Corrupt` itself before a byte reaches a value decoder. Whatever arrives
+/// here is known to be the bytes somebody stored.
+///
+/// The reasons are coarser than the set codec's on purpose: this walk has a dozen
+/// refusal points over four nested levels, and a caller acts on all of them
+/// identically. What an operator needs from the context is WHICH structure ran out
+/// of bytes, not which field.
+[[nodiscard]] inline std::expected<void, StorageError> Decode(std::span<std::byte const> blob, Stream& out)
 {
+    /// The refusal, spelled once so every path out carries the same code.
+    /// @param why What the bytes did not honour.
+    auto const malformed = [](std::string_view why) {
+        return std::unexpected(MakeMalformedValueError(std::string { "stream value blob: " } + std::string { why }));
+    };
+
     out = Stream {};
     if (blob.size() < 2 || blob[0] != Magic || blob[1] != TypeStream)
-        return false;
+        return malformed("not a stream blob (short, or wrong magic/type tag)");
     ByteCursor r { blob, /*offset=*/2 };
     if (!detail::ReadId(r, out.lastId) || !detail::ReadId(r, out.maxDeletedId) || !r.ReadU64(out.entriesAdded))
-        return false;
+        return malformed("truncated stream header");
     std::uint32_t entryCount = 0;
     if (!r.ReadCount(entryCount, detail::MinEntryBytes))
-        return false;
+        return malformed("entry count claims more entries than the remaining bytes could hold");
     for (auto i = std::uint32_t { 0 }; i < entryCount; ++i)
     {
         StreamEntry entry;
         if (!detail::ReadId(r, entry.id))
-            return false;
+            return malformed("truncated entry id");
         std::uint32_t fieldCount = 0;
         if (!r.ReadCount(fieldCount, detail::MinFieldBytes))
-            return false;
+            return malformed("field count claims more fields than the remaining bytes could hold");
         for (auto f = std::uint32_t { 0 }; f < fieldCount; ++f)
         {
             std::string name;
             std::string value;
             if (!r.ReadField(name) || !r.ReadField(value))
-                return false;
+                return malformed("truncated entry field");
             entry.fields.emplace_back(std::move(name), std::move(value));
         }
         out.entries.push_back(std::move(entry));
     }
     std::uint32_t groupCount = 0;
     if (!r.ReadCount(groupCount, detail::MinGroupBytes))
-        return false;
+        return malformed("group count claims more groups than the remaining bytes could hold");
     for (auto g = std::uint32_t { 0 }; g < groupCount; ++g)
     {
         ConsumerGroup group;
         if (!r.ReadField(group.name) || !detail::ReadId(r, group.lastDelivered) || !r.ReadU64(group.entriesRead))
-            return false;
+            return malformed("truncated consumer group header");
         std::uint32_t consumerCount = 0;
         if (!r.ReadCount(consumerCount, detail::MinConsumerBytes))
-            return false;
+            return malformed("consumer count claims more consumers than the remaining bytes could hold");
         for (auto c = std::uint32_t { 0 }; c < consumerCount; ++c)
         {
             std::string consumer;
             if (!r.ReadField(consumer))
-                return false;
+                return malformed("truncated consumer name");
             group.consumers.push_back(std::move(consumer));
         }
         std::uint32_t pelCount = 0;
         if (!r.ReadCount(pelCount, detail::MinPendingBytes))
-            return false;
+            return malformed("pending count claims more entries than the remaining bytes could hold");
         for (auto p = std::uint32_t { 0 }; p < pelCount; ++p)
         {
             PendingEntry pending;
             if (!detail::ReadId(r, pending.id) || !r.ReadU64(pending.deliveryTimeMs) || !r.ReadU64(pending.deliveryCount)
                 || !r.ReadField(pending.consumer))
-                return false;
+                return malformed("truncated pending-entry record");
             group.pel.push_back(std::move(pending));
         }
         out.groups.push_back(std::move(group));
     }
-    return r.Ok();
+    // `r.Ok()` last, which is not decoration: the cursor latches a failure, so a
+    // read that overran inside a nested loop can still leave the walk structurally
+    // complete. Trailing bytes are refused here too.
+    if (!r.Ok())
+        return malformed("truncated, or carrying bytes past the last record");
+    return {};
 }
 
 /// Parse an unsigned 64-bit decimal from `text`.

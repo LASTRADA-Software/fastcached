@@ -6,6 +6,7 @@
 #include <FastCache/Cache/StreamCodec.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -35,10 +36,22 @@ class CacheEngine
     /// to `DefaultSystemWallClock()`); tests pass a ManualWallClock so
     /// the wire path through HandleExpire's absolute branch is
     /// deterministic.
+    /// An optional `IMetricsSink*` receives the counters this layer owns -- today
+    /// only `CacheMalformedValues`, which is the one fact about a request that is
+    /// known HERE and nowhere else: the storage below has already verified the bytes
+    /// it returned, and the protocol above has no single seam where a storage error
+    /// becomes a reply. A pointer rather than a reference, and nullable, because the
+    /// engine is legitimately constructed without one -- benchmarks, and most of this
+    /// suite -- and the same shape `ReactorServerLoop` already uses for the same
+    /// reason.
     /// @param storage   Backing storage.
     /// @param clock     Monotonic clock for TTL/timeout semantics.
     /// @param wallClock Wall clock for absolute-UNIX-time translations.
-    CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock = DefaultSystemWallClock()) noexcept;
+    /// @param metrics   Where this layer's counters go; null to count nothing.
+    CacheEngine(IStorage& storage,
+                IClock& clock,
+                IWallClock& wallClock = DefaultSystemWallClock(),
+                IMetricsSink* metrics = nullptr) noexcept;
 
     // -- memcached-flavoured operations -------------------------------------
 
@@ -578,6 +591,17 @@ class CacheEngine
         return _wallClock;
     }
 
+    /// Where this layer's counters go, or null when nothing is counting.
+    ///
+    /// Public alongside `Clock()` and `WallClock()` for the same reason those are:
+    /// the decode helpers that need it are free functions in `CacheEngine.cpp`,
+    /// which already take the engine.
+    /// @return The sink, or nullptr.
+    [[nodiscard]] IMetricsSink* Metrics() const noexcept
+    {
+        return _metrics;
+    }
+
     /// Current wall-clock time in milliseconds since the UNIX epoch, taken from
     /// the injected `IWallClock`. Drives stream entry-ID timestamps and the
     /// PEL idle-time accounting; deterministic under `ManualWallClock`.
@@ -602,6 +626,7 @@ class CacheEngine
     IStorage& _storage;
     IClock& _clock;
     IWallClock& _wallClock;
+    IMetricsSink* _metrics { nullptr };
 };
 
 } // namespace FastCache
