@@ -281,6 +281,53 @@ readable and silently ignored. Every rule below has already been one of them.
   trip is kept honest. `ServiceNameRejection` covers the other direction: the
   name is concatenated into the directory launchd scans, so a separator writes a
   root-owned plist nothing knows how to remove.
+- **PROVENANCE is not VALUE: whether an operator NAMED a setting is a fact the
+  parse records, never one a comparison against the default recovers.** The two
+  agree everywhere except on the one input that matters — an operator typing the
+  default — and that is not an exotic input, it is what somebody does after
+  reading the value off the startup line to pin it. Where the answer decides
+  anything, `OptionSpec::explicitBit` records it at the parse and the decision
+  reads the bit.
+
+  Both sides of a flag ask this question, and getting one right is not getting the
+  flag right. `--listen-cache` had it wrong on both
+  ([#286](https://github.com/LASTRADA-Software/fastcached/issues/286)): the tier
+  compared `cfg.cacheListen` against `NodeConfig{}.cacheListen` to decide whether a
+  bind failure was **fatal**, so a pinned default port was read as a convenience
+  nobody asked for and the node started healthy serving no cache — and
+  `MakeNodeServiceSpec`'s `emitIfSet` compares the same two values to decide what to
+  register, so the same pinned port was dropped from the unit and the service came
+  back classified as defaulted, warning past a taken port at every boot. Fixing only
+  the startup half leaves the reported failure reachable through the install path,
+  which is the way this software actually runs.
+
+  So: a flag whose provenance decides anything is emitted **on the bit, never on
+  difference** — `emitIfExplicit`, a named sibling of `emitIfSet` rather than an `if`
+  per flag, because *reaching for `emitIfSet` is the mistake* and a named alternative
+  is what makes the choice visible where it is made. `emitIfSet` stays right for a
+  flag whose default is a constant the next start re-derives identically; it is wrong
+  the moment the default is host-derived (`--cache-memory` follows RAM) or the moment
+  being defaulted *means* something at startup (`--listen-cache`'s warn-versus-refuse).
+
+  The guard is mechanical, because the failure is an **omission** and every other
+  case in the file passes a row that regressed: a case walks `NodeOptions()`, and for
+  each row carrying an `explicitBit` sets the bit while leaving the field at its
+  **default** — the one shape no value comparison can tell from silence — and requires
+  the flag to be emitted. It asserts the converse over the same walk. A new row
+  therefore cannot go back to `emitIfSet` by omission, and nobody has to remember this
+  paragraph. Note the emission itself stays hand-written per binary for the reason
+  already recorded above: an `OptionSpec` says how to *parse* a flag and carries no
+  way to read a value back out.
+
+  Its converse is why "always emit it" is not the fix: a setting nobody named must
+  stay unnamed through the registration, or the machine's default is frozen at
+  install time and a node that should follow a memory upgrade or a moved default
+  silently does not.
+
+  A flag needs no bit when its default is **empty**. There is then no address to
+  arrive at without asking, so every failure on it is unconditionally fatal —
+  `--admin-listen` and `--cache-dir` are that shape, and the asymmetry with
+  `--listen-cache` is the default, not the surface.
 - **Teardown must address every domain, not re-probe for one.** Which launchd
   domain a user agent lives in is decided at install time — `gui/<uid>` needs an
   Aqua session, so an SSH install lands in `user/<uid>`. Re-probing at uninstall

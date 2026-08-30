@@ -835,6 +835,14 @@ Six more about what the tier IS and who gets to see it:
   letting `Start` do it — otherwise a bad `--cache-dir` on a node using the DEFAULT
   cache port is logged as a warning and stepped over, and the error names
   `--listen-cache` while pointing at a directory.
+
+  **"The operator typed it" is `cfg.cacheListenExplicit`, never a comparison against
+  the default** ([#286](https://github.com/LASTRADA-Software/fastcached/issues/286)).
+  Why a comparison cannot answer it, and why the registration side of the same flag
+  had it wrong too, is
+  [`platform-service-and-config.md`](platform-service-and-config.md) under
+  "provenance is not value" — read it before adding a flag whose default means
+  something.
 - **The tier lives behind a single-shard `ShardedStorage`, and that wrapper is the
   lock rather than any kind of sharding.** The tier is mutated on the reactor thread
   while the heartbeat thread and the `/metrics` scrape read its statistics, and

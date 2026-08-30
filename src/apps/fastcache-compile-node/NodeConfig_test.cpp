@@ -63,9 +63,8 @@ namespace
 
 /// Parse an argv fragment into a `NodeConfig`, the way `main` does.
 ///
-/// A local helper rather than a shared one because the two cases below are the only
-/// callers: everything else here builds a config directly, since what it is testing
-/// is what comes back OUT of one.
+/// A local helper rather than a shared one: everything outside this file builds a
+/// config directly, since what it is testing is what comes back OUT of one.
 /// @param args The flags, without the program name.
 /// @return The configuration, or the first parse error.
 [[nodiscard]] std::expected<NodeConfig, ConfigError> ParseNodeArgv(std::vector<char const*> const& args)
@@ -75,6 +74,24 @@ namespace
     if (!flow.has_value())
         return std::unexpected(flow.error());
     return cfg;
+}
+
+/// Read a registration back the way the service will at its next start.
+///
+/// The round trip every case about a registration asks for, in one place: whatever
+/// reaches a supervisor is re-read by this binary at every boot, so a value that
+/// cannot be spelled back is a service that registers cleanly and then fails
+/// forever. Written out by hand three times before, which is three copies of the
+/// step a case is *not* trying to test.
+/// @param spec The registration, whose strings must outlive the call.
+/// @return What this binary would come back up with, or the first parse error.
+[[nodiscard]] std::expected<NodeConfig, ConfigError> ReparseSpec(ServiceSpec const& spec)
+{
+    std::vector<char const*> argv;
+    argv.reserve(spec.arguments.size());
+    for (auto const& argument: spec.arguments)
+        argv.push_back(argument.c_str());
+    return ParseNodeArgv(argv);
 }
 
 /// What `CacheCapacityOf` reports for a node that built no cache tier.
@@ -231,6 +248,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.cacheDir = "cache";
     cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
     cfg.cacheListen = "127.0.0.1:6679";
+    // Typed, not merely different -- the same rule `--cache-memory` above follows,
+    // and for this flag the provenance is what decides whether a bind failure stops
+    // the node, so a registration that lost it warns past a taken port forever.
+    cfg.cacheListenExplicit = true;
     cfg.upstream = "cache.internal:6674";
     cfg.nodeId = "n1";
     cfg.raftListen = "0.0.0.0:6680";
@@ -326,12 +347,7 @@ TEST_CASE("NodeConfig: a discovery-off registration comes back with it still off
 
     // Round-tripped through this project's own parser, which is the rule every
     // registration follows: whatever reaches a supervisor has to survive it.
-    std::vector<char const*> argv;
-    argv.reserve(spec.arguments.size());
-    for (auto const& argument: spec.arguments)
-        argv.push_back(argument.c_str());
-
-    auto const reparsed = ParseNodeArgv(argv);
+    auto const reparsed = ReparseSpec(spec);
     REQUIRE(reparsed.has_value());
     CHECK_FALSE(reparsed->toolchainDiscovery);
 
@@ -639,12 +655,7 @@ TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[
 
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", cfg);
 
-    std::vector<char const*> argv;
-    argv.reserve(spec.arguments.size());
-    for (auto const& argument: spec.arguments)
-        argv.push_back(argument.c_str());
-
-    auto const reparsed = ParseNodeArgv(argv);
+    auto const reparsed = ReparseSpec(spec);
     REQUIRE(reparsed.has_value());
     CHECK(reparsed->raftPeers == cfg.raftPeers);
 }
@@ -1808,6 +1819,80 @@ TEST_CASE("Typing the cache budget is what marks it explicit", "[node][config][c
     auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
     REQUIRE(silent.has_value());
     CHECK_FALSE(silent->cacheMemoryExplicit);
+}
+
+TEST_CASE("Typing the cache port is what marks it explicit, even at its default value", "[node][config][cache]")
+{
+    // The one spelling value equality cannot see: an operator reading the startup
+    // line and typing the port back to pin it lands on the default exactly (#286).
+    auto const pinned = ParseNodeArgv({ "--listen-cache=127.0.0.1:6674" });
+    REQUIRE(pinned.has_value());
+    CHECK(pinned->cacheListen == NodeConfig {}.cacheListen);
+    CHECK(pinned->cacheListenExplicit);
+
+    // Turning the tier off is a decision too, and an empty value is as far from the
+    // default as a port is.
+    auto const off = ParseNodeArgv({ "--listen-cache=" });
+    REQUIRE(off.has_value());
+    CHECK(off->cacheListenExplicit);
+
+    auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(silent->cacheListenExplicit);
+}
+
+TEST_CASE("NodeConfig: a setting the operator pinned reaches the supervisor as pinned", "[node][service]")
+{
+    // Walked off the table rather than written out per flag, because the failure it
+    // guards is an OMISSION: a row given an `explicitBit` and then emitted with
+    // `emitIfSet` passes every other case in this file, since they all hand the
+    // field a value that differs. That is #286 exactly -- the registration half of
+    // it -- and a hand-written list is maintained by whoever forgot the emitter.
+    //
+    // The value is left at its DEFAULT while the bit is set, which is the shape no
+    // value comparison can tell from silence, and the only shape that matters here.
+    for (auto const& option: NodeOptions())
+    {
+        if (option.explicitBit == nullptr)
+            continue;
+
+        auto pinned = Installable();
+        pinned.*option.explicitBit = true;
+        INFO("flag: " << option.primary);
+
+        auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
+        CHECK(std::ranges::any_of(spec.arguments,
+                                  [&option](std::string const& arg) { return FlagMatches(arg, option.primary); }));
+    }
+
+    // Its converse, or "always emit it" would pass: a setting nobody named stays out
+    // of the registration, so the machine's default is not frozen at install time.
+    auto const silent = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", Installable());
+    for (auto const& option: NodeOptions())
+    {
+        if (option.explicitBit == nullptr)
+            continue;
+        INFO("flag: " << option.primary);
+        CHECK(std::ranges::none_of(silent.arguments,
+                                   [&option](std::string const& arg) { return FlagMatches(arg, option.primary); }));
+    }
+}
+
+TEST_CASE("NodeConfig: a cache port the operator pinned survives its own installer", "[node][service][cache]")
+{
+    // The round trip the platform rules require, asked of the PROVENANCE and not
+    // only the value: the service is how this program actually runs, so a
+    // registration that came back classified as defaulted would warn past a bind
+    // failure at every boot forever (#286).
+    auto pinned = Installable();
+    pinned.cacheListen = NodeConfig {}.cacheListen;
+    pinned.cacheListenExplicit = true;
+
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
+    auto const reparsed = ReparseSpec(spec);
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->cacheListen == pinned.cacheListen);
+    CHECK(reparsed->cacheListenExplicit);
 }
 
 TEST_CASE("A flag whose value other machines read refuses one that is not text", "[node][config][utf8]")
