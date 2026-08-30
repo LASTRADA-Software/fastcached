@@ -143,6 +143,34 @@ worker can decompress. The last one saves a round trip — the client is about t
 send a multi-megabyte payload and would otherwise have to guess or give up
 compressing it.
 
+!!! info "The lease token is signed, and what it covers is the point"
+
+    When `--cluster-key-file` is set, the token is not a serial number. It is
+    base64 text carrying the granted worker's endpoint, the toolchain fingerprint,
+    the object key and an absolute expiry, plus an HMAC-SHA256 tag over all of them
+    under the cluster's pre-shared key — the same key discovery proves membership
+    with, under a domain label of its own so one construction's tag can never pass
+    for the other's.
+
+    **The endpoint is inside the MAC, and that is the whole reason the token has a
+    shape at all.** A signature over "somebody may compile" is a signature that lets
+    a token captured on the way to one machine be replayed against every other
+    machine in the fleet. This is the same rule LAN discovery follows, where the
+    proof covers the `(node, endpoint)` pair.
+
+    The expiry carries **five minutes of slack**, because not every machine in a
+    fleet is NTP-managed and an unsynchronised clock is minutes out, not seconds.
+    It bounds how long a leaked token is worth replaying and **nothing else** — a
+    worker's slot count and in-flight byte budget are what bound what it will run,
+    so an unexpired lease is not a promise that the scheduler still holds capacity
+    for it.
+
+    A node started with no `--cluster-key-file` cannot sign, and hands out the bare
+    serial it always did. It says so in its log, once, at the first grant.
+
+    A worker does **not** verify the token yet — see
+    [The lease token, and what it does not yet buy](#the-lease-token-and-what-it-does-not-yet-buy).
+
 A refusal is one of four, and they are counted apart on purpose:
 
 | Refusal | What it means | What to do |
@@ -642,6 +670,28 @@ front of every port.
 
 The two credentials that are real and unaffected: `--dashboard-token-file` for the
 fleet page, and `fastcached`'s own `--requirepass` for the shared cache.
+
+### The lease token, and what it does not yet buy
+
+A lease grant is now a **signed capability** rather than a serial number: with
+`--cluster-key-file` set, the scheduler MACs the granted endpoint, the toolchain,
+the object key and an expiry under the cluster's pre-shared key
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)). A token is
+therefore unforgeable, and one minted for one worker does not authenticate against
+another.
+
+**A worker does not check it yet.** The verification half is
+[#282](https://github.com/LASTRADA-Software/fastcached/issues/282), and until that
+lands a worker's validator accepts whatever arrives — so the compile port's real
+boundary today is still reachability plus membership, exactly as described above.
+Signing first is deliberate: the token format has to exist before anything can be
+written against it, and a worker that started refusing unsigned leases before every
+scheduler in a fleet could mint them would stop distributing mid-upgrade.
+
+Once #282 lands, three refusals become reachable at the compile port —
+`lease-unauthorized`, `lease-endpoint-mismatch` and `lease-expired` — each with its
+own counter, because they are three different things for an operator to do. Until
+then those counters exist and stay at zero.
 
 Fuller treatment in
 [Distributed compilation § Security](../getting-started/distributed-compilation.md#security)

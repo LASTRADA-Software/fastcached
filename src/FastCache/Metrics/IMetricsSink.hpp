@@ -139,6 +139,16 @@ class IMetricsSink
         /// part of its distribution, which is a different thing to fix from a fleet
         /// that is merely full.
         DispatchLeasesReclaimed,
+        /// Releases refused because the token presented was not signed by this
+        /// cluster.
+        ///
+        /// The scheduler's own half of `WorkerJobsRefusedLeaseUnauthorized`, and its
+        /// own counter for the same reason the worker's refusals are split: this one
+        /// is about **who** asked, not about what the fleet could do. Deliberately
+        /// not folded into the uncounted `UnknownLease` refusal beside it, which is
+        /// a statement about one client's timing -- a token this cluster issued and
+        /// has since forgotten. This one was never issued at all.
+        DispatchLeasesUnauthorized,
 
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this
@@ -224,6 +234,32 @@ class IMetricsSink
         WorkerJobsRefusedEnvelopeUnsupportedCodec,
         WorkerJobsRefusedEnvelopeDeclaredTooLarge,
         WorkerJobsRefusedEnvelopeCorrupt,
+
+        /// Jobs refused because the lease presented was not signed by this cluster.
+        ///
+        /// The one counter here that is unambiguously a security signal rather than
+        /// a capacity or configuration one: membership decided the caller may reach
+        /// this port, and the lease decides the scheduler actually sent them. A
+        /// sustained rise is somebody probing the compile port, or -- far more often
+        /// -- a launcher built before signed leases, which presents a bare serial
+        /// that cannot authenticate. The two are indistinguishable here by design;
+        /// what tells them apart is whether the rise tracks a rollout.
+        WorkerJobsRefusedLeaseUnauthorized,
+        /// Jobs refused because an AUTHENTIC lease named a different worker.
+        ///
+        /// Almost never a replay and almost always a fleet whose registered endpoint
+        /// is not the one clients dial -- a NAT, or a hostname registered where an
+        /// address resolves. Counted apart from the refusal above precisely because
+        /// the actions differ: one is somebody attacking, the other is somebody's
+        /// `--scheduler-advertise` being wrong.
+        WorkerJobsRefusedLeaseEndpointMismatch,
+        /// Jobs refused because an AUTHENTIC lease had expired.
+        ///
+        /// Not a capacity fact. A lease's expiry bounds how long a captured token is
+        /// useful; a worker's slots bound what it will run. A rise on one machine
+        /// and nowhere else is that machine's clock drifting, which is why the check
+        /// carries skew slack and why this is worth seeing per node.
+        WorkerJobsRefusedLeaseExpired,
 
         /// Bytes of request payload read from clients, and of reply written back.
         /// The pair is what says whether a codec negotiation is doing anything:

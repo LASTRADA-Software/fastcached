@@ -564,6 +564,49 @@ Consequences that are each load-bearing:
   a **fresh** connection; the scheduler sweeps one idle for five seconds and a
   compile is longer, so reusing the lease socket would fail exactly when there was
   something to release.
+- **A lease token is a CREDENTIAL, and its MAC covers the granted endpoint or it is
+  a credential for the whole fleet.** For a long time it was a small decimal serial
+  the scheduler minted for its own bookkeeping, and the worker's validator was
+  literally `[](...){ return true; }` — so a worker compiled for anyone who could
+  reach its port and present any string, and membership (which matches on a source
+  address) was the entire boundary. A grant now carries an HMAC-SHA256 tag over the
+  worker's **endpoint**, the fingerprint, the object key and an absolute expiry,
+  under the same pre-shared key discovery uses. The endpoint is the load-bearing
+  field: a MAC over "somebody may compile" is a token captured on the way to one
+  machine and replayed against every machine that trusts the key, which is the
+  identical failure `Cluster::DiscoveryWire` closes by covering the
+  `(node, endpoint)` pair. The claim fields are **length-prefixed, never joined**,
+  and here the separator argument is not hypothetical — an endpoint is `host:port`,
+  so `{endpoint="a", key="b:1"}` and `{endpoint="a:b", key="1"}` would authenticate
+  identically. Every message is prefixed with a **domain label**, because the same
+  key already MACs discovery proofs and one key serving two constructions is how a
+  tag made for one comes to pass for the other. The token wraps the `LeaseTable`
+  serial rather than replacing it, which is what keeps that component pure — no key,
+  no wall clock, no crypto in the thing whose whole job is a deterministic unit
+  test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
+- **The MAC is verified BEFORE any other claim is reported on, and the expiry is not
+  a capacity bound.** Checking the plaintext endpoint first would be cheaper and
+  would turn a diagnostic into an oracle: `EndpointMismatch` and `Expired` are only
+  ever reported for a token that provably came from the scheduler, so a forger
+  learns exactly that their forgery failed, while an operator whose worker
+  advertises a name clients do not resolve is told precisely that — which is the
+  overwhelmingly common cause and is a NAT or a hostname, not an attack. The expiry
+  carries **five minutes of slack** because a fleet's machines are not all
+  NTP-managed and an unsynchronised clock is minutes out, not seconds; it bounds how
+  long a *captured* token is worth replaying and nothing else. A worker will
+  therefore accept an authentic lease for minutes after the scheduler stopped
+  suppressing its key, and that is correct: what bounds what a worker runs is its
+  own slot accounting and its in-flight byte budget, never the lease. Anything built
+  on "an unexpired lease implies the scheduler still holds capacity" is built on a
+  guarantee that does not exist.
+- **A scheduler with no `--cluster-key-file` signs nothing, and says so.** Refusing
+  to schedule without a key would break every single-machine install, which is what
+  most people run; doing it quietly is the failure class this repository keeps
+  rediscovering — a fleet that is green and is not doing the thing it claims. So the
+  fallback is the bare serial exactly as before, plus one bounded warning line at the
+  first grant. The flag's startup rule moved with it: it used to be refused unless
+  `--discovery` was set, on the stated premise that discovery was its only reader,
+  and a refusal whose premise has become false is worse than no refusal.
 - **A resolve answers on liveness, never on presence, and an unknown token is
   refused.** Nothing visits an expired token but an `Acquire` for the same key, so
   an expired entry is still sitting in the table when its holder finally reports —
@@ -1300,6 +1343,21 @@ the pair is indistinguishable again.
 
 ## Open work
 
+- **[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)** — the worker
+  does not verify the lease it is handed. The scheduler signs a grant
+  ([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)) and
+  `VerifyLeaseToken` exists with its wire codes and its counters, but nothing calls it
+  before a compiler is spawned, so a compile port's real boundary is still
+  reachability plus membership. Signing had to ship first — a worker refusing unsigned
+  leases before every scheduler in a fleet could mint them would stop distributing
+  mid-upgrade — but a signed grant nobody checks buys nothing, and the three
+  `fastcache_worker_jobs_refused_lease_*` series read zero until this lands.
+- **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
+  with no `--cluster-key-file` signs nothing and only warns. Refusing at startup is
+  what a credential deserves and would break every single-machine install, which is
+  what most people run; the current answer is the bare serial plus one bounded warning
+  line at the first grant. What is missing is a way for an operator to say *this fleet
+  signs* and have the absence of a key be fatal, without that being the default.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and

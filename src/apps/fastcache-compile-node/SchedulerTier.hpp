@@ -12,8 +12,10 @@
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace FastCache::Node
@@ -33,8 +35,14 @@ class SchedulerTier
 {
   public:
     /// Build the tier and start serving it.
+    ///
+    /// Reads `--cluster-key-file` when one is named, because that key is what a
+    /// lease grant is signed with. An unreadable one is fatal here rather than a
+    /// warning: an operator who named a key file and got a scheduler handing out
+    /// unsigned grants has a fleet that looks configured and is not.
     /// @param cfg The parsed configuration.
     /// @param clock Time source for registry expiry and lease timeouts.
+    /// @param wallClock Where a grant's absolute expiry comes from.
     /// @param metrics Where dispatch outcomes are counted.
     /// @param logger Where to announce the bound address.
     /// @return The running tier, or why it could not be served.
@@ -43,6 +51,7 @@ class SchedulerTier
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
+        IWallClock const& wallClock,
         IMetricsSink& metrics,
         ILogger& logger);
 
@@ -106,7 +115,12 @@ class SchedulerTier
     }
 
   private:
-    SchedulerTier(Distributed::IMembershipOracle const& membership, IClock& clock, IMetricsSink& metrics, ILogger& logger);
+    SchedulerTier(Distributed::IMembershipOracle const& membership,
+                  IClock& clock,
+                  IWallClock const& wallClock,
+                  IMetricsSink& metrics,
+                  ILogger& logger,
+                  std::span<std::byte const> signingKey);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.

@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/Base64.hpp>
+#include <FastCache/Core/Bytes.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
+#include <ranges>
 #include <string>
 
 #include <tests/Unwrap.hpp>
 
+using FastCache::AsBytes;
 using FastCache::Base64Decode;
+using FastCache::Base64Encode;
 using FastCache::Testing::Unwrap;
 
 TEST_CASE("Base64 decodes the RFC 4648 test vectors", "[core][base64]")
@@ -83,4 +88,51 @@ TEST_CASE("Base64 refuses a non-canonical final group", "[core][base64]")
     // An unpadded group has no spare bits, so nothing here narrows what was
     // already accepted.
     CHECK(Unwrap(Base64Decode("QUJD")) == "ABC");
+}
+
+TEST_CASE("Base64 encodes the RFC 4648 test vectors", "[core][base64]")
+{
+    // The same vectors the decoder is checked against, so the two are pinned to the
+    // published answers rather than to each other -- an encoder and a decoder that
+    // agree only with one another agree about a mistake just as happily.
+    CHECK(Base64Encode(AsBytes("")).empty());
+    CHECK(Base64Encode(AsBytes("f")) == "Zg==");
+    CHECK(Base64Encode(AsBytes("fo")) == "Zm8=");
+    CHECK(Base64Encode(AsBytes("foo")) == "Zm9v");
+    CHECK(Base64Encode(AsBytes("foob")) == "Zm9vYg==");
+    CHECK(Base64Encode(AsBytes("fooba")) == "Zm9vYmE=");
+    CHECK(Base64Encode(AsBytes("foobar")) == "Zm9vYmFy");
+}
+
+TEST_CASE("Base64 round-trips every byte value", "[core][base64]")
+{
+    // A signed-lease token is arbitrary bytes -- a 32-byte HMAC tag, big-endian
+    // integers -- so the high half of the byte range is not an edge case here, it is
+    // most of the payload. `char` is signed on x86-64 Linux and unsigned on aarch64,
+    // which is exactly the kind of difference this walks into.
+    std::string all;
+    for (auto const value: std::views::iota(0, 256))
+        all.push_back(static_cast<char>(value));
+
+    CHECK(Unwrap(Base64Decode(Base64Encode(AsBytes(all)))) == all);
+
+    // And every length modulo three, because that is what decides the padding.
+    for (auto const length: std::views::iota(std::size_t { 0 }, std::size_t { 9 }))
+    {
+        auto const prefix = all.substr(0, length);
+        CHECK(Unwrap(Base64Decode(Base64Encode(AsBytes(prefix)))) == prefix);
+    }
+}
+
+TEST_CASE("Base64 emits only what this project's decoder accepts", "[core][base64]")
+{
+    // The URL-safe alphabet is deliberately not decoded here, so emitting it would
+    // produce text this build cannot read back. Checked over a payload chosen to
+    // reach the two symbols that differ: 0x3E is `+` and 0x3F is `/`.
+    auto const text = Base64Encode(AsBytes(std::string { "\xFB\xFF\xBF" }));
+    CHECK(text.contains('+'));
+    CHECK(text.contains('/'));
+    CHECK_FALSE(text.contains('-'));
+    CHECK_FALSE(text.contains('_'));
+    CHECK(Base64Decode(text).has_value());
 }

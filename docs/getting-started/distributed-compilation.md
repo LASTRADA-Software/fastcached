@@ -420,6 +420,7 @@ start it with `--admin-listen` and these count the outcomes.
 | `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was **admitted** while advertising an endpoint whose host is not the address it connected from. Not a fault by itself — DNS names, a node dialling itself, NAT, a VPN and multi-homing all land here. See [the endpoint a registration names is not verified](../operations/cluster-communication.md#the-endpoint-a-registration-names-is-not-verified). |
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. Rising beside a rising registration count is a fleet whose heartbeats are not arriving, not one that is growing. |
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job, or restarted, and the keys it was building were freed. Work nobody will report done — a build that lost part of its distribution, which is a different thing to fix from a fleet that is merely full. |
+| `fastcached_dispatch_leases_unauthorized_total` | A client handed back a lease token this cluster never signed. Never sum it with the `unknown-lease` refusals beside it: those name a lease this scheduler *did* issue and has since forgotten, while a rise here is a forged release — or, far more likely, a launcher predating signed leases, in which case it tracks a rollout and stops when the rollout finishes. |
 
 The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and
@@ -443,11 +444,21 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | A client compressed with a codec this worker was not built with. A packaging difference between two honest machines; each one cost a local compile. |
 | `fastcache_worker_jobs_refused_envelope_malformed_total` | A payload envelope that did not parse: a version skew, or something on the port that is not this protocol. |
 | `fastcache_worker_jobs_refused_envelope_corrupt_total` | Bytes that parsed and then did not expand to their declared size. The one refusal here that implicates the **transport**. |
+| `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by this cluster. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating signed leases, which is told apart by whether the rise tracks a rollout. |
+| `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
+| `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
 The refusals are split by reason for the same reason the scheduler's two are:
 a full worker and a misconfigured one are different problems with different
 fixes, and one number covering both tells you neither.
+
+The three `..._lease_*` counters are exported and stay at **zero** until
+[#282](https://github.com/LASTRADA-Software/fastcached/issues/282) lands: a
+scheduler signs its grants today, and a worker does not yet check them. They are
+here now rather than with the check because a refusal's wire code and its counter
+are one fact, and splitting them across two changes is how one of them gets
+forgotten.
 
 The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,

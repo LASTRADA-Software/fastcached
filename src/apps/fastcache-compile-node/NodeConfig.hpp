@@ -361,6 +361,12 @@ struct NodeConfig
     /// end up in a unit file or a registry key that more accounts can read than
     /// can read a mode-0600 file. A leaked key admits a node, and an admitted node
     /// returns objects the whole fleet then caches.
+    ///
+    /// Read by **two** surfaces, which is worth stating because it used to be one:
+    /// discovery proves the cluster's identity with it, and the scheduler signs
+    /// lease grants with it (`Distributed/LeaseToken.hpp`). Without one a grant is a
+    /// bare serial and a worker has nothing to check, so anybody who can reach a
+    /// compile port can spend it.
     std::filesystem::path clusterKeyFile;
 
     /// The name the platform's supervisor keys this worker's registration on.

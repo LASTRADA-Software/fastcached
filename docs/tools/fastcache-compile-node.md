@@ -864,6 +864,15 @@ can read than can read a mode-0600 file. A leaked key admits a node, an admitted
 is assigned compile jobs, and the objects it returns are cached fleet-wide — so it is
 object injection into everybody's build.
 
+**Two surfaces read it, not one.** Discovery proves the cluster's identity with it,
+and the scheduler **signs lease grants** with it — a MAC over the granted worker's
+endpoint, the toolchain, the object key and an expiry
+([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)). A node running
+`--listen-scheduler` therefore wants the key whether or not it runs `--discovery`,
+and a scheduler started without one hands out unsigned grants and says so in its log
+at the first one. Both surfaces missing is still refused at startup: a secret nobody
+reads is the silent no-op that check exists for.
+
 **`--cluster-id` is routing, not authentication.** It is plain text in every beacon,
 so treating it as a credential would be the mistake. What it buys is that two
 unrelated fleets on one segment ignore each other, which holds even when somebody

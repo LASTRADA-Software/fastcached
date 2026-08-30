@@ -316,7 +316,8 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    Distributed::SchedulerService scheduler { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
 
     auto const routes =
@@ -371,7 +372,8 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    Distributed::SchedulerService scheduler { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
 
     auto const routes =
@@ -398,7 +400,8 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    Distributed::SchedulerService scheduler { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
 
     auto const routes =
@@ -470,7 +473,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     NullLogger logger;
     ScrapeHost const scrapeHost;
     ManualClock clock;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
 
     // Bind a probe, take its port, release it: `Start` refuses port 0, and a fixed
@@ -671,7 +675,8 @@ TEST_CASE("The sampler records only while this node leads", "[node][admin][fleet
     AtomicMetricsSink metrics;
     NullLogger logger;
     SystemWallClock const wall;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     FleetSampler sampler { sources, metrics, NodeFacts(), wall, {}, logger };
@@ -704,7 +709,8 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     AtomicMetricsSink metrics;
     NullLogger logger;
     SystemWallClock const wall;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -738,7 +744,8 @@ TEST_CASE("What the other machines handed over survives a leader restart", "[nod
     AtomicMetricsSink metrics;
     NullLogger logger;
     SystemWallClock const wall;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -856,7 +863,8 @@ struct ChartFixture
     AtomicMetricsSink metrics;
     NullLogger logger;
     SystemWallClock wall;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     std::unique_ptr<FleetSampler> sampler;
     std::vector<AdminRoute> routes;
 
@@ -1068,7 +1076,8 @@ TEST_CASE("A history a newer build wrote stops the sampler promising durability"
     // Its own sink, unlike the cases above: `logger` is what this case reads back,
     // and the scheduler's lines are not the ones it is asserting about.
     NullLogger schedulerLogger;
-    Distributed::SchedulerService scheduler { clock, metrics, schedulerLogger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -1119,7 +1128,8 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     AtomicMetricsSink metrics;
     NullLogger logger;
     SystemWallClock const wall;
-    Distributed::SchedulerService scheduler { clock, metrics, logger };
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     for ([[maybe_unused]] auto const hit: std::views::iota(0, 70))

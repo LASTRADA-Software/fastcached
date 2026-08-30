@@ -47,6 +47,13 @@ namespace
                             .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
         RefusalDescriptor { .code = Wire::ErrorCode::MalformedRegistration,
                             .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed },
+        // Counted, unlike `UnknownLease` beside it, and the split is the diagnostic:
+        // that one is a lease this scheduler issued and has since forgotten, which is
+        // a statement about one client's timing. This one was never issued at all, so
+        // a rise is somebody forging releases -- or, far more likely, a launcher from
+        // before signed leases still handing back the bare serial it was given.
+        RefusalDescriptor { .code = Wire::ErrorCode::LeaseUnauthorized,
+                            .counter = IMetricsSink::Counter::DispatchLeasesUnauthorized },
     };
 
     /// The refusals this service makes that deliberately move nothing.
@@ -229,12 +236,49 @@ namespace
     }
 } // namespace
 
-SchedulerService::SchedulerService(IClock& clock, IMetricsSink& metrics, ILogger& logger) noexcept:
+SchedulerService::SchedulerService(IClock& clock,
+                                   IWallClock const& wallClock,
+                                   IMetricsSink& metrics,
+                                   ILogger& logger,
+                                   std::span<std::byte const> signingKey):
+    _wallClock { wallClock },
     _metrics { metrics },
     _logger { logger },
+    _signingKey { signingKey.begin(), signingKey.end() },
     _workers { clock },
     _leases { clock }
 {
+}
+
+std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
+                                             std::string_view endpoint,
+                                             std::string_view fingerprint)
+{
+    if (_signingKey.empty())
+    {
+        // Stated once, loudly, rather than left to look like it worked. Every other
+        // way of getting here is worse: refusing to schedule would break every
+        // single-machine install that has no `--cluster-key-file`, and saying nothing
+        // is the failure mode this repository keeps rediscovering -- a fleet that is
+        // green and is not doing the thing it claims.
+        if (!_warnedUnsigned.exchange(true, std::memory_order_relaxed))
+            _logger.Logf(LogLevel::Warn,
+                         "handing out UNSIGNED lease grants: no cluster key is configured, so any client that can "
+                         "reach a worker's compile port can spend it. Set --cluster-key-file on every node to close "
+                         "this");
+        return lease.token;
+    }
+
+    // The expiry is derived from the lease table's own lifetime rather than written
+    // beside it. A token that outlived its lease would be a capability with no record
+    // anywhere; one that died first would have a worker refusing work whose key this
+    // scheduler is still suppressing.
+    return MintLeaseToken(_signingKey,
+                          LeaseClaims { .serial = lease.token,
+                                        .endpoint = std::string { endpoint },
+                                        .fingerprint = std::string { fingerprint },
+                                        .key = lease.key,
+                                        .expiresAt = _wallClock.Now() + _leases.Timeout() });
 }
 
 void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint)
@@ -562,12 +606,24 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     _workers.JobStarted(picked->id);
     _metrics.Increment(IMetricsSink::Counter::DispatchLeasesGranted);
 
+    // Signed over the endpoint as well as the key, which is what makes it a grant on
+    // ONE worker rather than on the fleet: without the endpoint inside the MAC, a
+    // lease minted for this machine replays against every other machine that trusts
+    // the same key.
+    //
+    // The PICKED worker's fingerprint, not the request's, though `Pick` matches the
+    // two byte for byte and they are equal today. What the worker will compare the
+    // claim against is its own registered fingerprint, so taking it from the same
+    // record the endpoint comes from keeps both halves of the binding local to this
+    // registry entry -- rather than resting on `Pick`'s comparison staying exact.
+    auto const token = MintGrantToken(*lease, picked->endpoint, picked->fingerprint);
+
     // The worker's codecs travel with the grant so the client can choose one for the
     // preprocessed payload it is about to send -- without a negotiation round trip,
     // and without guessing at something the worker cannot decode after the whole
     // payload has already crossed the network.
     return SchedulerReply::Success(Wire::EncodeLeaseGrant(
-        Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = lease->token, .workerCodecs = picked->codecs }));
+        Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = token, .workerCodecs = picked->codecs }));
 }
 
 SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)
@@ -575,7 +631,25 @@ SchedulerReply SchedulerService::Release(CallerContext const& caller, std::strin
     if (auto refusal = Gate(caller); refusal.has_value())
         return std::move(*refusal);
 
-    auto const lease = _leases.Release(leaseToken, key);
+    // The token the client hands back is the SIGNED grant, so the serial the lease
+    // table knows has to be unwrapped out of it -- which is also the point at which a
+    // release that was never granted stops being able to resolve anything. Verified
+    // rather than merely parsed: it costs one HMAC on a verb that already crossed the
+    // network, and a forged release frees a key somebody else is building.
+    //
+    // Only when this scheduler signs. Without a key it never wrapped anything, so the
+    // token is the serial, and demanding otherwise would refuse every lease it had
+    // itself just issued.
+    std::string serial { leaseToken };
+    if (!_signingKey.empty())
+    {
+        auto authentic = AuthenticateLeaseToken(_signingKey, leaseToken);
+        if (!authentic.has_value())
+            return Refuse(Wire::ErrorCode::LeaseUnauthorized);
+        serial = std::move(authentic->serial);
+    }
+
+    auto const lease = _leases.Release(serial, key);
     if (!lease.has_value())
         // Already gone: it expired under a job that outlived its lease, this is a
         // second release of one token, or the token belongs to a scheduler instance
