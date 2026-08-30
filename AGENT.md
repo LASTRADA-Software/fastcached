@@ -760,6 +760,53 @@ destruction; `Task<T>`'s `Awaiter` takes ownership of the coroutine
 handle on construction so the temporary `Task` cannot tear the coroutine
 down across a suspend point.
 
+### Caching an expensive repeated answer
+**An answer that costs a spawn, a syscall or a walk, and is asked for more than
+once, is cached — but only where staleness degrades safely.** That second clause is
+the whole rule; without it this principle is a licence to serve wrong answers
+quickly.
+
+**Decide safety first, because it decides whether to cache at all.**
+
+- **Staleness that costs a refusal, a miss or a retry is safe to cache.** The
+  local-address set behind the node's cache gate is this shape: an address added is
+  refused until the next refresh — it fails **closed** and self-heals; an address
+  removed is accepted a little longer, and exploiting that needs DHCP to reassign it
+  inside the window.
+- **Staleness that produces a wrong answer which looks right is NOT cacheable**,
+  however expensive the probe. `DiscoverTargetTriple` costs ~40 ms per translation
+  unit and is deliberately *not* memoized, because the triple goes into `compilerId`:
+  a stale one is **a wrong hit, not a miss** — an object built by a different code
+  generator, served under a key claiming otherwise
+  ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)). Expense is
+  not the criterion; what a stale answer *does* is.
+
+**Then, if it is safe:**
+
+- **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs
+  ~2.09 ms on Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart.
+  A design that looks free on the platform you develop on can be the dominant cost
+  on the one you ship to. "It is only a syscall" is how a hot path gets slow.
+- **Prefer being fast by construction to being fast by cache.** The cache gate
+  answers `IsLoopbackHost(peer)` first and never consults the seam for
+  essentially all real traffic. The cache then bounds only the rare path, which is
+  a far weaker thing to have to get right.
+- **Refresh on an interval, never on a miss.** A miss-triggered refresh hands a
+  remote peer a free amplifier: it can force the expensive probe once per request
+  simply by asking. Interval-guarded, an attacker gets one per interval regardless.
+- **Name both failure directions in the header** — what a too-old answer costs in
+  each direction — because that asymmetry is what makes a longer interval
+  defensible.
+- **Reach it through an injected seam with an injected clock**, like every other
+  ambient dependency. A cache with a hidden clock is untestable by construction.
+
+**And prefer not needing the cache.** Computing a value once and returning what you
+already have beats caching it: `CachedToolchainFingerprint` derives the resolved
+path, the include roots and the stamp, returns none of them, and its caller
+re-derives all three at an extra driver spawn per toolchain per survey
+([#259](https://github.com/LASTRADA-Software/fastcached/issues/259)). That is not a
+caching problem and a cache would be the wrong fix for it.
+
 ## C++ Coding Guidelines
 
 ### Baseline (general C++23)
