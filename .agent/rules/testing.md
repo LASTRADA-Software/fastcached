@@ -72,11 +72,73 @@ So a wait that can time out records what it would need to tell them apart:
   wrongly. Work burns CPU; a block does not.
 
 And where the signals disagree, say **INCONCLUSIVE** and name what is missing. A
-spawned compiler charges CPU to its own process, so a low figure is weaker evidence
-than a high one; the message says so rather than asserting a verdict the number
-cannot support. A confident wrong diagnosis costs more than an honest missing one --
-that is the whole lesson of this rulebook, applied to the reporting rather than to
-the code.
+confident wrong diagnosis costs more than an honest missing one -- that is the whole
+lesson of this rulebook, applied to the reporting rather than to the code.
+
+## What that classifier then got wrong, which is worth more than what it got right
+
+The first version of it shipped, fired on its fifth occurrence, and was wrong:
+
+```
+waited 300s for worker A to compute its toolchain fingerprint and bind
+  evidence: alive=True logGrew=True lastGrowth=300s ago cpuDuringWait=3.4s
+VERDICT: the process was still WORKING when the budget ran out (it consumed CPU
+throughout). That is a budget or contention problem, not a hang -- raise the
+budget or reduce what runs beside it.
+```
+
+Three separate errors, and only the first is about this fixture.
+
+- **A cumulative figure cannot answer a question about now.** `cpuDuringWait` was
+  the total over the whole wait and was read as a claim about the process's state
+  **at the deadline**. 3.4s spread evenly over 300 seconds and 3.4s burned in the
+  first ten seconds followed by a wedge are the same number and opposite
+  diagnoses. A *duty cycle* over that same window is the identical mistake with a
+  percent sign -- it is the same number divided by the same 300. Only a **recent**
+  window can answer a question about now, so that is what the verdict is drawn
+  from and the totals are printed as evidence only.
+- **No magnitude bar can be calibrated when the healthy range spans orders of
+  magnitude.** The whole Windows SDK include tree is 9,487 files and walks warm in
+  0.1s at 88% duty; the same walk cold, virus-scanned and contended is I/O bound
+  and burns a tiny fraction of that. A bar set high enough to exclude an idle
+  runtime's own timer threads would call a genuinely working cold walk BLOCKED,
+  which is the opposite error and the worse one -- it sends somebody hunting a hang
+  that is not there. **What does not vary is zero**: a blocked thread accrues no CPU
+  at any temperature. So the test is *presence* in a recent window rather than
+  magnitude, and everything between "idle" and "clearly working" is reported as
+  neither.
+- **An `-or` is right for two independent CONFIRMATIONS and wrong for two competing
+  READINGS.** `$progressing` was False -- the log had not grown in 300 seconds --
+  and `$busy` was True, and the disjunction let the weaker one win unopposed. The
+  two signals *contradicted each other* and the code combined them as though they
+  agreed. This is a reasoning error rather than a scripting one, and reaching for
+  `-or` is the reflex. Where two signals can disagree, the disagreement is the
+  finding.
+
+`logGrew=True` is the same family from the other side: it was true, and it counted
+the two startup lines landing in different polls. **A signal that cannot be false in
+the failing case is not evidence**, and printing it beside a conclusion lends it
+authority it has not earned.
+
+Two things follow for anything shaped like this.
+
+**Measure the process TREE, not the process.** A step that spawns a compiler sits in
+a kernel wait at zero own-CPU while the child does the work, so recent-window
+own-CPU alone reports BLOCKED for a healthy compile. The first version documented
+that limitation in prose and told the reader to run `Get-Process cl` by hand; a
+limitation you can describe is one the instrument can apply.
+
+**An instrument that prints a remedy has to know when the remedy is under dispute,
+and it cannot.** "Raise the budget" is sound general advice, was printed by the
+branch that fires most often, and is exactly what [#354](https://github.com/LASTRADA-Software/fastcached/issues/354)
+refuses -- that budget has been raised twice already. State the finding and stop.
+
+And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`, which drives
+`Wait-ForLogLine` against six synthetic processes -- a growing log, a self-spinner,
+a quiet parent with a spinning child, a sleeper, a trickle-then-silence, and one
+that dies. The fourth is the point: **a classifier that cannot be made to say
+BLOCKED cannot report a hang**, and the original could not. Each case also asserts
+that no verdict prescribes a remedy.
 
 ## A case name is an ARGUMENT, so it may not begin with `-`
 

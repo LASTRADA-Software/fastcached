@@ -665,6 +665,37 @@ else()
     )
 endif()
 
+# That fixture's WAIT CLASSIFIER, against synthetic processes.
+#
+# Registered outside the block above and gated on nothing but the platform,
+# because it starts no daemon, opens no socket and runs no compiler -- so it is
+# NOT labelled "smoke" and belongs in the default set, the same reasoning
+# `dist-compile-e2e-selftest` and `repository-hygiene` record for themselves.
+#
+# It exists because the classifier was wrong in production and nothing noticed.
+# Asked why a worker had not come up in five minutes it answered "the process was
+# still WORKING (it consumed CPU throughout)" about a process that had written
+# nothing for the whole wait and spent 1.1% of one core, and that verdict carried
+# an instruction to raise the budget that #354 explicitly refuses. A fixture's own
+# arithmetic is the one thing nothing else in this tree tests.
+#
+# The fourth case is the point: a classifier that cannot be made to say BLOCKED
+# cannot report a hang, and the previous one could not.
+if(WIN32)
+    add_test(
+        NAME "node-scratch-isolation-e2e-selftest"
+        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
+    )
+    # Serial because it MEASURES CPU. A stand-in that is supposed to read as busy
+    # has to actually get a core, and a suite racing it for one would push a
+    # genuinely spinning process below the working bound -- a timing measurement is
+    # exactly the kind of test that must not be run against unknown load.
+    set_tests_properties("node-scratch-isolation-e2e-selftest" PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+    )
+endif()
+
 # ---------------------------------------------------------------------------
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
