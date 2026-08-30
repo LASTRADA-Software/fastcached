@@ -998,11 +998,28 @@ feature working, right up until the first pull request enters the queue.
   names none, that is stated and the leg passes on what entry proved. A leg that
   passes because something else already checked is fine; a leg that passes and
   does not say why is a stub, and reads exactly like a working gate.
-- **`apply` is skipped in a queue, and a skipped dependency skips its
-  dependents.** GitHub accepts a `skipped` required check as passing, so the queue
-  would not stall — it would report a stub. `if: always() && needs.apply.result
-  != 'failure' && ...` keeps the gate running, scoped so a real failure still
-  stops it.
+- **A skipped job REPORTS, and a skipped required context is read as passing.**
+  Measured here, on the head of the docs-only #356 (`b4777aa`): `Check C++ style`,
+  `clang-tidy` and `macOS-clang-release` — all three required — each produced a
+  check run with `conclusion: skipped`, and the pull request merged. The opposite
+  claim is *also* true, of a different situation, which is why both get made: a
+  skipped **matrix** job never expands, so its per-leg contexts never exist and
+  nothing reports at all. On that same commit `Linux-*` and `Windows-*` came back
+  `success`, because those are gated on their steps for exactly that reason. One
+  hangs, one passes; the difference is the matrix.
+- **So a dependency's failure must not be allowed to skip a required gate.**
+  `apply` is skipped inside a queue — there is no pull request to label — and a
+  skipped dependency skips its dependents by default, which by the above is not a
+  stall but a **stub**: green, and indistinguishable from a working gate. The same
+  holds when `apply` *fails*: a condition excluding that result skips the gate, the
+  skip reads green, and a pull request with no `type/` label becomes mergeable
+  because the labeler broke. `Apply derivable labels` is not itself required, so
+  nothing else closes it. The gate does not need `apply` to have succeeded — it
+  reads the labels **fresh** from the API, so a human-applied label is readable
+  either way — so the condition is `if: ${{ !cancelled() }}` and the gate checks
+  for real. `!cancelled()` and not `always()`, which runs even when the run is
+  being cancelled; any status function already overrides the `needs:` success
+  requirement.
 - **Check the concurrency key.** `pr-labels-${{ github.event.pull_request.number }}`
   collapses to the constant `pr-labels-` on `merge_group`, and with
   `cancel-in-progress` each queue entry then cancels the one before it. A

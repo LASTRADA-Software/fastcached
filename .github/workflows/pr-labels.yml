@@ -247,16 +247,49 @@ jobs:
   gate:
     name: "Require a type label"
     needs: apply
-    # `apply` is skipped inside a queue, and a skipped dependency skips its
-    # dependents by default -- which would leave this REQUIRED context reporting
-    # `skipped` there. GitHub accepts that as passing, so the queue would not
-    # hang; it would report a stub, which is indistinguishable from a working
-    # gate and is exactly the shape this repository keeps a rulebook about. So
-    # the job runs, and its merge_group leg says what it checked.
+    # This job runs whatever `apply` did, and that is a safety property rather
+    # than a convenience.
     #
-    # `always()` is scoped rather than blanket: a genuine `apply` failure or a
-    # cancellation still stops this.
-    if: ${{ always() && needs.apply.result != 'failure' && needs.apply.result != 'cancelled' }}
+    # A skipped job REPORTS. Measured on this repository, on the head of the
+    # docs-only #356 (`b4777aa`): `Check C++ style`, `clang-tidy` and
+    # `macOS-clang-release` -- all three REQUIRED -- each produced a check run
+    # with `conclusion: skipped`, and the pull request merged. So a required
+    # context that skips is read by the ruleset as **passing**.
+    #
+    # (The opposite claim is also true, of a different situation, which is why
+    # both get made: a skipped MATRIX job never expands, so its per-leg contexts
+    # never exist and nothing reports at all. On that same commit `Linux-*` and
+    # `Windows-*` came back `success`, because #300 gates those on their STEPS
+    # for exactly this reason.)
+    #
+    # Two consequences, and the second was a real hole.
+    #
+    # `apply` is skipped inside a merge queue -- there is no pull request to
+    # label -- and a skipped dependency skips its dependents by default. That
+    # would leave this required context reporting `skipped` in the queue, which
+    # by the above is not a stall but a STUB: green, and indistinguishable from a
+    # working gate.
+    #
+    # And the same holds when `apply` FAILS. A condition excluding that result
+    # skips this job, the skip reads as green, and a pull request with no `type/`
+    # label becomes mergeable because the labeler broke. `Apply derivable labels`
+    # is not itself a required context, so nothing else closes it. That was true
+    # before this change too -- a bare `needs: apply` skipped the gate on a
+    # failure just the same -- and it is the failure class this file is about, so
+    # it is fixed here rather than filed.
+    #
+    # The gate does not need `apply` to have succeeded. It reads the labels FRESH
+    # from the API, precisely because the event payload is a stale snapshot, so a
+    # human-applied `type/` label is readable whether the labeler worked or not.
+    # If `apply` failed before it could derive one, this refuses and says which
+    # labels to add -- which is more useful than a skip, not less. `apply`'s
+    # failure stays visible as a failed job; it is not laundered through this one.
+    #
+    # `!cancelled()` rather than `always()`: `always()` runs even when the RUN is
+    # being cancelled, and a verdict on a cancelled run is not one anybody asked
+    # for. Any `if:` with a status function already overrides the `needs:` success
+    # requirement, so this runs on a successful, failed or skipped `apply` alike.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     permissions:
       pull-requests: read

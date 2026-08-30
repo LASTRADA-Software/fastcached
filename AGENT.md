@@ -627,6 +627,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   a constant and each entry cancels the last), state `merge_group` in the scope classifier rather than falling through,
   and add no JOB to `build.yml` — `check-release-gate` would drag the release behind it.
   `ctest -R merge-queue-contexts` asserts all eleven required contexts can report.
+- A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING — measured: three required contexts came
+  back `skipped` on `b4777aa`, which merged. A skipped **matrix** job is the opposite: it never expands, so its
+  per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.
+  So never let a dependency's failure skip a required gate — the skip reads green. `if: ${{ !cancelled() }}`, and
+  check for real. Not `always()`, which runs even while the run is being cancelled.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
