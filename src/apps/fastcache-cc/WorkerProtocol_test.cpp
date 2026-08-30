@@ -1169,7 +1169,7 @@ TEST_CASE("A NotLeader refusal reaches the node as an endpoint, not as prose", "
     auto const outcome = registrar.Register(scheduler);
     REQUIRE_FALSE(outcome.has_value());
     REQUIRE(outcome.error().leader.has_value());
-    CHECK(*outcome.error().leader == "10.0.0.7:6676");
+    CHECK(Unwrap(outcome.error().leader) == "10.0.0.7:6676");
     // And the operator still gets the words, because the two answer different
     // questions and a redirect this node cannot follow must still be diagnosable.
     CHECK_FALSE(outcome.error().reason.empty());
@@ -1219,7 +1219,7 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     auto const beat = registrar.Heartbeat(scheduler, 0);
     REQUIRE_FALSE(beat.has_value());
     REQUIRE(beat.error().leader.has_value());
-    CHECK(*beat.error().leader == "10.0.0.7:6676");
+    CHECK(Unwrap(beat.error().leader) == "10.0.0.7:6676");
     CHECK(registrar.WorkerId() == "w-1");
 }
 

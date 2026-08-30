@@ -3,8 +3,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -116,7 +119,7 @@ TEST_CASE("A remembered leader that stops answering falls back inside the same r
 
     auto const fallback = link.Lost();
     REQUIRE(fallback.has_value());
-    CHECK(*fallback == Configured);
+    CHECK(Unwrap(fallback) == Configured);
     CHECK(link.Target() == Configured);
     CHECK_FALSE(link.Following());
 }
