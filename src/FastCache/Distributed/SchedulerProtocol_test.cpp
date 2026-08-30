@@ -95,6 +95,31 @@ TEST_CASE("A scheduler answers its own verbs and nothing else", "[distributed][s
         CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
     }
 
+    SECTION("AUTH is refused with the one code the client steps over, not as a wrong port")
+    {
+        // NOT `DispatchNotPermitted`, and the distinction is a wire contract with a
+        // binary that does not link this library. `Cc::CacheProtocol::Exchange`
+        // tolerates exactly `Wire::UnimplementedVerb` for a verb an endpoint does not
+        // implement and proceeds unauthenticated -- right against a scheduler with no
+        // credential to check -- while treating every other refusal as being about
+        // the credential and returning it in place of the answer to the request the
+        // caller actually sent.
+        //
+        // So with `FASTCACHE_TOKEN` set, this code being wrong declined every LEASE
+        // and every compile silently happened locally: a green build, and a fleet
+        // distributing nothing (#340).
+        //
+        // Asserted by VALUE. The enumerator both sides name is the only thing holding
+        // them together, so "some refusal" would pass under the defect.
+        auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+        CHECK(ErrorOf(fixture.protocol.Answer(auth, Insider)) == Wire::UnimplementedVerb);
+
+        // And a bare token with no username, which is how `FASTCACHE_TOKEN` alone
+        // reaches the wire, takes the same answer.
+        auto const tokenOnly = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+        CHECK(ErrorOf(fixture.protocol.Answer(tokenOnly, Insider)) == Wire::UnimplementedVerb);
+    }
+
     SECTION("COMPILE is a worker's verb, not a scheduler's")
     {
         // The scheduler and the worker share a wire and answer disjoint halves of

@@ -226,10 +226,12 @@ enum class Status : std::uint8_t
 enum class ErrorCode : std::uint8_t
 {
     UnsupportedVersion = 0x01, ///< Request version outside this build's range.
-    UnknownOpcode = 0x02,      ///< Opcode not in `OpTable`.
-    MalformedFrame = 0x03,     ///< Fields do not exactly fill the declared payload.
-    PayloadTooLarge = 0x04,    ///< Declared payload exceeds the session's cap.
-    MalformedValue = 0x05,     ///< STORE payload is not a decodable compile-value.
+    /// Opcode not in `OpTable`, OR a verb this surface does not implement -- see
+    /// `UnimplementedVerb`, which is the name a refusal table spells.
+    UnknownOpcode = 0x02,
+    MalformedFrame = 0x03,  ///< Fields do not exactly fill the declared payload.
+    PayloadTooLarge = 0x04, ///< Declared payload exceeds the session's cap.
+    MalformedValue = 0x05,  ///< STORE payload is not a decodable compile-value.
 
     // 0x06 is RETIRED and must never be reassigned -- see `RetiredErrorCodes`
     // below, which makes that a build failure rather than a hope. It was
@@ -418,6 +420,97 @@ struct OpDescriptor
     /// operator's own cap is the right bound.
     std::size_t maxPayload;
 };
+
+/// What an endpoint answers for a verb it does not implement.
+///
+/// **A wire contract between binaries that do not link each other**, and the reason
+/// it is one name rather than a value each surface picks: `fastcache-cc` compiles
+/// this header in and links none of `FastCache`, so an enumerator named on both
+/// sides is the only thing holding the two ends together.
+///
+/// `Cc::CacheProtocol::Exchange` steps over exactly this code for a verb an endpoint
+/// does not implement and proceeds unauthenticated -- correct against a surface with
+/// no credential to check -- while treating every *other* refusal as being about the
+/// credential and returning it in place of the answer to the request the caller
+/// actually sent. So a surface answering AUTH with anything else gives every
+/// `FASTCACHE_TOKEN`-configured client a permanent failure that presents as an
+/// endlessly cold cache or a fleet that distributes nothing, with no signal saying
+/// which.
+///
+/// `DispatchNotPermitted` is the tempting alternative and is a different sentence:
+/// it says *this endpoint does not do that job*, which is a routing fact a client
+/// acts on. This says *I do not implement this verb*, which is what an absent
+/// capability is. Three surfaces answered the question three hand-written ways and
+/// drifted apart exactly as far as that distinction (#283, #340).
+///
+/// It is deliberately NOT a statement about AUTH. Any verb a surface does not serve
+/// takes this code; AUTH is merely the one whose absence a client is built to walk
+/// past.
+///
+/// Two production users spell it: `FindRefusal`'s tables, which is every server on
+/// this wire, and `Cc::CacheProtocol`'s tolerance, which is the client. Those two are
+/// the contract.
+inline constexpr ErrorCode UnimplementedVerb = ErrorCode::UnknownOpcode;
+
+// **The VALUE is pinned, not just the name.** Naming it once stops the surfaces in
+// THIS tree disagreeing with each other; it does nothing about the launchers already
+// deployed, which tolerate `0x02` and nothing else. Changing this alias -- even
+// consistently, so that every surface and the in-tree client move together -- is a
+// silent compatibility break with every binary in the field, and it is silent
+// precisely because the in-tree tests would all still agree with one another.
+//
+// Found by flipping the alias during #340 and watching the surface tests stay green:
+// they assert `== UnimplementedVerb` on both ends, which is a tautology under a
+// consistent change. This is the assertion that is not.
+//
+// Written against the BYTE rather than against `ErrorCode::UnknownOpcode`, because
+// the enumerator is a name this tree chose and `0x02` is what is on the wire: an
+// assertion naming the enumerator survives a renumbering of it, which is the other
+// way to break every deployed launcher without a single test going red.
+static_assert(static_cast<std::uint8_t>(UnimplementedVerb) == 0x02,
+              "deployed launchers step over 0x02 and nothing else; changing this breaks them silently");
+
+/// One verb a surface answers with something other than its generic refusal.
+///
+/// **The single home for this shape, and the single home for why it exists.** Which
+/// verbs a surface declines, and what it tells an operator, is the surface's own
+/// business and stays in its own table; that a refusal is `(op, code, why)` and is
+/// looked up *before* the catch-all is the wire's, and belongs here.
+///
+/// It lived in four translation units under two names -- `CacheProxy::RefusedVerbs`,
+/// `CompileCacheHandler::RelocatedVerbs`, and one added to each of the scheduler and
+/// worker by the change that exists to stop these surfaces drifting apart. Four
+/// copies of a struct is the answer to "if a sixth case showed up tomorrow, how many
+/// places would I edit".
+///
+/// **Why a table rather than a `switch` arm**, stated once here rather than in each
+/// caller: the moment there are two answers, the next verb added has to *state* which
+/// of them it is instead of inheriting whichever the catch-all happens to give. Three
+/// surfaces answering that question three hand-written ways is how #283 fixed one of
+/// them and left the other two broken for a fortnight (#340).
+///
+/// Here rather than in a library header because `fastcache-cc` compiles this file in
+/// and links none of `FastCache`. It needs only `Op`, `ErrorCode` and
+/// `std::string_view`, so the header-only, dependency-free rule holds.
+struct RefusedVerb
+{
+    Op op;                ///< The verb.
+    ErrorCode code;       ///< What the client acts on.
+    std::string_view why; ///< Why, in words a person can follow.
+};
+
+/// The row describing @p op, or null when the surface's generic refusal applies.
+///
+/// A `span` rather than a template over the extent, so one instantiation serves every
+/// surface and a table's length is never part of a caller's type.
+/// @param table That surface's rows.
+/// @param op The verb, already resolved against `OpTable`.
+/// @return Its row, or nullptr.
+[[nodiscard]] constexpr RefusedVerb const* FindRefusal(std::span<RefusedVerb const> table, Op op) noexcept
+{
+    auto const found = std::ranges::find(table, op, &RefusedVerb::op);
+    return found == table.end() ? nullptr : &*found;
+}
 
 /// Payload ceiling for AUTH: a username and a shared secret, and nothing that
 /// grows with a build artefact. Generous by orders of magnitude against any real

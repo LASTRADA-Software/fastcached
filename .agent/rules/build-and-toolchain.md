@@ -406,6 +406,37 @@ numbers are kept because each one is the reason a knob is where it is.
   exact failure `scripts/tidy-sweep.sh` canaries against, so it is caught rather
   than believed.
 
+- **And it must be configured with the same *target set* CI builds.** Its sibling
+  above is about a database whose commands do not work; this is about a database
+  that is missing commands, and it fails in the opposite direction — quietly, with a
+  number attached. A sweep whose scope is derived from a database is only as complete
+  as that database's target set, and **a target gated off by default is invisible to
+  the sweep rather than absent from CI**: the option table's default is what the
+  local `cmake` line inherits, and the workflow's own `-D…=ON` is what CI builds.
+  Those two disagreeing is not a misconfiguration anybody would notice, because both
+  sides are behaving as written. Measured on a review sweep here: a database
+  configured with the defaults produced **15** translation units for a diff that CI
+  tidies as **20**. The five were the launcher-facing sources reachable only through
+  the two default-OFF app targets, and every one of them was inside the change. The
+  sweep does not error on them — they simply are not in the file list, and it prints
+  a confident count of what it did check.
+
+  And **the script cannot catch this for you**, which is why it is a rule and not a
+  guard. `tidy-sweep.sh` drops a changed file with no compile command silently, and
+  it is *right* to: the bullet above requires exactly that, because `IocpReactor.cpp`
+  in a diff on Linux is a file this platform does not compile and must not fail the
+  sweep. Absent-because-this-platform and absent-because-that-target-is-off are
+  indistinguishable from the file list alone. Only a full plan of zero units is
+  fatal, and under-covering by five of twenty is not that.
+
+  So the check belongs to whoever configures the database, before running it:
+  compare the units the sweep reports against `git diff --name-only origin/master...HEAD`
+  and account for **every** file it did not reach. The answer is either "this
+  platform does not compile it" or "I configured the wrong target set" — and when
+  adding an app target the question is never "is it built by default" but "does any
+  CI job build it", because if yes its flag belongs in whatever line generates a
+  database.
+
 - **The sanitizer test run moved to `clang-asan-ubsan`; it did not go.** The
   `clang-debug` preset is the only configuration in the workflow with ASan and
   UBSan on, so that job's `ctest` is the project's entire sanitizer coverage in CI.

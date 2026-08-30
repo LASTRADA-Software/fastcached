@@ -7,6 +7,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 namespace FastCache::Distributed
@@ -32,6 +33,25 @@ namespace
     {
         return std::ranges::find(SchedulerOps, op) != SchedulerOps.end();
     }
+
+    /// This surface's rows. The shape, the lookup and why they exist are on
+    /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
+    ///
+    /// `Auth`, because a `FASTCACHE_TOKEN` client had every `LEASE` declined and
+    /// compiled locally forever -- a green build, and a fleet distributing nothing.
+    constexpr std::array RefusedVerbs {
+        Wire::RefusedVerb { .op = Wire::Op::Auth,
+                            .code = Wire::UnimplementedVerb,
+                            .why = "this endpoint schedules and checks no credential" },
+    };
+
+    // The table is consulted only on the path a verb this scheduler does NOT serve
+    // takes, so a row naming one it does serve is never read -- it would sit there
+    // looking like a decision and change nothing. Refused at compile time rather
+    // than left to be noticed, which is the same argument `RowsInEnumeratorOrder`
+    // makes: a guard that can only fire when the table is wrong.
+    static_assert(std::ranges::none_of(RefusedVerbs, IsSchedulerVerb, &Wire::RefusedVerb::op),
+                  "a refusal row for a verb this scheduler serves is dead: the lookup never reaches it");
 } // namespace
 
 std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> frame, CallerContext const& caller)
@@ -60,10 +80,15 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
         return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode);
 
     if (!IsSchedulerVerb(descriptor->code))
+    {
+        if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
+            return Wire::EncodeErrorReply(row->code, row->why);
+
         // A cache verb at the scheduler's port. Answered rather than dropped, so a
         // misconfigured client learns which port it got wrong instead of seeing
         // something indistinguishable from a dead host.
         return Wire::EncodeErrorReply(Wire::ErrorCode::DispatchNotPermitted);
+    }
 
     auto const payload = frame.subspan(Wire::RequestHeaderSize);
     if (payload.size() != header->payloadLength)
