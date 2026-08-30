@@ -61,17 +61,98 @@ function Get-FreePort {
     throw "could not allocate a free port below the ephemeral range"
 }
 
-function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what) {
+function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what, $proc) {
     # Bounded, and it says what it waited for. Reading the node's OWN log rather than
     # the scheduler's counters, because this wait is about one process reaching a
     # state -- the fleet-level wait comes after and asks a different question.
-    $deadline = (Get-Date).AddSeconds($seconds)
+    #
+    # It also says WHICH KIND of failure it was, because "waited 300s" alone cannot
+    # tell a loaded machine from a wedged process and those are fixed in different
+    # places -- one is a budget, the other is a bug. Issue #338's red leg was exactly
+    # that question and the log could not answer it: worker A had logged "computing
+    # the toolchain fingerprint" and nothing further, which is what a cold include
+    # walk on a contended runner looks like AND what a deadlock looks like.
+    #
+    # Three things separate them, and all three are free:
+    #
+    #   the log still GROWING at the deadline  -> progress; the budget is too small
+    #   the log static while the process lives -> no progress; suspect a hang
+    #   the process gone                       -> it died rather than hung, and the
+    #                                             exit code is the story
+    #
+    # And on SUCCESS it prints what the wait actually cost. Nothing recorded that
+    # before, so no budget here could be set from data -- the numbers were guesses
+    # that survived by being generous. A green run now measures itself.
+    $started = Get-Date
+    $deadline = $started.AddSeconds($seconds)
+    $lastSize = -1
+    $lastGrowth = $started
+    $everGrew = $false
+    # CPU as well as log growth, because the operation this wait most often covers --
+    # walking a compiler's include tree -- logs NOTHING while it runs. A slow walk and
+    # a wedged process therefore produce identical logs, so log growth alone would have
+    # mis-diagnosed #338 with confidence. CPU separates them: work burns it, a block
+    # does not. Sampled from the node itself; a spawned `cl` charges its own process,
+    # so a low figure here is weaker evidence than a high one, and the verdict below
+    # says so rather than pretending otherwise.
+    $cpuAtStart = $null
+    if ($proc) { try { $proc.Refresh(); $cpuAtStart = $proc.TotalProcessorTime } catch {} }
     while ((Get-Date) -lt $deadline) {
         $text = Get-Content -Raw $log -ErrorAction SilentlyContinue
-        if ($text -and $text -match $pattern) { return $true }
+        if ($text -and $text -match $pattern) {
+            Write-Host ("  waited {0}s of {1}s for {2}" -f [int]((Get-Date) - $started).TotalSeconds, $seconds, $what)
+            return $true
+        }
+        $size = if ($text) { $text.Length } else { 0 }
+        if ($size -ne $lastSize) {
+            if ($lastSize -ge 0) { $everGrew = $true }
+            $lastSize = $size; $lastGrowth = Get-Date
+        }
+        if ($proc -and $proc.HasExited) {
+            Write-Host ("FAILED after {0}s waiting for {1}: the process EXITED with code {2}. It did not hang -- it died, and the log below is why." `
+                        -f [int]((Get-Date) - $started).TotalSeconds, $what, $proc.ExitCode)
+            Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
+            return $false
+        }
         Start-Sleep -Milliseconds 400
     }
+    $stalledFor = [int]((Get-Date) - $lastGrowth).TotalSeconds
+    # Scaled to the budget rather than fixed: a 30s stall means nothing in a 6s wait
+    # and everything in a 300s one. Ten percent, floored at five seconds so a short
+    # wait still has a usable threshold.
+    $stallLimit = [Math]::Max(5, [int]($seconds * 0.1))
+    $cpuUsed = $null
+    if ($proc -and $cpuAtStart -ne $null) {
+        try { $proc.Refresh(); $cpuUsed = ($proc.TotalProcessorTime - $cpuAtStart).TotalSeconds } catch {}
+    }
     Write-Host "waited ${seconds}s for $what"
+    # The measurements first, always, whatever verdict follows: a verdict that turns
+    # out wrong is still useful if the numbers it was drawn from are on the page.
+    Write-Host ("  evidence: alive={0} logGrew={1} lastGrowth={2}s ago cpuDuringWait={3}" `
+                -f $(if ($proc) { -not $proc.HasExited } else { "unknown" }), $everGrew, $stalledFor,
+                   $(if ($cpuUsed -ne $null) { "{0:N1}s" -f $cpuUsed } else { "unknown" }))
+    if ($proc -and -not $proc.HasExited) {
+        $busy = ($cpuUsed -ne $null -and $cpuUsed -ge 1.0)
+        $progressing = ($everGrew -and $stalledFor -lt $stallLimit)
+        if ($progressing -or $busy) {
+            Write-Host ("VERDICT: the process was still WORKING when the budget ran out ({0}). That is a budget or contention problem, not a hang -- raise the budget or reduce what runs beside it." `
+                        -f $(if ($busy) { "it consumed CPU throughout" } else { "its log was still growing" }))
+        } elseif ($cpuUsed -ne $null) {
+            # Deliberately hedged, and the hedge is for whoever reads this at 2am.
+            # Low CPU HERE does not mean nothing is working: this wait covers an
+            # operation that spawns a compiler, and a spawned `cl` charges its own
+            # process. So the first move is to look for a live child, not to go
+            # hunting a deadlock that may not exist.
+            Write-Host ("VERDICT: the process is alive, wrote nothing new, and consumed essentially no CPU ITSELF ({0:N1}s)." -f $cpuUsed)
+            Write-Host ("  Before concluding it is hung: this step SPAWNS a compiler, and a spawned process charges CPU to itself, not to its parent.")
+            Write-Host ("  So check for a live child first -- `Get-Process cl,clang,clang-cl -ErrorAction SilentlyContinue` -- and if one is running and busy, this is a SLOW MACHINE, not a hang.")
+            Write-Host ("  Only with no busy child does this read as BLOCKED, and then do not simply raise the timeout.")
+        } else {
+            Write-Host ("VERDICT: INCONCLUSIVE -- the process is alive and quiet, but its CPU could not be sampled, and this wait covers an operation that logs nothing while it runs. Do not read this as either a hang or a slow machine without more evidence.")
+        }
+    } elseif ($proc) {
+        Write-Host ("VERDICT: the process exited with code {0} before the deadline." -f $proc.ExitCode)
+    }
     Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
     return $false
 }
@@ -176,12 +257,13 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
 
         # The scheduler's own worker serves a fingerprint no client asks for, so every
         # lease has to land on worker A or worker B.
-        $procs += Start-NodeIn "sched" @(
+        $schedProc = Start-NodeIn "sched" @(
             "--listen-scheduler=127.0.0.1:$schedPort", "--fleet-open",
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$schedWork", "--advertise=127.0.0.1:$schedWork",
             "--toolchain=scheduler-only=$Compiler", "--slots=1",
             "--admin-listen=127.0.0.1:$adminPort") $null
+        $procs += $schedProc
 
         # ONE slot each, so the second lease cannot land on the machine already busy
         # -- which is what puts a compile on both processes at the same time.
@@ -195,24 +277,26 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # Serialising costs nothing this test is about. The collision it exists to
         # catch happens when two workers COMPILE at once, which is arranged below --
         # not when they start.
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "sched.err.log") "compile node ready" 180 "the scheduler node to come up")) {
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "sched.err.log") "compile node ready" 180 "the scheduler node to come up" $schedProc)) {
             throw "the scheduler node did not start"
         }
 
-        $procs += Start-NodeIn "workerA" @(
+        $workerAProc = Start-NodeIn "workerA" @(
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$workerA", "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 300 "worker A to compute its toolchain fingerprint and bind")) {
+        $procs += $workerAProc
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 300 "worker A to compute its toolchain fingerprint and bind" $workerAProc)) {
             throw "worker A did not start"
         }
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
-        $procs += Start-NodeIn "workerB" @(
+        $workerBProc = Start-NodeIn "workerB" @(
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$workerB", "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 300 "worker B to compute its toolchain fingerprint and bind")) {
+        $procs += $workerBProc
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 300 "worker B to compute its toolchain fingerprint and bind" $workerBProc)) {
             throw "worker B did not start"
         }
 

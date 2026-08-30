@@ -641,7 +641,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
-- Every wait is bounded and says what it waited for.
+- Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
+  A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
+  alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
+  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the

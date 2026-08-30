@@ -39,6 +39,45 @@ One corollary, because reorganising a fixture is how its teeth get quietly pulle
 checked.** After that change the defect was reintroduced and the fixture confirmed to
 still fail for its original reason before the change was believed.
 
+## A bounded wait must also say WHICH KIND of failure it was
+
+"Every wait is bounded" is the rule above, and it is not enough on its own. A wait
+that reports only `waited 300s for worker A` cannot tell a loaded machine from a
+wedged process, and those are fixed in completely different places -- one is a
+budget, the other is a bug. Reading such a failure, nobody can responsibly choose
+between raising the timeout and opening a defect, so the timeout gets raised,
+because that is the action that makes the red go away.
+
+`node-scratch-isolation-e2e` failed exactly that way on a Windows leg: worker A had
+logged `computing the toolchain fingerprint` and nothing further inside its 300s
+budget. The artefacts could not distinguish a cold include walk on a contended
+runner from a deadlock, and the test's own history made both plausible -- it had
+already been re-shaped once, within hours, because two nodes computing fingerprints
+at the same time blew the budget.
+
+So a wait that can time out records what it would need to tell them apart:
+
+- **On success, what it actually cost.** Nothing recorded this, so no budget in the
+  fixture could be set from data -- every number was a guess that survived by being
+  generous. A green run now measures itself, and the next budget argument has
+  evidence behind it.
+- **Whether the process is still alive**, and its exit code if not. A process that
+  DIED is a third case, diagnosed in one line, and it should never be reported as a
+  timeout -- it is reported the moment it is noticed, rather than after the budget.
+- **Whether the log grew**, and how long ago.
+- **How much CPU it consumed during the wait**, and this is the half that is easy to
+  miss. The operation this wait covers -- walking a compiler's include tree -- logs
+  NOTHING while it runs, so a slow walk and a wedge produce *identical* logs. A
+  log-growth heuristic alone would have diagnosed that failure confidently and
+  wrongly. Work burns CPU; a block does not.
+
+And where the signals disagree, say **INCONCLUSIVE** and name what is missing. A
+spawned compiler charges CPU to its own process, so a low figure is weaker evidence
+than a high one; the message says so rather than asserting a verdict the number
+cannot support. A confident wrong diagnosis costs more than an honest missing one --
+that is the whole lesson of this rulebook, applied to the reporting rather than to
+the code.
+
 ## A case name is an ARGUMENT, so it may not begin with `-`
 
 `catch_discover_tests` registers each case as
