@@ -76,7 +76,8 @@ int main()
 
     std::printf("iterator-debug-canary: read %d past the end of a %zu-element vector "
                 "and SURVIVED -- the debug runtime did not trap it\n",
-                observed, values.size());
+                observed,
+                values.size());
 
     // Exit 0 on survival, so the gate's verdict is unambiguous: this program
     // returning normally IS the failure being reported.
