@@ -221,11 +221,37 @@ struct Reply
     return decoded.has_value() ? decoded->first : Wire::ErrorCode::MalformedFrame;
 }
 
+/// The still-enveloped object field of a reply that must be a successful compile.
+///
+/// The shared prefix of every codec assertion below, so the `Ok`-status +
+/// `DecodeCompileResult` chain exists once. A case that hand-rolled it dropped the
+/// status check and would have passed against an error reply.
+/// @param frame The whole reply frame.
+/// @return The object field, exactly as it travelled.
+[[nodiscard]] std::vector<std::byte> FieldOf(std::vector<std::byte> const& frame)
+{
+    auto const reply = Decode(frame);
+    REQUIRE(reply.status == Wire::Status::Ok);
+    auto const result = Wire::DecodeCompileResult(reply.payload);
+    REQUIRE(result.has_value());
+    // Handed back directly: `CompileResultFields` owns its bytes since #366, so this
+    // no longer has to copy the span out before the decoded buffer goes away.
+    return Unwrap(result).object;
+}
+
+/// Decode the object field of a reply that must be a successful compile.
+/// @param frame The whole reply frame.
+/// @return Its object field.
 /// A successful reply's object field, envelope header and all.
 ///
-/// Owns its bytes rather than mirroring `Wire::CodecEnvelope`, whose `bytes` is a
-/// span into the frame it was decoded from: returning that by value out of a helper
-/// that decoded a local would dangle the moment the caller read it.
+/// Owns, because this helper RETURNS it and `field` below dies with the call.
+/// `Wire::CodecEnvelopeView` deliberately borrows -- its production consumer reads
+/// it in scope, and owning there would put a second full copy of a preprocessed
+/// translation unit on the path least able to afford it (#366). So the copy belongs
+/// here, at the one caller that needs it, rather than in the wire type.
+///
+/// This is no longer a workaround for an unlabelled hazard, which is what it was
+/// before the type said `View`: it is a local answer to a documented property.
 struct ObjectField
 {
     std::uint8_t codec { Wire::IdentityCodec }; ///< The codec the worker answered in.
@@ -233,26 +259,6 @@ struct ObjectField
     std::vector<std::byte> bytes;               ///< The object as it travelled.
 };
 
-/// The still-enveloped object field of a reply that must be a successful compile.
-///
-/// The shared prefix of every codec assertion below, so the `Ok`-status +
-/// `DecodeCompileResult` chain exists once. A case that hand-rolled it dropped the
-/// status check and would have passed against an error reply.
-/// @param frame The whole reply frame.
-/// @return The object field, owned, exactly as it travelled.
-[[nodiscard]] std::vector<std::byte> FieldOf(std::vector<std::byte> const& frame)
-{
-    auto const reply = Decode(frame);
-    REQUIRE(reply.status == Wire::Status::Ok);
-    auto const result = Wire::DecodeCompileResult(reply.payload);
-    REQUIRE(result.has_value());
-    auto const field = Unwrap(result).object;
-    return { field.begin(), field.end() };
-}
-
-/// Decode the object field of a reply that must be a successful compile.
-/// @param frame The whole reply frame.
-/// @return Its object field.
 [[nodiscard]] ObjectField ObjectOf(std::vector<std::byte> const& frame)
 {
     auto const field = FieldOf(frame);

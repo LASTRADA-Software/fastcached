@@ -436,7 +436,16 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   served. Sharing a port is `ReusePort::Yes`, and only that.
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
   `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one
-  member becomes a view. A `*View` type borrows and says so; anything else owns.
+  member becomes a view. A `*View` type borrows and says so; anything else owns. It
+  has happened twice (`CapacityFields`, then `CompileResult`/`CodecEnvelope`). Which
+  shape to pick is per type: OWN when the result outlives the buffer in practice
+  (`CompileResultFields`, held across statements by `Dispatch`), stay a named `*View`
+  when every consumer reads it in scope and something depends on not copying
+  (`CodecEnvelopeView`, whose `Identity` path must not gain a second copy of a
+  preprocessed TU). The encode side goes on borrowing its inputs either way. A
+  regression test for this needs a payload of REAL SIZE: at four bytes the freed
+  block reads back correctly and ASan reports nothing, so the sizes are load-bearing
+  and must say so.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.
