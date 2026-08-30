@@ -665,6 +665,39 @@ else()
     )
 endif()
 
+# That fixture's WAIT CLASSIFIER (`Get-WaitVerdict`), against synthesised readings.
+#
+# Registered outside the block above and gated on nothing but the platform,
+# because it starts no daemon, opens no socket, runs no compiler and now spawns no
+# process at all -- so it is NOT labelled "smoke" and belongs in the default set,
+# the same reasoning `dist-compile-e2e-selftest` and `repository-hygiene` record
+# for themselves.
+#
+# It exists because the classifier was wrong in production and nothing noticed.
+# Asked why a worker had not come up in five minutes it answered "the process was
+# still WORKING (it consumed CPU throughout)" about a process that had written
+# nothing for the whole wait and spent 1.1% of one core, and that verdict carried
+# an instruction to raise the budget that #354 explicitly refuses. A fixture's own
+# arithmetic is the one thing nothing else in this tree tests.
+#
+# Not RUN_SERIAL and not slow, and both for the same reason. The first version
+# drove real stand-in processes arranged to consume specific amounts of CPU: it
+# needed a core to itself, took 53 seconds, and still failed on CI, because the
+# band it had to land a figure inside is 0.35s wide while a PowerShell process's
+# own startup costs 0.2-0.5s. The decision is now a pure function over a readings
+# record and the cases are rows -- 17 of them, both sides of every bound, in about
+# a third of a second. See `.agent/rules/testing.md`.
+if(WIN32)
+    add_test(
+        NAME "node-scratch-isolation-e2e-selftest"
+        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
+    )
+    set_tests_properties("node-scratch-isolation-e2e-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 # ---------------------------------------------------------------------------
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")

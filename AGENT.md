@@ -658,6 +658,23 @@ and what they may assume.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
   diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE.
+- A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same window is the same
+  number divided by the same 300: 3.4s spread over five minutes and 3.4s burned in the first ten before a wedge are
+  opposite diagnoses. Draw the verdict from a RECENT window and print the totals as evidence only. No magnitude bar
+  calibrates — the same include walk runs at 88% duty warm and a fraction of that cold — but **zero does not vary**, so
+  test for presence, measure the process TREE (a spawned `cl` charges its own CPU), and report the band between idle
+  and clearly-working as neither.
+- An `-or` is right for two independent CONFIRMATIONS and wrong for two competing READINGS: `logGrew` was False and
+  `busy` was True, and the disjunction let the weaker win unopposed. A signal that cannot be false in the failing case
+  is not evidence. And an instrument that prints a **remedy** cannot know when the remedy is under dispute — "raise the
+  budget" is what #354 refuses. State the finding and stop.
+- A classifier that cannot be made to say BLOCKED cannot report a hang. `ctest -R node-scratch-isolation-e2e-selftest`
+  drives each verdict against a synthesised **readings record**, in the default set.
+- A stand-in built to exhibit a MAGNITUDE must not be measured through an instrument whose own overhead is comparable
+  to it: the verdict band is 0.35s wide and a PowerShell process's startup costs 0.2–0.5s, so a stand-in that burned
+  exactly 250ms still read 0.52s on CI and 0.16s when moved. No arrangement fixes that — the noise IS the interpreter.
+  Split the DECISION out as a pure function over a record; leave acquisition alone. Branches that could not be staged
+  become one line, every bound gets pinned on BOTH sides, and 53s + RUN_SERIAL becomes 0.3s.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the

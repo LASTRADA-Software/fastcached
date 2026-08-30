@@ -72,11 +72,128 @@ So a wait that can time out records what it would need to tell them apart:
   wrongly. Work burns CPU; a block does not.
 
 And where the signals disagree, say **INCONCLUSIVE** and name what is missing. A
-spawned compiler charges CPU to its own process, so a low figure is weaker evidence
-than a high one; the message says so rather than asserting a verdict the number
-cannot support. A confident wrong diagnosis costs more than an honest missing one --
-that is the whole lesson of this rulebook, applied to the reporting rather than to
-the code.
+confident wrong diagnosis costs more than an honest missing one -- that is the whole
+lesson of this rulebook, applied to the reporting rather than to the code.
+
+## What that classifier then got wrong, which is worth more than what it got right
+
+The first version of it shipped, fired on its fifth occurrence, and was wrong:
+
+```
+waited 300s for worker A to compute its toolchain fingerprint and bind
+  evidence: alive=True logGrew=True lastGrowth=300s ago cpuDuringWait=3.4s
+VERDICT: the process was still WORKING when the budget ran out (it consumed CPU
+throughout). That is a budget or contention problem, not a hang -- raise the
+budget or reduce what runs beside it.
+```
+
+Three separate errors, and only the first is about this fixture.
+
+- **A cumulative figure cannot answer a question about now.** `cpuDuringWait` was
+  the total over the whole wait and was read as a claim about the process's state
+  **at the deadline**. 3.4s spread evenly over 300 seconds and 3.4s burned in the
+  first ten seconds followed by a wedge are the same number and opposite
+  diagnoses. A *duty cycle* over that same window is the identical mistake with a
+  percent sign -- it is the same number divided by the same 300. Only a **recent**
+  window can answer a question about now, so that is what the verdict is drawn
+  from and the totals are printed as evidence only.
+- **No magnitude bar can be calibrated when the healthy range spans orders of
+  magnitude.** The whole Windows SDK include tree is 9,487 files and walks warm in
+  0.1s at 88% duty; the same walk cold, virus-scanned and contended is I/O bound
+  and burns a tiny fraction of that. A bar set high enough to exclude an idle
+  runtime's own timer threads would call a genuinely working cold walk BLOCKED,
+  which is the opposite error and the worse one -- it sends somebody hunting a hang
+  that is not there. **What does not vary is zero**: a blocked thread accrues no CPU
+  at any temperature. So the test is *presence* in a recent window rather than
+  magnitude, and everything between "idle" and "clearly working" is reported as
+  neither.
+- **An `-or` is right for two independent CONFIRMATIONS and wrong for two competing
+  READINGS.** `$progressing` was False -- the log had not grown in 300 seconds --
+  and `$busy` was True, and the disjunction let the weaker one win unopposed. The
+  two signals *contradicted each other* and the code combined them as though they
+  agreed. This is a reasoning error rather than a scripting one, and reaching for
+  `-or` is the reflex. Where two signals can disagree, the disagreement is the
+  finding.
+
+`logGrew=True` is the same family from the other side: it was true, and it counted
+the two startup lines landing in different polls. **A signal that cannot be false in
+the failing case is not evidence**, and printing it beside a conclusion lends it
+authority it has not earned.
+
+Two things follow for anything shaped like this.
+
+**Measure the process TREE, not the process.** A step that spawns a compiler sits in
+a kernel wait at zero own-CPU while the child does the work, so recent-window
+own-CPU alone reports BLOCKED for a healthy compile. The first version documented
+that limitation in prose and told the reader to run `Get-Process cl` by hand; a
+limitation you can describe is one the instrument can apply.
+
+**An instrument that prints a remedy has to know when the remedy is under dispute,
+and it cannot.** "Raise the budget" is sound general advice, was printed by the
+branch that fires most often, and is exactly what [#354](https://github.com/LASTRADA-Software/fastcached/issues/354)
+refuses -- that budget has been raised twice already. State the finding and stop.
+
+And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`. **A classifier
+that cannot be made to say BLOCKED cannot report a hang**, and the original could
+not.
+
+## Do not measure a stand-in through an instrument as costly as the thing measured
+
+The first version of that test drove real processes. Six stand-ins, each arranged
+to exhibit one reading -- a growing log, a self-spinner, a quiet parent with a
+spinning child, a sleeper, a trickle-then-silence, one that dies -- and it read the
+classifier's answer back. Five of the six were robust, because they target a
+*presence*, an *absence* or a *death*, and those do not depend on how fast the box
+is.
+
+The sixth had to land a **magnitude** strictly inside the classifier's
+`(0.15s, 0.50s)` band. It burned until its own consumed process CPU had risen by
+250 ms -- already closing the loop on the right quantity rather than spinning for a
+duration -- and it still could not be made reliable:
+
+- it passed three consecutive local runs and failed on `Windows-clangcl-release` at
+  **0.52s against a 0.50s bound**, because leftover interpreter startup landed
+  inside the measured window;
+- tightened, it then put the deliberate burn at the recent window's cutoff edge,
+  where **0.16s of a measured 0.25s** counted.
+
+Neither was a bound being wrong. **The band is 0.35s wide and a PowerShell
+process's own startup costs 0.2-0.5s** -- the instrument's overhead and the
+quantity under test were the same magnitude, so there is no stand-in construction
+that fixes it. The noise *is* the interpreter the stand-in is made of.
+
+The fix is a seam, not a stand-in. `Get-WaitVerdict` is now pure -- it takes a
+record of readings (own recent CPU, descendant recent CPU, counts, log growth and
+stall age, alive, exit code, both bounds) and returns the lines to print. It opens
+no socket, reads no clock, spawns nothing. Acquisition keeps doing exactly what it
+did.
+
+Three things follow, and they are the reason to reach for this shape early rather
+than after a red CI leg:
+
+- **Branches that could not be staged become one line each.** The
+  could-not-sample-CPU verdict needs a live process whose CPU the script may not
+  read, which cannot be arranged; as a record it is `OwnRecent = $null`.
+- **Every bound gets pinned on both sides**, not demonstrated once from the middle
+  -- at the floor and just above it, at the working bound and just below it. That
+  is where an `-and`/`-or` mistake actually lives.
+- **It is instant**, so the sweep that proves each branch load-bearing is cheap
+  enough to actually run. Mutating each of the seven verdicts and each of the five
+  comparisons turns exactly the expected cases red; `EverGrew -and` weakened to
+  `-or` -- the original defect's own shape -- turns 14 of 17 red. 53 seconds and a
+  `RUN_SERIAL` became 0.3 seconds and neither.
+
+What deliberately stayed untested is **acquisition**: `Win32_Process`, the
+parentage walk, the pid-reuse guard by creation time, the locked-log read. All
+three real defects here were in that half, and it is exactly as hard to exercise
+wherever it lives -- but it now contains no decisions, so nothing silently right or
+wrong is hiding in it.
+
+The general rule, which is not about PowerShell: **a decision worth several named
+outcomes is worth separating from the ambient facts it reads**, and a fixture that
+must exhibit a magnitude must not be measured through machinery whose own cost is
+comparable to that magnitude. Both halves of this file got that wrong once, in the
+same direction -- towards a confident wrong answer.
 
 ## A case name is an ARGUMENT, so it may not begin with `-`
 

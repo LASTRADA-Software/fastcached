@@ -25,7 +25,14 @@ param(
     [string]$Fastcached,
     [string]$Node,
     [string]$Launcher,
-    [string]$Compiler
+    [string]$Compiler,
+    # The wait classifier only, against synthetic processes. Drives no node, opens
+    # no socket and runs no compiler, so it belongs in the default ctest set -- the
+    # same reasoning `dist-compile-e2e.ps1 -SelfTest` records for itself. It exists
+    # because a fixture's own logic is the one thing nothing else tests, and this
+    # particular logic reported WORKING for a process that had done nothing for five
+    # minutes (#354).
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,11 +43,16 @@ function Skip([string]$why) {
     exit $SkipExit
 }
 
-foreach ($pair in @(@{p=$Fastcached;n="-Fastcached"}, @{p=$Node;n="-Node"}, @{p=$Launcher;n="-Launcher"})) {
-    if (-not $pair.p -or -not (Test-Path $pair.p)) { Skip "$($pair.n) was not given a built binary" }
+# Skipped entirely under -SelfTest, which drives none of these: requiring a built
+# node to exercise a wait's arithmetic would put the one check that has no
+# prerequisites behind every prerequisite there is.
+if (-not $SelfTest) {
+    foreach ($pair in @(@{p=$Fastcached;n="-Fastcached"}, @{p=$Node;n="-Node"}, @{p=$Launcher;n="-Launcher"})) {
+        if (-not $pair.p -or -not (Test-Path $pair.p)) { Skip "$($pair.n) was not given a built binary" }
+    }
+    if (-not $Compiler) { $Compiler = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source }
+    if (-not $Compiler -or -not (Test-Path $Compiler)) { Skip "no MSVC cl.exe on PATH" }
 }
-if (-not $Compiler) { $Compiler = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source }
-if (-not $Compiler -or -not (Test-Path $Compiler)) { Skip "no MSVC cl.exe on PATH" }
 
 # Ports allocated per RUN, from BELOW the kernel's ephemeral range, and remembered.
 # A connect probe cannot see a port already held as an outbound connection's local
@@ -61,6 +73,149 @@ function Get-FreePort {
     throw "could not allocate a free port below the ephemeral range"
 }
 
+function Get-ProcessTreeCpu([int]$rootPid, $rootStarted) {
+    # The CPU of every DESCENDANT of a process, and how many there are.
+    #
+    # One CIM query answers parentage and CPU for every process on the box at once,
+    # so a whole subtree costs a single call rather than one `Get-Process` per child.
+    # It is sampled on its own, slower cadence than the log: the query enumerates
+    # around 350 processes and costs roughly 190ms on a developer machine, which is
+    # fine every few seconds and is not fine every 400ms. An instrument that loads
+    # the machine it is measuring changes the answer it is measuring.
+    #
+    # Returns $null when the query fails, which is NOT the same as a tree with no
+    # CPU in it -- the caller must not read "could not see" as "saw nothing", which
+    # is the whole defect this file exists to stop repeating.
+    try {
+        $all = Get-CimInstance Win32_Process `
+                   -Property ProcessId, ParentProcessId, KernelModeTime, UserModeTime, CreationDate `
+                   -ErrorAction Stop
+    } catch { return $null }
+
+    $byParent = @{}
+    foreach ($entry in $all) {
+        $key = [int]$entry.ParentProcessId
+        if (-not $byParent.ContainsKey($key)) { $byParent[$key] = [System.Collections.Generic.List[object]]::new() }
+        $byParent[$key].Add($entry)
+    }
+
+    $cpu = 0.0
+    $count = 0
+    $pids = [System.Collections.Generic.List[int]]::new()
+    $seen = @{ $rootPid = $true }
+    $frontier = @($rootPid)
+    while ($frontier.Count -gt 0) {
+        $next = [System.Collections.Generic.List[object]]::new()
+        foreach ($parent in $frontier) {
+            if (-not $byParent.ContainsKey([int]$parent)) { continue }
+            foreach ($child in $byParent[[int]$parent]) {
+                $childPid = [int]$child.ProcessId
+                if ($seen.ContainsKey($childPid)) { continue }
+                # Windows recycles process ids, so over a five-minute wait an
+                # unrelated process can inherit a dead child's number and appear to
+                # name our process as its parent. A process that STARTED BEFORE the
+                # root is not the root's descendant, whatever the id says.
+                if ($rootStarted -and $child.CreationDate -and $child.CreationDate -lt $rootStarted) { continue }
+                $seen[$childPid] = $true
+                $count++
+                $pids.Add($childPid)
+                $cpu += ([double]$child.KernelModeTime + [double]$child.UserModeTime) / 1e7
+                $next.Add($childPid)
+            }
+        }
+        $frontier = $next
+    }
+    # The ids as well as the totals, so a caller that has to CLEAN UP a tree reaches
+    # it through the same enumeration the measurement uses rather than a second one.
+    return [pscustomobject]@{ Cpu = $cpu; Count = $count; Pids = $pids }
+}
+
+function Get-WaitVerdict($readings) {
+    # The DECISION, and nothing else. No process, no clock, no `Get-CimInstance`,
+    # no `Get-Content` -- it takes a record of readings and returns the lines a
+    # timed-out wait should print, evidence first and verdict last.
+    #
+    # It is separate from the acquisition below because the first attempt to test
+    # it was not: the cases drove real processes, arranged to consume a specific
+    # amount of CPU, and read the classifier's answer back. That works for the
+    # verdicts that turn on presence or absence and it cannot work for the one
+    # that turns on a magnitude. The band between the two bounds is 0.35s wide and
+    # a PowerShell process's own interpreter startup costs 0.2-0.5s, so the noise
+    # and the signal were the same size. It passed three times locally and failed
+    # on `Windows-clangcl-release` at 0.52s against a 0.50s bound; a second
+    # arrangement then put the deliberate burn at the recent window's cutoff edge,
+    # where only 0.16s of a measured 0.25s counted. Neither was a bound being
+    # wrong. There is no stand-in construction that fixes it, because the noise IS
+    # the interpreter the stand-in is made of.
+    #
+    # As a record, every branch is one line and both sides of both bounds can be
+    # pinned -- which is where an `-and`/`-or` mistake of the kind this file
+    # exists to record actually lives.
+    #
+    # What deliberately did NOT move: acquisition. `Win32_Process`, the parentage
+    # walk, the pid-reuse guard by creation time and the locked-log read are where
+    # all three real defects here were, and they are exactly as hard to exercise
+    # wherever they live.
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $show = { param($value) if ($null -ne $value) { "{0:N2}s" -f $value } else { "unknown" } }
+
+    $ownRecent = $readings.OwnRecent
+    $childRecent = $readings.ChildRecent
+    $window = $readings.Window
+    $idleFloor = $readings.IdleFloor
+    $clearlyBusy = $readings.ClearlyBusy
+
+    # The measurements first, always, whatever verdict follows: a verdict that turns
+    # out wrong is still useful if the numbers it was drawn from are on the page.
+    $lines.Add(("  evidence: alive={0} log grew at all={1}, last growth {2}s ago (a stall over {3}s is no longer progress)" `
+                -f $readings.Alive, $readings.EverGrew, $readings.StalledFor, $readings.StallLimit))
+    $lines.Add(("  evidence: own cpu {0} over the whole wait, {1} in the last {2}s" `
+                -f (& $show $readings.OwnTotal), (& $show $ownRecent), $window))
+    $lines.Add(("  evidence: descendants now={0}, most seen in the window={1}, their cpu in the last {2}s={3}" `
+                -f $(if ($null -ne $readings.ChildrenNow) { $readings.ChildrenNow } else { "unknown" }), `
+                   $readings.ChildrenSeen, $window, (& $show $childRecent)))
+    $lines.Add(("  evidence: a recent figure at or below {0:N2}s reads as idle and at or above {1:N2}s as working; between them this cannot tell." `
+                -f $idleFloor, $clearlyBusy))
+
+    if (-not $readings.Alive) {
+        $lines.Add(("VERDICT: the process exited with code {0} before the deadline." -f $readings.ExitCode))
+        return $lines
+    }
+
+    if ($readings.EverGrew -and $readings.StalledFor -lt $readings.StallLimit) {
+        $lines.Add(("VERDICT: WORKING -- the log was still growing {0}s before the deadline, so the process was making observable progress when the budget ran out." -f $readings.StalledFor))
+    }
+    elseif ($null -ne $childRecent -and $childRecent -ge $clearlyBusy) {
+        $lines.Add(("VERDICT: WORKING -- a CHILD of this process burned {0:N2}s of CPU in the last {1}s. This step spawns a compiler, and a spawned process charges its own CPU, so the parent sitting quiet is expected." -f $childRecent, $window))
+    }
+    elseif ($null -ne $ownRecent -and $ownRecent -ge $clearlyBusy) {
+        $lines.Add(("VERDICT: WORKING -- the process burned {0:N2}s of its own CPU in the last {1}s, so it was still running code when the budget expired." -f $ownRecent, $window))
+    }
+    elseif ($null -eq $ownRecent -or $null -eq $childRecent) {
+        # Asked BEFORE the idle test, and the order is the whole point: a reading
+        # that could not be taken must never be folded into a sum and reported as a
+        # zero. Could-not-see is not saw-nothing.
+        $lines.Add(("VERDICT: INCONCLUSIVE -- the process is alive and quiet, but its CPU could not be sampled ({0} own, {1} descendants), and this wait covers an operation that logs nothing while it runs. Do not read this as either a hang or a slow machine." `
+                    -f $(if ($null -ne $ownRecent) { "read" } else { "unreadable" }), $(if ($null -ne $childRecent) { "read" } else { "unreadable" })))
+    }
+    elseif (($ownRecent + $childRecent) -le $idleFloor) {
+        $lines.Add(("VERDICT: BLOCKED -- the process is alive, wrote nothing for {0}s, and neither it nor any of its {1} descendant(s) consumed measurable CPU in the last {2}s ({3:N2}s against an idle floor of {4:N2}s). Nothing in this process tree was running code when the budget expired." `
+                    -f $readings.StalledFor, $readings.ChildrenSeen, $window, ($ownRecent + $childRecent), $idleFloor))
+        $lines.Add("  That is the signature of a hang and not of a slow machine. The log below is where it stopped.")
+    }
+    else {
+        $lines.Add(("VERDICT: INCONCLUSIVE -- {0:N2}s of CPU across this process tree in the last {1}s is above the {2:N2}s idle floor and below the {3:N2}s that would settle it. Something ran, and this instrument cannot say whether it was work or a runtime's own housekeeping." `
+                    -f ($ownRecent + $childRecent), $window, $idleFloor, $clearlyBusy))
+    }
+
+    # No verdict above prescribes a remedy. "Raise the budget" is sound advice in
+    # general, was printed by the branch that fires most often, and is precisely
+    # what #354 refuses -- that budget has been raised twice already. An instrument
+    # that prints a remedy has to know when the remedy is under dispute, and this
+    # one cannot, so it states the finding and stops.
+    return $lines
+}
+
 function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what, $proc) {
     # Bounded, and it says what it waited for. Reading the node's OWN log rather than
     # the scheduler's counters, because this wait is about one process reaching a
@@ -73,85 +228,189 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     # the toolchain fingerprint" and nothing further, which is what a cold include
     # walk on a contended runner looks like AND what a deadlock looks like.
     #
-    # Three things separate them, and all three are free:
-    #
-    #   the log still GROWING at the deadline  -> progress; the budget is too small
-    #   the log static while the process lives -> no progress; suspect a hang
-    #   the process gone                       -> it died rather than hung, and the
-    #                                             exit code is the story
-    #
     # And on SUCCESS it prints what the wait actually cost. Nothing recorded that
     # before, so no budget here could be set from data -- the numbers were guesses
     # that survived by being generous. A green run now measures itself.
+    #
+    # This half ACQUIRES; `Get-WaitVerdict` above decides. Everything below reads
+    # the world, and nothing below chooses.
+    #
+    # ------------------------------------------------------------------------
+    # What the first version of this classifier got wrong, and why the shape here
+    # is the fix rather than a tuning of it (#354's first real sighting):
+    #
+    #     evidence: alive=True logGrew=True lastGrowth=300s ago cpuDuringWait=3.4s
+    #     VERDICT: the process was still WORKING when the budget ran out (it
+    #     consumed CPU throughout) -- raise the budget.
+    #
+    # Three separate errors, and the third is the one worth remembering.
+    #
+    # 1. `cpuDuringWait` was CUMULATIVE over the whole wait and was read as a claim
+    #    about the process's state AT THE DEADLINE. 3.4s spread evenly over 300s and
+    #    3.4s burned in the first ten seconds followed by a wedge are the same
+    #    number and opposite diagnoses. A duty cycle over that same window does not
+    #    fix it -- it is the same number divided by the same 300. Only a RECENT
+    #    window can answer a question about now, so that is what the verdict is
+    #    drawn from and the totals are evidence only.
+    #
+    # 2. No MAGNITUDE bar can be calibrated here. The whole Windows SDK include tree
+    #    is 9,487 files and walks warm in 0.1s at 88% duty; the same walk on a cold,
+    #    virus-scanned, contended runner is I/O bound and burns a tiny fraction of
+    #    that. Healthy duty for this one operation spans two orders of magnitude, so
+    #    a bar set high enough to exclude idle noise would call a genuinely working
+    #    cold walk BLOCKED -- and send somebody hunting a hang that is not there.
+    #    What does not vary is ZERO: a blocked thread accrues no CPU at any
+    #    temperature. So the test is PRESENCE in a recent window, not magnitude, and
+    #    everything between "idle" and "clearly working" is reported as neither.
+    #
+    # 3. The two signals CONTRADICTED each other and an `-or` let the weaker one win
+    #    unopposed: `$progressing` was False (the log had not grown in 300s) and
+    #    `$busy` was True (3.4s >= 1.0s), and the disjunction reported WORKING. An
+    #    `-or` is right for two independent CONFIRMATIONS and wrong for two
+    #    competing READINGS. `logGrew=True` was true and uninformative -- it counted
+    #    the two startup lines landing in different polls -- and printing it beside a
+    #    conclusion lent it authority it had not earned. A signal that cannot be
+    #    false in the failing case is not evidence.
+    #
+    # The process TREE is not a refinement of this, it is required for correctness:
+    # between the fingerprint line and "compile node ready" the node spawns `cl` two
+    # or three times and then sits in a kernel wait at zero own-CPU while the child
+    # works. Recent-window own-CPU alone would call that BLOCKED, which is error 2
+    # again from the other end. The earlier version documented this limitation in
+    # prose and told the reader to run `Get-Process cl` by hand; the instrument does
+    # it now.
     $started = Get-Date
     $deadline = $started.AddSeconds($seconds)
     $lastSize = -1
     $lastGrowth = $started
     $everGrew = $false
-    # CPU as well as log growth, because the operation this wait most often covers --
-    # walking a compiler's include tree -- logs NOTHING while it runs. A slow walk and
-    # a wedged process therefore produce identical logs, so log growth alone would have
-    # mis-diagnosed #338 with confidence. CPU separates them: work burns it, a block
-    # does not. Sampled from the node itself; a spawned `cl` charges its own process,
-    # so a low figure here is weaker evidence than a high one, and the verdict below
-    # says so rather than pretending otherwise.
-    $cpuAtStart = $null
-    if ($proc) { try { $proc.Refresh(); $cpuAtStart = $proc.TotalProcessorTime } catch {} }
-    while ((Get-Date) -lt $deadline) {
+
+    # Scaled to the budget rather than fixed: a 30s stall means nothing in a 6s wait
+    # and everything in a 300s one. Ten percent, floored at five seconds so a short
+    # wait still has a usable threshold.
+    $stallLimit = [Math]::Max(5, [int]($seconds * 0.1))
+
+    # The window the CPU verdict is drawn from, and the two bounds it is judged
+    # against. Both bounds are printed beside the verdict, because they are
+    # judgements rather than measurements and the next reader should be able to
+    # disagree with them from the numbers on the page.
+    #
+    #   floor -- at or below this, indistinguishable from an idle .NET runtime's own
+    #            timer and GC threads (measured: 0.062s over 12s for an idle pwsh).
+    #   clear -- at or above this, activity no idle process produces.
+    #
+    # Between them this instrument genuinely cannot tell, and says so.
+    $window = [Math]::Min($seconds, [Math]::Max(30, [int]($seconds / 4)))
+    $idleFloor = [Math]::Max(0.15, $window * 0.002)
+    $clearlyBusy = [Math]::Max(0.50, $window * 0.010)
+
+    $rootPid = $null
+    $rootStarted = $null
+    if ($proc) { try { $rootPid = $proc.Id; $rootStarted = $proc.StartTime } catch {} }
+
+    $ownSamples = [System.Collections.Generic.List[object]]::new()
+    $treeSamples = [System.Collections.Generic.List[object]]::new()
+    # Often enough that a short wait still gets several samples, rarely enough that
+    # the query does not become the load.
+    $treeEvery = [TimeSpan]::FromSeconds([Math]::Max(1, [Math]::Min(5, [int]($seconds / 6))))
+    $treeDue = $started
+
+    while ($true) {
+        $now = Get-Date
+        if ($proc) {
+            try {
+                $proc.Refresh()
+                $ownSamples.Add([pscustomobject]@{ At = $now; Cpu = $proc.TotalProcessorTime.TotalSeconds })
+            } catch {}
+        }
+        if ($rootPid -and $now -ge $treeDue) {
+            $treeDue = $now.Add($treeEvery)
+            $tree = Get-ProcessTreeCpu $rootPid $rootStarted
+            if ($tree) { $treeSamples.Add([pscustomobject]@{ At = $now; Cpu = $tree.Cpu; Count = $tree.Count }) }
+        }
+
         $text = Get-Content -Raw $log -ErrorAction SilentlyContinue
         if ($text -and $text -match $pattern) {
             Write-Host ("  waited {0}s of {1}s for {2}" -f [int]((Get-Date) - $started).TotalSeconds, $seconds, $what)
             return $true
         }
-        $size = if ($text) { $text.Length } else { 0 }
-        if ($size -ne $lastSize) {
-            if ($lastSize -ge 0) { $everGrew = $true }
-            $lastSize = $size; $lastGrowth = Get-Date
+        # Only a read that SUCCEEDED may move the growth clock. A log briefly locked
+        # by the writer reads as $null, and treating that as a size change would
+        # have a wedged process report progress every time its log could not be
+        # opened -- false progress, in the one direction that matters.
+        if ($null -ne $text) {
+            $size = $text.Length
+            if ($size -ne $lastSize) {
+                if ($lastSize -ge 0) { $everGrew = $true }
+                $lastSize = $size
+                $lastGrowth = Get-Date
+            }
         }
+
         if ($proc -and $proc.HasExited) {
             Write-Host ("FAILED after {0}s waiting for {1}: the process EXITED with code {2}. It did not hang -- it died, and the log below is why." `
                         -f [int]((Get-Date) - $started).TotalSeconds, $what, $proc.ExitCode)
             Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
             return $false
         }
+        if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Milliseconds 400
     }
+
     $stalledFor = [int]((Get-Date) - $lastGrowth).TotalSeconds
-    # Scaled to the budget rather than fixed: a 30s stall means nothing in a 6s wait
-    # and everything in a 300s one. Ten percent, floored at five seconds so a short
-    # wait still has a usable threshold.
-    $stallLimit = [Math]::Max(5, [int]($seconds * 0.1))
-    $cpuUsed = $null
-    if ($proc -and $cpuAtStart -ne $null) {
-        try { $proc.Refresh(); $cpuUsed = ($proc.TotalProcessorTime - $cpuAtStart).TotalSeconds } catch {}
+    $cutoff = (Get-Date).AddSeconds(-$window)
+
+    # Own CPU is monotonic, so the recent figure is a plain difference against the
+    # first sample inside the window.
+    $ownTotal = $null
+    $ownRecent = $null
+    if ($ownSamples.Count -ge 2) {
+        $last = $ownSamples[$ownSamples.Count - 1]
+        $ownTotal = $last.Cpu - $ownSamples[0].Cpu
+        $base = $last
+        foreach ($sample in $ownSamples) { if ($sample.At -ge $cutoff) { $base = $sample; break } }
+        $ownRecent = $last.Cpu - $base.Cpu
     }
-    Write-Host "waited ${seconds}s for $what"
-    # The measurements first, always, whatever verdict follows: a verdict that turns
-    # out wrong is still useful if the numbers it was drawn from are on the page.
-    Write-Host ("  evidence: alive={0} logGrew={1} lastGrowth={2}s ago cpuDuringWait={3}" `
-                -f $(if ($proc) { -not $proc.HasExited } else { "unknown" }), $everGrew, $stalledFor,
-                   $(if ($cpuUsed -ne $null) { "{0:N1}s" -f $cpuUsed } else { "unknown" }))
-    if ($proc -and -not $proc.HasExited) {
-        $busy = ($cpuUsed -ne $null -and $cpuUsed -ge 1.0)
-        $progressing = ($everGrew -and $stalledFor -lt $stallLimit)
-        if ($progressing -or $busy) {
-            Write-Host ("VERDICT: the process was still WORKING when the budget ran out ({0}). That is a budget or contention problem, not a hang -- raise the budget or reduce what runs beside it." `
-                        -f $(if ($busy) { "it consumed CPU throughout" } else { "its log was still growing" }))
-        } elseif ($cpuUsed -ne $null) {
-            # Deliberately hedged, and the hedge is for whoever reads this at 2am.
-            # Low CPU HERE does not mean nothing is working: this wait covers an
-            # operation that spawns a compiler, and a spawned `cl` charges its own
-            # process. So the first move is to look for a live child, not to go
-            # hunting a deadlock that may not exist.
-            Write-Host ("VERDICT: the process is alive, wrote nothing new, and consumed essentially no CPU ITSELF ({0:N1}s)." -f $cpuUsed)
-            Write-Host ("  Before concluding it is hung: this step SPAWNS a compiler, and a spawned process charges CPU to itself, not to its parent.")
-            Write-Host ("  So check for a live child first -- `Get-Process cl,clang,clang-cl -ErrorAction SilentlyContinue` -- and if one is running and busy, this is a SLOW MACHINE, not a hang.")
-            Write-Host ("  Only with no busy child does this read as BLOCKED, and then do not simply raise the timeout.")
-        } else {
-            Write-Host ("VERDICT: INCONCLUSIVE -- the process is alive and quiet, but its CPU could not be sampled, and this wait covers an operation that logs nothing while it runs. Do not read this as either a hang or a slow machine without more evidence.")
+
+    # A tree's total is NOT monotonic: a child that exits takes its CPU out of the
+    # sum. So the recent figure accumulates the positive steps rather than
+    # differencing the endpoints -- a child ending is activity too, but it is not
+    # activity this can measure, and it must never be subtracted from a sibling's
+    # real work.
+    $childRecent = $null
+    $childrenNow = $null
+    $childrenSeen = 0
+    if ($treeSamples.Count -ge 2) {
+        $childRecent = 0.0
+        foreach ($index in 1..($treeSamples.Count - 1)) {
+            if ($treeSamples[$index].At -lt $cutoff) { continue }
+            $step = $treeSamples[$index].Cpu - $treeSamples[$index - 1].Cpu
+            if ($step -gt 0) { $childRecent += $step }
         }
-    } elseif ($proc) {
-        Write-Host ("VERDICT: the process exited with code {0} before the deadline." -f $proc.ExitCode)
+        $childrenNow = $treeSamples[$treeSamples.Count - 1].Count
+        foreach ($sample in $treeSamples) {
+            if ($sample.At -ge $cutoff -and $sample.Count -gt $childrenSeen) { $childrenSeen = $sample.Count }
+        }
+    }
+
+    Write-Host "waited ${seconds}s for $what"
+    if ($proc) {
+        $readings = [pscustomobject]@{
+            Alive        = (-not $proc.HasExited)
+            ExitCode     = $(if ($proc.HasExited) { $proc.ExitCode } else { $null })
+            EverGrew     = $everGrew
+            StalledFor   = $stalledFor
+            StallLimit   = $stallLimit
+            OwnTotal     = $ownTotal
+            OwnRecent    = $ownRecent
+            ChildRecent  = $childRecent
+            ChildrenNow  = $childrenNow
+            ChildrenSeen = $childrenSeen
+            Window       = $window
+            IdleFloor    = $idleFloor
+            ClearlyBusy  = $clearlyBusy
+        }
+        foreach ($line in @(Get-WaitVerdict $readings)) { Write-Host $line }
     }
     Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
     return $false
@@ -167,6 +426,217 @@ function ConvertTo-QuotedArgs([string[]]$arguments) {
         if ($_ -match '\s' -and $_ -notmatch '^"') { '"' + $_ + '"' } else { $_ }
     }
 }
+
+# ---------------------------------------------------------------------------
+# `Get-WaitVerdict`, against synthesised readings.
+#
+# This exists because the classifier was WRONG in production and nothing noticed.
+# Asked why a worker had not come up in five minutes it answered "the process was
+# still WORKING (it consumed CPU throughout)" about a process that had written
+# nothing for the whole wait and spent 1.1% of one core, and that verdict carried
+# an instruction to raise a budget #354 explicitly refuses. Every other test in
+# this tree passed, because nothing tests a fixture's own arithmetic.
+#
+# The cases are RECORDS rather than processes, and that is the second lesson of
+# the same file. The first attempt drove real stand-ins arranged to consume a
+# measured amount of CPU. It worked for the verdicts that turn on presence or
+# absence and could not work for the one that turns on a magnitude: the band is
+# 0.35s wide and a PowerShell process's own startup costs 0.2-0.5s, so the
+# instrument's overhead and the quantity under test were the same size. Three
+# green runs locally, then 0.52s against a 0.50s bound on CI; and a second
+# arrangement put the burn at the recent window's cutoff edge, where 0.16s of a
+# measured 0.25s counted. Records take 4ms and cannot drift.
+#
+# What that buys beyond not flaking:
+#
+#   - the unsampleable-CPU branch is testable at all, where a live process whose
+#     CPU this script may not read could not be arranged;
+#   - every bound is pinned on BOTH sides rather than demonstrated once from the
+#     middle, which is where an `-and`/`-or` mistake of the original kind lives;
+#   - precedence between the branches is assertable, including the one that
+#     matters most: an unsampled reading must not be folded into a sum as a zero.
+#
+# What is NOT covered here, stated rather than left as an apparent omission:
+# acquisition. `Win32_Process`, the parentage walk, the pid-reuse guard and the
+# locked-log read are where all three real defects were, and they are exactly as
+# hard to exercise wherever they live. So is the early return that reports a
+# process which died mid-wait; the record below covers only the end-of-wait form.
+
+function Invoke-SelfTest {
+    # The reading a healthy-looking but idle process produces: alive, a log that
+    # grew long ago, nothing burning. That is BLOCKED, so every case that wants
+    # another verdict says exactly which reading changes it -- and a row's
+    # overrides are then the whole of what it is about.
+    $base = @{
+        Alive        = $true
+        ExitCode     = $null
+        EverGrew     = $true
+        StalledFor   = 300
+        StallLimit   = 30
+        OwnTotal     = 0.0
+        OwnRecent    = 0.0
+        ChildRecent  = 0.0
+        ChildrenNow  = 0
+        ChildrenSeen = 0
+        Window       = 75
+        IdleFloor    = 0.15
+        ClearlyBusy  = 0.50
+    }
+
+    $cases = @(
+        @{  Name = "a log still growing at the deadline"
+            Readings = @{ StalledFor = 5 }
+            Expect = "VERDICT: WORKING -- the log was still growing"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
+
+        @{  # `-lt`, not `-le`: a stall that has reached the limit is not progress.
+            Name = "a log that stopped growing exactly at the stall limit"
+            Readings = @{ StalledFor = 30 }
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # The `-and`. `logGrew` alone was the uninformative half of the
+            # original bug: it counted two startup lines landing in different
+            # polls. A log that never grew cannot report progress however recently
+            # it was read.
+            Name = "a log that never grew, however recently it was read"
+            Readings = @{ EverGrew = $false; StalledFor = 0 }
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  Name = "a child exactly at the working bound"
+            Readings = @{ ChildRecent = 0.50; ChildrenNow = 1; ChildrenSeen = 1 }
+            Expect = "VERDICT: WORKING -- a CHILD of this process burned"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
+
+        @{  Name = "a child just below the working bound"
+            Readings = @{ ChildRecent = 0.49; ChildrenNow = 1; ChildrenSeen = 1 }
+            Expect = "VERDICT: INCONCLUSIVE"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  Name = "the process itself exactly at the working bound"
+            Readings = @{ OwnRecent = 0.50 }
+            Expect = "VERDICT: WORKING -- the process burned"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
+
+        @{  Name = "the process itself just below the working bound"
+            Readings = @{ OwnRecent = 0.49 }
+            Expect = "VERDICT: INCONCLUSIVE"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  Name = "own cpu that could not be sampled"
+            Readings = @{ OwnRecent = $null }
+            Expect = "could not be sampled (unreadable own, read descendants)"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  Name = "descendant cpu that could not be sampled"
+            Readings = @{ ChildRecent = $null; ChildrenNow = $null }
+            Expect = "could not be sampled (read own, unreadable descendants)"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  # The precedence that matters most, and the reason the unsampleable
+            # test is asked BEFORE the idle one. Folded into a sum, an unreadable
+            # reading becomes a zero and a process nobody could see reports as a
+            # hang -- the same "could not tell" read as "nothing there" that this
+            # repository keeps a list about.
+            Name = "an unsampled reading is not a zero"
+            Readings = @{ OwnRecent = $null; ChildRecent = 0.0 }
+            Expect = "VERDICT: INCONCLUSIVE"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  # `-le`, not `-lt`: exactly at the floor is idle.
+            Name = "a tree exactly at the idle floor"
+            Readings = @{ OwnRecent = 0.15 }
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  Name = "a tree just above the idle floor"
+            Readings = @{ OwnRecent = 0.16 }
+            Expect = "VERDICT: INCONCLUSIVE"
+            Forbid = @("WORKING", "BLOCKED") },
+
+        @{  Name = "a tree at rest"
+            Readings = @{}
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  Name = "a busy child outranks an idle parent"
+            Readings = @{ OwnRecent = 0.0; ChildRecent = 2.0; ChildrenNow = 1; ChildrenSeen = 1 }
+            Expect = "VERDICT: WORKING -- a CHILD of this process burned"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
+
+        @{  Name = "a growing log outranks an idle tree"
+            Readings = @{ StalledFor = 1 }
+            Expect = "VERDICT: WORKING -- the log was still growing"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
+
+        @{  # #354's own reading, as the classifier now receives it. 3.4s of
+            # CUMULATIVE cpu with none of it recent, and a log whose only growth
+            # was its first two lines. The original called this WORKING and told
+            # an operator to raise a budget. It is the case this whole change
+            # exists for, and it is one row.
+            Name = "the reading that produced #354"
+            Readings = @{ EverGrew = $true; StalledFor = 300; OwnTotal = 3.4; OwnRecent = 0.0 }
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  Name = "a process that died rather than hanging"
+            Readings = @{ Alive = $false; ExitCode = 3 }
+            Expect = "the process exited with code 3 before the deadline"
+            Forbid = @("WORKING", "BLOCKED", "INCONCLUSIVE") }
+    )
+
+    # Asserted on EVERY case, not just the ones that tempt it. #354 refuses a third
+    # raise of this budget, and the branch that printed that advice was the one that
+    # fired most often. A remedy under dispute is not the instrument's to give.
+    $forbiddenEverywhere = @("raise the budget", "reduce what runs beside it")
+
+    # What a verdict must SHOW, not just claim. A conclusion whose numbers are not
+    # on the page cannot be argued with, and being arguable is the whole value --
+    # it is why #354's wrong verdict could be challenged at all.
+    $evidenceLines = @("evidence: alive=", "evidence: own cpu", "evidence: descendants", "evidence: a recent figure")
+
+    $failures = 0
+    foreach ($case in $cases) {
+        $fields = @{}
+        foreach ($key in $base.Keys) { $fields[$key] = $base[$key] }
+        foreach ($key in $case.Readings.Keys) { $fields[$key] = $case.Readings[$key] }
+
+        $captured = (@(Get-WaitVerdict ([pscustomobject]$fields))) -join "`n"
+
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if (-not $captured.Contains($case.Expect)) { $problems.Add("expected `"$($case.Expect)`"") }
+        foreach ($banned in @($case.Forbid) + $forbiddenEverywhere) {
+            # Ordinal and case-sensitive, which is load-bearing: the bounds line
+            # says "reads as idle and at or above 0.50s as working", and a
+            # case-insensitive match would see a forbidden "WORKING" in every
+            # single case.
+            if ($banned -and $captured.Contains($banned)) { $problems.Add("must not say `"$banned`"") }
+        }
+        foreach ($line in $evidenceLines) {
+            if (-not $captured.Contains($line)) { $problems.Add("expected an `"$line`" line") }
+        }
+
+        if ($problems.Count -eq 0) {
+            Write-Host ("PASS  {0}" -f $case.Name)
+        } else {
+            $failures++
+            Write-Host ("FAIL  {0}: {1}" -f $case.Name, ($problems -join "; "))
+            Write-Host $captured
+        }
+    }
+
+    if ($failures -gt 0) {
+        Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $cases.Count)
+        return 1
+    }
+    Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} cases passed" -f $cases.Count)
+    return 0
+}
+
+# Before anything with a side effect, so the classifier's own test needs no scratch
+# directory, no ports and no binaries.
+if ($SelfTest) { exit (Invoke-SelfTest) }
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("fc-scratch-iso-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
