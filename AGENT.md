@@ -762,6 +762,27 @@ and what they may assume.
   exactly 250ms still read 0.52s on CI and 0.16s when moved. No arrangement fixes that — the noise IS the interpreter.
   Split the DECISION out as a pure function over a record; leave acquisition alone. Branches that could not be staged
   become one line, every bound gets pinned on BOTH sides, and 53s + RUN_SERIAL becomes 0.3s.
+- **A fixture that has never completed has told you nothing**, however carefully it was read.
+  `launcher-replay-e2e` was reviewed and merged into a CI job, and its first run anywhere died on the
+  first line that starts a process, behind which sat three more defects — one of them #390, a
+  repository bug the fixture merely reached first. A flag spelling is checked against `CliOptions()`,
+  never remembered — `--memory-limit` does not exist, and the daemon answered usage while the fixture
+  reported "never accepted a connection". `exit` inside a `( ... )` ends the subshell only, so a
+  `fail` helper signals the top-level shell and tests `BASHPID`, since bash keeps `$$` at the parent's
+  value there and the guard would silently never fire.
+- **A guard written to prove a fixture bites can itself fail to bite.** The replay canary compiled a
+  wrong object over a unit of ANOTHER target, the binary under test never linked it, and the fixture
+  announced "the suite PASSED with a wrong object linked in" — a true observation carrying a false
+  claim, which names the subject as broken when the instrument is. An injection is ASSERTED, in the
+  artefact and again in the thing that consumes it.
+- **Attribute by asking the process, never by adjacency in interleaved output.** Reading the
+  `[n/m] Building CXX object ...` line above each launcher outcome split one unit differently across
+  two runs of the same build (74/41 against 75/40) — a guard that fails a build for a scheduling
+  accident. A wrapper that labels the unit on the same stream, from the same process, inside the same
+  edge cannot be separated from what it labels; an unlabelled outcome is counted as NEITHER and
+  refused by name. And an unattributed total hides the only column that means anything: 106 of 221
+  units missing was alarming and was entirely third-party, while one project unit missing is the
+  actual regression shape and is invisible inside the same number.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the
