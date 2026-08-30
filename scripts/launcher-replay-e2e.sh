@@ -73,7 +73,24 @@ while [ $# -gt 0 ]; do
 done
 
 SKIP=77
-fail() { echo "launcher-replay-e2e FAILED: $*" >&2; exit 1; }
+top_pid=$$
+
+# `fail` is reached from inside subshells -- the control build runs in one so
+# it can unset the launcher environment without disturbing the two builds
+# after it -- and there a bare `exit` ends the subshell only. The script then
+# carries on and reports a SECOND failure about the artefacts the first one
+# explains: a configure error was followed by `no build.ninja` and `produced
+# no binary`, which names the wrong thing twice and buries the cause.
+#
+# So a stop is a stop wherever it is raised. `$$` is no help: bash keeps it at
+# the parent's value inside a subshell, and the comparison would silently
+# always hold. `BASHPID` is the running shell's own pid, which is the whole
+# point of the check.
+fail() {
+    echo "launcher-replay-e2e FAILED: $*" >&2
+    [ "${BASHPID:-$$}" = "$top_pid" ] || kill -TERM "$top_pid" 2>/dev/null
+    exit 1
+}
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
 note() { echo "   $*"; }
 
@@ -97,6 +114,10 @@ cleanup() {
     rm -rf "$workdir"
 }
 trap cleanup EXIT
+# A `fail` raised in a subshell reaches the top-level shell as SIGTERM, whose
+# default disposition would report 143. One failing status whichever shell
+# raised it; the EXIT trap above still runs and still removes the workdir.
+trap 'exit 1' TERM
 
 # ---------------------------------------------------------------------------
 echo "== the daemon this build will cache through"
