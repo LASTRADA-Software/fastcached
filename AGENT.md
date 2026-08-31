@@ -250,6 +250,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - What a node holds back from compiles is what its tier **built**, never what a flag
   asked for — so capacity is derived *below* the tier startup. Which tiers cost RAM
   is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing.
+- A node SERVES while it identifies its toolchains. The cheap half (WHICH compilers)
+  stays at startup; the walk (over 300 s cold, at 2.7% CPU duty — a filesystem wall,
+  not a thread shortage) moves to the heartbeat thread's first round. It registers
+  NOTHING until the fingerprint is real, which is #225 and falls out of a
+  `ServedToolchain` needing one. An empty map is two opposite answers, so
+  `ToolchainSurvey` travels beside it with a deleted default constructor. "Nothing to
+  serve" stays fatal; only its timing moves. `/healthz` stays green, or every restart
+  reads as an outage.
 - A probe that did not RUN is not one that answered nothing, and an identity built on
   one is neither served nor cached. Empty roots are ordinary — several mechanisms
   legitimately have none — so the guard is `exitCode == NotSpawned`, never the count.

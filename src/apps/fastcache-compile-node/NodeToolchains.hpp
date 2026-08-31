@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +26,47 @@ struct ToolchainEntry
 {
     std::string fingerprint; ///< Empty when the node must compute it.
     std::string compiler;    ///< Path to the compiler.
+};
+
+/// How the set of compilers to serve was arrived at.
+///
+/// Carried from the cheap half of the survey to the expensive one because it is the
+/// only thing that makes a "nothing to serve" refusal honest, and there are three
+/// ways to arrive at that: the machine was searched and holds nothing, every named
+/// compiler was rejected, or nothing was named and nothing was to be searched. The
+/// first names WHERE it looked; the others must not, because reciting places nobody
+/// looked in reads as "your compiler is not installed" when the answer is "the one
+/// you named was refused, a line above".
+///
+/// An enum rather than the `bool discovered` this replaced, and not only for the
+/// third case: a bool passed between two functions is a bool one of them can be
+/// handed wrongly, and the three messages are three states.
+enum class ToolchainSource : std::uint8_t
+{
+    /// Discovery answered and the set is the machine's own.
+    MachineSearched,
+    /// Every entry came from a `--toolchain`. The operator's list wins whole.
+    OperatorNamed,
+    /// `--no-toolchain-discovery` and no `--toolchain`: this worker was told to
+    /// serve nothing, which is a configuration answer rather than a search result.
+    NothingToSearch,
+};
+
+/// Which compilers this node will serve, before any of them has been fingerprinted.
+///
+/// The **cheap** half of the survey, and the split exists because the two halves cost
+/// three orders of magnitude apart. Deciding the set is a spawn per candidate;
+/// identifying them walks every byte under every include root, which has been
+/// measured at 5136 files and over 300 s on a cold Windows CI runner
+/// ([#354](https://github.com/LASTRADA-Software/fastcached/issues/354)). Keeping the
+/// cheap half synchronous is what lets a misconfigured node still be refused at
+/// startup, promptly, while the expensive half moves off the path that blocks the
+/// node from serving anything at all
+/// ([#365](https://github.com/LASTRADA-Software/fastcached/issues/365)).
+struct DiscoveredToolchains
+{
+    std::vector<ToolchainEntry> entries; ///< What to fingerprint, in table order.
+    ToolchainSource source;              ///< How the set was chosen.
 };
 
 /// What a toolchain's fingerprint was computed FROM, so it can be rechecked cheaply.
@@ -190,6 +232,86 @@ struct ServedToolchain
                                                                                       Cc::IToolchainHost& host,
                                                                                       IClock const& clock,
                                                                                       ILogger& logger);
+
+/// Decide WHICH compilers this node will serve, without identifying any of them.
+///
+/// `ResolveToolchains` is this followed by `FingerprintToolchains`, and every rule
+/// above still holds -- the two are split by COST, not by policy. This half spawns
+/// each discovered candidate once to prove it can be executed and parses each
+/// `--toolchain`; it walks nothing.
+///
+/// A node that cannot serve anything is NOT refused here, and that is deliberate
+/// rather than an omission. Discovery finding four compilers does not mean four will
+/// be served: a fingerprint that does not identify its toolchain is dropped, so
+/// "nothing to serve" can only be decided once the expensive half has run, and it is
+/// decided there.
+///
+/// @param cfg What the operator asked for.
+/// @param discovery Where the machine's own compilers come from; null when
+///        `--no-toolchain-discovery` was given.
+/// @param runner Process-spawning seam, for the "can this be executed" probe.
+/// @param logger Startup log.
+/// @return The set and how it was chosen, or nullopt when a `--toolchain` value is
+///         malformed -- the one refusal this half can reach, and the reason it is
+///         worth keeping on the startup path.
+[[nodiscard]] std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& cfg,
+                                                                           Cc::IToolchainDiscovery* discovery,
+                                                                           Cc::IProcessRunner& runner,
+                                                                           ILogger& logger);
+
+/// What identifying the discovered compilers came to.
+///
+/// Three states, not an `optional`, because the third is real and is not either of
+/// the others. A survey that was ABANDONED because the node is stopping has produced
+/// no answer, and folding it into "nothing to serve" would exit a stopping node with
+/// a configuration error it does not have -- in the log an operator reads to find out
+/// why `systemctl stop` took a while.
+enum class SurveyOutcome : std::uint8_t
+{
+    /// The walk finished and this node serves what `served` holds.
+    Served,
+    /// The walk finished and nothing survived it. A startup refusal; see
+    /// `FingerprintToolchains`.
+    NothingToServe,
+    /// The node was asked to stop mid-walk. `served` is meaningless.
+    Cancelled,
+};
+
+/// The outcome and, when there is one, the answer.
+struct SurveyResult
+{
+    SurveyOutcome outcome { SurveyOutcome::NothingToServe }; ///< What happened.
+    std::map<std::string, ServedToolchain> served;           ///< Empty unless `Served`.
+};
+
+/// Identify the discovered compilers, and refuse a node that would serve none.
+///
+/// The **expensive** half: a driver spawn and a full walk of the include tree per
+/// entry, concurrently. See `DiscoveredToolchains` for what that costs and why the
+/// split exists.
+///
+/// @param discovered What `DiscoverToolchainEntries` returned.
+/// @param runner Process-spawning seam, for the compiler probes.
+/// @param host The machine's filesystem, registry and environment.
+/// @param clock Where the hash phase's progress rate reads elapsed time (#354).
+/// @param logger Startup log.
+/// @return Fingerprint to what this worker serves under it -- never empty -- or
+///         nullopt when there is nothing to serve, which is refused HERE with the
+///         message that fits `discovered.source`.
+/// @param stop Observed between toolchains and between hashed files, so a node told
+///        to stop mid-walk stops. It is not a courtesy: since #365 this runs on the
+///        heartbeat thread, whose `jthread` destructor joins before `main` returns,
+///        and the stop handlers are installed a few lines after it starts. An
+///        unobservable walk therefore makes `systemctl stop` wait out the whole
+///        survey -- minutes on a cold machine -- and a supervisor answers that with
+///        SIGKILL and no diagnostic. Pass a default-constructed token where nothing
+///        can cancel, which is every caller but the node's.
+[[nodiscard]] SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
+                                                 Cc::IProcessRunner& runner,
+                                                 Cc::IToolchainHost& host,
+                                                 IClock const& clock,
+                                                 ILogger& logger,
+                                                 std::stop_token const& stop);
 
 /// Which of these toolchains no longer match the machine they were derived from.
 ///

@@ -169,7 +169,7 @@ TEST_CASE("A worker takes its compiler from its own configuration, never from th
     // remote shell.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     REQUIRE(jobs.Run(Job()).has_value());
     REQUIRE_FALSE(runner.Argv().empty());
@@ -182,7 +182,7 @@ TEST_CASE("An unknown fingerprint is refused, never served with a default", "[co
     // directly did not go through scheduling at all.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     auto job = Job();
     job.fingerprint = "clang-19";
@@ -197,9 +197,52 @@ TEST_CASE("A worker with no toolchains serves nothing", "[compile-job]")
 {
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), {} };
+    CompileJobRunner jobs { runner, scratch.Path(), {}, ToolchainSurvey::Completed() };
     CHECK(jobs.Run(Job()).error() == JobRefusal::UnknownFingerprint);
     CHECK(jobs.Fingerprints().empty());
+}
+
+TEST_CASE("A worker still surveying refuses by name, not as an unknown fingerprint", "[compile-job]")
+{
+    // The case above and this one hold the SAME empty map, and that is the point:
+    // nothing about the map distinguishes "this machine serves nothing" from "this
+    // machine has not been asked yet", so a test that only checked the empty case
+    // would pass under either answer. A node serves its cache tier while it walks its
+    // include trees (#365, over 300 s on a cold Windows runner per #354), so a client
+    // reaching the compile port during that window is a real state and not a
+    // hypothetical.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), {}, ToolchainSurvey::InFlight() };
+
+    auto const refused = jobs.Run(Job());
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == JobRefusal::ToolchainSurveyInFlight);
+    // Refused before anything was spawned, and before a scratch directory was made:
+    // a worker that has not been surveyed cannot know which program to run.
+    CHECK(runner.Argv().empty());
+
+    // And the survey ARRIVING is what ends it -- the same call the heartbeat's
+    // re-survey makes, so there is one way into the serving state rather than two.
+    jobs.ReplaceToolchains({ { "gcc-13", "/opt/real/g++" } });
+    REQUIRE(jobs.Run(Job()).has_value());
+    REQUIRE_FALSE(runner.Argv().empty());
+    CHECK(runner.Argv().front() == "/opt/real/g++");
+}
+
+TEST_CASE("A survey that answers with nothing is not a survey in flight", "[compile-job]")
+{
+    // The other direction, and the one an operator meets on a machine whose only
+    // compiler was uninstalled: surveyed, serving nothing. It must NOT keep reporting
+    // "still starting" forever -- that is a node that never becomes diagnosable.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), {}, ToolchainSurvey::InFlight() };
+    jobs.ReplaceToolchains({});
+
+    auto const refused = jobs.Run(Job());
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == JobRefusal::UnknownFingerprint);
 }
 
 TEST_CASE("An argument the worker's allowlist does not admit is refused", "[compile-job]")
@@ -217,7 +260,7 @@ TEST_CASE("An argument the worker's allowlist does not admit is refused", "[comp
     // to be a superset rather than a replacement that lost ground.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     for (auto const& hostile: { "-wrapper",
                                 "-fplugin=evil",
@@ -248,7 +291,7 @@ TEST_CASE("The worker decides where a byte lands, whatever the client asked to c
     // the directory.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto job = Job();
     job.sourceName = "../../../etc/passwd.cpp";
@@ -276,7 +319,7 @@ TEST_CASE("The worker gives its scratch file the name the client asked for", "[c
     // at all.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto job = Job();
     job.sourceName = "Widget.cpp";
@@ -289,7 +332,7 @@ TEST_CASE("A successful compile returns the object the compiler wrote", "[compil
 {
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto const result = jobs.Run(Job());
     REQUIRE(result.has_value());
@@ -305,7 +348,7 @@ TEST_CASE("A failing compile returns its diagnostics and no object", "[compile-j
     runner.ScriptExit(1);
     runner.ScriptStderr("error: no");
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto const result = jobs.Run(Job());
     REQUIRE(result.has_value());
@@ -322,7 +365,7 @@ TEST_CASE("A compiler that cannot be spawned is not a failed compile", "[compile
     ScriptedRunner runner;
     runner.ScriptExit(-1);
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto const result = jobs.Run(Job());
     REQUIRE_FALSE(result.has_value());
@@ -335,7 +378,7 @@ TEST_CASE("A compiler claiming success but writing nothing is refused", "[compil
     ScriptedRunner runner;
     runner.ScriptNoObject();
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     auto const result = jobs.Run(Job());
     REQUIRE_FALSE(result.has_value());
@@ -347,7 +390,7 @@ TEST_CASE("Each job gets its own scratch directory, and it is removed", "[compil
     // A worker leaking a directory per job fills its disk during a long build.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
 
     REQUIRE(jobs.Run(Job()).has_value());
     auto const first = runner.Argv();
@@ -643,7 +686,7 @@ TEST_CASE("A compiler this worker cannot classify refuses the JOB, not its argum
     // loop and spawn a driver whose command-line dialect this worker does not know.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "mystery", "/opt/weird/xlc" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "mystery", "/opt/weird/xlc" } }, ToolchainSurvey::Completed() };
 
     auto job = Job({});
     job.fingerprint = "mystery";
@@ -695,7 +738,9 @@ TEST_CASE("The output flag follows the worker's own driver family", "[compile-jo
     {
         ScriptedRunner runner;
         ScratchDirectory scratch { "fc-jobtest" };
-        CompileJobRunner jobs { runner, scratch.Path(), { { "msvc", R"(C:\MSVC\bin\cl.exe)" } } };
+        CompileJobRunner jobs {
+            runner, scratch.Path(), { { "msvc", R"(C:\MSVC\bin\cl.exe)" } }, ToolchainSurvey::Completed()
+        };
 
         auto job = Job({});
         job.fingerprint = "msvc";
@@ -712,7 +757,7 @@ TEST_CASE("The output flag follows the worker's own driver family", "[compile-jo
     {
         ScriptedRunner runner;
         ScratchDirectory scratch { "fc-jobtest" };
-        CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+        CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
         (void) jobs.Run(Job({}));
 
@@ -751,7 +796,7 @@ TEST_CASE("Concurrent jobs each get their OWN object rather than a sibling's", "
 
     ScratchDirectory scratch { "fc-jobtest" };
     OverlappingEchoRunner runner;
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     // Same source NAME, different source TEXT -- exactly the case a shared scratch
     // directory collapses, and exactly what a real fleet does when two machines
@@ -869,7 +914,7 @@ TEST_CASE("A worker serves the toolchains it was last given, not the ones it sta
     // new refusal, wire code or counter invented for the case.
     ScriptedRunner runner;
     ScratchDirectory const scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     REQUIRE(jobs.Run(Job()).has_value());
     CHECK(jobs.Fingerprints() == std::vector<std::string> { "gcc-13" });
@@ -905,7 +950,7 @@ TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[co
     // than half against one and half against another.
     ParkingRunner runner;
     ScratchDirectory const scratch { "fc-jobtest" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/before/g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/before/g++" } }, ToolchainSurvey::Completed() };
 
     std::expected<CompileOutcome, JobError> outcome;
     std::thread worker { [&] { outcome = jobs.Run(Job()); } };
@@ -925,7 +970,7 @@ TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[co
     // And the NEXT job takes the new one, so what the case above proves is that the
     // replacement was survived rather than ignored.
     ScriptedRunner after;
-    CompileJobRunner replaced { after, scratch.Path(), { { "gcc-13", "/opt/before/g++" } } };
+    CompileJobRunner replaced { after, scratch.Path(), { { "gcc-13", "/opt/before/g++" } }, ToolchainSurvey::Completed() };
     replaced.ReplaceToolchains({ { "gcc-13", "/opt/after/g++" } });
     REQUIRE(replaced.Run(Job()).has_value());
     REQUIRE_FALSE(after.Argv().empty());

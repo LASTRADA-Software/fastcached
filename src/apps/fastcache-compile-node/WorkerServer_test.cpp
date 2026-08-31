@@ -282,7 +282,7 @@ struct Fixture
     Distributed::OpenMembership membership;
 
     Fixture():
-        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } },
+        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
         protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics }
     {
     }
@@ -518,7 +518,7 @@ TEST_CASE("A worker serves its slots at once, not one at a time", "[worker-serve
     // reading a saturated fleet could report was `1 / 30 compiling`.
     ScratchDirectory const scratch { "worker-concurrent" };
     HoldingRunner runner;
-    Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
     Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
     Distributed::OpenMembership membership;

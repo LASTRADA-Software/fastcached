@@ -15,6 +15,7 @@
 #include <map>
 #include <ranges>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -276,6 +277,134 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->second.compiler == "/opt/gcc=13/bin/gcc");
     CHECK(Unwrap(resolved).begin()->first != "/opt/gcc");
+}
+
+TEST_CASE("NodeToolchains: the two halves compose into what the whole survey answers", "[node][toolchains]")
+{
+    // The split is by COST, not by policy (#365): node startup runs the cheap half
+    // and defers the expensive one, so the two paths must land on the same answer or
+    // a node serves something different from what `--print-toolchain-fingerprint`
+    // reports about the same machine.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/opt/real/g++") } };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const whole = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
+    REQUIRE(whole.has_value());
+
+    FixedDiscovery again { { Candidate("/opt/real/g++") } };
+    SpawnScript runnerAgain;
+    ScriptedToolchainHost hostAgain;
+    CapturingLogger loggerAgain;
+
+    auto const discovered = DiscoverToolchainEntries(cfg, &again, runnerAgain, loggerAgain);
+    REQUIRE(discovered.has_value());
+    CHECK(Unwrap(discovered).source == ToolchainSource::MachineSearched);
+    auto const halves =
+        FingerprintToolchains(Unwrap(discovered), runnerAgain, hostAgain, TestClock(), loggerAgain, std::stop_token {});
+    REQUIRE(halves.outcome == SurveyOutcome::Served);
+
+    REQUIRE(halves.served.size() == Unwrap(whole).size());
+    CHECK(halves.served.begin()->first == Unwrap(whole).begin()->first);
+    CHECK(halves.served.begin()->second.compiler == Unwrap(whole).begin()->second.compiler);
+}
+
+TEST_CASE("NodeToolchains: a malformed --toolchain is refused by the CHEAP half", "[node][toolchains]")
+{
+    // Which half refuses is the whole point of the split, not an implementation
+    // detail: this one stays on the startup path, so a typo'd flag is still refused
+    // in milliseconds rather than after a multi-minute walk of somebody else's
+    // include trees (#354).
+    NodeConfig cfg = Startable();
+    cfg.toolchains = { "=" };
+    SpawnScript runner;
+    CapturingLogger logger;
+
+    CHECK_FALSE(DiscoverToolchainEntries(cfg, nullptr, runner, logger).has_value());
+    CHECK(Logged(logger, "malformed"));
+}
+
+TEST_CASE("NodeToolchains: nothing to serve is refused by the EXPENSIVE half", "[node][toolchains]")
+{
+    // And this one cannot move, which is why the node still exits when it fires.
+    // Discovery finding compilers does not mean any will be served: a fingerprint
+    // that does not identify its toolchain is dropped, so "nothing to serve" is only
+    // decidable once the walk has run.
+    NodeConfig const cfg = Startable();
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    DiscoveredToolchains const nothing { .entries = {}, .source = ToolchainSource::NothingToSearch };
+    CHECK(FingerprintToolchains(nothing, runner, host, TestClock(), logger, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
+    CHECK(Logged(logger, "--no-toolchain-discovery"));
+}
+
+TEST_CASE("NodeToolchains: a survey abandoned for a stop is neither served nor refused", "[node][toolchains]")
+{
+    // Three states, and this is the one that did not exist before #365. The survey
+    // moved onto the heartbeat thread, whose `jthread` destructor joins before the
+    // process can finish stopping -- and the stop handlers are installed just after
+    // that thread starts, so a SIGTERM during the walk is CAUGHT rather than fatal.
+    // An unobservable walk therefore makes `systemctl stop` wait out the whole
+    // survey, which on the cold machine #354 measured is minutes, and a supervisor
+    // answers that with SIGKILL and no diagnostic.
+    //
+    // Cancelled must not read as `NothingToServe`: that is the node's startup
+    // refusal, and reporting it here would exit a STOPPING node with a configuration
+    // error it does not have -- and non-zero, telling a supervisor to restart
+    // something that was asked to stop.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/opt/real/g++") } };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+    REQUIRE(discovered.has_value());
+    REQUIRE_FALSE(Unwrap(discovered).entries.empty());
+
+    // Already stopped when the walk begins, which is the same observation the walk
+    // makes part-way through: the token is the only thing it consults.
+    std::stop_source source;
+    source.request_stop();
+
+    auto const cancelled = FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, source.get_token());
+    CHECK(cancelled.outcome == SurveyOutcome::Cancelled);
+    CHECK(cancelled.served.empty());
+    // And it says so, because a node that stopped during its survey and a node that
+    // found nothing look identical in a log that does not distinguish them.
+    CHECK(Logged(logger, "abandoned"));
+    // NOT the startup refusal. Its absence is the assertion: that message is what
+    // makes the node exit non-zero.
+    CHECK_FALSE(Logged(logger, "no toolchain to serve"));
+}
+
+TEST_CASE("NodeToolchains: the source decides which refusal an operator is given", "[node][toolchains]")
+{
+    // Three states, not a bool: the three sentences send an operator to three
+    // different places, and the worst of them recites a list of directories nobody
+    // looked in to somebody whose named compiler was refused a line above.
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+
+    CapturingLogger searched;
+    DiscoveredToolchains const machine { .entries = {}, .source = ToolchainSource::MachineSearched };
+    CHECK(FingerprintToolchains(machine, runner, host, TestClock(), searched, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
+    CHECK(Logged(searched, "Searched:"));
+
+    CapturingLogger named;
+    DiscoveredToolchains const operatorNamed { .entries = {}, .source = ToolchainSource::OperatorNamed };
+    CHECK(FingerprintToolchains(operatorNamed, runner, host, TestClock(), named, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
+    CHECK(Logged(named, "every compiler named with --toolchain was refused"));
+    CHECK_FALSE(Logged(named, "Searched:"));
 }
 
 TEST_CASE("NodeToolchains: a discovered path that would abort the operator parser is served", "[node][toolchains]")

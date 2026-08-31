@@ -734,10 +734,12 @@ std::string SafeSourceName(std::string_view sourceName)
 
 CompileJobRunner::CompileJobRunner(IProcessRunner& runner,
                                    std::filesystem::path scratchRoot,
-                                   std::map<std::string, std::string> toolchains):
+                                   std::map<std::string, std::string> toolchains,
+                                   ToolchainSurvey survey):
     _runner { runner },
     _scratchRoot { std::move(scratchRoot) },
-    _toolchains { std::move(toolchains) }
+    _toolchains { std::move(toolchains) },
+    _survey { survey }
 {
 }
 
@@ -755,6 +757,7 @@ void CompileJobRunner::ReplaceToolchains(std::map<std::string, std::string> tool
 {
     std::unique_lock const guard { _toolchainsMutex };
     _toolchains = std::move(toolchains);
+    _survey = ToolchainSurvey::Completed();
 }
 
 std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& job)
@@ -776,6 +779,13 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     std::string compiler;
     {
         std::shared_lock const guard { _toolchainsMutex };
+        // Asked BEFORE the lookup, not after it fails, and under the same lock: the
+        // two are one fact. A worker still walking its include trees has an empty map
+        // for a reason that has nothing to do with the fingerprint it was handed, and
+        // reporting `UnknownFingerprint` there tells an operator the fleet is matching
+        // the wrong machines when the answer is "this one is still starting" (#365).
+        if (!_survey.HasCompleted())
+            return std::unexpected(JobError { .reason = JobRefusal::ToolchainSurveyInFlight, .detail = {} });
         auto const found = _toolchains.find(job.fingerprint);
         if (found == _toolchains.end())
             return std::unexpected(JobError { .reason = JobRefusal::UnknownFingerprint, .detail = {} });

@@ -184,6 +184,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Jobs refused because the compiler could not be spawned: the "
               "toolchain this worker advertises is not usable here.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedSurveyInFlight,
+      .prometheusName = "fastcache_worker_jobs_refused_survey_in_flight_total",
+      .help = "Jobs refused because this worker had not finished identifying its "
+              "toolchains: it is still starting, not misconfigured. Rises only "
+              "from clients dialling this port directly -- the scheduler is not "
+              "offered this worker until the survey completes.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedNoSlot,
       .prometheusName = "fastcache_worker_jobs_refused_no_slot_total",
       .help = "Jobs refused because every slot was busy: this worker is too "

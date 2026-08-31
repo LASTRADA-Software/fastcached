@@ -381,6 +381,25 @@ enum class ErrorCode : std::uint8_t
     /// Clock skew is real across a fleet, so the check carries slack; a rise here on
     /// one machine and nowhere else is that machine's clock, not the fleet's leases.
     LeaseExpired = 0x1B,
+
+    /// This worker has not finished identifying its toolchains yet.
+    ///
+    /// Distinct from `FingerprintMismatch`, and the distinction is the whole point.
+    /// Both mean "not compiled here", but they send an operator to different places:
+    /// a mismatch says this worker serves a different toolchain and the scheduler
+    /// should not have chosen it, while this says the worker is coming up and the
+    /// same request will succeed shortly. Collapsed, a node restart reads as a fleet
+    /// full of machines on the wrong compiler.
+    ///
+    /// A node serves its cache tier and its admin surface while it walks its include
+    /// trees -- measured at over 300 s on a cold Windows runner (#354) -- and it
+    /// registers **nothing** until the walk finishes, because a provisional
+    /// fingerprint is a machine advertising a value no other machine will compute
+    /// (#225). So a client reaches this only by dialling the compile port directly;
+    /// through the scheduler it is simply not offered this worker yet.
+    ///
+    /// Transient by construction: the walk either completes or the node exits.
+    WorkerToolchainSurveyInFlight = 0x1C,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -883,6 +902,9 @@ inline constexpr std::array ErrorTable {
                       .name = "lease-endpoint-mismatch",
                       .defaultMessage = "this lease was issued for another worker" },
     ErrorDescriptor { .code = ErrorCode::LeaseExpired, .name = "lease-expired", .defaultMessage = "this lease has expired" },
+    ErrorDescriptor { .code = ErrorCode::WorkerToolchainSurveyInFlight,
+                      .name = "worker-toolchain-survey-in-flight",
+                      .defaultMessage = "this worker is still identifying its toolchains" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.

@@ -356,8 +356,12 @@ TEST_CASE("Two nodes compiling at once, each on its own claimed root, keep their
     REQUIRE((*rootA)->Root() != (*rootB)->Root());
 
     OverlappingEchoRunner runner;
-    FastCache::Cc::CompileJobRunner first { runner, (*rootA)->Root(), { { "gcc-13", "/opt/real/g++" } } };
-    FastCache::Cc::CompileJobRunner second { runner, (*rootB)->Root(), { { "gcc-13", "/opt/real/g++" } } };
+    FastCache::Cc::CompileJobRunner first {
+        runner, (*rootA)->Root(), { { "gcc-13", "/opt/real/g++" } }, FastCache::Cc::ToolchainSurvey::Completed()
+    };
+    FastCache::Cc::CompileJobRunner second {
+        runner, (*rootB)->Root(), { { "gcc-13", "/opt/real/g++" } }, FastCache::Cc::ToolchainSurvey::Completed()
+    };
     std::array<FastCache::Cc::CompileJobRunner*, OverlappingEchoRunner::Overlap> const runners { &first, &second };
 
     // Same source NAME, different source TEXT: two machines compiling their own

@@ -615,21 +615,35 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // node with a port conflict walked its whole toolchain and only then said the
     // address was taken.
     //
-    // This is the safe half of #365. The rest of that ticket -- serving the cache
-    // tier while the survey runs -- moves this below the tiers, which is a larger
-    // change with a sharp edge: registration must still wait for a REAL fingerprint,
-    // because a node advertising a provisional one is #225.
+    // Only the CHEAP half runs here, and that split is the whole of #365. Deciding
+    // WHICH compilers to serve is a spawn per candidate; IDENTIFYING them walks every
+    // byte under every include root, measured at 5136 files and over 300 s on a cold
+    // Windows runner (#354). Done here, that walk is time during which this node
+    // serves nothing at all -- not its cache tier, not `/healthz`, not `/metrics`.
     //
-    // Its own clock rather than one of the tiers', and declared beside its one caller
-    // so nothing outlives it: the survey runs to completion here and the reporter it
-    // feeds does not exist afterwards.
+    // So discovery stays on the startup path, because it is what refuses a
+    // misconfigured node promptly and by name, and the fingerprinting moves to the
+    // heartbeat thread's first round, below the tiers.
+    //
+    // Registration is NOT moved with it, and cannot be: `toolchains` stays empty
+    // until the walk answers, `registrarsFor` builds nothing from an empty map, and a
+    // `ServedToolchain` cannot exist without a real fingerprint. So this node
+    // advertises nothing until it knows what it is -- which is #365's acceptance
+    // criterion, and #225 is what happens when it is not met.
+    //
+    // Its own clock rather than one of the tiers': it is what the hash phase's
+    // progress rate reads elapsed time from.
     SteadyClock const toolchainClock;
-    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, toolchainClock, logger);
-    if (!toolchainsOrNone.has_value())
+    auto discoveredOrNone = Node::DiscoverToolchainEntries(cfg, discovery.get(), *runner, logger);
+    if (!discoveredOrNone.has_value())
         return ExitUsage;
-    // NOT const: a compiler patched under a running service makes this stale, and the
-    // heartbeat re-derives it (#238).
-    auto toolchains = *std::move(toolchainsOrNone);
+    auto const discoveredToolchains = *std::move(discoveredOrNone);
+
+    // Empty until the heartbeat thread's first round answers. NOT const for the same
+    // reason it never was: a compiler patched under a running service makes it stale
+    // and the heartbeat re-derives it (#238) -- the initial survey is now simply the
+    // first of those.
+    std::map<std::string, Node::ServedToolchain> toolchains;
 
     // The scratch root is claimed EXCLUSIVELY, and it is the worker tier's alone.
     //
@@ -645,9 +659,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // to start for want of one. Every node serves compiles today, so this is always
     // true -- named anyway, so that when a node can offer zero slots (#206) the
     // claim is already conditional rather than something somebody has to remember.
-    // With no toolchains every job is refused on the fingerprint lookup, which
-    // happens before `CompileJobRunner::Run` touches any path at all.
-    auto const servesCompiles = !toolchains.empty();
+    //
+    // Asked of what was DISCOVERED, not of what is served: since #365 nothing is
+    // served yet at this point, and reading the served map here would have claimed no
+    // scratch root on every node -- then failed every compile for want of one, once
+    // the survey answered and jobs started arriving. The two maps are equal in size
+    // only after the walk, which is exactly what has not happened yet.
+    auto const servesCompiles = !discoveredToolchains.entries.empty();
     auto const scratchBase = std::filesystem::temp_directory_path() / "fastcache-compile-node";
     auto scratchClaimOrRefusal = ClaimWorkerScratchRoot(servesCompiles, scratchBase, logger);
     if (!scratchClaimOrRefusal.has_value())
@@ -663,7 +681,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
             compilers.emplace(fingerprint, toolchain.compiler);
         return compilers;
     };
-    Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains) };
+    // Constructed BEFORE anything has been identified, and told so. An empty map and
+    // an unanswered one are the same `std::map` and opposite answers to a client, so
+    // the state is carried beside it rather than inferred from it: until the survey
+    // lands, a job is refused `ToolchainSurveyInFlight` -- "this worker is starting"
+    // -- instead of `UnknownFingerprint`, which says the fleet is matching the wrong
+    // machines and sends an operator to look at the wrong thing (#365).
+    Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains), Cc::ToolchainSurvey::InFlight() };
 
     // Every lease is accepted, and that is stated rather than hidden. The boundary
     // today is reachability of this port plus membership -- the same boundary the
@@ -1082,10 +1106,14 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 
     auto registrars = registrarsFor(toolchains);
 
-    // Read here, where this thread is still the only one that can see `toolchains`.
-    // The ready line below is printed after the heartbeat thread starts, and that
-    // thread may replace the map (#238).
-    auto const startupToolchainCount = toolchains.size();
+    // What this node will TRY to serve, which since #365 is the only honest number
+    // available at the ready line: the served map is empty until the heartbeat
+    // thread's first round finishes walking the include trees, and printing its size
+    // here would tell an operator "0 toolchain(s)" about a node that is starting
+    // normally -- the one line they read to confirm the worker came up.
+    //
+    // Read from the DISCOVERED set, which this thread owns and no other touches.
+    auto const startupToolchainCount = discoveredToolchains.entries.size();
 
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
@@ -1133,7 +1161,73 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // destructor before any of this goes.
     Node::SchedulerLink link { cfg.scheduler };
 
+    // Set by the heartbeat thread when the initial survey answers with nothing, read
+    // by this one at the return below.
+    //
+    // "Nothing to serve" was a startup refusal before #365 and stays one: left
+    // running, a worker with nothing to serve is the worst shape this system has --
+    // it registers nothing, so the scheduler never hears of it; the heartbeat reports
+    // "0 of 0 toolchain(s) registered" and calls that a complete success; the ready
+    // line says the node is up. A supervisor sees a healthy unit, an operator sees a
+    // green fleet, and every build compiles locally with no error at either end.
+    //
+    // What #365 changes is only WHEN it is said, not whether. The common
+    // misconfiguration -- no compiler at all, a malformed `--toolchain` -- is still
+    // refused promptly, above, because discovery stayed on the startup path. What
+    // arrives late is the narrow case where compilers were found, spawned, and then
+    // every one of them failed to yield a usable identity. `ResolveToolchains` has
+    // already logged which, and the exit code is what a supervisor reads.
+    std::atomic<bool> surveyFoundNothing { false };
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
+        // The initial survey, and it runs HERE rather than at startup because it is
+        // the expensive half: a full walk of every include tree, measured over 300 s
+        // on a cold Windows runner (#354). Off the startup path, the node has already
+        // bound its port, brought up its cache tier and its admin surface, and said
+        // it is ready -- so a machine that takes minutes to identify its toolchains
+        // spends those minutes SERVING rather than silent.
+        //
+        // On this thread and not a new one, deliberately: this thread already owns
+        // `toolchains`, already calls `ReplaceToolchains` and `registrarsFor` on
+        // every re-survey (#238), and already runs before the first announcement. A
+        // dedicated survey thread would be a second writer to all three and would
+        // need a lock that the re-survey path has never needed.
+        // The stop token is passed, and that is not a courtesy. This runs on the
+        // heartbeat thread, whose `jthread` destructor joins before `WorkerBody`
+        // returns, and `InstallNodeStopHandlers` runs a few lines below -- so a
+        // SIGTERM arriving here is CAUGHT rather than fatal, and an unobservable walk
+        // would make the process wait out the whole survey before it could finish
+        // stopping. Minutes, on the cold machine this ticket is about, which a
+        // supervisor answers with SIGKILL and no diagnostic.
+        //
+        // Before #365 this work ran on the main thread, before any handler existed,
+        // so the same signal simply killed the process. Moving it here is what made
+        // cancellation something that has to be spelled.
+        auto surveyed =
+            Node::FingerprintToolchains(discoveredToolchains, *runner, *toolchainHost, toolchainClock, logger, stop);
+        switch (surveyed.outcome)
+        {
+            case Node::SurveyOutcome::Served:
+                toolchains = std::move(surveyed.served);
+                // The same two calls, in the same order, as the re-survey below: the
+                // compile port first and the registration second, so this worker
+                // never announces a fingerprint it is not yet ready to serve. One way
+                // into the serving state rather than two.
+                jobs.ReplaceToolchains(compilersOf(toolchains));
+                registrars = registrarsFor(toolchains);
+                break;
+            case Node::SurveyOutcome::NothingToServe:
+                surveyFoundNothing = true;
+                DaemonControls::Instance().RequestStop();
+                return;
+            case Node::SurveyOutcome::Cancelled:
+                // Already stopping, and `surveyFoundNothing` stays false: this node
+                // was not misconfigured, it was interrupted, and exiting non-zero
+                // would tell a supervisor to restart something that was asked to
+                // stop.
+                return;
+        }
+
         while (!stop.stop_requested())
         {
             // Asked BEFORE the announcement, so a machine whose compiler was patched
@@ -1231,16 +1325,16 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // The scheduler tier prints the same phrase from the same function, so a node
     // running both says one thing rather than two.
     logger.Logf(LogLevel::Info,
-                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, {} toolchain(s), {}",
+                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, identifying {} toolchain(s), {}",
                 listeningOn,
                 advertise,
                 slots,
                 Distributed::TraitsFor(cfg.nodeClass).name,
-                // The count as this node STARTED, captured before the heartbeat
-                // thread could re-survey and replace the map. Reading `toolchains`
-                // here raced that thread the moment the set stopped being fixed at
-                // startup -- and a ready line is a statement about starting anyway,
-                // so the startup number is also the honest one to print.
+                // The count this node is BRINGING UP, not the count it is serving:
+                // the survey runs on the heartbeat thread and has almost certainly
+                // not finished when this prints (#365). Reading `toolchains` here
+                // would race that thread as well as understate it -- and a ready
+                // line is a statement about starting anyway.
                 startupToolchainCount,
                 Node::AdmissionSummary(cfg));
 
@@ -1269,7 +1363,11 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // in the gap finds it unreachable and compiles locally, which is the same
     // fallback every other refusal takes.
     logger.Logf(LogLevel::Info, "compile node stopped");
-    return ExitOk;
+    // A node that came up, served, and then found it had nothing to compile with
+    // exits as the refusal it would have been before #365 -- late, but with the same
+    // code and the same diagnostic. A supervisor that restarts on failure must not
+    // read this as a clean stop.
+    return surveyFoundNothing ? ExitUsage : ExitOk;
 }
 
 } // namespace
