@@ -878,6 +878,72 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# End-to-end compile-cache test. Starts a real daemon, drives real compiles
+# through the launcher, and asserts miss/hit, byte-identical object
+# reproduction, cross-depth portability and -- since #423 -- that a wrong object
+# planted under a correct key is named rather than linked. Those are the
+# properties unit tests cannot cover, because they need a compiler and a server.
+#
+# Registered HERE and not beside the launcher, for the reason `dist-compile-e2e`
+# below records and this test learned the hard way: src/apps processes its table
+# in order, so at the point src/apps/fastcache-cc is configured the
+# compile-cache-testclient target does not exist yet, and `if(TARGET
+# compile-cache-testclient)` there is not a condition -- it is the constant
+# FALSE. The fixture would have reported its wrong-object case SKIPPED on every
+# machine, in every job, forever, in a sentence that reads exactly like a
+# legitimate skip. `check-target-file-guards` cannot catch that: it asks whether
+# the guard was WRITTEN, which it was.
+#
+# Labelled "smoke" so it can be selected (ctest -L smoke) or skipped
+# (ctest -LE smoke); a missing prerequisite exits 77 and reports as skipped
+# rather than failed.
+#
+# Both platforms assert the same contract except the planted-wrong-object case,
+# which is POSIX-only because it needs compile-cache-testclient -- the only thing
+# that can STORE a chosen value under a chosen key. Every other way of planting
+# one goes through the launcher, which derives the key from the source and so
+# cannot be made to disagree with itself. The mechanism it exercises
+# (`HitVerification`) is platform-neutral and unit-tested on every platform; what
+# the fixture adds is the end-to-end path, and one platform proving that is what
+# the rule about duplicating a case asks for.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-cc)
+    message(STATUS "compile-cache-e2e: daemon or launcher not built — skipping")
+elseif(WIN32)
+    add_test(
+        NAME "compile-cache-e2e"
+        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/run-launcher-e2e.ps1"
+            -Fastcached "$<TARGET_FILE:fastcached>"
+            -Launcher "$<TARGET_FILE:fastcache-cc>"
+    )
+else()
+    # Passed when it was built, and the fixture says out loud which of the two it
+    # is running as -- FASTCACHED_BUILD_TESTCLIENT is off by default and on for
+    # the linux and clang-tidy jobs, so a reader of a local run and a reader of a
+    # CI log are looking at different tests and must be told so.
+    set(_fc_e2e_testclient "")
+    if(TARGET compile-cache-testclient)
+        set(_fc_e2e_testclient --testclient "$<TARGET_FILE:compile-cache-testclient>")
+    endif()
+    add_test(
+        NAME "compile-cache-e2e"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/compile-cache-e2e.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --launcher "$<TARGET_FILE:fastcache-cc>"
+            --compiler "${CMAKE_CXX_COMPILER}"
+            ${_fc_e2e_testclient}
+    )
+endif()
+if(TARGET fastcached AND TARGET fastcache-cc)
+    # Binds a port and spawns a daemon, so it must not run concurrently with the
+    # other server-starting smoke tests.
+    set_tests_properties("compile-cache-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fastcache-cc)
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()

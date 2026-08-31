@@ -2,7 +2,8 @@
 #
 # Target-file guard hygiene: fail when a test registration names an OPTIONAL
 # executable through `$<TARGET_FILE:>` without first asking whether that target
-# exists.
+# exists -- and, since #423, when it asks a question that can only ever be
+# answered no.
 #
 # `$<TARGET_FILE:x>` naming a target that was not built is not a test that gets
 # skipped. It is a hard error at GENERATE time, so the whole configuration
@@ -23,6 +24,17 @@
 # without sccache installed never reaches the broken reference and the flag
 # appears to work. The error then names CMake rather than the option, on some
 # machines and not others.
+#
+# The second rule exists because the first one can be satisfied by a guard that
+# is not a condition at all. `src/apps` adds its table IN ORDER, so inside
+# `src/apps/fastcache-cc/` the target `compile-cache-testclient` -- two rows
+# further down -- does not exist yet, and `if(TARGET compile-cache-testclient)`
+# is the constant FALSE. A fixture written that way reports its case SKIPPED on
+# every machine, in every job, forever, in a sentence indistinguishable from a
+# legitimate skip; and the rule above passes it, because it asks whether the
+# guard was WRITTEN. That is skipped-versus-absent again, arriving through the
+# checker rather than around it. `src/tests/CMakeLists.txt` is where such a test
+# belongs, and it is added after `src/apps` so every guard there is real.
 #
 # Which targets are optional is READ from `src/apps/CMakeLists.txt`, never
 # restated here. That file's `FASTCACHED_APPS` table is the one place an app and
@@ -147,7 +159,27 @@ foreach(cmakeFile IN LISTS cmakeFiles)
                 endif()
             endforeach()
 
-            if(guarded)
+            # A guard is only a guard where the target it names can exist. Inside
+            # `src/apps/<x>/`, every optional target at or after `<x>` in the table
+            # is still undefined, so the question was asked of nothing.
+            set(staleGuard FALSE)
+            if(guarded AND NOT selfTarget STREQUAL "")
+                list(FIND optionalTargets "${selfTarget}" selfIndex)
+                list(FIND optionalTargets "${target}" targetIndex)
+                if(NOT selfIndex EQUAL -1 AND NOT targetIndex EQUAL -1 AND NOT targetIndex LESS selfIndex)
+                    set(staleGuard TRUE)
+                endif()
+            endif()
+
+            # Three outcomes, not two, and the stale one reports as itself rather
+            # than as the missing-guard case beside it. They are fixed differently:
+            # one asks for a condition to be added, the other for the registration
+            # to move, and a reader told the wrong one adds a guard that is already
+            # there.
+            if(staleGuard)
+                list(APPEND violations
+                     "${relative}:${lineNumber}: `TARGET ${target}` is asked inside src/apps/${selfTarget}/, which the app table configures FIRST -- the target does not exist yet, so that guard is the constant FALSE and everything it protects is silently dropped. Register it in src/tests/CMakeLists.txt, which is added after src/apps")
+            elseif(guarded)
                 math(EXPR guardedCount "${guardedCount} + 1")
             else()
                 list(APPEND violations
@@ -187,6 +219,10 @@ if(violations)
     message("GENERATE step -- the whole configure, not just that test. Guard the block on")
     message("`TARGET x` as well as on whatever feature makes the test interesting, and say")
     message("what was skipped, the way the blocks around it do.")
+    message("")
+    message("And a guard asked from src/apps/<x>/ about a target the app table configures")
+    message("later is not a guard: it is FALSE on every machine, and the test it protects")
+    message("never runs anywhere. Register such a test in src/tests/CMakeLists.txt.")
     list(LENGTH violations violationCount)
     message(FATAL_ERROR "target-file guard hygiene: ${violationCount} unguarded reference(s)")
 endif()
