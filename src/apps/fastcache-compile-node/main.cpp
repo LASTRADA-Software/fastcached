@@ -1192,24 +1192,40 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
         // every re-survey (#238), and already runs before the first announcement. A
         // dedicated survey thread would be a second writer to all three and would
         // need a lock that the re-survey path has never needed.
-        if (auto surveyed =
-                Node::FingerprintToolchains(discoveredToolchains, *runner, *toolchainHost, toolchainClock, logger);
-            surveyed.has_value())
+        // The stop token is passed, and that is not a courtesy. This runs on the
+        // heartbeat thread, whose `jthread` destructor joins before `WorkerBody`
+        // returns, and `InstallNodeStopHandlers` runs a few lines below -- so a
+        // SIGTERM arriving here is CAUGHT rather than fatal, and an unobservable walk
+        // would make the process wait out the whole survey before it could finish
+        // stopping. Minutes, on the cold machine this ticket is about, which a
+        // supervisor answers with SIGKILL and no diagnostic.
+        //
+        // Before #365 this work ran on the main thread, before any handler existed,
+        // so the same signal simply killed the process. Moving it here is what made
+        // cancellation something that has to be spelled.
+        auto surveyed =
+            Node::FingerprintToolchains(discoveredToolchains, *runner, *toolchainHost, toolchainClock, logger, stop);
+        switch (surveyed.outcome)
         {
-            toolchains = *std::move(surveyed);
-
-            // The same two calls, in the same order, as the re-survey below: the
-            // compile port first and the registration second, so this worker never
-            // announces a fingerprint it is not yet ready to serve. One way into the
-            // serving state rather than two.
-            jobs.ReplaceToolchains(compilersOf(toolchains));
-            registrars = registrarsFor(toolchains);
-        }
-        else
-        {
-            surveyFoundNothing = true;
-            DaemonControls::Instance().RequestStop();
-            return;
+            case Node::SurveyOutcome::Served:
+                toolchains = std::move(surveyed.served);
+                // The same two calls, in the same order, as the re-survey below: the
+                // compile port first and the registration second, so this worker
+                // never announces a fingerprint it is not yet ready to serve. One way
+                // into the serving state rather than two.
+                jobs.ReplaceToolchains(compilersOf(toolchains));
+                registrars = registrarsFor(toolchains);
+                break;
+            case Node::SurveyOutcome::NothingToServe:
+                surveyFoundNothing = true;
+                DaemonControls::Instance().RequestStop();
+                return;
+            case Node::SurveyOutcome::Cancelled:
+                // Already stopping, and `surveyFoundNothing` stays false: this node
+                // was not misconfigured, it was interrupted, and exiting non-zero
+                // would tell a supervisor to restart something that was asked to
+                // stop.
+                return;
         }
 
         while (!stop.stop_requested())

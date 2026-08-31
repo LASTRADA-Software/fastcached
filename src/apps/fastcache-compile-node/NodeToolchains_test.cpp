@@ -15,6 +15,7 @@
 #include <map>
 #include <ranges>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -302,12 +303,13 @@ TEST_CASE("NodeToolchains: the two halves compose into what the whole survey ans
     auto const discovered = DiscoverToolchainEntries(cfg, &again, runnerAgain, loggerAgain);
     REQUIRE(discovered.has_value());
     CHECK(Unwrap(discovered).source == ToolchainSource::MachineSearched);
-    auto const halves = FingerprintToolchains(Unwrap(discovered), runnerAgain, hostAgain, TestClock(), loggerAgain);
-    REQUIRE(halves.has_value());
+    auto const halves =
+        FingerprintToolchains(Unwrap(discovered), runnerAgain, hostAgain, TestClock(), loggerAgain, std::stop_token {});
+    REQUIRE(halves.outcome == SurveyOutcome::Served);
 
-    REQUIRE(Unwrap(halves).size() == Unwrap(whole).size());
-    CHECK(Unwrap(halves).begin()->first == Unwrap(whole).begin()->first);
-    CHECK(Unwrap(halves).begin()->second.compiler == Unwrap(whole).begin()->second.compiler);
+    REQUIRE(halves.served.size() == Unwrap(whole).size());
+    CHECK(halves.served.begin()->first == Unwrap(whole).begin()->first);
+    CHECK(halves.served.begin()->second.compiler == Unwrap(whole).begin()->second.compiler);
 }
 
 TEST_CASE("NodeToolchains: a malformed --toolchain is refused by the CHEAP half", "[node][toolchains]")
@@ -337,8 +339,50 @@ TEST_CASE("NodeToolchains: nothing to serve is refused by the EXPENSIVE half", "
     CapturingLogger logger;
 
     DiscoveredToolchains const nothing { .entries = {}, .source = ToolchainSource::NothingToSearch };
-    CHECK_FALSE(FingerprintToolchains(nothing, runner, host, TestClock(), logger).has_value());
+    CHECK(FingerprintToolchains(nothing, runner, host, TestClock(), logger, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
     CHECK(Logged(logger, "--no-toolchain-discovery"));
+}
+
+TEST_CASE("NodeToolchains: a survey abandoned for a stop is neither served nor refused", "[node][toolchains]")
+{
+    // Three states, and this is the one that did not exist before #365. The survey
+    // moved onto the heartbeat thread, whose `jthread` destructor joins before the
+    // process can finish stopping -- and the stop handlers are installed just after
+    // that thread starts, so a SIGTERM during the walk is CAUGHT rather than fatal.
+    // An unobservable walk therefore makes `systemctl stop` wait out the whole
+    // survey, which on the cold machine #354 measured is minutes, and a supervisor
+    // answers that with SIGKILL and no diagnostic.
+    //
+    // Cancelled must not read as `NothingToServe`: that is the node's startup
+    // refusal, and reporting it here would exit a STOPPING node with a configuration
+    // error it does not have -- and non-zero, telling a supervisor to restart
+    // something that was asked to stop.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/opt/real/g++") } };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+    REQUIRE(discovered.has_value());
+    REQUIRE_FALSE(Unwrap(discovered).entries.empty());
+
+    // Already stopped when the walk begins, which is the same observation the walk
+    // makes part-way through: the token is the only thing it consults.
+    std::stop_source source;
+    source.request_stop();
+
+    auto const cancelled = FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, source.get_token());
+    CHECK(cancelled.outcome == SurveyOutcome::Cancelled);
+    CHECK(cancelled.served.empty());
+    // And it says so, because a node that stopped during its survey and a node that
+    // found nothing look identical in a log that does not distinguish them.
+    CHECK(Logged(logger, "abandoned"));
+    // NOT the startup refusal. Its absence is the assertion: that message is what
+    // makes the node exit non-zero.
+    CHECK_FALSE(Logged(logger, "no toolchain to serve"));
 }
 
 TEST_CASE("NodeToolchains: the source decides which refusal an operator is given", "[node][toolchains]")
@@ -351,12 +395,14 @@ TEST_CASE("NodeToolchains: the source decides which refusal an operator is given
 
     CapturingLogger searched;
     DiscoveredToolchains const machine { .entries = {}, .source = ToolchainSource::MachineSearched };
-    CHECK_FALSE(FingerprintToolchains(machine, runner, host, TestClock(), searched).has_value());
+    CHECK(FingerprintToolchains(machine, runner, host, TestClock(), searched, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
     CHECK(Logged(searched, "Searched:"));
 
     CapturingLogger named;
     DiscoveredToolchains const operatorNamed { .entries = {}, .source = ToolchainSource::OperatorNamed };
-    CHECK_FALSE(FingerprintToolchains(operatorNamed, runner, host, TestClock(), named).has_value());
+    CHECK(FingerprintToolchains(operatorNamed, runner, host, TestClock(), named, std::stop_token {}).outcome
+          == SurveyOutcome::NothingToServe);
     CHECK(Logged(named, "every compiler named with --toolchain was refused"));
     CHECK_FALSE(Logged(named, "Searched:"));
 }

@@ -100,7 +100,8 @@ namespace
     /// @param clock Where the hash phase's progress rate reads elapsed time (#354).
     /// @param logger Startup log.
     /// @return One survey per entry, in the same order.
-    [[nodiscard]] std::vector<SurveyedToolchain> FingerprintAll(std::vector<ToolchainEntry> const& entries,
+    [[nodiscard]] std::vector<SurveyedToolchain> FingerprintAll(std::stop_token const& stop,
+                                                                std::vector<ToolchainEntry> const& entries,
                                                                 Cc::IProcessRunner& runner,
                                                                 Cc::IToolchainHost& host,
                                                                 IClock const& clock,
@@ -138,16 +139,23 @@ namespace
         {
             // A constructor rather than designated initialisers: an override makes
             // this polymorphic, and a polymorphic class is not an aggregate.
-            AnnouncingParallelFor(Cc::IParallelFor& parallelFor, IClock const& source, ILogger& sink) noexcept:
+            AnnouncingParallelFor(Cc::IParallelFor& parallelFor,
+                                  IClock const& source,
+                                  ILogger& sink,
+                                  std::stop_token const& stopping) noexcept:
                 inner { parallelFor },
                 clock { source },
-                logger { sink }
+                logger { sink },
+                stop { stopping }
             {
             }
 
             Cc::IParallelFor& inner;
             IClock const& clock;
             ILogger& logger;
+            /// Observed per hashed file; see `Run`. A reference because the token
+            /// outlives this wrapper -- it belongs to the thread being stopped.
+            std::stop_token const& stop;
 
             [[nodiscard]] bool Run(std::size_t count, std::function<void(std::size_t)> const& slice) override
             {
@@ -164,17 +172,28 @@ namespace
                 // during the walk, and a figure printed after it finishes is one the
                 // failing case never reaches.
                 ToolchainHashProgress progress { count, ToolchainHashProgress::DefaultInterval, clock, logger };
-                return inner.Run(count, [&slice, &progress](std::size_t index) {
+                return inner.Run(count, [&slice, &progress, this](std::size_t index) {
+                    // The finest grain a stop can be observed at, and it has to be
+                    // this fine: ONE toolchain's walk is the thing measured past
+                    // 300 s, so a check only between toolchains would still make a
+                    // stopping node wait out a whole one (#365).
+                    if (stop.stop_requested())
+                        return;
                     slice(index);
                     progress.Observe();
                 });
             }
         };
-        AnnouncingParallelFor announcing { parallel, clock, logger };
+        AnnouncingParallelFor announcing { parallel, clock, logger, stop };
 
         auto identify = [&] {
             for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
             {
+                // Between toolchains as well as between files. The per-file check
+                // bounds one walk; this stops the survey reaching for the next
+                // machine-wide toolchain at all.
+                if (stop.stop_requested())
+                    return;
                 auto const& entry = entries[index];
                 if (!entry.fingerprint.empty())
                 {
@@ -390,11 +409,12 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
     return DiscoveredToolchains { .entries = std::move(entries), .source = source };
 }
 
-std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(DiscoveredToolchains const& discovered,
-                                                                            Cc::IProcessRunner& runner,
-                                                                            Cc::IToolchainHost& host,
-                                                                            IClock const& clock,
-                                                                            ILogger& logger)
+SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
+                                   Cc::IProcessRunner& runner,
+                                   Cc::IToolchainHost& host,
+                                   IClock const& clock,
+                                   ILogger& logger,
+                                   std::stop_token const& stop)
 {
     auto const& entries = discovered.entries;
 
@@ -406,7 +426,19 @@ std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(Disc
     // start where an operator is watching. Warm starts read the cache and are
     // instant, so this buys nothing on any boot after the first; it is the first one
     // that decides whether the feature looks like it works.
-    auto fingerprints = FingerprintAll(entries, runner, host, clock, logger);
+    auto fingerprints = FingerprintAll(stop, entries, runner, host, clock, logger);
+
+    // Asked after the walk rather than instead of it: the check inside skips the work
+    // per file, so a cancelled survey returns promptly carrying entries that were
+    // never probed. Serving those would be a node offering whichever half of its
+    // toolchains happened to finish first, and calling them "nothing to serve" would
+    // exit a stopping node with a configuration error it does not have -- in the log
+    // an operator reads to find out why the stop took a while.
+    if (stop.stop_requested())
+    {
+        logger.Logf(LogLevel::Info, "toolchain survey abandoned: this node is stopping");
+        return SurveyResult { .outcome = SurveyOutcome::Cancelled, .served = {} };
+    }
 
     // Indexed rather than zipped: `std::views::zip` is C++23 and not uniformly
     // available across the four standard libraries this project builds against.
@@ -499,7 +531,7 @@ std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(Disc
                             "worker was told to serve nothing");
                 break;
         }
-        return std::nullopt;
+        return SurveyResult { .outcome = SurveyOutcome::NothingToServe, .served = {} };
     }
 
     // Said out loud when the machine answered, because the set is then something
@@ -510,7 +542,7 @@ std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(Disc
                     "discovered {} toolchain(s) on this machine; pass --toolchain to serve a narrower set",
                     toolchains.size());
 
-    return toolchains;
+    return SurveyResult { .outcome = SurveyOutcome::Served, .served = std::move(toolchains) };
 }
 
 std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
@@ -527,7 +559,16 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
     auto discovered = DiscoverToolchainEntries(cfg, discovery, runner, logger);
     if (!discovered.has_value())
         return std::nullopt;
-    return FingerprintToolchains(*discovered, runner, host, clock, logger);
+
+    // A default-constructed token, which is never stopped: every caller that reaches
+    // the WHOLE survey runs it to completion by definition -- the re-survey on the
+    // heartbeat thread, `--print-toolchain-fingerprint`, and the tests. The node's
+    // FIRST survey is the one that can be cancelled, and it calls the two halves
+    // itself rather than coming through here.
+    auto surveyed = FingerprintToolchains(*discovered, runner, host, clock, logger, std::stop_token {});
+    if (surveyed.outcome != SurveyOutcome::Served)
+        return std::nullopt;
+    return std::move(surveyed.served);
 }
 
 std::vector<std::string> StaleToolchains(std::map<std::string, ServedToolchain> const& served)

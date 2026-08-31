@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -258,6 +259,31 @@ struct ServedToolchain
                                                                            Cc::IProcessRunner& runner,
                                                                            ILogger& logger);
 
+/// What identifying the discovered compilers came to.
+///
+/// Three states, not an `optional`, because the third is real and is not either of
+/// the others. A survey that was ABANDONED because the node is stopping has produced
+/// no answer, and folding it into "nothing to serve" would exit a stopping node with
+/// a configuration error it does not have -- in the log an operator reads to find out
+/// why `systemctl stop` took a while.
+enum class SurveyOutcome : std::uint8_t
+{
+    /// The walk finished and this node serves what `served` holds.
+    Served,
+    /// The walk finished and nothing survived it. A startup refusal; see
+    /// `FingerprintToolchains`.
+    NothingToServe,
+    /// The node was asked to stop mid-walk. `served` is meaningless.
+    Cancelled,
+};
+
+/// The outcome and, when there is one, the answer.
+struct SurveyResult
+{
+    SurveyOutcome outcome { SurveyOutcome::NothingToServe }; ///< What happened.
+    std::map<std::string, ServedToolchain> served;           ///< Empty unless `Served`.
+};
+
 /// Identify the discovered compilers, and refuse a node that would serve none.
 ///
 /// The **expensive** half: a driver spawn and a full walk of the include tree per
@@ -272,12 +298,20 @@ struct ServedToolchain
 /// @return Fingerprint to what this worker serves under it -- never empty -- or
 ///         nullopt when there is nothing to serve, which is refused HERE with the
 ///         message that fits `discovered.source`.
-[[nodiscard]] std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(
-    DiscoveredToolchains const& discovered,
-    Cc::IProcessRunner& runner,
-    Cc::IToolchainHost& host,
-    IClock const& clock,
-    ILogger& logger);
+/// @param stop Observed between toolchains and between hashed files, so a node told
+///        to stop mid-walk stops. It is not a courtesy: since #365 this runs on the
+///        heartbeat thread, whose `jthread` destructor joins before `main` returns,
+///        and the stop handlers are installed a few lines after it starts. An
+///        unobservable walk therefore makes `systemctl stop` wait out the whole
+///        survey -- minutes on a cold machine -- and a supervisor answers that with
+///        SIGKILL and no diagnostic. Pass a default-constructed token where nothing
+///        can cancel, which is every caller but the node's.
+[[nodiscard]] SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
+                                                 Cc::IProcessRunner& runner,
+                                                 Cc::IToolchainHost& host,
+                                                 IClock const& clock,
+                                                 ILogger& logger,
+                                                 std::stop_token const& stop);
 
 /// Which of these toolchains no longer match the machine they were derived from.
 ///
