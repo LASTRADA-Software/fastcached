@@ -86,6 +86,46 @@ namespace FastCache::Node
 /// @return The line, without a level or a newline.
 [[nodiscard]] std::string DescribeTermAdoption(Consensus::Term adopted, Consensus::TermAdoption const& cause);
 
+/// Whether a configuration change this node proposed is still in flight.
+///
+/// `RaftNode` refuses a second change while one is in flight, so a reconciler that
+/// re-proposed every interval would log a refusal per interval for as long as
+/// replication took. Waiting is therefore right — but only for as long as the
+/// proposal can still be the one that lands.
+///
+/// **A term this node no longer holds is what ends the wait**, and that clause is the
+/// whole reason this is a function rather than one comparison. A proposal made in a
+/// term that has since moved is not in flight: it was never committed, an uncommitted
+/// entry from a dead term is truncated by whoever leads next, and the index it landed
+/// at may hold something else entirely or nothing at all. Comparing the remembered
+/// index against the commit index ALONE, a node that proposed at index N, was deposed,
+/// and was later elected again reads `N > commitIndex` forever and never proposes
+/// again — so the joiner that change was going to admit is never counted, is excused
+/// from every deadline for having no cluster, and the cluster silently loses the
+/// ability to re-elect once one more member goes away
+/// ([#388](https://github.com/LASTRADA-Software/fastcached/issues/388)).
+///
+/// The single symptom was one `Warn` naming an index that no longer exists.
+///
+/// Pure, and separated from the reconciler for that reason: the decision is four
+/// values and the acquisition is a live cluster, and only one of those can be put
+/// into a test.
+/// @param proposedAt Where this node's last proposal landed, or a default index if none.
+/// @param proposedIn The term it was made in.
+/// @param commitIndex How far the log is committed now.
+/// @param currentTerm The term this node is operating in now.
+/// @return True while the proposal may still commit, so no new one should be made.
+[[nodiscard]] constexpr bool QuorumProposalPending(Consensus::LogIndex proposedAt,
+                                                   Consensus::Term proposedIn,
+                                                   Consensus::LogIndex commitIndex,
+                                                   Consensus::Term currentTerm) noexcept
+{
+    if (proposedIn != currentTerm)
+        return false;
+
+    return proposedAt > commitIndex;
+}
+
 /// Consensus, running.
 ///
 /// **What this replaces is the reason it exists.** Until now every node called
@@ -493,6 +533,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     ///
     /// Reconciler thread only; nothing else reads it.
     Consensus::LogIndex _quorumProposedAt {};
+
+    /// The term that proposal was made in.
+    ///
+    /// Kept beside the index because the index alone cannot say whether the wait is
+    /// still meaningful — see `QuorumProposalPending`, which is where the reasoning
+    /// lives. Reconciler thread only.
+    Consensus::Term _quorumProposedIn {};
 
     /// How many passes the current proposal has been waiting, for that one report.
     std::uint32_t _quorumWaited { 0 };

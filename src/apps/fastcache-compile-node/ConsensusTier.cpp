@@ -668,7 +668,7 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
     // refusal per interval -- and the wait itself is the diagnostic that matters,
     // because a configuration naming a member that will never acknowledge this
     // leader never commits and is otherwise completely silent.
-    if (_quorumProposedAt > progress.commitIndex)
+    if (QuorumProposalPending(_quorumProposedAt, _quorumProposedIn, progress.commitIndex, progress.term))
     {
         ++_quorumWaited;
 
@@ -707,6 +707,11 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
     }
 
     _quorumProposedAt = *proposed;
+
+    // Recorded together, because the pair is what the wait above is asked about: an
+    // index without its term cannot say whether the proposal it names can still be
+    // the one that lands.
+    _quorumProposedIn = progress.term;
     _logger.Logf(
         LogLevel::Info, "cluster: proposing a quorum of {} member(s) at index {}", change->size(), _quorumProposedAt.value);
 }

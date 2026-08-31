@@ -88,3 +88,59 @@ TEST_CASE("A demotion names the term, the peer, and what this node was", "[node]
     CHECK(DescribeTermAdoption(FastCache::Consensus::Term { .value = 2 }, cause)
           == "consensus: term 2 arrived from n3; this node was leader in term 1");
 }
+
+TEST_CASE("A quorum proposal stops being in flight when the term moves", "[node][consensus][membership]")
+{
+    // #388. The reconciler waits rather than re-proposing while a configuration
+    // change is in flight, which is right -- `RaftNode` refuses a second one, so
+    // re-proposing every interval would log a refusal every interval.
+    //
+    // What the wait could not see is that leadership moved. A proposal made in a
+    // term this node no longer holds was never committed, and an uncommitted entry
+    // from a dead term is truncated by whoever leads next -- so the index it landed
+    // at may hold something else, or nothing.
+    using Consensus::LogIndex;
+    using Consensus::Term;
+
+    constexpr auto At = [](std::uint64_t v) {
+        return LogIndex { .value = v };
+    };
+    constexpr auto In = [](std::uint64_t v) {
+        return Term { .value = v };
+    };
+
+    SECTION("in flight while the term holds and the log has not caught up")
+    {
+        CHECK(QuorumProposalPending(At(5), In(1), /*commitIndex=*/At(4), /*currentTerm=*/In(1)));
+    }
+
+    SECTION("settled once the commit index reaches it")
+    {
+        CHECK_FALSE(QuorumProposalPending(At(5), In(1), At(5), In(1)));
+        CHECK_FALSE(QuorumProposalPending(At(5), In(1), At(6), In(1)));
+    }
+
+    SECTION("and abandoned when the term moved, however far behind the log is")
+    {
+        // The case that deadlocked. A node proposes at index 5 in term 1, is
+        // deposed, and is elected again; the entry at 5 is long gone and the commit
+        // index is BELOW it. Judged on the index alone this reads as "still in
+        // flight" forever, so the change is never re-proposed, the joiner it was
+        // going to admit is never counted, and -- having no cluster -- that joiner
+        // is excused from every deadline and votes in no election. The cluster then
+        // cannot re-elect once one more member goes away.
+        CHECK_FALSE(QuorumProposalPending(At(5), In(1), /*commitIndex=*/At(4), /*currentTerm=*/In(2)));
+
+        // Including the case where the log went backwards further still, which is
+        // what a truncation looks like.
+        CHECK_FALSE(QuorumProposalPending(At(5), In(1), At(0), In(3)));
+    }
+
+    SECTION("a node that has proposed nothing is never waiting")
+    {
+        // The default-constructed pair. Term 0 is what a node starts in, so this
+        // must not read as a live proposal made in the current term.
+        CHECK_FALSE(QuorumProposalPending(LogIndex {}, Term {}, LogIndex {}, Term {}));
+        CHECK_FALSE(QuorumProposalPending(LogIndex {}, Term {}, At(9), In(4)));
+    }
+}
