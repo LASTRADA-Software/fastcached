@@ -554,6 +554,10 @@ void ConsensusTier::Reconcile()
 
     LearnMembers(state, desired);
 
+    // Every node, because the question "what does THIS node count" has no other
+    // answer anywhere. See `ReportQuorum`.
+    ReportQuorum();
+
     // Only a leader may propose, and asking here rather than letting `Propose`
     // refuse is what keeps a follower from logging a `NotLeader` every interval for
     // as long as it is a follower -- which is most of a healthy cluster's life.
@@ -655,6 +659,51 @@ void ConsensusTier::LearnMembers(Cluster::ClusterState const& state, std::span<C
     for (auto const& member: desired)
         if (std::ranges::find(state.members, member.id, &Cluster::ClusterMember::id) == state.members.end())
             learn(member.id, member.raftEndpoint);
+}
+
+void ConsensusTier::ReportQuorum()
+{
+    // The only place a node says what its own consensus configuration is.
+    //
+    // Nothing else could: `--cluster-status` reports the FLEET's member record from
+    // `ClusterStateMachine`, which is a different set, and only a leader answers it
+    // at all -- so the one node whose view you need during a stall is the one that
+    // redirects you elsewhere. There is no consensus counter either. That gap is
+    // why #388 read as an unexplainable silence: a joiner that never adopted a
+    // configuration is excused from every deadline, campaigns in no election, and
+    // logs NOTHING while doing it, which is indistinguishable from a healthy
+    // follower with nothing to say.
+    //
+    // #435 is the surface this should eventually be; a line an operator can already
+    // read is what can be had without one.
+    auto members = _driver->CurrentProgress().members;
+    std::ranges::sort(members);
+
+    // The FIRST pass reports whatever it finds, changed or not, and that is the
+    // point rather than an initialisation detail. A joiner starts with no members,
+    // so a report that only fired on a CHANGE would say nothing at all about the
+    // state that matters -- and silence would then mean both "this node counts no
+    // cluster" and "this loop never ran". Those are different failures.
+    if (_quorumReported && members == _reportedMembers)
+        return;
+
+    _quorumReported = true;
+    _reportedMembers = std::move(members);
+
+    if (_reportedMembers.empty())
+    {
+        // Said out loud, because it is a legitimate state for a `--raft-join` node
+        // and a fatal one for any other -- and the two are told apart by which node
+        // logged it, not by the line.
+        _logger.Log(LogLevel::Info, "consensus: this node counts no cluster of its own; it is waiting to be admitted");
+        return;
+    }
+
+    auto names = std::string {};
+    for (auto const& id: _reportedMembers)
+        names += (names.empty() ? "" : ", ") + id;
+
+    _logger.Logf(LogLevel::Info, "consensus: this node counts {} member(s): {}", _reportedMembers.size(), names);
 }
 
 void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)

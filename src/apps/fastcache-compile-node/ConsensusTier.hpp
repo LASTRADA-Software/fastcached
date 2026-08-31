@@ -397,6 +397,16 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// towards a quorum before anything can dial it is a cluster that stops forming
     /// one.
     /// @param state The cluster's state as this node last applied it.
+    /// Say what this node counts as its consensus configuration, when it changes.
+    ///
+    /// Every node, not only a leader: there is no other way to learn what a given
+    /// node believes its own quorum to be. `--cluster-status` reports the fleet's
+    /// member record and is answered by the leader alone, and no counter carries it
+    /// (#435).
+    ///
+    /// Reconciler thread only.
+    void ReportQuorum();
+
     void ReconcileQuorum(Cluster::ClusterState const& state);
 
     /// Record that one of the two reactor loops has ended.
@@ -533,6 +543,17 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     ///
     /// Reconciler thread only; nothing else reads it.
     Consensus::LogIndex _quorumProposedAt {};
+
+    /// What this node last said it counts, and whether it has said anything yet.
+    ///
+    /// The flag is not redundant with an empty vector: a node waiting to be admitted
+    /// legitimately counts nobody, so "empty" is a real reading rather than the
+    /// absence of one, and reporting only on a CHANGE would leave that state silent
+    /// and indistinguishable from a loop that never ran. Reconciler thread only.
+    std::vector<Consensus::NodeId> _reportedMembers;
+
+    /// Whether `ReportQuorum` has said anything yet.
+    bool _quorumReported { false };
 
     /// The term that proposal was made in.
     ///
