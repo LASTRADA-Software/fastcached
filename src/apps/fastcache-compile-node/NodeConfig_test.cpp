@@ -161,6 +161,34 @@ class FakeHost final: public IHostFactsSource
 
 } // namespace
 
+TEST_CASE("The node's credential is a secret and nothing else", "[node][config]")
+{
+    // `--requirepass` fills `token`, and there is no username beside it. One was
+    // DECLARED beside it -- parsed by nothing, read by nothing, emitted by nothing --
+    // and the reason that was worth removing rather than leaving is adjacency: a dead
+    // field next to a live credential is what somebody later wires up on the
+    // assumption it was always meant to work, and a half-wired username on an
+    // authentication path is worse than no username at all (#385).
+    //
+    // What this case can assert is the shape that half-wiring would take. A member
+    // nothing parses is not expressible as a test in this language -- the guard for
+    // that is the table itself, since a setting only exists here by having a row --
+    // so the assertion is that no such row has appeared, in either of the two
+    // spellings somebody reaching for one would try.
+    NodeConfig cfg;
+    std::array const args { "--requirepass=hunter2" };
+    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg).has_value());
+    CHECK(cfg.token == "hunter2");
+
+    for (auto const& spelling: { std::string_view { "--user" }, std::string_view { "--username" } })
+    {
+        INFO("spelling: " << spelling);
+        CHECK(std::ranges::none_of(NodeOptions(), [spelling](auto const& option) {
+            return option.primary == spelling || option.alias == spelling;
+        }));
+    }
+}
+
 TEST_CASE("NodeConfig: --migrate-cache is a mode, and never reaches a service registration", "[node][config]")
 {
     auto const parsed = ParseNodeArgv({ "--migrate-cache", "--cache-dir=/var/cache/fastcache-node" });
