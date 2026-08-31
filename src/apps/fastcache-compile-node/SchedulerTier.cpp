@@ -20,8 +20,9 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              IMetricsSink& metrics,
                              ILogger& logger,
                              std::span<std::byte const> signingKey,
+                             std::string_view clusterId,
                              std::shared_ptr<AuthPolicy const> policy):
-    _service { clock, wallClock, metrics, logger, signingKey },
+    _service { clock, wallClock, metrics, logger, signingKey, clusterId },
     _protocol { _service },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
     // object, and a node that answered "is this peer one of ours" differently at its
@@ -40,7 +41,11 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // lease. It is deliberately not `Undecided`: a node that refused every verb until
     // an election completed would be strictly worse than what it replaces at exactly
     // the moment somebody is watching it start.
-    _service.SetRole(Distributed::SchedulerRole::Leader, {});
+    // Term ZERO, and it is an answer rather than a placeholder: a node with no
+    // `--node-id` runs no consensus and there is no term to be in. Every grant it
+    // mints names 0, and the only verifier that could compare terms is one told what
+    // is current -- which nothing tells a lone node, because nothing elects it (#322).
+    _service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 }
 
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
@@ -85,7 +90,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     }
 
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
-        membership, clock, wallClock, metrics, logger, signingKey, std::move(policy) } };
+        membership, clock, wallClock, metrics, logger, signingKey, cfg.clusterId, std::move(policy) } };
 
     // The surface, not an address. A bare port binds the WILDCARD here, the opposite
     // of the cache's loopback, and that asymmetry is now a column of this surface's

@@ -231,6 +231,18 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "security signal, not a capacity one -- or a launcher predating "
               "signed leases, which presents a token that cannot authenticate.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_wrong_cluster_total",
+      .help = "Jobs refused because an authentic lease was issued by a different fleet. "
+              "A rise means two clusters are running from the same --cluster-key-file, "
+              "which is what copying a working configuration to a second site produces.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_stale_epoch_total",
+      .help = "Jobs refused because an authentic lease named a scheduler term that is no "
+              "longer current. A replay window across a leadership change, not a "
+              "provisioning mistake; zero on a fleet that is not electing.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseEndpointMismatch,
       .prometheusName = "fastcache_worker_jobs_refused_lease_endpoint_mismatch_total",
       .help = "Jobs refused because an authentic lease named a different worker. "

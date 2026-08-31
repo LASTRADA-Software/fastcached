@@ -98,9 +98,10 @@ namespace
 
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
+                                    std::string clusterId,
                                     IWallClock const& clock)
 {
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock](
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), cluster = std::move(clusterId), &clock](
                std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
@@ -111,7 +112,14 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // which is why the grant's fingerprint check is not redundant with the
         // worker's.
         auto verified = Distributed::VerifyLeaseToken(
-            key, token, Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint }, clock.Now());
+            key,
+            token,
+            Distributed::LeaseExpectation { .endpoint = endpoint,
+                                            .fingerprint = fingerprint,
+                                            .clusterId = cluster,
+                                            // Stated, not omitted -- see the header.
+                                            .epoch = Distributed::LeaseEpochCheck::NotKnownHere() },
+            clock.Now());
         if (verified.has_value())
             return std::nullopt;
 

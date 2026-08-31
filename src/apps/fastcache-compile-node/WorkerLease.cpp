@@ -51,8 +51,15 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
     if (!key.has_value())
         return std::unexpected { key.error() };
 
-    logger.Logf(LogLevel::Info, "verifying lease signatures against the cluster key, for grants naming {}", advertise);
-    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, clock);
+    // The cluster is named in the line as well as checked, because "the key
+    // verified and the fleet did not" is the failure two sites provisioned from one
+    // key file produce, and an operator reading a startup line is who has to notice
+    // that this node believes it belongs to a cluster they did not mean (#322).
+    logger.Logf(LogLevel::Info,
+                "verifying lease signatures against the cluster key, for grants naming {} issued by cluster '{}'",
+                advertise,
+                cfg.clusterId);
+    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, cfg.clusterId, clock);
 }
 
 } // namespace FastCache::Node

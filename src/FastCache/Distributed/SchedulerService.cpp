@@ -240,11 +240,13 @@ SchedulerService::SchedulerService(IClock& clock,
                                    IWallClock const& wallClock,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
-                                   std::span<std::byte const> signingKey):
+                                   std::span<std::byte const> signingKey,
+                                   std::string_view clusterId):
     _wallClock { wallClock },
     _metrics { metrics },
     _logger { logger },
     _signingKey { signingKey.begin(), signingKey.end() },
+    _clusterId { clusterId },
     _workers { clock },
     _leases { clock }
 {
@@ -278,15 +280,21 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
                                         .endpoint = std::string { endpoint },
                                         .fingerprint = std::string { fingerprint },
                                         .key = lease.key,
-                                        .expiresAt = _wallClock.Now() + _leases.Timeout() });
+                                        .expiresAt = _wallClock.Now() + _leases.Timeout(),
+                                        .clusterId = _clusterId,
+                                        .epoch = _epoch.load(std::memory_order_acquire) });
 }
 
-void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint)
+void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
 {
     {
         std::scoped_lock const guard { _leaderMutex };
         _leaderEndpoint.assign(leaderEndpoint);
     }
+    // Before the role, for the reason the endpoint is: a thread that has seen
+    // `Leader` must already be able to see the term it leads under, or the first
+    // grant after an election carries the previous one.
+    _epoch.store(epoch, std::memory_order_release);
     // Published after the endpoint it describes, so a reader that sees `Leader`
     // has already been able to see the address that came with it.
     _role.store(role, std::memory_order_release);
@@ -663,6 +671,19 @@ SchedulerReply SchedulerService::Release(CallerContext const& caller, std::strin
         auto authentic = AuthenticateLeaseToken(_signingKey, leaseToken);
         if (!authentic.has_value())
             return Refuse(Wire::ErrorCode::LeaseUnauthorized);
+
+        // The cluster, because a release names a SERIAL and this fleet issues serials
+        // from the same space another fleet sharing the key does: an authentic token
+        // from cluster A would otherwise release whatever cluster B's table happens to
+        // hold under that number (#322).
+        if (authentic->clusterId != _clusterId)
+            return Refuse(Wire::ErrorCode::LeaseUnauthorized);
+
+        // And deliberately NOT the epoch. A release under a term other than the
+        // current one is what a compile that outlived an election looks like, which is
+        // ordinary and is the case `Release` exists for -- refusing it would leave the
+        // key marked in flight until the lease expired, which is #212 exactly. The
+        // epoch guards SPENDING a grant, never tidying one up.
         serial = std::move(authentic->serial);
     }
 

@@ -33,6 +33,15 @@ namespace FastCache::Distributed
 /// algorithm thinks, this one what the *scheduler* is allowed to do, and a node
 /// that leads but has not yet caught up on its own log is the case where the two
 /// answers differ.
+/// The scheduler term a node leading alone is in.
+///
+/// Zero, and it is an answer rather than a placeholder: a node with no `--node-id`
+/// runs no consensus, so there is no election and no term to be in. Named so that no
+/// caller spells a bare `0` for it -- the term goes inside every lease grant (#322),
+/// and a literal at a call site is exactly how somebody later reads it as "unknown"
+/// and starts treating it as one.
+inline constexpr std::uint64_t StandaloneSchedulerTerm = 0;
+
 enum class SchedulerRole : std::uint8_t
 {
     /// Not the leader. Refuse and redirect if a leader is known.
@@ -184,11 +193,17 @@ class SchedulerService
     ///        leases existed, which a single machine with no `--cluster-key-file`
     ///        still runs. It is not silent: the first unsigned grant says so in the
     ///        log, once.
+    /// @param clusterId Which fleet this scheduler leads, copied. Goes inside every
+    ///        grant's MAC, so a worker refuses a grant from a fleet that is not its
+    ///        own even when both trust the same key (#322). **Empty is legal** and
+    ///        means a node with no `--cluster-id`, which is the one-machine
+    ///        deployment: a verifier that names none expects none.
     SchedulerService(IClock& clock,
                      IWallClock const& wallClock,
                      IMetricsSink& metrics,
                      ILogger& logger,
-                     std::span<std::byte const> signingKey);
+                     std::span<std::byte const> signingKey,
+                     std::string_view clusterId);
 
     /// Where a node's handed-over history goes, or null to discard it.
     ///
@@ -208,7 +223,14 @@ class SchedulerService
     /// configuration-at-construction, not an exception to it.
     /// @param role What this node may do.
     /// @param leaderEndpoint Where the leader is, when one is known; empty otherwise.
-    void SetRole(SchedulerRole role, std::string_view leaderEndpoint);
+    /// @param epoch The scheduler term this standing belongs to. It goes inside every
+    ///        grant this node mints, so a token captured before an election is not
+    ///        replayable after it (#322). Zero is the term of a node leading alone
+    ///        with no consensus, which is a real deployment rather than a missing
+    ///        answer -- and it is why this is a parameter rather than something the
+    ///        service could derive: only the consensus driver knows the term, and a
+    ///        node without one still mints grants.
+    void SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
 
     /// Give this scheduler a cluster to administer.
     ///
@@ -564,6 +586,12 @@ class SchedulerService
     /// nothing while every test passes.
     std::vector<std::byte> _signingKey;
 
+    /// Which fleet this scheduler leads; empty when the operator named none.
+    ///
+    /// Copied for the reason the key is: it is read from a configuration that has no
+    /// reason to outlive this service.
+    std::string _clusterId;
+
     WorkerRegistry _workers;
     LeaseTable _leases;
 
@@ -580,6 +608,16 @@ class SchedulerService
     /// interleaving is reachable by a heartbeat landing one instant later, so a
     /// lock spanning both would buy an atomicity the fleet does not have anyway.
     std::atomic<SchedulerRole> _role { SchedulerRole::Undecided };
+
+    /// The term the role above belongs to, stamped into every grant minted under it.
+    ///
+    /// Atomic and read on the minting path rather than guarded beside the endpoint:
+    /// a grant carrying the term from one instant either side of an election is
+    /// exactly as correct as one minted an instant earlier or later, and the token's
+    /// own expiry is what bounds it. What must not happen is a torn read, which is
+    /// what makes this atomic rather than a plain member.
+    std::atomic<std::uint64_t> _epoch { 0 };
+
     mutable std::mutex _leaderMutex;
     std::string _leaderEndpoint {}; ///< Guarded by `_leaderMutex`.
 

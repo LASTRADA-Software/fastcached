@@ -57,14 +57,14 @@ struct Fixture
 {
     Fixture()
     {
-        service.SetRole(Distributed::SchedulerRole::Leader, {});
+        service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     }
 
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
+    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
     Distributed::SchedulerProtocol protocol { service };
 
     /// Frame `request`, answer it, and hand back the reply bytes.
@@ -320,7 +320,7 @@ TEST_CASE("A follower is refused and told who to ask", "[node][clusteradmin]")
     Fixture fixture;
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
-    fixture.service.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6675");
+    fixture.service.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6675", Distributed::StandaloneSchedulerTerm);
 
     auto const reply = fixture.Ask(Ask(ClusterAction::Status));
     CHECK(StatusOf(reply) == Wire::Status::Error);

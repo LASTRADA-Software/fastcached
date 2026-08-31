@@ -1016,14 +1016,21 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
     auto const key = ReadClusterKey(keyFile);
     REQUIRE(key.has_value());
 
+    // The cluster the sections below build their validator for, read off a default
+    // `NodeConfig` rather than written out: `--cluster-id` carries a non-empty default,
+    // and a grant naming a different fleet is refused before the endpoint is even
+    // looked at (#322). Spelling the literal here would pass today and diverge the day
+    // that default moves.
+    auto const cluster = NodeConfig {}.clusterId;
+
     auto const grantFor = [&](std::string_view endpoint) {
-        return Distributed::MintLeaseToken(
-            *key,
-            Distributed::LeaseClaims { .serial = "17",
-                                       .endpoint = std::string { endpoint },
-                                       .fingerprint = "gcc-13",
-                                       .key = "obj-abc",
-                                       .expiresAt = clock.Now() + std::chrono::minutes { 10 } });
+        return Distributed::MintLeaseToken(*key,
+                                           Distributed::LeaseClaims { .serial = "17",
+                                                                      .endpoint = std::string { endpoint },
+                                                                      .fingerprint = "gcc-13",
+                                                                      .key = "obj-abc",
+                                                                      .expiresAt = clock.Now() + std::chrono::minutes { 10 },
+                                                                      .clusterId = cluster });
     };
 
     SECTION("a configured key means the grants are checked")
@@ -1052,7 +1059,8 @@ TEST_CASE("The lease check a node applies comes from its configuration", "[worke
                                                                    .endpoint = std::string { Advertise },
                                                                    .fingerprint = "gcc-13",
                                                                    .key = "obj-abc",
-                                                                   .expiresAt = clock.Now() + std::chrono::minutes { 10 } });
+                                                                   .expiresAt = clock.Now() + std::chrono::minutes { 10 },
+                                                                   .clusterId = cluster });
         CHECK(Unwrap((*validator)(forged, "gcc-13")).reason == Distributed::LeaseRefusalReason::Unauthorized);
 
         // An authentic grant for a different machine. That field is nowhere in the

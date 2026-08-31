@@ -364,13 +364,25 @@ struct NodeConfig
     /// leaders in one term.
     std::filesystem::path clusterDir;
 
-    /// Which fleet this node belongs to, for discovery.
+    /// Which fleet this node belongs to.
     ///
-    /// Routing, not authentication, and saying so keeps it honest: it is plain
-    /// text in every beacon, so treating it as a credential would be the mistake.
-    /// What it buys is that two unrelated fleets on one segment ignore each other,
-    /// which holds even when somebody shares a key across fleets -- which they
-    /// should not.
+    /// **Still not a credential**, and saying so keeps it honest: it is plain text in
+    /// every beacon, so anybody on the segment can read it and anybody can claim it.
+    /// What it buys in discovery is that two unrelated fleets on one segment ignore
+    /// each other.
+    ///
+    /// **It is also inside every lease grant's MAC since
+    /// [#322](https://github.com/LASTRADA-Software/fastcached/issues/322)**, and that
+    /// is a second job rather than a promotion to credential. A grant naming another
+    /// fleet is refused *after* its MAC has verified -- so what the id decides is
+    /// whose authentic grants this node honours, never whether a grant is authentic.
+    /// Two fleets that share a `--cluster-key-file` and differ here stop compiling for
+    /// each other; two that share both are one fleet as far as leases are concerned,
+    /// which is what the default means for everybody who never set it.
+    ///
+    /// So it now has an operational consequence: an operator running two fleets from
+    /// one key file must give them different ids, and the default is what makes that
+    /// a thing they have to do rather than get.
     std::string clusterId { "fastcache" };
 
     /// Where discovery beacons go, empty to leave discovery off.

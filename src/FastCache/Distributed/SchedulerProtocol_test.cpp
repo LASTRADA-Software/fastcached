@@ -38,14 +38,14 @@ struct Fixture
 {
     Fixture()
     {
-        service.SetRole(SchedulerRole::Leader, {});
+        service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
 
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
     SchedulerProtocol protocol { service };
 };
 
@@ -268,7 +268,7 @@ TEST_CASE("The service's refusals reach the wire with their codes intact", "[dis
 
     SECTION("a follower, carrying the leader's endpoint in the message")
     {
-        fixture.service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+        fixture.service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
         auto const reply = fixture.protocol.Answer(ask, Insider);
         REQUIRE(ErrorOf(reply) == Wire::ErrorCode::NotLeader);
 

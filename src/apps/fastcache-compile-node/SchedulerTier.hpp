@@ -69,9 +69,9 @@ class SchedulerTier
     /// constructor's standalone leadership stands, which is what one machine wants.
     /// @param role What this node is now.
     /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
-    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint)
+    void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
     {
-        _service.SetRole(role, leaderEndpoint);
+        _service.SetRole(role, leaderEndpoint, epoch);
     }
 
     /// Give this surface a cluster to administer.
@@ -122,6 +122,7 @@ class SchedulerTier
                   IMetricsSink& metrics,
                   ILogger& logger,
                   std::span<std::byte const> signingKey,
+                  std::string_view clusterId,
                   std::shared_ptr<AuthPolicy const> policy);
 
     // Declaration order IS construction order, and each is referenced by the one

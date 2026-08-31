@@ -562,8 +562,8 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
-    scheduler.SetRole(SchedulerRole::Leader, {});
+    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
 
     CallerContext const member { .membership = Membership::Member, .peerId = "peer" };
     auto announce =
@@ -597,7 +597,7 @@ TEST_CASE("Collecting a fleet without a cluster is a snapshot, not a crash", "[d
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
+    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
 
     auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics });
     CHECK_FALSE(snapshot.cluster.has_value());

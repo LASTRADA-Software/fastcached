@@ -86,7 +86,7 @@ namespace Wire = CompileCacheWire;
     // No `SetRole`: the refusal is answered before `Route`, so before any `Gate()`.
     // Leadership is not part of this contract, and a line setting it would tell a
     // reader it is.
-    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {} };
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
     Distributed::SchedulerProtocol protocol { service };
 
     auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" });

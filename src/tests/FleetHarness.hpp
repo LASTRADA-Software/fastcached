@@ -100,6 +100,13 @@ class FleetHarness final: public Cc::IEndpointExchange
         CompileCacheWire::ErrorCode code;
     };
 
+    /// The fleet every node in this harness belongs to.
+    ///
+    /// One id across all of them, because a grant minted by any of these schedulers
+    /// must verify on any of these workers -- that is what the harness exists to
+    /// drive. Named rather than empty so the comparison is a real one (#322).
+    static constexpr std::string_view ClusterId = "fleet-harness";
+
     /// @param signingKey The cluster key every scheduler here signs with. Empty —
     ///        the default — means unsigned grants, which is what a fleet with no
     ///        `--cluster-key-file` runs and is the simpler thing to assert against.
@@ -135,9 +142,9 @@ class FleetHarness final: public Cc::IEndpointExchange
         (void) NodeAt(endpoint); // refuse an endpoint nobody added, loudly
         for (auto const& node: _nodes)
             if (node->endpoint == endpoint)
-                node->service.SetRole(Distributed::SchedulerRole::Leader, {});
+                node->service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
             else
-                node->service.SetRole(Distributed::SchedulerRole::Follower, endpoint);
+                node->service.SetRole(Distributed::SchedulerRole::Follower, endpoint, Distributed::StandaloneSchedulerTerm);
     }
 
     /// Register a worker with one scheduler.
@@ -258,7 +265,15 @@ class FleetHarness final: public Cc::IEndpointExchange
         /// @param at How clients address it.
         Node(FleetHarness& harness, std::string at):
             endpoint { std::move(at) },
-            service { harness._clock, harness._wallClock, harness._metrics, harness._logger, harness._signingKey },
+            service { harness._clock,
+                      harness._wallClock,
+                      harness._metrics,
+                      harness._logger,
+                      harness._signingKey,
+                      // One fleet, so one cluster id across every node the harness
+                      // builds: a grant minted by any of them must verify on any
+                      // other, which is what the harness exists to exercise (#322).
+                      FleetHarness::ClusterId },
             protocol { service }
         {
         }

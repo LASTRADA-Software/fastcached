@@ -118,6 +118,13 @@ struct Fixture
 /// The endpoint the worker under test advertises, and the one grants must name.
 inline constexpr std::string_view ThisWorker = "worker-under-test:6675";
 
+/// The fleet this worker belongs to, and the one a grant has to name.
+///
+/// Named rather than empty so the cases exercise a real comparison: an empty cluster
+/// on both sides passes whether the check runs or not, which is the shape that would
+/// have let #322 ship with a verifier that never looked.
+inline constexpr std::string_view ThisCluster = "fleet-under-test";
+
 /// What a lease case compiles. Its content is irrelevant to every one of them; it is
 /// named only so the calls that vary the lease do not each restate it.
 inline constexpr std::string_view DefaultSource = "int main(){return 0;}";
@@ -142,10 +149,12 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
 /// @param endpoint The worker the grant is issued FOR.
 /// @param fingerprint The toolchain it authorizes.
 /// @param validFor How long past `LeaseClock()` it lasts; negative for an expired one.
+/// @param cluster Which fleet mints it; defaults to the one the worker belongs to.
 /// @return The token, as a client would present it.
 [[nodiscard]] std::string GrantFor(std::string_view endpoint,
                                    std::string_view fingerprint = "gcc-13",
-                                   std::chrono::seconds validFor = std::chrono::minutes { 10 })
+                                   std::chrono::seconds validFor = std::chrono::minutes { 10 },
+                                   std::string_view cluster = ThisCluster)
 {
     return FastCache::Distributed::MintLeaseToken(
         TestClusterKey(),
@@ -153,14 +162,16 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
                                               .endpoint = std::string { endpoint },
                                               .fingerprint = std::string { fingerprint },
                                               .key = "obj-abc",
-                                              .expiresAt = LeaseClock.Now() + validFor });
+                                              .expiresAt = LeaseClock.Now() + validFor,
+                                              .clusterId = std::string { cluster },
+                                              .epoch = 4 });
 }
 
 /// A worker that holds the cluster key and therefore checks what it is handed.
 /// @return The production validator, built the way `main.cpp` builds it.
 [[nodiscard]] LeaseValidator VerifyingValidator()
 {
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock);
+    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock);
 }
 
 /// A COMPILE frame carrying `source` as its source field, already enveloped.
