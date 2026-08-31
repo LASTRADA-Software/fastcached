@@ -272,6 +272,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
     cfg.drainTimeoutSeconds = 90;
+    // Worker state like any other, and the one that supplies most of the rest: a
+    // registration that dropped it would come back at every boot knowing only what
+    // was typed alongside --install-service, which for a package install is close
+    // to nothing.
+    cfg.configPath = "node.yaml";
 
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
 
@@ -2313,4 +2318,171 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         cfg.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
+}
+
+// ---------------------------------------------------------------------------
+// The configuration FILE (#291). Before it, this worker was configured by a bag
+// of command-line arguments in a shell fragment the systemd unit expanded, and
+// nothing anywhere said which of the two mechanisms won.
+
+namespace
+{
+/// Apply a file and then a command line, the way `main` does.
+///
+/// It calls the very function `main` calls -- a helper that re-implemented the
+/// three steps would pass while the binary did something else, which is the
+/// shape "a reclaimer nothing constructs" takes here.
+/// @param settings What the file said.
+/// @param args The command line, program name already removed.
+/// @return The merged configuration, or the refusal.
+[[nodiscard]] std::expected<NodeConfig, ConfigError> FromFileAndArgv(std::vector<YamlSetting> const& settings,
+                                                                     std::vector<char const*> const& args)
+{
+    NodeConfig cfg;
+    return ApplyNodeConfiguration(settings, std::filesystem::path { "/etc/n.yaml" }, args, cfg).transform([&cfg] {
+        return cfg;
+    });
+}
+
+[[nodiscard]] YamlSetting Setting(std::string key, std::vector<std::string> values)
+{
+    return YamlSetting { .key = std::move(key), .values = std::move(values), .line = 1 };
+}
+} // namespace
+
+TEST_CASE("NodeConfig: every row is reachable from a file or named as one that is not", "[node][config]")
+{
+    // The compile-time guard beside the table proves this for the build; this is
+    // the same claim stated where somebody reading the tests will find it, and it
+    // also pins the SHAPE of the exclusions -- a row a file may not carry must be
+    // one a file could not sensibly express, which for every one of them today
+    // means it ends the process or describes how the process was started.
+    auto const keyed = std::ranges::count_if(NodeOptions(), [](auto const& row) { return !row.yamlKey.empty(); });
+    CHECK(keyed > 30);
+
+    // No key is spelled like its flag: the mapping is snake_case of the flag, and
+    // a leading `--` in a YAML key would be a setting nobody could type.
+    for (auto const& row: NodeOptions())
+    {
+        INFO("row: " << row.primary);
+        CHECK_FALSE(row.yamlKey.starts_with("-"));
+        CHECK_FALSE(row.yamlKey.contains('-'));
+    }
+}
+
+TEST_CASE("NodeConfig: a setting in the file takes effect", "[node][config]")
+{
+    auto const merged = FromFileAndArgv({ Setting("scheduler", { "cache.internal:6675" }),
+                                          Setting("slots", { "9" }),
+                                          Setting("toolchain", { "/usr/bin/g++", "/usr/bin/clang++" }),
+                                          Setting("no_toolchain_discovery", { "true" }) },
+                                        {});
+
+    REQUIRE(merged.has_value());
+    CHECK(merged->scheduler == "cache.internal:6675");
+    CHECK(merged->slots == 9);
+    CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/g++", "/usr/bin/clang++" });
+    CHECK_FALSE(merged->toolchainDiscovery);
+}
+
+TEST_CASE("NodeConfig: the command line wins over the file", "[node][config]")
+{
+    auto const merged = FromFileAndArgv({ Setting("scheduler", { "from-file:6675" }), Setting("slots", { "9" }) },
+                                        { "--scheduler=from-argv:6675" });
+
+    REQUIRE(merged.has_value());
+    CHECK(merged->scheduler == "from-argv:6675");
+    // And a setting the command line did NOT name is still the file's: precedence
+    // is per setting, not per source.
+    CHECK(merged->slots == 9);
+}
+
+TEST_CASE("NodeConfig: a command line naming a toolchain replaces the file's list", "[node][config]")
+{
+    // The worker's toolchain set is an OVERRIDE, so extending it is the one
+    // behaviour that must not happen: a `--toolchain` meant to pin this run to one
+    // compiler would otherwise add it to whatever the file already served.
+    auto const merged =
+        FromFileAndArgv({ Setting("toolchain", { "/usr/bin/g++", "/usr/bin/clang++" }) }, { "--toolchain=/usr/bin/tcc" });
+
+    REQUIRE(merged.has_value());
+    CHECK(merged->toolchains == std::vector<std::string> { "/usr/bin/tcc" });
+}
+
+TEST_CASE("NodeConfig: a file naming an unknown setting refuses to start", "[node][config]")
+{
+    auto const merged = FromFileAndArgv({ Setting("schedular", { "typo:6675" }) }, {});
+
+    REQUIRE_FALSE(merged.has_value());
+    CHECK(merged.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(merged.error().field == "schedular");
+    CHECK(merged.error().source == "/etc/n.yaml");
+}
+
+TEST_CASE("NodeConfig: a file may not name a one-shot verb or a startup fact", "[node][config]")
+{
+    // Each of these is a decision taken once. A file is read at EVERY start, so a
+    // key for one would replay it forever -- a worker that re-registers itself, or
+    // asks the cluster a question, instead of serving.
+    for (auto const& key: { "install_service",
+                            "uninstall_service",
+                            "migrate_cache",
+                            "cluster_forget",
+                            "service_name",
+                            "service_scope",
+                            "daemon",
+                            "config",
+                            "help",
+                            "version",
+                            "print_surfaces" })
+    {
+        auto const merged = FromFileAndArgv({ Setting(key, { "x" }) }, {});
+        INFO("key: " << key);
+        REQUIRE_FALSE(merged.has_value());
+        CHECK(merged.error().code == ConfigErrorCode::UnknownKey);
+    }
+}
+
+TEST_CASE("NodeConfig: a registration carries the config path and not the file's settings", "[node][service]")
+{
+    // A registration replays its arguments at every start. Baking in what the FILE
+    // said would freeze one reading of that file into launch arguments that then
+    // outrank the file itself: the operator edits it, restarts the service, and
+    // nothing changes, with no error anywhere. So the spec is built from the
+    // command-line-only parse, and what it carries about the file is the PATH.
+    auto cfg = Installable();
+    // RELATIVE, which is the interesting input: a service does not inherit the
+    // installing shell's working directory, so a relative path captured at install
+    // time resolves somewhere else at every start. What is asserted is therefore the
+    // RULE -- made absolute, and the flag and the field agreeing -- and not a
+    // literal, which would be a POSIX string on a test that also runs on Windows.
+    cfg.configPath = "node.yaml";
+
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
+
+    std::error_code ec;
+    auto const expected = std::filesystem::absolute(cfg.configPath, ec).string();
+    REQUIRE_FALSE(ec);
+    REQUIRE(expected != cfg.configPath);
+
+    CHECK(std::ranges::any_of(
+        spec.arguments, [&expected](auto const& argument) { return argument == std::format("--config={}", expected); }));
+
+    // The same value on the field, so `InlineCredentialRejection` names the file the
+    // service was actually given rather than one nobody passed. Two spellings of one
+    // path in one registration is a refusal pointing somewhere the service never
+    // looks.
+    CHECK(spec.configPath == expected);
+}
+
+TEST_CASE("NodeConfig: a registration for a worker given no file names none", "[node][service]")
+{
+    // Empty is a real answer: the worker repeats the machine-wide lookup at every
+    // start, which is what lets a package replace that file without touching the
+    // registration. Emitting a resolved path instead would pin the service to
+    // whatever the lookup found on the day somebody ran the installer.
+    auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
+
+    CHECK(std::ranges::none_of(spec.arguments, [](auto const& argument) { return argument.starts_with("--config="); }));
+    CHECK(spec.configPath.empty());
 }

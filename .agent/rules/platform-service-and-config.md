@@ -448,6 +448,78 @@ readable and silently ignored. Every rule below has already been one of them.
   every start. The per-user launchd agent and the systemd user unit pass none —
   the packaged config describes the system daemon, whose cache only the service
   account can write.
+## A configuration FILE through the option table
+
+- **The file's values and the command line's reach the same fields through the
+  SAME appliers, in that order, so "the command line wins" is which loop runs
+  second.** The daemon does the other thing: `ReadYamlConfig` fills a `Config`,
+  `ParseCli` fills a `CliResult`, and `Merge` copies field by field consulting a
+  per-field explicit bit and a per-field presence bit. Four lists that have to
+  agree, none derived from the others — and the file's own comments record that a
+  flag which parsed and never merged has shipped four times. `fastcache-compile-node`
+  has one list, `NodeOptions()`, and a row that parses cannot fail to merge because
+  parsing and merging stopped being two things. `Config/FileOptions.hpp`.
+- **Which key a row answers to is a COLUMN, never a derivation.** Measured on the
+  daemon: 44 flags, 34 keys, diverging four ways — `--storage` is `storage_path`,
+  `--expiry-scan` is `active_expiry_scan`, `--expiry-interval` is
+  `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not),
+  and `--listen`/`--listen-tls` collapse into one `listeners:`. There is no rule
+  with exceptions there, only a mapping, and a convention derived from flag names
+  would silently rename three existing keys the day somebody generalised it.
+- **A key naming no row is REFUSED, never ignored.** A file is read at every
+  start, so a key nothing reads is a setting an operator believes is in force
+  forever — the exact failure the file exists to remove, and a typo is the common
+  way to reach it.
+- **A row a file may not carry is on a named list with a per-row reason, and a
+  compile-time guard reads that list rather than restating it.** Two kinds live
+  there and they are not the same objection: a one-shot verb (`--install-service`,
+  `--cluster-forget`, `--migrate-cache`) is a decision taken once, and a file would
+  replay it at every start; the rest (`--config`, `--service-name`, `--daemon`)
+  describe how this process was STARTED, so reading them out of the file the start
+  already found is circular. Both directions are asserted — a row with neither a key
+  nor a reason, and a reason naming a row that has a key.
+- **A flag whose meaning is its PRESENCE is a boolean in the file, and `apply` runs
+  on `true` alone.** The key spells the flag, so the reading is exact for both
+  polarities: `raft_join: true` passes `--raft-join`, and `no_toolchain_discovery:
+  false` passes nothing, which is discovery left on. A positively-named key would
+  need an applier no flag has — a setting reachable from a file and not from argv,
+  which is the second mechanism the whole arrangement removes. Only `true` and
+  `false` are accepted: YAML 1.1's `yes`/`on` are a schema this reader would have to
+  reproduce exactly to be trusted.
+- **A repeatable row's applier APPENDS, so the command line must EMPTY the list
+  before it is applied over a file-seeded result.** Otherwise `--toolchain` extends
+  the file's set instead of replacing it, and the worker serves a compiler the
+  operator was pinning it away from. Replacement is the rule because mixing partial
+  file values with partial command-line values makes precedence depend on
+  declaration order. Driven off the table's own `clear` column, so a fourth
+  repeatable flag is a column value rather than an edit somebody has to remember —
+  and it walks argv through the parser's own `TakeValue`, because a VALUE is not a
+  flag: `--advertise --toolchain` gives `--advertise` the value `--toolchain`, and a
+  scan of every token would read that as naming the list and silently empty what the
+  file declared.
+- **A file that failed halfway is DECLINED, not half-applied.** "Some of the
+  settings, up to the bad line" is a configuration nobody wrote; the command line
+  then stands alone.
+- **An error a value parser raised is re-attributed to the FILE and names the KEY.**
+  `ApplyOneOption` stamps the row's `primary` for the same reason a shared parser
+  cannot name a flag — but stamping `--cache-memory` on a bad `cache_memory:` sends
+  an operator to look at a command line they never typed.
+- **`--install-service` registers the command-line-only parse, and what it carries
+  about the file is the PATH.** Baking in what the file said freezes one reading of
+  it into launch arguments that then outrank the file forever: the operator edits it,
+  restarts, and nothing changes with no error anywhere. Emitting a *resolved* default
+  path is the same mistake one step down — it pins the service to whatever the lookup
+  found on the day somebody ran the installer.
+- **A missing file is `FileNotFound`, not `ParseError`.** `YAML::BadFile` derives
+  from `YAML::Exception`, so catching only the general case sent an operator who
+  mistyped `--config` hunting for a syntax mistake in a file that is not there.
+- **The shipped reference configuration is checked against the table.** Nothing else
+  connects them: the flag parses, the file parses, and a build in which they describe
+  different products passes everything. A setting with no commented block is one
+  nobody can find; a block for a key the table dropped is worse, because uncommenting
+  it makes the worker refuse to start. `ctest -R node-config-reference`, which also
+  fails when either scan matches nothing — two empty lists agree perfectly.
+
 ## The CLI option table
 
 - **A flag is one row, and every binary's row table drives both parsing and
@@ -523,6 +595,29 @@ readable and silently ignored. Every rule below has already been one of them.
   worker cannot write and must not offer to a scheduler as room it has.
 
 ## Open work
+
+- **[#384](https://github.com/LASTRADA-Software/fastcached/issues/384)** — the
+  worker's configuration file is obeyed whatever its mode, so anyone who can write
+  it decides what the worker runs and which compilers it serves. `Platform/FileTrust`
+  already answers this question for the daemon's machine-wide file and is not
+  consulted here. Stated in the flag's own help text, in the shipped reference and in
+  the operator docs rather than left to be discovered.
+- **[#396](https://github.com/LASTRADA-Software/fastcached/issues/396)** —
+  `WithScopeDefaults` decides two things from one bit. `ServiceSpec::applicationName`
+  means both "this service keeps files" and "it takes `--config` AND `--storage`", and
+  the worker is the first service that is file-configured with no `--storage`. It
+  therefore leaves the field empty — naming an application would bake a `--storage=`
+  into every user-scope registration, and the job would answer its own command line
+  with "unrecognised argument" at every start. What that costs is the system-scope
+  `--config=` default (emitted by `MakeNodeServiceSpec` itself instead) and the
+  install-time `ServiceAccountReadDenial` check on it, which nothing now performs for
+  the worker.
+- **[#397](https://github.com/LASTRADA-Software/fastcached/issues/397)** — the
+  worker's configuration file is packaged on Linux only. A `.pkg` and an MSI
+  have no conffile mechanism, so their equivalent is a `.default` plus a postinstall
+  that seeds the live file once — and `macos/seed-config.sh.inc` handles exactly one
+  file, appending a `storage_path:` the worker does not have. On those platforms the
+  worker is configured by `--install-service --config=<path>`.
 
 - **[#208](https://github.com/LASTRADA-Software/fastcached/issues/208)** — the rule
   above covers the addresses this node OPENS. The ones it dials — `--advertise`,

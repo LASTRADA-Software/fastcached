@@ -4,6 +4,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
@@ -387,6 +388,22 @@ struct NodeConfig
     /// Where a POSIX daemonized run writes its pid, empty for none.
     std::string pidfile;
 
+    /// The configuration file the operator named, or empty to look for one.
+    ///
+    /// Read BEFORE the rest of this structure is filled in, by a first parse whose
+    /// only purpose is to find this field -- so it is the one setting that cannot
+    /// come from a file. A `config:` key inside a configuration file names the file
+    /// to read, which is either the file itself or another one, and neither answer
+    /// is one an operator should have to reason about.
+    ///
+    /// Empty is not "no file". A named path is strict: absent, unreadable or
+    /// malformed is a refusal, because an operator who typed a path is owed the news
+    /// that it did not arrive. An empty one falls back to the machine-wide candidate
+    /// this application looks up, which is skipped when it is not there -- the rule
+    /// `Config/DefaultConfigPath` already states for the daemon, applied to the
+    /// second binary that has a file.
+    std::string configPath;
+
     // ---------------------------------------------------------------------------
     // Every member below is one byte wide, and they are kept in a single run rather
     // than beside the setting each belongs to.
@@ -400,7 +417,6 @@ struct NodeConfig
     //
     // Add the next flag HERE rather than next to what it configures. Its doc comment
     // is what carries the reader across; the position is a layout constraint.
-
     /// How chatty the log is.
     LogLevel logLevel { LogLevel::Info };
 
@@ -562,6 +578,34 @@ struct NodeConfig
 [[nodiscard]] Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
                                                        IHostFactsSource const& host,
                                                        Distributed::NodeCacheCapacity const& cache);
+
+/// Build a configuration from a file and a command line, in that order.
+///
+/// The whole of "the command line wins": the file's values and the command
+/// line's reach the same fields through the SAME appliers, and precedence is
+/// which loop runs second. There is no per-field merge, no per-field presence
+/// bit and no second list to keep in step with the option table -- which is the
+/// shape the daemon has, and which has shipped a flag that parsed but never
+/// merged four times.
+///
+/// Pure with respect to I/O: the caller has already read the file, so this can be
+/// driven from a test on every platform rather than only where a temporary file
+/// and a spawned process are cheap. `main` reads and then calls this, and has no
+/// other path to a merged configuration.
+///
+/// @param settings What the file carried, from `ReadYamlSettings`.
+/// @param path The file, for error attribution only.
+/// @param args The command line, program name already removed. It must be the
+///        SAME argv the caller parsed to find the config path -- it is re-applied
+///        here, so anything the first parse accepted this one accepts too.
+/// @param result Populated on success; left in an unspecified state on failure,
+///        because a file that failed halfway has applied part of a document
+///        nobody wrote.
+/// @return Nothing, or the first setting that could not be applied.
+[[nodiscard]] std::expected<void, ConfigError> ApplyNodeConfiguration(std::vector<YamlSetting> const& settings,
+                                                                      std::filesystem::path const& path,
+                                                                      std::span<char const* const> args,
+                                                                      NodeConfig& result);
 
 /// Every accepted option, one row each.
 ///

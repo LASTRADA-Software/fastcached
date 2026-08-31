@@ -50,6 +50,21 @@ The startup banner reports which file was chosen:
 `config=<none>` there means no file was found and the built-in defaults are in
 effect — which is a perfectly good way to run fastcached.
 
+!!! note "The compile worker has its own file, with its own name"
+
+    `fastcache-compile-node` reads `fastcache-compile-node.yaml` from the same
+    locations under its own name, by the same rule: named is strict, discovered
+    is skipped when absent, unreadable or untrusted. Everything on this page
+    about *where* applies to it unchanged.
+
+    What differs is the mapping. Every key there is one flag of
+    `fastcache-compile-node --help`, spelled with underscores instead of dashes,
+    and the file and the command line reach each setting through the same
+    applier — so precedence is simply that the command line is applied second.
+    The daemon's keys below are a *mapping* rather than a rule (`--storage` is
+    `storage_path`), which is why they are listed out. The worker's are on
+    [its own page](../tools/fastcache-compile-node.md#running-it-as-a-service).
+
 !!! note "Named files are strict, discovered ones are not"
 
     `--config=<path>` overrides the search entirely, and the file must exist —

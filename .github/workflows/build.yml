@@ -1486,7 +1486,7 @@ jobs:
                       ./usr/lib/systemd/system/fastcache-compile-node.service \
                       ./usr/lib/systemd/system/fastcache-compile-node.socket \
                       ./usr/lib/sysusers.d/fastcache-node.conf \
-                      ./etc/fastcached/compile-node.env \
+                      ./etc/fastcached/fastcache-compile-node.yaml \
                       ./etc/fastcached/fastcached.yaml; do
             grep -qx "$path" /tmp/deb-paths.txt || { echo "::error::missing $path"; exit 1; }
           done
@@ -1497,8 +1497,13 @@ jobs:
 
           # Without the conffiles entry an upgrade silently discards local edits.
           dpkg -e "$deb" /tmp/debcontrol
-          grep -qx '/etc/fastcached/fastcached.yaml' /tmp/debcontrol/conffiles \
-            || { echo "::error::config not registered as a conffile"; exit 1; }
+          # Both, and for the same reason: an upgrade that reset either one is a
+          # silent regression. The worker's file is what makes it work at all, so
+          # resetting it un-registers the worker with no error anywhere.
+          for path in /etc/fastcached/fastcached.yaml /etc/fastcached/fastcache-compile-node.yaml; do
+            grep -qx "$path" /tmp/debcontrol/conffiles \
+              || { echo "::error::$path not registered as a conffile"; exit 1; }
+          done
 
       - name: "Inspect the .rpm payload"
         working-directory: out/build/gcc-release
@@ -1519,15 +1524,15 @@ jobs:
                       /usr/lib/systemd/system/fastcache-compile-node.service \
                       /usr/lib/systemd/system/fastcache-compile-node.socket \
                       /usr/lib/sysusers.d/fastcache-node.conf \
-                      /etc/fastcached/compile-node.env \
+                      /etc/fastcached/fastcache-compile-node.yaml \
                       /etc/fastcached/fastcached.yaml; do
             grep -qx "$path" /tmp/rpm-paths.txt || { echo "::error::missing $path"; exit 1; }
           done
 
           # Both, and for the same reason: an upgrade that reset either one is a
-          # silent regression. compile-node.env is what makes the worker work at
-          # all, so resetting it un-registers the worker with no error anywhere.
-          for path in /etc/fastcached/fastcached.yaml /etc/fastcached/compile-node.env; do
+          # silent regression. The worker's file is what makes it work at all, so
+          # resetting it un-registers the worker with no error anywhere.
+          for path in /etc/fastcached/fastcached.yaml /etc/fastcached/fastcache-compile-node.yaml; do
             grep -qx "$path" /tmp/rpm-config.txt \
               || { echo "::error::$path not marked %config"; exit 1; }
           done
@@ -1597,8 +1602,12 @@ jobs:
           # A scheduler that is not there. The worker must still start, warn and
           # keep retrying -- a fleet where the scheduler restarts must not turn
           # into a fleet of dead workers.
-          printf 'FASTCACHE_NODE_ARGS=--scheduler=127.0.0.1:6675 --advertise=127.0.0.1:6676 --toolchain=/usr/bin/g++\n' \
-            | sudo tee /etc/fastcached/compile-node.env >/dev/null
+          # Written as YAML into the file the unit's ExecStart names, which is the
+          # ONLY way to configure this worker since #291 -- an env file of
+          # command-line arguments and a config file are two mechanisms that can
+          # disagree about one setting, and nobody had written down which won.
+          printf 'scheduler: 127.0.0.1:6675\nadvertise: 127.0.0.1:6676\ntoolchain:\n  - /usr/bin/g++\n' \
+            | sudo tee /etc/fastcached/fastcache-compile-node.yaml >/dev/null
 
           # Enabling the SOCKET is what enables the worker; the service carries
           # no [Install] on purpose.

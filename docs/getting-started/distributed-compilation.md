@@ -335,9 +335,9 @@ tier off, which is what a machine that only compiles for others wants. The whole
 of it is on
 [the node's own page](../tools/fastcache-compile-node.md#a-cache-of-its-own).
 
-On Linux the package ships a socket-activated unit; put the arguments in
-`FASTCACHE_NODE_ARGS` in `/etc/fastcached/compile-node.env` and enable the
-**socket**:
+On Linux the package ships a socket-activated unit; put the settings in
+`/etc/fastcached/fastcache-compile-node.yaml` — every key is one flag, spelled
+with underscores — and enable the **socket**:
 
 ```sh
 sudo systemctl enable --now fastcache-compile-node.socket
@@ -753,7 +753,8 @@ so a build LAN where addresses can be spoofed is not a boundary this can hold.
   so there is nothing for the flag to do and it reports as much. A worker that
   needs `--requirepass` cannot be registered on any platform — a supervisor records
   launch arguments where every local account can read them — so on Linux that token
-  goes in `FASTCACHE_NODE_ARGS`, and elsewhere such a worker runs in the foreground.
+  goes in the worker's configuration file as `requirepass:`, and the registration
+  carries `--config=<path>` rather than the token.
 - **On Windows a dispatched object is not byte-identical to a local one — the code
   in it is.** Every MSVC-family driver stamps the clock into the COFF header, and
   `cl` also records the absolute path of the object file (in `.debug$S`) and a hash

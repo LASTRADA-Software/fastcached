@@ -29,17 +29,30 @@ Type=simple
 # defensible default, so they come from a file an operator writes rather than
 # from this unit. A worker nothing knows about serves nobody, so starting without
 # them is a configuration error and the binary refuses -- loudly, at start, which
-# is the right time to find out. The `-` prefix keeps the missing file from being
-# a *unit* error, so the failure reported is the real one.
+# is the right time to find out.
 #
-# The TOOLCHAINS are not in that file any more. "No default compiler" and "no
-# discovery" turned out to be different claims: a default is how a job ends up
-# running against something nobody chose, while which compilers a machine holds is
-# a fact this worker can establish for itself. It surveys the machine at startup
-# and serves what it finds; `--toolchain` narrows that, and
-# `--no-toolchain-discovery` turns it off.
-EnvironmentFile=-/etc/fastcached/compile-node.env
-ExecStart=/usr/bin/fastcache-compile-node $FASTCACHE_NODE_ARGS
+# That file is now the node's own YAML configuration rather than a shell fragment
+# of command-line arguments (#291). One file, one grammar, one precedence rule:
+# what an operator writes there is configuration the binary parses, not text a
+# unit expands into an argument vector. The mechanism it replaces could disagree
+# with the command line with nobody having written down which won.
+#
+# `--config` is passed explicitly, and it is NOT a second source of truth: the
+# path below is the same one the node would discover on its own, because
+# DefaultConfigPath's system candidate is `<sysconfdir>/{app}.yaml` and this
+# application is `fastcache-compile-node`. Stating it is what makes the failure
+# legible -- a config the operator NAMED is strict, so a missing or unparseable
+# file stops the service here instead of silently starting a worker configured
+# out of nothing. The two spellings cannot drift apart; one is the other written
+# down.
+#
+# The TOOLCHAINS are not in it. "No default compiler" and "no discovery" turned
+# out to be different claims: a default is how a job ends up running against
+# something nobody chose, while which compilers a machine holds is a fact this
+# worker can establish for itself. It surveys the machine at startup and serves
+# what it finds; `toolchain:` narrows that, and `toolchain_discovery: false`
+# turns it off.
+ExecStart=/usr/bin/fastcache-compile-node --config=/etc/fastcached/fastcache-compile-node.yaml
 
 # SIGTERM stops accepting and lets the accept loop finish; the stop flag is
 # polled at 100 ms and jobs are served inline, so a clean stop is bounded by

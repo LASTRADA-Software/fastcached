@@ -75,11 +75,26 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
         "linux/fastcache-compile-node.service|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcache-compile-node.service|Runtime"
         "linux/fastcache-compile-node.socket|${FASTCACHED_SYSTEMD_SYSTEM_DIR}|data|fastcache-compile-node.socket|Runtime"
         "linux/fastcache-compile-node.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcache-node.conf|Runtime"
-        # Marked `config` so dpkg registers it as a conffile and rpm as
-        # %config(noreplace): it is the file an operator edits to make the worker
+        # The worker's own configuration file, marked `config` for the reason
+        # fastcached.yaml is: it is the file an operator edits to make the worker
         # work at all, and an upgrade that reset it would un-register the worker
-        # silently.
-        "linux/compile-node.env|${FASTCACHED_SYSCONF_DIR}|config|compile-node.env|Runtime"
+        # silently. The unit's ExecStart names this exact path.
+        #
+        # Linux only. The .pkg and the MSI have no conffile mechanism, so their
+        # equivalent is a `.default` copy plus a postinstall that seeds the live
+        # file once -- and macos/seed-config.sh.inc handles exactly one file,
+        # fastcached.yaml, appending a `storage_path:` the worker does not have.
+        # Generalising it is #397; on those platforms the worker is
+        # configured by `--install-service --config=<path>`, which registers the
+        # path and reads the current file at every start.
+        "linux/fastcache-compile-node.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcache-compile-node.yaml|Runtime"
+        #
+        # What used to be here was `compile-node.env`, a shell fragment of
+        # command-line arguments the unit expanded into ExecStart. It is gone
+        # (#291): two mechanisms that can disagree about one setting are worse
+        # than either alone, and nobody had written down which won. Removing the
+        # row is what stops new packages shipping it; a copy already on disk is
+        # dpkg's and rpm's to deal with, which is #383.
     )
 elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
     # The generated scripts are referenced from the build tree; see below.

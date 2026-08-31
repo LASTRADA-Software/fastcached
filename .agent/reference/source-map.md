@@ -167,7 +167,12 @@ src/FastCache/
                 NarrowText (what code page this process transcodes narrow text
                 through, whether a path built from bytes decodes as UTF-8, and
                 the two total conversions for text something ELSE wrote)
-  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp), ConfigReloader,
+  Config/       Config, CliParser, ByteSize, YamlReader (yaml-cpp; ReadYamlConfig
+                for the daemon's own shape, ReadYamlSettings for any table -- keys,
+                values and line numbers, with nothing typed), FileOptions (applies
+                those settings through an OptionSpec table, so a file and a command
+                line reach a field by the same applier and precedence is the order
+                the two run in), ConfigReloader,
                 EnvExpand ($VAR/${VAR} in path settings), DefaultConfigPath
                 (per-platform config lookup + --seed-config, behind IConfigPathProbe)
   Metrics/      IMetricsSink + AtomicMetricsSink (counter-only by design; the
