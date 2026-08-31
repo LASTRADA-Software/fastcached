@@ -20,7 +20,16 @@
 #
 # ## The rule, and why it is exact rather than a heuristic
 #
-# **`Wire::EncodeErrorReply` appears exactly once in the file, inside `Refuse`.**
+# **`Wire::EncodeErrorReply` appears exactly once across the surfaces, inside
+# `Refuse`.**
+#
+# Two files are covered, because a worker has two 0xFC surfaces and an operator reads
+# their counters side by side: `WorkerProtocol.cpp` answers the verbs, and
+# `WorkerServer.cpp` answers before a verb is reached -- admission, capacity, the
+# in-flight budget, and the frame-level payload ceiling. That last one is the CHEAPEST
+# probe there is, needing only a header where the envelope refusals need a whole frame
+# read, so it is the likeliest thing to be pointed at a node and it counted nothing at
+# all ([#326](https://github.com/LASTRADA-Software/fastcached/issues/326)).
 #
 # It is exact because the three refusals that ALREADY counted -- the lease refusal,
 # the envelope error and the job refusal -- were routed through `Refuse` too, carrying
@@ -48,31 +57,41 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
 
-set(surface "${FASTCACHED_SOURCE_DIR}/src/apps/fastcache-cc/WorkerProtocol.cpp")
-if(NOT EXISTS "${surface}")
-    message(FATAL_ERROR "the compile surface is missing: ${surface}")
-endif()
+# The surfaces, and the number of `Refuse` definitions to expect across them. One:
+# `WorkerServer` calls the one `WorkerProtocol` defines, because two surfaces of one
+# worker must not hold two notions of what a refusal is.
+set(surfaces
+    "src/apps/fastcache-cc/WorkerProtocol.cpp"
+    "src/apps/fastcache-compile-node/WorkerServer.cpp")
+
+foreach(relative IN LISTS surfaces)
+    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")
+        message(FATAL_ERROR "a covered surface is missing: ${relative}")
+    endif()
+endforeach()
 
 # Read and split by hand rather than with `file(STRINGS)`, which returns a LIST: a
 # line containing a semicolon becomes two elements and every line number after it
 # drifts. C++ is made of semicolons, so this is not a corner case here.
-file(READ "${surface}" content)
-string(REPLACE ";" "\\;" content "${content}")
-string(REPLACE "\r\n" "\n" content "${content}")
-string(REPLACE "\n" ";" lines "${content}")
-
 set(callSites "")
-set(lineNumber 0)
-foreach(line IN LISTS lines)
-    math(EXPR lineNumber "${lineNumber} + 1")
+foreach(relative IN LISTS surfaces)
+    file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" content)
+    string(REPLACE ";" "\\;" content "${content}")
+    string(REPLACE "\r\n" "\n" content "${content}")
+    string(REPLACE "\n" ";" lines "${content}")
 
-    # Prose, not a call.
-    if(line MATCHES "^[ \t]*(//|///|\\*)")
-        continue()
-    endif()
-    if(line MATCHES "EncodeErrorReply[ \t]*\\(")
-        list(APPEND callSites "${lineNumber}")
-    endif()
+    set(lineNumber 0)
+    foreach(line IN LISTS lines)
+        math(EXPR lineNumber "${lineNumber} + 1")
+
+        # Prose, not a call.
+        if(line MATCHES "^[ \t]*(//|///|\\*)")
+            continue()
+        endif()
+        if(line MATCHES "EncodeErrorReply[ \t]*\\(")
+            list(APPEND callSites "${relative}:${lineNumber}")
+        endif()
+    endforeach()
 endforeach()
 
 list(LENGTH callSites siteCount)
@@ -82,7 +101,7 @@ list(LENGTH callSites siteCount)
 # into success, which is the direction this project keeps getting wrong.
 if(siteCount EQUAL 0)
     message("")
-    message("  No `EncodeErrorReply` call was found in WorkerProtocol.cpp at all.")
+    message("  No `EncodeErrorReply` call was found on either covered surface.")
     message("")
     message("`Refuse` is built on one, so zero means this scan is no longer looking at")
     message("what it thinks it is -- a renamed function, a moved file, a changed")
@@ -93,7 +112,7 @@ endif()
 if(NOT siteCount EQUAL 1)
     string(REPLACE ";" ", " where "${callSites}")
     message("")
-    message("  WorkerProtocol.cpp calls EncodeErrorReply at ${siteCount} places: lines ${where}")
+    message("  EncodeErrorReply is called at ${siteCount} places: ${where}")
     message("")
     message("Exactly one is allowed, inside `Refuse`, because that is what makes every")
     message("refusal on this surface move a counter. A refusal answered while nothing")

@@ -246,6 +246,17 @@ class IMetricsSink
         WorkerFramesRefusedNotPermitted,
         /// The payload did not decode into the fields its verb requires.
         WorkerFramesRefusedMalformedPayload,
+        /// The frame's own header declared a payload larger than this surface
+        /// accepts, so it was refused without being read.
+        ///
+        /// **The cheapest probe there is**, and the reason it needs its own counter
+        /// rather than leaning on the envelope refusals: this check needs a header,
+        /// where `WorkerJobsRefusedEnvelopeDeclaredTooLarge` needs a whole frame to
+        /// have been sent and read. An operator alerting only on the envelope series
+        /// watches a client hammer the node with oversized declarations, sees the
+        /// node refuse every one correctly, and concludes it is not being probed
+        /// (#326).
+        WorkerFramesRefusedPayloadTooLarge,
 
         /// Jobs refused while opening the request's codec envelope, one counter per
         /// reason — the same split, and for the same argument, that `EnvelopeError`

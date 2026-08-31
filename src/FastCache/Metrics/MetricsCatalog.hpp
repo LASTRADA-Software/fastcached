@@ -239,6 +239,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "requires: a version or encoding mismatch between two ends that agree "
               "on the framing.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_worker_frames_refused_payload_too_large_total",
+      .help = "Frames whose header declared a payload larger than this surface "
+              "accepts, refused without being read. The cheapest probe there is: it "
+              "needs only a header, where the envelope series needs a whole frame.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
       .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",
       .help = "Jobs refused because the request's codec envelope could not be "

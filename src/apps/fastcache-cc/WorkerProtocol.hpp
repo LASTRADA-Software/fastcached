@@ -23,6 +23,48 @@
 namespace FastCache::Cc
 {
 
+/// One refusal a 0xFC surface can answer with: the wire code a client acts on and the
+/// counter an operator watches, as ONE row.
+///
+/// **The row is the REFUSAL, not the code**, and that distinction is load-bearing.
+/// Two refusals on the compile surface both answer `MalformedFrame` and must not
+/// share a counter -- a truncated frame is a framing fault or a hostile peer, an
+/// undecodable payload is a version or encoding mismatch between two ends that agree
+/// on the framing. One code, because a client acts on both identically; two counters,
+/// because an operator does not. A table keyed on the code could not hold both, which
+/// is why `EnumTable<ErrorCode, Counter>` is the wrong instrument here
+/// ([#327](https://github.com/LASTRADA-Software/fastcached/issues/327)).
+///
+/// Shared by `WorkerProtocol` and `WorkerServer` rather than declared twice: they are
+/// two surfaces of one worker, an operator reads their counters side by side, and a
+/// second definition of "what a refusal is" is how the two would come to disagree.
+struct SurfaceRefusal
+{
+    CompileCacheWire::ErrorCode code; ///< What the client is told.
+    IMetricsSink::Counter counter;    ///< What the operator sees rise.
+};
+
+/// Answer a refusal, and record it.
+///
+/// **The one way a 0xFC surface refuses**, which is the point rather than a
+/// convenience: six refusals answered on the wire and incremented nothing, and a
+/// seventh would have joined them by omission. A refusal answered while nothing rises
+/// is indistinguishable, on `/metrics`, from a port nobody is talking to -- and the
+/// frame-level refusals are the CHEAPEST probe, needing only a header, so the easiest
+/// accident is the one that leaves the series flat (#326).
+///
+/// Taking a ROW rather than a code is what makes the counter impossible to forget:
+/// there is no argument to pass a bare `ErrorCode` to. `worker-refusals-counted`
+/// covers the door the type system cannot, since `EncodeErrorReply` is a free
+/// function every surface includes and stays callable.
+/// @param metrics Where the refusal is recorded.
+/// @param refusal Which refusal, as one row.
+/// @param detail Words for a person, or empty when there are none to add.
+/// @return The encoded reply.
+[[nodiscard]] std::vector<std::byte> Refuse(IMetricsSink& metrics,
+                                            SurfaceRefusal const& refusal,
+                                            std::string_view detail = {});
+
 /// Decide whether a lease token authorizes a job.
 ///
 /// Injected rather than called directly, because reading a cluster key and a wall
