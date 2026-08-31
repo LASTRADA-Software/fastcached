@@ -406,12 +406,11 @@ TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
 
 TEST_CASE("An oversize frame is refused with both numbers, and never buffered", "[node][scheduler]")
 {
-    // Membership is checked inside the service, i.e. AFTER the frame is read, so an
-    // unauthenticated peer can make this endpoint buffer whatever it declares. That is
-    // the hole `OpDescriptor::maxPayload` closes for AUTH on the cache port, and it is
-    // closed the same way here. The refusal names the ceiling, because "too large"
-    // without it tells an operator nothing about a 64 KiB limit -- and the check is on
-    // the DECLARED length, so the bytes are never taken.
+    // The refusal names the ceiling, because "too large" without it tells an operator
+    // nothing about a 64 KiB limit -- and the check is on the DECLARED length, so the
+    // bytes are never taken. (The small ceiling used to double as the bound on what a
+    // stranger could make this endpoint allocate, because membership was checked after
+    // the frame was read. `RefusePeer` closes that directly now; see below.)
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
@@ -462,6 +461,21 @@ class HoldableResponder final: public IFrameResponder
         co_return Wire::EncodeReply(Wire::Status::Miss, {});
     }
 
+    /// @copydoc IFrameResponder::RefusePeer
+    ///
+    /// Admits by default and counts every call, so a case can assert both that the
+    /// refusal fired and that it fired exactly ONCE -- an uncounted refusal and a
+    /// double-counted one are both worse than none, because the count is what an
+    /// operator reads to know the gate works.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view /*peer*/) const override
+    {
+        _peerChecks.fetch_add(1, std::memory_order_acq_rel);
+        if (!_refusePeers.load(std::memory_order_acquire))
+            return std::nullopt;
+        _peerRefusals.fetch_add(1, std::memory_order_acq_rel);
+        return Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not admitted");
+    }
+
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return 64ULL * 1024ULL;
@@ -493,6 +507,24 @@ class HoldableResponder final: public IFrameResponder
         _budget = budget;
     }
 
+    /// Refuse every peer before its payload is read.
+    void RefuseEveryPeer(bool refuse) noexcept
+    {
+        _refusePeers.store(refuse, std::memory_order_release);
+    }
+
+    /// @return How many requests were refused at the door.
+    [[nodiscard]] std::size_t PeerRefusals() const noexcept
+    {
+        return _peerRefusals.load(std::memory_order_acquire);
+    }
+
+    /// @return How many times the peer predicate was consulted at all.
+    [[nodiscard]] std::size_t PeerChecks() const noexcept
+    {
+        return _peerChecks.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] std::size_t Entered() const noexcept
     {
         return _entered.load(std::memory_order_acquire);
@@ -506,6 +538,11 @@ class HoldableResponder final: public IFrameResponder
   private:
     FastCache::IReactor* _reactor { nullptr };
     std::atomic<bool> _held { false };
+    std::atomic<bool> _refusePeers { false };
+    // Mutable because `RefusePeer` is `const` -- it is a predicate, and counting how
+    // often it was asked must not make it look like a mutator.
+    mutable std::atomic<std::size_t> _peerRefusals { 0 };
+    mutable std::atomic<std::size_t> _peerChecks { 0 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
     std::size_t _concurrent { 8 };
@@ -519,6 +556,90 @@ class HoldableResponder final: public IFrameResponder
 }
 
 } // namespace
+
+TEST_CASE("A peer the surface refuses never gets its payload read", "[node][frame]")
+{
+    // #285 and #377. The acceptance is deliberately NOT "the stranger is refused" --
+    // that passed while the bug was live, because the refusal happened either way,
+    // just after the frame had been read. What separates the two states is whether
+    // the bytes were taken first, so that is what this has to observe.
+    //
+    // **The instrument: declare a payload and send none of it.** With the gate ahead
+    // of the read, the refusal is decided from the header alone and comes back
+    // without a body. Without it, the server sits in `ReadExactly` waiting for bytes
+    // that will never arrive, answers nothing, and is eventually swept by its own
+    // `RequestTimeout` -- so the reply is empty. One state can answer; the other
+    // cannot answer at all. No timing threshold is involved in telling them apart.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RefuseEveryPeer(true);
+    // A budget the declared length exceeds, which pins the ORDER against the other
+    // pre-payload gate as well: if the peer check ran after the byte budget this
+    // would come back `EndpointBusy`, and a refusable peer would still be able to
+    // push the surface into answering `EndpointBusy` to the peers it does serve.
+    responder.Limit(8, 1024);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // Declared, never sent. Comfortably inside `MaxRequestBytes()`, so the size
+    // ceiling cannot be what refuses this -- the peer gate has to be.
+    constexpr std::uint32_t Declared = 32ULL * 1024ULL;
+    std::array<std::byte, Wire::RequestHeaderSize> frame {};
+    WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
+
+    auto const startedAt = std::chrono::steady_clock::now();
+    auto const reply = Exchange(port, frame);
+    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+
+    // Says WHICH failure it is when it fails. A refusal decided from the header
+    // requires no work at all, so a run that takes anything near `RequestTimeout`
+    // was blocked reading a payload -- whereas a slow machine still answers, just
+    // later. Reporting the number is what lets a reader tell those apart instead of
+    // guessing at a bare "no reply".
+    INFO("waited " << waited.count() << "ms for a refusal that costs no work; RequestTimeout is "
+                   << FrameServer::RequestTimeout.count() << "ms. An empty reply at roughly that figure is the "
+                   << "server blocked in ReadExactly for a payload it should never have asked for; an empty reply "
+                   << "well under it is something else, and a late but PRESENT reply is only a slow machine.");
+    REQUIRE_FALSE(reply.empty());
+    REQUIRE(ErrorOf(reply) == Wire::ErrorCode::NotAMember);
+
+    // The allocation claim rather than the refusal claim: the responder was never
+    // entered, so nothing downstream of the read ran.
+    CHECK(responder.Entered() == 0);
+    // Exactly one, per the counter rule: the surfaces that increment a metric inside
+    // this predicate would double-count every refusal if it were consulted twice.
+    CHECK(responder.PeerChecks() == 1);
+    CHECK(responder.PeerRefusals() == 1);
+}
+
+TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
+{
+    // The control. Without it a surface that refused EVERYTHING would satisfy the
+    // case above while serving nobody, and the gate would look like it worked.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RefuseEveryPeer(false);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const reply = Exchange(port, Fetch("admitted"));
+    REQUIRE_FALSE(reply.empty());
+
+    CHECK(responder.PeerRefusals() == 0);
+    CHECK(responder.PeerChecks() == 1);
+    CHECK(responder.Entered() == 1);
+    CHECK(responder.Answered() == 1);
+}
 
 TEST_CASE("A held answer does not stop another client being served", "[node][frame]")
 {

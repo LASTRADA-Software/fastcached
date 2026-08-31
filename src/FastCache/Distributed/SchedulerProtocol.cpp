@@ -54,6 +54,17 @@ namespace
                   "a refusal row for a verb this scheduler serves is dead: the lookup never reaches it");
 } // namespace
 
+std::optional<std::vector<std::byte>> SchedulerProtocol::RefusePeer(CallerContext const& caller) const
+{
+    auto const refusal = _service.RefuseUnlessMember(caller);
+    if (!refusal.has_value())
+        return std::nullopt;
+    // Encoded exactly as `Answer` encodes a refusal, so an early refusal and a late
+    // one are the same bytes on the wire -- a client must not be able to tell which
+    // side of the payload read it was refused on.
+    return Wire::EncodeErrorReply(refusal->error, refusal->message);
+}
+
 std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> frame, CallerContext const& caller)
 {
     auto const header = Wire::DecodeRequestHeader(frame);

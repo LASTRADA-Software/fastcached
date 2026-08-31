@@ -154,6 +154,17 @@ class SchedulerProtocol
     /// @return The encoded reply. Never empty: a refusal is still an answer.
     [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> frame, CallerContext const& caller);
 
+    /// Refuse a caller the surface will not serve, without seeing its request.
+    ///
+    /// The encoded form of `SchedulerService::RefuseUnlessMember`, for a transport
+    /// that wants the answer **before it buffers a payload** (#285). It exists here
+    /// rather than in the transport because encoding a `SchedulerReply` into wire
+    /// bytes is this class's job, and because the predicate must stay the service's
+    /// -- the transport asks, it does not decide.
+    /// @param caller Who is asking, gathered by the transport.
+    /// @return The encoded refusal, or nullopt when the caller is admitted.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(CallerContext const& caller) const;
+
   private:
     /// Decode one verb's payload and hand it to the service.
     ///

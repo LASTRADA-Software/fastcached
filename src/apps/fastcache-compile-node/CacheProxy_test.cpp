@@ -344,3 +344,42 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // operator whose peers stopped getting hits needs one number that says why.
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
 }
+
+TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the payload",
+          "[node][cache][membership][cache-locality]")
+{
+    // #285/#377 moved this decision ahead of the payload read, which means it is now
+    // reachable by two routes: `FrameServer` asks `RefusePeer` from the header, and
+    // `Answer` asks it again for the callers that hand over a whole frame. Two routes
+    // to one policy is how a gate drifts, and this pins that they cannot -- `Answer`
+    // DELEGATES rather than restating the rule.
+    Fixture fixture;
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder responder { fixture.proxy, locality, fixture.metrics };
+
+    SECTION("a stranger is refused from the header alone, and counted exactly once")
+    {
+        // The early route, with no frame in hand at all: this is what the server can
+        // ask before it has read a byte of payload.
+        auto const refusal = responder.RefusePeer("10.0.0.1");
+        REQUIRE(refusal.has_value());
+        CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::NotAMember);
+
+        // ONE, not two. The increment lives inside the predicate, so a `FrameServer`
+        // that asked early and an `Answer` that re-derived the rule would each charge
+        // it -- and the counter an operator reads to explain lost hits would report
+        // double the refusals that happened.
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
+    }
+
+    SECTION("and this machine is not refused, so the early gate is not a closed door")
+    {
+        // The control: a predicate that refused everyone would satisfy the section
+        // above while making the node's own cache unreachable, which is the failure
+        // #229 already paid for.
+        CHECK_FALSE(responder.RefusePeer("10.0.0.7").has_value());
+        CHECK_FALSE(responder.RefusePeer("127.0.0.1").has_value());
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 0);
+    }
+}

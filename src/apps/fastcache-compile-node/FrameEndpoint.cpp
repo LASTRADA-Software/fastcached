@@ -365,6 +365,32 @@ namespace
                     continue;
                 }
 
+                // Admission, BEFORE the budget is charged and before a payload byte
+                // is read. Third of three pre-payload refusals in this loop, and the
+                // same shape as the two around it: decided on what the header
+                // declared, answered as a reply, resynchronized by stepping over the
+                // body the peer said it was sending.
+                //
+                // Ordered ahead of the byte budget on purpose. A peer this surface
+                // will not serve should not be able to reach a resource decision at
+                // all -- otherwise a flood of refusable frames could still exhaust
+                // the budget and make the surface answer `EndpointBusy` to the peers
+                // it does serve, which is the denial reconstructed one step further
+                // out (#285, #377).
+                //
+                // The predicate belongs to the responder; this only asks it earlier.
+                if (auto refusal = state->responder.RefusePeer(peer); refusal.has_value())
+                {
+                    // Answered first, then drained, exactly as the two refusals below
+                    // and above are: draining first would make the reply contingent on
+                    // a peer finishing a write it may already have abandoned.
+                    if (!co_await WriteAll(socket.get(), *refusal))
+                        break;
+                    if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
+                        break;
+                    continue;
+                }
+
                 if (auto const budget = state->responder.MaxInFlightBytes();
                     budget != 0 && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
                 {
