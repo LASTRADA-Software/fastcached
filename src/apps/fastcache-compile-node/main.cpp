@@ -563,12 +563,6 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 
     auto const toolchainHost = Cc::MakeToolchainHost();
     auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
-    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, logger);
-    if (!toolchainsOrNone.has_value())
-        return ExitUsage;
-    // NOT const: a compiler patched under a running service makes this stale, and the
-    // heartbeat re-derives it (#238).
-    auto toolchains = *std::move(toolchainsOrNone);
 
     auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
 
@@ -611,6 +605,25 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
         bound->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
 
     IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
+
+    // Surveyed HERE rather than before the port is bound, and the order is the one
+    // socket activation already argues for a few lines up: do the cheap, fallible
+    // thing first. Binding costs microseconds and fails on a port another process
+    // holds; the survey reads every byte under every include root and has been
+    // measured exceeding 300 s on a cold Windows runner (#354). Surveyed first, a
+    // node with a port conflict walked its whole toolchain and only then said the
+    // address was taken.
+    //
+    // This is the safe half of #365. The rest of that ticket -- serving the cache
+    // tier while the survey runs -- moves this below the tiers, which is a larger
+    // change with a sharp edge: registration must still wait for a REAL fingerprint,
+    // because a node advertising a provisional one is #225.
+    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, logger);
+    if (!toolchainsOrNone.has_value())
+        return ExitUsage;
+    // NOT const: a compiler patched under a running service makes this stale, and the
+    // heartbeat re-derives it (#238).
+    auto toolchains = *std::move(toolchainsOrNone);
 
     // The scratch root is claimed EXCLUSIVELY, and it is the worker tier's alone.
     //
