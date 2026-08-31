@@ -161,6 +161,28 @@ struct NodeConfig
     /// accident.
     std::filesystem::path dashboardTokenFile;
 
+    /// File holding the credential the SCHEDULER verbs require, or empty for none.
+    ///
+    /// The inbound half of `--requirepass`, which is outbound only -- that flag is
+    /// the secret this node *presents* when it registers, and until #289 nothing on
+    /// the receiving side ever checked one. So a scheduler port reachable from the
+    /// network served `Register`, `Lease` and the cluster verbs to anyone who could
+    /// open a socket to it; membership is an anti-leeching rule about which hosts an
+    /// operator listed, not a credential.
+    ///
+    /// A FILE for the reason `dashboardTokenFile` is one: a command line is readable
+    /// through `ps`. Unlike the dashboard's, this secret is deliberately the SAME one
+    /// every member already holds as `--requirepass` -- that is what it is for, and a
+    /// separate one would mean distributing two.
+    ///
+    /// **A bearer token, so its confidentiality rests on the transport.** Anyone who
+    /// can read the wire can replay it, exactly as for `--requirepass` and the
+    /// dashboard credential. That is a property of the scheme rather than a defect in
+    /// it, and a MAC would not fix it: this credential authenticates a connection
+    /// this process terminates, so there is nothing for a signature to bind that the
+    /// connection does not already establish.
+    std::filesystem::path schedulerTokenFile;
+
     /// Certificate the admin surface serves TLS with, or empty for plaintext.
     ///
     /// Spelled as the daemon spells it, because an operator copies these between

@@ -37,13 +37,22 @@ namespace
     /// This surface's rows. The shape, the lookup and why they exist are on
     /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
     ///
-    /// `Auth`, because a `FASTCACHE_TOKEN` client had every `LEASE` declined and
-    /// compiled locally forever -- a green build, and a fleet distributing nothing.
-    constexpr std::array RefusedVerbs {
-        Wire::RefusedVerb { .op = Wire::Op::Auth,
-                            .code = Wire::UnimplementedVerb,
-                            .why = "this endpoint schedules and checks no credential" },
-    };
+    /// **Empty since #289**, and the removal is the point. The row that was here said
+    /// `Auth` was `UnimplementedVerb` -- "this endpoint schedules and checks no
+    /// credential" -- which was true and is not any more: the scheduler surface
+    /// terminates `AUTH` in `FrameServer`'s loop, because what that verb changes is
+    /// per-connection state and this class is deliberately stateless.
+    ///
+    /// Leaving the row would have been the exact failure the rulebook records twice
+    /// (#283, #340): `UnimplementedVerb` tells `Cc::CacheProtocol::Exchange` to step
+    /// over the refusal and proceed UNAUTHENTICATED, so a launcher holding the right
+    /// token would have skipped presenting it and then had every gated verb refused --
+    /// a green build and a fleet distributing nothing, which is the shape the removed
+    /// row was itself added to fix, pointing the other way.
+    ///
+    /// Kept as an empty table rather than deleted so the next verb this surface
+    /// refuses is a row, not a `case`.
+    constexpr std::array<Wire::RefusedVerb, 0> RefusedVerbs {};
 
     // The table is consulted only on the path a verb this scheduler does NOT serve
     // takes, so a row naming one it does serve is never read -- it would sit there

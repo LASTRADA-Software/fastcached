@@ -719,6 +719,19 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "cluster_key_file",
         },
         {
+            .primary = "--scheduler-token-file",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::schedulerTokenFile, ParsePathValue>(),
+            .description = "credential this node REQUIRES on its scheduler verbs.\n"
+                           "The inbound half of --requirepass, which only says\n"
+                           "what this node presents. A FILE and not a flag: a\n"
+                           "command line is readable through ps. Without it,\n"
+                           "membership is the only gate, and that is a host list,\n"
+                           "not a secret.",
+            .yamlKey = "scheduler_token_file",
+        },
+        {
             .primary = "--admin-listen",
             .arity = Arity::Value,
             .operand = "=[<address>:]<port>",
@@ -1151,6 +1164,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // The PATH, never the secret it holds -- the same rule `--requirepass` is
     // refused outright by, one step less strict because a path is not a credential.
     emitPathIfSet("dashboard-token-file", cfg.dashboardTokenFile.string());
+    emitPathIfSet("scheduler-token-file", cfg.schedulerTokenFile.string());
     if (cfg.tlsSelfSigned)
         argv.emplace_back("--tls-self-signed");
     emitPathIfSet("tls-cert", cfg.tlsCertFile.string());

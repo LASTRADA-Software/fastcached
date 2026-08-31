@@ -58,7 +58,7 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
     };
 }
 
-std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
+std::expected<std::string, std::string> ReadSecretFile(std::filesystem::path const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file)
@@ -88,7 +88,15 @@ std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::
                                              "worse than none, because the surface looks guarded",
                                              path.string()) };
 
-    return AdminCredential { std::move(secret) };
+    return secret;
+}
+
+std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
+{
+    // The reading is shared with `--scheduler-token-file` (#289); what differs is
+    // only what the secret becomes. Written once, so the trailing-newline rule and
+    // the empty-file refusal cannot hold for one credential and not the other.
+    return ReadSecretFile(path).transform([](std::string secret) { return AdminCredential { std::move(secret) }; });
 }
 
 namespace

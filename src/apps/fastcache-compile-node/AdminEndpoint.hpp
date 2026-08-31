@@ -111,6 +111,19 @@ struct NodeScrapeSources
 /// file works without the operator having to know that.
 /// @param path Where the secret is.
 /// @return The credential, or why it could not be used.
+/// Read a secret an operator put in a file.
+///
+/// Trailing newlines are trimmed because every editor adds one and an operator
+/// should not have to know that a secret which looks right is a byte longer than the
+/// one they typed. Leading whitespace is NOT trimmed -- no editor adds it, and a
+/// secret that legitimately begins with a space would otherwise silently be a
+/// different secret. An empty file is refused: a credential nobody can fail to match
+/// is worse than none, because the surface still looks guarded.
+///
+/// @param path The file to read.
+/// @return The secret, or why it could not be used.
+[[nodiscard]] std::expected<std::string, std::string> ReadSecretFile(std::filesystem::path const& path);
+
 [[nodiscard]] std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path);
 
 /// The routes that serve the fleet dashboard.

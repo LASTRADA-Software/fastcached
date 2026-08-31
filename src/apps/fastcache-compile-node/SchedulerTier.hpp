@@ -5,6 +5,7 @@
 #include "NodeConfig.hpp"
 #include "Responders.hpp"
 
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -120,7 +121,8 @@ class SchedulerTier
                   IWallClock const& wallClock,
                   IMetricsSink& metrics,
                   ILogger& logger,
-                  std::span<std::byte const> signingKey);
+                  std::span<std::byte const> signingKey,
+                  std::shared_ptr<AuthPolicy const> policy);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.

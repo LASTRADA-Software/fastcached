@@ -4,6 +4,7 @@
 #include "CacheProxy.hpp"
 #include "FrameEndpoint.hpp"
 
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -22,9 +23,19 @@ class SchedulerResponder final: public IFrameResponder
   public:
     /// @param protocol Answers each request; must outlive this.
     /// @param membership Decides who may spend the fleet's capacity; must outlive this.
-    SchedulerResponder(Distributed::SchedulerProtocol& protocol, Distributed::IMembershipOracle const& membership) noexcept:
+    /// @param policy The credential this surface requires, or nullptr for none.
+    ///        Shared rather than referenced because "there is no credential" has to
+    ///        be representable, and a null reference is not
+    ///        ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
+    /// @param metrics Where a refused credential is counted; must outlive this.
+    SchedulerResponder(Distributed::SchedulerProtocol& protocol,
+                       Distributed::IMembershipOracle const& membership,
+                       IMetricsSink& metrics,
+                       std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
         _protocol { protocol },
-        _membership { membership }
+        _membership { membership },
+        _metrics { metrics },
+        _policy { std::move(policy) }
     {
     }
 
@@ -52,6 +63,40 @@ class SchedulerResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const override
     {
         return _protocol.RefusePeer(Context(peer));
+    }
+
+    /// @copydoc IFrameResponder::AuthRequired
+    ///
+    /// **Membership is not a credential.** It answers "is this host one an operator
+    /// listed", which a host that is not on the list can satisfy by being on the
+    /// network the list was written for -- so it is an anti-leeching rule, and #289
+    /// is what makes the scheduler verbs safe on a port that faces one.
+    [[nodiscard]] bool AuthRequired() const noexcept override
+    {
+        return _policy != nullptr && _policy->Enabled();
+    }
+
+    /// @copydoc IFrameResponder::CheckCredential
+    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    {
+        return FastCache::CheckCredential(_policy.get(), payload);
+    }
+
+    /// @copydoc IFrameResponder::RefusalReply
+    ///
+    /// The credential refusal is the one this surface counts. It is deliberately the
+    /// only counted arm: a size or opcode refusal says the peer is confused, an
+    /// unauthenticated one says somebody is reaching for verbs they hold no secret
+    /// for, and an operator watching for the second does not want the first summed
+    /// into it.
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const override
+    {
+        if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
+            _metrics.Increment(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated);
+
+        // No detail. What a message could add is which verb the caller failed to
+        // reach, and an unauthenticated peer learns nothing from being told that.
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
 
     /// Kilobytes, not megabytes.
@@ -103,6 +148,8 @@ class SchedulerResponder final: public IFrameResponder
 
     Distributed::SchedulerProtocol& _protocol;
     Distributed::IMembershipOracle const& _membership;
+    IMetricsSink& _metrics;
+    std::shared_ptr<AuthPolicy const> _policy;
 };
 
 /// Serves this node's own cache tier to clients on this machine, and to nobody else.
@@ -181,6 +228,43 @@ class CacheResponder final: public IFrameResponder
         _metrics.Increment(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
                                                   "this node serves its cache to its own machine only");
+    }
+
+    /// @copydoc IFrameResponder::AuthRequired
+    ///
+    /// **No**, and stated rather than inherited. This surface is already closed to
+    /// everyone but this machine (#287), so the peer gate above refuses every caller
+    /// a credential could -- and a credential here would have to be readable by every
+    /// local build, which makes it one an attacker who is already local can read too.
+    ///
+    /// The interface is pure virtual precisely so this answer has to be written down:
+    /// a default would let a surface added later inherit an open door by saying
+    /// nothing, which is the shape this codebase records as reopening a hole by
+    /// omission.
+    [[nodiscard]] bool AuthRequired() const noexcept override
+    {
+        return false;
+    }
+
+    /// @copydoc IFrameResponder::CheckCredential
+    ///
+    /// There is no policy, so this answers `NoPolicy` for every payload: `Ok`, and
+    /// nothing verified. That is what keeps a token-configured launcher working
+    /// against a node whose cache requires none -- the same reason the daemon answers
+    /// AUTH `Ok` when auth is off.
+    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    {
+        return FastCache::CheckCredential(nullptr, payload);
+    }
+
+    /// @copydoc IFrameResponder::RefusalReply
+    ///
+    /// Nothing to count: this surface requires no credential, so it can never
+    /// produce the one refusal that carries a counter. The size and opcode arms are
+    /// framing errors and are already visible as such to the peer.
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const override
+    {
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
 
     /// Megabytes, because a STORE carries a whole object file.

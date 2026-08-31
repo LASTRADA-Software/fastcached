@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "AdminEndpoint.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 
 #include <cstddef>
+#include <format>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,7 +19,8 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              IWallClock const& wallClock,
                              IMetricsSink& metrics,
                              ILogger& logger,
-                             std::span<std::byte const> signingKey):
+                             std::span<std::byte const> signingKey,
+                             std::shared_ptr<AuthPolicy const> policy):
     _service { clock, wallClock, metrics, logger, signingKey },
     _protocol { _service },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
@@ -23,7 +28,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // two surfaces would admit a peer to the fleet and refuse it the objects that
     // fleet produced. It also outlives this tier, which is what lets a node serve a
     // cache with no scheduler at all.
-    _responder { _protocol, membership }
+    _responder { _protocol, membership, metrics, std::move(policy) }
 {
     // Standalone leadership, which is now a DEFAULT rather than a placeholder. A node
     // with no `--node-id` runs no consensus and is the only scheduler there is: it
@@ -64,8 +69,23 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
         signingKey = std::move(*key);
     }
 
-    auto tier =
-        std::unique_ptr<SchedulerTier> { new SchedulerTier { membership, clock, wallClock, metrics, logger, signingKey } };
+    // The credential this surface REQUIRES, which is the inbound half of
+    // `--requirepass` (#289). Absent is legal and means membership is the only gate;
+    // unreadable is fatal, for the reason the key file is -- an operator who named a
+    // token file and got an unauthenticated scheduler has a port that looks guarded.
+    std::shared_ptr<AuthPolicy const> policy;
+    if (!cfg.schedulerTokenFile.empty())
+    {
+        auto secret = ReadSecretFile(cfg.schedulerTokenFile);
+        if (!secret.has_value())
+            return std::unexpected { std::format("--scheduler-token-file {}", secret.error()) };
+        // No username: every in-tree client presents the `requirepass` form, and
+        // `CheckCredential` matches on the secret alone when none is given.
+        policy = std::make_shared<AuthPolicy const>(std::string {}, std::move(*secret));
+    }
+
+    auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
+        membership, clock, wallClock, metrics, logger, signingKey, std::move(policy) } };
 
     // The surface, not an address. A bare port binds the WILDCARD here, the opposite
     // of the cache's loopback, and that asymmetry is now a column of this surface's

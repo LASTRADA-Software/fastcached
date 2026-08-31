@@ -326,6 +326,20 @@ class IMetricsSink
         /// to "is this happening to me".
         NodeCacheRequestsRefusedNotLocal,
 
+        /// Scheduler requests refused because the connection presented no accepted
+        /// credential.
+        ///
+        /// Counted at the pre-payload gate, so it rises for a frame whose body was
+        /// never read. Only a surface with `--scheduler-token-file` configured can
+        /// move it: with no credential set there is nothing to fail, and the counter
+        /// stays at zero -- which is the honest answer to "is my scheduler port
+        /// guarded", because zero here plus a non-loopback bind means it is not.
+        ///
+        /// Never sum with `WorkerJobsRefusedNotAMember`: that one says a host was not
+        /// on the operator's list, this one says a caller held no secret. A fleet peer
+        /// with a stale token moves this and not that.
+        SchedulerRequestsRefusedUnauthenticated,
+
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those
         /// keys were never published.

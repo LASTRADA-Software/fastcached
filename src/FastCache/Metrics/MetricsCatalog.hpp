@@ -300,6 +300,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "surface is bound to and whatever the member list says. Stays at zero on the "
               "default loopback bind; a rise means something off-box is asking.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
+      .prometheusName = "fastcache_scheduler_requests_refused_unauthenticated_total",
+      .help = "Scheduler requests refused because the connection presented no "
+              "accepted credential. Zero while no --scheduler-token-file is set, "
+              "because there is then nothing to fail -- so zero here on a "
+              "non-loopback bind means the port is open, not that it is quiet.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
       .help = "Reclaimed keys whose expired/evicted keyspace event was never published, because "

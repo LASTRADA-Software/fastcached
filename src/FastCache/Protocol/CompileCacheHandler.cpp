@@ -3,6 +3,7 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/CompileCacheAuth.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
@@ -226,35 +227,35 @@ namespace
                                         std::vector<std::byte> payload,
                                         bool* credentialAccepted)
     {
-        auto const fields = Wire::DecodeAuthPayload(payload);
-        if (!fields.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
-
-        if (policy == nullptr || !policy->Enabled())
+        // The decision is shared with the compile node's frame server, which
+        // terminates this verb too (#289); what stays here is how to ANSWER it.
+        switch (CheckCredential(policy.get(), payload))
         {
-            // Auth is off, so there is no credential to check and nothing to
-            // refuse. Answering Ok rather than an error keeps a token-configured
-            // launcher working against a server that does not require one — the
-            // alternative would make enabling a token on the client a breaking
-            // change against every unauthenticated daemon.
-            //
-            // `credentialAccepted` is deliberately NOT set: nothing was verified.
-            // Setting it would mean a SIGHUP that later enables auth blesses this
-            // connection on the strength of a check that never ran — the same hole
-            // as seeding the flag from the policy, reached from the other side.
-            // Nothing is lost, because while auth is off the gate never reads it.
-            co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
-        }
+            case CredentialOutcome::Malformed:
+                co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
 
-        auto const username = Wire::AsStringView(fields->username);
-        auto const secret = Wire::AsStringView(fields->secret);
-        // An empty username asks to be checked against the secret alone (the redis
-        // `requirepass` form), so a client configured with only a token is not
-        // locked out of a server that also names a user.
-        bool const ok = username.empty() ? policy->Verify(secret) : policy->Verify(username, secret);
-        if (!ok)
-            co_return co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, "authentication failed") ? Next::Continue
-                                                                                                             : Next::Abort;
+            case CredentialOutcome::NoPolicy:
+                // Auth is off, so there is no credential to check and nothing to
+                // refuse. Answering Ok rather than an error keeps a token-configured
+                // launcher working against a server that does not require one — the
+                // alternative would make enabling a token on the client a breaking
+                // change against every unauthenticated daemon.
+                //
+                // `credentialAccepted` is deliberately NOT set: nothing was verified.
+                // Setting it would mean a SIGHUP that later enables auth blesses this
+                // connection on the strength of a check that never ran — the same hole
+                // as seeding the flag from the policy, reached from the other side.
+                // Nothing is lost, because while auth is off the gate never reads it.
+                co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
+
+            case CredentialOutcome::Rejected:
+                co_return co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, "authentication failed")
+                    ? Next::Continue
+                    : Next::Abort;
+
+            case CredentialOutcome::Accepted:
+                break;
+        }
 
         *credentialAccepted = true;
         co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
@@ -561,25 +562,39 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
         // exists to deny — defeating it through the one door it holds open.
         //
         // Drained and answered rather than closed, like every other refusal here.
-        if (auto const opCap = Wire::OpPayloadCap(header->opRaw, session.maxPayloadBytes); header->payloadLength > opCap)
+        // Both pre-payload refusals, from one predicate. The ceiling and the
+        // credential were two hand-written checks here and nowhere else; the compile
+        // node's frame server has the same loop and needed the same rule, so the rule
+        // moved into the header both surfaces already share rather than being written
+        // a second time (#289). `DecidePrePayload` also fixes the ORDER -- bound
+        // first, then gate -- which is what stops a peer declaring the session cap on
+        // the one verb the gate deliberately holds open.
+        auto const decision = Wire::DecidePrePayload({ .opRaw = header->opRaw,
+                                                       .declaredLength = header->payloadLength,
+                                                       .sessionCap = session.maxPayloadBytes,
+                                                       .authRequired = authRequired,
+                                                       .credentialAccepted = credentialAccepted });
+        if (decision != Wire::PrePayloadDecision::Serve)
         {
-            auto message = std::format(
-                "declared payload {} bytes exceeds the {} cap of {}", header->payloadLength, descriptor->name, opCap);
-            session.LogFrameDrop(
-                ProtocolLabel,
-                ProtocolError { .code = ProtocolErrorCode::PayloadTooLarge, .context = std::string { message } });
-            if (!(co_await reader.Skip(header->payloadLength)).has_value())
-                co_return;
-            if (!co_await ReplyError(socket, Wire::ErrorCode::PayloadTooLarge, std::move(message)))
-                co_return;
-            continue;
-        }
+            // Only the size refusal says more than its code does. The credential
+            // refusal deliberately carries no detail: what it would have to say is
+            // which verb the peer failed to reach, and an unauthenticated caller
+            // learns nothing here it did not already know.
+            auto message = decision == Wire::PrePayloadDecision::PayloadTooLarge
+                               ? std::format("declared payload {} bytes exceeds the {} cap of {}",
+                                             header->payloadLength,
+                                             descriptor->name,
+                                             Wire::OpPayloadCap(header->opRaw, session.maxPayloadBytes))
+                               : std::string {};
+            if (decision == Wire::PrePayloadDecision::PayloadTooLarge)
+                session.LogFrameDrop(ProtocolLabel,
+                                     ProtocolError { .code = ProtocolErrorCode::PayloadTooLarge, .context = message });
 
-        if (authRequired && !credentialAccepted && !Wire::IsPreAuthAllowed(header->opRaw))
-        {
+            // Drained before answering, which is this surface's convention for every
+            // refusal in this loop. Unchanged from the two branches this replaced.
             if (!(co_await reader.Skip(header->payloadLength)).has_value())
                 co_return;
-            if (!co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, {}))
+            if (!co_await ReplyError(socket, Wire::ErrorCodeFor(decision), std::move(message)))
                 co_return;
             continue;
         }

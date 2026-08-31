@@ -390,7 +390,7 @@ TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable")
     CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Fetch)));
     CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::Store)));
 
-    auto const openVerbs = std::ranges::count_if(OpTable, [](auto const& row) { return row.preAuth; });
+    auto const openVerbs = std::ranges::count_if(OpTable, [](auto const& row) { return row.preAuth.Allowed(); });
     CHECK(openVerbs == 1);
 }
 
@@ -927,4 +927,104 @@ TEST_CASE("A history batch above the ceiling is refused, not truncated", "[wire]
         overSized.emplace_back(owned.back());
     }
     CHECK_FALSE(DecodeHistoryBuckets(WireFields::Encode(WireFields::FieldList { overSized })).has_value());
+}
+
+TEST_CASE("The pre-payload gate refuses an unknown opcode before anything else", "[wire][prepayload]")
+{
+    // Total by design, and the header says why: an earlier draft took a RESOLVED
+    // opcode as a precondition, which left the node's loop -- the one surface that
+    // does not resolve opcodes before reading -- free to buffer the whole request cap
+    // for opcode 0xFF from an unauthenticated peer. Asked for every byte value, that
+    // hole cannot be reconstructed.
+    //
+    // Asserted with the gate OFF as well, because that is the configuration the hole
+    // was reachable in: a surface with no credential still must not buffer for a verb
+    // it cannot name.
+    constexpr std::uint8_t NoSuchVerb = 0xFF;
+    static_assert(FindOp(NoSuchVerb) == nullptr, "0xFF must stay unassigned for this case to mean anything");
+
+    CHECK(DecidePrePayload({ .opRaw = NoSuchVerb,
+                             .declaredLength = 16,
+                             .sessionCap = 64 * 1024,
+                             .authRequired = false,
+                             .credentialAccepted = false })
+          == PrePayloadDecision::UnknownOpcode);
+    CHECK(DecidePrePayload({ .opRaw = NoSuchVerb,
+                             .declaredLength = 16,
+                             .sessionCap = 64 * 1024,
+                             .authRequired = true,
+                             .credentialAccepted = true })
+          == PrePayloadDecision::UnknownOpcode);
+}
+
+TEST_CASE("A gated verb is refused without a credential and served with one", "[wire][prepayload]")
+{
+    // BOTH halves, and the second is the one that matters. A gate that refused
+    // everything would satisfy the first on its own while serving nobody, and would
+    // look exactly like a working credential check -- which is the shape #355 exists
+    // to refuse.
+    constexpr auto Gated = static_cast<std::uint8_t>(Op::Lease);
+    static_assert(!OpTable[static_cast<std::size_t>(Op::Lease)].preAuth.Allowed(),
+                  "this case is about a verb the gate covers");
+
+    auto const request = [](bool authRequired, bool accepted) {
+        return PrePayloadRequest { .opRaw = Gated,
+                                   .declaredLength = 16,
+                                   .sessionCap = 64 * 1024,
+                                   .authRequired = authRequired,
+                                   .credentialAccepted = accepted };
+    };
+
+    CHECK(DecidePrePayload(request(true, false)) == PrePayloadDecision::Unauthenticated);
+    CHECK(DecidePrePayload(request(true, true)) == PrePayloadDecision::Serve);
+
+    // A surface with no credential configured serves it, which is what keeps turning
+    // a token on at a client from being a breaking change against a server needing
+    // none.
+    CHECK(DecidePrePayload(request(false, false)) == PrePayloadDecision::Serve);
+
+    // The transposition the request STRUCT exists to prevent, pinned as behaviour so
+    // it is caught even if somebody flattens the parameters back out: the two flags
+    // are adjacent booleans, and swapping them turns a refusal into a Serve.
+    CHECK(DecidePrePayload(request(true, false)) != DecidePrePayload(request(false, true)));
+}
+
+TEST_CASE("AUTH itself is reachable before a credential exists, and still bounded", "[wire][prepayload]")
+{
+    // Otherwise the gate is a deadlock: the verb that establishes the credential
+    // would need the credential.
+    constexpr auto Auth = static_cast<std::uint8_t>(Op::Auth);
+    CHECK(DecidePrePayload({ .opRaw = Auth,
+                             .declaredLength = 16,
+                             .sessionCap = 64 * 1024,
+                             .authRequired = true,
+                             .credentialAccepted = false })
+          == PrePayloadDecision::Serve);
+
+    // And bounded by its OWN ceiling rather than the session's, which is the whole
+    // reason a pre-auth verb carries one: the session cap here is far larger, so a
+    // reply of PayloadTooLarge can only have come from `MaxAuthPayload`.
+    CHECK(DecidePrePayload({ .opRaw = Auth,
+                             .declaredLength = MaxAuthPayload + 1,
+                             .sessionCap = 64 * 1024,
+                             .authRequired = true,
+                             .credentialAccepted = false })
+          == PrePayloadDecision::PayloadTooLarge);
+}
+
+TEST_CASE("The size ceiling is decided before the credential, not after", "[wire][prepayload]")
+{
+    // Ordering, and it is deliberate rather than incidental. Refusing on auth first
+    // would let a peer that merely holds a connection open declare an enormous
+    // payload for a pre-auth verb and take exactly the allocation this gate denies.
+    //
+    // The observable consequence: an oversize frame from an UNAUTHENTICATED peer
+    // reports the size, not the credential.
+    constexpr auto Gated = static_cast<std::uint8_t>(Op::Lease);
+    CHECK(DecidePrePayload({ .opRaw = Gated,
+                             .declaredLength = 1024 * 1024,
+                             .sessionCap = 64 * 1024,
+                             .authRequired = true,
+                             .credentialAccepted = false })
+          == PrePayloadDecision::PayloadTooLarge);
 }

@@ -391,6 +391,58 @@ enum class ErrorCode : std::uint8_t
     return static_cast<std::uint8_t>(1U << static_cast<unsigned>(status));
 }
 
+/// Whether a verb may be served before a credential has been accepted.
+///
+/// **A type rather than a `bool`, so that a row which does not state its
+/// classification fails to COMPILE** ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
+/// The default constructor is deleted, which makes an aggregate row that omits
+/// `.preAuth` ill-formed: designated initializers value-initialize an omitted
+/// member, and a class with no default constructor cannot be value-initialized.
+///
+/// A defaulted `bool` was not enough, and the distinction is the whole point. It
+/// defaulted to `false` -- closed, which is the right direction -- but "the author
+/// did not think about it" and "the author decided this verb needs a credential"
+/// then produce identical text, so the table can no longer be read as a record of
+/// decisions. That is the same failure this codebase records as reopening a hole by
+/// omission, and the reason the pre-auth set is a table column at all: what an
+/// unauthenticated peer can reach must be readable off the table, and a silent
+/// default is not readable.
+///
+/// Spelled at each row as `OpenBeforeAuth` or `RequiresAuth` rather than as a
+/// boolean, because `.preAuth = RequiresAuth` reads as an absence and `.preAuth =
+/// RequiresAuth` reads as a decision.
+class PreAuth
+{
+  public:
+    /// Deleted on purpose: a row must state its classification. See the class
+    /// comment -- this deletion IS the acceptance criterion of #289.
+    PreAuth() = delete;
+
+    /// @param allowed True when an unauthenticated peer may reach this verb.
+    constexpr explicit PreAuth(bool allowed) noexcept:
+        _allowed { allowed }
+    {
+    }
+
+    /// @return True when an unauthenticated peer may reach this verb.
+    [[nodiscard]] constexpr bool Allowed() const noexcept
+    {
+        return _allowed;
+    }
+
+  private:
+    bool _allowed;
+};
+
+/// This verb is reachable by a peer that has not presented a credential.
+///
+/// Every one of these is a hole held deliberately open, so each must also declare a
+/// `maxPayload` -- `PreAuthVerbsAreBounded` refuses the table otherwise.
+inline constexpr PreAuth OpenBeforeAuth { true };
+
+/// This verb is refused until a credential has been accepted.
+inline constexpr PreAuth RequiresAuth { false };
+
 /// One row of the opcode table: everything the framing layer knows about a verb.
 struct OpDescriptor
 {
@@ -403,9 +455,8 @@ struct OpDescriptor
     /// A column rather than a predicate with its own `switch`: "which verbs are
     /// reachable by an unauthenticated peer" is the security-relevant property of
     /// the whole table, and a reviewer must be able to read it off the table
-    /// itself. A verb added without thinking about it defaults to `false` —
-    /// closed, which is the direction a mistake here has to fail in.
-    bool preAuth;
+    /// itself. A row that does not state it does not compile -- see `PreAuth`.
+    PreAuth preAuth;
     /// Largest payload this verb may declare, or 0 for "the session cap".
     ///
     /// A verb reachable *before* authentication MUST declare a real bound, and
@@ -547,20 +598,20 @@ inline constexpr std::array OpTable {
                    .name = "store",
                    .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = 0 }, // an object file; bounded by the operator's cap
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
                    .fieldCount = 1, // key
                    .legalStatuses =
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = 0 },
     OpDescriptor { .code = Op::Auth,
                    .name = "auth",
                    .fieldCount = 2, // username, secret
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = true,
+                   .preAuth = OpenBeforeAuth,
                    .maxPayload = MaxAuthPayload },
 
     // Distributed execution. None is `preAuth`: causing a compiler to run on
@@ -569,55 +620,55 @@ inline constexpr std::array OpTable {
                    .name = "register",
                    .fieldCount = 5, // fingerprint, endpoint, u32 slots, accepted codecs, capacity
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Heartbeat,
                    .name = "heartbeat",
                    .fieldCount = 3, // workerId, u32 inFlight, load
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
                    .fieldCount = 3, // fingerprint, key, accepted codecs
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Release,
                    .name = "release",
                    .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::ClusterStatus,
                    .name = "cluster-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::ClusterSet,
                    .name = "cluster-set",
                    .fieldCount = 2, // setting name, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 2, // member id, consensus endpoint
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = MaxControlPayload },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
-                   .preAuth = false,
+                   .preAuth = RequiresAuth,
                    .maxPayload = 0 }, // carries a preprocessed TU; the operator's cap governs
 };
 
@@ -629,7 +680,8 @@ inline constexpr std::array OpTable {
 /// @return True when no `preAuth` row leaves `maxPayload` at 0.
 [[nodiscard]] constexpr bool PreAuthVerbsAreBounded() noexcept
 {
-    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) { return !row.preAuth || row.maxPayload != 0; });
+    return std::ranges::all_of(OpTable,
+                               [](OpDescriptor const& row) { return !row.preAuth.Allowed() || row.maxPayload != 0; });
 }
 
 static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must declare its own payload ceiling");
@@ -837,7 +889,100 @@ static_assert(FieldCountsAgree(), "a verb carries fields, or is listed as carryi
 [[nodiscard]] constexpr bool IsPreAuthAllowed(std::uint8_t opRaw) noexcept
 {
     auto const* row = FindOp(opRaw);
-    return row != nullptr && row->preAuth;
+    return row != nullptr && row->preAuth.Allowed();
+}
+
+/// What a surface must do with a frame, decided from its HEADER alone.
+///
+/// One value per outcome rather than a `bool`, because "serve it", "it declared too
+/// much" and "it has not authenticated" are three different answers that a caller
+/// reports differently, and collapsing them is how a refusal comes to be counted as
+/// the wrong thing.
+enum class PrePayloadDecision : std::uint8_t
+{
+    Serve,           ///< Read the declared payload and answer the verb.
+    UnknownOpcode,   ///< No row in `OpTable`; nothing can be known about it.
+    PayloadTooLarge, ///< More than this verb may carry, whoever is asking.
+    Unauthenticated, ///< Not reachable until a credential has been accepted.
+};
+
+/// Everything the pre-payload decision depends on.
+///
+/// A struct rather than five positional parameters: `authRequired` and
+/// `credentialAccepted` are both `bool` and adjacent, so at a call site they are one
+/// transposition away from a gate that admits exactly the peers it should refuse --
+/// and that transposition compiles and passes any test whose surface has no
+/// credential configured.
+struct PrePayloadRequest
+{
+    std::uint8_t opRaw {};           ///< Third header byte. MUST already resolve via `FindOp`.
+    std::uint32_t declaredLength {}; ///< What the header says the payload is.
+    std::size_t sessionCap {};       ///< The operator's configured per-frame maximum.
+    bool authRequired {};            ///< Whether this surface has a credential configured at all.
+    bool credentialAccepted {};      ///< Whether THIS connection has presented it.
+};
+
+/// Decide a frame's fate before a payload byte is read.
+///
+/// **The one place both surfaces spell this rule.** The daemon's `0xFC` handler and
+/// the compile node's frame server each have a read loop, each has to answer the
+/// same question in the same order, and each used to answer it in its own code. That
+/// is the arrangement that produced three refusal tables which drifted (#283, #340);
+/// this is one predicate with two callers instead
+/// ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
+///
+/// **The ceiling is checked BEFORE the credential, and the order is load-bearing.**
+/// `Op::Auth` is deliberately reachable unauthenticated, so if the credential gate
+/// ran first a peer could declare the whole session cap on the one verb the gate
+/// holds open and get exactly the allocation the gate exists to deny. Bounding first
+/// means a pre-auth verb is bounded whoever is asking.
+///
+/// The two are not otherwise ordered by preference: telling an unauthenticated peer
+/// that its declared length exceeded a published constant discloses nothing, because
+/// the constant is in this header and this header ships inside `fastcache-cc`.
+///
+/// **Total, so an unknown verb is refused rather than buffered.** An earlier draft
+/// took a resolved opcode as a precondition, which left the node's loop -- the one
+/// surface that does not resolve opcodes before reading -- free to buffer the whole
+/// request cap for opcode `0xFF` from an unauthenticated peer, reconstructing the
+/// exact hole this gate closes. Answering the question for every byte value is what
+/// removes that, and it costs one enumerator.
+///
+/// @param request The header's facts and the connection's auth state.
+/// @return What to do. `Serve` is the only value that permits reading the payload.
+[[nodiscard]] constexpr PrePayloadDecision DecidePrePayload(PrePayloadRequest const& request) noexcept
+{
+    if (FindOp(request.opRaw) == nullptr)
+        return PrePayloadDecision::UnknownOpcode;
+    if (request.declaredLength > OpPayloadCap(request.opRaw, request.sessionCap))
+        return PrePayloadDecision::PayloadTooLarge;
+    if (request.authRequired && !request.credentialAccepted && !IsPreAuthAllowed(request.opRaw))
+        return PrePayloadDecision::Unauthenticated;
+    return PrePayloadDecision::Serve;
+}
+
+/// The wire code a refusing decision is reported with.
+///
+/// A mapping in one place rather than each surface naming an enumerator, for the
+/// reason `UnimplementedVerb` is one constant: two surfaces spelling the same
+/// refusal separately is precisely how they came to disagree twice.
+/// @param decision A decision other than `Serve`.
+/// @return The code to answer with. `Serve` has no code and yields `Unauthenticated`,
+///         which is unreachable by contract and closed if it ever were not.
+[[nodiscard]] constexpr ErrorCode ErrorCodeFor(PrePayloadDecision decision) noexcept
+{
+    switch (decision)
+    {
+        case PrePayloadDecision::UnknownOpcode:
+            return ErrorCode::UnknownOpcode;
+        case PrePayloadDecision::PayloadTooLarge:
+            return ErrorCode::PayloadTooLarge;
+        case PrePayloadDecision::Unauthenticated:
+            return ErrorCode::Unauthenticated;
+        case PrePayloadDecision::Serve:
+            break;
+    }
+    return ErrorCode::Unauthenticated;
 }
 
 /// Whether this build can decode a request at `version`.
