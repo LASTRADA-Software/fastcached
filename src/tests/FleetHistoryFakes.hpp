@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -21,22 +22,34 @@ class PlacedWallClock final: public IWallClock
   public:
     [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept override
     {
+        std::scoped_lock const lock { _mutex };
         return _now;
     }
 
     /// @param at Where the clock should stand.
     void Set(std::chrono::system_clock::time_point at) noexcept
     {
+        std::scoped_lock const lock { _mutex };
         _now = at;
     }
 
     /// @param by How far forward to move it.
     void Advance(std::chrono::seconds by) noexcept
     {
+        std::scoped_lock const lock { _mutex };
         _now += by;
     }
 
   private:
+    /// Guarded like `ManualClock`, and for the same reason: a placed clock is driven
+    /// by the case's own thread while a production component reads it from one of
+    /// its own. `FleetSampler`'s constructor starts a thread that samples
+    /// immediately, so every case that injects this fake and then moves it races the
+    /// sampler -- reported by ThreadSanitizer on master as a write in `Advance`
+    /// against a read in `FleetHistory::NowMillis`. Thread-safety is a property of
+    /// this seam, not of the one case that happened to be caught.
+    mutable std::mutex _mutex;
+
     /// A round epoch offset, so a bucket start is easy to reason about in a failure
     /// message: 2026-01-01T00:00:00Z is a whole number of hours and of minutes.
     std::chrono::system_clock::time_point _now { std::chrono::seconds { 1'767'225'600 } };
