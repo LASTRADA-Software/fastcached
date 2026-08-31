@@ -1039,12 +1039,24 @@ TEST_CASE("A release names a lease this scheduler actually signed", "[distribute
 
     SECTION("nor does one signed with another cluster's key")
     {
+        // The claims name THIS cluster and this term. Only the signing key differs, so
+        // what the case pins is the MAC and nothing else -- a foreign `clusterId` here
+        // would leave it passing whichever of the two checks happened to run first.
         auto const foreign = MintLeaseToken(std::vector<std::byte>(32, std::byte { 0x11 }),
                                             LeaseClaims { .serial = "1",
                                                           .endpoint = "peer-1:7100",
                                                           .fingerprint = "gcc-14",
                                                           .key = "obj-1",
-                                                          .expiresAt = Noon + 10min });
+                                                          .expiresAt = Noon + 10min,
+                                                          // `std::string`, not the
+                                                          // `string_view` the
+                                                          // EXPECTATIONS above take:
+                                                          // claims come back by value
+                                                          // from a decode and must not
+                                                          // borrow the bytes they were
+                                                          // decoded from.
+                                                          .clusterId = std::string { Signing::TestCluster },
+                                                          .epoch = 0 });
         CHECK(fleet.service.Release(Insider, foreign, "obj-1").error == Wire::ErrorCode::LeaseUnauthorized);
         CHECK(fleet.service.Leases().IsInFlight("obj-1"));
     }
