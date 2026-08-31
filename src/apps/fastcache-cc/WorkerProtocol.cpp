@@ -85,6 +85,49 @@ namespace
     ///
     /// `Auth`, because a `--requirepass` worker was refused at `REGISTER` and never
     /// joined the fleet at all -- absent rather than idle, which is harder to notice.
+    /// One refusal this surface can answer with: the wire code a client acts on and
+    /// the counter an operator watches, as ONE row.
+    ///
+    /// The row is the REFUSAL, not the code, and that distinction is load-bearing:
+    /// two of the rows below both answer `MalformedFrame` and must not share a
+    /// counter, because a truncated frame and an undecodable payload are different
+    /// diagnoses. A table keyed on the code could not hold both (#327).
+    ///
+    /// `RefusedVerb` in `CompileCacheWire.hpp` deliberately carries no counter column
+    /// and cannot: that header is compiled into `fastcache-cc`, which does not link
+    /// `FastCache`, so `IMetricsSink::Counter` is not reachable from it. The pairing
+    /// therefore lives here, in the surface that owns the sink.
+    struct SurfaceRefusal
+    {
+        Wire::ErrorCode code;          ///< What the client is told.
+        IMetricsSink::Counter counter; ///< What the operator sees rise.
+    };
+
+    constexpr SurfaceRefusal UnsupportedVersion {
+        .code = Wire::ErrorCode::UnsupportedVersion,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnsupportedVersion,
+    };
+    constexpr SurfaceRefusal TruncatedFrame {
+        .code = Wire::ErrorCode::MalformedFrame,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedTruncated,
+    };
+    constexpr SurfaceRefusal UnknownOpcode {
+        .code = Wire::ErrorCode::UnknownOpcode,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnknownOpcode,
+    };
+    constexpr SurfaceRefusal UnimplementedVerb {
+        .code = Wire::UnimplementedVerb,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnimplementedVerb,
+    };
+    constexpr SurfaceRefusal NotPermitted {
+        .code = Wire::ErrorCode::DispatchNotPermitted,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedNotPermitted,
+    };
+    constexpr SurfaceRefusal MalformedPayload {
+        .code = Wire::ErrorCode::MalformedFrame,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload,
+    };
+
     constexpr std::array RefusedVerbs {
         Wire::RefusedVerb { .op = Wire::Op::Auth,
                             .code = Wire::UnimplementedVerb,
@@ -141,6 +184,33 @@ LeaseValidator UncheckedLeaseValidator()
     return [](std::string_view, std::string_view) {
         return std::optional<Distributed::LeaseRefusal> {};
     };
+}
+
+/// Answer a refusal, and record it.
+///
+/// The ONE way this surface refuses, which is the whole point rather than a
+/// convenience: six refusals here used to answer on the wire and increment nothing,
+/// and a seventh would have joined them by omission. A refusal answered while nothing
+/// rises is how a port being probed looks, on `/metrics`, exactly like a port nobody
+/// is talking to (#327).
+///
+/// Taking a ROW rather than a code is what makes the counter impossible to forget:
+/// there is no argument to pass a bare `ErrorCode` to.
+///
+/// **Every refusal in this file goes through here**, including the three that already
+/// counted -- the lease refusal, the envelope error and the job refusal -- which carry
+/// rows of their own tables and now convert them rather than restating the pair. That
+/// is what makes the guard exact rather than a heuristic: `Wire::EncodeErrorReply`
+/// appears exactly once in this file, on the line below, and
+/// `worker-refusals-counted` fails if a second one is ever added.
+/// @param metrics Where the refusal is recorded.
+/// @param refusal Which refusal, as one row.
+/// @param detail Words for a person, or empty when there are none to add.
+/// @return The encoded reply.
+[[nodiscard]] std::vector<std::byte> Refuse(IMetricsSink& metrics, SurfaceRefusal const& refusal, std::string_view detail)
+{
+    metrics.Increment(refusal.counter);
+    return Wire::EncodeErrorReply(refusal.code, detail);
 }
 
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
@@ -203,26 +273,30 @@ std::optional<std::vector<std::byte>> WorkerProtocol::Answer(std::span<std::byte
         return std::nullopt;
 
     if (!Wire::IsSupported(header->version))
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion, {});
+        return Refuse(_metrics, UnsupportedVersion, {});
 
     if (frame.size() < Wire::RequestHeaderSize + header->payloadLength)
-        return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame, "frame shorter than its declared payload");
+        return Refuse(_metrics, TruncatedFrame, "frame shorter than its declared payload");
     auto const payload = frame.subspan(Wire::RequestHeaderSize, header->payloadLength);
 
     auto const* const descriptor = Wire::FindOp(header->opRaw);
     if (descriptor == nullptr)
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, {});
+        return Refuse(_metrics, UnknownOpcode, {});
 
     if (descriptor->code != Wire::Op::Compile)
     {
+        // The wire row carries the code and the words; the counter is paired here,
+        // because `RefusedVerb` cannot reach `IMetricsSink`. Asserted rather than
+        // assumed: every row of `RefusedVerbs` answers `UnimplementedVerb` today, and
+        // a row that answered something else would be counted under a name that no
+        // longer described it.
         if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-            return Wire::EncodeErrorReply(row->code, row->why);
+            return Refuse(_metrics, SurfaceRefusal { .code = row->code, .counter = UnimplementedVerb.counter }, row->why);
 
         // A worker is not a scheduler and not a cache. Refused with a reply rather
         // than a close, so a client that sent the wrong verb to the wrong port
         // learns which -- a dropped connection is indistinguishable from a dead host.
-        return Wire::EncodeErrorReply(Wire::ErrorCode::DispatchNotPermitted,
-                                      "this endpoint compiles; it does not schedule or cache");
+        return Refuse(_metrics, NotPermitted, "this endpoint compiles; it does not schedule or cache");
     }
 
     return Compile(payload);
@@ -232,7 +306,7 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
 {
     auto const fields = Wire::DecodeCompilePayload(payload);
     if (!fields.has_value())
-        return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame, {});
+        return Refuse(_metrics, MalformedPayload, {});
 
     auto const token = Wire::AsStringView(fields->leaseToken);
     auto const fingerprint = Wire::AsStringView(fields->fingerprint);
@@ -256,14 +330,16 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // the scheduler to look for a fault that is local.
     if (auto const refusal = _validator(token, fingerprint); refusal.has_value())
     {
-        auto const& row = Distributed::DescribeLeaseRefusal(refusal->reason);
-        _metrics.Increment(row.workerCounter);
-
         // The detail travels. It is empty for anything that failed the MAC -- a
         // caller that could not authenticate a token has established no fact about
         // it, so there is nothing truthful to say -- and populated for the two
         // refusals an operator actually has to act on.
-        return Wire::EncodeErrorReply(row.code, refusal->detail);
+        //
+        // Through `Refuse` like every other refusal here, carrying another table's
+        // row rather than its own: `LeaseRefusalTable` already pairs the code with
+        // the counter, and this converts that pair rather than restating it.
+        auto const& row = Distributed::DescribeLeaseRefusal(refusal->reason);
+        return Refuse(_metrics, SurfaceRefusal { .code = row.code, .counter = row.workerCounter }, refusal->detail);
     }
 
     // Opened AFTER the lease check and BEFORE any expensive work, and refused on the
@@ -291,8 +367,9 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
         // rises is how a port being probed with envelope bombs looked, on
         // `/metrics`, exactly like a port nobody was talking to.
         auto const reason = source.error();
-        _metrics.Increment(CounterFor(reason));
-        return Wire::EncodeErrorReply(WireCodeFor(reason), DescribeEnvelopeError(reason));
+        return Refuse(_metrics,
+                      SurfaceRefusal { .code = WireCodeFor(reason), .counter = CounterFor(reason) },
+                      DescribeEnvelopeError(reason));
     }
 
     // Counted around the runner rather than inside it: the runner is a seam with
@@ -315,13 +392,13 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                 .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
     if (!outcome.has_value())
     {
-        auto const& descriptor = DescriptorFor(outcome.error().reason);
-        _metrics.Increment(descriptor.counter);
         // The refusal's detail rides the reply message, so a client's local fallback
         // can name the offending flag rather than only report that one existed. Empty
         // for every refusal that has nothing to add, which reproduces the previous
         // empty-message wire exactly.
-        return Wire::EncodeErrorReply(descriptor.code, outcome.error().detail);
+        auto const& descriptor = DescriptorFor(outcome.error().reason);
+        return Refuse(
+            _metrics, SurfaceRefusal { .code = descriptor.code, .counter = descriptor.counter }, outcome.error().detail);
     }
 
     // A compiler that ran and rejected the code did its job — that is the client's

@@ -489,6 +489,51 @@ The pattern is easy to recognise in someone else's code and nearly invisible in
 your own, because in your own the collapsed state is the one you were not thinking
 about when you chose the representation.
 
+## A refusal answered while nothing rises is a port that looks unused
+
+Six refusals in `WorkerProtocol.cpp` answered the right wire code and incremented
+nothing (#327). That was not six oversights: `Wire::EncodeErrorReply` takes a code and
+knows nothing about a sink, so counting was something each author had to remember, and
+a seventh would have joined them by omission. On `/metrics`, a port being probed then
+looks exactly like a port nobody is talking to.
+
+- **`Refuse(metrics, row, detail)` is the one way that surface refuses**, and it takes
+  a ROW carrying the code AND the counter. There is no argument to pass a bare
+  `ErrorCode` to, so the counter cannot be left out — the same guard shape as
+  `NodeSurfaceTable`, where an opener takes a `NodeSurface` because there is nothing
+  else to hand it.
+- **The row is the REFUSAL, not the code**, and that distinction is load-bearing. Two
+  of the six answer `MalformedFrame` and must not share a counter: a truncated frame
+  is a framing fault or a hostile peer, an undecodable payload is a version or
+  encoding mismatch between two ends that agree on the framing. One code, because a
+  client acts on both identically; two counters, because an operator does not. **A
+  table keyed on the code could not hold both** — which is why `EnumTable<ErrorCode,
+  Counter>`, the obvious instrument, is the wrong one here.
+- **`ErrorCode` could not carry an `EnumTable` anyway.** It is a WIRE enum with sparse
+  values and no `Last`, and a sentinel would permanently claim a byte in the one enum
+  whose retired-code rule exists because bytes are scarce and irreversible.
+- **`RefusedVerb` cannot grow a counter column.** It lives in `CompileCacheWire.hpp`,
+  which is header-only and dependency-free because `fastcache-cc` compiles it in
+  without linking `FastCache`; `IMetricsSink::Counter` is not reachable from there. The
+  pairing lives in the surface that owns the sink.
+- **The refusals that ALREADY counted go through the same door**, converting their own
+  tables' rows rather than restating the pair. Not tidiness: it is what makes the guard
+  a structural fact — `EncodeErrorReply` appears exactly ONCE in that file — instead of
+  "is there an `Increment` within N lines", which passes for the wrong reasons when an
+  increment belongs to another branch or drifts out of range.
+- **`worker-refusals-counted` closes the door the type system cannot**, because
+  `EncodeErrorReply` is a free function every surface includes and stays callable. It
+  fails in BOTH directions: a second call site is named by line, and a scan that
+  matches NOTHING is its own failure rather than a pass — `Refuse` is built on one, so
+  zero means the scan stopped seeing the file it thinks it is reading.
+- **Assert that no OTHER counter moved.** A test checking only the wire code passes
+  with every refusal wired to one shared counter — and it passed, on the first run of
+  the very test written to prove the two `MalformedFrame` refusals are separate: the
+  fixture's "undecodable payload" frame had been shortened without rewriting the
+  declared length, so it was refused as TRUNCATED, answered the same code, and moved
+  the neighbouring counter. The confusion the split exists to end, inside the test
+  written to prove the split.
+
 ## Text a peer sent is text, or the fleet refuses it
 
 Every string a peer states about itself -- a toolchain fingerprint, an endpoint,

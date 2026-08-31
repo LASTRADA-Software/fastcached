@@ -286,6 +286,36 @@ set_tests_properties("target-file-guards" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Every refusal the compile surface answers with moves a counter.
+#
+# Six sites in `WorkerProtocol.cpp` answered on the wire and incremented nothing
+# (#327), which is not six oversights but the default: `Wire::EncodeErrorReply` takes
+# a code and knows nothing about a sink, so counting was something each author had to
+# remember. A refusal answered while nothing rises is indistinguishable, on
+# `/metrics`, from a port nobody is talking to.
+#
+# `Refuse(metrics, row, detail)` takes a ROW carrying both the code and the counter,
+# so there is no argument to pass a bare `ErrorCode` to. This covers the door the type
+# system cannot close: `EncodeErrorReply` is a free function in a header every surface
+# includes, and remains callable. The rule is exact rather than approximate --
+# EXACTLY ONE call in that file, inside `Refuse` -- because the three refusals that
+# already counted were routed through it too. See the script's header.
+#
+# In the default set with the other hygiene checks: it reads one file and compares
+# strings.
+add_test(
+    NAME "worker-refusals-counted"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-worker-refusals-counted.cmake"
+)
+set_tests_properties("worker-refusals-counted" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The compile worker's shipped reference configuration against its option table.
 # Fails when a setting the file can carry has no commented block for an operator
 # to find, or when the file documents a key the table no longer has -- which is
