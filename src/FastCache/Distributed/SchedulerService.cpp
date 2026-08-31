@@ -679,6 +679,21 @@ SchedulerReply SchedulerService::Release(CallerContext const& caller, std::strin
         if (authentic->clusterId != _clusterId)
             return Refuse(Wire::ErrorCode::LeaseUnauthorized);
 
+        // The KEY the token itself names, rather than only the one the caller states
+        // (#323). Until this, the credential was read on the compile path and
+        // discarded here: the token said what it authorised, and the release path
+        // trusted the caller's word and left `LeaseTable` to notice.
+        //
+        // That worked, and worked BY COINCIDENCE of another component's strictness --
+        // `LeaseTable` holds the authoritative mapping, so a wrong key finds no live
+        // lease. Any change making that lookup more permissive (a normalisation, a
+        // fallback, an index by worker rather than by key) would silently remove the
+        // only check that the released lease is the one the token names, with nothing
+        // here to fail. A credential that is honoured on one verb and ignored on
+        // another is trusted by accident of which verb ran.
+        if (authentic->key != key)
+            return Refuse(Wire::ErrorCode::LeaseUnauthorized);
+
         // And deliberately NOT the epoch. A release under a term other than the
         // current one is what a compile that outlived an election looks like, which is
         // ordinary and is the case `Release` exists for -- refusing it would leave the
