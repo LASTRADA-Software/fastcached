@@ -408,6 +408,35 @@ class SchedulerService
     /// @return A refusal, or nullopt when the caller may proceed.
     [[nodiscard]] std::optional<SchedulerReply> Gate(CallerContext const& caller) const;
 
+  public:
+    /// The half of `Gate()` that depends on the CALLER alone.
+    ///
+    /// Public and named because the transport asks it **before it reads a payload**:
+    /// membership is a property of the peer, so a stranger can be refused without
+    /// this process allocating for the frame it declared
+    /// ([#285](https://github.com/LASTRADA-Software/fastcached/issues/285)).
+    ///
+    /// **`Gate()` calls this rather than repeating it, and that is the point.** Two
+    /// call sites for one rule is how the two come to disagree -- an edit to what
+    /// membership means landing in the early check and not the authoritative one
+    /// would leave a door open that every test still says is shut. There is one
+    /// function, so there is one answer.
+    ///
+    /// It carries the counter with it, for the same reason: a refusal's wire code and
+    /// its counter are one fact, and separating them is how a gate comes to work
+    /// while the dashboard says it never fired. Each call increments once -- the
+    /// transport refusing early does not then also call `Answer`, so one refused
+    /// request moves it exactly one.
+    ///
+    /// Leadership is deliberately NOT here. It is a fact about this node rather than
+    /// about the caller, and its refusal carries the leader's endpoint that clients
+    /// and workers both follow -- so hoisting it would put a change to redirect
+    /// behaviour inside a change about buffering.
+    /// @param caller Who is asking.
+    /// @return A refusal, or nullopt when the caller is admitted.
+    [[nodiscard]] std::optional<SchedulerReply> RefuseUnlessMember(CallerContext const& caller) const;
+
+  private:
     /// Drop workers that stopped heartbeating, and free what they were holding.
     ///
     /// The registry and the lease table are siblings and neither may reach the

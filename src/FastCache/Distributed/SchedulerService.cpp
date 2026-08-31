@@ -403,9 +403,16 @@ std::optional<SchedulerReply> SchedulerService::Gate(CallerContext const& caller
     if (Role() != SchedulerRole::Leader)
         return Refuse(Wire::ErrorCode::NotLeader, LeaderEndpoint());
 
-    // Then the anti-leeching rule. A non-member is *not* refused the cache -- it
-    // reads and writes objects exactly as before -- it is refused the fleet's CPU
-    // time, which is the thing membership pays for.
+    // Then the anti-leeching rule, which is the half the transport can also ask
+    // before it reads a payload -- so it lives in one function that both call.
+    return RefuseUnlessMember(caller);
+}
+
+std::optional<SchedulerReply> SchedulerService::RefuseUnlessMember(CallerContext const& caller) const
+{
+    // A non-member is *not* refused the cache -- it reads and writes objects exactly
+    // as before -- it is refused the fleet's CPU time, which is the thing membership
+    // pays for.
     if (caller.membership != Membership::Member)
         return Refuse(Wire::ErrorCode::NotAMember);
 

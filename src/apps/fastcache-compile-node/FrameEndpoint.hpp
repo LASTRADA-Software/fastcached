@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -63,6 +64,44 @@ class IFrameResponder
     /// @return The encoded reply, or empty to close without answering -- which is
     ///         only ever right when the peer is not speaking this protocol at all.
     [[nodiscard]] virtual Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) = 0;
+
+    /// May this peer send at all, before a byte of its payload is taken?
+    ///
+    /// **The point is WHEN this is asked, not that it is asked.** Both surfaces
+    /// already refused the peers this refuses -- but from inside `Answer`, which runs
+    /// after the whole declared payload has been read and charged against the byte
+    /// budget. So a caller the surface was always going to refuse could still make
+    /// this process allocate for it, which is the cheapest denial there is: the
+    /// refusal cost exactly what serving would have
+    /// ([#285](https://github.com/LASTRADA-Software/fastcached/issues/285),
+    /// [#377](https://github.com/LASTRADA-Software/fastcached/issues/377)).
+    ///
+    /// **Only decisions that depend on the PEER alone belong here.** That is what
+    /// makes the question answerable before the frame exists. A surface's membership
+    /// or locality rule qualifies; anything reading the verb, the payload or a
+    /// credential does not, and stays in `Answer` where the request is.
+    ///
+    /// **The responder owns the predicate; the endpoint only asks it earlier.** The
+    /// refusal is returned already encoded, so the wording, the wire code and the
+    /// counter stay with the surface that decided -- rather than the endpoint growing
+    /// its own copy of a rule that would then have two places to drift.
+    ///
+    /// **The gate inside `Answer` stays, and is still the authority.** This is an
+    /// early-out, not a replacement: `Answer` is reachable directly, and a predicate
+    /// enforced only at the door is one a later caller can walk around.
+    ///
+    /// Pure virtual rather than defaulted to "admit everyone", deliberately. A
+    /// default would let a surface added later inherit an open door by saying
+    /// nothing, which is the shape this codebase records as reopening a hole by
+    /// omission. A surface with no peer policy returns `std::nullopt` and says so.
+    ///
+    /// @param peer The peer's host, as `Answer` receives it.
+    /// @return The encoded refusal to send back, or nullopt to go on and read the
+    ///         payload. A refusal is answered as a **reply and a resynchronization**
+    ///         by the caller -- never a close, because the frame declared its length
+    ///         and a peer that cannot tell a policy refusal from a dead host retries
+    ///         forever.
+    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const = 0;
 
     /// Largest request this surface will buffer.
     ///
@@ -128,13 +167,15 @@ class IFrameResponder
 ///
 /// ## The payload cap is small on purpose
 ///
-/// Membership is checked *inside* the service, which means after the frame has been
-/// read -- so an unauthenticated peer can make this endpoint buffer whatever it
-/// declares. That is the same hole `OpDescriptor::maxPayload` closes for `AUTH` on
-/// the cache port, and it is closed the same way: a scheduler verb carries a
-/// fingerprint, an endpoint and a key, none of which is large, so the ceiling is
-/// kilobytes rather than the cache's megabytes. A frame over it is refused with a
-/// *reply* naming both numbers, not a close.
+/// A scheduler verb carries a fingerprint, an endpoint and a key, none of which is
+/// large, so the ceiling is kilobytes rather than the cache's megabytes. A frame over
+/// it is refused with a *reply* naming both numbers, not a close.
+///
+/// It used to carry a second job: membership was checked inside the service, after
+/// the frame had been read, so the small cap was what bounded what a stranger could
+/// make this endpoint allocate. `IFrameResponder::RefusePeer` closes that directly
+/// now (#285, #377) -- a peer the surface will refuse is refused before its payload
+/// is read at all -- and the cap is back to being only what it says it is.
 class FrameServer
 {
   public:

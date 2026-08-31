@@ -36,8 +36,22 @@ class SchedulerResponder final: public IFrameResponder
     /// allocation and no round trip is a legitimate thing to be.
     [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
-        co_return _protocol.Answer(frame,
-                                   Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer });
+        co_return _protocol.Answer(frame, Context(peer));
+    }
+
+    /// @copydoc IFrameResponder::RefusePeer
+    ///
+    /// Membership, which is decided from the peer's host alone -- so the transport
+    /// can ask it before it reads a payload, and a stranger cannot make the scheduler
+    /// allocate for a frame that was never going to be served (#285).
+    ///
+    /// Delegated rather than reimplemented: `SchedulerService::RefuseUnlessMember` is
+    /// the same function `Gate()` calls, so the early check and the authoritative one
+    /// cannot disagree, and the `NotAMember` counter is incremented inside it exactly
+    /// once per refused request.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const override
+    {
+        return _protocol.RefusePeer(Context(peer));
     }
 
     /// Kilobytes, not megabytes.
@@ -71,6 +85,22 @@ class SchedulerResponder final: public IFrameResponder
     }
 
   private:
+    /// Who is asking, as both the gate and the early refusal need it.
+    ///
+    /// One place the peer becomes a `CallerContext`, so the classification behind an
+    /// early refusal is by construction the classification the verb would have got.
+    ///
+    /// @param peer The caller's peer host. BORROWED: `CallerContext::peerId` is a
+    ///             `std::string_view`, so this must outlive the returned context --
+    ///             which is why the parameter is a view over the caller's storage
+    ///             rather than a `std::string` this function owns. Taking it by value
+    ///             compiles, moves, and returns a view into a parameter destroyed at
+    ///             the closing brace.
+    [[nodiscard]] Distributed::CallerContext Context(std::string_view peer) const
+    {
+        return Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer };
+    }
+
     Distributed::SchedulerProtocol& _protocol;
     Distributed::IMembershipOracle const& _membership;
 };
@@ -129,13 +159,28 @@ class CacheResponder final: public IFrameResponder
         // and compiles; a new code would be an unknown one to every launcher already
         // deployed, and an unknown refusal is the one shape that has cost this tree a
         // permanent 0% hit rate before. The sentence carries what changed.
-        if (!_locality.IsThisMachine(peer))
-        {
-            _metrics.Increment(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
-            co_return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
-                                                         "this node serves its cache to its own machine only");
-        }
+        if (auto refusal = RefusePeer(peer); refusal.has_value())
+            co_return *std::move(refusal);
         co_return co_await _proxy.Answer(frame);
+    }
+
+    /// @copydoc IFrameResponder::RefusePeer
+    ///
+    /// Locality, which is decided from the peer's host alone -- so the transport asks
+    /// it before it reads a payload, and a caller this tier will not serve cannot
+    /// charge the surface's byte budget on the way to being refused (#377).
+    ///
+    /// **This is the one implementation of the rule**, and `Answer` above calls it
+    /// rather than repeating it, so the early refusal and the authoritative one are
+    /// the same code and the counter moves exactly once per refused request whichever
+    /// path reached it.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const override
+    {
+        if (_locality.IsThisMachine(peer))
+            return std::nullopt;
+        _metrics.Increment(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
+                                                  "this node serves its cache to its own machine only");
     }
 
     /// Megabytes, because a STORE carries a whole object file.
