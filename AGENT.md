@@ -194,7 +194,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   distribute nothing while every scheduler counter read zero. A selector naming a
   FILE, or an `-x` value with no exact language, is still refused.
 - Leadership and membership are one `Gate()`, and it runs for every verb — reads
-  included.
+  included. But they answer different questions and only leadership stops applying at
+  demotion: a RELEASE settles an obligation this node itself created, in a per-node
+  `LeaseTable` nobody else holds, so gating it on leadership pinned the key on the one
+  machine that could free it (#371). A `GateScope`, never a verb that skips the gate;
+  membership is never relaxed; `Scheduling` is the default. A verb qualifies only if it
+  touches non-replicated state this node created AND can create nothing — both clauses,
+  since `Lease` passes the first. And the settlement still refuses a token it never
+  issued, or the fix is a hole.
 - Duplicate suppression is asked **before** capacity, or a busy fleet reports
   `NoCapacity` for a key it is already building.
 - A lease has three transitions and expiry is the third: the **client** resolves it,

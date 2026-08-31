@@ -393,14 +393,18 @@ SchedulerReply SchedulerService::Refuse(Wire::ErrorCode code, std::string messag
     return SchedulerReply { .status = Wire::Status::Error, .error = code, .message = std::move(message), .payload = {} };
 }
 
-std::optional<SchedulerReply> SchedulerService::Gate(CallerContext const& caller) const
+std::optional<SchedulerReply> SchedulerService::Gate(CallerContext const& caller, GateScope scope) const
 {
     // Leadership first, and not only because it is cheaper to answer. A follower
     // holds a registry that is a stale copy of somebody else's, so admitting a
     // worker here would put it in a fleet nothing schedules onto -- and the worker
     // would heartbeat happily into it forever. Refusing with the leader's address
     // is what turns that into one redirect.
-    if (Role() != SchedulerRole::Leader)
+    //
+    // Skipped for a settlement, and `GateScope`'s comment carries the whole of why:
+    // a release resolves a lease this node minted, in a table nobody else has a copy
+    // of. There is no decision here for a leader to be making instead.
+    if (scope == GateScope::Scheduling && Role() != SchedulerRole::Leader)
         return Refuse(Wire::ErrorCode::NotLeader, LeaderEndpoint());
 
     // Then the anti-leeching rule, which is the half the transport can also ask
@@ -635,7 +639,13 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
 
 SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)
 {
-    if (auto refusal = Gate(caller); refusal.has_value())
+    // A settlement, not a scheduling decision -- so leadership does not apply and
+    // membership still does. Before this, a node demoted between granting a lease and
+    // being handed it back refused its own lease's release with `NotLeader`, and the
+    // key stayed pinned on the ONE machine that could have freed it until it expired
+    // (#371). The client was doing exactly the right thing: the rulebook requires a
+    // release to go to whoever ISSUED the lease, and this is where that arrived.
+    if (auto refusal = Gate(caller, GateScope::Settlement); refusal.has_value())
         return std::move(*refusal);
 
     // The token the client hands back is the SIGNED grant, so the serial the lease

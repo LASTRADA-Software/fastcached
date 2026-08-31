@@ -208,6 +208,37 @@ Consequences that are each load-bearing:
   without them would be a verb that quietly skips both — and the test asserts the
   refusal *per verb* precisely because "I added a handler that forgot the gate" is
   the regression the arrangement exists to make impossible.
+- **But the two rules answer different questions, and only one of them stops applying
+  at demotion.** Leadership asks *may this node decide*; membership asks *may this
+  caller spend the fleet's CPU*. Almost every verb here is a decision about the
+  fleet's FUTURE — who joins, what is worth scheduling, what the cluster agrees — and
+  a demoted node must make none of those, because a follower answering them is how a
+  split fleet forms. **A release is not one.** It settles an obligation this node
+  itself created, against a `LeaseTable` that is per-node and never replicated: the
+  lease exists nowhere else, and no other node can free it. Gating it on leadership
+  did not stop a demoted node doing harm, it stopped it cleaning up after itself, and
+  the key stayed pinned on the one machine that could have released it until it
+  expired ([#371](https://github.com/LASTRADA-Software/fastcached/issues/371)) — while
+  the client was doing exactly the right thing, because the rule below requires a
+  release to go to whoever ISSUED the lease.
+
+  So the exemption is a **scope on the gate** (`GateScope::Settlement`), never a verb
+  that skips it: membership is still checked, and `Scheduling` is the default so a new
+  verb has to type out the relaxation. The test for whether a future verb qualifies is
+  checkable rather than a feeling: **does it act only on non-replicated state this
+  node created itself, AND can it create nothing?** Both clauses are load-bearing —
+  `Lease` touches the same non-replicated `LeaseTable` and is excluded by the second.
+  Measured against every gated verb, `Release` is the only one that passes:
+  `ClusterStatus` reads replicated state, the three cluster verbs propose,
+  `Register` and `Lease` create, and `Heartbeat` refreshes the registry the LEADER
+  schedules from — a demoted node's copy going stale is the mechanism that pushes a
+  worker to re-register with the new leader, not a cost.
+- **Letting a settlement through must not mean letting any settlement through.** The
+  half that turns this fix into a hole is the one that stays: a token this node never
+  issued still answers `UnknownLease`, because a resolve answers on liveness rather
+  than presence and that refusal is the only place "this job outlived its lease" can
+  be observed. `LeaseTable::Release` matches on token **and** key and erases only on
+  both, so a release cannot free a key it does not name.
 - **Leadership is asked first, and the reason is the diagnostic rather than the
   cost.** A follower cannot know the cluster's membership any better than it knows
   the fleet, so answering `NotAMember` there sends an operator to inspect a policy
@@ -1914,16 +1945,6 @@ only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
 
-- **[#371](https://github.com/LASTRADA-Software/fastcached/issues/371)** — a scheduler
-  that loses leadership between granting a lease and being handed it back refuses its
-  own release, because `Gate()` puts leadership ahead of every verb. The client is
-  right and the key stays pinned on the only machine that could free it, until it
-  expires. Routing the release to the new leader instead is strictly worse and the
-  fleet harness demonstrates why: two schedulers number their leases independently and
-  both start at one, so that release matches another client's live lease for the same
-  key and frees a job somebody is still running. So the fix is on the scheduler, and
-  which shape it takes — exempting `Release` from the leadership check, sweeping on
-  demotion, or accepting the flap window — is the open question.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was
