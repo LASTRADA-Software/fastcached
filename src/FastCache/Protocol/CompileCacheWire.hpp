@@ -443,6 +443,64 @@ inline constexpr PreAuth OpenBeforeAuth { true };
 /// This verb is refused until a credential has been accepted.
 inline constexpr PreAuth RequiresAuth { false };
 
+/// The largest payload a verb may declare, stated rather than defaulted.
+///
+/// A plain `std::size_t` here had the hole `PreAuth` had: a designated initializer
+/// that omits the member value-initializes it to `0`, and `0` is a *meaningful*
+/// value -- "the operator's session cap governs". So a control verb added later
+/// would silently inherit a listener-wide 256 MiB ceiling, which is the failure
+/// [#284](https://github.com/LASTRADA-Software/fastcached/issues/284) is about, and
+/// it would compile and pass every test.
+///
+/// Spelling it as a type with no default constructor makes the omission
+/// ill-formed. The ticket suggested a `ControlVerbsAreBounded()` assertion instead;
+/// that would need a second column saying which verbs are "control", and two
+/// classifications of the same rows are exactly what this table's rule exists to
+/// avoid. Making the cap unomittable removes the failure mode for every verb at
+/// once rather than for one category.
+class PayloadCap
+{
+  public:
+    /// Deleted on purpose: a row must state its ceiling. See the class comment.
+    PayloadCap() = delete;
+
+    /// @param bytes The ceiling, or 0 for "the session cap governs".
+    constexpr explicit PayloadCap(std::size_t bytes) noexcept:
+        _bytes { bytes }
+    {
+    }
+
+    /// @return The declared ceiling in bytes; 0 means the session cap governs.
+    [[nodiscard]] constexpr std::size_t Bytes() const noexcept
+    {
+        return _bytes;
+    }
+
+    /// @return True when this verb declares a bound of its own.
+    [[nodiscard]] constexpr bool IsBounded() const noexcept
+    {
+        return _bytes != 0;
+    }
+
+  private:
+    std::size_t _bytes;
+};
+
+/// This verb carries whatever the operator's session cap allows.
+///
+/// Legitimate for the three payload-bearing verbs -- STORE and a COMPILE reply carry
+/// an object file, COMPILE carries a preprocessed translation unit -- and never for a
+/// verb reachable before authentication, which `PreAuthVerbsAreBounded` refuses.
+inline constexpr PayloadCap SessionCapGoverns { 0 };
+
+/// This verb declares a ceiling of its own, tighter than the session's.
+/// @param bytes The ceiling.
+/// @return The cap to put in the row.
+[[nodiscard]] constexpr PayloadCap BoundedTo(std::size_t bytes) noexcept
+{
+    return PayloadCap { bytes };
+}
+
 /// One row of the opcode table: everything the framing layer knows about a verb.
 struct OpDescriptor
 {
@@ -457,7 +515,11 @@ struct OpDescriptor
     /// the whole table, and a reviewer must be able to read it off the table
     /// itself. A row that does not state it does not compile -- see `PreAuth`.
     PreAuth preAuth;
-    /// Largest payload this verb may declare, or 0 for "the session cap".
+    /// Largest payload this verb may declare.
+    ///
+    /// `SessionCapGoverns` or `BoundedTo(n)`, never a bare number and never omitted
+    /// -- see `PayloadCap`, whose deleted default constructor is what makes a row
+    /// that says nothing a build failure rather than a 256 MiB surprise (#284).
     ///
     /// A verb reachable *before* authentication MUST declare a real bound, and
     /// `PreAuthVerbsAreBounded` asserts that it does. The pre-auth gate exists so
@@ -469,7 +531,7 @@ struct OpDescriptor
     /// A gated verb may legitimately leave this 0: STORE carries a whole object
     /// file, and by the time it is read the peer has authenticated, so the
     /// operator's own cap is the right bound.
-    std::size_t maxPayload;
+    PayloadCap maxPayload;
 };
 
 /// What an endpoint answers for a verb it does not implement.
@@ -599,20 +661,20 @@ inline constexpr std::array OpTable {
                    .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = 0 }, // an object file; bounded by the operator's cap
+                   .maxPayload = SessionCapGoverns }, // an object file; bounded by the operator's cap
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
                    .fieldCount = 1, // key
                    .legalStatuses =
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = 0 },
+                   .maxPayload = SessionCapGoverns },
     OpDescriptor { .code = Op::Auth,
                    .name = "auth",
                    .fieldCount = 2, // username, secret
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = OpenBeforeAuth,
-                   .maxPayload = MaxAuthPayload },
+                   .maxPayload = BoundedTo(MaxAuthPayload) },
 
     // Distributed execution. None is `preAuth`: causing a compiler to run on
     // another machine is the last thing an unauthenticated peer should reach.
@@ -621,55 +683,55 @@ inline constexpr std::array OpTable {
                    .fieldCount = 5, // fingerprint, endpoint, u32 slots, accepted codecs, capacity
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::Heartbeat,
                    .name = "heartbeat",
                    .fieldCount = 3, // workerId, u32 inFlight, load
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
                    .fieldCount = 3, // fingerprint, key, accepted codecs
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::Release,
                    .name = "release",
                    .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::ClusterStatus,
                    .name = "cluster-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::ClusterSet,
                    .name = "cluster-set",
                    .fieldCount = 2, // setting name, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 2, // member id, consensus endpoint
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = MaxControlPayload },
+                   .maxPayload = BoundedTo(MaxControlPayload) },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = 0 }, // carries a preprocessed TU; the operator's cap governs
+                   .maxPayload = SessionCapGoverns }, // carries a preprocessed TU; the operator's cap governs
 };
 
 /// Whether every verb reachable before authentication declares a payload bound.
@@ -681,7 +743,7 @@ inline constexpr std::array OpTable {
 [[nodiscard]] constexpr bool PreAuthVerbsAreBounded() noexcept
 {
     return std::ranges::all_of(OpTable,
-                               [](OpDescriptor const& row) { return !row.preAuth.Allowed() || row.maxPayload != 0; });
+                               [](OpDescriptor const& row) { return !row.preAuth.Allowed() || row.maxPayload.IsBounded(); });
 }
 
 static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must declare its own payload ceiling");
@@ -862,9 +924,9 @@ static_assert(FieldCountsAgree(), "a verb carries fields, or is listed as carryi
 [[nodiscard]] constexpr std::size_t OpPayloadCap(std::uint8_t opRaw, std::size_t sessionCap) noexcept
 {
     auto const* row = FindOp(opRaw);
-    if (row == nullptr || row->maxPayload == 0)
+    if (row == nullptr || !row->maxPayload.IsBounded())
         return sessionCap;
-    return row->maxPayload < sessionCap ? row->maxPayload : sessionCap;
+    return row->maxPayload.Bytes() < sessionCap ? row->maxPayload.Bytes() : sessionCap;
 }
 
 /// Whether `op` may legally be answered with `status`, per the table.
