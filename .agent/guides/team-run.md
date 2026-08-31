@@ -113,6 +113,18 @@ Each of these is a scar, not a preference.
 - **Merging is the manager's.** `gh pr merge --merge --auto`, then
   `gh pr update-branch --rebase` on every `BEHIND`; auto-merge alone never makes a branch
   up to date.
+- **The scratchpad is shared, and nothing about its path says so.** Every lane in a run
+  writes to one directory. Two sessions wrote a PR body to `scratchpad/pr-body.md`, the
+  second replaced the first, and #313 carried #314's description until the session that
+  *lost* the file noticed — nothing in the process did. A PR body is at least published;
+  a helper script replaced between staging it and running it produces a number attached
+  to work that is not yours and reports success either way. **Prefix every scratchpad file
+  and directory with the lane that owns it** (`mgr-`, `devc-`, `devd-`, `devl-`, `devn-`),
+  and re-stage under a prefixed name before you report a result a generically-named script
+  produced. Checked while writing this: one lane's files are already prefixed
+  (`devc-322-leasetoken.py`) and the same directory holds `a.patch`, `b2.patch`,
+  `claims.sh`, `dbcheck.sh`, `attribute.sh` and `build1.log` from others — so the
+  collision is a matter of when, not whether.
 
 ### The type-label check
 
@@ -146,6 +158,158 @@ causes below is not a cancellation at all:
   destroyed and emits a `::warning::` naming it — if that warning is in the run log,
   this is your cause and there is nothing further to diagnose.
 - Never `gh run rerun` — it races the concurrency group and makes it worse.
+
+### Pairwise clean is not serially clean
+
+**Before sequencing two PRs that touch the same file, merge-tree the second onto a
+synthetic `master + first` — not onto `master`.** Two branches that each *add* something
+at the same anchor are pairwise clean and serially conflicting, always, and every check
+anybody runs by reflex answers the pairwise question.
+
+#382 and #391 were both mine, both green, both queued in that order. Each merged cleanly
+onto `master`:
+
+```
+git merge-tree --write-tree origin/master claude/launcher-replay-320       # rc=0
+git merge-tree --write-tree origin/master claude/daemon-target-guard-390   # rc=0
+```
+
+Both results were true and neither answered the question that mattered. Build the
+sequence instead — commit the first merge's tree, then merge the second onto *that*:
+
+```
+tree="$(git merge-tree --write-tree origin/master "$first")"
+sim="$(git commit-tree "$tree" -p origin/master -p "$first" -m 'simulated merge')"
+git merge-tree --write-tree "$sim" "$second"; rc=$?
+```
+
+```
+CONFLICT (content): Merge conflict in .agent/rules/testing.md
+CONFLICT (content): Merge conflict in AGENT.md
+```
+
+The two hunks: both branches add a bullet immediately before
+`- A script-driven test naming more than one executable is registered in` in AGENT.md's
+testing list, and both add a `##` section immediately before `## Open work` in
+`.agent/rules/testing.md`. Neither branch changes a line the other changes — there is no
+overlap to see in a diff — and that is exactly why it conflicts: git has two insertions
+for one position and no basis to order them.
+
+This is worth a habit because of *where* it goes wrong. `mergeStateStatus` answers the
+pairwise question, `gh pr checks` answers the pairwise question, and a green PR page
+answers the pairwise question. The failure surfaces only when the first PR merges, at
+which point the second is blocked and has to be rebased and resolved by hand — after its
+CI has already passed and while it is sitting in a queue somebody is throttling.
+
+#### Judge it by the exit status. The output cannot tell you.
+
+`git merge-tree --write-tree` writes a tree **on conflict as well**, so its success output
+and its failure output are the same shape — a hash on the first line:
+
+```
+clean:     acaf0e17e2bf4e09ab929e5b54b558629b9af512
+conflict:  490e9b1f18761a302133c9e7e66d202cee0475c1
+           100644 <blob> 1  AGENT.md          <- stage entries follow, and only then
+           100644 <blob> 2  AGENT.md
+```
+
+So `[ -z "$tree" ]` reports **clean for every conflict**, confidently and by default. That
+is not a hypothetical: the first pass over the full pending order was written that way and
+printed `#391 ... clean` — the exact opposite of a conflict that had already been
+measured. An instrument with no way to express the failing state reports the passing one.
+
+`rc` is better and is **still not enough**, which is the part to read twice. Measured:
+
+```
+clean                          rc=0    tree on stdout
+conflicted                     rc=1    tree on stdout, then stage entries
+a ref that cannot be resolved  rc=1    NOTHING on stdout; "not something we can merge"
+a usage error                  rc=129  usage text
+```
+
+**Git returns 1 for a conflict and 1 for a branch name it cannot resolve.** So
+`[ $rc -ne 0 ]` — the obvious fix, and the one written after the `-z` version was
+caught — calls a stale or mistyped branch a conflict, and a sequencing loop over a
+deleted ref reports every pair as conflicting and sends somebody rebasing against
+nothing. Same collapse as the first bug, one state over.
+
+Three states, and the discriminator is `rc` **plus** whether stdout carries a tree:
+
+```
+out="$(git merge-tree --write-tree "$a" "$b" 2>/dev/null)"; rc=$?
+first="$(echo "$out" | sed 1q)"
+
+if [ "$rc" = 0 ]; then
+    verdict=clean
+elif [ "$rc" = 1 ] && echo "$first" | grep -Eq '^[0-9a-f]{40,64}$'; then
+    verdict=conflicted          # a tree was written, so the merge actually ran
+else
+    verdict="errored rc=$rc"    # no tree: a ref it could not resolve, or worse
+fi
+```
+
+The shape worth remembering rather than the snippet: **a conflict writes a tree and an
+error does not**, so the presence of the tree is what separates the two states that share
+an exit code.
+
+#### A third branch is only as tested as the tree beneath it
+
+`merge-tree` carries a conflicted tree forward rather than stopping, so a third PR
+simulated on top of an unresolved second is being merged against a tree containing
+**conflict markers** — a different question again, and its `clean` is provisional. When
+#392 was added to the order it came back clean, but on top of #391's *unresolved* tree, so
+that answer stood for nothing until the simulation was re-run against the real resolution.
+Label such a result unverified and re-run it once the conflict below it is actually fixed.
+
+#### Verify the tip you pushed, not the tree you were in when you thought to
+
+The resolution above was checked by diffing the resolved files against master and
+reporting `0 deletions` in both — presented as *the check that matters*, because an
+add/add resolution that deletes nothing has provably kept both sides. The pushed tip
+was:
+
+```
+AGENT.md                  +8   -0
+.agent/rules/testing.md   +40  -2
+```
+
+Nothing was wrong with the branch. The two deletions were a deliberate one-line
+cross-reference fix made *after* the check ran and disclosed in the same message — so
+the prose and the number contradicted each other, and the number was the one carrying
+the weight. A reviewer who reads `-0` in a summary and `-2` in the diff stops believing
+the rest of a careful write-up, and is right to.
+
+Measure `origin/master...origin/<branch>` — the pushed ref, three dots — as the last
+thing before reporting. Anything measured earlier describes a tree that is no longer
+what CI, the queue, or a reviewer will see.
+
+#### Two ways the resolution itself can go quietly wrong
+
+**`sed -E '/^=======$/d'` is not a safe way to strip conflict markers.** A bare
+`=======` is a valid setext heading underline in markdown, so on a file that has one
+the strip silently promotes a heading to a paragraph. Both sides here were checked for
+one first — zero in each — but the technique needs that check every time, and reaching
+for it on a file you have not checked is how a documentation heading disappears without
+a conflict, a warning, or a diff anyone reads.
+
+**A verdict assigned inside `$(...)` is discarded.** The serial simulation returned its
+carried-forward tree through a global set inside a function called in a command
+substitution, so the subshell's assignment never reached the caller and each step would
+have merged onto the *previous* iteration's tree — a plausible-looking sequence for an
+order nobody was testing. `set -u` turned it into an unbound-variable error instead of a
+wrong answer, which is the entire reason it is worth having on. Return such values
+through globals set by a plain call, or print them and parse.
+
+Two more things follow.
+
+**Do not fix it by moving the anchors.** Relocating a rule so two branches stop colliding
+organises the file by merge history instead of by subject, and the next reader inherits
+both the odd placement and no explanation for it. Take the rebase.
+
+**Do not cancel a running job to pre-empt it either.** The conflict is *scheduled*: it
+cannot bite before the first PR merges, and when it does it announces itself as a blocked
+queue entry rather than as a surprise. A conflict with a known arrival time and a
+mechanical resolution loses to almost anything you would have to cancel to avoid it.
 
 ## Review gates
 
