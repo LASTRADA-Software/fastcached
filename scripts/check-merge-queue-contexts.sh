@@ -130,6 +130,27 @@ EmitJobContexts() {
 }
 
 # ---------------------------------------------------------------------------
+# Does this workflow's `on:` block filter `pull_request` by base branch?
+#
+# The THIRD door to the never-arrives failure, after `paths-ignore` and a missing
+# `merge_group:` row. A `branches:` filter under `pull_request:` means a pull
+# request whose base is anything else produces no check run at all -- so every
+# required context stays pending and the pull request sits at BLOCKED. That is
+# every layer of a STACKED pull request but the bottom one, and it is invisible:
+# the workflow is valid, the jobs are correct, and the only observable is a pull
+# request waiting on CI nobody asked to run.
+FiltersPullRequestBranches() {
+    awk '
+        /^on:[ \t]*$/             { inOn = 1; next }
+        inOn && /^[^ \t]/         { inOn = 0 }
+        inOn && /^[ \t]*#/        { next }
+        inOn && /^  [a-z_]+:/     { inPr = ($0 ~ /^  pull_request:/) }
+        inOn && inPr && /^    branches:/ { found = 1 }
+        END                       { exit(found ? 0 : 1) }
+    ' "$1"
+}
+
+# ---------------------------------------------------------------------------
 # Every workflow named in the table must listen for the event.
 #
 # A read loop and not `mapfile`: that is bash 4+, and macOS still ships 3.2 as
@@ -152,6 +173,12 @@ for workflow in "${workflows[@]}"; do
         echo "ok: $workflow triggers on merge_group"
     else
         Fail "$workflow has no \`merge_group:\` trigger, so every required context it produces would NEVER REPORT inside a merge queue -- a queued pull request would sit there rather than fail"
+    fi
+
+    if FiltersPullRequestBranches "$workflow"; then
+        Fail "$workflow filters \`pull_request\` by base branch, so every required context it produces would NEVER REPORT on a pull request based on anything else -- which is every layer of a stacked pull request but the bottom one, and it presents as CI that has not started rather than as a failure"
+    else
+        echo "ok: $workflow does not filter pull_request by base branch"
     fi
 done
 
