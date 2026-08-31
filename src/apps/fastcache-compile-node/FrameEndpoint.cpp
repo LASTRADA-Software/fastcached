@@ -271,6 +271,46 @@ namespace
     /// coroutine's closure outlives the expression that created it.
     /// @param state Shared server state.
     /// @param owned The accepted socket; this task owns it.
+    /// Answer an `AUTH` frame and record what it established on this connection.
+    ///
+    /// Separated from `ServeConnection` because it needs none of the loop: one
+    /// payload, one flag, one reply. That keeps the loop under the
+    /// cognitive-complexity ceiling and puts the credential rules where they can be
+    /// read without the framing around them.
+    ///
+    /// @param responder The surface whose credential this is.
+    /// @param payload The AUTH request body, already bounded by `MaxAuthPayload`.
+    /// @param credentialAccepted This connection's flag; set only on `Accepted`.
+    /// @return The reply frame to write.
+    [[nodiscard]] std::vector<std::byte> AnswerAuth(IFrameResponder const& responder,
+                                                    std::span<std::byte const> payload,
+                                                    bool& credentialAccepted)
+    {
+        auto const outcome = responder.CheckCredential(payload);
+
+        // `NoPolicy` answers Ok and sets NOTHING. A surface with no credential must
+        // not break a token-configured client, and must not mark it authenticated
+        // either -- nothing was verified, and a later reconfiguration would otherwise
+        // inherit the blessing.
+        if (outcome == CredentialOutcome::Accepted)
+            credentialAccepted = true;
+
+        // Total over the enumerators, so a fifth outcome cannot be answered by
+        // falling through to Ok -- the one wrong answer here, because it would tell a
+        // client its credential was accepted.
+        switch (outcome)
+        {
+            case CredentialOutcome::Malformed:
+                return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame, {});
+            case CredentialOutcome::Rejected:
+                return Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed");
+            case CredentialOutcome::NoPolicy:
+            case CredentialOutcome::Accepted:
+                break;
+        }
+        return Wire::EncodeReply(Wire::Status::Ok, {});
+    }
+
     DetachedTask ServeConnection(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
     {
         auto* const state = shared.get();
@@ -301,6 +341,13 @@ namespace
             // internally, so a per-request reader would discard bytes already pulled
             // off the socket -- which is exactly the pipelined second frame.
             ByteReader reader { *socket, /*maxLineBytes*/ 1, cap };
+
+            // Per CONNECTION, exactly as the daemon keeps it: the responder is shared
+            // by every connection on this surface, so a credential accepted here must
+            // not bless anyone else. It starts false and is only ever set by an AUTH
+            // frame this loop verified -- never seeded from the policy, which would
+            // authenticate a connection on the strength of a check that never ran.
+            bool credentialAccepted = false;
 
             while (!state->shuttingDown.load(std::memory_order_acquire))
             {
@@ -391,6 +438,32 @@ namespace
                     continue;
                 }
 
+                // The credential, decided from the header and this connection's state
+                // (#289). A SECOND question at the same point rather than a wider
+                // first one: `RefusePeer` answers on the peer alone, which is what
+                // lets it be asked before a frame exists; this needs the verb, the
+                // declared length and per-connection state, so folding them together
+                // would make that predicate's name stop describing it.
+                //
+                // `DecidePrePayload` is the same function the daemon's loop calls, so
+                // the two surfaces cannot disagree about which verbs are open, what
+                // they may carry, or in which order those are decided.
+                auto const decision = Wire::DecidePrePayload({ .opRaw = decoded->opRaw,
+                                                               .declaredLength = decoded->payloadLength,
+                                                               .sessionCap = cap,
+                                                               .authRequired = state->responder.AuthRequired(),
+                                                               .credentialAccepted = credentialAccepted });
+                if (decision != Wire::PrePayloadDecision::Serve)
+                {
+                    // Encoded and counted by the surface, not here: the endpoint owns
+                    // WHEN the question is asked, the responder owns the answer.
+                    if (!co_await WriteAll(socket.get(), state->responder.RefusalReply(decision)))
+                        break;
+                    if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
+                        break;
+                    continue;
+                }
+
                 if (auto const budget = state->responder.MaxInFlightBytes();
                     budget != 0 && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
                 {
@@ -421,6 +494,20 @@ namespace
                 auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
                 if (!payload.has_value())
                     break;
+
+                // AUTH is answered HERE and never reaches `Answer`, because what it
+                // changes is this connection's state and the responder is shared by
+                // all of them. The same split the daemon makes for the same reason.
+                //
+                // Lifted out of this loop rather than written inline: the loop sits at
+                // its cognitive-complexity ceiling, and an arm needing one payload and
+                // one flag is exactly the part that reads fine without the framing.
+                if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
+                {
+                    if (!co_await WriteAll(socket.get(), AnswerAuth(state->responder, *payload, credentialAccepted)))
+                        break;
+                    continue;
+                }
 
                 std::vector<std::byte> frame { header->begin(), header->end() };
                 frame.insert(frame.end(), payload->begin(), payload->end());

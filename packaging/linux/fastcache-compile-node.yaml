@@ -161,6 +161,12 @@
 # any client that can reach a worker's compile port can spend it.
 #cluster_key_file:
 
+# credential this node REQUIRES on its scheduler verbs. The inbound half of
+# --requirepass, which only says what this node presents. A FILE and not a
+# flag: a command line is readable through ps. Without it, membership is the
+# only gate, and that is a host list, not a secret.
+#scheduler_token_file:
+
 # serve /metrics and /healthz here; off unless given. A bare port binds
 # loopback: a scrape endpoint on a public interface is an operator's
 # decision, not a default. /healthz is also the liveness probe this worker

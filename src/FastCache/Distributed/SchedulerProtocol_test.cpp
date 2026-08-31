@@ -95,29 +95,39 @@ TEST_CASE("A scheduler answers its own verbs and nothing else", "[distributed][s
         CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
     }
 
-    SECTION("AUTH is refused with the one code the client steps over, not as a wrong port")
+    SECTION("AUTH is served elsewhere, so this layer says not-permitted rather than unknown")
     {
-        // NOT `DispatchNotPermitted`, and the distinction is a wire contract with a
-        // binary that does not link this library. `Cc::CacheProtocol::Exchange`
-        // tolerates exactly `Wire::UnimplementedVerb` for a verb an endpoint does not
-        // implement and proceeds unauthenticated -- right against a scheduler with no
-        // credential to check -- while treating every other refusal as being about
-        // the credential and returning it in place of the answer to the request the
-        // caller actually sent.
+        // **Reversed by #289, and the reversal is the contract rather than a detail.**
         //
-        // So with `FASTCACHE_TOKEN` set, this code being wrong declined every LEASE
-        // and every compile silently happened locally: a green build, and a fleet
-        // distributing nothing (#340).
+        // This asserted `UnimplementedVerb` and was right to: the scheduler checked no
+        // credential, and `Cc::CacheProtocol::Exchange` tolerates exactly that code,
+        // steps over the refusal and proceeds unauthenticated. Answering anything else
+        // made it treat the refusal as being about the credential and return it in
+        // place of the answer to the request actually sent -- with `FASTCACHE_TOKEN`
+        // set that declined every LEASE and compiled everything locally, a green build
+        // and a fleet distributing nothing (#340).
         //
-        // Asserted by VALUE. The enumerator both sides name is the only thing holding
-        // them together, so "some refusal" would pass under the defect.
+        // #289 makes the surface serve `AUTH` -- in `FrameServer`'s loop, because what
+        // the verb changes is per-connection state and this class is stateless -- and
+        // that flips which code is correct here. The rulebook states the rule directly:
+        // *unimplemented* is not *served elsewhere*. Keeping `UnimplementedVerb` would
+        // now tell a launcher holding the right token to skip presenting it and then
+        // have every gated verb refused, which is #340 again pointing the other way.
+        //
+        // `UnknownOpcode` would be worse still: it tells a client this daemon is too
+        // OLD when it is in fact too new.
+        //
+        // Asserted by VALUE, for the reason it always was -- the enumerator both sides
+        // name is the only thing holding two binaries together, so "some refusal"
+        // would pass under either defect.
         auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
-        CHECK(ErrorOf(fixture.protocol.Answer(auth, Insider)) == Wire::UnimplementedVerb);
+        CHECK(ErrorOf(fixture.protocol.Answer(auth, Insider)) == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(ErrorOf(fixture.protocol.Answer(auth, Insider)) != Wire::UnimplementedVerb);
 
         // And a bare token with no username, which is how `FASTCACHE_TOKEN` alone
         // reaches the wire, takes the same answer.
         auto const tokenOnly = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
-        CHECK(ErrorOf(fixture.protocol.Answer(tokenOnly, Insider)) == Wire::UnimplementedVerb);
+        CHECK(ErrorOf(fixture.protocol.Answer(tokenOnly, Insider)) == Wire::ErrorCode::DispatchNotPermitted);
     }
 
     SECTION("COMPILE is a worker's verb, not a scheduler's")

@@ -6,6 +6,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/IListener.hpp>
+#include <FastCache/Protocol/CompileCacheAuth.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -102,6 +104,52 @@ class IFrameResponder
     ///         and a peer that cannot tell a policy refusal from a dead host retries
     ///         forever.
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const = 0;
+
+    /// Does this surface require a credential before its gated verbs?
+    ///
+    /// Asked once per frame rather than cached, because a surface may be
+    /// reconfigured and a connection already open must not keep an answer from
+    /// before. It is a field read behind a virtual call, not a probe.
+    ///
+    /// Deliberately NOT folded into `RefusePeer`: that predicate answers on the peer
+    /// alone, which is what makes it answerable before a frame exists at all. A
+    /// credential gate needs the verb, the declared length and per-connection state,
+    /// none of which are peer facts -- so it is a second question asked at the same
+    /// point in the loop, not a wider version of the first
+    /// ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
+    ///
+    /// @return True when unauthenticated peers must be refused the gated verbs.
+    [[nodiscard]] virtual bool AuthRequired() const noexcept = 0;
+
+    /// Check an `AUTH` payload against this surface's credential.
+    ///
+    /// The endpoint terminates `AUTH` rather than passing it to `Answer`, because
+    /// what the verb changes is **connection state**, and the responder is shared by
+    /// every connection on this surface -- exactly as the daemon's handler keeps
+    /// `credentialAccepted` in its own loop rather than in the policy.
+    ///
+    /// @param payload The `AUTH` request payload, already bounded by `MaxAuthPayload`
+    ///        through the pre-payload gate.
+    /// @return What was established. Only `Accepted` may mark the connection
+    ///         authenticated -- `NoPolicy` is answered `Ok` and verifies nothing.
+    [[nodiscard]] virtual CredentialOutcome CheckCredential(std::span<std::byte const> payload) const = 0;
+
+    /// Encode -- and count -- a pre-payload refusal `DecidePrePayload` decided.
+    ///
+    /// The same division of labour as `RefusePeer`: one predicate decides, and the
+    /// surface owns the wording, the wire code and the counter, so a refusal cannot
+    /// be worded one way here and another way in `Answer`. The endpoint deliberately
+    /// does not encode this itself -- it would then own a counter belonging to a
+    /// policy it does not implement.
+    ///
+    /// Pure virtual rather than defaulted for the reason `RefusePeer` is: a surface
+    /// that says nothing would silently stop counting its own refusals, and a
+    /// security counter reading zero because nobody wired it is indistinguishable
+    /// from one reading zero because nothing was refused.
+    ///
+    /// @param decision Any value other than `Serve`.
+    /// @return The encoded refusal to send back. Never empty.
+    [[nodiscard]] virtual std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const = 0;
 
     /// Largest request this surface will buffer.
     ///

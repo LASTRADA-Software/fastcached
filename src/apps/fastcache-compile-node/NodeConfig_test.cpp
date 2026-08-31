@@ -269,6 +269,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.discoveryAddress = "255.255.255.255:6681";
     cfg.discoveryReplyPort = 6682;
     cfg.clusterKeyFile = "cluster.key";
+    // A PATH, exactly like `--cluster-key-file` above, which is why it belongs in a
+    // registration at all: the case below asserts the SECRET is never written, and
+    // the two rules only stay compatible because what travels is where to read the
+    // credential rather than the credential.
+    cfg.schedulerTokenFile = "scheduler.token";
     cfg.logLevel = LogLevel::Debug;
     cfg.pidfile = "worker.pid";
     cfg.drainTimeoutSeconds = 90;

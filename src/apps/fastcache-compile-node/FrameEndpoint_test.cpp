@@ -59,7 +59,7 @@ struct Fleet
     // endpoint is given with a port so the constructor's host/endpoint collapse is
     // exercised rather than bypassed.
     Distributed::ClusterMembership membership { { "127.0.0.1:7000" } };
-    SchedulerResponder responder { protocol, membership };
+    SchedulerResponder responder { protocol, membership, metrics };
     NullLogger logger;
 
     /// The reactor every endpoint in a case accepts on.
@@ -476,6 +476,40 @@ class HoldableResponder final: public IFrameResponder
         return Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not admitted");
     }
 
+    /// @copydoc IFrameResponder::AuthRequired
+    ///
+    /// Off by default, so every case written before #289 keeps asserting what it did.
+    /// A case that turns it on is asking about the credential gate specifically.
+    [[nodiscard]] bool AuthRequired() const noexcept override
+    {
+        return _authRequired.load(std::memory_order_acquire);
+    }
+
+    /// @copydoc IFrameResponder::CheckCredential
+    ///
+    /// Answers whatever the case placed, and counts the calls. The count is not
+    /// decoration: what separates a working gate from a door that is simply shut is
+    /// that the ACCEPTED path is reached at all, so a case has to be able to say the
+    /// credential was consulted rather than bypassed.
+    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> /*payload*/) const override
+    {
+        _credentialChecks.fetch_add(1, std::memory_order_acq_rel);
+        return _outcome;
+    }
+
+    /// @copydoc IFrameResponder::RefusalReply
+    ///
+    /// Counts only the unauthenticated arm, mirroring `SchedulerResponder`: a size or
+    /// opcode refusal says the caller is confused, an unauthenticated one says
+    /// somebody is reaching for verbs they hold no secret for, and summing them would
+    /// hide the second in the first.
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision) const override
+    {
+        if (decision == Wire::PrePayloadDecision::Unauthenticated)
+            _unauthenticatedRefusals.fetch_add(1, std::memory_order_acq_rel);
+        return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), {});
+    }
+
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
     {
         return 64ULL * 1024ULL;
@@ -513,6 +547,30 @@ class HoldableResponder final: public IFrameResponder
         _refusePeers.store(refuse, std::memory_order_release);
     }
 
+    /// Require a credential before the gated verbs.
+    void RequireAuth(bool required) noexcept
+    {
+        _authRequired.store(required, std::memory_order_release);
+    }
+
+    /// What the next `CheckCredential` will answer.
+    void CredentialAnswers(CredentialOutcome outcome) noexcept
+    {
+        _outcome = outcome;
+    }
+
+    /// @return How many times the credential was actually consulted.
+    [[nodiscard]] std::size_t CredentialChecks() const noexcept
+    {
+        return _credentialChecks.load(std::memory_order_acquire);
+    }
+
+    /// @return How many frames were refused for holding no accepted credential.
+    [[nodiscard]] std::size_t UnauthenticatedRefusals() const noexcept
+    {
+        return _unauthenticatedRefusals.load(std::memory_order_acquire);
+    }
+
     /// @return How many requests were refused at the door.
     [[nodiscard]] std::size_t PeerRefusals() const noexcept
     {
@@ -543,6 +601,10 @@ class HoldableResponder final: public IFrameResponder
     // often it was asked must not make it look like a mutator.
     mutable std::atomic<std::size_t> _peerRefusals { 0 };
     mutable std::atomic<std::size_t> _peerChecks { 0 };
+    std::atomic<bool> _authRequired { false };
+    CredentialOutcome _outcome { CredentialOutcome::NoPolicy };
+    mutable std::atomic<std::size_t> _credentialChecks { 0 };
+    mutable std::atomic<std::size_t> _unauthenticatedRefusals { 0 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
     std::size_t _concurrent { 8 };
@@ -615,6 +677,92 @@ TEST_CASE("A peer the surface refuses never gets its payload read", "[node][fram
     // this predicate would double-count every refusal if it were consulted twice.
     CHECK(responder.PeerChecks() == 1);
     CHECK(responder.PeerRefusals() == 1);
+}
+
+TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][frame]")
+{
+    // #289, and the same instrument as the peer gate above for the same reason: "the
+    // stranger is refused" passes while the bug is live, because the refusal happens
+    // either way -- just after the frame has been read. Declare a payload, send none
+    // of it, and only a header-decided refusal can answer at all.
+    //
+    // Separate from the peer case rather than folded into it: this gate reads the
+    // VERB and per-connection state, the other reads only the peer, and a case that
+    // could not tell them apart would pass if one were deleted.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RequireAuth(true);
+    // The peer gate must NOT be what refuses this, or the case proves nothing about
+    // the credential.
+    responder.RefuseEveryPeer(false);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // Comfortably inside `MaxRequestBytes()`, so the size ceiling cannot be what
+    // refuses it -- and `Fetch` is a gated verb, so the credential has to be.
+    constexpr std::uint32_t Declared = 32ULL * 1024ULL;
+    std::array<std::byte, Wire::RequestHeaderSize> frame {};
+    WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
+
+    auto const startedAt = std::chrono::steady_clock::now();
+    auto const reply = Exchange(port, frame);
+    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+
+    INFO("waited " << waited.count() << "ms for a refusal that costs no work; RequestTimeout is "
+                   << FrameServer::RequestTimeout.count() << "ms. An EMPTY reply near that figure is the server "
+                   << "blocked in ReadExactly for a payload it should never have asked for; an empty reply well "
+                   << "under it is something else, and a late but PRESENT reply is only a slow machine.");
+    REQUIRE_FALSE(reply.empty());
+    CHECK(ErrorOf(reply) == Wire::ErrorCode::Unauthenticated);
+
+    // The allocation claim rather than the refusal claim.
+    CHECK(responder.Entered() == 0);
+    // Counted once. An uncounted refusal and a double-counted one are both worse than
+    // the bug, because this number is what tells an operator the gate is working.
+    CHECK(responder.UnauthenticatedRefusals() == 1);
+}
+
+TEST_CASE("An authenticated peer is served the same verb", "[node][frame]")
+{
+    // The control, and the half that a gate refusing EVERYTHING would fail. Without
+    // it the case above is satisfied by a surface that serves nobody.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RequireAuth(true);
+    responder.CredentialAnswers(CredentialOutcome::Accepted);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // AUTH first -- itself reachable before a credential exists, or the gate would be
+    // a deadlock -- then the gated verb, on the SAME connection, because that is
+    // where the accepted credential lives.
+    Conversation conversation { port };
+
+    auto const authReply = conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" }));
+    REQUIRE_FALSE(authReply.empty());
+    CHECK(ErrorOf(authReply) == std::nullopt);
+
+    // The gated verb, on the SAME connection, because that is where the accepted
+    // credential lives -- a second connection would start unauthenticated again,
+    // which is itself the property that keeps one client's secret from blessing
+    // everybody else's connection to a shared responder.
+    auto const fetchReply = conversation.Send(Wire::EncodeFetch("k"));
+    REQUIRE_FALSE(fetchReply.empty());
+    CHECK(ErrorOf(fetchReply) == std::nullopt);
+    CHECK(responder.CredentialChecks() == 1);
+    CHECK(responder.UnauthenticatedRefusals() == 0);
+    // Reached, which is the whole point: the gate let a credentialled caller through.
+    CHECK(responder.Entered() == 1);
 }
 
 TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
