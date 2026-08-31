@@ -708,7 +708,7 @@ Consequences that are each load-bearing:
   `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
   `--bind`/`--port` are read by nothing. The value is still *in* the configuration;
   it has simply stopped describing anything. So a keyless node carrying a stale
-  `--bind=127.0.0.1` in `FASTCACHE_NODE_ARGS`, plus `--fleet-open` or a remote
+  `--bind=127.0.0.1` in its configuration, plus `--fleet-open` or a remote
   `--fleet-member`, passed the startup table, built `UncheckedLeaseValidator` and
   served an unauthenticated compile port to the network with all three
   `worker_jobs_refused_lease_*` counters reading zero. #282 recurring inside the fix

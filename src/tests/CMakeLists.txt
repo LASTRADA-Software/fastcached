@@ -224,6 +224,31 @@ set_tests_properties("target-file-guards" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The compile worker's shipped reference configuration against its option table.
+# Fails when a setting the file can carry has no commented block for an operator
+# to find, or when the file documents a key the table no longer has -- which is
+# the worse direction, since uncommenting it makes the worker refuse to start.
+#
+# Nothing else connects the two: NodeOptions() drives the parse, the YAML is
+# prose, and a build in which they describe different products is a build in
+# which everything passes. See scripts/check-node-config-reference.cmake.
+#
+# Not labelled "smoke", for the reason the checks above are not: it reads two
+# source files and compares strings, so it belongs in the default `ctest` set and
+# must survive `ctest -LE smoke`. Both files ship in an exported tarball, so it
+# has no skip path.
+add_test(
+    NAME "node-config-reference"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-config-reference.cmake"
+)
+set_tests_properties("node-config-reference" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
 # directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
 # is enforced rather than merely asserted.
@@ -671,6 +696,41 @@ set_tests_properties("compile-cache-daemon-staging" PROPERTIES
 # worker's output can never be byte-identical to a local build's. Every section
 # carrying code or data is, and the fixture's own comparison is what says so --
 # which is why that comparison has a self-test of its own below.
+# ---------------------------------------------------------------------------
+# The compile worker reads its configuration file (#291), driven through the
+# real binary.
+#
+# `ApplyNodeConfiguration` is unit-tested on every platform, which is a different
+# claim from "the process reads a file": `PurgeExpired` was correct and tested
+# and had no production caller at all. This asserts the composition in `main`.
+#
+# It also asks the three questions only a process can answer -- absent,
+# unreadable and malformed -- each of which must produce its OWN named outcome
+# rather than the nearest neighbour, since the exit code and one line of stderr
+# are everything an operator gets.
+#
+# NOT labelled "smoke": it opens no socket, starts no daemon and needs no
+# compiler. `--print-surfaces` renders the resolved configuration and exits, so
+# every case is a process that lives for milliseconds.
+if(NOT TARGET fastcache-compile-node)
+    message(STATUS "node-config-file-e2e: compile node not built -- skipping")
+elseif(WIN32)
+    # POSIX-only, the way the fixtures below record for themselves: a PowerShell
+    # twin would be a translation of this script rather than new coverage, and the
+    # one case that needs a platform -- an unreadable file -- is a POSIX mode.
+    message(STATUS "node-config-file-e2e: POSIX-only fixture -- skipping on Windows")
+else()
+    add_test(
+        NAME "node-config-file-e2e"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/node-config-file-e2e.sh"
+            "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    set_tests_properties("node-config-file-e2e" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 # ---------------------------------------------------------------------------
 # fleet-dashboard-e2e: the leader's dashboard, over a real socket.
 #

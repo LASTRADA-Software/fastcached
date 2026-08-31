@@ -70,6 +70,35 @@ struct OptionSpec
     bool Result::* explicitBit { nullptr }; ///< The "user typed this" tracker a config merge consults, or null.
     ParseFlow flow { ParseFlow::Continue }; ///< Whether parsing continues after this flag.
     std::string_view description {};        ///< Help text; '\n' wraps, `{token}`s expand at render time.
+
+    /// The key this setting carries in a YAML configuration file, or empty when it
+    /// may not come from one.
+    ///
+    /// **A column rather than a derivation, because the mapping is not derivable.**
+    /// Measured on the daemon: 44 flags, 34 keys, diverging four ways -- `--storage`
+    /// is `storage_path`, `--expiry-scan` is `active_expiry_scan`,
+    /// `--expiry-interval` is `active_expiry_interval_ms` (renamed *and* carrying a
+    /// unit the flag does not), and `--listen`/`--listen-tls` collapse into a single
+    /// `listeners:` key. There is no rule with exceptions there, only a mapping, and
+    /// a convention derived from flag names would silently rename three existing
+    /// keys the day somebody generalised it.
+    ///
+    /// Empty is a decision rather than an omission: a one-shot verb has no business
+    /// in a file, because a file is read at every start and would replay one
+    /// operator's decision forever. Which rows those are is a named list beside the
+    /// table, and a guard walks the table requiring every other row to carry a key.
+    std::string_view yamlKey {};
+
+    /// Empties this row's target before command-line values replace file-sourced
+    /// ones, or null for a row whose value is not a list.
+    ///
+    /// Only repeatable rows need it, and only because their applier APPENDS. A
+    /// command line naming any value for a list setting **replaces** what the file
+    /// declared rather than extending it -- the daemon's rule for `listeners:`, and
+    /// its reasoning is what decides it: mixing partial file values with partial
+    /// command-line values makes precedence depend on declaration order, which is
+    /// not something an operator can reason about.
+    ApplyFlag<Result> clear { nullptr };
 };
 
 /// Check at compile time that a table says what it must.
@@ -93,10 +122,38 @@ template <typename Result>
     if (!shapeOk)
         return false;
 
+    // A row reachable from a config file must be one a file can actually express.
+    // `select` marks a row choosing what the process DOES instead of running --
+    // `--help`, `--install-service`, a cluster question -- and `flow == Stop` ends
+    // parsing; both are incoherent read from a file at every start. A `clear` on a
+    // row with no key is a row somebody half-converted to a list. Checked here
+    // rather than at runtime because a row that is both is not a condition to
+    // report, it is one that should not compile.
+    //
+    // Arity is deliberately NOT checked. An `Arity::None` row is a flag whose
+    // meaning is its presence, and a file spells presence as a boolean: the key
+    // takes `true` or `false`, and `apply` runs on `true` alone. That reading is
+    // exact for both polarities -- `raft_join: true` passes `--raft-join`, and
+    // `no_toolchain_discovery: false` passes nothing, which is discovery left on.
+    // The alternative, a positively-named key with an applier no flag has, is a
+    // setting reachable from a file and not from argv -- two mechanisms for one
+    // setting, which is the shape this column exists to remove.
+    auto const fileRowsOk = std::ranges::all_of(table, [](OptionSpec<Result> const& spec) {
+        if (spec.yamlKey.empty())
+            return spec.clear == nullptr;
+        return spec.apply != nullptr && spec.select == nullptr && spec.flow == ParseFlow::Continue;
+    });
+    if (!fileRowsOk)
+        return false;
+
     auto const indices = std::views::iota(std::size_t { 0 }, table.size());
     return std::ranges::all_of(indices, [table, indices](std::size_t a) {
         return std::ranges::all_of(indices | std::views::drop(a + 1), [table, a](std::size_t b) {
-            return table[a].primary != table[b].primary && (table[a].alias.empty() || table[a].alias != table[b].alias);
+            // The key joins the spelling checks for the same reason: two rows
+            // answering to one key means whichever the walk reaches second wins,
+            // silently.
+            return table[a].primary != table[b].primary && (table[a].alias.empty() || table[a].alias != table[b].alias)
+                   && (table[a].yamlKey.empty() || table[a].yamlKey != table[b].yamlKey);
         });
     });
 }
@@ -225,6 +282,22 @@ template <auto Field, auto Parse>
     return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
         return Parse(value).transform(
             [&result](auto&& parsed) { TargetOf<Field>(result).push_back(std::forward<decltype(parsed)>(parsed)); });
+    };
+}
+
+/// An applier that EMPTIES `Field` — the reset a repeatable row needs before
+/// command-line values replace file-sourced ones.
+///
+/// The same `ApplyFlag<Result>` type as `apply` and `select`, so the column costs a
+/// field of a type the row already has rather than a new concept. Its value
+/// argument is ignored: there is nothing to parse in "forget what you were told".
+/// @return The applier, usable as an OptionSpec::clear in a `constexpr` table.
+template <auto Field>
+[[nodiscard]] constexpr auto ClearList() noexcept
+{
+    return [](auto& result, std::string_view) -> std::expected<void, ConfigError> {
+        TargetOf<Field>(result).clear();
+        return {};
     };
 }
 

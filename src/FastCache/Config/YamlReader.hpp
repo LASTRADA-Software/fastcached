@@ -6,7 +6,9 @@
 
 #include <expected>
 #include <filesystem>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache
 {
@@ -66,5 +68,48 @@ struct YamlConfigWithPresence
 /// @return Parsed config + presence bits, or a ConfigError.
 [[nodiscard]] std::expected<YamlConfigWithPresence, ConfigError> ReadYamlConfigWithPresence(
     std::filesystem::path const& path);
+
+/// One top-level key from a YAML document, with the scalar values it carried.
+struct YamlSetting
+{
+    /// The top-level key, verbatim. Never interpreted here.
+    std::string key;
+
+    /// One entry for a scalar; one per element for a sequence of scalars.
+    ///
+    /// A sequence rather than a second shape, because that is what a repeatable
+    /// setting looks like in YAML and a caller applying values one at a time does
+    /// not need to know which spelling it met.
+    std::vector<std::string> values;
+
+    /// One-based source line of the key, or 0 when the document would not say.
+    /// Carried so a rejection points at the line an operator has to edit.
+    unsigned line { 0 };
+};
+
+/// Read a YAML file as top-level key/scalar settings, without knowing what any
+/// key MEANS.
+///
+/// The generic door `ReadYamlConfig` never had: that function parses straight into
+/// the daemon's `Config` through a hand-written key ladder, so a second binary had
+/// no way in. This returns the file's shape and nothing else, which is what lets a
+/// caller drive its own option table from it.
+///
+/// **yaml-cpp stays out of the header** — values come back as `std::string`, so the
+/// dependency remains an implementation detail of this translation unit exactly as
+/// it is for `ReadYamlConfig`.
+///
+/// Deliberately shallow. A value that is a map, or a sequence containing anything
+/// but scalars, is a `TypeMismatch` naming the key rather than something flattened:
+/// a caller that applies values through a table has no way to represent nesting,
+/// and silently ignoring a nested block would be a setting an operator wrote and
+/// nothing read. The daemon's own `listeners:` is nested, which is why that reader
+/// stays where it is rather than being rebuilt on this.
+///
+/// An empty document is success carrying nothing, because a fully-commented
+/// reference file is a legitimate and expected configuration.
+/// @param path Filesystem path of the YAML file.
+/// @return The settings in document order, or why the file could not be read.
+[[nodiscard]] std::expected<std::vector<YamlSetting>, ConfigError> ReadYamlSettings(std::filesystem::path const& path);
 
 } // namespace FastCache

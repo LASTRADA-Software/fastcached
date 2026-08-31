@@ -68,7 +68,9 @@ src/FastCache/
                 interval-refreshed oracle), NarrowText (what a `char` is on this
                 host, and reading text something else wrote)
   Config/       Config, CliParser + CliOptions (the one flag table), ByteSize,
-                YamlReader, ConfigReloader, EnvExpand, DefaultConfigPath
+                YamlReader, FileOptions (an option table applied from a config
+                FILE, through the same appliers argv reaches), ConfigReloader,
+                EnvExpand, DefaultConfigPath
   Metrics/      IMetricsSink + AtomicMetricsSink, MetricsCatalog (the counter
                 table) and PrometheusFormatter, which renders that table
 ```
@@ -507,6 +509,31 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `--toolchain`.
 - A value parser cannot know which flag it was reached through, so it names none and
   `ApplyOneOption` stamps the row's own spelling.
+- A configuration FILE reaches the same fields through the SAME appliers, in that
+  order, so "the command line wins" is which loop runs second — never a per-field
+  merge with a per-field explicit bit and a per-field presence bit, which is the
+  daemon's shape and has shipped a flag that parsed and never merged four times.
+  Which key a row answers to is a COLUMN (`yamlKey`), because the mapping is not
+  derivable: 34 keys for 44 daemon flags, diverging four ways. A key naming no row
+  is REFUSED — a file is read at every start, so a key nothing reads is a setting an
+  operator believes is in force forever. A row a file may not carry is on a named
+  list with a per-row reason, and the compile-time guard READS that list.
+- A flag whose meaning is its presence is a boolean in the file and `apply` runs on
+  `true` alone — the key spells the FLAG, so `no_toolchain_discovery: false` passes
+  nothing. A repeatable row APPENDS, so the command line EMPTIES the list first
+  (driven off the `clear` column) or `--toolchain` extends the file's set instead of
+  replacing it — and that reset walks argv through the parser's own `TakeValue`, or a
+  flag's VALUE spelled like a list flag empties the list. A file that failed halfway
+  is DECLINED, never half-applied.
+- `--install-service` registers the command-line-only parse and carries the config
+  PATH, never the file's values and never a resolved default — either pins the
+  service to one reading of a file the operator then edits with no effect.
+- A missing file is `FileNotFound`, not `ParseError`: `YAML::BadFile` derives from
+  `YAML::Exception`, and the general catch sent a mistyped `--config` hunting for a
+  syntax error in a file that is not there.
+- The shipped reference configuration is checked against the table
+  (`ctest -R node-config-reference`) — nothing else connects them, and that check
+  fails when either scan matches nothing, because two empty lists agree perfectly.
 
 **[`.agent/rules/storage.md`](.agent/rules/storage.md)** — the on-disk format and
 converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.

@@ -1,0 +1,258 @@
+# fastcache-compile-node configuration
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every setting below is commented out, so this file as shipped has NO behaviour:
+# an untouched copy is exactly `fastcache-compile-node` with no flags. Anything
+# this worker does that you did not want is therefore something written here or
+# on its command line -- which is the property the file is for, and the reason
+# nothing is uncommented for you.
+#
+#   systemctl restart fastcache-compile-node   apply any change
+#
+# There is no reloadable subset: every setting here is read once at startup.
+#
+# Every key is one flag, spelled with underscores instead of dashes, and there
+# is no setting that a file can express and a command line cannot. A flag on the
+# command line WINS over the same key here. For a list setting (toolchain,
+# raft_peer, fleet_member) naming any value on the command line REPLACES this
+# file's list rather than extending it.
+#
+# A flag whose meaning is its presence -- one you would pass with no value --
+# is a boolean here, and only `true` and `false` are accepted. `raft_join: true`
+# is `--raft-join`; `raft_join: false` is not passing it. Read
+# `no_toolchain_discovery` the same way: `true` turns discovery OFF.
+#
+# Started without --config, this worker reads the first of these that exists and
+# it can read, so this file is found with no flag at all:
+#
+#   POSIX    $XDG_CONFIG_HOME/fastcache-compile-node/fastcache-compile-node.yaml
+#            ~/.config/fastcache-compile-node/fastcache-compile-node.yaml
+#            <sysconfdir>/fastcache-compile-node.yaml
+#   Windows  %APPDATA%\fastcache-compile-node\fastcache-compile-node.yaml
+#            %ProgramData%\fastcache-compile-node\fastcache-compile-node.yaml
+#
+# where <sysconfdir> is the directory this build was packaged for -- on Linux
+# that is /etc/fastcached, which is where this very file is installed.
+#
+# The per-user rows apply to an unprivileged run. A run as root takes every row,
+# and requires each to be one only an administrator could have written, so
+# `sudo` cannot pick up a config out of an account's own $HOME.
+#
+# A path you pass to --config is STRICT: if it is absent, unreadable or
+# malformed the worker refuses to start, because you are owed the news that the
+# file you named did not arrive. A file found by the lookup above is skipped
+# when it is not there.
+#
+# THE MODE OF THIS FILE IS NOT CHECKED. Anyone who can write it decides what
+# this worker runs and which compilers it serves. Keep it writable only by root
+# (0644 root:root is what the package installs). See issue #384.
+#
+# Every key below is one row of the same table `fastcache-compile-node --help`
+# prints, and a check in this project's test suite fails the build when the two
+# stop agreeing -- so a setting missing here, or one here that the worker no
+# longer has, is a build failure rather than something you find at a restart.
+# The full reasoning for each setting is in that help output.
+
+
+# the scheduler's --listen-scheduler endpoint. Required: a worker nothing
+# knows about serves nobody.
+#scheduler:
+
+# host:port CLIENTS should use to reach this worker. Defaults to --bind and
+# --port, which is wrong behind NAT or on a multi-homed host: the scheduler
+# hands this string to clients verbatim, so a worker that advertises an
+# address only it can reach is leased and then never answers.
+#advertise:
+
+# address to listen on (default 0.0.0.0)
+#bind:
+
+# port to listen on (default 6676)
+#port:
+
+# a toolchain this worker serves; repeatable. An OVERRIDE: naming any pins
+# this worker to exactly that set, and naming none means serve whatever this
+# machine has. There is still no default COMPILER -- a default is how a job
+# ends up running against something nobody chose.
+#toolchain:
+#  - <compiler>
+#  - <fingerprint>=<compiler>
+
+# do not survey this machine for compilers. Without --toolchain this leaves
+# the worker with nothing to serve, so it refuses to start -- and refuses to
+# be INSTALLED as a service, which is the registration that would otherwise
+# fail at every boot with nobody watching.
+#no_toolchain_discovery: false
+
+# concurrent compiles. Default: derived from this machine's cores and
+# memory, less what --node-class reserves. A number given here is the answer
+# and is not clamped or reduced further. Advertised to the scheduler AND
+# enforced here: a worker that accepted more would be fuller and slower than
+# the scheduler believes, at the same moment.
+#slots:
+
+# how hard this machine may be driven (default: workstation). A workstation
+# keeps cores free for the person using it; a dedicated node may be driven
+# to its slot limit. The default is the safe answer rather than the common
+# one.
+#node_class:
+
+# seconds a stop waits for compiles still running before giving up and
+# saying what it abandoned; 0 waits forever. Unbounded, the supervisor
+# decides instead and answers with SIGKILL and no diagnostic.
+#drain_timeout_seconds:
+
+# cores never offered to the fleet, overriding what the node class reserves.
+# 0 is a real answer and is not the same as omitting the flag. Ignored when
+# --slots names a number, which is the operator's answer already.
+#reserve_cores:
+
+# this node's identity in the cluster. Giving it turns consensus ON; without
+# it this node leads alone, which is right for one machine and is the
+# default.
+#node_id:
+
+# where peers reach this node's consensus port. A bare port binds the
+# WILDCARD: peers are on other machines by definition, so loopback would
+# silently not work.
+#listen_raft:
+
+# a cluster member and where it answers; repeatable. Both halves in one
+# token because a member id with no address is a node counted towards quorum
+# and unreachable. This is the BOOTSTRAP set only: membership is replicated
+# once the cluster runs.
+#raft_peer:
+#  - <id>=<host>:<port>
+#  - <id>=<host>:<port>
+
+# start with NO cluster and wait to be admitted to one. --raft-peer then
+# lists nodes this one can REACH rather than a cluster it belongs to --
+# itself, and whoever will admit it, because a joiner has to be able to
+# answer the leader before it can learn where that leader is. Without this
+# flag a node bootstraps a cluster of itself, elects itself, and can never
+# afterwards be admitted to anybody else's.
+#raft_join: false
+
+# where consensus keeps its durable state. A node that answered a vote and
+# forgot it votes twice in one term after a restart, which is two leaders.
+#cluster_dir:
+
+# which fleet this node belongs to. Plain text in every beacon and NOT a
+# credential: what it buys is that two unrelated fleets on one segment
+# ignore each other.
+#cluster_id:
+
+# announce this node on the segment and listen for peers here; off unless
+# given. Needs --node-id and --cluster-key-file. Without it a cluster is
+# exactly the --raft-peer list an operator typed.
+#discovery:
+
+# port peers unicast their discovery challenges and proofs to; kernel-chosen
+# unless given. NOT the --discovery port: that one is shared by every node
+# on the segment, and only one socket sharing a port is handed a unicast.
+# Pin it where a host firewall opens named ports only -- one per node on the
+# machine.
+#discovery_reply_port:
+
+# the cluster's pre-shared key. A FILE and not a flag: a command line is
+# readable through ps, and a key that leaks admits a node whose objects the
+# whole fleet then caches. Discovery proves the cluster with it, and the
+# scheduler SIGNS lease grants with it. Without one, a grant is unsigned and
+# any client that can reach a worker's compile port can spend it.
+#cluster_key_file:
+
+# serve /metrics and /healthz here; off unless given. A bare port binds
+# loopback: a scrape endpoint on a public interface is an operator's
+# decision, not a default. /healthz is also the liveness probe this worker
+# otherwise has none of.
+#admin_listen:
+
+# also serve the fleet dashboard on --admin-listen, at /fleet and
+# /fleet.json. Off unless given: the page is a map of every member's
+# hostname, endpoint and capacity. Answered in full only while this node
+# LEADS; anyone else names the leader rather than showing half a fleet.
+#dashboard: false
+
+# credential the dashboard requires, as Basic or Bearer. A FILE and not a
+# flag: a command line is readable through ps. Its own secret rather than
+# --requirepass, which every member of the fleet already holds. Required
+# when --admin-listen is not on loopback.
+#dashboard_token_file:
+
+# generate a self-signed certificate at startup and serve the admin surface
+# over HTTPS with it, so an internal deployment needs no certificate to
+# obtain. Encrypts the traffic; it does NOT prove which node answered, so
+# the fingerprint is logged for you to compare. Regenerated every restart --
+# name --tls-cert for a stable identity.
+#tls_self_signed: false
+
+# serve the admin surface over HTTPS with this certificate. TLS is on by
+# naming a certificate and a key rather than by a flag, so there is no way
+# to ask for it without the material to do it.
+#tls_cert:
+
+# private key for --tls-cert. Both or neither.
+#tls_key:
+
+# serve the fleet's scheduler verbs here; off unless given. Answered only
+# while this node LEADS the cluster; a follower redirects to the leader and
+# an election in progress refuses, both of which a client answers by
+# compiling locally. A bare port binds the wildcard: peers have to reach it.
+#listen_scheduler:
+
+# a peer this node serves; repeatable. Gates all three surfaces -- the
+# compile port, the cache tier and the scheduler -- so a WORKER needs it
+# too, or it compiles for its own machine alone. Only the host is matched: a
+# peer dials from an ephemeral port, so an endpoint is not something a
+# connection can be compared to.
+#fleet_member:
+#  - <host>[:<port>]
+#  - <host>[:<port>]
+
+# admit every caller to this node, not only --fleet-member hosts. For one
+# machine, or a network that is already the boundary. Explicit because 'no
+# policy' and 'admit everybody' must be the same decision -- listing nobody
+# refuses everybody.
+#fleet_open: false
+
+# size of this node's own in-memory cache tier; k/m/g = KiB/MiB/GiB or N% of
+# host RAM. Defaults to 25% of RAM within [512m, 8g]; 0 turns it off. It
+# exists so a local rebuild on a slow or bad network never reaches the wire
+# at all.
+#cache_memory:
+
+# cap this node's on-disk cache tier at this size (default 0, meaning grow
+# as needed). Only means anything with --cache-dir: without a path there is
+# no disk tier for a budget to bound.
+#cache_disk:
+
+# back the local cache tier with disk at this path. Memory-only otherwise: a
+# disk tier is a resource an operator should have to name. ONE node per
+# path, enforced: the store is claimed exclusively, so a second node sharing
+# it refuses to start.
+#cache_dir:
+
+# serve cache verbs to local clients here (default 127.0.0.1:6674, where
+# fastcache-cc already looks; empty turns it off). A bare port binds
+# LOOPBACK, unlike --listen-scheduler: a cache any host can dial is this
+# machine's whole build output served to strangers. Widen it and only this
+# machine and --fleet-member peers are still admitted.
+#listen_cache:
+
+# the shared fastcached this node reads through to. Empty is honest rather
+# than broken: one developer's machine has no shared cache.
+#upstream:
+
+# credential presented to the scheduler. THIS is where it belongs: a
+# supervisor records launch arguments where every local account can read
+# them, so --install-service refuses the flag outright and registers
+# --config=<path> instead. The mode of this file is not checked by the
+# worker (#384), so a file carrying a token should be readable only by the
+# account the service runs as -- 0640 root:fastcache-node.
+#requirepass:
+
+# trace, debug, info, warn, error, fatal (default info)
+#log_level:
+
+# write the pid here when daemonizing (POSIX)
+#pidfile:

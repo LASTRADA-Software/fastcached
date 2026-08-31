@@ -31,6 +31,9 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Version.hpp>
@@ -1217,8 +1220,22 @@ int main(int argc, char** argv)
 {
     std::span<char const* const> const argvSpan { const_cast<char const* const*>(argv), static_cast<std::size_t>(argc) };
 
-    NodeConfig cfg;
-    auto const flow = ParseOptionsInto(NodeOptions(), argvSpan.subspan(1), cfg);
+    // Parsed TWICE, into two results, and which one a decision reads is the whole
+    // of this arrangement.
+    //
+    // `cliOnly` holds nothing but the command line. It answers the two questions a
+    // configuration file must not be able to answer: WHICH file to read, and what
+    // gets baked into a service registration -- `--install-service` registers the
+    // command line as typed, so a setting the file supplied must not be copied into
+    // launch arguments that then outrank the file forever.
+    //
+    // `cfg` is the file applied first and the command line applied over it, through
+    // the SAME appliers in that order. "The command line wins" is therefore the
+    // order two loops run in rather than a per-field merge with a per-field
+    // explicit bit -- which is the shape the daemon has, and which has shipped a
+    // flag that parsed but never merged four times.
+    NodeConfig cliOnly;
+    auto const flow = ParseOptionsInto(NodeOptions(), argvSpan.subspan(1), cliOnly);
     if (!flow.has_value())
     {
         // The FIELD as well as the reason. Without it an unrecognised argument reads
@@ -1242,7 +1259,7 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
-    if (cfg.help)
+    if (cliOnly.help)
     {
         // The color decision is made here rather than inside the help renderer so
         // that module stays free of ambient probes -- and on Windows the call also
@@ -1250,11 +1267,83 @@ int main(int argc, char** argv)
         std::cout << HelpText(StdoutSupportsColor() ? UsageColor::Colored : UsageColor::Plain);
         return 0;
     }
-    if (cfg.version)
+    if (cliOnly.version)
     {
         std::cout << "fastcache-compile-node " << FASTCACHE_NODE_VERSION << '\n';
         return 0;
     }
+
+    // Both of the above answer without reading anything, deliberately: a file this
+    // build cannot parse must not be able to stop `--help` from explaining the flag
+    // that would name a different one.
+
+    // A leftover from when this worker was configured by a bag of arguments in an
+    // EnvironmentFile. The unit no longer reads it, so a value left behind would
+    // silently stop taking effect -- an operator's settings disappearing at an
+    // upgrade with nothing anywhere saying why. Said once, at every start, because
+    // the remedy is to delete the file and there is nothing else to report.
+    if (ReadEnvironmentVariable("FASTCACHE_NODE_ARGS").has_value())
+        std::cerr << "fastcache-compile-node: FASTCACHE_NODE_ARGS is set and is no longer read; this worker is "
+                     "configured by --config=<file> (see /etc/fastcached/fastcache-compile-node.yaml). Delete "
+                     "the leftover /etc/fastcached/compile-node.env and put those settings in the YAML file.\n";
+
+    // The file the operator named, or else whichever platform default is actually
+    // there. `EffectiveConfigPath` owns that rule -- a named path is strict and a
+    // discovered one is skipped when it is absent, unreadable or untrusted -- and
+    // it is the same rule and the same code the daemon's lookup uses.
+    auto const lookup = EffectiveConfigPath(cliOnly.configPath, SystemConfigPathProbe {}, NodeApplicationName);
+
+    // A file that is there and readable and was passed over anyway has to say so.
+    // Silence would leave an operator editing a file this worker has quietly
+    // decided not to obey, over a permission problem only they can fix.
+    for (auto const& [rejectedPath, reason]: lookup.rejected)
+        std::cerr << "fastcache-compile-node: " << rejectedPath.string() << ": " << reason << '\n';
+
+    // A file this run cannot use is fatal -- with ONE exception, and it is the same
+    // one the daemon carves out and for the same reason. `--uninstall-service`
+    // names a registration to remove and reads nothing out of the file; refusing to
+    // run it because the file at the default location has a typo blocks the very
+    // recovery an operator reached for, and the registration being removed is
+    // frequently the thing that put the bad file there.
+    //
+    // Narrower than the daemon's carve-out, deliberately. `--install-service` is
+    // judged against the merged configuration, `--print-surfaces` prints it, and a
+    // cluster verb dials an endpoint that may come from it -- so for those three, a
+    // file that did not load would produce a confident answer about a configuration
+    // this process never assembled.
+    //
+    // A path the operator NAMED is fatal even then: they are owed the news that the
+    // file they typed did not arrive.
+    auto const fileIsAdvisory = cliOnly.uninstallService && cliOnly.configPath.empty();
+
+    NodeConfig cfg;
+    bool fileApplied = false;
+    if (!lookup.path.empty())
+    {
+        auto const loaded =
+            ReadYamlSettings(lookup.path).and_then([&cfg, &lookup, argvSpan](std::vector<YamlSetting> const& settings) {
+                return ApplyNodeConfiguration(settings, lookup.path, argvSpan.subspan(1), cfg);
+            });
+        if (loaded.has_value())
+            fileApplied = true;
+        else if (!fileIsAdvisory)
+        {
+            std::cerr << "fastcache-compile-node: " << loaded.error().ToString() << '\n';
+            return ExitUsage;
+        }
+        else
+            std::cerr << "fastcache-compile-node: ignoring " << lookup.path.string() << ": " << loaded.error().ToString()
+                      << '\n';
+    }
+
+    if (!fileApplied)
+        // Assigned rather than left as it is: a file that failed halfway leaves
+        // `cfg` holding part of a document this run has decided not to obey, and
+        // "some of the settings, up to the bad line" is a configuration nobody
+        // wrote. Declining a file means the command line stands alone -- which is
+        // also the ordinary no-file case, where `cliOnly` is already the answer.
+        cfg = cliOnly;
+
     if (cfg.printSurfaces)
     {
         // Before the startup rules below, deliberately. An operator reaches for this
@@ -1288,6 +1377,13 @@ int main(int argc, char** argv)
         // Only an install has to be viable; an uninstall merely names a
         // registration to remove, and refusing to remove one because it was
         // misconfigured is how a bad registration becomes permanent.
+        //
+        // Judged on the MERGED configuration, and registered from the command line
+        // alone -- which is not a contradiction. What the service will run with is
+        // the file plus these arguments, so judging the command line alone would
+        // refuse the documented setup, where `--scheduler` and the toolchains come
+        // out of the packaged file. What is baked in is still only what was typed,
+        // plus the `--config` path that supplies the rest.
         if (cfg.installService)
             if (auto const rejection = NodeInstallRejection(cfg))
             {
@@ -1295,7 +1391,13 @@ int main(int argc, char** argv)
                 return ExitUsage;
             }
 
-        auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), cfg);
+        // `cliOnly`, never `cfg`: a registration replays its arguments at every
+        // start, so baking in what the FILE said would freeze one reading of that
+        // file into launch arguments that then outrank the file itself -- the
+        // operator edits it, restarts the service, and nothing changes. What the
+        // registration does carry is the `--config` path, so the service reads the
+        // current file at every start rather than a snapshot of it.
+        auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), cliOnly);
         auto const result =
             cfg.installService ? InstallService(spec, cfg.serviceScope) : UninstallService(spec, cfg.serviceScope);
         if (result.exitCode == 0)

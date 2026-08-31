@@ -1110,10 +1110,25 @@ The package ships a socket-activated unit. Enable the **socket**, not the
 service:
 
 ```sh
-sudoedit /etc/fastcached/compile-node.env     # scheduler and advertise; the
-                                              # compilers are discovered
+sudoedit /etc/fastcached/fastcache-compile-node.yaml   # scheduler and advertise;
+                                                       # the compilers are discovered
 sudo systemctl enable --now fastcache-compile-node.socket
 ```
+
+The unit's `ExecStart` names that file, and the shipped copy is every setting
+commented out — so an untouched install behaves exactly like running the worker
+with no flags, and anything it does that you did not want is something written
+there. Every key is one flag with underscores instead of dashes, a flag on the
+command line wins over the same key, and there is no setting the file can express
+that a command line cannot. It is a dpkg conffile and an rpm `%config(noreplace)`,
+so an upgrade leaves your edits alone.
+
+Its **mode is not checked**: anyone who can write it decides what this worker
+runs and which compilers it serves. The package installs it `0644 root:root`, so
+keep it writable only by root
+([#384](https://github.com/LASTRADA-Software/fastcached/issues/384)) — and
+tighten it to `0640 root:fastcache-node` if you put a `requirepass:` in it, since
+the default is readable by every local account.
 
 Socket activation means systemd owns the port: it answers from boot, so a client
 that leases this worker never races its startup, and an idle worker costs
@@ -1230,12 +1245,18 @@ never reached.
 records launch arguments where every local account can read them, and for a
 worker that token is what the scheduler authenticates it *by*.
 
-Where it goes instead is a supervisor override, not a config file — this worker
-reads no configuration file at all. On Linux that is `FASTCACHE_NODE_ARGS` in
-`/etc/fastcached/compile-node.env`, which systemd reads and the worker never
-sees on a world-readable command line. macOS and Windows have no equivalent
-today, so a worker that needs a token is run there in the foreground rather than
-registered as a service.
+Where it goes instead is the configuration file: `requirepass:` in
+`/etc/fastcached/fastcache-compile-node.yaml`, which the worker reads at every
+start and which is not a world-readable command line — mode `0640
+root:fastcache-node` for a file that holds one. Where `--install-service` is the
+registration mechanism, pass `--config=<path>` alongside it: what gets baked into
+the launch arguments is then the path, not the secret.
+
+On macOS and Windows there is no packaged copy of that file yet — the `.pkg`
+and the MSI have no conffile mechanism, and the seeding their installers do
+handles `fastcached.yaml` alone
+([#397](https://github.com/LASTRADA-Software/fastcached/issues/397)) — so write
+the file yourself and name it with `--config`.
 
 **macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
 you, which is the per-developer case. `--service-scope=system` registers a

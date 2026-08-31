@@ -6,6 +6,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
@@ -429,130 +430,215 @@ std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::s
     return std::pair { std::move(name), std::string { text.substr(split + 1) } };
 }
 
+std::expected<void, ConfigError> ApplyNodeConfiguration(std::vector<YamlSetting> const& settings,
+                                                        std::filesystem::path const& path,
+                                                        std::span<char const* const> args,
+                                                        NodeConfig& result)
+{
+    if (auto applied = ApplyFileSettings(NodeOptions(), settings, path, result); !applied.has_value())
+        return applied;
+
+    // A repeatable row's applier APPENDS, so a `--toolchain` on the command line
+    // would otherwise EXTEND the file's list rather than replace it. Replacement is
+    // the rule -- mixing partial file values with partial command-line values makes
+    // precedence depend on declaration order, which is not something an operator can
+    // reason about -- and it is driven off the table's own `clear` column, so a
+    // fourth repeatable flag needs no edit here.
+    ClearListsNamedOn(NodeOptions(), args, result);
+
+    // The command line over the file-seeded result, through the same appliers. Its
+    // outcome is discarded rather than ignored: the caller has already parsed this
+    // exact argv once to find the config path, so anything that could be refused
+    // here was refused there, with the message an operator wants and before a file
+    // was read at all.
+    (void) ParseOptionsInto(NodeOptions(), args, result);
+    return {};
+}
+
 std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
 {
     static constexpr auto options = std::to_array<OptionSpec<NodeConfig>>({
-        { .primary = "--scheduler",
-          .arity = Arity::Value,
-          .operand = "=<host:port>",
-          .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
-          .description = "the scheduler's --listen-scheduler endpoint. Required: a\n"
-                         "worker nothing knows about serves nobody." },
-        { .primary = "--advertise",
-          .arity = Arity::Value,
-          .operand = "=<host:port>",
-          .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
-          .description = "host:port CLIENTS should use to reach this worker.\n"
-                         "Defaults to --bind and --port, which is wrong behind NAT\n"
-                         "or on a multi-homed host: the scheduler hands this string\n"
-                         "to clients verbatim, so a worker that advertises an\n"
-                         "address only it can reach is leased and then never\n"
-                         "answers." },
-        { .primary = "--bind",
-          .arity = Arity::Value,
-          .operand = "=<address>",
-          .apply = AssignFrom<&NodeConfig::bindAddress, ParseUtf8Text>(),
-          .description = "address to listen on (default 0.0.0.0)" },
-        { .primary = "--port",
-          .arity = Arity::Value,
-          .operand = "=<n>",
-          .apply = AssignFrom<&NodeConfig::port, ParseNodePort>(),
-          .description = "port to listen on (default 6676)" },
-        { .primary = "--toolchain",
-          .arity = Arity::Value,
-          .operand = "=<compiler>|<fingerprint>=<compiler>",
-          .apply = AppendFrom<&NodeConfig::toolchains, ParseToolchain>(),
-          .description = "a toolchain this worker serves; repeatable. An OVERRIDE:\n"
-                         "naming any pins this worker to exactly that set, and\n"
-                         "naming none means serve whatever this machine has.\n"
-                         "There is still no default COMPILER -- a default is how a\n"
-                         "job ends up running against something nobody chose." },
-        { .primary = "--no-toolchain-discovery",
-          .arity = Arity::None,
-          .apply = SetFalse<&NodeConfig::toolchainDiscovery>(),
-          .description = "do not survey this machine for compilers. Without\n"
-                         "--toolchain this leaves the worker with nothing to\n"
-                         "serve, so it refuses to start -- and refuses to be\n"
-                         "INSTALLED as a service, which is the registration that\n"
-                         "would otherwise fail at every boot with nobody watching." },
-        { .primary = "--slots",
-          .arity = Arity::Value,
-          .operand = "=<n>",
-          .apply = AssignFrom<&NodeConfig::slots, ParseSlots>(),
-          .description = "concurrent compiles. Default: derived from this\n"
-                         "machine's cores and memory, less what --node-class\n"
-                         "reserves. A number given here is the answer and is\n"
-                         "not clamped or reduced further. Advertised to the\n"
-                         "scheduler AND enforced here: a worker that accepted\n"
-                         "more would be fuller and slower than the scheduler\n"
-                         "believes, at the same moment." },
-        { .primary = "--node-class",
-          .arity = Arity::Value,
-          .operand = "=workstation|dedicated",
-          .apply = AssignFrom<&NodeConfig::nodeClass, ParseNodeClass>(),
-          .description = "how hard this machine may be driven (default:\n"
-                         "workstation). A workstation keeps cores free for the\n"
-                         "person using it; a dedicated node may be driven to its\n"
-                         "slot limit. The default is the safe answer rather than\n"
-                         "the common one." },
-        { .primary = "--drain-timeout",
-          .arity = Arity::Value,
-          .operand = "=<seconds>",
-          .apply = AssignFrom<&NodeConfig::drainTimeoutSeconds, ParseDrainTimeout>(),
-          .description = "seconds a stop waits for compiles still running\n"
-                         "before giving up and saying what it abandoned;\n"
-                         "0 waits forever. Unbounded, the supervisor\n"
-                         "decides instead and answers with SIGKILL and no\n"
-                         "diagnostic." },
-        { .primary = "--reserve-cores",
-          .arity = Arity::Value,
-          .operand = "=<n>",
-          .apply = AssignFrom<&NodeConfig::reservedCores, ParseReservedCores>(),
-          .description = "cores never offered to the fleet, overriding what the\n"
-                         "node class reserves. 0 is a real answer and is not the\n"
-                         "same as omitting the flag. Ignored when --slots names\n"
-                         "a number, which is the operator's answer already." },
-        { .primary = "--node-id",
-          .arity = Arity::Value,
-          .operand = "=<id>",
-          .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
-          .description = "this node's identity in the cluster. Giving it turns\n"
-                         "consensus ON; without it this node leads alone,\n"
-                         "which is right for one machine and is the default." },
-        { .primary = "--listen-raft",
-          .arity = Arity::Value,
-          .operand = "=[<address>:]<port>",
-          .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
-          .description = "where peers reach this node's consensus port. A bare\n"
-                         "port binds the WILDCARD: peers are on other machines\n"
-                         "by definition, so loopback would silently not work." },
-        { .primary = "--raft-peer",
-          .arity = Arity::Value,
-          .operand = "=<id>=<host>:<port>",
-          .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
-          .description = "a cluster member and where it answers; repeatable.\n"
-                         "Both halves in one token because a member id with\n"
-                         "no address is a node counted towards quorum and\n"
-                         "unreachable. This is the BOOTSTRAP set only:\n"
-                         "membership is replicated once the cluster runs." },
-        { .primary = "--raft-join",
-          .arity = Arity::None,
-          .apply = SetTrue<&NodeConfig::raftJoin>(),
-          .description = "start with NO cluster and wait to be admitted to one.\n"
-                         "--raft-peer then lists nodes this one can REACH rather\n"
-                         "than a cluster it belongs to -- itself, and whoever\n"
-                         "will admit it, because a joiner has to be able to\n"
-                         "answer the leader before it can learn where that\n"
-                         "leader is. Without this flag a node bootstraps a\n"
-                         "cluster of itself, elects itself, and can never\n"
-                         "afterwards be admitted to anybody else's." },
-        { .primary = "--cluster-dir",
+        { .primary = "--config",
           .arity = Arity::Value,
           .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::clusterDir, ParsePathValue>(),
-          .description = "where consensus keeps its durable state. A node\n"
-                         "that answered a vote and forgot it votes twice in\n"
-                         "one term after a restart, which is two leaders." },
+          .apply = AssignFrom<&NodeConfig::configPath, ParseText>(),
+          .description = "read settings from this YAML file. Every SETTING flag here\n"
+                         "is a key in it, spelled with underscores; the one-shot\n"
+                         "verbs (--install-service, --cluster-*, --help) are not, and\n"
+                         "neither is this flag. The command line wins where both name\n"
+                         "one. A named path is strict -- absent, unreadable or\n"
+                         "malformed refuses to start -- while the machine-wide file\n"
+                         "this looks for when unset is skipped when it is not there.\n"
+                         "Its MODE is not checked: anyone who can write it decides\n"
+                         "what this worker runs (#384)." },
+        {
+            .primary = "--scheduler",
+            .arity = Arity::Value,
+            .operand = "=<host:port>",
+            .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
+            .description = "the scheduler's --listen-scheduler endpoint. Required: a\n"
+                           "worker nothing knows about serves nobody.",
+            .yamlKey = "scheduler",
+        },
+        {
+            .primary = "--advertise",
+            .arity = Arity::Value,
+            .operand = "=<host:port>",
+            .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
+            .description = "host:port CLIENTS should use to reach this worker.\n"
+                           "Defaults to --bind and --port, which is wrong behind NAT\n"
+                           "or on a multi-homed host: the scheduler hands this string\n"
+                           "to clients verbatim, so a worker that advertises an\n"
+                           "address only it can reach is leased and then never\n"
+                           "answers.",
+            .yamlKey = "advertise",
+        },
+        {
+            .primary = "--bind",
+            .arity = Arity::Value,
+            .operand = "=<address>",
+            .apply = AssignFrom<&NodeConfig::bindAddress, ParseUtf8Text>(),
+            .description = "address to listen on (default 0.0.0.0)",
+            .yamlKey = "bind",
+        },
+        {
+            .primary = "--port",
+            .arity = Arity::Value,
+            .operand = "=<n>",
+            .apply = AssignFrom<&NodeConfig::port, ParseNodePort>(),
+            .description = "port to listen on (default 6676)",
+            .yamlKey = "port",
+        },
+        {
+            .primary = "--toolchain",
+            .arity = Arity::Value,
+            .operand = "=<compiler>|<fingerprint>=<compiler>",
+            .apply = AppendFrom<&NodeConfig::toolchains, ParseToolchain>(),
+            .description = "a toolchain this worker serves; repeatable. An OVERRIDE:\n"
+                           "naming any pins this worker to exactly that set, and\n"
+                           "naming none means serve whatever this machine has.\n"
+                           "There is still no default COMPILER -- a default is how a\n"
+                           "job ends up running against something nobody chose.",
+            .yamlKey = "toolchain",
+            .clear = ClearList<&NodeConfig::toolchains>(),
+        },
+        {
+            .primary = "--no-toolchain-discovery",
+            .arity = Arity::None,
+            .apply = SetFalse<&NodeConfig::toolchainDiscovery>(),
+            .description = "do not survey this machine for compilers. Without\n"
+                           "--toolchain this leaves the worker with nothing to\n"
+                           "serve, so it refuses to start -- and refuses to be\n"
+                           "INSTALLED as a service, which is the registration that\n"
+                           "would otherwise fail at every boot with nobody watching.",
+            .yamlKey = "no_toolchain_discovery",
+        },
+        {
+            .primary = "--slots",
+            .arity = Arity::Value,
+            .operand = "=<n>",
+            .apply = AssignFrom<&NodeConfig::slots, ParseSlots>(),
+            .description = "concurrent compiles. Default: derived from this\n"
+                           "machine's cores and memory, less what --node-class\n"
+                           "reserves. A number given here is the answer and is\n"
+                           "not clamped or reduced further. Advertised to the\n"
+                           "scheduler AND enforced here: a worker that accepted\n"
+                           "more would be fuller and slower than the scheduler\n"
+                           "believes, at the same moment.",
+            .yamlKey = "slots",
+        },
+        {
+            .primary = "--node-class",
+            .arity = Arity::Value,
+            .operand = "=workstation|dedicated",
+            .apply = AssignFrom<&NodeConfig::nodeClass, ParseNodeClass>(),
+            .description = "how hard this machine may be driven (default:\n"
+                           "workstation). A workstation keeps cores free for the\n"
+                           "person using it; a dedicated node may be driven to its\n"
+                           "slot limit. The default is the safe answer rather than\n"
+                           "the common one.",
+            .yamlKey = "node_class",
+        },
+        {
+            .primary = "--drain-timeout",
+            .arity = Arity::Value,
+            .operand = "=<seconds>",
+            .apply = AssignFrom<&NodeConfig::drainTimeoutSeconds, ParseDrainTimeout>(),
+            .description = "seconds a stop waits for compiles still running\n"
+                           "before giving up and saying what it abandoned;\n"
+                           "0 waits forever. Unbounded, the supervisor\n"
+                           "decides instead and answers with SIGKILL and no\n"
+                           "diagnostic.",
+            .yamlKey = "drain_timeout_seconds",
+        },
+        {
+            .primary = "--reserve-cores",
+            .arity = Arity::Value,
+            .operand = "=<n>",
+            .apply = AssignFrom<&NodeConfig::reservedCores, ParseReservedCores>(),
+            .description = "cores never offered to the fleet, overriding what the\n"
+                           "node class reserves. 0 is a real answer and is not the\n"
+                           "same as omitting the flag. Ignored when --slots names\n"
+                           "a number, which is the operator's answer already.",
+            .yamlKey = "reserve_cores",
+        },
+        {
+            .primary = "--node-id",
+            .arity = Arity::Value,
+            .operand = "=<id>",
+            .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
+            .description = "this node's identity in the cluster. Giving it turns\n"
+                           "consensus ON; without it this node leads alone,\n"
+                           "which is right for one machine and is the default.",
+            .yamlKey = "node_id",
+        },
+        {
+            .primary = "--listen-raft",
+            .arity = Arity::Value,
+            .operand = "=[<address>:]<port>",
+            .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
+            .description = "where peers reach this node's consensus port. A bare\n"
+                           "port binds the WILDCARD: peers are on other machines\n"
+                           "by definition, so loopback would silently not work.",
+            .yamlKey = "listen_raft",
+        },
+        {
+            .primary = "--raft-peer",
+            .arity = Arity::Value,
+            .operand = "=<id>=<host>:<port>",
+            .apply = AppendFrom<&NodeConfig::raftPeers, ParseRaftPeer>(),
+            .description = "a cluster member and where it answers; repeatable.\n"
+                           "Both halves in one token because a member id with\n"
+                           "no address is a node counted towards quorum and\n"
+                           "unreachable. This is the BOOTSTRAP set only:\n"
+                           "membership is replicated once the cluster runs.",
+            .yamlKey = "raft_peer",
+            .clear = ClearList<&NodeConfig::raftPeers>(),
+        },
+        {
+            .primary = "--raft-join",
+            .arity = Arity::None,
+            .apply = SetTrue<&NodeConfig::raftJoin>(),
+            .description = "start with NO cluster and wait to be admitted to one.\n"
+                           "--raft-peer then lists nodes this one can REACH rather\n"
+                           "than a cluster it belongs to -- itself, and whoever\n"
+                           "will admit it, because a joiner has to be able to\n"
+                           "answer the leader before it can learn where that\n"
+                           "leader is. Without this flag a node bootstraps a\n"
+                           "cluster of itself, elects itself, and can never\n"
+                           "afterwards be admitted to anybody else's.",
+            .yamlKey = "raft_join",
+        },
+        {
+            .primary = "--cluster-dir",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::clusterDir, ParsePathValue>(),
+            .description = "where consensus keeps its durable state. A node\n"
+                           "that answered a vote and forgot it votes twice in\n"
+                           "one term after a restart, which is two leaders.",
+            .yamlKey = "cluster_dir",
+        },
         { .primary = "--cluster-status",
           .arity = Arity::None,
           .apply = SelectClusterAction<ClusterAction::Status>(),
@@ -584,172 +670,233 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "membership change nothing automatic makes:\n"
                          "discovery only ever adds, because a peer goes\n"
                          "quiet far more often than it leaves." },
-        { .primary = "--cluster-id",
-          .arity = Arity::Value,
-          .operand = "=<name>",
-          .apply = AssignFrom<&NodeConfig::clusterId, ParseUtf8Text>(),
-          .description = "which fleet this node belongs to. Plain text in every\n"
-                         "beacon and NOT a credential: what it buys is that two\n"
-                         "unrelated fleets on one segment ignore each other." },
-        { .primary = "--discovery",
-          .arity = Arity::Value,
-          .operand = "=<address>:<port>",
-          .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
-          .description = "announce this node on the segment and listen for peers\n"
-                         "here; off unless given. Needs --node-id and\n"
-                         "--cluster-key-file. Without it a cluster is exactly\n"
-                         "the --raft-peer list an operator typed." },
-        { .primary = "--discovery-reply-port",
-          .arity = Arity::Value,
-          .operand = "=<n>",
-          .apply = AssignFrom<&NodeConfig::discoveryReplyPort, ParseNodePort>(),
-          .description = "port peers unicast their discovery challenges and\n"
-                         "proofs to; kernel-chosen unless given. NOT the\n"
-                         "--discovery port: that one is shared by every node on\n"
-                         "the segment, and only one socket sharing a port is\n"
-                         "handed a unicast. Pin it where a host firewall opens\n"
-                         "named ports only -- one per node on the machine." },
-        { .primary = "--cluster-key-file",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
-          .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
-                         "a command line is readable through ps, and a key that\n"
-                         "leaks admits a node whose objects the whole fleet\n"
-                         "then caches. Discovery proves the cluster with it,\n"
-                         "and the scheduler SIGNS lease grants with it. Without\n"
-                         "one, a grant is unsigned and any client that can reach\n"
-                         "a worker's compile port can spend it." },
-        { .primary = "--admin-listen",
-          .arity = Arity::Value,
-          .operand = "=[<address>:]<port>",
-          .apply = AssignFrom<&NodeConfig::adminListen, ParseText>(),
-          .description = "serve /metrics and /healthz here; off unless given.\n"
-                         "A bare port binds loopback: a scrape endpoint on a\n"
-                         "public interface is an operator's decision, not a\n"
-                         "default. /healthz is also the liveness probe this\n"
-                         "worker otherwise has none of." },
-        { .primary = "--dashboard",
-          .apply = SetTrue<&NodeConfig::dashboard>(),
-          .description = "also serve the fleet dashboard on --admin-listen, at\n"
-                         "/fleet and /fleet.json. Off unless given: the page is a\n"
-                         "map of every member's hostname, endpoint and capacity.\n"
-                         "Answered in full only while this node LEADS; anyone else\n"
-                         "names the leader rather than showing half a fleet." },
-        { .primary = "--dashboard-token-file",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::dashboardTokenFile, ParsePathValue>(),
-          .description = "credential the dashboard requires, as Basic or Bearer.\n"
-                         "A FILE and not a flag: a command line is readable\n"
-                         "through ps. Its own secret rather than --requirepass,\n"
-                         "which every member of the fleet already holds. Required\n"
-                         "when --admin-listen is not on loopback." },
-        { .primary = "--tls-self-signed",
-          .apply = SetTrue<&NodeConfig::tlsSelfSigned>(),
-          .description = "generate a self-signed certificate at startup and serve\n"
-                         "the admin surface over HTTPS with it, so an internal\n"
-                         "deployment needs no certificate to obtain. Encrypts the\n"
-                         "traffic; it does NOT prove which node answered, so the\n"
-                         "fingerprint is logged for you to compare. Regenerated\n"
-                         "every restart -- name --tls-cert for a stable identity." },
-        { .primary = "--tls-cert",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::tlsCertFile, ParsePathValue>(),
-          .description = "serve the admin surface over HTTPS with this\n"
-                         "certificate. TLS is on by naming a certificate and a\n"
-                         "key rather than by a flag, so there is no way to ask\n"
-                         "for it without the material to do it." },
-        { .primary = "--tls-key",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::tlsKeyFile, ParsePathValue>(),
-          .description = "private key for --tls-cert. Both or neither." },
-        { .primary = "--listen-scheduler",
-          .arity = Arity::Value,
-          .operand = "=[<address>:]<port>",
-          .apply = AssignFrom<&NodeConfig::schedulerListen, ParseText>(),
-          .description = "serve the fleet's scheduler verbs here; off unless\n"
-                         "given. Answered only while this node LEADS the\n"
-                         "cluster; a follower redirects to the leader and an\n"
-                         "election in progress refuses, both of which a client\n"
-                         "answers by compiling locally. A bare port binds the\n"
-                         "wildcard: peers have to reach it." },
-        { .primary = "--fleet-member",
-          .arity = Arity::Value,
-          .operand = "=<host>[:<port>]",
-          .apply = AppendFrom<&NodeConfig::fleetMembers, ParseText>(),
-          .description = "a peer this node serves; repeatable. Gates all three\n"
-                         "surfaces -- the compile port, the cache tier and the\n"
-                         "scheduler -- so a WORKER needs it too, or it compiles\n"
-                         "for its own machine alone. Only the host is matched:\n"
-                         "a peer dials from an ephemeral port, so an endpoint\n"
-                         "is not something a connection can be compared to." },
-        { .primary = "--fleet-open",
-          .arity = Arity::None,
-          .apply = SetTrue<&NodeConfig::fleetOpen>(),
-          .description = "admit every caller to this node, not only\n"
-                         "--fleet-member hosts. For one machine, or a network\n"
-                         "that is already the boundary. Explicit because\n"
-                         "'no policy' and 'admit everybody' must be the same\n"
-                         "decision -- listing nobody refuses everybody." },
-        { .primary = "--cache-memory",
-          .arity = Arity::Value,
-          .operand = "=<size>",
-          .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
-          .explicitBit = &NodeConfig::cacheMemoryExplicit,
-          .description = "size of this node's own in-memory cache tier;\n"
-                         "k/m/g = KiB/MiB/GiB or N% of host RAM. Defaults\n"
-                         "to 25% of RAM within [512m, 8g]; 0 turns it off.\n"
-                         "It exists so a local rebuild on a slow or bad\n"
-                         "network never reaches the wire at all." },
-        { .primary = "--cache-disk",
-          .arity = Arity::Value,
-          .operand = "=<bytes>",
-          .apply = AssignFrom<&NodeConfig::cacheDiskBytes, ParseCacheDiskBytes>(),
-          .description = "cap this node's on-disk cache tier at this size\n"
-                         "(default 0, meaning grow as needed). Only means\n"
-                         "anything with --cache-dir: without a path there is\n"
-                         "no disk tier for a budget to bound." },
-        { .primary = "--cache-dir",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::cacheDir, ParsePathValue>(),
-          .description = "back the local cache tier with disk at this path.\n"
-                         "Memory-only otherwise: a disk tier is a resource an\n"
-                         "operator should have to name. ONE node per path,\n"
-                         "enforced: the store is claimed exclusively, so a\n"
-                         "second node sharing it refuses to start." },
-        { .primary = "--listen-cache",
-          .arity = Arity::Value,
-          .operand = "=[<address>:]<port>",
-          .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
-          .explicitBit = &NodeConfig::cacheListenExplicit,
-          .description = "serve cache verbs to local clients here (default\n"
-                         "127.0.0.1:6674, where fastcache-cc already looks;\n"
-                         "empty turns it off). A bare port binds LOOPBACK,\n"
-                         "unlike --listen-scheduler: a cache any host can\n"
-                         "dial is this machine's whole build output served\n"
-                         "to strangers. Widen it and only this machine and\n"
-                         "--fleet-member peers are still admitted." },
-        { .primary = "--upstream",
-          .arity = Arity::Value,
-          .operand = "=<host:port>",
-          .apply = AssignFrom<&NodeConfig::upstream, ParseText>(),
-          .description = "the shared fastcached this node reads through to.\n"
-                         "Empty is honest rather than broken: one developer's\n"
-                         "machine has no shared cache." },
-        { .primary = "--requirepass",
-          .arity = Arity::Value,
-          .operand = "=<secret>",
-          .apply = AssignFrom<&NodeConfig::token, ParseText>(),
-          .description = "credential presented to the scheduler" },
-        { .primary = "--log-level",
-          .arity = Arity::Value,
-          .operand = "=<level>",
-          .apply = AssignFrom<&NodeConfig::logLevel, ParseNodeLogLevel>(),
-          .description = "trace, debug, info, warn, error, fatal (default info)" },
+        {
+            .primary = "--cluster-id",
+            .arity = Arity::Value,
+            .operand = "=<name>",
+            .apply = AssignFrom<&NodeConfig::clusterId, ParseUtf8Text>(),
+            .description = "which fleet this node belongs to. Plain text in every\n"
+                           "beacon and NOT a credential: what it buys is that two\n"
+                           "unrelated fleets on one segment ignore each other.",
+            .yamlKey = "cluster_id",
+        },
+        {
+            .primary = "--discovery",
+            .arity = Arity::Value,
+            .operand = "=<address>:<port>",
+            .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
+            .description = "announce this node on the segment and listen for peers\n"
+                           "here; off unless given. Needs --node-id and\n"
+                           "--cluster-key-file. Without it a cluster is exactly\n"
+                           "the --raft-peer list an operator typed.",
+            .yamlKey = "discovery",
+        },
+        {
+            .primary = "--discovery-reply-port",
+            .arity = Arity::Value,
+            .operand = "=<n>",
+            .apply = AssignFrom<&NodeConfig::discoveryReplyPort, ParseNodePort>(),
+            .description = "port peers unicast their discovery challenges and\n"
+                           "proofs to; kernel-chosen unless given. NOT the\n"
+                           "--discovery port: that one is shared by every node on\n"
+                           "the segment, and only one socket sharing a port is\n"
+                           "handed a unicast. Pin it where a host firewall opens\n"
+                           "named ports only -- one per node on the machine.",
+            .yamlKey = "discovery_reply_port",
+        },
+        {
+            .primary = "--cluster-key-file",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
+            .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
+                           "a command line is readable through ps, and a key that\n"
+                           "leaks admits a node whose objects the whole fleet\n"
+                           "then caches. Discovery proves the cluster with it,\n"
+                           "and the scheduler SIGNS lease grants with it. Without\n"
+                           "one, a grant is unsigned and any client that can reach\n"
+                           "a worker's compile port can spend it.",
+            .yamlKey = "cluster_key_file",
+        },
+        {
+            .primary = "--admin-listen",
+            .arity = Arity::Value,
+            .operand = "=[<address>:]<port>",
+            .apply = AssignFrom<&NodeConfig::adminListen, ParseText>(),
+            .description = "serve /metrics and /healthz here; off unless given.\n"
+                           "A bare port binds loopback: a scrape endpoint on a\n"
+                           "public interface is an operator's decision, not a\n"
+                           "default. /healthz is also the liveness probe this\n"
+                           "worker otherwise has none of.",
+            .yamlKey = "admin_listen",
+        },
+        {
+            .primary = "--dashboard",
+            .apply = SetTrue<&NodeConfig::dashboard>(),
+            .description = "also serve the fleet dashboard on --admin-listen, at\n"
+                           "/fleet and /fleet.json. Off unless given: the page is a\n"
+                           "map of every member's hostname, endpoint and capacity.\n"
+                           "Answered in full only while this node LEADS; anyone else\n"
+                           "names the leader rather than showing half a fleet.",
+            .yamlKey = "dashboard",
+        },
+        {
+            .primary = "--dashboard-token-file",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::dashboardTokenFile, ParsePathValue>(),
+            .description = "credential the dashboard requires, as Basic or Bearer.\n"
+                           "A FILE and not a flag: a command line is readable\n"
+                           "through ps. Its own secret rather than --requirepass,\n"
+                           "which every member of the fleet already holds. Required\n"
+                           "when --admin-listen is not on loopback.",
+            .yamlKey = "dashboard_token_file",
+        },
+        {
+            .primary = "--tls-self-signed",
+            .apply = SetTrue<&NodeConfig::tlsSelfSigned>(),
+            .description = "generate a self-signed certificate at startup and serve\n"
+                           "the admin surface over HTTPS with it, so an internal\n"
+                           "deployment needs no certificate to obtain. Encrypts the\n"
+                           "traffic; it does NOT prove which node answered, so the\n"
+                           "fingerprint is logged for you to compare. Regenerated\n"
+                           "every restart -- name --tls-cert for a stable identity.",
+            .yamlKey = "tls_self_signed",
+        },
+        {
+            .primary = "--tls-cert",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::tlsCertFile, ParsePathValue>(),
+            .description = "serve the admin surface over HTTPS with this\n"
+                           "certificate. TLS is on by naming a certificate and a\n"
+                           "key rather than by a flag, so there is no way to ask\n"
+                           "for it without the material to do it.",
+            .yamlKey = "tls_cert",
+        },
+        {
+            .primary = "--tls-key",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::tlsKeyFile, ParsePathValue>(),
+            .description = "private key for --tls-cert. Both or neither.",
+            .yamlKey = "tls_key",
+        },
+        {
+            .primary = "--listen-scheduler",
+            .arity = Arity::Value,
+            .operand = "=[<address>:]<port>",
+            .apply = AssignFrom<&NodeConfig::schedulerListen, ParseText>(),
+            .description = "serve the fleet's scheduler verbs here; off unless\n"
+                           "given. Answered only while this node LEADS the\n"
+                           "cluster; a follower redirects to the leader and an\n"
+                           "election in progress refuses, both of which a client\n"
+                           "answers by compiling locally. A bare port binds the\n"
+                           "wildcard: peers have to reach it.",
+            .yamlKey = "listen_scheduler",
+        },
+        {
+            .primary = "--fleet-member",
+            .arity = Arity::Value,
+            .operand = "=<host>[:<port>]",
+            .apply = AppendFrom<&NodeConfig::fleetMembers, ParseText>(),
+            .description = "a peer this node serves; repeatable. Gates all three\n"
+                           "surfaces -- the compile port, the cache tier and the\n"
+                           "scheduler -- so a WORKER needs it too, or it compiles\n"
+                           "for its own machine alone. Only the host is matched:\n"
+                           "a peer dials from an ephemeral port, so an endpoint\n"
+                           "is not something a connection can be compared to.",
+            .yamlKey = "fleet_member",
+            .clear = ClearList<&NodeConfig::fleetMembers>(),
+        },
+        {
+            .primary = "--fleet-open",
+            .arity = Arity::None,
+            .apply = SetTrue<&NodeConfig::fleetOpen>(),
+            .description = "admit every caller to this node, not only\n"
+                           "--fleet-member hosts. For one machine, or a network\n"
+                           "that is already the boundary. Explicit because\n"
+                           "'no policy' and 'admit everybody' must be the same\n"
+                           "decision -- listing nobody refuses everybody.",
+            .yamlKey = "fleet_open",
+        },
+        {
+            .primary = "--cache-memory",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::cacheMemoryBytes, ParseCacheBytes>(),
+            .explicitBit = &NodeConfig::cacheMemoryExplicit,
+            .description = "size of this node's own in-memory cache tier;\n"
+                           "k/m/g = KiB/MiB/GiB or N% of host RAM. Defaults\n"
+                           "to 25% of RAM within [512m, 8g]; 0 turns it off.\n"
+                           "It exists so a local rebuild on a slow or bad\n"
+                           "network never reaches the wire at all.",
+            .yamlKey = "cache_memory",
+        },
+        {
+            .primary = "--cache-disk",
+            .arity = Arity::Value,
+            .operand = "=<bytes>",
+            .apply = AssignFrom<&NodeConfig::cacheDiskBytes, ParseCacheDiskBytes>(),
+            .description = "cap this node's on-disk cache tier at this size\n"
+                           "(default 0, meaning grow as needed). Only means\n"
+                           "anything with --cache-dir: without a path there is\n"
+                           "no disk tier for a budget to bound.",
+            .yamlKey = "cache_disk",
+        },
+        {
+            .primary = "--cache-dir",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::cacheDir, ParsePathValue>(),
+            .description = "back the local cache tier with disk at this path.\n"
+                           "Memory-only otherwise: a disk tier is a resource an\n"
+                           "operator should have to name. ONE node per path,\n"
+                           "enforced: the store is claimed exclusively, so a\n"
+                           "second node sharing it refuses to start.",
+            .yamlKey = "cache_dir",
+        },
+        {
+            .primary = "--listen-cache",
+            .arity = Arity::Value,
+            .operand = "=[<address>:]<port>",
+            .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
+            .explicitBit = &NodeConfig::cacheListenExplicit,
+            .description = "serve cache verbs to local clients here (default\n"
+                           "127.0.0.1:6674, where fastcache-cc already looks;\n"
+                           "empty turns it off). A bare port binds LOOPBACK,\n"
+                           "unlike --listen-scheduler: a cache any host can\n"
+                           "dial is this machine's whole build output served\n"
+                           "to strangers. Widen it and only this machine and\n"
+                           "--fleet-member peers are still admitted.",
+            .yamlKey = "listen_cache",
+        },
+        {
+            .primary = "--upstream",
+            .arity = Arity::Value,
+            .operand = "=<host:port>",
+            .apply = AssignFrom<&NodeConfig::upstream, ParseText>(),
+            .description = "the shared fastcached this node reads through to.\n"
+                           "Empty is honest rather than broken: one developer's\n"
+                           "machine has no shared cache.",
+            .yamlKey = "upstream",
+        },
+        {
+            .primary = "--requirepass",
+            .arity = Arity::Value,
+            .operand = "=<secret>",
+            .apply = AssignFrom<&NodeConfig::token, ParseText>(),
+            .description = "credential presented to the scheduler",
+            .yamlKey = "requirepass",
+        },
+        {
+            .primary = "--log-level",
+            .arity = Arity::Value,
+            .operand = "=<level>",
+            .apply = AssignFrom<&NodeConfig::logLevel, ParseNodeLogLevel>(),
+            .description = "trace, debug, info, warn, error, fatal (default info)",
+            .yamlKey = "log_level",
+        },
         { .primary = "--daemon",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::daemon>(),
@@ -757,11 +904,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "the Windows SCM starts. Supervisors that manage a\n"
                          "foreground process -- systemd and launchd -- must NOT\n"
                          "pass it: they reap a job that forks as 'exited'." },
-        { .primary = "--pidfile",
-          .arity = Arity::Value,
-          .operand = "=<path>",
-          .apply = AssignFrom<&NodeConfig::pidfile, ParseText>(),
-          .description = "write the pid here when daemonizing (POSIX)" },
+        {
+            .primary = "--pidfile",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::pidfile, ParseText>(),
+            .description = "write the pid here when daemonizing (POSIX)",
+            .yamlKey = "pidfile",
+        },
         { .primary = "--install-service",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::installService>(),
@@ -824,6 +974,67 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .description = "print the version and exit" },
     });
     static_assert(TableIsWellFormed<NodeConfig>(options));
+
+    // Every row a file may NOT carry, and why for each.
+    //
+    // The guard below reads this array rather than restating it, so the two cannot
+    // disagree: a new flag either names a key or is listed here with a reason, and
+    // there is no third state in which it is quietly unreachable from the file an
+    // operator is told configures this worker.
+    //
+    // Two kinds live here and they are not the same objection. A one-shot verb
+    // (`--install-service`, `--cluster-forget`, `--migrate-cache`, `--help`) is a
+    // decision taken once; a file is read at EVERY start, so a key for one would
+    // replay that decision forever -- a worker that re-registers itself, or asks
+    // the cluster a question, instead of serving. The rest are settings that
+    // describe how this process was STARTED rather than what it does, and reading
+    // them from the very file the start already found is circular.
+    static constexpr auto notFromFile = std::to_array<std::pair<std::string_view, std::string_view>>({
+        { "--config", "names the file being read; a key for it would name a file to read while reading one" },
+        { "--daemon",
+          "how this process was started, decided by whoever started it -- a service is already "
+          "supervised, and a file that forked an operator's foreground run would take away the "
+          "console they were watching" },
+        { "--service-name",
+          "the identity a registration is made under, read back from the file that "
+          "registration points at -- so the name would come from the file the name found" },
+        { "--service-scope", "the same circle as --service-name, for which supervisor the registration goes to" },
+        { "--install-service", "registers and exits; a key would re-register at every start" },
+        { "--uninstall-service", "removes the registration and exits; a key would remove it at every start" },
+        { "--migrate-cache",
+          "converts the store and exits; a key would convert at every start, on a store "
+          "that after the first run has nothing left to convert" },
+        { "--print-surfaces", "prints the ports and exits; a key would print them instead of serving them" },
+        { "--cluster-status", "asks a running cluster a question and exits" },
+        { "--cluster-set", "changes a running cluster's settings and exits" },
+        { "--cluster-admit", "admits a member and exits" },
+        { "--cluster-forget", "removes a member and exits" },
+        { "--help", "prints usage and exits" },
+        { "--version", "prints the version and exits" },
+    });
+
+    // A row is reachable from the file or it is named above. Checked at compile
+    // time, because a flag that is silently absent from the file is not a condition
+    // to report -- it is a setting an operator writes, restarts, and never sees take
+    // effect, with nothing anywhere saying why.
+    static_assert(std::ranges::all_of(options,
+                                      [](OptionSpec<NodeConfig> const& spec) {
+                                          return !spec.yamlKey.empty()
+                                                 || std::ranges::any_of(notFromFile, [&spec](auto const& excluded) {
+                                                        return excluded.first == spec.primary;
+                                                    });
+                                      }),
+                  "every --flag must carry a yamlKey or be listed in notFromFile with a reason");
+
+    // And the converse: a row named above must not also carry a key, which is how
+    // an exclusion becomes a comment describing something that stopped being true.
+    static_assert(std::ranges::all_of(notFromFile,
+                                      [](auto const& excluded) {
+                                          return std::ranges::any_of(options, [&excluded](auto const& spec) {
+                                              return spec.primary == excluded.first && spec.yamlKey.empty();
+                                          });
+                                      }),
+                  "every notFromFile entry must name a real row that carries no yamlKey");
     return options;
 }
 
@@ -889,17 +1100,37 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     /// A service does not inherit the installing shell's working directory, so a
     /// relative path captured at install time resolves somewhere else at start --
     /// which for a pidfile means a supervisor that cannot find its own process.
-    auto const emitPathIfSet = [&argv](std::string_view flag, std::string const& value) {
+    /// Resolve a path the same way `emitPathIfSet` does, for a spec FIELD.
+    ///
+    /// Shared with it rather than restated: a `configPath` that disagreed with the
+    /// `--config=` in the very same registration is two answers to one question,
+    /// and the refusal that reads the field would then name a path the service was
+    /// never given.
+    auto const absoluteOrAsWritten = [](std::string const& value) {
         if (value.empty())
-            return;
+            return std::string {};
         std::error_code ec;
         auto const absolute = std::filesystem::absolute(value, ec);
-        argv.emplace_back(std::format("--{}={}", flag, ec ? value : absolute.string()));
+        return ec ? value : absolute.string();
+    };
+
+    auto const emitPathIfSet = [&argv, &absoluteOrAsWritten](std::string_view flag, std::string const& value) {
+        if (value.empty())
+            return;
+        argv.emplace_back(std::format("--{}={}", flag, absoluteOrAsWritten(value)));
     };
 
     // Unconditional: it is what the running service identifies itself by, and on
     // launchd it is what the job label derives from.
     argv.push_back(std::format("--service-name={}", cfg.serviceName));
+
+    // First, and made absolute like every other path: it is what supplies every
+    // setting the operator did NOT type here, and a service does not inherit the
+    // installing shell's working directory. Emitted rather than resolved -- an
+    // empty value means the operator named no file, and the service repeats the
+    // machine-wide lookup at each start, which is what lets a package replace that
+    // file without touching the registration.
+    emitPathIfSet("config", cfg.configPath);
 
     emitIfSet("scheduler", cfg.scheduler, defaults.scheduler);
     emitIfSet("advertise", cfg.advertise, defaults.advertise);
@@ -1007,14 +1238,32 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          .serviceAccount = "fastcache-node",
                          .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
-                         .configPath = {},
-                         // Empty, and load-bearing: this worker is configured
-                         // entirely from argv and NodeOptions() has neither
-                         // `--config` nor `--storage`. Naming an application here
-                         // would invite WithScopeDefaults to bake one in, and the
-                         // registration would then be a job that answers its own
-                         // command line with "unrecognised argument" at every
-                         // start -- reported installed, dead at every boot.
+                         // What the operator named, so InlineCredentialRejection can
+                         // say where the secret belongs instead of merely that it
+                         // may not go here. Absolute for the same reason the flag
+                         // above is: an install run from a shell resolves a relative
+                         // path somewhere the service never will.
+                         .configPath = absoluteOrAsWritten(cfg.configPath),
+                         // Still empty, and the reason has CHANGED with #291 -- so
+                         // it is restated rather than left to read as before.
+                         //
+                         // This worker now has a config file, so "configured
+                         // entirely from argv" is no longer why. What is still true
+                         // is that it has no `--storage`, and `applicationName` is
+                         // the one bit `WithScopeDefaults` reads before appending
+                         // BOTH defaults: naming an application here would bake a
+                         // `--storage=` into every user-scope registration, and the
+                         // job would answer its own command line with "unrecognised
+                         // argument" at every start -- reported installed, dead at
+                         // every boot.
+                         //
+                         // What that costs is the system-scope `--config=` default,
+                         // which this spec therefore emits itself above from what the
+                         // operator typed, and the install-time readability check
+                         // `ServiceAccountReadDenial` performs on a configPath the
+                         // installer chose. Both are gaps rather than decisions:
+                         // #396, which is `WithScopeDefaults` learning to decide
+                         // the two defaults separately.
                          .applicationName = {},
                          // The Windows half of the same decision `serviceAccount`
                          // makes for launchd. Told nothing, the SCM logs a service
