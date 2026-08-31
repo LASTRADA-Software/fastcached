@@ -221,7 +221,11 @@ TEST_CASE("A leader sends a snapshot to a follower it can no longer replay to", 
                                                         .followerId = "n2" },
                                 At(300));
 
-    auto const beat = fix.node.Tick(At(100'000));
+    // Past the heartbeat deadline but inside `electionTimeoutMin` of the responses
+    // above, which stamped n2's contact at 300. A far-future tick would now find a
+    // leader that has heard from nobody for 100 seconds, and since #437 that leader
+    // steps down rather than replicating (correctly -- it cannot still be one).
+    auto const beat = fix.node.Tick(At(400));
     auto const snapshots = MessagesOfType<InstallSnapshotRequest>(beat);
     REQUIRE_FALSE(snapshots.empty());
     CHECK(snapshots[0].lastIncludedIndex == fix.node.SnapshotIndex());
@@ -442,7 +446,9 @@ TEST_CASE("A snapshot acknowledgement moves the follower's progress", "[consensu
 
     // The next AppendEntries for that peer starts after what the snapshot
     // covered, rather than at an index the log no longer holds.
-    auto const beat = fix.node.Tick(At(100'000));
+    // Inside `electionTimeoutMin` of the acknowledgement above (#437); see the
+    // sibling case for why a far-future tick no longer replicates.
+    auto const beat = fix.node.Tick(At(500));
     auto const appends = MessagesOfType<AppendEntriesRequest>(beat);
     auto sawPeer = false;
     for (auto const& request: appends)

@@ -510,6 +510,54 @@ TEST_CASE("A cluster formed on a bare quorum keeps its leader when the last memb
     RequireNoViolations(cluster);
 }
 
+TEST_CASE("A leader that loses quorum contact stops being one", "[consensus][raft][cluster][prevote]")
+{
+    // #437. Raft does not need this for SAFETY -- a partitioned leader commits
+    // nothing, because committing needs the quorum it has lost. It is needed by
+    // everything that READS from a leader, which is most of what this daemon
+    // exposes: `--cluster-status`, the fleet page, `NotLeader` redirects, and a
+    // `--cluster-set` that is reported accepted and then never commits.
+    //
+    // What made it invisible is that `HasQuorumContact` already existed and was
+    // consulted only when answering somebody else's pre-vote. The leader knew, and
+    // acted on it only on another node's behalf.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(cluster));
+
+    auto const isolated = Unwrap(cluster.Leader());
+    auto const termWhenLeading = cluster.At(isolated).driver->Node().CurrentTerm();
+    cluster.Partition({ isolated });
+
+    auto stoodDown = false;
+    for (auto step = std::size_t { 0 }; step < 600; ++step)
+    {
+        cluster.Step();
+        if (cluster.At(isolated).driver->Node().CurrentRole() != Role::Leader)
+        {
+            stoodDown = true;
+            break;
+        }
+    }
+    CHECK(stoodDown);
+
+    // In the SAME term, which is the half that keeps this from being a cure worse
+    // than the disease: a node that bumped its term here would return from the
+    // partition and depose a leader that is working perfectly well -- exactly the
+    // disruption pre-vote exists to prevent.
+    CHECK(cluster.At(isolated).driver->Node().CurrentTerm() == termWhenLeading);
+
+    // And it names nobody, rather than going on redirecting clients to itself.
+    CHECK_FALSE(cluster.At(isolated).driver->Node().KnownLeader().has_value());
+
+    // The majority side is unaffected and still elects, so this cannot pass by the
+    // whole cluster having stalled.
+    cluster.Run(200);
+    auto const others = cluster.Leaders();
+    CHECK(std::ranges::find(others, isolated) == others.end());
+
+    RequireNoViolations(cluster);
+}
+
 TEST_CASE("A healthy cluster never changes term", "[consensus][raft][cluster][prevote]")
 {
     // The property issue #117 is about, stated at the cluster level: with every

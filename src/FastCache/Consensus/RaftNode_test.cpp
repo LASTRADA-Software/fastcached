@@ -1074,7 +1074,13 @@ TEST_CASE("A match index beyond the leader's own log is clamped", "[consensus][r
     CHECK(fix.node.CommitIndex() == LogIndex { .value = 1 });
 
     // And the next request to that peer still names a position that exists.
-    auto const next = fix.node.Tick(At(400));
+    //
+    // At(300) rather than a far-future tick: since #437 a leader that has heard
+    // nothing from a quorum for `electionTimeoutMin` (150ms) steps down instead of
+    // replicating, and the response above stamped n2's contact at 210. This is
+    // still past the heartbeat deadline, so it beats -- it is simply a leader that
+    // is still in touch, which is the only kind that replicates.
+    auto const next = fix.node.Tick(At(300));
     auto const sent = MessagesOfType<AppendEntriesRequest>(next);
     REQUIRE_FALSE(sent.empty());
     CHECK(sent[0].prevLogIndex <= fix.node.Log().LastIndex());
