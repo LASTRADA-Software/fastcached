@@ -830,10 +830,30 @@ echo "== case 8: a worker exits on SIGTERM"
 # accept() when the listener is closed, so the loop only comes back through the
 # SO_RCVTIMEO poll. macOS wakes the accept anyway and hides the whole thing, which
 # is why this is asserted here and not left to a developer machine.
+#
+# Its fingerprint is PINNED and unique, like every other single-purpose worker here,
+# and that is not cosmetic. This worker registers with the shared scheduler and is
+# then deliberately killed -- but the scheduler only learns a worker is gone when its
+# heartbeat lapses, which is by design: a polite goodbye would be a second path to
+# "this worker is alive", exercised on exactly the shutdowns that are already
+# harmless and never on the crash that matters (the reasoning is at the end of
+# `WorkerBody`). So for the rest of the heartbeat window this endpoint is still
+# leasable.
+#
+# On the DEFAULT fingerprint that made this corpse a candidate for case 12, which
+# asks the same scheduler for the same toolchain the launcher uses. The scheduler
+# hands out the dead endpoint, the dispatch fails at the transport, the client
+# correctly falls back to a local compile -- and case 12, which asserts DISPATCHED,
+# fails for a reason that has nothing to do with what it guards. Seen twice on
+# macOS, once ejecting a pull request from the merge queue (#427).
+#
+# Pinning removes the overlap rather than papering over it: nothing leases
+# `graceful-stop-only`, so a corpse under that name is inert. Loosening case 12 to
+# accept a local fallback would have deleted the #236 assertion it exists for.
 stop_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
-    --toolchain="${compiler}" --slots=1 --log-level=info \
+    --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info \
     > "${workdir}/stop-worker.log" 2>&1 &
 stop_worker_pid=$!
 pids+=("$stop_worker_pid")
