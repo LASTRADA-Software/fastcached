@@ -183,12 +183,17 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
         // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO`
         // is inert: the per-operation ceiling is a `DeadlineTimer` that closes the
         // socket, which bounds the whole exchange rather than one call.
-        upstream = std::make_unique<RemoteUpstream>(cfg.upstream,
-                                                    Cc::Credential { .username = {}, .secret = cfg.token },
-                                                    io.Connector(),
-                                                    &io.Reactor(),
-                                                    UpstreamConnectTimeout,
-                                                    UpstreamIoTimeout);
+        upstream = std::make_unique<RemoteUpstream>(
+            cfg.upstream,
+            Cc::Credential { .username = {}, .secret = cfg.token },
+            // The node is a CLIENT of the shared cache, and had the same
+            // silence the launcher did: a token set here against a daemon
+            // that does not know AUTH was ignored, and nothing said so.
+            [&logger](std::string_view text) { logger.Logf(LogLevel::Warn, "upstream cache: {}", text); },
+            io.Connector(),
+            &io.Reactor(),
+            UpstreamConnectTimeout,
+            UpstreamIoTimeout);
 
     auto tier =
         std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };

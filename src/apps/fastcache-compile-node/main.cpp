@@ -1015,6 +1015,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // when the machine's toolchains change underneath the node, and two spellings of
     // what a registration carries is how a re-registered worker comes to advertise
     // something subtly different from the one it replaced.
+    // One notice for every registrar this node builds, and it outlives them: the
+    // heartbeat rebuilds the list when the machine's toolchains change, and a notice
+    // per rebuild would say the same thing again on every change (#363).
+    static Cc::CredentialNotice registrarNotice { [&logger](std::string_view text) {
+        logger.Logf(LogLevel::Warn, "scheduler: {}", text);
+    } };
+
     auto registrarsFor = [&](std::map<std::string, Node::ServedToolchain> const& served) {
         std::vector<Cc::WorkerRegistrar> built;
         built.reserve(served.size());
@@ -1030,7 +1037,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
             // grant relays it to the client, which compresses the preprocessed
             // translation unit against it. A literal `{ Identity }` here therefore sent
             // several megabytes per TU uncompressed as well (#265).
-            built.emplace_back(fingerprint, advertise, slots, Cc::AvailableCodecs(), perToolchain);
+            built.emplace_back(registrarNotice, fingerprint, advertise, slots, Cc::AvailableCodecs(), perToolchain);
         }
         return built;
     };

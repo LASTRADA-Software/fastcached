@@ -25,6 +25,19 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
+/// A notice these cases do not inspect.
+///
+/// Shared on purpose: every case here asserts the OUTCOME's `credentialIgnored`
+/// flag, not the diagnostic, and a fresh object per call would imply they cared. The
+/// cases that do care build their own recording notice, because a shared one reports
+/// once and would let whichever case ran first silence the rest -- a coupling to
+/// Catch2's ordering that is invisible until it fails.
+/// @return A notice with no sink.
+[[nodiscard]] FastCache::Cc::CredentialNotice& Unwatched()
+{
+    static FastCache::Cc::CredentialNotice notice = FastCache::Cc::CredentialNotice::Silent();
+    return notice;
+}
 
 /// One scripted peer: replays canned replies and records what it was sent.
 class ScriptedPeer final: public ISocket
@@ -137,7 +150,7 @@ class ScriptedFleet final: public IEndpointExchange
             if (budget.BoundsTotal() && budget.total < slow->second)
                 return CacheOutcome {};
         ScriptedPeer peer { it->second, &_sent[key] };
-        return SyncRun(ExchangeFramed(&peer, std::move(frame), credential));
+        return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
 
     /// Endpoints dialled, in order. The ORDER is the assertion in several cases:

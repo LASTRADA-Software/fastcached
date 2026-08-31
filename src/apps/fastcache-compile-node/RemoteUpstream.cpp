@@ -40,12 +40,14 @@ namespace
 
 RemoteUpstream::RemoteUpstream(std::string endpoint,
                                Cc::Credential credential,
+                               Cc::CredentialNotice::Sink noticeSink,
                                IConnector& connector,
                                IReactor* reactor,
                                std::chrono::milliseconds connectTimeout,
                                std::chrono::milliseconds ioTimeout) noexcept:
     _endpoint { std::move(endpoint) },
     _credential { std::move(credential) },
+    _notice { std::move(noticeSink) },
     _connector { connector },
     _reactor { reactor },
     _connectTimeout { connectTimeout },
@@ -71,7 +73,7 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
     // how the two come to disagree.
     auto const bound = ArmExchangeDeadline(_reactor, _ioTimeout, client.get());
 
-    auto outcome = co_await Cc::CacheFetch(client.get(), key, _credential);
+    auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential);
     if (!outcome.IsHit())
         co_return std::nullopt;
     co_return std::move(outcome.value);
@@ -109,7 +111,7 @@ Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::b
     CompileCacheWire::StoreRequest const request {
         .key = key, .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = value
     };
-    auto const outcome = co_await Cc::CacheStore(client.get(), request, _credential);
+    auto const outcome = co_await Cc::CacheStore(client.get(), &_notice, request, _credential);
 
     // A STORE that succeeded comes back as `Hit`: the wire answers `Ok`, and
     // `CacheOutcomeKind` names the STATUS rather than the verb. Anything else --

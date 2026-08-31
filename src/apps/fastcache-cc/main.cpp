@@ -596,28 +596,24 @@ void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
                      sourcePath));
 }
 
-/// Report, once, that a configured credential was not understood by the daemon.
-///
-/// This is not a failure — the exchange succeeded and the cache is working — so
-/// it is deliberately not a fall-back reason and does not touch the recorded
-/// outcome. It is said out loud anyway because the operator asked for something
-/// that did not happen: a daemon predating the AUTH verb steps over it and serves
-/// the traffic unauthenticated. Believing a shared cache is authenticated when it
-/// is not is worth a line in a build log.
-///
-/// Guarded so a build of thousands of translation units says it once rather than
-/// thousands of times, which is the difference between a diagnostic and noise.
-/// @param outcome The completed exchange.
-void NoteIfCredentialIgnored(Cc::CacheOutcome const& outcome)
-{
-    static bool reported = false;
-    if (!outcome.credentialIgnored || reported)
-        return;
-    reported = true;
-    Note("daemon does not support authentication; the configured credential was ignored");
-}
-
 // --- process exec -----------------------------------------------------------
+
+/// The one place a "your credential went unchecked" line comes from.
+///
+/// Constructed here because this file is the composition root, and reached by the
+/// same accessor idiom as `ProcessRunner()` and `ToolchainHost()` below. What
+/// changed in [#363](https://github.com/LASTRADA-Software/fastcached/issues/363) is
+/// not that the guard exists but WHERE: it used to be a `static bool` inside a
+/// function only the cache path called, so the six dispatch consumers -- three in
+/// other translation units, one in another executable -- had nothing to report
+/// through. The notice now travels with the exchange, so every path reports and none
+/// of them has to remember to.
+/// @return The process's credential notice.
+[[nodiscard]] Cc::CredentialNotice& Notice()
+{
+    static Cc::CredentialNotice notice { [](std::string_view text) { Note(text); } };
+    return notice;
+}
 
 /// The process runner used by every spawn in this file. Created once; the
 /// concrete implementation (CreateProcess on Windows, posix_spawn elsewhere)
@@ -1036,8 +1032,7 @@ struct SourceProbe
 /// @return The stored bytes on hit.
 [[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(Config const& cfg, std::string const& key)
 {
-    auto outcome = Cc::RunOneExchange(cfg.addr, Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
-    NoteIfCredentialIgnored(outcome);
+    auto outcome = Cc::RunOneExchange(cfg.addr, Notice(), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
     if (!outcome.IsHit())
     {
         WarnIfRejected(outcome, "manifest fetch", key);
@@ -1064,6 +1059,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
     // otherwise, and a manifest that never lands makes direct mode look simply
     // ineffective.
     auto const outcome = Cc::RunOneExchange(addr,
+                                            Notice(),
                                             Wire::EncodeStore(Wire::StoreRequest { .key = key,
                                                                                    .prefetchGroup = cfg.prefetchGroup,
                                                                                    .srcRoot = cfg.srcRoot,
@@ -1071,7 +1067,6 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
                                                                                    .value = Wire::AsBytes(body) }),
                                             cfg.credential,
                                             BudgetOf(cfg));
-    NoteIfCredentialIgnored(outcome);
     WarnIfRejected(outcome, "STORE (raw)", key);
 }
 
@@ -1575,7 +1570,7 @@ void RecordManifest(Config const& cfg,
         return std::nullopt;
     }
 
-    auto const exchange = Cc::MakeTcpExchange();
+    auto const exchange = Cc::MakeTcpExchange(Notice());
     auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = identity.fingerprint,
@@ -1892,8 +1887,7 @@ void RecordManifest(Config const& cfg,
 
     // FETCH.
     {
-        auto const outcome = Cc::RunOneExchange(cfg.addr, Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
-        NoteIfCredentialIgnored(outcome);
+        auto const outcome = Cc::RunOneExchange(cfg.addr, Notice(), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
         fetchKind = outcome.kind;
         if (!Cc::CacheIsServing(fetchKind))
         {
@@ -2084,6 +2078,7 @@ void RecordManifest(Config const& cfg,
     // a transport failure, which reads the same way it always did.
     auto const outcome =
         Cc::RunOneExchange(cfg.addr,
+                           Notice(),
                            Wire::EncodeStore(Wire::StoreRequest { .key = key,
                                                                   .prefetchGroup = cfg.prefetchGroup,
                                                                   .srcRoot = cfg.srcRoot,
@@ -2091,7 +2086,6 @@ void RecordManifest(Config const& cfg,
                                                                   .value = std::span<std::byte const> { encoded } }),
                            cfg.credential,
                            BudgetOf(cfg));
-    NoteIfCredentialIgnored(outcome);
     if (outcome.IsHit())
         Note(std::format("STORED key={} bytes={}", key, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)

@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -55,6 +56,83 @@ struct CacheOutcome
     {
         return kind == CacheOutcomeKind::Hit;
     }
+};
+
+/// Says once, per process, that a configured credential went unchecked.
+///
+/// Passed to the exchanges as a POINTER rather than a reference, and that is not a
+/// style choice: they are coroutines, and a reference parameter to a coroutine
+/// dangles the moment the frame outlives the caller's full expression
+/// (`cppcoreguidelines-avoid-reference-coroutine-parameters`). `RunExchange` in this
+/// same tree already takes its reactor and connector as pointers for exactly that
+/// reason. Non-coroutine holders -- `WorkerRegistrar`, `ReactorExchange` -- keep a
+/// reference, because they are not frames that can outlive their caller.
+///
+/// **The once-guard is a member and the output is a sink**, which is the whole point
+/// ([#363](https://github.com/LASTRADA-Software/fastcached/issues/363)). It was a
+/// function-local `static bool` inside the launcher's `main.cpp`, so exactly one of
+/// the seven consumers of an outcome could report: the cache path. Every dispatch
+/// path -- COMPILE, LEASE, RELEASE, REGISTER, HEARTBEAT and the cluster admin verbs,
+/// three of them in other translation units and one in another executable entirely --
+/// received `credentialIgnored` and had nowhere to say it.
+///
+/// That mattered more after #340 than before. Making a scheduler answer AUTH with a
+/// code the launcher steps over is correct -- a permanent 0% hit rate presenting as a
+/// cold cache was the bug -- but it converts a loud failure into a silent success on
+/// the dispatch paths, and the diagnostic meant to compensate was wired to the one
+/// path that did not need it.
+///
+/// Injected rather than reached for, per the DI rule: a second hidden global with a
+/// nicer name would be the same defect with better spelling.
+class CredentialNotice
+{
+  public:
+    /// Where the line goes. Empty means say nothing.
+    using Sink = std::function<void(std::string_view)>;
+
+    /// @param sink Where to report; may be empty.
+    explicit CredentialNotice(Sink sink) noexcept:
+        _sink { std::move(sink) }
+    {
+    }
+
+    /// A notice that reports nowhere.
+    ///
+    /// Named rather than a default argument, and that is deliberate: a defaulted
+    /// parameter is how six call sites came to drop this in the first place. A caller
+    /// that genuinely has nowhere to report has to say so.
+    /// @return A notice with no sink.
+    [[nodiscard]] static CredentialNotice Silent()
+    {
+        return CredentialNotice { Sink {} };
+    }
+
+    /// Report, if this outcome says a credential went unchecked and nothing has said
+    /// so yet.
+    ///
+    /// Guarded so a build of thousands of translation units says it once rather than
+    /// thousands of times, which is the difference between a diagnostic and noise.
+    /// @param outcome The completed exchange.
+    /// @return True when this call was the one that reported.
+    bool Observe(CacheOutcome const& outcome)
+    {
+        if (!outcome.credentialIgnored || _said)
+            return false;
+        _said = true;
+        if (_sink)
+            _sink("the peer does not support authentication; the configured credential was ignored");
+        return true;
+    }
+
+    /// @return Whether anything has been reported yet.
+    [[nodiscard]] bool Reported() const noexcept
+    {
+        return _said;
+    }
+
+  private:
+    Sink _sink;
+    bool _said { false };
 };
 
 /// Describe an outcome for a diagnostic line — the daemon's own code and words
@@ -161,7 +239,10 @@ struct ExchangeBudget
 /// @param frame A complete framed request.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome.
-[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential = {});
+[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client,
+                                                CredentialNotice* notice,
+                                                std::vector<std::byte> frame,
+                                                Credential credential = {});
 
 /// Where a refusal says to ask instead, when it says so.
 ///
@@ -212,7 +293,10 @@ struct ExchangeBudget
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] Task<CacheOutcome> CacheFetch(ISocket* client, std::string_view key, Credential credential = {});
+[[nodiscard]] Task<CacheOutcome> CacheFetch(ISocket* client,
+                                            CredentialNotice* notice,
+                                            std::string_view key,
+                                            Credential credential = {});
 
 /// STORE one entry over an already-connected client.
 ///
@@ -222,6 +306,7 @@ struct ExchangeBudget
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
 [[nodiscard]] Task<CacheOutcome> CacheStore(ISocket* client,
+                                            CredentialNotice* notice,
                                             CompileCacheWire::StoreRequest request,
                                             Credential credential = {});
 

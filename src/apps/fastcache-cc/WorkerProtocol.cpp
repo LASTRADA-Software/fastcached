@@ -340,11 +340,13 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                         .correlation = Wire::AsBytes(outcome->correlation) }));
 }
 
-WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
+WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
+                                 std::string fingerprint,
                                  std::string endpoint,
                                  std::uint32_t slots,
                                  Wire::CodecList acceptedCodecs,
                                  Wire::CapacityFields capacity):
+    _notice { notice },
     _fingerprint { std::move(fingerprint) },
     _endpoint { std::move(endpoint) },
     _slots { slots },
@@ -363,7 +365,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
                                                                     .capacity = _capacity });
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (!outcome.IsHit())
         // The scheduler's own words, code and message both, which is the whole
         // reason this is not a bool: "not a member of this cluster" and "fingerprint
@@ -403,7 +405,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& schedul
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, frame, credential));
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (outcome.IsHit())
         return {};
 

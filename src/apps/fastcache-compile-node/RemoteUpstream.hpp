@@ -68,6 +68,7 @@ class RemoteUpstream final: public ICacheUpstream
     ///        block.
     RemoteUpstream(std::string endpoint,
                    Cc::Credential credential,
+                   Cc::CredentialNotice::Sink noticeSink,
                    IConnector& connector,
                    IReactor* reactor,
                    std::chrono::milliseconds connectTimeout,
@@ -89,6 +90,14 @@ class RemoteUpstream final: public ICacheUpstream
   private:
     std::string _endpoint;
     Cc::Credential _credential;
+    /// Where "your credential went unchecked" is said; the node is a CLIENT here,
+    /// and had the same silence the launcher did (#363).
+    ///
+    /// OWNED, and the sink is what is injected. A reference would have to be
+    /// threaded through `CacheTier::Start` and `StartCacheTierOrExplain` purely to
+    /// reach here, and neither of them has any other use for it -- so the object
+    /// lives with the exchanges it reports on, and only the destination travels.
+    Cc::CredentialNotice _notice;
     IConnector& _connector;
     IReactor* _reactor;
     std::chrono::milliseconds _connectTimeout;

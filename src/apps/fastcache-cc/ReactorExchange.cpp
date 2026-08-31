@@ -24,6 +24,7 @@ namespace
     /// lambda: a coroutine's frame outlives the expression that created it.
     /// @param reactor Loop to stop when the exchange ends.
     /// @param connector How to dial.
+    /// @param notice Where an ignored credential is reported; not owned.
     /// @param hostPort Where to dial. By value, for the coroutine-frame reason.
     /// @param frame The request; moved in so a STORE's object file is not copied.
     /// @param credential Presented with the request.
@@ -31,6 +32,7 @@ namespace
     /// @param out Where to leave the outcome.
     DetachedTask RunExchange(IReactor* reactor,
                              IConnector* connector,
+                             CredentialNotice* notice,
                              std::string hostPort,
                              std::vector<std::byte> frame,
                              Credential credential,
@@ -66,7 +68,7 @@ namespace
                     [](void* socket) { static_cast<ISocket*>(socket)->Close(); },
                     client.get());
 
-            *out = co_await ExchangeFramed(client.get(), std::move(frame), std::move(credential));
+            *out = co_await ExchangeFramed(client.get(), notice, std::move(frame), std::move(credential));
         }
 
         client->Close();
@@ -76,9 +78,10 @@ namespace
 
 } // namespace
 
-ReactorExchange::ReactorExchange(IReactor& reactor, IConnector& connector) noexcept:
+ReactorExchange::ReactorExchange(IReactor& reactor, IConnector& connector, CredentialNotice& notice) noexcept:
     _reactor { reactor },
-    _connector { connector }
+    _connector { connector },
+    _notice { notice }
 {
 }
 
@@ -103,12 +106,20 @@ CacheOutcome ReactorExchange::Run(std::string_view hostPort,
     // cannot be read as a hit.
     CacheOutcome outcome;
 
-    RunExchange(&_reactor, &_connector, std::string { hostPort }, std::move(frame), std::move(credential), budget, &outcome);
+    RunExchange(&_reactor,
+                &_connector,
+                &_notice,
+                std::string { hostPort },
+                std::move(frame),
+                std::move(credential),
+                budget,
+                &outcome);
     _reactor.Run();
     return outcome;
 }
 
 CacheOutcome RunOneExchange(std::string_view hostPort,
+                            CredentialNotice& notice,
                             std::vector<std::byte> frame,
                             Credential credential,
                             ExchangeBudget budget)
@@ -122,7 +133,7 @@ CacheOutcome RunOneExchange(std::string_view hostPort,
     ThreadedAddressResolver resolver;
     PlatformConnector connector { reactor, resolver, clock };
 
-    ReactorExchange exchange { reactor, connector };
+    ReactorExchange exchange { reactor, connector, notice };
     auto outcome = exchange.Run(hostPort, std::move(frame), std::move(credential), budget);
 
     // Stopped before the reactor goes out of scope: a worker handing a result back
@@ -152,19 +163,28 @@ namespace
     class TcpExchange final: public IEndpointExchange
     {
       public:
+        /// @param notice Where an ignored credential is reported; must outlive this.
+        explicit TcpExchange(CredentialNotice& notice) noexcept:
+            _notice { notice }
+        {
+        }
+
         [[nodiscard]] CacheOutcome Exchange(std::string_view hostPort,
                                             std::vector<std::byte> frame,
                                             Credential const& credential,
                                             ExchangeBudget budget) override
         {
-            return RunOneExchange(hostPort, std::move(frame), credential, budget);
+            return RunOneExchange(hostPort, _notice, std::move(frame), credential, budget);
         }
+
+      private:
+        CredentialNotice& _notice;
     };
 } // namespace
 
-std::unique_ptr<IEndpointExchange> MakeTcpExchange()
+std::unique_ptr<IEndpointExchange> MakeTcpExchange(CredentialNotice& notice)
 {
-    return std::make_unique<TcpExchange>();
+    return std::make_unique<TcpExchange>(notice);
 }
 
 } // namespace FastCache::Cc
