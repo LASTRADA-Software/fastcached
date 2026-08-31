@@ -2,9 +2,9 @@
 #include "EndpointDial.hpp"
 #include "ReactorExchange.hpp"
 
-#include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/PlatformConnector.hpp>
+#include <FastCache/Net/SocketDeadline.hpp>
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <cassert>
@@ -56,17 +56,11 @@ namespace
             // completes it, so the task reaches its own end and frees its own frame.
             //
             // An unbounded budget arms NOTHING, which is what `FASTCACHE_TIMEOUT_MS=0`
-            // has always been documented to mean -- `ExchangeBudget::BoundsTotal` is
-            // where that rule lives, and why it is not spelled out again here.
-            // `std::optional` rather than a sentinel deadline: a timer that is not
-            // armed is the honest spelling of no bound.
-            std::optional<DeadlineTimer> bound;
-            if (budget.BoundsTotal())
-                bound.emplace(
-                    *reactor,
-                    reactor->Clock().Now() + budget.total,
-                    [](void* socket) { static_cast<ISocket*>(socket)->Close(); },
-                    client.get());
+            // has always been documented to mean. That rule now lives in
+            // `ArmSocketDeadline`, which the node's upstream shares (#248) -- it was
+            // implemented here and again in `RemoteUpstream`, and only one of the two
+            // had a regression test.
+            auto const bound = ArmSocketDeadline(reactor, budget.total, client.get());
 
             *out = co_await ExchangeFramed(client.get(), notice, std::move(frame), std::move(credential));
         }
