@@ -618,7 +618,12 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // tier while the survey runs -- moves this below the tiers, which is a larger
     // change with a sharp edge: registration must still wait for a REAL fingerprint,
     // because a node advertising a provisional one is #225.
-    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, logger);
+    //
+    // Its own clock rather than one of the tiers', and declared beside its one caller
+    // so nothing outlives it: the survey runs to completion here and the reporter it
+    // feeds does not exist afterwards.
+    SteadyClock const toolchainClock;
+    auto toolchainsOrNone = ResolveToolchains(cfg, discovery.get(), *runner, *toolchainHost, toolchainClock, logger);
     if (!toolchainsOrNone.has_value())
         return ExitUsage;
     // NOT const: a compiler patched under a running service makes this stale, and the
@@ -1120,8 +1125,8 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
             auto const depth =
                 beat % SweepEveryBeats == 0 ? Node::RecheckDepth::Unconditional : Node::RecheckDepth::WhenEvidenceMoved;
 
-            if (auto refreshed =
-                    Node::RefreshToolchains(toolchains, cfg, discovery.get(), *runner, *toolchainHost, logger, depth);
+            if (auto refreshed = Node::RefreshToolchains(
+                    toolchains, cfg, discovery.get(), *runner, *toolchainHost, toolchainClock, logger, depth);
                 refreshed.changed)
             {
                 toolchains = std::move(refreshed.served);

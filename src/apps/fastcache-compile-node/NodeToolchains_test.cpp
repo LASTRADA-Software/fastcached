@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeToolchains.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
@@ -241,6 +242,19 @@ void DescribeMsvcLayout(ScriptedToolchainHost& host)
     return std::ranges::any_of(records,
                                [&](CapturingLogger::Record const& record) { return record.message.contains(text); });
 }
+/// A real clock for the survey's progress reporter.
+///
+/// Real rather than manual, and it makes no difference to these cases: the reporter
+/// emits nothing until its interval elapses, and every walk here is a handful of
+/// files against a ten-second window. What it does buy is that nobody has to remember
+/// to advance a clock to keep a case about toolchain resolution passing.
+/// @return A steady clock that outlives every case.
+[[nodiscard]] IClock const& TestClock()
+{
+    static SteadyClock const clock;
+    return clock;
+}
+
 } // namespace
 
 TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override", "[node][toolchains]")
@@ -257,7 +271,7 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->second.compiler == "/opt/gcc=13/bin/gcc");
@@ -276,7 +290,7 @@ TEST_CASE("NodeToolchains: a discovered path that would abort the operator parse
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 2);
     CHECK_FALSE(Logged(logger, "malformed"));
@@ -297,7 +311,7 @@ TEST_CASE("NodeToolchains: a toolchain whose include probe did not run is refuse
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
 
     // The healthy one is still served -- one bad probe does not cost the machine its
     // other toolchains.
@@ -327,7 +341,7 @@ TEST_CASE("NodeToolchains: a discovered compiler that cannot be spawned is dropp
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->second.compiler == "/usr/bin/gcc");
@@ -352,7 +366,7 @@ TEST_CASE("NodeToolchains: an operator-named compiler is never spawn-probed", "[
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->first == "deadbeef");
@@ -372,7 +386,7 @@ TEST_CASE("NodeToolchains: the operator's list wins whole", "[node][toolchains]"
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 1);
 
@@ -390,7 +404,7 @@ TEST_CASE("NodeToolchains: discovery turned off with nothing named is refused", 
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    CHECK_FALSE(ResolveToolchains(cfg, nullptr, runner, host, logger).has_value());
+    CHECK_FALSE(ResolveToolchains(cfg, nullptr, runner, host, TestClock(), logger).has_value());
     CHECK(Logged(logger, "told to serve nothing"));
 
     // And it does NOT recite the search list: nothing was searched.
@@ -410,7 +424,7 @@ TEST_CASE("NodeToolchains: a machine with no compiler resolves to nothing", "[no
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
 
     // The search list is what an operator whose compiler was not found actually
     // needs -- the verdict alone says nothing about where to install one.
@@ -434,7 +448,7 @@ TEST_CASE("NodeToolchains: every discovered compiler that cannot run leaves noth
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
 }
 
 TEST_CASE("NodeToolchains: a malformed --toolchain is refused, naming the value", "[node][toolchains]")
@@ -447,7 +461,7 @@ TEST_CASE("NodeToolchains: a malformed --toolchain is refused, naming the value"
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
     CHECK(Logged(logger, "malformed --toolchain"));
 }
 
@@ -469,7 +483,7 @@ TEST_CASE("NodeToolchains: many toolchains are all identified, and reported in o
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
 
     // Nine distinct compilers, nine distinct identities: a shared result slot or a
@@ -547,7 +561,7 @@ TEST_CASE("NodeToolchains: an identity that names no compiler is refused, not re
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, logger).has_value());
+    CHECK_FALSE(ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger).has_value());
 
     // Named, and pointed at the way out. An operator who genuinely wants this
     // toolchain served can pin an identity by hand, which is the one mechanism that
@@ -572,7 +586,7 @@ TEST_CASE("NodeToolchains: an unaskable compiler with a locatable include tree i
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->second.compiler == MsvcCompiler);
@@ -592,7 +606,7 @@ TEST_CASE("NodeToolchains: an operator's pinned identity is never second-guessed
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, nullptr, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, nullptr, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
     CHECK(Unwrap(resolved).begin()->first == "deadbeef");
@@ -612,7 +626,7 @@ TEST_CASE("NodeToolchains: a driver that answers is kept whatever its roots", "[
     ScopedStateDir const state;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 1);
     CHECK_FALSE(Logged(logger, "refusing"));
@@ -637,7 +651,7 @@ TEST_CASE("NodeToolchains: two names for one toolchain are served once, and said
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     REQUIRE(Unwrap(resolved).size() == 1);
 
@@ -665,7 +679,7 @@ TEST_CASE("NodeToolchains: two distinct compilers stay two", "[node][toolchains]
     ScriptedToolchainHost host;
     CapturingLogger logger;
 
-    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, logger);
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
     REQUIRE(resolved.has_value());
     CHECK(Unwrap(resolved).size() == 2);
     CHECK_FALSE(Logged(logger, "is the same toolchain as"));
@@ -804,7 +818,7 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
         // Not a defect in `StaleToolchains` -- it is asked about an empty set and
         // correctly answers that nothing it was given has moved.
         FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
-        auto const refreshed = RefreshToolchains(nothing, cfg, &discovery, runner, host, logger);
+        auto const refreshed = RefreshToolchains(nothing, cfg, &discovery, runner, host, TestClock(), logger);
 
         CHECK_FALSE(refreshed.changed);
         CHECK(discovery.Calls() == 0);
@@ -814,7 +828,7 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
     {
         FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
         auto const refreshed =
-            RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+            RefreshToolchains(nothing, cfg, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
 
         CHECK(refreshed.changed);
         CHECK(refreshed.served.size() == 1);
@@ -826,11 +840,12 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
         // It runs on a timer, so answering "changed" here would re-register every
         // worker in the fleet on that timer for no reason at all.
         FixedDiscovery discovery { { Cc::ToolchainCandidate { .compiler = "/usr/bin/g++", .layout = "usr" } } };
-        auto const first = RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+        auto const first =
+            RefreshToolchains(nothing, cfg, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
         REQUIRE(first.changed);
 
         auto const again =
-            RefreshToolchains(first.served, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+            RefreshToolchains(first.served, cfg, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
         CHECK_FALSE(again.changed);
         CHECK(again.served.empty());
     }
@@ -842,7 +857,7 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
         // a change it cannot describe.
         FixedDiscovery discovery { {} };
         auto const refreshed =
-            RefreshToolchains(nothing, cfg, &discovery, runner, host, logger, RecheckDepth::Unconditional);
+            RefreshToolchains(nothing, cfg, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
 
         CHECK_FALSE(refreshed.changed);
         CHECK(refreshed.served.empty());

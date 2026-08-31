@@ -108,6 +108,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeMembership_test.cpp
         NodeToolchains.cpp
         NodeToolchains_test.cpp
+        ToolchainHashProgress_test.cpp
         ToolchainWalkConcurrency_test.cpp
         FrameEndpoint.cpp
         NodeIoLoop.cpp
