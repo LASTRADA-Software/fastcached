@@ -49,6 +49,7 @@
 # Usage:
 #   compile-cache-e2e.sh --fastcached <path> --launcher <path>
 #                        [--port <n>] [--compiler <cxx>]
+#                        [--testclient <path>]
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime
 # prerequisite was missing (skip).
@@ -56,6 +57,7 @@ set -euo pipefail
 
 fastcached=""
 launcher=""
+testclient=""
 port=""
 compiler="${CXX:-c++}"
 
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --launcher)   launcher="$2";   shift 2 ;;
         --port)       port="$2";       shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
+        --testclient) testclient="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -215,6 +218,96 @@ echo "   object reproduced byte-identically"
 grep -q "hdr.hpp" "${proj}/build/a.d" \
     || fail "restored depfile does not list the header the TU includes"
 echo "   depfile restored on the hit"
+
+# --- 2b: a wrong object under a correct key must be detected -----------------
+# The one failure this whole cache exists not to have, and until #423 the one
+# nothing here could observe: #368 was noticed only because the stale object
+# happened to crash, and one that linked and passed would have left no trace.
+#
+# It is PLANTED rather than provoked, because no way of driving the launcher can
+# produce it -- the launcher derives the key from the source, so it cannot
+# disagree with itself. The test client is the only thing that stores a chosen
+# value under a chosen key.
+#
+# The plant compiles a DIFFERENT source that includes the SAME header, and both
+# halves of that are load-bearing. Different source, or the object might come out
+# byte-identical and the case would prove nothing. Same header, or the value's
+# dependency record names paths this checkout does not have, `MaterializeHit`
+# declares the hit stale, the launcher recompiles for an ordinary reason, and the
+# case would pass while never exercising verification at all.
+if [[ -n "$testclient" && -x "$testclient" ]]; then
+    echo "== a planted wrong object must be named, and the fresh one used =="
+
+    # The key the launcher actually used, read off its own trace rather than
+    # recomputed here: a second implementation of the key would be a second thing
+    # to be wrong, and the key is precisely what this case is about.
+    planted_key="$(sed -n 's/^fastcache-cc: MISS key=//p' "${workdir}/miss.log" | head -n 1)"
+    [[ -n "$planted_key" ]] || fail "could not read the object key out of the MISS trace"
+
+    cat > "${proj}/wrong.cpp" <<'EOF'
+#include "hdr.hpp"
+#include <string>
+int main() { return (helper() * 7) + static_cast<int>(std::string{"a different translation unit"}.size()); }
+EOF
+
+    "$testclient" store \
+        --host 127.0.0.1 --port "$port" \
+        --key "$planted_key" \
+        --prefetch-group "e2e" \
+        --srcroot "$proj" --buildtree "${proj}/build" \
+        --compiler "$compiler" --source "${proj}/wrong.cpp" \
+        --out "${workdir}/planted.o" > "${workdir}/plant.log" 2>&1 \
+        || { cat "${workdir}/plant.log" >&2; fail "could not plant an object under the launcher's key"; }
+
+    # The plant has to actually differ, or this case passes for the wrong reason.
+    # A comparison that never fired and a comparison that fired and matched are
+    # indistinguishable from outside, which is the shape the whole feature exists
+    # to refuse.
+    if cmp -s "${workdir}/expected.o" "${workdir}/planted.o"; then
+        fail "the planted object is identical to the real one, so this case would prove nothing"
+    fi
+
+    rm -f "${proj}/build/a.o" "${proj}/build/a.d"
+    FASTCACHE_VERIFY=1 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" \
+        -c "${proj}/a.cpp" -o "${proj}/build/a.o" 2> "${workdir}/verify.log" \
+        || { cat "${workdir}/verify.log" >&2; fail "the verifying compile returned non-zero"; }
+    # Only the launcher's own lines. The rest of that log is the PLANTED value's
+    # replayed diagnostics -- a hit replays the producing compile's streams, and
+    # the plant was compiled with `-MD` writing to one, so it is ~150 lines of
+    # another translation unit's dependency list. Correct behaviour, and noise
+    # that would bury the two lines this case is about.
+    grep '^fastcache-cc:' "${workdir}/verify.log" || true
+
+    grep -q "fastcache-cc: HIT" "${workdir}/verify.log" \
+        || fail "the planted object was not served, so nothing was verified"
+    grep -q "WRONG OBJECT" "${workdir}/verify.log" \
+        || fail "a wrong object was served and nothing said so"
+    grep -q "$planted_key" "${workdir}/verify.log" \
+        || fail "the mismatch was reported without naming the key, so the entry cannot be looked at"
+
+    # And the half that matters more than the message: what the build is left
+    # holding. A launcher that named the mismatch and then linked the cache's
+    # object would be worse than one that said nothing, because it would have been
+    # believed.
+    cmp "${workdir}/expected.o" "${proj}/build/a.o" \
+        || fail "the wrong object was left on disk after being detected"
+    [[ ! -e "${proj}/build/a.o.fastcache-verify" ]] \
+        || fail "verification left its scratch copy in the build tree"
+    echo "   the wrong object was named, and the freshly compiled one was used"
+
+    # The entry is deliberately NOT repaired, here or by the launcher: which side
+    # of the disagreement is wrong is not knowable from one machine, and a
+    # launcher that overwrote the fleet's entry from a host whose own environment
+    # is the anomaly would turn one bad build into everyone's. Nothing below
+    # fetches this key -- the two later compiles of the same source run with an
+    # unreachable daemon and with `-coverage`, which keys differently.
+    rm -f "${proj}/build/a.o" "${proj}/build/a.d" "${proj}/wrong.cpp"
+else
+    # Said out loud rather than skipped in silence: FASTCACHED_BUILD_TESTCLIENT is
+    # off by default and on for the linux and clang-tidy jobs, so a reader of a
+    # local run must be told which of those they are looking at.
+    echo "== SKIPPED: no --testclient built, so the planted-wrong-object case did not run =="
+fi
 
 # --- 3: a value larger than the socket send buffer ---------------------------
 # Every other fixture here compiles to a few KB, which never fills a send buffer

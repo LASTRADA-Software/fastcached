@@ -147,6 +147,7 @@ set(_fc_cc_sources
     DependencyOutput.cpp
     DependencyProbe.cpp
     DirectManifest.cpp
+    HitVerification.cpp
     ParallelFor.cpp
     PathResolve.cpp
     ReplayGuard.cpp
@@ -259,6 +260,7 @@ if(FASTCACHED_BUILD_TESTS)
         CacheKey_test.cpp
         ParallelFor_test.cpp
         CacheProtocol_test.cpp
+        HitVerification_test.cpp
         CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
         # Test infrastructure, and on THIS target only: the shipped launcher must
@@ -305,44 +307,9 @@ if(FASTCACHED_BUILD_TESTS)
     catch_discover_tests(fastcache-cc-tests)
 
     # ---------------------------------------------------------------------
-    # End-to-end compile-cache test. Starts a real daemon, drives real
-    # compiles through the launcher, and asserts miss/hit, byte-identical
-    # object reproduction, and cross-depth portability — the properties unit
-    # tests cannot cover because they need a compiler and a server.
-    #
-    # Labelled "smoke" so it can be selected (ctest -L smoke) or skipped
-    # (ctest -LE smoke); a missing prerequisite exits 77 and reports as
-    # skipped rather than failed. Both platforms assert the same contract.
-    #
-    # The test drives a real daemon, so it only exists when the daemon is being
-    # built: the app table makes each executable independently gateable, and an
-    # unguarded $<TARGET_FILE:fastcached> would break configuration outright
-    # under -DFASTCACHED_BUILD_DAEMON=OFF.
-    if(NOT TARGET fastcached)
-        message(STATUS "fastcache-cc: skipping compile-cache-e2e test (fastcached not built)")
-    elseif(WIN32)
-        add_test(
-            NAME "compile-cache-e2e"
-            COMMAND pwsh -NoProfile -File "${CMAKE_CURRENT_SOURCE_DIR}/run-launcher-e2e.ps1"
-                -Fastcached "$<TARGET_FILE:fastcached>"
-                -Launcher "$<TARGET_FILE:fastcache-cc>"
-        )
-    else()
-        add_test(
-            NAME "compile-cache-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/compile-cache-e2e.sh"
-                --fastcached "$<TARGET_FILE:fastcached>"
-                --launcher "$<TARGET_FILE:fastcache-cc>"
-                --compiler "${CMAKE_CXX_COMPILER}"
-        )
-    endif()
-    if(TARGET fastcached)
-        # Binds a fixed port and spawns a daemon, so it must not run concurrently
-        # with the other server-starting smoke tests.
-        set_tests_properties("compile-cache-e2e" PROPERTIES
-            LABELS "smoke"
-            SKIP_RETURN_CODE 77
-            RUN_SERIAL TRUE
-        )
-    endif()
+    # The end-to-end compile-cache test (`compile-cache-e2e`) used to be
+    # registered here. It now lives in src/tests/CMakeLists.txt, for the reason
+    # that file records for `dist-compile-e2e`: it names a target defined LATER
+    # in the app table, and a `$<TARGET_FILE:>` guard on such a target is
+    # permanently false rather than conditional.
 endif()

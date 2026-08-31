@@ -171,6 +171,19 @@ namespace
                                 "cache key, so it never partitions the cache." },
         EnvVarSpec { .name = EnvName::Verbose, .summary = "Print HIT/MISS and fall-back diagnostics to stderr." },
         EnvVarSpec { .name = EnvName::NoStats, .summary = "Do not record invocations to the statistics log." },
+        EnvVarSpec { .name = EnvName::Verify,
+                     .summary = "Verify one cache hit in every N by compiling the\n"
+                                "translation unit again and comparing the object\n"
+                                "byte for byte. Unset or 0 is off, which is the\n"
+                                "default: a verified hit costs a whole compile.\n"
+                                "On a mismatch the FRESHLY compiled object is\n"
+                                "used and the key is named on stderr, whether or\n"
+                                "not FASTCACHE_VERBOSE is set -- a wrong object\n"
+                                "under a correct key is the one thing nobody\n"
+                                "should have to have opted in to hearing about.\n"
+                                "Which hits are sampled is decided by hashing the\n"
+                                "key, not by chance, so the rate holds over a\n"
+                                "build and a unit that verified verifies again." },
         EnvVarSpec { .name = EnvName::NoDirect,
                      .summary = "Disable direct mode (always preprocess to derive the key).\n"
                                 "Direct mode is on by default: it reaches a cached object by\n"
