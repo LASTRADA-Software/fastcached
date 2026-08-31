@@ -458,7 +458,7 @@ namespace
                 {
                     // Encoded and counted by the surface, not here: the endpoint owns
                     // WHEN the question is asked, the responder owns the answer.
-                    if (!co_await WriteAll(socket.get(), state->responder.RefusalReply(decision)))
+                    if (!co_await WriteAll(socket.get(), state->responder.RefusalReply(decision, decoded->opRaw)))
                         break;
                     if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
                         break;

@@ -94,7 +94,8 @@ class SchedulerResponder final: public IFrameResponder
     /// unauthenticated one says somebody is reaching for verbs they hold no secret
     /// for, and an operator watching for the second does not want the first summed
     /// into it.
-    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const override
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
+                                                      std::uint8_t /*opRaw*/) const override
     {
         if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
             _metrics.Increment(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated);
@@ -282,7 +283,8 @@ class CacheResponder final: public IFrameResponder
     /// Nothing to count: this surface requires no credential, so it can never
     /// produce the one refusal that carries a counter. The size and opcode arms are
     /// framing errors and are already visible as such to the peer.
-    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const override
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
+                                                      std::uint8_t /*opRaw*/) const override
     {
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
