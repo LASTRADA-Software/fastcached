@@ -447,6 +447,24 @@ here"*, which is not the same question as *"can I bind here"* — and the gap be
 the two is exactly where a smoke test fails for a reason that has nothing to do
 with what it tests.
 
+## A shared failure message describes one caller, and lies to the others
+
+`cluster-e2e`'s `find_leader` ended with:
+
+    fail "no node ever answered a cluster question; the cluster never elected a leader"
+
+Correct where it was written -- the first formation -- and false everywhere else it
+is called from. In [#388](https://github.com/LASTRADA-Software/fastcached/issues/388)
+it fired in phase 6, *after* eight assertions had passed, one of which had printed
+the endpoint the cluster was being led from. The cluster had elected; what it could
+not do was elect **again**, which is a different defect with a different cause. The
+sentence sent the first half hour of the investigation to the wrong place.
+
+So the situation is a **parameter**, named by each caller, and the failure prints
+who was asked and what each said. "Nobody answered" is the absence of a finding;
+the finding is in the refusals, each of which names the endpoint that node believes
+leads.
+
 ## A reproduction models the wiring as it is
 
 **A fix at a different layer invalidates the reproduction that found the bug — and

@@ -416,6 +416,65 @@ TEST_CASE("A machine with no cluster is admitted into a running one", "[consensu
     }
 }
 
+TEST_CASE("A cluster that admitted a member re-elects after losing the leader", "[consensus][raft][cluster][membership]")
+{
+    // What `cluster-e2e` phase 6 does, in process. Admission is what makes this
+    // different from the plain "a leader dies" case: the quorum grew to four while
+    // one of the four holds a configuration it was given rather than started with,
+    // and that node is the one the arithmetic now depends on.
+    //
+    // The failure this is written against (#388) is a cluster that formed, admitted,
+    // served -- and then could not re-elect, because the admitted node never fell
+    // due. `NextDeadline()` answers `TimePoint::max()` while `HasCluster()` is
+    // false, so a joiner that lost its configuration neither campaigns nor answers,
+    // and a four-member quorum with one node dead and one silent can never reach
+    // three.
+    RaftClusterHarness cluster { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(cluster));
+
+    cluster.Join("n4");
+    cluster.Run(30);
+    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2", "n3", "n4" }).has_value());
+    cluster.Run(120);
+    REQUIRE(cluster.At("n4").driver->Node().HasCluster());
+
+    auto const deposed = Unwrap(cluster.Leader());
+
+    // Isolating the leader is losing it as far as everyone else is concerned, and
+    // it is what the harness can express. The other three are a majority of four,
+    // so they must elect -- and n4 has to take part for them to get there.
+    auto survivors = std::set<NodeId> {};
+    for (auto const* const id: Everyone)
+        if (id != deposed)
+            survivors.insert(id);
+    cluster.Partition(survivors);
+
+    auto elected = std::optional<NodeId> {};
+    for (auto step = std::size_t { 0 }; step < 600; ++step)
+    {
+        cluster.Step();
+        for (auto const& who: cluster.Leaders())
+            if (who != deposed)
+                elected = who;
+        if (elected.has_value())
+            break;
+    }
+
+    // Named rather than counted, because "no leader" and "the deposed one is still
+    // reported" are different failures: the first is the stall this is about, the
+    // second would mean the partition never took effect and the case proved
+    // nothing.
+    CHECK(elected.has_value());
+
+    // The half that says WHY, so a failure does not need the log read twice. A
+    // joiner that dropped its configuration reports no cluster, and a node with no
+    // cluster is excused from every deadline -- silent, and uncountable.
+    CHECK(cluster.At("n4").driver->Node().HasCluster());
+    CHECK(cluster.At("n4").driver->Node().ActiveMembers().size() == 4);
+
+    RequireNoViolations(cluster);
+}
+
 TEST_CASE("An admitted member survives its own restart", "[consensus][raft][cluster][membership]")
 {
     // The whole point of putting membership in the log rather than on a command

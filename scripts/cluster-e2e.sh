@@ -248,7 +248,23 @@ done
 # Bounded. An election takes a few hundred milliseconds and a cold CI runner takes
 # longer; a cluster that has not settled inside ~30s has not settled.
 leader_endpoint=""
+
+# @param $1 What was being waited for, named by the caller.
+#
+# The description is a parameter because this is called in two situations that
+# fail for different reasons, and a shared sentence describing only the first one
+# sends the next reader to the wrong place. #388's phase 6 failure reported "the
+# cluster never elected a leader" -- after eight assertions had passed, one of
+# which printed the endpoint it was led from. The cluster had elected perfectly
+# well; what it could not do was elect AGAIN, and that is a different defect with
+# a different cause. Half an hour went into re-reading logs against a sentence
+# that was false.
+#
+# It also prints who was asked and what they said. "Nobody answered" is not a
+# finding, it is the absence of one -- the finding is in the refusals, which name
+# the endpoint each node believes leads.
 find_leader() {
+    local what="${1:-a leader}"
     leader_endpoint=""
     local index answer
     for _ in $(seq 1 150); do
@@ -262,7 +278,13 @@ find_leader() {
         done
         sleep 0.2
     done
-    fail "no node ever answered a cluster question; the cluster never elected a leader"
+
+    echo "no live node answered as leader within 30s, waiting for ${what}. What each was asked and said:"
+    for index in "${!scheduler_ports[@]}"; do
+        [[ -n "${scheduler_ports[$index]}" ]] || { echo "  slot ${index}: stopped by this fixture"; continue; }
+        echo "  127.0.0.1:${scheduler_ports[$index]}: $(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
+    done
+    fail "no live node answered as leader, waiting for ${what}"
 }
 
 # The endpoint a refusal tells a client to ask instead, or empty when it names
@@ -478,7 +500,7 @@ submit_setting() {
     local answer
     answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
     if [[ "$answer" != *"$2"* ]]; then
-        find_leader
+        find_leader "whoever leads now, to re-offer a setting the previous leader did not take"
         answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
     fi
     [[ "$answer" == *"$2"* ]] || fail "$3 (asked ${leader_endpoint}): ${answer}"
@@ -517,7 +539,7 @@ for _ in $(seq 1 100); do
     # or this node no longer leads, in which case the setting may have died with
     # its term and has to be offered to whoever leads now.
     if [[ "$answer" != *"known settings:"* ]]; then
-        find_leader
+        find_leader "whoever leads now, to re-offer a setting that may have died with its term"
         set_upstream
     fi
     sleep 0.2
@@ -678,7 +700,7 @@ for index in 0 1 2 3; do
     fi
 done
 
-find_leader
+find_leader "a new leader after the old one was stopped"
 echo "cluster E2E: a new leader is elected at ${leader_endpoint}"
 
 echo "cluster E2E: OK"
