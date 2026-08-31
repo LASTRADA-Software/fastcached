@@ -179,9 +179,19 @@ class IFrameResponder
     /// security counter reading zero because nobody wired it is indistinguishable
     /// from one reading zero because nothing was refused.
     ///
+    /// **Takes the verb, since #290**, for the counter rather than for the wording.
+    /// A merged 0xFC listener routes each verb to the surface that owns it, and a
+    /// refusal has to be counted against that surface: a cache STORE that overran its
+    /// ceiling attributed to the scheduler is a counter that names the wrong
+    /// subsystem, which is the one thing an operator uses these to do. The wording
+    /// stays verb-blind on purpose -- a peer that failed to authenticate learns
+    /// nothing from being told which verb it failed to reach.
+    ///
     /// @param decision Any value other than `Serve`.
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
     /// @return The encoded refusal to send back. Never empty.
-    [[nodiscard]] virtual std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision) const = 0;
+    [[nodiscard]] virtual std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
+                                                              std::uint8_t opRaw) const = 0;
 
     /// Largest request this surface will buffer.
     ///

@@ -518,11 +518,25 @@ class HoldableResponder final: public IFrameResponder
     /// opcode refusal says the caller is confused, an unauthenticated one says
     /// somebody is reaching for verbs they hold no secret for, and summing them would
     /// hide the second in the first.
-    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision) const override
+    ///
+    /// Records the verb as well, which is what a merged listener has to get right: the
+    /// refusal is counted against the surface that OWNED the verb, so a case can assert
+    /// the attribution rather than only the reply (#290).
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t opRaw) const override
     {
+        _refusedOp.store(static_cast<int>(opRaw), std::memory_order_release);
         if (decision == Wire::PrePayloadDecision::Unauthenticated)
             _unauthenticatedRefusals.fetch_add(1, std::memory_order_acq_rel);
         return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), {});
+    }
+
+    /// @return The verb of the last refusal, or nullopt if nothing was refused.
+    [[nodiscard]] std::optional<std::uint8_t> LastRefusedOp() const noexcept
+    {
+        auto const raw = _refusedOp.load(std::memory_order_acquire);
+        if (raw < 0)
+            return std::nullopt;
+        return static_cast<std::uint8_t>(raw);
     }
 
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
@@ -649,6 +663,9 @@ class HoldableResponder final: public IFrameResponder
     CredentialOutcome _outcome { CredentialOutcome::NoPolicy };
     mutable std::atomic<std::size_t> _credentialChecks { 0 };
     mutable std::atomic<std::size_t> _unauthenticatedRefusals { 0 };
+    /// The verb of the last refusal, or -1. An `int` for the same reason the two
+    /// verb selectors above are.
+    mutable std::atomic<int> _refusedOp { -1 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
     std::size_t _concurrent { 8 };
@@ -907,6 +924,43 @@ TEST_CASE("One verb needs a credential and another does not on the same listener
     REQUIRE_FALSE(served.empty());
     CHECK(ErrorOf(served) == std::nullopt);
     CHECK(responder.Entered() == 1);
+}
+
+TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
+{
+    // The third and last seam #290 has to widen, and the only one that is about the
+    // COUNTER rather than the decision. `RefusalReply` both encodes the refusal and
+    // tallies it, so on a merged listener it has to be told which surface's verb was
+    // refused -- a cache STORE that overran its ceiling counted against the scheduler
+    // names the wrong subsystem, and naming the subsystem is the entire job of these
+    // counters.
+    //
+    // The wording stays verb-blind, which is a separate decision and still the right
+    // one: a peer that failed to authenticate learns nothing from being told which
+    // verb it failed to reach.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RequireAuth(true);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    CHECK(responder.LastRefusedOp() == std::nullopt);
+
+    std::array<std::byte, Wire::RequestHeaderSize> leaseHeader {};
+    WireFrame::PutHeader(leaseHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Lease), 0);
+    Conversation conversation { port };
+    auto const refused = conversation.Send(leaseHeader);
+    REQUIRE_FALSE(refused.empty());
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::Unauthenticated);
+
+    // The verb, not merely that something was refused. Without this the widening is
+    // satisfied by a parameter nothing reads.
+    CHECK(responder.LastRefusedOp() == static_cast<std::uint8_t>(Wire::Op::Lease));
 }
 
 TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
