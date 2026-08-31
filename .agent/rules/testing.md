@@ -137,6 +137,43 @@ And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`. **A classif
 that cannot be made to say BLOCKED cannot report a hang**, and the original could
 not.
 
+## A fixture waits on what a line MEANS, and a rename is not what changes it
+
+`node-scratch-isolation-e2e` starts three nodes one at a time, and the paragraph
+explaining why has been in the file since it was written: two include-tree walks
+racing on a two-core runner exceeded the budget and the fixture failed having never
+reached a compile. The serialisation rested on waiting for `compile node ready`
+before starting the next node, which at the time meant **surveyed** -- a node
+fingerprinted before it bound.
+
+[#365](https://github.com/LASTRADA-Software/fastcached/issues/365) made a node bind
+and serve first and survey afterwards, for good reasons of its own. The log line was
+not renamed, not moved and not reworded; it simply stopped carrying the fact the
+fixture was reading out of it. Every node now reached it in about a second, all three
+walked at once, and the measured rate on the `clangcl` runner fell to **2-5 file/s**
+against the ~30 file/s [#354](https://github.com/LASTRADA-Software/fastcached/issues/354)
+measured with a single walker. 5136 files did not fit in the 600 s that
+[#428](https://github.com/LASTRADA-Software/fastcached/issues/428) had just moved
+onto the registration wait, and an unrelated pull request was ejected from the merge
+queue for it.
+
+Three things follow.
+
+**The budget was the symptom and raising it would have buried the cause.** The
+fixture asked the machine for three times the concurrent I/O it was written to ask
+for; a budget that accommodated that would have made every later run three times
+slower and left the next reader with no way to see why.
+
+**Wait on the stage, not on a line that currently coincides with it.** The two
+stages now have two waits -- `compile node ready` for the bind, `serving <compiler>
+as <fingerprint>` for the survey -- and they are kept separate rather than folded,
+because bind-stalled and survey-stalled have different costs and different fixes,
+and a fixture that folds them cannot say which one happened.
+
+**A comment stating the intent did not protect it.** The serialisation paragraph was
+correct, prominent and three lines above the wait that stopped implementing it. What
+a fixture depends on has to be in what it *does*.
+
 ## Do not measure a stand-in through an instrument as costly as the thing measured
 
 The first version of that test drove real processes. Six stand-ins, each arranged
