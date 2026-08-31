@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <format>
+#include <iostream>
 #include <utility>
 
 namespace FastCache::Node
@@ -135,8 +136,17 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     // credential pipelining and the "a daemon that does not know AUTH still served
     // the command" fall-through are each subtle enough that two implementations
     // would differ, and the one that differed would be the untested one.
+    // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
+    // process" and "once per invocation" are the same thing, and the admin surface
+    // has no long-lived object to hang it on. What matters is that the verb reports
+    // at all -- before #363 the cluster verbs discarded this silently, so an operator
+    // running `--cluster-status` with a token against an older scheduler was told
+    // nothing.
+    auto notice =
+        Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
+
     auto const outcome = SyncRun(Cc::ExchangeFramed(
-        client.get(), EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token }));
+        client.get(), &notice, EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token }));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the scheduler at {} did not answer", cfg.scheduler) };

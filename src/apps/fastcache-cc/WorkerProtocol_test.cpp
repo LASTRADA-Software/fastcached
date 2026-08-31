@@ -38,6 +38,19 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
+/// A notice these cases do not inspect.
+///
+/// Shared on purpose: every case here asserts the OUTCOME's `credentialIgnored`
+/// flag, not the diagnostic, and a fresh object per call would imply they cared. The
+/// cases that do care build their own recording notice, because a shared one reports
+/// once and would let whichever case ran first silence the rest -- a coupling to
+/// Catch2's ordering that is invisible until it fails.
+/// @return A notice with no sink.
+[[nodiscard]] FastCache::Cc::CredentialNotice& Unwatched()
+{
+    static FastCache::Cc::CredentialNotice notice = FastCache::Cc::CredentialNotice::Silent();
+    return notice;
+}
 
 /// A runner that writes a canned object and reports success.
 ///
@@ -1133,7 +1146,7 @@ namespace
 /// A registrar with the fields every case below shares.
 [[nodiscard]] WorkerRegistrar MakeRegistrar()
 {
-    return WorkerRegistrar { "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
+    return WorkerRegistrar { Unwatched(), "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
 }
 
 } // namespace
@@ -1243,7 +1256,13 @@ TEST_CASE("A credentialled client reaches a worker that has no AUTH and still ge
     auto const stored = std::vector<std::byte> { std::byte { 0x7 } };
     Testing::ScriptedSocket client { Testing::Replies({ Unwrap(refusal), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, "k", Credential { .username = {}, .secret = "s3cret" }));
+    // A RECORDING notice, not the shared silent one: this case is about the
+    // diagnostic as much as the flag. Before #363 the flag was set here and only the
+    // launcher's cache path could say so, which is the whole defect.
+    std::vector<std::string> said;
+    Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
+
+    auto const outcome = SyncRun(CacheFetch(&client, &notice, "k", Credential { .username = {}, .secret = "s3cret" }));
 
     // The command behind the credential is served. This is the half that was broken.
     REQUIRE(outcome.IsHit());
@@ -1252,6 +1271,9 @@ TEST_CASE("A credentialled client reaches a worker that has no AUTH and still ge
     // And the operator is still told their token went unchecked. Restoring the answer
     // must not also swallow the fact that nothing checked the credential.
     CHECK(outcome.credentialIgnored);
+    // And it was SAID, which is the half that had no test at all.
+    CHECK(said.size() == 1);
+    CHECK(notice.Reported());
 }
 
 namespace
@@ -1474,7 +1496,7 @@ class LiveFleet final: public IEndpointExchange, public IFrameResponder
     {
         _current = std::string { hostPort };
         AnsweringPeer peer { *this };
-        return SyncRun(ExchangeFramed(&peer, std::move(frame), credential));
+        return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
 
     [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> request) override

@@ -114,7 +114,11 @@ TEST_CASE("A credentialled client reaches a scheduler that has no AUTH and still
     Testing::ScriptedSocket socket { Testing::Replies(
         { SchedulerAuthRefusal(), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
-    auto const outcome = SyncRun(Cc::CacheFetch(&socket, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
+    std::vector<std::string> said;
+    Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
+
+    auto const outcome =
+        SyncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
     // The command behind the credential is served. This is the half that was broken.
     REQUIRE(outcome.IsHit());
@@ -124,6 +128,8 @@ TEST_CASE("A credentialled client reaches a scheduler that has no AUTH and still
     // silently does less than it was configured to is the failure this codebase keeps
     // a list about -- restoring the answer must not also swallow that.
     CHECK(outcome.credentialIgnored);
+    // Said once, through the notice the exchange carries -- the property #363 adds.
+    CHECK(said.size() == 1);
 }
 
 TEST_CASE("This scheduler refuses AUTH at the wrong layer without claiming it is unknown", "[node][auth-contract]")
@@ -180,9 +186,14 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     auto const stored = std::vector<std::byte> { std::byte { 0x9 } };
     Testing::ScriptedSocket socket { Testing::Replies({ refusal, Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
-    auto const outcome = SyncRun(Cc::CacheFetch(&socket, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
+    std::vector<std::string> said;
+    Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
+
+    auto const outcome =
+        SyncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
     CHECK(outcome.credentialIgnored);
+    CHECK(said.size() == 1);
 }

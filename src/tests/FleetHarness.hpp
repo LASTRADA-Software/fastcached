@@ -26,6 +26,20 @@
 #include <Dispatch.hpp>
 #include <tests/ScriptedSocket.hpp>
 
+/// A notice these cases do not inspect.
+///
+/// Shared on purpose: every case here asserts the OUTCOME's `credentialIgnored`
+/// flag, not the diagnostic, and a fresh object per call would imply they cared. The
+/// cases that do care build their own recording notice, because a shared one reports
+/// once and would let whichever case ran first silence the rest -- a coupling to
+/// Catch2's ordering that is invisible until it fails.
+/// @return A notice with no sink.
+[[nodiscard]] FastCache::Cc::CredentialNotice& Unwatched()
+{
+    static FastCache::Cc::CredentialNotice notice = FastCache::Cc::CredentialNotice::Silent();
+    return notice;
+}
+
 namespace FastCache::Testing
 {
 
@@ -229,7 +243,7 @@ class FleetHarness final: public Cc::IEndpointExchange
         // would let the two ends drift apart independently, which is the failure
         // #340 was.
         ScriptedSocket socket { std::move(reply) };
-        auto outcome = SyncRun(Cc::ExchangeFramed(&socket, std::move(frame), credential));
+        auto outcome = SyncRun(Cc::ExchangeFramed(&socket, &Unwatched(), std::move(frame), credential));
 
         _calls[slot].kind = outcome.kind;
         _calls[slot].code = outcome.code;

@@ -260,7 +260,8 @@ class WorkerRegistrar
     ///        object comes back in. Two spellings here is how a node comes to advertise
     ///        something it does not answer in.
     /// @param capacity What this machine is, for the scheduler to size it by.
-    WorkerRegistrar(std::string fingerprint,
+    WorkerRegistrar(CredentialNotice& notice,
+                    std::string fingerprint,
                     std::string endpoint,
                     std::uint32_t slots,
                     CompileCacheWire::CodecList acceptedCodecs,
@@ -314,6 +315,12 @@ class WorkerRegistrar
     }
 
   private:
+    /// Where "your credential went unchecked" is said, once per process.
+    ///
+    /// A reference held at construction rather than a parameter on every verb: the
+    /// registrar announces and heartbeats over the same connection with the same
+    /// credential, so this is a property of the registrar, not of a call.
+    CredentialNotice& _notice;
     std::string _fingerprint;
     std::string _endpoint;
     std::uint32_t _slots;

@@ -37,7 +37,7 @@ class ReactorExchange
   public:
     /// @param reactor The loop this exchange runs on. Single use: see the class note.
     /// @param connector How to dial; its sockets must belong to `reactor`.
-    ReactorExchange(IReactor& reactor, IConnector& connector) noexcept;
+    ReactorExchange(IReactor& reactor, IConnector& connector, CredentialNotice& notice) noexcept;
 
     ReactorExchange(ReactorExchange const&) = delete;
     ReactorExchange(ReactorExchange&&) = delete;
@@ -63,6 +63,8 @@ class ReactorExchange
   private:
     IReactor& _reactor;
     IConnector& _connector;
+    /// Where "your credential went unchecked" is said, once per process.
+    CredentialNotice& _notice;
     bool _used { false };
 };
 
@@ -79,6 +81,7 @@ class ReactorExchange
 /// @param budget The two deadlines.
 /// @return The outcome; `Transport` when the endpoint could not be reached.
 [[nodiscard]] CacheOutcome RunOneExchange(std::string_view hostPort,
+                                          CredentialNotice& notice,
                                           std::vector<std::byte> frame,
                                           Credential credential,
                                           ExchangeBudget budget);
@@ -95,6 +98,7 @@ class ReactorExchange
 /// one object serves a lease, a compile and a release without a caller having to
 /// remember which of them it was built for.
 /// @return An exchange; never null.
-[[nodiscard]] std::unique_ptr<IEndpointExchange> MakeTcpExchange();
+/// @param notice Where an ignored credential is reported; must outlive the result.
+[[nodiscard]] std::unique_ptr<IEndpointExchange> MakeTcpExchange(CredentialNotice& notice);
 
 } // namespace FastCache::Cc

@@ -124,7 +124,10 @@ namespace
     /// It costs nothing here because every caller moves into it -- a STORE frame
     /// carries a whole object file, and copying it would double the peak
     /// footprint on the hot path of a parallel build.
-    [[nodiscard]] Task<CacheOutcome> Exchange(ISocket* client, std::vector<std::byte> frame, Credential credential)
+    [[nodiscard]] Task<CacheOutcome> Exchange(ISocket* client,
+                                              CredentialNotice* notice,
+                                              std::vector<std::byte> frame,
+                                              Credential credential)
     {
         if (!credential.Configured())
         {
@@ -171,6 +174,11 @@ namespace
         if (authOutcome.kind == CacheOutcomeKind::Rejected && authOutcome.code == Wire::UnimplementedVerb)
         {
             commandOutcome.credentialIgnored = true;
+            // Said HERE, at the one place the flag becomes true, rather than left for
+            // a caller to notice. Six of the seven consumers did not (#363), and a
+            // seventh added later would not either -- the fact and the reporting of
+            // it are one thing, so they live together.
+            (void) notice->Observe(commandOutcome);
             co_return commandOutcome;
         }
 
@@ -185,9 +193,12 @@ namespace
 
 } // namespace
 
-Task<CacheOutcome> ExchangeFramed(ISocket* client, std::vector<std::byte> frame, Credential credential)
+Task<CacheOutcome> ExchangeFramed(ISocket* client,
+                                  CredentialNotice* notice,
+                                  std::vector<std::byte> frame,
+                                  Credential credential)
 {
-    co_return co_await Exchange(client, std::move(frame), std::move(credential));
+    co_return co_await Exchange(client, notice, std::move(frame), std::move(credential));
 }
 
 std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
@@ -229,14 +240,14 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
     return "unknown outcome";
 }
 
-Task<CacheOutcome> CacheFetch(ISocket* client, std::string_view key, Credential credential)
+Task<CacheOutcome> CacheFetch(ISocket* client, CredentialNotice* notice, std::string_view key, Credential credential)
 {
-    co_return co_await Exchange(client, Wire::EncodeFetch(key), std::move(credential));
+    co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential));
 }
 
-Task<CacheOutcome> CacheStore(ISocket* client, Wire::StoreRequest request, Credential credential)
+Task<CacheOutcome> CacheStore(ISocket* client, CredentialNotice* notice, Wire::StoreRequest request, Credential credential)
 {
-    co_return co_await Exchange(client, Wire::EncodeStore(request), std::move(credential));
+    co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential));
 }
 
 } // namespace FastCache::Cc

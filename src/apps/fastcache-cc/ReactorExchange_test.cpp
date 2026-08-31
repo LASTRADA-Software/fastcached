@@ -33,6 +33,17 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
+/// A notice these cases do not inspect.
+///
+/// Shared on purpose: these assert the exchange's transport behaviour, not the
+/// credential diagnostic. A case that asserted the diagnostic would need its own,
+/// because the notice reports once and a shared one couples cases to Catch2's order.
+/// @return A notice with no sink.
+[[nodiscard]] FastCache::Cc::CredentialNotice& Unwatched()
+{
+    static FastCache::Cc::CredentialNotice notice = FastCache::Cc::CredentialNotice::Silent();
+    return notice;
+}
 
 class ScriptedPeer;
 
@@ -281,7 +292,7 @@ TEST_CASE("An exchange returns the daemon's answer")
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     auto const outcome = exchange.Run("cache.example.com:6674", Wire::EncodeFetch("k"), {}, {});
 
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Miss);
@@ -301,7 +312,7 @@ TEST_CASE("An unreachable endpoint is a transport failure, not a throw")
     ScriptedConnector connector;
     connector.Refuse();
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, {});
 
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
@@ -313,7 +324,7 @@ TEST_CASE("Text that names no port is refused without dialling")
     TestReactor reactor { clock };
     ScriptedConnector connector;
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     auto const outcome = exchange.Run("6674", Wire::EncodeFetch("k"), {}, {});
 
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
@@ -334,7 +345,7 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     ScriptedConnector connector;
     connector.Reply({}); // accepts, answers nothing
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
 
     // The reactor is driven by `Run()`, and `TestReactor::Run` returns as soon as
     // both queues drain -- so the clock has to be advanced from a task ON the
@@ -423,7 +434,7 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
         }
     };
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     auto const start = clock.Now();
     dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
 
@@ -482,7 +493,7 @@ TEST_CASE("A budget of zero arms no deadline at all")
         }
     };
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     auto const start = clock.Now();
     dribble(&reactor, &clock, &connector.Log(), Turns);
 
@@ -514,7 +525,7 @@ TEST_CASE("A reactor exchange runs once")
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
 
-    Cc::ReactorExchange exchange { reactor, connector };
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
     CHECK(exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, {}).kind == Cc::CacheOutcomeKind::Miss);
 
     // A second run on the same instance is a programmer error, caught by the assert
