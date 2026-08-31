@@ -205,7 +205,8 @@ for index in 0 1 2; do
     peers+=("--raft-peer=n$((index + 1))=127.0.0.1:${raft_ports[$index]}")
 done
 
-# `--listen-cache=` turns each node's own cache port OFF. It defaults to
+# `--cache-memory=0` turns each node's own cache tier OFF -- the node port stays
+# open, because the scheduler verbs are answered on it too since #290. It defaults to
 # 127.0.0.1:6674, which is right for the one node per machine a real deployment
 # runs and wrong here, where three share a host and would race for it.
 start_node() {
@@ -219,10 +220,11 @@ start_node() {
         --listen-raft="127.0.0.1:${raft_ports[$index]}" \
         "${peers[@]}" \
         --cluster-dir="${workdir}/${id}" \
-        --listen-scheduler="127.0.0.1:${scheduler_ports[$index]}" \
+        --serve-scheduler \
+        --listen-node="127.0.0.1:${scheduler_ports[$index]}" \
         --fleet-open \
         --cluster-key-file="$cluster_key" \
-        --listen-cache= \
+        --cache-memory=0 \
         --scheduler="127.0.0.1:${scheduler_ports[$index]}" \
         --toolchain="/bin/sh" \
         --port="$(free_port)" \
@@ -560,10 +562,11 @@ scheduler_ports+=("$(free_port)")
     --listen-raft="127.0.0.1:${raft_ports[3]}" \
     --raft-peer="n4=127.0.0.1:${raft_ports[3]}" "${peers[@]}" \
     --cluster-dir="${workdir}/n4" \
-    --listen-scheduler="127.0.0.1:${scheduler_ports[3]}" \
+    --serve-scheduler \
+    --listen-node="127.0.0.1:${scheduler_ports[3]}" \
     --fleet-open \
     --cluster-key-file="$cluster_key" \
-    --listen-cache= \
+    --cache-memory=0 \
     --scheduler="127.0.0.1:${scheduler_ports[3]}" \
     --toolchain="/bin/sh" \
     --port="$(free_port)" \

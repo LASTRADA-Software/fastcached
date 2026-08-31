@@ -54,7 +54,7 @@
 # The full reasoning for each setting is in that help output.
 
 
-# the scheduler's --listen-scheduler endpoint. Required: a worker nothing
+# the scheduler's --listen-node endpoint. Required: a worker nothing
 # knows about serves nobody.
 #scheduler:
 
@@ -200,11 +200,13 @@
 # private key for --tls-cert. Both or neither.
 #tls_key:
 
-# serve the fleet's scheduler verbs here; off unless given. Answered only
-# while this node LEADS the cluster; a follower redirects to the leader and
-# an election in progress refuses, both of which a client answers by
-# compiling locally. A bare port binds the wildcard: peers have to reach it.
-#listen_scheduler:
+# serve the fleet's scheduler verbs; off unless given. Answered on
+# --listen-node, beside the cache verbs, and only while this node LEADS the
+# cluster; a follower redirects to the leader and an election in progress
+# refuses, both of which a client answers by compiling locally. It also
+# decides where a bare --listen-node binds: the wildcard here, because peers
+# have to reach it, and loopback without it.
+#serve_scheduler: false
 
 # a peer this node serves; repeatable. Gates all three surfaces -- the
 # compile port, the cache tier and the scheduler -- so a WORKER needs it
@@ -238,12 +240,14 @@
 # it refuses to start.
 #cache_dir:
 
-# serve cache verbs to local clients here (default 127.0.0.1:6674, where
-# fastcache-cc already looks; empty turns it off). A bare port binds
-# LOOPBACK, unlike --listen-scheduler: a cache any host can dial is this
-# machine's whole build output served to strangers. Widen it and only this
-# machine and --fleet-member peers are still admitted.
-#listen_cache:
+# this node's 0xFC port: cache verbs, and the scheduler verbs with
+# --serve-scheduler (default port 6674, where fastcache-cc already looks;
+# empty closes it). A bare port binds LOOPBACK on a worker -- a cache any
+# host can dial is this machine's whole build output served to strangers --
+# and the wildcard with --serve-scheduler, whose peers are elsewhere by
+# definition. Widening it admits nobody new to the cache: those verbs answer
+# this machine alone whatever this is bound to.
+#listen_node:
 
 # the shared fastcached this node reads through to. Empty is honest rather
 # than broken: one developer's machine has no shared cache.

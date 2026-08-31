@@ -826,6 +826,58 @@ TEST_CASE("No distributed verb is reachable before authentication")
     }
 }
 
+TEST_CASE("Every verb states which family it belongs to")
+{
+    // A grouping the `Op` enum has always carried as comment blocks, and which stopped
+    // being enough the moment one listener served several families (#290): a merged
+    // surface asks the OWNER of a verb who is admitted, whether a credential is
+    // required, and which counter a refusal moves.
+    //
+    // The build already refuses a row that omits it -- `EveryVerbHasAFamily` is a
+    // `static_assert` -- so what is left here is that the classification is the RIGHT
+    // one. A row that said `Cache` for `LEASE` would compile, pass that assertion, and
+    // route the fleet's capacity requests into the cache tier.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Store)) == VerbFamily::Cache);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Fetch)) == VerbFamily::Cache);
+
+    // AUTH is nobody's verb family and its own: it establishes a credential for the
+    // connection, and which component owns the credential is a routing decision the
+    // surface makes rather than a fact about the verb.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Auth)) == VerbFamily::Session);
+
+    for (auto const op: { Op::Register, Op::Heartbeat, Op::Lease, Op::Release })
+    {
+        INFO("op 0x" << static_cast<unsigned>(op));
+        CHECK(FamilyOf(static_cast<std::uint8_t>(op)) == VerbFamily::Scheduler);
+    }
+    for (auto const op: { Op::ClusterStatus, Op::ClusterSet, Op::ClusterForget, Op::ClusterAdmit })
+    {
+        INFO("op 0x" << static_cast<unsigned>(op));
+        CHECK(FamilyOf(static_cast<std::uint8_t>(op)) == VerbFamily::Scheduler);
+    }
+
+    // COMPILE is its own family rather than the scheduler's, and the split is
+    // load-bearing: it is the one verb that must not be served on a reactor, because
+    // it spawns a process and blocks for seconds (#213).
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Compile)) == VerbFamily::Compile);
+}
+
+TEST_CASE("A byte that names no verb has no family")
+{
+    // Total over every byte value, like every other predicate reading the third header
+    // byte: what arrives is a byte, not an `Op`, and a lookup that assumed otherwise
+    // would push "is this even a verb" onto each call site separately.
+    CHECK(FamilyOf(0x00) == VerbFamily::Unset);
+    CHECK(FamilyOf(0xFF) == VerbFamily::Unset);
+
+    for (unsigned raw = 0; raw <= 0xFF; ++raw)
+    {
+        INFO("op 0x" << raw);
+        auto const known = FindOp(static_cast<std::uint8_t>(raw)) != nullptr;
+        CHECK(known == (FamilyOf(static_cast<std::uint8_t>(raw)) != VerbFamily::Unset));
+    }
+}
+
 TEST_CASE("The scheduler's control verbs are bounded well below the session cap")
 {
     // These are answered on a listener a whole fleet is meant to reach. A scheduler

@@ -217,13 +217,13 @@ readable and silently ignored. Every rule below has already been one of them.
   rather than the text an operator typed.
 
   **The line is "pure function of the command line", and it is narrower than "would
-  be fatal".** `--listen-scheduler`, `--admin-listen`, `--listen-cache` and
+  be fatal".** `--serve-scheduler`, `--admin-listen`, `--listen-node` and
   `--discovery` were the same defect one tier along
   ([#186](https://github.com/LASTRADA-Software/fastcached/issues/186)): each names an
   address, each grammar was checked where the surface is opened, and a typo therefore
   registered cleanly and killed the node at every boot. They were one `EndpointFlag`
   table, because four rules differing only in a flag name and a grammar are the
-  repetition a table exists to remove -- and `--listen-cache` is in it, which is easy
+  repetition a table exists to remove -- and `--listen-node` is in it, which is easy
   to miss: its failure is fatal only once the address is *named*, and a value that
   does not parse is named by construction.
 
@@ -271,7 +271,7 @@ readable and silently ignored. Every rule below has already been one of them.
   **A host somebody did not write is not a host they meant.** All four rows refuse an
   empty one, and it is worth knowing why that is not fussiness: an empty BIND host
   reaches `getaddrinfo` as nullptr under `AI_PASSIVE` (`SocketAddress.cpp:163`), which
-  is the WILDCARD -- so `--listen-cache=:6674` would quietly serve this node's private
+  is the WILDCARD -- so `--listen-node=:6674` would quietly serve this node's private
   cache to the whole network, which is exactly what `CacheListenDefaultHost`'s loopback
   exists to make a decision rather than a typo. `UdpSocket::Send` refuses an empty
   destination outright, so `--discovery=:6681` announces to nobody. A **bare** port is
@@ -318,7 +318,7 @@ readable and silently ignored. Every rule below has already been one of them.
   reads the bit.
 
   Both sides of a flag ask this question, and getting one right is not getting the
-  flag right. `--listen-cache` had it wrong on both
+  flag right. `--listen-node` had it wrong on both
   ([#286](https://github.com/LASTRADA-Software/fastcached/issues/286)): the tier
   compared `cfg.cacheListen` against `NodeConfig{}.cacheListen` to decide whether a
   bind failure was **fatal**, so a pinned default port was read as a convenience
@@ -335,7 +335,7 @@ readable and silently ignored. Every rule below has already been one of them.
   is what makes the choice visible where it is made. `emitIfSet` stays right for a
   flag whose default is a constant the next start re-derives identically; it is wrong
   the moment the default is host-derived (`--cache-memory` follows RAM) or the moment
-  being defaulted *means* something at startup (`--listen-cache`'s warn-versus-refuse).
+  being defaulted *means* something at startup (`--listen-node`'s warn-versus-refuse).
 
   The guard is mechanical, because the failure is an **omission** and every other
   case in the file passes a row that regressed: a case walks `NodeOptions()`, and for
@@ -355,7 +355,7 @@ readable and silently ignored. Every rule below has already been one of them.
   A flag needs no bit when its default is **empty**. There is then no address to
   arrive at without asking, so every failure on it is unconditionally fatal —
   `--admin-listen` and `--cache-dir` are that shape, and the asymmetry with
-  `--listen-cache` is the default, not the surface.
+  `--listen-node` is the default, not the surface.
 - **Teardown must address every domain, not re-probe for one.** Which launchd
   domain a user agent lives in is decided at install time — `gui/<uid>` needs an
   Aqua session, so an SSH install lands in `user/<uid>`. Re-probing at uninstall

@@ -56,15 +56,15 @@ namespace
         Wire::RefusedVerb { .op = Wire::Op::Register,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+                                   "fastcache-compile-node --serve-scheduler and point clients at it" },
         Wire::RefusedVerb { .op = Wire::Op::Heartbeat,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+                                   "fastcache-compile-node --serve-scheduler and point clients at it" },
         Wire::RefusedVerb { .op = Wire::Op::Lease,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+                                   "fastcache-compile-node --serve-scheduler and point clients at it" },
         Wire::RefusedVerb { .op = Wire::Op::Compile,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and does not execute compiles; send the job to the worker "
@@ -72,23 +72,23 @@ namespace
         Wire::RefusedVerb { .op = Wire::Op::Release,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
-                                   "fastcache-compile-node --listen-scheduler and point clients at it" },
+                                   "fastcache-compile-node --serve-scheduler and point clients at it" },
         Wire::RefusedVerb { .op = Wire::Op::ClusterStatus,
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                                   "fastcache-compile-node --listen-scheduler instead" },
+                                   "fastcache-compile-node --serve-scheduler instead" },
         Wire::RefusedVerb { .op = Wire::Op::ClusterSet,
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                                   "fastcache-compile-node --listen-scheduler instead" },
+                                   "fastcache-compile-node --serve-scheduler instead" },
         Wire::RefusedVerb { .op = Wire::Op::ClusterForget,
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                                   "fastcache-compile-node --listen-scheduler instead" },
+                                   "fastcache-compile-node --serve-scheduler instead" },
         Wire::RefusedVerb { .op = Wire::Op::ClusterAdmit,
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
-                                   "fastcache-compile-node --listen-scheduler instead" },
+                                   "fastcache-compile-node --serve-scheduler instead" },
     };
 
     /// What to answer `op` with.
@@ -391,7 +391,7 @@ namespace
     [[nodiscard]] Task<Next> HandleDistributed(ISocket* socket, Wire::Op op)
     {
         // Answered, never served. `fastcached` is a cache and nothing else: the fleet's
-        // scheduler moved to `fastcache-compile-node --listen-scheduler`, because
+        // scheduler moved to `fastcache-compile-node --serve-scheduler`, because
         // handing out capacity is a decision only one node may make at a time and
         // nothing here can establish which node that is.
         //

@@ -31,7 +31,7 @@ Full reference: [fastcache-cc](fastcache-cc.md).
 
 Takes translation units that missed the cache and compiles them, so a build is
 not limited to the cores of the machine running it. Workers register with **one
-of their own** — a node started with `--listen-scheduler`, never `fastcached` —
+of their own** — a node started with `--serve-scheduler`, never `fastcached` —
 and clients are handed one on a miss.
 
 It is the fleet's only binary and wears several hats: every node compiles, holds

@@ -265,7 +265,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // each other -- but this case exists to give every field a non-default value
     // so every emitter fires, and it asserts nothing about coherence.
     cfg.tlsSelfSigned = true;
-    cfg.schedulerListen = "0.0.0.0:6678";
+    cfg.serveScheduler = true;
     cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
     // Derived from the default rather than written out, because the default is a
@@ -278,11 +278,11 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.cacheMemoryExplicit = true;
     cfg.cacheDir = "cache";
     cfg.cacheDiskBytes = 40ULL * 1024 * 1024 * 1024;
-    cfg.cacheListen = "127.0.0.1:6679";
+    cfg.nodeListen = "127.0.0.1:6679";
     // Typed, not merely different -- the same rule `--cache-memory` above follows,
     // and for this flag the provenance is what decides whether a bind failure stops
     // the node, so a registration that lost it warns past a taken port forever.
-    cfg.cacheListenExplicit = true;
+    cfg.nodeListenExplicit = true;
     cfg.upstream = "cache.internal:6674";
     cfg.nodeId = "n1";
     cfg.raftListen = "0.0.0.0:6680";
@@ -849,10 +849,10 @@ TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused b
     // is that EACH is refused on its own: one row covering for another is exactly
     // what a table of four near-identical rules would hide.
     auto const shapes = std::to_array<std::pair<char const*, NodeConfig>>({
-        { "--listen-scheduler",
+        { "--listen-node",
           [] {
               auto cfg = Installable();
-              cfg.schedulerListen = "nope";
+              cfg.nodeListen = "nope";
               cfg.fleetOpen = true; // else the fleet-membership rule answers first
               return cfg;
           }() },
@@ -862,10 +862,10 @@ TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused b
               cfg.adminListen = "nope";
               return cfg;
           }() },
-        { "--listen-cache",
+        { "--listen-node",
           [] {
               auto cfg = Installable();
-              cfg.cacheListen = "nope";
+              cfg.nodeListen = "nope";
               return cfg;
           }() },
         { "--discovery",
@@ -902,29 +902,29 @@ TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused b
 TEST_CASE("NodeConfig: a listen flag that is absent, defaulted or valid is accepted", "[node][policy]")
 {
     // The direction a "must parse" rule gets wrong. Empty means the surface is off
-    // for three of these, and `--listen-cache` carries a non-empty default that
+    // for three of these, and `--listen-node` carries a non-empty default that
     // every ordinary node runs with -- so a rule reading "must parse" rather than
     // "parses when given" would refuse the default deployment outright.
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
     CHECK_FALSE(NodeInstallRejection(Installable()).has_value());
 
     auto off = Installable();
-    off.schedulerListen.clear();
+    off.serveScheduler = false;
     off.adminListen.clear();
-    off.cacheListen.clear(); // documented as "no cache tier", not as a mistake
+    off.nodeListen.clear(); // documented as "no cache tier", not as a mistake
     off.discoveryAddress.clear();
     CHECK_FALSE(StartupPolicyRejection(off).has_value());
 
     // Every surface configured, in each of the spellings the tiers accept: a bare
     // port, an address and port, and a bracketed v6 literal.
     auto configured = Installable();
-    configured.schedulerListen = "6678";
+    configured.serveScheduler = true;
     configured.fleetOpen = true;
     // `--fleet-open` admits every machine there is, so this node has to be able to
     // check the grants they present (#282).
     configured.clusterKeyFile = "cluster.key";
     configured.adminListen = "127.0.0.1:6677";
-    configured.cacheListen = "[::1]:6679";
+    configured.nodeListen = "[::1]:6679";
     configured.dashboard = true;
     CHECK_FALSE(StartupPolicyRejection(configured).has_value());
 }
@@ -936,10 +936,10 @@ TEST_CASE("NodeConfig: a listen flag with a port and no host is refused, not wid
     // the cache surface is the whole machine's network rather than the loopback its
     // default promises, and nothing anywhere would say so.
     auto cache = Installable();
-    cache.cacheListen = ":6674";
+    cache.nodeListen = ":6674";
     auto const widened = StartupPolicyRejection(cache);
     REQUIRE(widened.has_value());
-    CHECK(Unwrap(widened).contains("--listen-cache"));
+    CHECK(Unwrap(widened).contains("--listen-node"));
 
     auto admin = Installable();
     admin.adminListen = ":6677";
@@ -948,9 +948,9 @@ TEST_CASE("NodeConfig: a listen flag with a port and no host is refused, not wid
     // A BARE port is a different thing and stays legal: it names no host at all, so
     // it takes the surface's own default rather than silently replacing it.
     auto bare = Installable();
-    bare.cacheListen = "6674";
+    bare.nodeListen = "6674";
     bare.adminListen = "6677";
-    bare.schedulerListen = "6678";
+    bare.serveScheduler = true;
     bare.fleetOpen = true;
     bare.clusterKeyFile = "cluster.key"; // --fleet-open admits other machines (#282)
     CHECK_FALSE(StartupPolicyRejection(bare).has_value());
@@ -1165,7 +1165,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // working configuration, and the two are told apart here rather than at
         // runtime by an operator reading counters.
         NodeConfig cfg;
-        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.serveScheduler = true;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
@@ -1179,7 +1179,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // believes is in force -- which is worse than refusing, because it is the
         // permissive half that would win by accident.
         NodeConfig cfg;
-        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.serveScheduler = true;
         cfg.fleetOpen = true;
         // Derived from the default rather than written out, because the default is a
         // fraction of HOST RAM now: any literal here is one that silently equals the
@@ -1190,7 +1190,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // fixture that assigns the field has to say so too.
         cfg.cacheMemoryExplicit = true;
         cfg.cacheDir = "cache";
-        cfg.cacheListen = "127.0.0.1:6679";
+        cfg.nodeListen = "127.0.0.1:6679";
         cfg.upstream = "cache.internal:6674";
         cfg.fleetMembers = { "10.0.0.1:6676" };
 
@@ -1233,7 +1233,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
             { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .bind = "0.0.0.0" },
             { .what = "the v6 wildcard", .advertise = "[::]:6676", .bind = "0.0.0.0" },
             // An empty host is the wildcard too -- it reaches `getaddrinfo` as
-            // nullptr -- which is the third case `--listen-cache=:6674` is refused
+            // nullptr -- which is the third case `--listen-node=:6674` is refused
             // for and the one that reads like an address.
             { .what = "a bare colon", .advertise = ":6676", .bind = "0.0.0.0" },
         });
@@ -1263,7 +1263,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK_FALSE(StartupPolicyRejection(alone).has_value());
 
         // A node sharing its CACHE tier with listed peers and registering nowhere.
-        // That surface is reached at `--listen-cache`, so its advertise is never
+        // That surface is reached at `--listen-node`, so its advertise is never
         // sent to anybody and the wildcard costs it nothing.
         NodeConfig cacheOnly;
         cacheOnly.fleetMembers = { "10.0.0.1:6676" };
@@ -1313,13 +1313,13 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // machine now needs: the scheduler signs a grant and the worker checks it,
         // and neither is possible without the key (#282).
         NodeConfig listed;
-        listed.schedulerListen = "0.0.0.0:6678";
+        listed.serveScheduler = true;
         listed.fleetMembers = { "10.0.0.1:6676" };
         listed.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
-        open.schedulerListen = "0.0.0.0:6678";
+        open.serveScheduler = true;
         open.fleetOpen = true;
         open.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
@@ -1545,7 +1545,7 @@ TEST_CASE("NodeConfig: a node is sized from its hardware and its class", "[node]
     SECTION("a node that built no cache tier holds nothing back for one")
     {
         // The pairing no case used to make, and the whole of #167: a cache budget
-        // that was asked for, and a tier that was never built. `--listen-cache=`
+        // that was asked for, and a tier that was never built. `--listen-node=`
         // reaches it, and so does a DEFAULT cache port `fastcached` already holds on
         // the same machine -- neither of which touches `cacheMemoryBytes`, whose
         // default is a quarter of RAM. Sized from the flag, this node reserved eight
@@ -1624,12 +1624,12 @@ TEST_CASE("NodeConfig: the node answers where the launcher looks", "[node][cli]"
     // FASTCACHE_ADDR set, and nothing else would notice if one of them moved. The
     // symptom of a drift is not an error — the launcher connects to a closed port,
     // falls back, and every build is silently uncached.
-    CHECK(NodeConfig {}.cacheListen == Cc::DefaultAddr);
+    CHECK(NodeConfig {}.nodeListen == Cc::DefaultAddr);
 
     // Loopback, and that is the anti-leeching half rather than a preference: this
     // surface serves this machine's whole build output, so reaching it from the
     // network has to be something an operator typed.
-    CHECK(NodeConfig {}.cacheListen.starts_with("127.0.0.1:"));
+    CHECK(NodeConfig {}.nodeListen.starts_with("127.0.0.1:"));
 
     // And it is on by default, because a local tier is what the program is for.
     CHECK(NodeConfig {}.cacheMemoryBytes > 0);
@@ -1646,7 +1646,7 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
     /// dashboard rule under test can fire.
     auto const servingNode = [] {
         NodeConfig cfg;
-        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.serveScheduler = true;
         cfg.fleetOpen = true;
         // `--fleet-open` admits other machines, and a node that admits them has to
         // be able to check the grants they present (#282). Present here so that only
@@ -1674,12 +1674,12 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         // only ever say it is not the leader -- which looks like a working
         // dashboard right up until somebody reads it.
         auto cfg = servingNode();
-        cfg.schedulerListen.clear();
+        cfg.serveScheduler = false;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--dashboard"));
-        CHECK(Unwrap(refusal).contains("--listen-scheduler"));
+        CHECK(Unwrap(refusal).contains("--serve-scheduler"));
     }
 
     SECTION("a credential nothing reads")
@@ -1924,20 +1924,20 @@ TEST_CASE("Typing the cache port is what marks it explicit, even at its default 
 {
     // The one spelling value equality cannot see: an operator reading the startup
     // line and typing the port back to pin it lands on the default exactly (#286).
-    auto const pinned = ParseNodeArgv({ "--listen-cache=127.0.0.1:6674" });
+    auto const pinned = ParseNodeArgv({ "--listen-node=127.0.0.1:6674" });
     REQUIRE(pinned.has_value());
-    CHECK(pinned->cacheListen == NodeConfig {}.cacheListen);
-    CHECK(pinned->cacheListenExplicit);
+    CHECK(pinned->nodeListen == NodeConfig {}.nodeListen);
+    CHECK(pinned->nodeListenExplicit);
 
     // Turning the tier off is a decision too, and an empty value is as far from the
     // default as a port is.
-    auto const off = ParseNodeArgv({ "--listen-cache=" });
+    auto const off = ParseNodeArgv({ "--listen-node=" });
     REQUIRE(off.has_value());
-    CHECK(off->cacheListenExplicit);
+    CHECK(off->nodeListenExplicit);
 
     auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
     REQUIRE(silent.has_value());
-    CHECK_FALSE(silent->cacheListenExplicit);
+    CHECK_FALSE(silent->nodeListenExplicit);
 }
 
 TEST_CASE("NodeConfig: a setting the operator pinned reaches the supervisor as pinned", "[node][service]")
@@ -1984,14 +1984,14 @@ TEST_CASE("NodeConfig: a cache port the operator pinned survives its own install
     // registration that came back classified as defaulted would warn past a bind
     // failure at every boot forever (#286).
     auto pinned = Installable();
-    pinned.cacheListen = NodeConfig {}.cacheListen;
-    pinned.cacheListenExplicit = true;
+    pinned.nodeListen = NodeConfig {}.nodeListen;
+    pinned.nodeListenExplicit = true;
 
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", pinned);
     auto const reparsed = ReparseSpec(spec);
     REQUIRE(reparsed.has_value());
-    CHECK(reparsed->cacheListen == pinned.cacheListen);
-    CHECK(reparsed->cacheListenExplicit);
+    CHECK(reparsed->nodeListen == pinned.nodeListen);
+    CHECK(reparsed->nodeListenExplicit);
 }
 
 TEST_CASE("A flag whose value other machines read refuses one that is not text", "[node][config][utf8]")
@@ -2184,7 +2184,7 @@ TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[n
     SECTION("a scheduler alone")
     {
         auto cfg = Installable();
-        cfg.schedulerListen = "0.0.0.0:6678";
+        cfg.serveScheduler = true;
         cfg.fleetOpen = true;
         cfg.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
@@ -2232,8 +2232,8 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // whole point of `explicitBit`: the value says nothing, the fact that it was
     // typed says everything.
     NodeConfig const defaults;
-    cfg.cacheListen = defaults.cacheListen;
-    cfg.cacheListenExplicit = true;
+    cfg.nodeListen = defaults.nodeListen;
+    cfg.nodeListenExplicit = true;
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 
@@ -2244,7 +2244,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // for the wrong reason, having asserted a rule permits flags that were never
     // emitted.
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
-    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--listen-cache="); }));
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--listen-node="); }));
     CHECK(std::ranges::any_of(spec.arguments, [](std::string const& a) { return a.starts_with("--cache-memory="); }));
 
     // The half that actually bites: what a supervisor replays has to pass the
@@ -2255,7 +2255,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
 
     // And provenance survives the round trip, or the second boot silently drops what
     // the first one was told.
-    CHECK((*reparsed).cacheListenExplicit);
+    CHECK((*reparsed).nodeListenExplicit);
     CHECK((*reparsed).cacheMemoryExplicit);
 }
 

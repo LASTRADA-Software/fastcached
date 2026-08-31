@@ -476,7 +476,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<host:port>",
             .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
-            .description = "the scheduler's --listen-scheduler endpoint. Required: a\n"
+            .description = "the scheduler's --listen-node endpoint. Required: a\n"
                            "worker nothing knows about serves nobody.",
             .yamlKey = "scheduler",
         },
@@ -796,17 +796,18 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "tls_key",
         },
         {
-            .primary = "--listen-scheduler",
-            .arity = Arity::Value,
-            .operand = "=[<address>:]<port>",
-            .apply = AssignFrom<&NodeConfig::schedulerListen, ParseText>(),
-            .description = "serve the fleet's scheduler verbs here; off unless\n"
-                           "given. Answered only while this node LEADS the\n"
-                           "cluster; a follower redirects to the leader and an\n"
-                           "election in progress refuses, both of which a client\n"
-                           "answers by compiling locally. A bare port binds the\n"
-                           "wildcard: peers have to reach it.",
-            .yamlKey = "listen_scheduler",
+            .primary = "--serve-scheduler",
+            .arity = Arity::None,
+            .apply = SetTrue<&NodeConfig::serveScheduler>(),
+            .description = "serve the fleet's scheduler verbs; off unless given.\n"
+                           "Answered on --listen-node, beside the cache verbs,\n"
+                           "and only while this node LEADS the cluster; a\n"
+                           "follower redirects to the leader and an election in\n"
+                           "progress refuses, both of which a client answers by\n"
+                           "compiling locally. It also decides where a bare\n"
+                           "--listen-node binds: the wildcard here, because\n"
+                           "peers have to reach it, and loopback without it.",
+            .yamlKey = "serve_scheduler",
         },
         {
             .primary = "--fleet-member",
@@ -870,19 +871,22 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "cache_dir",
         },
         {
-            .primary = "--listen-cache",
+            .primary = "--listen-node",
             .arity = Arity::Value,
             .operand = "=[<address>:]<port>",
-            .apply = AssignFrom<&NodeConfig::cacheListen, ParseText>(),
-            .explicitBit = &NodeConfig::cacheListenExplicit,
-            .description = "serve cache verbs to local clients here (default\n"
-                           "127.0.0.1:6674, where fastcache-cc already looks;\n"
-                           "empty turns it off). A bare port binds LOOPBACK,\n"
-                           "unlike --listen-scheduler: a cache any host can\n"
-                           "dial is this machine's whole build output served\n"
-                           "to strangers. Widen it and only this machine and\n"
-                           "--fleet-member peers are still admitted.",
-            .yamlKey = "listen_cache",
+            .apply = AssignFrom<&NodeConfig::nodeListen, ParseText>(),
+            .explicitBit = &NodeConfig::nodeListenExplicit,
+            .description = "this node's 0xFC port: cache verbs, and the\n"
+                           "scheduler verbs with --serve-scheduler (default\n"
+                           "port 6674, where fastcache-cc already looks; empty\n"
+                           "closes it). A bare port binds LOOPBACK on a worker\n"
+                           "-- a cache any host can dial is this machine's\n"
+                           "whole build output served to strangers -- and the\n"
+                           "wildcard with --serve-scheduler, whose peers are\n"
+                           "elsewhere by definition. Widening it admits nobody\n"
+                           "new to the cache: those verbs answer this machine\n"
+                           "alone whatever this is bound to.",
+            .yamlKey = "listen_node",
         },
         {
             .primary = "--upstream",
@@ -966,7 +970,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         // `ParseFlow::Continue`, unlike `--help` and `--version`, and the difference
         // is the whole point of the flag. Those two ignore the rest of the command
         // line; this one REPORTS on it. With `Stop`, `--print-surfaces
-        // --listen-scheduler 6675` parsed nothing after the first flag and printed
+        // --listen-node 6675` parsed nothing after the first flag and printed
         // the defaults -- a worksheet that silently describes a different node from
         // the one the operator asked about, which is the misleading-document failure
         // this flag exists to prevent.
@@ -1098,7 +1102,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     ///
     /// Which flags need this is not a matter of taste. `--cache-memory`'s default is
     /// a share of host RAM, so a pinned budget moves under a VM resize; and
-    /// `--listen-cache` decides on provenance whether a bind failure is FATAL, so a
+    /// `--listen-node` decides on provenance whether a bind failure is FATAL, so a
     /// registration that lost the bit warns past a taken port forever and the node
     /// comes up healthy serving no cache (#286). `NodeConfig_test` walks
     /// `NodeOptions()` and requires every row carrying an `explicitBit` to arrive
@@ -1169,10 +1173,11 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--tls-self-signed");
     emitPathIfSet("tls-cert", cfg.tlsCertFile.string());
     emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
-    emitIfSet("listen-scheduler", cfg.schedulerListen, defaults.schedulerListen);
+    if (cfg.serveScheduler)
+        argv.emplace_back("--serve-scheduler");
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
-    emitIfExplicit("listen-cache", cfg.cacheListen, cfg.cacheListenExplicit);
+    emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
     emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
     emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
@@ -1322,7 +1327,7 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 
     // The two spellings of "every interface", plus the empty host -- which reaches
     // `getaddrinfo` as nullptr under AI_PASSIVE and is therefore the wildcard as
-    // well, the same third case `--listen-cache=:6674` is refused for. The bracketed
+    // well, the same third case `--listen-node=:6674` is refused for. The bracketed
     // spelling needs no row of its own: `HostOfEndpoint` strips the brackets whether
     // or not a port follows, so `[::]` and `[::]:6676` both arrive here as `::`.
     return host.empty() || host == "0.0.0.0" || host == "::";
@@ -1444,7 +1449,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     // consensus prose can name a flag but not a value.
     //
     // "Parses when GIVEN", never "must parse". Empty is how five of the six say the
-    // surface is off, and `--listen-cache` carries a non-empty default every ordinary
+    // surface is off, and `--listen-node` carries a non-empty default every ordinary
     // node runs with -- so a rule spelled the other way would refuse the default
     // deployment outright.
     //
@@ -1485,9 +1490,8 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     };
 
     constexpr auto Rules = std::to_array<Rule>({
-        { .refuses =
-              [](NodeConfig const& c) { return !c.schedulerListen.empty() && !c.fleetOpen && c.fleetMembers.empty(); },
-          .message = "--listen-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
+        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty(); },
+          .message = "--serve-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
                      "refuses every caller, which is the right default but not a working configuration. It would "
                      "start, bind, log nothing wrong, and decline the whole fleet." },
         { .refuses = [](NodeConfig const& c) { return c.fleetOpen && !c.fleetMembers.empty(); },
@@ -1517,7 +1521,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // halves have to be typed together or neither is worth anything. Scoped to a
         // node that registers with a scheduler, because that is what makes the
         // advertised endpoint travel: a node admitting peers to its CACHE tier is
-        // reached at `--listen-cache` and needs no advertise at all. And a node with
+        // reached at `--listen-node` and needs no advertise at all. And a node with
         // no membership flags is untouched, which is what keeps the one-machine
         // deployment -- no advertise, loopback clients, and correct -- working.
         { .refuses =
@@ -1602,7 +1606,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // mistake caught later. It began as "unless --discovery"; the scheduler
         // became a second reader when it started SIGNING grants (#281) and the rule
         // turned a correct configuration into a node that would not start. It was
-        // widened to "unless --discovery or --listen-scheduler"; the worker became a
+        // widened to "unless --discovery or the scheduler tier"; the worker became a
         // third reader here (#282), and the rule immediately refused the configuration
         // the rule below REQUIRES -- a plain worker admitting remote peers, which
         // needs the key precisely and runs neither of the other two surfaces.
@@ -1612,12 +1616,21 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // discovery resolve to on this machine, which happens long after this table
         // runs. A refusal whose premise has become false is worse than no refusal, and
         // one that cannot state its premise without guessing has no business firing.
+        // Newly reachable since the surfaces merged (#290), and silent without a row:
+        // the scheduler verbs are answered on `--listen-node`, so emptying that flag
+        // closes the port the scheduler would have been reached on. Before the merge
+        // these were two flags naming two ports and neither could cancel the other; now
+        // one can, and a node would start, log a scheduler, and answer nobody.
+        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && c.nodeListen.empty(); },
+          .message = "--serve-scheduler needs --listen-node: the scheduler verbs are answered on the node's 0xFC "
+                     "port, beside the cache verbs, and an empty --listen-node closes it. There would be nothing "
+                     "left for a peer to dial." },
         { .refuses = [](NodeConfig const& c) { return c.dashboard && c.adminListen.empty(); },
           .message = "--dashboard needs --admin-listen: the dashboard is served on the admin surface, and "
                      "without one there is no port for it to answer on. It would start, log nothing wrong, "
                      "and serve the page to nobody." },
-        { .refuses = [](NodeConfig const& c) { return c.dashboard && c.schedulerListen.empty(); },
-          .message = "--dashboard needs --listen-scheduler: a node that runs no scheduler never leads a fleet, "
+        { .refuses = [](NodeConfig const& c) { return c.dashboard && !c.serveScheduler; },
+          .message = "--dashboard needs --serve-scheduler: a node that runs no scheduler never leads a fleet, "
                      "so the page could only ever say it is not the leader. The fleet-wide facts live where "
                      "leadership does." },
         { .refuses = [](NodeConfig const& c) { return !c.dashboardTokenFile.empty() && !c.dashboard; },

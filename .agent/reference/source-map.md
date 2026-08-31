@@ -213,7 +213,7 @@ src/apps/
                             is header-only, so including it costs no build row.
   fastcache-compile-node/   the compile worker AND the peer service (
                             FASTCACHED_BUILD_NODE, default ON) — registers with a
-                            scheduler's `--listen-scheduler` endpoint (another node's;
+                            scheduler's `--serve-scheduler` endpoint (another node's;
                             `--listen-dispatch` on the daemon is gone) and answers
                             `Compile` on its own port. It may also BE the scheduler,
                             hold a cache tier for this machine's clients, and run

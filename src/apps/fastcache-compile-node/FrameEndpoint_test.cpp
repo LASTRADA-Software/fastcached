@@ -224,7 +224,7 @@ class Conversation
 /// Written THROUGH the surface's own row rather than by naming the config field, so
 /// a test cannot reach a port by a route production code no longer has. The row
 /// already knows where each surface's text lives; a helper that hard-coded
-/// `cfg.schedulerListen` would be a second copy of that mapping, which is the fifth
+/// `cfg.nodeListen` would be a second copy of that mapping, which is the fifth
 /// place again in test form.
 /// @param surface Which surface to configure.
 /// @param spec The address it should serve.
@@ -244,8 +244,9 @@ class Conversation
 /// A configuration serving @p surface on loopback at @p port.
 ///
 /// Loopback is spelled out rather than left to the surface's own default, and that
-/// is deliberate: the scheduler's default host is the WILDCARD, so a bare port here
-/// would bind every interface on a developer's machine and on CI.
+/// is deliberate: the node port's default host is the WILDCARD once the node
+/// schedules, so a bare port here would bind every interface on a developer's machine
+/// and on CI the moment a case sets `--serve-scheduler`.
 /// @param surface Which surface to configure.
 /// @param port The port it should serve.
 /// @return A configuration serving that surface on loopback.
@@ -263,13 +264,17 @@ TEST_CASE("A surface with no address to bind is refused, not guessed at", "[node
     // the message lives. What is left here is the shape this factory still has to
     // refuse: a surface it was asked to serve that resolves to no address at all.
     Fleet fleet;
-    auto const started =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Scheduler, NodeConfig {}, fleet.responder, fleet.logger);
+    // Emptied rather than defaulted: `--listen-node` carries a non-empty default that
+    // every ordinary node runs with, so a default-constructed config now resolves to
+    // an address rather than to nothing.
+    NodeConfig unserved;
+    unserved.nodeListen.clear();
+    auto const started = FrameEndpoint::Start(fleet.io, NodeSurface::Node, unserved, fleet.responder, fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     // Naming the flag, because an operator reading it has to know which surface went
     // unserved -- the endpoint knows, and a bare "no address" would not say.
-    CHECK(started.error().contains("--listen-scheduler"));
+    CHECK(started.error().contains("--listen-node"));
 }
 
 TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
@@ -282,7 +287,7 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
     auto const started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, ConfigFor(NodeSurface::Scheduler, unreachable), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, ConfigFor(NodeSurface::Node, unreachable), fleet.responder, fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
@@ -301,7 +306,7 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     probe.reset();
 
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
     fleet.Serve();
 
@@ -334,7 +339,7 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -370,7 +375,7 @@ TEST_CASE("This machine is admitted whatever the member list says", "[node][sche
 
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -414,7 +419,7 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -705,7 +710,7 @@ TEST_CASE("A peer the surface refuses never gets its payload read", "[node][fram
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -760,7 +765,7 @@ TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -800,7 +805,7 @@ TEST_CASE("An authenticated peer is served the same verb", "[node][frame]")
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -849,7 +854,7 @@ TEST_CASE("One peer is refused one verb and served another on the same listener"
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -899,7 +904,7 @@ TEST_CASE("One verb needs a credential and another does not on the same listener
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -945,7 +950,7 @@ TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -974,7 +979,7 @@ TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1002,7 +1007,7 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1046,7 +1051,7 @@ TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1072,7 +1077,7 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1117,7 +1122,7 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1164,7 +1169,7 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1199,7 +1204,7 @@ TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
 
     auto const port = FreePort();
     auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1226,7 +1231,7 @@ TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Scheduler, LoopbackFor(NodeSurface::Scheduler, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 

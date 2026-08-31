@@ -262,12 +262,15 @@ Consequences that are each load-bearing:
     make another host entitled to read it, and there is no configuration in which it
     should — so the responder does not take an `IMembershipOracle` at all. Its
     absence is the fix; a flag it consulted would be a flag somebody could set wrong.
-  - **"It is only bound to loopback" is not a policy and stops being available at
-    all.** The default bind closes this by accident, and the accident evaporates the
-    moment `--listen-cache` is widened — or, once cache, scheduler and compile share
-    one wildcard listener (#290), the moment there is no per-surface bind left to
-    reason about. A rule on the verb survives that merge; a rule on the bind does not.
-    This ticket is that merge's hard prerequisite for exactly that reason.
+  - **"It is only bound to loopback" is not a policy, and since #290 it is not even
+    available.** The default bind closed this by accident, and the accident evaporated
+    the moment `--listen-node` was widened — or, now that the cache and scheduler
+    verbs share one listener, the moment a node passes `--serve-scheduler` and that
+    listener takes the wildcard by default. A rule on the verb survived that merge; a
+    rule on the bind did not, which is why this ticket was its hard prerequisite. On a
+    scheduling node the locality check is the whole defence, and
+    `NodeCacheRequestsRefusedNotLocal` rises in normal operation there rather than
+    staying at zero.
   - **The question is ambient, so it arrives through a seam with a clock**:
     `Platform/ILocalityOracle`, over `IHostAddressSource` (`getifaddrs` /
     `GetAdaptersAddresses`). Not a syscall in the responder — a security decision
@@ -339,7 +342,7 @@ Consequences that are each load-bearing:
     surfaces — the scheduler, the cache tier and the compile port — and `WorkerServer`
     is constructed unconditionally, so `--fleet-member` / `--fleet-open` are consulted
     on every node there is. `StartupPolicyRejection` nonetheless refused them without
-    `--listen-scheduler`, reasoning that "a policy nothing consults is a policy an
+    `--serve-scheduler`, reasoning that "a policy nothing consults is a policy an
     operator believes is in force" — and the premise was simply false. What the row
     achieved was pinning every non-scheduler node's oracle to an *empty list*, which
     admits loopback and nothing else, so the worker the getting-started page called
@@ -355,7 +358,7 @@ Consequences that are each load-bearing:
     letting a worker carry a membership flag at all is what made it reachable from a
     hand-started one, so the startup table gained the row in the same change.
     Deliberately scoped: a node that registers **nowhere** and admits peers to its
-    cache tier is reached at `--listen-cache` and needs no advertise, and a node with
+    cache tier is reached at `--listen-node` and needs no advertise, and a node with
     no membership flags is the one-machine deployment and is correct as it stands.
     Only the wildcard is refused, never an address that might not resolve — a host
     that is down today can be right at the next boot (#208), while the wildcard is
@@ -766,10 +769,11 @@ Consequences that are each load-bearing:
     in a guard. Two instances make it a family rather than a coincidence: when a
     premise is doing load-bearing work, check it still holds on every path that reads
     it, not only on the path it was written for.
-  - **And the sibling is already known.** `--listen-scheduler` describes nothing under
+  - **And the sibling is already known.** `--listen-node` describes nothing under
     activation for exactly the same reason, so the scheduler-side refusal (#303) will
-    have this hole the day it is written. Recorded on that issue from the other
-    direction.
+    have this hole the day it is written -- and since #290 that one flag carries the
+    scheduler's address as well as the cache's, so the hole is one flag wider than it
+    was. Recorded on that issue from the other direction.
 - **The trust decision does not live in `main()`.** It lived there, as
   `[](...){ return true; }`, through a fully passing suite — the shape this file
   already names as *a reclaimer nothing constructs is the bug it was written to
@@ -1110,10 +1114,11 @@ Six more about what the tier IS and who gets to see it:
 
 - **What a node holds back from compiles is what its tier BUILT, never what a flag
   asked for.** `--cache-memory` is a request, and three things grant it and one
-  denies it: `--listen-cache=` builds no tier at all, `--cache-memory 0` builds no
-  memory half, and a DEFAULT `--listen-cache` already held — by the `fastcached` on
+  denies it: `--cache-memory 0` with no `--cache-dir` leaves nowhere to keep objects
+  and builds no tier at all, `--cache-memory 0` beside a `--cache-dir` builds no
+  memory half, and a DEFAULT `--listen-node` already held — by the `fastcached` on
   the same machine, which is where that port points — is a warning the node carries
-  on past. None of the three touches `cacheMemoryBytes`, whose default is a quarter
+  on past, leaving the tier unreachable. None of the three touches `cacheMemoryBytes`, whose default is a quarter
   of RAM, so `NodeCapacityOf` reading the flag reserved 8 GiB on a 32 GiB box that
   cached nothing and offered the fleet 24 slots instead of 32. Under-utilisation
   rather than breakage, and therefore silent forever: nothing anywhere reports a
@@ -1145,7 +1150,7 @@ Six more about what the tier IS and who gets to see it:
   `std::string`, so `StartCacheTierOrExplain` opens the store itself rather than
   letting `Start` do it — otherwise a bad `--cache-dir` on a node using the DEFAULT
   cache port is logged as a warning and stepped over, and the error names
-  `--listen-cache` while pointing at a directory.
+  `--listen-node` while pointing at a directory.
 
 - **A port this node LISTENS on is a row of `NodeSurfaceTable()`, and an opener takes
   the `NodeSurface` rather than an address.** The port map lived in five places --
@@ -1181,7 +1186,7 @@ Six more about what the tier IS and who gets to see it:
   because a label described it.
 
   `--print-surfaces` renders the **resolved** configuration, never the defaults --
-  a worksheet claiming `127.0.0.1` for a node started with `--listen-cache 0.0.0.0:6674`
+  a worksheet claiming `127.0.0.1` for a node started with `--listen-node 0.0.0.0:6674`
   is a security misstatement rather than an untidy one -- so it parses the whole
   command line (`ParseFlow::Continue`, unlike `--help`) or it describes a machine
   nobody configured.
@@ -1247,7 +1252,7 @@ silently stores nothing while reporting success on every write. `CacheEngine` al
 spelled it the same way, which is what makes this a drift rather than a discovery.
 
 - **`FASTCACHE_ADDR` defaults to LOOPBACK, and set-but-empty is the opt-out.** Unset
-  resolves to `Cc::DefaultAddr` (`127.0.0.1:6674`), which is where `--listen-cache`
+  resolves to `Cc::DefaultAddr` (`127.0.0.1:6674`), which is where `--listen-node`
   answers, so the launcher caches against a node on this machine with no
   configuration at all. Three-valued on purpose, and `EnvOr` — which collapses
   set-but-empty into unset — must not be used to read it, or the documented opt-out
@@ -1497,7 +1502,7 @@ has seconds of include-tree walking to do.
 
 **A dashboard route is a verb, and gets the same leadership answer as the rest of
 the surface.** `/fleet` and `/fleet.json` are not registered at all on a node with
-no `--listen-scheduler`, so they are a plain 404 rather than a route answering with
+no `--serve-scheduler`, so they are a plain 404 rather than a route answering with
 an empty fleet -- a process with no fleet view offers no fleet route. Where one
 exists, a node that does not lead answers `503` naming the leader, which is
 `Gate()`'s `NotLeader` rendered in HTTP. The reasoning, and why it is never a
@@ -1952,7 +1957,10 @@ only thing that would catch an encoding that drops a field on the way.
   people run — is answered by the shape #282 landed on: ask whether a machine that is
   not this one can reach the surface, not whether a key is configured, and a
   single-machine install is out of scope by construction. What is left is applying
-  that predicate to `--listen-scheduler` rather than to `--bind`.
+  that predicate to `--listen-node` rather than to `--bind` -- which since #290 is the
+  address the scheduler verbs are answered on, and which takes the wildcard by default
+  the moment `--serve-scheduler` is passed. That default is exactly the configuration
+  the predicate has to catch.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and

@@ -582,7 +582,7 @@ TEST_CASE("ServiceControl: a TLS listener's kind survives the registration", "[p
     //
     // This case used to assert the same property for `--listen-dispatch`. That flag
     // is gone -- the fleet's scheduler moved to `fastcache-compile-node
-    // --listen-scheduler` -- and the property it was guarding is the general one:
+    // --serve-scheduler` -- and the property it was guarding is the general one:
     // whichever listener flag an endpoint was spelled with is the one it comes back
     // as. TLS is the surviving second kind, so it inherits the guard rather than
     // leaving `ListenFlagFor` with no test at all.

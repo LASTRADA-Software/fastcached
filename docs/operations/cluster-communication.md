@@ -365,7 +365,7 @@ client's own cache connection.
 
 | Opened by | Answered by | Port | When | Carries |
 |---|---|---|---|---|
-| `fastcache-cc` | a cache — `fastcached` or a node's `--listen-cache` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
+| `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
 | `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, conventionally `:6675` | on a cache miss, when dispatch is configured | `LEASE` |
 | `fastcache-cc` | the worker named in the grant | whatever that worker advertises; `--port`, default `6676` | once per dispatched compile, held for its duration | `COMPILE` |
 | `fastcache-cc` | the leader's scheduler | `:6675` | a **second** connection, on every path out of the compile | `RELEASE` |
@@ -376,10 +376,11 @@ client's own cache connection.
 | an operator | the leader's scheduler | `:6675` | on demand | `CLUSTER-STATUS`, `-SET`, `-FORGET`, `-ADMIT` |
 | a browser or scraper | a node's `--admin-listen`, or `fastcached`'s `--metrics` (default `:9259`) | as configured | on demand | HTTP: `/fleet`, `/fleet.json`, `/metrics`, `/healthz` |
 
-Two of those numbers are real defaults and one is not. A cache listens on `6674`
-and a worker's compile port on `6676` unless you say otherwise; **`6675` is only
-a convention this documentation follows** — `--listen-scheduler` has no default
-and a scheduler does not exist until you ask for one. Neither does a consensus or
+Two of those numbers are real defaults and one is not. A node's `0xFC` port listens
+on `6674` and a worker's compile port on `6676` unless you say otherwise; **`6675` is
+only a convention this documentation follows** — a scheduler does not exist until you
+ask for one with `--serve-scheduler`, and when you do it is answered on
+`--listen-node`, beside the cache verbs, rather than on a port of its own. Neither does a consensus or
 discovery port: those have no conventional number at all. See
 [Install](../getting-started/install.md#distributed-compilation) for the
 port summary, and
@@ -572,9 +573,11 @@ at the one moment they are watching.
 A node's tier is two independent halves, and the flags are separate because the
 questions are:
 
-- **`--listen-cache`** — where it *answers*, defaulting to `127.0.0.1:6674`
-  because that is where `fastcache-cc` already looks. Loopback by default: this
-  tier holds the machine's own build output.
+- **`--listen-node`** — where it *answers*, defaulting to port `6674` because that
+  is where `fastcache-cc` already looks. Loopback by default on a worker: this tier
+  holds the machine's own build output. On a node passing `--serve-scheduler` the
+  same bare port takes the wildcard instead, because that one listener also answers
+  the fleet's scheduler verbs.
 
     It is served to **this machine and to nothing else**, always
     ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). Not to
@@ -630,7 +633,7 @@ that machine actually runs with, lists every port it would bind and the protocol
 each, then exits without opening anything:
 
 ```console
-$ fastcache-compile-node --print-surfaces --listen-scheduler 6675 \
+$ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
 compile           0.0.0.0:6676    TCP
 cache             127.0.0.1:6674  TCP
@@ -660,7 +663,7 @@ serves.
     Nothing. The client, the node and its tier all talk over loopback.
 
     ```sh
-    fastcache-compile-node --listen-scheduler 6675 --scheduler 127.0.0.1:6675
+    fastcache-compile-node --serve-scheduler --listen-node 6675 --scheduler 127.0.0.1:6675
     ```
 
 === "One scheduler, N workers"

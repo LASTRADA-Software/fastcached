@@ -194,15 +194,19 @@ struct NodeConfig
     /// Private key for `tlsCertFile`. Both or neither.
     std::filesystem::path tlsKeyFile;
 
-    /// Where this node serves the fleet's scheduler verbs, or empty to leave it off.
+    /// Whether this node serves the fleet's scheduler verbs.
     ///
     /// Off by default and for the same reason `--admin-listen` is: handing out other
     /// machines' CPU time is an operator's decision, not something they get by
-    /// starting a worker. Unlike the admin endpoint, a bare port binds the WILDCARD
-    /// rather than loopback -- a scheduler no peer can dial is a scheduler that does
-    /// nothing, so loopback would be a default that silently cannot work, which is
-    /// exactly the shape `--advertise` is refused for.
-    std::string schedulerListen;
+    /// starting a worker.
+    ///
+    /// A flag rather than an address since the surfaces merged (#290) -- the scheduler
+    /// verbs are answered on `nodeListen`, beside the cache verbs, so there is no
+    /// second address left for it to name. What it still decides is where a bare
+    /// `--listen-node` binds: a node that schedules takes the WILDCARD, because a
+    /// scheduler no peer can dial is a scheduler that does nothing, and one that does
+    /// not takes loopback. See `NodeListenDefaultHost`.
+    bool serveScheduler { false };
 
     /// Peers this node serves, as `host:port`; repeatable.
     ///
@@ -274,14 +278,19 @@ struct NodeConfig
     /// `FASTCACHE_ADDR` they then have to point at it — is two steps to get the
     /// behaviour that is the point of running the program.
     ///
-    /// Loopback, unlike `--listen-scheduler`'s wildcard, and that asymmetry is the
-    /// anti-leeching rule rather than a preference: a scheduler no peer can dial does
-    /// nothing, while a cache any host can dial is this machine's entire build output
-    /// served to strangers. Widening it is an operator's decision, and even then
-    /// `CacheResponder` admits only THIS MACHINE (#287) -- not this cluster's members,
-    /// which is what it admitted until locality became a property of the verb. So
-    /// widening this address buys reaching the tier from this host under another
-    /// address, and nothing else.
+    /// Loopback on a node that does not schedule, the wildcard on one that does, and
+    /// that asymmetry is the anti-leeching rule rather than a preference: a scheduler
+    /// no peer can dial does nothing, while a cache any host can dial is this machine's
+    /// entire build output served to strangers. It used to be a difference between two
+    /// surfaces; since they merged (#290) it is a difference between two
+    /// configurations of one, and `NodeListenDefaultHost` is where it is decided.
+    ///
+    /// Widening it is an operator's decision, and even then `CacheResponder` admits
+    /// only THIS MACHINE (#287) -- not this cluster's members, which is what it
+    /// admitted until locality became a property of the verb. So widening this address
+    /// buys reaching the tier from this host under another address, and nothing else:
+    /// on a scheduling node, whose port faces the network by default, the cache verbs
+    /// are closed by that policy alone rather than by the socket.
     ///
     /// A port already taken is fatal when the operator **named** it and a warning when
     /// it is this default. Typed, it is a promise, and a broken promise is fatal;
@@ -289,12 +298,12 @@ struct NodeConfig
     /// start over a convenience nobody requested, and the launcher reaches the daemon
     /// on that port instead. Never silently, either way.
     ///
-    /// Which of the two applies is `cacheListenExplicit`, and it has to be: comparing
+    /// Which of the two applies is `nodeListenExplicit`, and it has to be: comparing
     /// this value against the default cannot see the operator who typed the default.
     /// `--admin-listen` needs no such bit and draws no such distinction -- its default
     /// is *empty*, so there is no address to arrive at without asking, and every bind
     /// failure on it is unconditionally fatal.
-    std::string cacheListen { "127.0.0.1:6674" };
+    std::string nodeListen { "127.0.0.1:6674" };
 
     /// The shared `fastcached` this node reads through to, or empty for none.
     ///
@@ -332,8 +341,8 @@ struct NodeConfig
 
     /// Where this node answers its peers' Raft traffic.
     ///
-    /// A bare port binds the WILDCARD, like `--listen-scheduler` and unlike
-    /// `--listen-cache`: peers are on other machines by definition, so a loopback
+    /// A bare port binds the WILDCARD, like a scheduling node's `--listen-node`
+    /// and unlike a worker's: peers are on other machines by definition, so a loopback
     /// default would be one that silently cannot work.
     std::string raftListen;
 
@@ -485,14 +494,14 @@ struct NodeConfig
     /// So what is emitted follows whether they said it, not whether it differs.
     bool cacheMemoryExplicit { false };
 
-    /// Whether `--listen-cache` was typed rather than defaulted.
+    /// Whether `--listen-node` was typed rather than defaulted.
     ///
     /// **Provenance, not value**, like `cacheMemoryExplicit` above -- and here it
     /// decides whether the node STARTS at all. What the two answers are, and why they
-    /// differ, is on `cacheListen`; this is the bit that picks between them, and it
-    /// has to be a bit, because `--listen-cache=127.0.0.1:6674` is a promise whose
+    /// differ, is on `nodeListen`; this is the bit that picks between them, and it
+    /// has to be a bit, because `--listen-node=127.0.0.1:6674` is a promise whose
     /// value equals the default (#286).
-    bool cacheListenExplicit { false };
+    bool nodeListenExplicit { false };
 
     /// Whether the admin surface also serves the fleet dashboard.
     ///
@@ -576,7 +585,7 @@ struct NodeConfig
     /// It renders the RESOLVED configuration rather than the defaults, which is what
     /// makes it worth having: an operator building a firewall list needs the ports
     /// this invocation would bind, and a list showing `127.0.0.1` for a node started
-    /// with `--listen-cache 0.0.0.0:6674` would tell them a surface is loopback-only
+    /// with `--listen-node 0.0.0.0:6674` would tell them a surface is loopback-only
     /// when it is open to the network.
     bool printSurfaces { false };
 
@@ -605,7 +614,7 @@ struct NodeConfig
 /// **The cache arrives as what the tier BECAME, never as the flag that asked for
 /// one** -- the rule this function exists to hold, and the one it got wrong. The
 /// memory a node holds back from compiles is the memory its tier actually holds, and
-/// `cacheMemoryBytes` is only ever the request: `--listen-cache=` builds no tier at
+/// `cacheMemoryBytes` is only ever the request: `--listen-node=` builds no tier at
 /// all, `--cache-memory 0` builds no memory half, and a DEFAULT cache port already
 /// held by a `fastcached` on the same machine is a warning the node carries on past.
 /// None of the three is visible in the flag, so sizing from it reserved a quarter of
@@ -699,25 +708,50 @@ struct NodeConfig
 
 /// What a bare `--listen-raft` binds.
 ///
-/// The wildcard, like `--listen-scheduler` and unlike `--listen-cache`: peers are on
-/// other machines by definition, so a loopback default would be one that silently
-/// cannot work. Named because two places have to agree on it -- the policy row that
+/// The wildcard, like a scheduling node's `--listen-node` and unlike a worker's:
+/// peers are on other machines by definition, so a loopback default would be one that
+/// silently cannot work. Named because two places have to agree on it -- the policy row that
 /// refuses an unusable `--listen-raft` and the tier that binds it -- and a default
 /// they disagreed about is a row accepting what the tier then refuses.
 inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
 
-/// What a bare `--listen-scheduler` binds.
+/// What a bare `--listen-node` binds on a node that serves the scheduler verbs.
 ///
 /// The wildcard, for the reason `--listen-raft` takes one: a scheduler hands out other
 /// machines' work, so the callers are on other machines by definition.
-inline constexpr std::string_view SchedulerListenDefaultHost = "0.0.0.0";
+inline constexpr std::string_view SchedulingNodeListenDefaultHost = "0.0.0.0";
 
-/// What a bare `--listen-cache` binds.
+/// What a bare `--listen-node` binds on a node that does not.
 ///
 /// Loopback, the OPPOSITE of the two above and deliberately: this is the surface
 /// `fastcache-cc` on this machine talks to, and a node's private cache reachable from
 /// the network is a decision rather than something an operator gets by typing a port.
-inline constexpr std::string_view CacheListenDefaultHost = "127.0.0.1";
+inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
+
+/// Where a bare `--listen-node` binds under @p cfg.
+///
+/// **One surface, two defaults**, which is the shape #290 left behind. The cache verbs
+/// and the scheduler verbs are answered on one listener now, and they pulled its
+/// address in opposite directions while they had one each: a scheduler no peer can
+/// dial does nothing, and a cache every host can dial is this machine's whole build
+/// output served to strangers.
+///
+/// Making it follow `--serve-scheduler` keeps BOTH of the answers the two surfaces
+/// gave. A worker or a plain cache node binds loopback exactly as `--listen-cache`
+/// did; a scheduling node binds the wildcard exactly as `--listen-scheduler` did. What
+/// changes is only that a scheduling node's cache verbs are now closed by
+/// `CacheResponder`'s locality rule (#287) rather than additionally by the socket --
+/// and that node's scheduler port faced the network before the merge anyway.
+///
+/// A function rather than a constant because a surface row's `defaultHost` is one
+/// value and this depends on the configuration; the row delegates here rather than
+/// carrying a second copy of the rule.
+/// @param cfg What the operator asked for.
+/// @return The host a bare port falls back to.
+[[nodiscard]] inline std::string_view NodeListenDefaultHost(NodeConfig const& cfg) noexcept
+{
+    return cfg.serveScheduler ? SchedulingNodeListenDefaultHost : WorkerNodeListenDefaultHost;
+}
 
 /// What a bare `--admin-listen` binds.
 ///
@@ -771,7 +805,7 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// all, which is the whole of #235's second half: such a worker starts, logs a
 /// healthy line and refuses every dispatched compile, so the one line an operator
 /// reads has to say that the port is closed. A scheduler cannot reach that case --
-/// `--listen-scheduler` with no policy is refused at startup -- so it costs its line
+/// `--serve-scheduler` with no policy is refused at startup -- so it costs its line
 /// nothing.
 ///
 /// *What* it says depends on whether `--node-id` turned consensus on, because such a

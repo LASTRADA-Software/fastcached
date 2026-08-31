@@ -35,7 +35,11 @@ class NodeIoLoop;
 class SchedulerTier
 {
   public:
-    /// Build the tier and start serving it.
+    /// Build the tier.
+    ///
+    /// **Binds nothing since #290.** The scheduler verbs are answered on the node's
+    /// one `0xFC` listener, beside the cache's, so this is a component rather than a
+    /// surface; `StartNodeSurfaceOrExplain` opens that listener.
     ///
     /// Reads `--cluster-key-file` when one is named, because that key is what a
     /// lease grant is signed with. An unreadable one is fatal here rather than a
@@ -45,10 +49,9 @@ class SchedulerTier
     /// @param clock Time source for registry expiry and lease timeouts.
     /// @param wallClock Where a grant's absolute expiry comes from.
     /// @param metrics Where dispatch outcomes are counted.
-    /// @param logger Where to announce the bound address.
-    /// @return The running tier, or why it could not be served.
+    /// @param logger Where the tier reports what it is doing.
+    /// @return The tier, or why it could not be built.
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
-        NodeIoLoop& io,
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
@@ -109,10 +112,16 @@ class SchedulerTier
         _service.SetHistorySink(sink);
     }
 
-    /// The address the scheduler surface bound.
-    [[nodiscard]] std::string const& BoundEndpoint() const noexcept
+    /// What answers the scheduler verbs on this node's `0xFC` listener.
+    ///
+    /// Handed to `MergedResponder`, which routes each frame to the component owning
+    /// its verb family. It also owns the CREDENTIAL, so `AUTH` is routed here too --
+    /// the cache requires none, and a credential every local build can read is not a
+    /// credential (#290).
+    /// @return This tier's responder; outlives no longer than the tier.
+    [[nodiscard]] IFrameResponder& Responder() noexcept
     {
-        return _endpoint->BoundEndpoint();
+        return _responder;
     }
 
   private:
@@ -130,7 +139,6 @@ class SchedulerTier
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
     SchedulerResponder _responder;
-    std::unique_ptr<FrameEndpoint> _endpoint;
 };
 
 } // namespace FastCache::Node

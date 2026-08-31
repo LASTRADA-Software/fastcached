@@ -134,7 +134,7 @@ struct Command
 ///
 /// Localhost, so `fastcache-cc` works with no configuration at all: whichever of
 /// `fastcached` or `fastcache-compile-node` a developer runs answers here, and the
-/// node's `--listen-cache` defaults to this same address for exactly that reason.
+/// node's `--listen-node` defaults to this same address for exactly that reason.
 ///
 /// Defaulting to a *remote* address would be indefensible — every translation unit
 /// on a machine with nothing listening would pay a connect timeout, in silence. A

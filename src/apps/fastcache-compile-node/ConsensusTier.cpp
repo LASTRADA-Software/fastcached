@@ -243,7 +243,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // cannot, and the answer for a `NodeConfig` no argv produced (#168).
     // Through the surface's row, so the wildcard a bare port takes here is the same
     // value `--print-surfaces` prints and the same one the startup grammar judged.
-    // The asymmetry with `--listen-cache`'s loopback is the rule -- peers are on
+    // The asymmetry with a worker's `--listen-node` loopback is the rule -- peers are on
     // other machines by definition -- and it is a column rather than a constant each
     // opener reaches for.
     auto const resolved = SoleEndpointOf(NodeSurface::Raft, cfg);
@@ -796,18 +796,17 @@ void ConsensusTier::Republish()
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
-    NodeConfig const& cfg, std::unique_ptr<SchedulerTier> const& schedulerTier, NodeMembership& membership, ILogger& logger)
+    NodeConfig const& cfg,
+    std::unique_ptr<SchedulerTier> const& schedulerTier,
+    std::string_view schedulerBound,
+    NodeMembership& membership,
+    ILogger& logger)
 {
     // No cluster configured, which is the common deployment: one machine, leading
     // itself. Requiring an operator to configure a one-member cluster to get that
     // would be ceremony for the ordinary case.
     if (cfg.nodeId.empty())
         return std::unique_ptr<ConsensusTier> {};
-
-    // What the surface BOUND rather than what was asked for, because `--listen-
-    // scheduler=0` means "pick a port" and an endpoint echoing `:0` back names
-    // nothing a client could dial.
-    auto const schedulerBound = schedulerTier != nullptr ? schedulerTier->BoundEndpoint() : std::string {};
 
     auto tier = ConsensusTier::Start(
         cfg,

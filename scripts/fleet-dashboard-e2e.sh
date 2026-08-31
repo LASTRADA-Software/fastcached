@@ -241,13 +241,14 @@ tls_args=()
     --toolchain "$toolchain" \
     --port "$worker_port" \
     --advertise "127.0.0.1:${worker_port}" \
-    --listen-scheduler "$sched_port" \
+    --serve-scheduler \
+    --listen-node "$sched_port" \
     --fleet-open \
     --cluster-key-file "$cluster_key" \
     --admin-listen "$admin_port" \
     --dashboard \
     --dashboard-token-file "${workdir}/token" \
-    --listen-cache "" \
+    --cache-memory 0 \
     ${tls_args[@]+"${tls_args[@]}"} \
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!

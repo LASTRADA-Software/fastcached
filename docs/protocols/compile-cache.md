@@ -140,7 +140,8 @@ arity does not depend on which credential style a client uses.
 
 Five more verbs turn the same wire into a scheduler and a worker protocol. None
 of them is served by `fastcached`: the scheduler is `fastcache-compile-node
---listen-scheduler` and the worker is the same binary's own port.
+--serve-scheduler` (answered on its `--listen-node`) and the worker is the same
+binary's own compile port.
 
 A scheduling verb arriving at a cache listener is answered `dispatch-not-permitted`
 with a message naming where the scheduler went. It is a **reply**, not a dropped

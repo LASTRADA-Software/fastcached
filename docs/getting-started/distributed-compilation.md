@@ -35,7 +35,7 @@ different program.
 | Role | Program | What it does |
 |------|---------|--------------|
 | **Client** | `fastcache-cc` | Fronts each compile. Checks the cache, and on a miss asks for a worker. |
-| **Scheduler** | `fastcache-compile-node --listen-scheduler` | Tracks the fleet's workers and hands one out. Exactly one node at a time. |
+| **Scheduler** | `fastcache-compile-node --serve-scheduler` | Tracks the fleet's workers and hands one out. Exactly one node at a time. |
 | **Worker** | `fastcache-compile-node` | Compiles what it is sent. Also holds a cache tier of its own, unless you turn it off. |
 | **Shared cache** | `fastcached` | Optional, and *not* the scheduler. Where objects end up so other machines get them. |
 
@@ -195,11 +195,11 @@ digest as well.
 ### The scheduler
 
 The scheduler is a **compile node**, not the cache. Pick one machine and give it
-`--listen-scheduler`:
+`--serve-scheduler`:
 
 ```sh
 fastcache-compile-node \
-    --listen-scheduler=0.0.0.0:6675 \
+    --serve-scheduler --listen-node=0.0.0.0:6675 \
     --fleet-member=worker-01.internal \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
@@ -327,7 +327,7 @@ a curated toolchain — or `--no-toolchain-discovery` to stop the survey entirel
 Naming any `--toolchain` pins the worker to exactly those.
 
 A node started this way is **also a cache**, which is the part that surprises
-people: `--listen-cache` defaults to `127.0.0.1:6674` and `--cache-memory` to a
+people: `--listen-node` defaults to `127.0.0.1:6674` and `--cache-memory` to a
 quarter of host RAM within `[512m, 8g]`, so the machine gets a local tier without
 asking for one. Point it at the shared cache with `--upstream` and a local rebuild
 stops reaching the wire at all. `--cache-memory=0` with no `--cache-dir` turns the
@@ -359,7 +359,7 @@ cmake -DCMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc ...
 ```
 
 `FASTCACHE_ADDR` is the **cache** — a `fastcached`, or the local node's own
-`--listen-cache`. It defaults to `127.0.0.1:6674` when unset, which is where a
+`--listen-node`. It defaults to `127.0.0.1:6674` when unset, which is where a
 node on this machine already answers, so a developer running a node needs only
 the scheduler line. `FASTCACHE_ADDR=` (set but empty) is the opt-out -- on a POSIX shell. PowerShell cannot
 express a set-but-empty variable: `$env:FASTCACHE_ADDR = ""` looks set from inside
@@ -373,8 +373,8 @@ counted under `unavailable` by `--show-stats`) and the translation unit is
 dispatched anyway. The `FASTCACHE_ADDR=` opt-out above is different, and turns
 both off — it is how a build says it wants no launcher at all.
 
-`FASTCACHE_SCHEDULER` is the **scheduler**, which is some node's
-`--listen-scheduler`, never the cache port. Unset it and every miss compiles
+`FASTCACHE_SCHEDULER` is the **scheduler**, which is the `--listen-node` port of
+some node running `--serve-scheduler`. Unset it and every miss compiles
 locally again — the behaviour without this feature, and the way to turn it off
 for one build.
 
@@ -550,13 +550,13 @@ counts that cache twice.
 ### The whole fleet on one page
 
 `--dashboard`, on a leader that already has `--admin-listen` and
-`--listen-scheduler`, serves `/fleet` and `/fleet.json` — every member's
+`--serve-scheduler`, serves `/fleet` and `/fleet.json` — every member's
 hostname, endpoint, software version, capacity and cache, plus charts of the last
 24 hours or 7 days:
 
 ```sh
 fastcache-compile-node ... \
-    --listen-scheduler=6675 --fleet-member=10.0.0.2 \
+    --serve-scheduler --listen-node=6675 --fleet-member=10.0.0.2 \
     --admin-listen=6677 \
     --dashboard --dashboard-token-file=/etc/fastcached/dashboard.token
 ```
@@ -730,7 +730,7 @@ against the rest of the fleet.
 Beyond the lease, the fleet's own traffic is unauthenticated, so treat its boundary
 as **network reachability plus membership** and size the network accordingly.
 
-So: keep `--listen-scheduler` off any network you would not run a compiler for,
+So: keep `--serve-scheduler` off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
 The two remaining credentials in this system are real and unaffected —
 `--dashboard-token-file` guards the fleet page, and `fastcached`'s own

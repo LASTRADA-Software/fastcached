@@ -53,7 +53,7 @@ namespace
     /// the two would come to disagree.
     ///
     /// NOT foldable into `ParseEndpoint`, which supplies a default host and therefore
-    /// accepts an empty one -- and `--listen-cache=:6674` binding every interface is
+    /// accepts an empty one -- and `--listen-node=:6674` binding every interface is
     /// exactly what this refuses.
     /// @param text What the operator typed.
     /// @return True when it is `[<address>:]<port>`.
@@ -74,9 +74,10 @@ namespace
 
     /// Resolve a row's own `spec` against its own `defaultHost`.
     ///
-    /// The whole of what cache, scheduler and admin do, so they share it rather than
-    /// each carrying a lambda naming the member pointer and constant their row
-    /// already holds. Raft delegates here too, after its `--node-id` gate.
+    /// The whole of what admin does, so it is written once here rather than as a
+    /// lambda naming the member pointer and constant the row already holds. Raft
+    /// delegates here too, after its `--node-id` gate, and so does the node's own 0xFC
+    /// row once it has picked which default host applies.
     ///
     /// Through `ParseEndpoint` rather than `SplitHostPort`, and the difference is the
     /// default host -- right for a BIND address an operator typed, wrong for text
@@ -124,40 +125,48 @@ namespace
                     "where clients actually go",
         },
         SurfaceRow {
-            .surface = NodeSurface::Cache,
-            .name = "cache",
-            .flags = { "--listen-cache", {} },
+            .surface = NodeSurface::Node,
+            .name = "node",
+            .flags = { "--listen-node", {} },
             .protocol = SurfaceProtocol::Tcp,
-            .defaultHost = CacheListenDefaultHost,
-            .spec = &NodeConfig::cacheListen,
+            // Empty, and the one row where that is not "this surface has no default".
+            // Its default host depends on the CONFIGURATION -- loopback on a worker,
+            // the wildcard on a node that schedules -- so it cannot be one constant,
+            // and `NodeListenDefaultHost` is where it is decided. A value here would be
+            // a second author of the rule, which is exactly what this table exists to
+            // prevent (#290).
+            .defaultHost = {},
+            .spec = &NodeConfig::nodeListen,
             .grammar = ListenEndpointGrammar,
             .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
-                // A port with nothing behind it is not a served surface. `--cache-memory 0`
-                // with no `--cache-dir` leaves the tier nothing to keep objects in, so
-                // `StartCacheTierOrExplain` returns before binding -- and a worksheet that
-                // listed the port anyway would have an operator open their build output to
-                // the network for a socket that is never created. The same shape as raft's
-                // `--node-id` gate: a surface can be configured and still not served.
-                if (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty())
+                // A port with nothing behind it is not a served surface -- but "nothing
+                // behind it" now has two halves, because two components answer here.
+                // A node with no cache tier still serves the scheduler, and one that
+                // neither caches nor schedules binds nothing at all. The same shape as
+                // raft's `--node-id` gate: a surface can be configured and still not
+                // served.
+                //
+                // `--cache-memory 0` with no `--cache-dir` leaves the tier nothing to
+                // keep objects in, so `StartCacheTierOrExplain` returns without one --
+                // and a worksheet that listed the port anyway would have an operator
+                // open a port for a socket that is never created.
+                auto const holdsCache = cfg.cacheMemoryBytes != 0 || !cfg.cacheDir.empty();
+                if (!holdsCache && !cfg.serveScheduler)
                     return {};
-                return ResolveFromSpec(row, cfg);
+
+                // Its own `defaultHost` is empty by design, so the row is resolved
+                // against the one this configuration picks.
+                auto resolved = row;
+                resolved.defaultHost = NodeListenDefaultHost(cfg);
+                return ResolveFromSpec(resolved, cfg);
             },
-            .note = "loopback for a bare port, the opposite of the scheduler and raft: this machine's whole "
-                    "build output is served here, so widening it is a decision rather than a typo. Not served "
-                    "at all without somewhere to keep objects -- --cache-memory 0 and no --cache-dir is a node "
-                    "that compiles for others and caches nothing",
-        },
-        SurfaceRow {
-            .surface = NodeSurface::Scheduler,
-            .name = "scheduler",
-            .flags = { "--listen-scheduler", {} },
-            .protocol = SurfaceProtocol::Tcp,
-            .defaultHost = SchedulerListenDefaultHost,
-            .spec = &NodeConfig::schedulerListen,
-            .grammar = ListenEndpointGrammar,
-            .resolve = ResolveFromSpec,
-            .note = "answered only while this node LEADS; a follower redirects and an election in progress "
-                    "refuses, so the port is open on every member whether or not it is answering today",
+            .note = "one 0xFC port for the cache verbs and, with --serve-scheduler, the scheduler verbs. A bare "
+                    "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
+                    "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "
+                    "so widening it admits nobody new to them. Not bound at all by a node that neither holds a "
+                    "cache tier nor schedules. Scheduling is answered only while this node LEADS; a follower "
+                    "redirects and an election in progress refuses, so the port is open on every member whether "
+                    "or not it is answering today",
         },
         SurfaceRow {
             .surface = NodeSurface::Admin,
@@ -272,7 +281,7 @@ namespace
     /// switches consensus on -- to set the flag they had just set. The same line met
     /// somebody whose address was malformed, which is a state `--print-surfaces` is
     /// deliberately reachable in: it runs BEFORE `StartupPolicyRejection`, precisely
-    /// so the map is available while a port is still wrong, and "set --listen-cache"
+    /// so the map is available while a port is still wrong, and "set --listen-node"
     /// then describes the wrong problem in the one situation the flag exists for.
     ///
     /// Only the PRIMARY flag is named for a surface that is off, never every flag the
@@ -338,7 +347,7 @@ std::expected<SurfaceEndpoint, std::string> SoleEndpointOf(NodeSurface surface, 
 std::string RenderSurfaces(NodeConfig const& cfg)
 {
     // Resolved ONCE per row and kept, rather than resolved again to print. Not for the
-    // six allocations -- this prints and exits -- but because a resolver reached twice
+    // five allocations -- this prints and exits -- but because a resolver reached twice
     // could answer differently between the measuring pass and the printing pass, and
     // would then rag the very columns the first pass exists to align.
     struct Line
@@ -367,7 +376,7 @@ std::string RenderSurfaces(NodeConfig const& cfg)
             lines.push_back(Line { .label = endpoint.role.empty() ? std::string { row.name }
                                                                   : std::format("{} {}", row.name, endpoint.role),
                                    // `FormatHostPort`, not a hand-rolled join: it brackets a v6
-                                   // host, so `--listen-cache [2001:db8::1]:6674` comes back as an
+                                   // host, so `--listen-node [2001:db8::1]:6674` comes back as an
                                    // address that reads back rather than as `2001:db8::1:6674`.
                                    // This is the surface whose whole purpose is being transcribed.
                                    .address = FormatHostPort(endpoint.host, endpoint.port),
