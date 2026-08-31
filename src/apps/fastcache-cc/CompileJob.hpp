@@ -49,6 +49,15 @@ enum class JobRefusal : std::uint8_t
     /// The compiler could not be spawned at all. Distinct from a compiler that ran
     /// and rejected the code: only the latter is the client's answer.
     SpawnFailed,
+    /// This worker has not finished identifying its toolchains, so it has no map to
+    /// look the fingerprint up in yet.
+    ///
+    /// Reached only before the first survey completes. Kept apart from
+    /// `UnknownFingerprint` because the two are the same sentence to a client and
+    /// opposite instructions to an operator: one says the fleet is matching the
+    /// wrong machines, the other says this machine is still coming up and will serve
+    /// the identical request shortly (#365).
+    ToolchainSurveyInFlight,
     Last, ///< Not a refusal, and has no row: `RefusalTable`'s length.
 };
 
@@ -179,6 +188,57 @@ class ICompileJobRunner
 ///
 /// The source *name* is used for exactly one thing: its extension, so the compiler
 /// picks the right language. Even that is sanitized rather than trusted.
+/// Whether a runner's toolchain map is an ANSWER or an absence.
+///
+/// An empty map means two opposite things and a `std::map` cannot tell them apart:
+/// this machine was surveyed and serves nothing, or it has not been surveyed yet. A
+/// node now comes up and serves its cache tier while it walks its include trees --
+/// over 300 s on a cold Windows runner
+/// ([#354](https://github.com/LASTRADA-Software/fastcached/issues/354)) -- so the
+/// second state is one a running worker is genuinely in, and a client that reaches
+/// the compile port during it must be told "not yet" rather than "wrong toolchain".
+/// Those send an operator to opposite conclusions
+/// ([#365](https://github.com/LASTRADA-Software/fastcached/issues/365)).
+///
+/// **No default constructor**, for the reason `PreAuth` and `PayloadCap` have none:
+/// a defaulted value would answer the question by omission, and the answer it would
+/// give -- "surveyed" -- is exactly the conflation this exists to end. The compiler
+/// asks; there is nothing to forget.
+class ToolchainSurvey
+{
+  public:
+    ToolchainSurvey() = delete;
+
+    /// The map is not an answer yet. Every job is refused
+    /// `JobRefusal::ToolchainSurveyInFlight` until `ReplaceToolchains` supplies one.
+    /// @return The pre-survey state.
+    [[nodiscard]] static ToolchainSurvey InFlight() noexcept
+    {
+        return ToolchainSurvey { false };
+    }
+
+    /// The map is what this machine serves, empty or not.
+    /// @return The surveyed state.
+    [[nodiscard]] static ToolchainSurvey Completed() noexcept
+    {
+        return ToolchainSurvey { true };
+    }
+
+    /// @return True once a survey has answered.
+    [[nodiscard]] bool HasCompleted() const noexcept
+    {
+        return _completed;
+    }
+
+  private:
+    explicit ToolchainSurvey(bool completed) noexcept:
+        _completed { completed }
+    {
+    }
+
+    bool _completed;
+};
+
 class CompileJobRunner final: public ICompileJobRunner
 {
   public:
@@ -186,9 +246,12 @@ class CompileJobRunner final: public ICompileJobRunner
     /// @param scratchRoot Directory to create per-job scratch directories under.
     /// @param toolchains Fingerprint → compiler path. A job whose fingerprint is not
     ///        a key here is refused; there is deliberately no default entry.
+    /// @param survey Whether @p toolchains is an answer or an absence. Undefaulted
+    ///        on purpose; see `ToolchainSurvey`.
     CompileJobRunner(IProcessRunner& runner,
                      std::filesystem::path scratchRoot,
-                     std::map<std::string, std::string> toolchains);
+                     std::map<std::string, std::string> toolchains,
+                     ToolchainSurvey survey);
 
     /// Run one job to completion.
     ///
@@ -231,6 +294,13 @@ class CompileJobRunner final: public ICompileJobRunner
     /// **Safe against concurrent `Run` and `Fingerprints`.** Jobs already admitted
     /// keep the compiler they looked up; only the next lookup sees the new map.
     /// @param toolchains Fingerprint to compiler path, as the constructor takes it.
+    /// A survey has answered; serve this set from now on.
+    ///
+    /// Completes the survey as well as replacing the map, because the answer
+    /// ARRIVING is what completes it -- the first call is the node's initial survey
+    /// and every later one is a re-survey (#238), and neither can leave the runner
+    /// claiming it has not been asked.
+    /// @param toolchains Fingerprint → compiler path.
     void ReplaceToolchains(std::map<std::string, std::string> toolchains);
 
     /// Where scratch files are written.
@@ -254,6 +324,12 @@ class CompileJobRunner final: public ICompileJobRunner
     /// thread is replacing.
     mutable std::shared_mutex _toolchainsMutex;
     std::map<std::string, std::string> _toolchains;
+
+    /// Whether `_toolchains` has been answered for. Under `_toolchainsMutex` with
+    /// the map it qualifies, because the two are one fact and a reader that saw a
+    /// stale survey beside a fresh map would refuse a job this worker can do.
+    ToolchainSurvey _survey;
+
     /// Atomic because a worker runs `slots` compiles at once, on `slots` threads,
     /// through ONE of these.
     ///

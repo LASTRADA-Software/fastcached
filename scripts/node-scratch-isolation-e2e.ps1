@@ -295,7 +295,7 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     #    false in the failing case is not evidence.
     #
     # The process TREE is not a refinement of this, it is required for correctness:
-    # between the fingerprint line and "compile node ready" the node spawns `cl` two
+    # between the fingerprint line and the first registration the node spawns `cl` two
     # or three times and then sits in a kernel wait at zero own-CPU while the child
     # works. Recent-window own-CPU alone would call that BLOCKED, which is error 2
     # again from the other end. The earlier version documented this limitation in
@@ -856,7 +856,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             "--port=$workerA", "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 300 "worker A to compute its toolchain fingerprint and bind" $workerAProc)) {
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 120 "worker A to bind its compile port" $workerAProc)) {
             throw "worker A did not start"
         }
 
@@ -866,7 +866,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             "--port=$workerB", "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 300 "worker B to compute its toolchain fingerprint and bind" $workerBProc)) {
+        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 120 "worker B to bind its compile port" $workerBProc)) {
             throw "worker B did not start"
         }
 
@@ -874,7 +874,16 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # logging "compile node ready" says its own port is bound, not that the
         # scheduler has heard from it -- dispatching on that races the first
         # heartbeat and is refused NoWorker.
-        $deadline = (Get-Date).AddSeconds(120); $regs = 0
+        #
+        # This wait is where the toolchain walk now lives, and the budget moved here
+        # with it (#365). A node used to fingerprint before binding, so "compile node
+        # ready" meant "surveyed", and the 300 s belonged on the wait above -- which
+        # is where #354 was measured blowing through it. Since #365 the node binds and
+        # serves first and registers only once the walk yields a REAL fingerprint, so
+        # the bind is prompt and the wait for registration is the one that can take
+        # minutes on a cold machine. Leaving 120 s here would simply move the same
+        # timeout to a new line and make it look like a different bug.
+        $deadline = (Get-Date).AddSeconds(600); $regs = 0
         while ((Get-Date) -lt $deadline -and $regs -lt 3) {
             Start-Sleep -Milliseconds 700
             try {
@@ -885,7 +894,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             } catch { }
         }
         if ($regs -lt 3) {
-            Write-Host "waited 120s for three worker registrations at the scheduler; saw $regs (all three nodes were already up, so this is heartbeats, not startup)"
+            Write-Host "waited 600s for three worker registrations at the scheduler; saw $regs (all three nodes had bound their ports, so this covers the toolchain walk and the first heartbeat)"
             foreach ($n in @("sched", "workerA", "workerB")) {
                 Write-Host "--- $n"; Get-Content (Join-Path $phaseDir "$n.err.log") -Tail 20 -ErrorAction SilentlyContinue
             }

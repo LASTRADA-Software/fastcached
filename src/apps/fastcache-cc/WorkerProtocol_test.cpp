@@ -93,7 +93,7 @@ struct Fixture
     ///        cases that ARE about the lease pass `SignedLeaseValidator`, which is
     ///        the other production shape.
     explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeaseValidator validator = UncheckedLeaseValidator()):
-        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } },
+        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
         worker { jobs, std::move(validator), std::move(codecs), metrics }
     {
     }
@@ -542,7 +542,7 @@ TEST_CASE("The envelope ceiling is the surface's own, not a figure this class as
     // two disagree about how much memory one request may cost.
     StubRunner runner;
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
     constexpr std::size_t TinyCap = 8;
     WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics, TinyCap };
@@ -1372,7 +1372,7 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     // will -- from what it asked for, against what came back.
     StubRunner runner;
     FastCache::Testing::ScratchDirectory const scratch { "fc-wp-corr" };
-    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } } };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
     AtomicMetricsSink metrics;
     WorkerProtocol worker { jobs, UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
 

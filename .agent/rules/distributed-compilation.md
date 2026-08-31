@@ -1741,6 +1741,58 @@ be a poor place to do it. The pool is joined **explicitly** before the return: l
 are destroyed after the return value is constructed, so leaving it to scope exit
 copies the results while the workers are still writing into them.
 
+**A node SERVES while it identifies its toolchains, and registers only once it
+knows what it is.** The survey has two halves that cost three orders of magnitude
+apart: deciding WHICH compilers to serve is a spawn per candidate, while IDENTIFYING
+them walks every byte under every include root — 5136 files and over 300 s on a cold
+Windows CI runner, measured at 2.7% CPU duty, which is a filesystem wall and not
+something more threads reach past (#354). Run before the bind, that walk was time
+during which the node served *nothing*: not its cache tier, not `/healthz`, not
+`/metrics`. So `DiscoverToolchainEntries` stays on the startup path and
+`FingerprintToolchains` moves to the heartbeat thread's first round (#365).
+
+- **Registration is not moved with it, and cannot be.** A `ServedToolchain` cannot
+  exist without a real fingerprint, so `toolchains` is simply empty until the walk
+  answers and `registrarsFor` builds nothing from it. That is the acceptance
+  criterion rather than a happy accident: a node registering a provisional identity
+  advertises a value **no other machine will ever compute**, and both directions of
+  that are silent from both ends (#225).
+- **The survey runs on the heartbeat thread, not a new one.** That thread already
+  owns `toolchains`, already calls `ReplaceToolchains` then `registrarsFor` in that
+  order on every re-survey (#238), and already runs before the first announcement.
+  A dedicated thread would be a second writer to all three and would need a lock the
+  re-survey path has never needed.
+- **An empty map is two opposite answers, so the state travels beside it.**
+  Surveyed-and-serving-nothing and not-yet-asked are the same `std::map`, and
+  reporting `UnknownFingerprint` for the second tells an operator the fleet is
+  matching the wrong machines when this one is merely starting. `ToolchainSurvey` has
+  a **deleted default constructor** for the reason `PreAuth` and `PayloadCap` do: a
+  defaulted value answers by omission, and the answer it would give is the conflation
+  being fixed. `ReplaceToolchains` completes it, because the answer ARRIVING is what
+  completes it.
+- **"Nothing to serve" stays fatal, and only its timing changes.** Left running, a
+  worker with nothing to serve is the worst shape this system has — it registers
+  nothing, the heartbeat calls "0 of 0 toolchain(s)" a success, and the ready line
+  says the node is up. Splitting discovery out is what keeps the *common*
+  misconfiguration (no compiler, a malformed `--toolchain`) a prompt refusal; what
+  arrives late is only the case where compilers were found, spawned, and every one
+  failed to yield a usable identity.
+- **`/healthz` stays green during the survey**, deliberately. The node is serving its
+  cache tier, which is the whole point; a readiness probe that went red for minutes on
+  every restart would read as an outage to a supervisor and could produce a restart
+  loop that never lets the walk finish. The state is visible as
+  `fastcache_worker_jobs_refused_survey_in_flight_total`, as the named wire refusal,
+  and in the ready line — which says *identifying* N toolchain(s), because printing
+  the served count there would tell an operator "0 toolchain(s)" about a node that is
+  starting normally.
+- **A wait's budget belongs where the work is.** `node-scratch-isolation-e2e` had
+  300 s on "compile node ready" because a node used to fingerprint before binding.
+  After this change the bind is prompt and the walk happens before REGISTRATION, so
+  leaving the budget behind would have moved the same timeout to a new line and made
+  it look like a different bug. The number followed the work; so did the sentences
+  describing it, one of which ("all three nodes were already up, so this is
+  heartbeats, not startup") was true before and false after.
+
 **The workers share the ONE injected runner, and `IProcessRunner` requires that.**
 Making a runner per thread reads like a courtesy to the seam and is the opposite of
 one: a function whose caller passed an `IProcessRunner&` and that calls

@@ -184,6 +184,12 @@ class IMetricsSink
         /// Distinct from a compiler that ran and failed: this one says the
         /// toolchain this worker advertises is not actually usable here.
         WorkerJobsRefusedSpawnFailed,
+        /// Jobs refused because this worker had not finished surveying its
+        /// toolchains. Its own counter rather than folded into
+        /// `WorkerJobsRefusedUnknownFingerprint`, because the two send an operator
+        /// to opposite conclusions: one says the fleet is matching wrongly, the
+        /// other says a node is still starting.
+        WorkerJobsRefusedSurveyInFlight,
         /// Jobs refused because every slot was busy.
         ///
         /// Not a fault and deliberately its own counter: it is the worker's half

@@ -278,6 +278,89 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     CHECK(Unwrap(resolved).begin()->first != "/opt/gcc");
 }
 
+TEST_CASE("NodeToolchains: the two halves compose into what the whole survey answers", "[node][toolchains]")
+{
+    // The split is by COST, not by policy (#365): node startup runs the cheap half
+    // and defers the expensive one, so the two paths must land on the same answer or
+    // a node serves something different from what `--print-toolchain-fingerprint`
+    // reports about the same machine.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/opt/real/g++") } };
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+    CapturingLogger logger;
+
+    auto const whole = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
+    REQUIRE(whole.has_value());
+
+    FixedDiscovery again { { Candidate("/opt/real/g++") } };
+    SpawnScript runnerAgain;
+    ScriptedToolchainHost hostAgain;
+    CapturingLogger loggerAgain;
+
+    auto const discovered = DiscoverToolchainEntries(cfg, &again, runnerAgain, loggerAgain);
+    REQUIRE(discovered.has_value());
+    CHECK(Unwrap(discovered).source == ToolchainSource::MachineSearched);
+    auto const halves = FingerprintToolchains(Unwrap(discovered), runnerAgain, hostAgain, TestClock(), loggerAgain);
+    REQUIRE(halves.has_value());
+
+    REQUIRE(Unwrap(halves).size() == Unwrap(whole).size());
+    CHECK(Unwrap(halves).begin()->first == Unwrap(whole).begin()->first);
+    CHECK(Unwrap(halves).begin()->second.compiler == Unwrap(whole).begin()->second.compiler);
+}
+
+TEST_CASE("NodeToolchains: a malformed --toolchain is refused by the CHEAP half", "[node][toolchains]")
+{
+    // Which half refuses is the whole point of the split, not an implementation
+    // detail: this one stays on the startup path, so a typo'd flag is still refused
+    // in milliseconds rather than after a multi-minute walk of somebody else's
+    // include trees (#354).
+    NodeConfig cfg = Startable();
+    cfg.toolchains = { "=" };
+    SpawnScript runner;
+    CapturingLogger logger;
+
+    CHECK_FALSE(DiscoverToolchainEntries(cfg, nullptr, runner, logger).has_value());
+    CHECK(Logged(logger, "malformed"));
+}
+
+TEST_CASE("NodeToolchains: nothing to serve is refused by the EXPENSIVE half", "[node][toolchains]")
+{
+    // And this one cannot move, which is why the node still exits when it fires.
+    // Discovery finding compilers does not mean any will be served: a fingerprint
+    // that does not identify its toolchain is dropped, so "nothing to serve" is only
+    // decidable once the walk has run.
+    NodeConfig const cfg = Startable();
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    DiscoveredToolchains const nothing { .entries = {}, .source = ToolchainSource::NothingToSearch };
+    CHECK_FALSE(FingerprintToolchains(nothing, runner, host, TestClock(), logger).has_value());
+    CHECK(Logged(logger, "--no-toolchain-discovery"));
+}
+
+TEST_CASE("NodeToolchains: the source decides which refusal an operator is given", "[node][toolchains]")
+{
+    // Three states, not a bool: the three sentences send an operator to three
+    // different places, and the worst of them recites a list of directories nobody
+    // looked in to somebody whose named compiler was refused a line above.
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+
+    CapturingLogger searched;
+    DiscoveredToolchains const machine { .entries = {}, .source = ToolchainSource::MachineSearched };
+    CHECK_FALSE(FingerprintToolchains(machine, runner, host, TestClock(), searched).has_value());
+    CHECK(Logged(searched, "Searched:"));
+
+    CapturingLogger named;
+    DiscoveredToolchains const operatorNamed { .entries = {}, .source = ToolchainSource::OperatorNamed };
+    CHECK_FALSE(FingerprintToolchains(operatorNamed, runner, host, TestClock(), named).has_value());
+    CHECK(Logged(named, "every compiler named with --toolchain was refused"));
+    CHECK_FALSE(Logged(named, "Searched:"));
+}
+
 TEST_CASE("NodeToolchains: a discovered path that would abort the operator parser is served", "[node][toolchains]")
 {
     // A leading or trailing `=` is a malformed *flag value* and a perfectly ordinary

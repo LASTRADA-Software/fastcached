@@ -325,20 +325,25 @@ std::string SearchedLayouts()
     return names;
 }
 
-std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
-                                                                        Cc::IToolchainDiscovery* discovery,
-                                                                        Cc::IProcessRunner& runner,
-                                                                        Cc::IToolchainHost& host,
-                                                                        IClock const& clock,
-                                                                        ILogger& logger)
+std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& cfg,
+                                                             Cc::IToolchainDiscovery* discovery,
+                                                             Cc::IProcessRunner& runner,
+                                                             ILogger& logger)
 {
     // One fact, stated once. The set is the machine's when the operator named none
     // and there is something to ask -- which is also what decides whether the count
-    // at the end is worth saying out loud.
-    bool const discovered = cfg.toolchains.empty() && discovery != nullptr;
+    // at the end is worth saying out loud, and which of three refusals is honest
+    // when nothing survives the fingerprinting.
+    auto const source = [&] {
+        if (!cfg.toolchains.empty())
+            return ToolchainSource::OperatorNamed;
+        if (discovery != nullptr)
+            return ToolchainSource::MachineSearched;
+        return ToolchainSource::NothingToSearch;
+    }();
 
     std::vector<ToolchainEntry> entries;
-    if (discovered)
+    if (source == ToolchainSource::MachineSearched)
     {
         for (auto const& candidate: discovery->Discover())
         {
@@ -381,6 +386,17 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
             // no scheduler will accept: this function is not reached on that path.
             entries.push_back(*std::move(split));
         }
+
+    return DiscoveredToolchains { .entries = std::move(entries), .source = source };
+}
+
+std::optional<std::map<std::string, ServedToolchain>> FingerprintToolchains(DiscoveredToolchains const& discovered,
+                                                                            Cc::IProcessRunner& runner,
+                                                                            Cc::IToolchainHost& host,
+                                                                            IClock const& clock,
+                                                                            ILogger& logger)
+{
+    auto const& entries = discovered.entries;
 
     // Computed CONCURRENTLY, and the cost is why. A cold fingerprint is a full walk
     // of the include tree -- about two seconds over 288 MB on an ordinary Xcode
@@ -464,31 +480,54 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
     // out, so a layout added to the table necessarily appears in it.
     if (toolchains.empty())
     {
-        if (discovered)
-            logger.Logf(LogLevel::Error,
-                        "no toolchain to serve: found no compiler on this machine. Searched: {}. Name one with "
-                        "--toolchain, or install a compiler where this worker can find it",
-                        SearchedLayouts());
-        else if (!cfg.toolchains.empty())
-            logger.Logf(LogLevel::Error,
-                        "no toolchain to serve: every compiler named with --toolchain was refused, for the reason "
-                        "given above each");
-        else
-            logger.Logf(LogLevel::Error,
-                        "no toolchain to serve: --no-toolchain-discovery was given and no --toolchain, so this "
-                        "worker was told to serve nothing");
+        switch (discovered.source)
+        {
+            case ToolchainSource::MachineSearched:
+                logger.Logf(LogLevel::Error,
+                            "no toolchain to serve: found no compiler on this machine. Searched: {}. Name one with "
+                            "--toolchain, or install a compiler where this worker can find it",
+                            SearchedLayouts());
+                break;
+            case ToolchainSource::OperatorNamed:
+                logger.Logf(LogLevel::Error,
+                            "no toolchain to serve: every compiler named with --toolchain was refused, for the reason "
+                            "given above each");
+                break;
+            case ToolchainSource::NothingToSearch:
+                logger.Logf(LogLevel::Error,
+                            "no toolchain to serve: --no-toolchain-discovery was given and no --toolchain, so this "
+                            "worker was told to serve nothing");
+                break;
+        }
         return std::nullopt;
     }
 
     // Said out loud when the machine answered, because the set is then something
     // nobody typed: an operator reading this log has to be able to tell "the fleet
     // decided" from "I configured that".
-    if (discovered)
+    if (discovered.source == ToolchainSource::MachineSearched)
         logger.Logf(LogLevel::Info,
                     "discovered {} toolchain(s) on this machine; pass --toolchain to serve a narrower set",
                     toolchains.size());
 
     return toolchains;
+}
+
+std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
+                                                                        Cc::IToolchainDiscovery* discovery,
+                                                                        Cc::IProcessRunner& runner,
+                                                                        Cc::IToolchainHost& host,
+                                                                        IClock const& clock,
+                                                                        ILogger& logger)
+{
+    // The whole survey, for every caller that can afford to wait for it: the
+    // re-survey on the heartbeat thread, `--print-toolchain-fingerprint`, and every
+    // test that wants one answer. Node startup is the one caller that cannot, and it
+    // is the reason the two halves are separable at all (#365).
+    auto discovered = DiscoverToolchainEntries(cfg, discovery, runner, logger);
+    if (!discovered.has_value())
+        return std::nullopt;
+    return FingerprintToolchains(*discovered, runner, host, clock, logger);
 }
 
 std::vector<std::string> StaleToolchains(std::map<std::string, ServedToolchain> const& served)
