@@ -315,6 +315,50 @@ problems, which is why it survived being seen repeatedly.
   `::warning::` when it fires, because a silent repair would leave nobody knowing
   how often the race occurs — which is exactly how the original survived.
 
+## A `cmake -P` check cannot fail its own test
+
+`message(FATAL_ERROR)` in script mode prints `CMake Error ...` and then exits
+**0**. Measured on both sides: CMake 3.28.3 exits 0, CMake 4.3.1 exits 1. This
+project declares `cmake_minimum_required(VERSION 3.28)`, so on its own stated
+minimum every `cmake -P` hygiene check reported PASSED however loudly it had just
+objected. **Thirteen were registered that way**, and AGENT.md names several of
+them as the one thing standing behind a rule that has already been a bug:
+`target-file-guards`, `net-boundary`, `repository-hygiene`, `test-name-hygiene`,
+`node-config-reference`, `tsan-scope-hygiene`.
+
+- **The fact was already written down, one clause short of the conclusion.** The
+  `repository-hygiene` registration says a `-P` script "cannot choose its own exit
+  code before CMake 3.29 (`cmake_language(EXIT)`) while this project supports
+  3.28", and draws from it the right answer for SKIP — `SKIP_REGULAR_EXPRESSION`
+  rather than `SKIP_RETURN_CODE 77`. The same sentence decides the FAIL direction
+  and nobody carried it there. The skip direction is the cosmetic one; the fail
+  direction is the whole check.
+- **So the verdict is read from the output**, which every CMake version produces
+  identically: `FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"`, one
+  spelling defined once in `src/tests/CMakeLists.txt`. A pattern restated per
+  registration is one that drifts, and a drifted pattern stops matching without
+  saying so.
+- **A failure signal that is a property needs a canary and an omission check, and
+  they answer different questions.** `script-check-canary` is a script whose only
+  job is to fail, registered `WILL_FAIL TRUE`: it is green exactly while the
+  mechanism works, and red the moment CTest stops honouring the property — naming
+  the mechanism rather than whichever real check happened to have something to say
+  that day. That covers nothing about whether a given registration *uses* the
+  property, which is the far likelier failure and the one that reads as a working
+  check; `script-check-signals` (`scripts/check-script-check-signals.cmake`)
+  covers that, deriving the set of `cmake -P` registrations from
+  `src/tests/CMakeLists.txt` rather than restating it.
+- **A scan that attributes nothing reports nothing.** `check-script-check-signals`
+  pairs each `-P` with the most recent `NAME` above it and **reports** a `-P` it
+  could not attribute rather than skipping it: an unattributed registration means
+  the scan lost track, and every verdict after that point was drawn from the wrong
+  place. It also refuses to conclude when it matched no registrations at all.
+- Do not "fix" this by raising the minimum to 3.29 and using
+  `cmake_language(EXIT)`. The property works on every version, costs nothing, and
+  is what makes the canary and the omission check possible; a version bump would
+  buy an exit code and still leave nothing asserting that any given check can
+  fail.
+
 ## The Windows Debug leg exists for the RUNTIME, and proves it is live
 
 `build.yml`'s Windows matrix ran `cl-release` and `clangcl-release` only, so the
