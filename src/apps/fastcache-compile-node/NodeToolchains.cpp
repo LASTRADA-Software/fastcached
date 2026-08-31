@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <ranges>
 #include <string>
 #include <thread>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include <CmdLine.hpp>
+#include <IParallelFor.hpp>
 #include <ParallelFor.hpp>
 #include <ToolchainProbe.hpp>
 
@@ -119,6 +121,37 @@ namespace
         // of files. The inner is the work.
         Cc::ThreadedParallelFor parallel;
 
+        // A decorator, so the walk announces itself without `ToolchainProbe` learning
+        // about a logger. `ProbeToolchainFiles` enumerates every root SERIALLY and
+        // only then hands the file list here, so this line lands exactly between
+        // those two phases and separates them for free: a stall before it is
+        // discovery or enumeration, a stall after it is hashing.
+        //
+        // Reached from every identifying thread when there is more than one
+        // toolchain, so nothing here may race. It writes only through `logger`, and
+        // `Run` is called once per walk, which makes this one line per toolchain
+        // rather than a stream.
+        struct AnnouncingParallelFor final: Cc::IParallelFor
+        {
+            // A constructor rather than designated initialisers: an override makes
+            // this polymorphic, and a polymorphic class is not an aggregate.
+            AnnouncingParallelFor(Cc::IParallelFor& parallelFor, ILogger& sink) noexcept:
+                inner { parallelFor },
+                logger { sink }
+            {
+            }
+
+            Cc::IParallelFor& inner;
+            ILogger& logger;
+
+            [[nodiscard]] bool Run(std::size_t count, std::function<void(std::size_t)> const& slice) override
+            {
+                logger.Logf(LogLevel::Info, "hashing {} toolchain file(s)", count);
+                return inner.Run(count, slice);
+            }
+        };
+        AnnouncingParallelFor announcing { parallel, logger };
+
         auto identify = [&] {
             for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
             {
@@ -148,10 +181,23 @@ namespace
                 // process is working rather than wedged.
                 logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", entry.compiler);
                 auto const banner = Cc::CompilerBanner(runner, entry.compiler);
+
+                // The three lines this one begins exist because a 300s stall here
+                // reported as ONE undifferentiated silence (#354). The comment above
+                // already says an operator needs to know the process is working
+                // rather than wedged -- and then nothing else was ever logged, so
+                // "working" and "wedged" still looked identical for five minutes.
+                //
+                // Sampling cannot close that gap: the banner probe is a `cl` that
+                // takes 15-36ms warm, and no process-tree poll cheap enough to run
+                // for five minutes will see it. What locates a stall is saying which
+                // phase ended.
+                logger.Logf(LogLevel::Info, "read the compiler banner for {}", entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
                 auto const& spec = Cc::DriverOf(flavor);
                 fingerprints[index].identity =
-                    Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec, parallel);
+                    Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec, announcing);
+                logger.Logf(LogLevel::Info, "computed the toolchain fingerprint for {}", entry.compiler);
 
                 // The evidence this identity rests on, kept so that noticing it has
                 // moved costs no spawn at all (#238). It is the same banner, the same

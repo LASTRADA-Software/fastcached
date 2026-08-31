@@ -174,14 +174,28 @@ function Get-WaitVerdict($readings) {
     $lines.Add(("  evidence: descendants now={0}, most seen in the window={1}, their cpu in the last {2}s={3}" `
                 -f $(if ($null -ne $readings.ChildrenNow) { $readings.ChildrenNow } else { "unknown" }), `
                    $readings.ChildrenSeen, $window, (& $show $childRecent)))
-    # The WHOLE wait, beside the window. The verdict never reads these -- it is a
-    # question about now and the window answers it -- but a reader deciding
-    # BETWEEN the verdict's alternatives needs them. "No descendant in the last
-    # 75s" and "no descendant at any point in 300s" are different facts with
-    # different causes, and only the second rules out a driver spawn.
-    $lines.Add(("  evidence: over the WHOLE wait: descendants most seen={0}, their cpu={1} (a spawn before the window is invisible to the line above)" `
+    # The WHOLE wait, beside the window, and NAMED as a sample rather than as a
+    # fact about the wait. This is the one instrument here that has already been
+    # misread: "descendants most seen=0" was taken as "no compiler was ever
+    # spawned", and a whole hypothesis was declared dead on it.
+    #
+    # It cannot support that. `Get-ProcessTreeCpu` enumerates processes that are
+    # ALIVE at the instant of the sample, so a child that starts and exits
+    # between two samples leaves no trace in either the count or the cpu. The
+    # probe this fixture waits on is a bare `cl`, measured at 15-36ms warm,
+    # against a sampling interval of seconds -- so a zero here is a detection
+    # failure and not a negative result, and the second line says so rather than
+    # leaving it to be inferred.
+    #
+    # Raising the rate is not the fix. Nothing cheap enough to run for five
+    # minutes catches a 15ms child; what locates a stall is the process saying
+    # which phase it finished.
+    $lines.Add(("  evidence: over the WHOLE wait: most descendants alive at any one sample={0}, their cpu={1}" `
                 -f $(if ($null -ne $readings.ChildrenEver) { $readings.ChildrenEver } else { "unknown" }), `
                    (& $show $readings.ChildTotal)))
+    $lines.Add(("  evidence: descendants are SAMPLED every {0}s ({1} samples); a child shorter than that is invisible here, so 0 is not proof that none ran" `
+                -f $(if ($null -ne $readings.TreeEvery) { $readings.TreeEvery } else { "?" }), `
+                   $(if ($null -ne $readings.TreeSamples) { $readings.TreeSamples } else { "?" })))
     $lines.Add(("  evidence: a recent figure at or below {0:N2}s reads as idle and at or above {1:N2}s as working; between them this cannot tell." `
                 -f $idleFloor, $clearlyBusy))
 
@@ -433,6 +447,8 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
             ChildrenNow  = $childrenNow
             ChildrenSeen = $childrenSeen
             ChildrenEver = $childrenEver
+            TreeEvery    = $treeEvery.TotalSeconds
+            TreeSamples  = $treeSamples.Count
             Window       = $window
             IdleFloor    = $idleFloor
             ClearlyBusy  = $clearlyBusy
@@ -507,6 +523,8 @@ function Invoke-SelfTest {
         ChildrenNow  = 0
         ChildrenSeen = 0
         ChildrenEver = 0
+        TreeEvery    = 5
+        TreeSamples  = 60
         Window       = 75
         IdleFloor    = 0.15
         ClearlyBusy  = 0.50
@@ -622,23 +640,42 @@ function Invoke-SelfTest {
             # locale-formatted, so this machine renders "42,00s" and a CI runner
             # renders "42.00s". A case that pinned the decimal separator would
             # pass here and fail there, which is a test asserting the locale.
-            Expect = "WHOLE wait: descendants most seen=1"
+            Expect = "WHOLE wait: most descendants alive at any one sample=1"
             Forbid = @("WORKING", "INCONCLUSIVE") },
 
-        @{  # And the converse, so the two can never be conflated: a wait in which
-            # nothing was EVER spawned reports zero on both, which is the reading
-            # that actually rules a driver spawn out.
-            Name = "no descendant at any point is a different fact from none recently"
+        @{  # And the converse: nothing seen at any sample. This case used to claim
+            # that reading "rules a driver spawn out", and it does NOT -- the
+            # sampler sees only what is alive when it looks, and the `cl` this
+            # fixture waits on runs for 15-36ms warm. Zero here is a detection
+            # failure, and #354 had a hypothesis declared dead on it.
+            Name = "nothing seen at any sample is not proof that nothing ran"
             Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildTotal = 0.0; ChildrenEver = 0 }
-            Expect = "WHOLE wait: descendants most seen=0"
+            Expect = "WHOLE wait: most descendants alive at any one sample=0"
             Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # The caveat is part of the reading, not a footnote to it: a zero that
+            # does not carry its own sampling interval is the sentence that was
+            # misread. Pinned on the words that make it unusable as a negative
+            # result, so a later tidy-up cannot quietly drop them.
+            Name = "a zero descendant count states the interval that could have hidden a child"
+            Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildTotal = 0.0; ChildrenEver = 0 }
+            Expect = "is invisible here, so 0 is not proof that none ran"
+            Forbid = @() },
+
+        @{  # And the interval itself is the record's, never a literal: a fixture
+            # that samples every second and one that samples every five have very
+            # different blind spots, and only the number in the record knows which.
+            Name = "the sampling interval reported is the one that was used"
+            Readings = @{ StalledFor = 300; OwnRecent = 0.0; TreeEvery = 2; TreeSamples = 150 }
+            Expect = "SAMPLED every 2s (150 samples)"
+            Forbid = @() },
 
         @{  # And an unsampled whole-wait figure must read as unknown rather than
             # zero, for the reason the windowed one already does: "could not see"
             # folded into "saw nothing" is the failure this file exists about.
             Name = "an unsampled whole-wait figure is not a zero"
             Readings = @{ StalledFor = 300; OwnRecent = 0.0; ChildTotal = $null; ChildrenEver = 2 }
-            Expect = "WHOLE wait: descendants most seen=2, their cpu=unknown"
+            Expect = "WHOLE wait: most descendants alive at any one sample=2, their cpu=unknown"
             Forbid = @() },
 
         @{  Name = "a process that died rather than hanging"
@@ -656,7 +693,8 @@ function Invoke-SelfTest {
     # on the page cannot be argued with, and being arguable is the whole value --
     # it is why #354's wrong verdict could be challenged at all.
     $evidenceLines = @("evidence: alive=", "evidence: own cpu", "evidence: descendants",
-                       "evidence: over the WHOLE wait", "evidence: a recent figure")
+                       "evidence: over the WHOLE wait", "evidence: descendants are SAMPLED",
+                       "evidence: a recent figure")
 
     $failures = 0
     foreach ($case in $cases) {
