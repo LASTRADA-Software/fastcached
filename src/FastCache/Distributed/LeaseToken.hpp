@@ -106,6 +106,38 @@ struct LeaseClaims
     /// instant means nothing on another machine, and a lease is checked on a
     /// machine other than the one that minted it by definition.
     std::chrono::system_clock::time_point expiresAt {};
+
+    /// Which cluster issued it.
+    ///
+    /// Inside the MAC for the reason `endpoint` is: without it a grant is good on
+    /// every fleet that trusts the same key, and two fleets sharing a key file is
+    /// the ORDINARY outcome of copying a working configuration to a second site or
+    /// cloning staging from production. The MAC verifies, the endpoint matches, the
+    /// fingerprint matches, the expiry is in the future -- and cluster B's worker
+    /// compiles work leased by a scheduler that is not its own
+    /// ([#322](https://github.com/LASTRADA-Software/fastcached/issues/322)).
+    ///
+    /// Empty is legal and means a node with no `--cluster-id`, which is the
+    /// one-machine deployment. A verifier that has none expects none: two nodes that
+    /// have both declined to name a cluster are not thereby in different ones.
+    std::string clusterId;
+
+    /// The scheduler term this grant was issued under.
+    ///
+    /// The cluster id closes the door between two FLEETS; this one closes it between
+    /// two leaders of the same fleet. Without it a grant minted under an old term
+    /// stays good after a new leader takes over, so a token captured before an
+    /// election is replayable after it.
+    ///
+    /// The Raft term rather than a counter the scheduler keeps: a per-process counter
+    /// restarts at zero with the process, and a restarted leader would then re-mint
+    /// epochs it had already used. Zero is the term of a node leading alone with no
+    /// consensus, which is a real deployment and not a missing answer.
+    std::uint64_t epoch {};
+
+    // Declared LAST, matching the wire order in `PackClaims`: these two are appended
+    // after the fields version 1 carried, so the struct reads in the order the bytes
+    // do and a designated initializer lists them in the order it declares them.
 };
 
 /// Why a lease was refused. One enumerator per outcome that is not "compile it".
@@ -119,6 +151,10 @@ enum class LeaseRefusalReason : std::uint8_t
     Malformed = 0,
     /// A lease token this cluster's key does not authenticate.
     Unauthorized,
+    /// An authentic lease, issued by a different fleet that shares this key.
+    ClusterMismatch,
+    /// An authentic lease, issued under a scheduler term that is no longer current.
+    EpochMismatch,
     /// An authentic lease, for a different worker.
     EndpointMismatch,
     /// An authentic lease, for a different toolchain.
@@ -159,6 +195,14 @@ struct LeaseRefusalDescriptor
 /// `FingerprintMismatch` reuses the existing wire code rather than minting a new
 /// one: a client already answers it correctly, and a second spelling of one fact
 /// is how two peers come to disagree about what happened.
+///
+/// `ClusterMismatch` and `EpochMismatch` share `LeaseUnauthorized` too, and each
+/// keeps a counter of its own. The wire code is the same because the client's answer
+/// is the same -- compile it locally -- and a code it does not know would be worse
+/// than one it does. The counters are separate because the OPERATOR's answer is not:
+/// a rise in the first says two fleets are sharing a key file, which is a
+/// provisioning mistake, and a rise in the second says grants are outliving
+/// elections, which is not. Summing them would send somebody to the wrong one.
 inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefusalTable { {
     { .reason = LeaseRefusalReason::Malformed,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
@@ -166,6 +210,12 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
+    { .reason = LeaseRefusalReason::ClusterMismatch,
+      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster },
+    { .reason = LeaseRefusalReason::EpochMismatch,
+      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch },
     { .reason = LeaseRefusalReason::EndpointMismatch,
       .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseEndpointMismatch },
@@ -216,7 +266,12 @@ inline constexpr std::string_view LeaseTokenDomain = "fastcache-lease-v1";
 /// Carried as a field of its own rather than inferred, so a future layout is a
 /// refusal by name in an old build rather than a mis-parse: the fields are
 /// length-prefixed, so a different arity would otherwise decode as *something*.
-inline constexpr std::uint8_t LeaseTokenVersion = 1;
+///
+/// **2 since #322**, which added the cluster id and the epoch to what the MAC
+/// covers. Every outstanding version-1 grant stops authenticating, which is exactly
+/// why that ticket argued for doing it while the format is new: a covered field
+/// added after a fleet is deployed is a flag day, and nothing is deployed.
+inline constexpr std::uint8_t LeaseTokenVersion = 2;
 
 /// How far a verifier's wall clock may trail the minting scheduler's.
 ///
@@ -261,6 +316,7 @@ namespace Detail
         auto const versionField = std::array { static_cast<std::byte>(version) };
         auto const expiry = WireFields::ToBigEndian<std::uint64_t>(static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(claims.expiresAt.time_since_epoch()).count()));
+        auto const epoch = WireFields::ToBigEndian<std::uint64_t>(claims.epoch);
         return WireFields::Encode({
             std::span<std::byte const> { versionField },
             WireFields::AsBytes(claims.serial),
@@ -268,6 +324,8 @@ namespace Detail
             WireFields::AsBytes(claims.fingerprint),
             WireFields::AsBytes(claims.key),
             std::span<std::byte const> { expiry },
+            WireFields::AsBytes(claims.clusterId),
+            std::span<std::byte const> { epoch },
         });
     }
 
@@ -286,7 +344,7 @@ namespace Detail
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
     /// How many fields the packed claims hold.
-    inline constexpr std::size_t ClaimFieldCount = 6;
+    inline constexpr std::size_t ClaimFieldCount = 8;
 
     /// The largest expiry this host's wall clock can represent, in milliseconds.
     ///
@@ -368,6 +426,9 @@ namespace Detail
     auto const expiryMillis = WireFields::FromBigEndian<std::uint64_t>((*fields)[5]);
     if (!expiryMillis.has_value() || *expiryMillis > static_cast<std::uint64_t>(Detail::MaxExpiryMillis))
         return std::unexpected { LeaseRefusalReason::Malformed };
+    auto const epoch = WireFields::FromBigEndian<std::uint64_t>((*fields)[7]);
+    if (!epoch.has_value())
+        return std::unexpected { LeaseRefusalReason::Malformed };
 
     // The tag is recomputed over the bytes AS RECEIVED rather than over a re-encoding
     // of the decoded claims. Re-encoding would authenticate what this build would have
@@ -384,15 +445,98 @@ namespace Detail
                          .endpoint = std::string { WireFields::AsStringView((*fields)[2]) },
                          .fingerprint = std::string { WireFields::AsStringView((*fields)[3]) },
                          .key = std::string { WireFields::AsStringView((*fields)[4]) },
-                         .expiresAt = std::chrono::system_clock::time_point {
-                             std::chrono::milliseconds { static_cast<std::int64_t>(*expiryMillis) } } };
+                         .expiresAt = std::chrono::system_clock::time_point { std::chrono::milliseconds {
+                             static_cast<std::int64_t>(*expiryMillis) } },
+                         .clusterId = std::string { WireFields::AsStringView((*fields)[6]) },
+                         .epoch = *epoch };
 }
+
+/// Whether this verifier knows which scheduler term is current.
+///
+/// A type rather than an `std::optional<std::uint64_t>`, and the difference is that
+/// this one cannot be defaulted. An omitted optional value-initializes to "no
+/// expectation", so a verifier added later would silently accept a grant from any
+/// term -- which is the hole this class exists to close, reopened by saying nothing.
+/// `PreAuth` and `PayloadCap` in the wire table are spelled the same way for the same
+/// reason.
+///
+/// **`NotKnownHere` is a real answer and not a placeholder.** A worker learns the
+/// current term from nowhere: the only term it ever sees is the one inside the token
+/// it is checking, and comparing a claim against itself establishes nothing. Making
+/// it say so out loud is what keeps "this verifier does not check the epoch" a
+/// decision somebody wrote rather than a field somebody forgot. Closing that gap
+/// needs the term to travel on REGISTER or a heartbeat, which is
+/// [#421](https://github.com/LASTRADA-Software/fastcached/issues/421); until then the
+/// epoch is COVERED by the MAC -- so it cannot be edited -- and enforced by the
+/// scheduler, which knows its own.
+class LeaseEpochCheck
+{
+  public:
+    /// Deleted on purpose: a verifier states what it knows. See the class comment.
+    LeaseEpochCheck() = delete;
+
+    /// This verifier cannot know the current term, so it does not check one.
+    /// @return The check.
+    [[nodiscard]] static constexpr LeaseEpochCheck NotKnownHere() noexcept
+    {
+        return LeaseEpochCheck { false, 0 };
+    }
+
+    /// This verifier knows the current term, and refuses any other.
+    /// @param epoch The term a grant must name.
+    /// @return The check.
+    [[nodiscard]] static constexpr LeaseEpochCheck MustEqual(std::uint64_t epoch) noexcept
+    {
+        return LeaseEpochCheck { true, epoch };
+    }
+
+    /// @param claimed The term the grant names.
+    /// @return True when this verifier accepts it.
+    [[nodiscard]] constexpr bool Accepts(std::uint64_t claimed) const noexcept
+    {
+        return !_checked || claimed == _epoch;
+    }
+
+    /// @return The term this verifier expects; meaningless when it checks none.
+    [[nodiscard]] constexpr std::uint64_t Expected() const noexcept
+    {
+        return _epoch;
+    }
+
+    /// @return Whether this verifier checks the term at all.
+    [[nodiscard]] constexpr bool Checked() const noexcept
+    {
+        return _checked;
+    }
+
+  private:
+    constexpr LeaseEpochCheck(bool checked, std::uint64_t epoch) noexcept:
+        _checked { checked },
+        _epoch { epoch }
+    {
+    }
+
+    bool _checked;
+    std::uint64_t _epoch;
+};
 
 /// What a verifier expects a grant to say about itself.
 struct LeaseExpectation
 {
     std::string_view endpoint;    ///< The endpoint this worker registered under.
     std::string_view fingerprint; ///< The toolchain this worker is about to run.
+
+    /// The cluster this verifier belongs to; empty when it names none.
+    ///
+    /// Compared for EQUALITY rather than for presence, so two nodes that have both
+    /// declined to name a cluster still agree -- that is the one-machine deployment
+    /// and it must keep working -- while a node that names one refuses a grant from a
+    /// fleet that names another, or none.
+    std::string_view clusterId;
+
+    /// Whether this verifier knows the current term. No default: see
+    /// `LeaseEpochCheck`.
+    LeaseEpochCheck epoch;
 };
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
@@ -404,9 +548,15 @@ struct LeaseExpectation
 /// granted `10.0.0.7:6675` is told precisely that. Checking the plaintext endpoint
 /// first would be cheaper and would turn a diagnostic into an oracle.
 ///
+/// The cluster and the epoch are checked FIRST, ahead of the endpoint and the
+/// fingerprint, because they answer a different question: those two ask "is this
+/// grant for me", these ask "is it from anybody I take orders from" (#322). Both
+/// still sit below the MAC, so neither is an oracle -- everything they report is
+/// already in the token the caller is holding.
+///
 /// @param signingKey The cluster's pre-shared key.
 /// @param token The token the client presented.
-/// @param expected What this worker is.
+/// @param expected What this worker is, and what it knows.
 /// @param now This machine's wall clock.
 /// @param slack How far this clock may trail the scheduler's.
 /// @return The authentic claims, or why the job is refused.
@@ -420,6 +570,24 @@ struct LeaseExpectation
     auto authentic = AuthenticateLeaseToken(signingKey, token);
     if (!authentic.has_value())
         return std::unexpected { LeaseRefusal { .reason = authentic.error(), .detail = {} } };
+
+    // Before the endpoint and the fingerprint, because those answer "is this grant
+    // for me" while these answer "is this grant from anyone I take orders from". A
+    // token from another fleet that happens to name this endpoint would otherwise be
+    // reported as a match on the way to being refused for something else.
+    if (authentic->clusterId != expected.clusterId)
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::ClusterMismatch,
+            .detail = std::format("this lease was issued by cluster '{}'; this worker belongs to '{}'",
+                                  authentic->clusterId,
+                                  expected.clusterId) } };
+
+    if (!expected.epoch.Accepts(authentic->epoch))
+        return std::unexpected { LeaseRefusal {
+            .reason = LeaseRefusalReason::EpochMismatch,
+            .detail = std::format("this lease was issued under scheduler term {}; term {} is current",
+                                  authentic->epoch,
+                                  expected.epoch.Expected()) } };
 
     if (authentic->endpoint != expected.endpoint)
         return std::unexpected { LeaseRefusal {

@@ -25,6 +25,17 @@ using namespace std::chrono_literals;
 
 namespace
 {
+/// The fleet these grants belong to.
+///
+/// Named rather than empty, so every case exercises a real comparison. Empty on both
+/// sides passes whether the check runs or not, which is exactly the shape that would
+/// let a verifier ship without looking (#322).
+inline constexpr std::string_view TestCluster = "fleet-alpha";
+
+/// A second fleet, provisioned from the SAME key -- which is what copying a working
+/// configuration to another site produces, and the whole scenario #322 is about.
+inline constexpr std::string_view OtherCluster = "fleet-beta";
+
 /// The cluster's key, as a file holding thirty-two bytes would supply it.
 [[nodiscard]] std::vector<std::byte> Key(unsigned char fill = 0x5A)
 {
@@ -40,20 +51,31 @@ namespace
 /// The grant a scheduler would mint for one job.
 [[nodiscard]] LeaseClaims Grant(std::string_view endpoint = "10.0.0.7:6675",
                                 std::string_view fingerprint = "clang-19-x86_64",
-                                std::string_view key = "obj-abc")
+                                std::string_view key = "obj-abc",
+                                std::string_view cluster = TestCluster,
+                                std::uint64_t epoch = 7)
 {
     return LeaseClaims { .serial = "17",
                          .endpoint = std::string { endpoint },
                          .fingerprint = std::string { fingerprint },
                          .key = std::string { key },
-                         .expiresAt = Noon() + 10min };
+                         .expiresAt = Noon() + 10min,
+                         .clusterId = std::string { cluster },
+                         .epoch = epoch };
 }
 
 /// What the worker at the granted endpoint expects to see.
+/// @param endpoint The address this worker answers on.
+/// @param fingerprint The toolchain it is about to run.
+/// @param cluster The fleet it belongs to.
+/// @param epoch What it knows about the current scheduler term.
+/// @return The expectation.
 [[nodiscard]] LeaseExpectation Worker(std::string_view endpoint = "10.0.0.7:6675",
-                                      std::string_view fingerprint = "clang-19-x86_64")
+                                      std::string_view fingerprint = "clang-19-x86_64",
+                                      std::string_view cluster = TestCluster,
+                                      LeaseEpochCheck epoch = LeaseEpochCheck::NotKnownHere())
 {
-    return LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint };
+    return LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster, .epoch = epoch };
 }
 
 /// Where the version byte sits in a decoded envelope.
@@ -329,11 +351,125 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
                                                           .endpoint = "10.0.0.7:6675",
                                                           .fingerprint = "clang-19-x86_64",
                                                           .key = "obj-abc",
-                                                          .expiresAt = farFuture });
+                                                          .expiresAt = farFuture,
+                                                          .clusterId = std::string { TestCluster } });
 
         auto const preEpoch = std::chrono::system_clock::time_point {} - 24h;
         CHECK(VerifyLeaseToken(key, distant, Worker(), preEpoch).has_value());
     }
+}
+
+TEST_CASE("A grant from another fleet sharing the key is refused", "[distributed][lease][token]")
+{
+    // #322's whole scenario, and the reason it is not exotic: two clusters
+    // provisioned from the same `--cluster-key-file` is what copying a working
+    // configuration to a second site produces, or cloning staging from production.
+    // The MAC verifies, the endpoint matches, the fingerprint matches and the expiry
+    // is in the future -- so before the cluster id went inside the MAC, cluster B's
+    // worker compiled work leased by a scheduler that was not its own.
+    auto const key = Key();
+    auto const foreign = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster));
+
+    auto const refusal = VerifyLeaseToken(key, foreign, Worker(), Noon());
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::ClusterMismatch);
+
+    // Both fleets named, because the operator action is to look at two configurations
+    // and find out which one is wrong. This is reported only AFTER the MAC verified,
+    // so it tells a forger nothing it did not already hand over.
+    CHECK(refusal.error().detail.contains(OtherCluster));
+    CHECK(refusal.error().detail.contains(TestCluster));
+}
+
+TEST_CASE("Two nodes that name no cluster still agree", "[distributed][lease][token]")
+{
+    // The one-machine deployment, and it must keep working. The comparison is for
+    // EQUALITY rather than for presence, so "neither named one" is a match -- a rule
+    // spelled as "the grant must name a cluster" would refuse every node that never
+    // configured one.
+    auto const key = Key();
+    auto const grant = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", ""));
+
+    CHECK(VerifyLeaseToken(key, grant, Worker("10.0.0.7:6675", "clang-19-x86_64", ""), Noon()).has_value());
+}
+
+TEST_CASE("A grant from a superseded scheduler term is refused where the term is known", "[distributed][lease][token]")
+{
+    // The second half of #322: the cluster id closes the door between two FLEETS, the
+    // epoch closes it between two leaders of the same fleet. Without it a token
+    // captured before an election stays good after one, because nothing in the grant
+    // said which term issued it.
+    auto const key = Key();
+    auto const old = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 6));
+
+    auto const refusal = VerifyLeaseToken(
+        key, old, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::MustEqual(7)), Noon());
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::EpochMismatch);
+
+    // And the current term is served.
+    auto const current = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
+    CHECK(VerifyLeaseToken(
+              key, current, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::MustEqual(7)), Noon())
+              .has_value());
+}
+
+TEST_CASE("A verifier that cannot know the term accepts any of them", "[distributed][lease][token]")
+{
+    // `NotKnownHere` is an answer rather than a placeholder, and this pins what it
+    // means so that changing it is a decision somebody makes rather than a default
+    // somebody inherits. A worker learns the current term from nowhere -- the only
+    // term it sees is the one inside the token it is checking -- so until #421 makes
+    // the term travel on REGISTER, the epoch is covered by the MAC and enforced by the
+    // scheduler alone.
+    auto const key = Key();
+    for (auto const epoch: { std::uint64_t { 0 }, std::uint64_t { 1 }, std::uint64_t { 9'999 } })
+    {
+        INFO("epoch " << epoch);
+        auto const grant = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, epoch));
+        CHECK(VerifyLeaseToken(key, grant, Worker(), Noon()).has_value());
+    }
+}
+
+TEST_CASE("The cluster and the epoch are inside the MAC, not beside it", "[distributed][lease][token]")
+{
+    // The property the whole ticket rests on: an attacker holding a token cannot edit
+    // either field, because both are covered. Asserted by MINTING two grants that
+    // differ only in those fields and checking the tags differ -- a field that were
+    // merely carried would produce the same tag twice, which is what "beside it" would
+    // look like and would pass every functional case above.
+    auto const key = Key();
+    auto const base = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
+    auto const otherCluster = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster, 7));
+    auto const otherEpoch = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 8));
+
+    CHECK(base != otherCluster);
+    CHECK(base != otherEpoch);
+    CHECK(otherCluster != otherEpoch);
+}
+
+TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][token]")
+{
+    // The cost of covering two more fields, stated rather than discovered. Every
+    // outstanding grant minted by an older build stops verifying, which is exactly why
+    // #322 argued for doing this while the format is new: after a fleet is deployed it
+    // is a flag day, and nothing is deployed.
+    //
+    // Refused as `Malformed` rather than `Unauthorized`, which is the version field
+    // doing its job: the arity differs, so without it the fields would decode as
+    // *something* and the refusal would name the wrong problem.
+    CHECK(LeaseTokenVersion == 2);
+
+    auto const key = Key();
+    auto const claims = Grant();
+    auto const packedV1 = Detail::PackClaims(1, claims);
+    auto const tag = Detail::ExpectedTag(key, packedV1);
+    auto const envelope =
+        WireFields::Encode({ std::span<std::byte const> { packedV1 }, std::span<std::byte const> { tag } });
+
+    auto const refusal = AuthenticateLeaseToken(key, Base64Encode(envelope));
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error() == LeaseRefusalReason::Malformed);
 }
 
 TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token]")

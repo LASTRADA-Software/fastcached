@@ -62,7 +62,7 @@ struct Leading
 {
     Leading()
     {
-        service.SetRole(SchedulerRole::Leader, {});
+        service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
 
     ManualClock clock;
@@ -72,7 +72,7 @@ struct Leading
     /// from any case that cares and costs the rest nothing.
     CapturingLogger logger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, logger, {} };
+    SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
 };
 
 /// A fixed wall-clock instant, so a grant's expiry is a value a test can name.
@@ -88,8 +88,14 @@ struct Signing
 {
     Signing()
     {
-        service.SetRole(SchedulerRole::Leader, {});
+        service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
+
+    /// The fleet this scheduler leads.
+    ///
+    /// Named rather than empty so the grants it mints carry a real cluster id: empty
+    /// on both sides of the comparison passes whether the check runs or not (#322).
+    static constexpr std::string_view TestCluster = "fleet-under-test";
 
     /// Thirty-two bytes, as `--cluster-key-file` would supply them.
     std::vector<std::byte> key = std::vector<std::byte>(32, std::byte { 0x5A });
@@ -98,7 +104,7 @@ struct Signing
     AtomicMetricsSink metrics;
     CapturingLogger logger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, logger, key };
+    SchedulerService service { clock, wallClock, metrics, logger, key, TestCluster };
 };
 } // namespace
 
@@ -170,7 +176,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
 
     SECTION("an undecided node refuses, and names nobody")
     {
@@ -186,7 +192,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
 
     SECTION("a follower refuses and redirects")
     {
-        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
         auto const reply = service.Lease(Insider, Ask("gcc-14", "abc"));
         CHECK(reply.status == Wire::Status::Error);
         CHECK(reply.error == Wire::ErrorCode::NotLeader);
@@ -199,7 +205,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         // without thinking about it is refused rather than served. Asserted per
         // verb because "I added a handler that skips the gate" is exactly the
         // regression this arrangement exists to make impossible.
-        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
         CHECK(service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Heartbeat(Insider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Lease(Insider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
@@ -219,7 +225,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         // that is asserted rather than skipped past, since "the release got through"
         // and "the release resolved something" are the two halves that must not be
         // confused.
-        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
         auto const reply = service.Release(Insider, "l1", "abc");
         CHECK(reply.error != Wire::ErrorCode::NotLeader);
         CHECK(reply.error == Wire::ErrorCode::UnknownLease);
@@ -255,8 +261,8 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
-    service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
 
     CHECK(service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
 
@@ -954,8 +960,13 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
 
     SECTION("the worker it names accepts it")
     {
-        auto const verified = VerifyLeaseToken(
-            fleet.key, token, LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14" }, Noon);
+        auto const verified = VerifyLeaseToken(fleet.key,
+                                               token,
+                                               LeaseExpectation { .endpoint = "peer-1:7100",
+                                                                  .fingerprint = "gcc-14",
+                                                                  .clusterId = Signing::TestCluster,
+                                                                  .epoch = LeaseEpochCheck::NotKnownHere() },
+                                               Noon);
         REQUIRE(verified.has_value());
         CHECK(verified->key == "obj-1");
 
@@ -970,8 +981,13 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
         // The replay the endpoint is inside the MAC for. Without it, one grant is a
         // grant on every machine that trusts the key -- which is every machine in
         // the fleet.
-        auto const refusal = VerifyLeaseToken(
-            fleet.key, token, LeaseExpectation { .endpoint = "peer-2:7100", .fingerprint = "gcc-14" }, Noon);
+        auto const refusal = VerifyLeaseToken(fleet.key,
+                                              token,
+                                              LeaseExpectation { .endpoint = "peer-2:7100",
+                                                                 .fingerprint = "gcc-14",
+                                                                 .clusterId = Signing::TestCluster,
+                                                                 .epoch = LeaseEpochCheck::NotKnownHere() },
+                                              Noon);
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::EndpointMismatch);
     }
@@ -980,7 +996,10 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
     {
         auto const refusal = VerifyLeaseToken(fleet.key,
                                               token,
-                                              LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14" },
+                                              LeaseExpectation { .endpoint = "peer-1:7100",
+                                                                 .fingerprint = "gcc-14",
+                                                                 .clusterId = Signing::TestCluster,
+                                                                 .epoch = LeaseEpochCheck::NotKnownHere() },
                                               Noon + LeaseTable::DefaultLeaseTimeout + LeaseTokenClockSkewSlack + 1s);
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Expired);

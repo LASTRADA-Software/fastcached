@@ -245,6 +245,22 @@ class IMetricsSink
         /// that cannot authenticate. The two are indistinguishable here by design;
         /// what tells them apart is whether the rise tracks a rollout.
         WorkerJobsRefusedLeaseUnauthorized,
+        /// Jobs refused because an AUTHENTIC lease came from a different fleet.
+        ///
+        /// Its own counter rather than a share of the one above, because the operator
+        /// action is different and specific: two clusters are running from the same
+        /// `--cluster-key-file`, which is the ordinary outcome of copying a working
+        /// configuration to a second site or cloning staging from production. Nothing
+        /// else produces this. Before #322 the token bound no cluster identity, so
+        /// those grants verified and the other fleet's workers simply compiled them.
+        WorkerJobsRefusedLeaseWrongCluster,
+        /// Jobs refused because an AUTHENTIC lease named a superseded scheduler term.
+        ///
+        /// Again its own, and again because the action differs: this says grants are
+        /// outliving elections, which is a replay window rather than a provisioning
+        /// mistake. Expected to read zero on a fleet that is not electing, so any
+        /// sustained rise is worth looking at even when it is small.
+        WorkerJobsRefusedLeaseStaleEpoch,
         /// Jobs refused because an AUTHENTIC lease named a different worker.
         ///
         /// Almost never a replay and almost always a fleet whose registered endpoint

@@ -758,18 +758,28 @@ void ConsensusTier::Republish()
     // Two tests rather than one, because the log and the scheduler are asking
     // different questions. A node campaigning round after round without winning is
     // `Undecided` with no endpoint every time, so a single test leaves the one
-    // condition somebody reads a dump to find completely silent; a term that moved
-    // is therefore worth a line even when the announcement did not change. The
-    // scheduler still hears only real changes -- it has no use for a term, and
-    // re-announcing an unchanged role is what the paragraph above forbids.
-    auto const announcementMoved = !_published || scheduled != _publishedRole || leaderEndpoint != _publishedEndpoint;
+    // condition somebody reads a dump to find completely silent.
+    //
+    // A moved TERM is now a real change for the scheduler too, which it was not
+    // before #322: the term goes inside every grant it mints, so a node that stayed
+    // `Leader` across an election and was told nothing would keep stamping the
+    // previous one -- and the whole point of covering the epoch is that a grant names
+    // the term it was actually issued under. Re-announcing an UNCHANGED role with an
+    // unchanged term is still forbidden, which is what the paragraph above is about.
+    auto const announcementMoved =
+        !_published || scheduled != _publishedRole || leaderEndpoint != _publishedEndpoint || _lastTerm != _publishedTerm;
     if (!announcementMoved && _lastTerm == _publishedTerm)
         return;
 
+    auto const termMoved = _lastTerm != _publishedTerm;
     _published = true;
     _publishedTerm = _lastTerm;
 
-    _logger.Log(LogLevel::Info, DescribeRole(scheduled, _lastTerm, leaderEndpoint));
+    // The line is written when EITHER moved, which is what keeps a node campaigning
+    // without winning visible; the observer is called when the announcement moved,
+    // and a moved term is now part of that.
+    if (announcementMoved || termMoved)
+        _logger.Log(LogLevel::Info, DescribeRole(scheduled, _lastTerm, leaderEndpoint));
 
     if (!announcementMoved)
         return;
@@ -779,7 +789,10 @@ void ConsensusTier::Republish()
     _leads.store(scheduled == Distributed::SchedulerRole::Leader, std::memory_order_relaxed);
 
     if (_onRole)
-        _onRole(scheduled, leaderEndpoint);
+        // .value, because Term is a distinct type here and a plain integer on the
+        // wire: the token carries a number, and the type exists to stop terms being
+        // confused with log indices inside consensus rather than outside it.
+        _onRole(scheduled, leaderEndpoint, _lastTerm.value);
 }
 
 std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
@@ -799,13 +812,13 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     auto tier = ConsensusTier::Start(
         cfg,
         schedulerBound,
-        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint) {
+        [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
             // Null when this node runs no scheduler surface, which is a legitimate
             // shape: a member that contributes CPU and consensus without handing out
             // anybody's work. It still votes, and its leadership -- if it wins -- is
             // simply not exercised through a port nobody can reach.
             if (schedulerTier != nullptr)
-                schedulerTier->SetRole(role, leaderEndpoint);
+                schedulerTier->SetRole(role, leaderEndpoint, term);
         },
         [&membership](std::vector<std::string> const& endpoints) {
             // The replicated member set joins the fleet's admission policy, so a node

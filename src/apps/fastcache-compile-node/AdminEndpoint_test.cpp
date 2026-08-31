@@ -383,8 +383,8 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
         Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
@@ -439,8 +439,8 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676", Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
         Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
@@ -467,8 +467,8 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
         Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
@@ -554,8 +554,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     ScrapeHost const scrapeHost;
     ManualClock clock;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     // Bind a probe, take its port, release it: `Start` refuses port 0, and a fixed
     // port is one more way to collide with whatever else a runner is doing.
@@ -756,19 +756,19 @@ TEST_CASE("The sampler records only while this node leads", "[node][admin][fleet
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     FleetSampler sampler { sources, metrics, NodeFacts(), wall, {}, logger };
 
-    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676");
+    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676", Distributed::StandaloneSchedulerTerm);
     // A follower's registry holds whatever registered against *it*, so a sample
     // here would record a fraction of the fleet as though it were the whole -- and
     // the chart would show the fleet shrinking every time leadership moved.
     CHECK_FALSE(sampler.SampleOnce());
     CHECK(sampler.History().Empty());
 
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     CHECK(sampler.SampleOnce());
     CHECK_FALSE(sampler.History().Empty());
 
@@ -790,8 +790,8 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     {
@@ -825,8 +825,8 @@ TEST_CASE("What the other machines handed over survives a leader restart", "[nod
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     // One closed bucket, as a heartbeat would carry it -- in a window this leader
@@ -944,13 +944,13 @@ struct ChartFixture
     NullLogger logger;
     SystemWallClock wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
     std::unique_ptr<FleetSampler> sampler;
     std::vector<AdminRoute> routes;
 
     ChartFixture()
     {
-        scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+        scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
         Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
         sampler = std::make_unique<FleetSampler>(sources, metrics, NodeFacts(), wall, HistoryPaths {}, logger);
         REQUIRE(sampler->SampleOnce());
@@ -1157,8 +1157,8 @@ TEST_CASE("A history a newer build wrote stops the sampler promising durability"
     // and the scheduler's lines are not the ones it is asserting about.
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {} };
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     {
@@ -1209,7 +1209,7 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {} };
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     for ([[maybe_unused]] auto const hit: std::views::iota(0, 70))
@@ -1229,7 +1229,7 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     CHECK(own.back().values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] == 3);
 
     // Becoming leader adds the fleet series without disturbing the node one.
-    scheduler.SetRole(Distributed::SchedulerRole::Leader, {});
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     CHECK(sampler.SampleOnce());
     CHECK_FALSE(sampler.History().Empty());
     CHECK_FALSE(sampler.NodeHistory().Empty());

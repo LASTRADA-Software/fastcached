@@ -177,7 +177,14 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// A `string_view` rather than a `std::string`: every consumer forwards it
     /// straight to `SchedulerService::SetRole`, which takes a view, so a by-value
     /// parameter here would be a copy made once per role change purely to be read.
-    using RoleObserver = std::function<void(Distributed::SchedulerRole role, std::string_view leaderEndpoint)>;
+    ///
+    /// The TERM travels with it since #322, because it goes inside every lease grant
+    /// the scheduler mints: without it a token captured before an election stays
+    /// replayable after one. Only the driver knows the term, which is why it is
+    /// pushed rather than pulled -- and why a role that stays `Leader` across a term
+    /// change is now a real announcement rather than a repeat of one.
+    using RoleObserver =
+        std::function<void(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term)>;
 
     /// Told the cluster's member endpoints whenever they change.
     using MembersObserver = std::function<void(std::vector<std::string> const& endpoints)>;

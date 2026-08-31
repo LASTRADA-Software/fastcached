@@ -230,8 +230,8 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
     FastCache::AtomicMetricsSink metrics;
     FastCache::NullLogger schedulerLogger;
     FastCache::ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {} };
-    service.SetRole(SchedulerRole::Leader, {});
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
 
     auto const ask = [&](std::string_view peer) {
         return service.Lease(

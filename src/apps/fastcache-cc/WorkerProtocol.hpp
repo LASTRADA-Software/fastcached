@@ -82,12 +82,26 @@ using LeaseValidator =
 /// @param advertisedEndpoint This worker's address as clients are told to dial it --
 ///        exactly the string it registered with the scheduler under, because that is
 ///        the string the scheduler signed.
+/// @param clusterId The fleet this worker belongs to, copied. Compared for EQUALITY
+///        against what the grant names, so two clusters provisioned from one
+///        `--cluster-key-file` -- the ordinary outcome of copying a configuration to
+///        a second site -- stop authenticating each other's grants (#322). Empty is
+///        legal and means a node that named no cluster: it then expects grants that
+///        name none, which is the one-machine deployment and must keep working.
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
 /// @return The validator.
+///
+/// The scheduler TERM is deliberately not checked here, and `LeaseEpochCheck` is the
+/// type that makes that a stated decision rather than a forgotten field: a worker
+/// learns the current term from nowhere, since the only term it ever sees is the one
+/// inside the token it is checking. The epoch is covered by the MAC regardless -- so
+/// it cannot be edited -- and enforced by the scheduler, which knows its own. Making
+/// it travel on REGISTER is #421.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
+                                                  std::string clusterId,
                                                   IWallClock const& clock);
 
 /// The validator a worker with no cluster key builds: it refuses nothing.
