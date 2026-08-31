@@ -440,10 +440,11 @@ namespace
 
                 // The credential, decided from the header and this connection's state
                 // (#289). A SECOND question at the same point rather than a wider
-                // first one: `RefusePeer` answers on the peer and the verb, which
-                // lets it be asked before a frame exists; this needs the verb, the
-                // declared length and per-connection state, so folding them together
-                // would make that predicate's name stop describing it.
+                // first one: `RefusePeer` answers on the peer and the verb before the
+                // payload is read, and returns an encoded refusal; this one answers on
+                // the verb alone and feeds the decision alongside the declared length
+                // and per-connection state, so folding them together would make
+                // neither predicate's name describe it.
                 //
                 // `DecidePrePayload` is the same function the daemon's loop calls, so
                 // the two surfaces cannot disagree about which verbs are open, what
@@ -451,7 +452,7 @@ namespace
                 auto const decision = Wire::DecidePrePayload({ .opRaw = decoded->opRaw,
                                                                .declaredLength = decoded->payloadLength,
                                                                .sessionCap = cap,
-                                                               .authRequired = state->responder.AuthRequired(),
+                                                               .authRequired = state->responder.AuthRequired(decoded->opRaw),
                                                                .credentialAccepted = credentialAccepted });
                 if (decision != Wire::PrePayloadDecision::Serve)
                 {
