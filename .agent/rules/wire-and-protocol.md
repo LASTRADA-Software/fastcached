@@ -1010,3 +1010,20 @@ consequence rather than a precaution.
 - **Reporting without erasing would have been worse than neither.** The record
   stays, so the next `APPEND`/`INCR`/CAS on the same lapsed key fires `expired`
   again. The erase is what makes the event true exactly once.
+
+## Open work
+
+- [#395](https://github.com/LASTRADA-Software/fastcached/issues/395) —
+  `Distributed::CallerContext` borrows without saying so: its `peerId` is a
+  `std::string_view`, the type is not named `*View`, and it is built inline at its
+  call sites, so the lifetime obligation is invisible exactly where a caller has to
+  honour it. The third instance of the borrow rule above (after `CapacityFields` and
+  `CompileResult`/`CodecEnvelope`), found when #394 factored the two construction
+  sites into one helper and wrote it the obvious way — a by-value parameter moved
+  into the aggregate, which returns a view into a parameter destroyed at the closing
+  brace. Master is correct only because every author so far happened to hold a view
+  already. **It cannot be tested**: with the defect restored the whole node suite
+  passes under ASan with `detect_stack_use_after_return=1`, because the peer strings
+  fit the SSO buffer and nothing reuses that stack memory. Unobservable and real is
+  what the naming rule exists for, so the fix is the name or the ownership, not a
+  regression test.
