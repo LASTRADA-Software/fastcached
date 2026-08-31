@@ -32,8 +32,28 @@ on:
     # or not-yet-supported tag costs nothing instead of an hour, and it is the one
     # place that records why an rc tag cannot build yet.
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # NO `branches:` filter, and its absence is load-bearing rather than an
+  # omission. It read `branches: [master]`, which is the **third door** to the
+  # never-arrives failure this file already records twice.
+  #
+  # A pull request whose base is another branch -- which is every layer of a
+  # STACKED pull request but the bottom one -- matched no branch, so this workflow
+  # produced no check run at all. Not a failing one: none. Every required context
+  # then stayed pending forever and the pull request sat at BLOCKED with nothing
+  # anywhere saying why, exactly as a `paths-ignore` filter does and exactly as a
+  # missing `merge_group:` row does. Measured on #414, #415 and #416: the label
+  # workflow reported (it filters no branches) while every build context was
+  # simply absent, so the pull request looked like it was waiting on CI that had
+  # never been asked to run.
+  #
+  # Dropping the filter rather than widening it to a branch namespace: a filter
+  # that has to be kept in step with how anybody happens to name a branch is a
+  # filter that will be wrong again, and the rulebook's answer to exactly this is
+  # to gate at the JOB level instead, where a skipped job still REPORTS. That
+  # gating is already here -- `scripts/ci-scope.sh` decides it and every job
+  # consults it -- so the filter was buying nothing that the jobs do not already
+  # decide for themselves.
   pull_request:
-    branches: [master]
   # The merge queue's event, and the whole reason #351 was not a ruleset
   # checkbox. Without this row every required context in this file would simply
   # never report inside a queue, and a queued pull request would sit there
