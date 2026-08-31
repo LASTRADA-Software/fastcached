@@ -212,6 +212,15 @@ class RaftDriver
     {
         std::vector<NodeId> members; ///< The member set this node operates under.
         LogIndex commitIndex;        ///< How far its log is committed.
+
+        /// The term it is operating in.
+        ///
+        /// Taken under the same lock as the other two, which is the point: a caller
+        /// comparing a log index it remembers against a commit index has to know
+        /// whether the two belong to the same term, and reading the term separately
+        /// would let leadership move between the reads and produce a triple that
+        /// never existed.
+        Term term;
     };
 
     /// @return The member set and commit index, read together.
