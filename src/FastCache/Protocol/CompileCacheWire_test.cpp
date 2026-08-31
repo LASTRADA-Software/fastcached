@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -1027,4 +1028,71 @@ TEST_CASE("The size ceiling is decided before the credential, not after", "[wire
                              .authRequired = true,
                              .credentialAccepted = false })
           == PrePayloadDecision::PayloadTooLarge);
+}
+
+TEST_CASE("Every verb refuses at its own declared ceiling, not the listener's", "[wire][prepayload]")
+{
+    // #284. The 64 KiB control ceiling used to be a property of the LISTENER, so it
+    // applied uniformly to every verb arriving on it -- wrong in both directions once
+    // surfaces share a port: a scheduler verb got 64 KiB of headroom it never needs,
+    // and a compile that legitimately carries megabytes could not share the listener
+    // at all. A merged port cannot have one ceiling, which is why this is #290's
+    // prerequisite.
+    //
+    // Driven off `OpTable` rather than a list of verbs, so a verb added later is
+    // covered by this case without anybody remembering to extend it.
+    constexpr std::size_t SessionCap = 256ULL * 1024ULL * 1024ULL;
+
+    for (auto const& row: OpTable)
+    {
+        INFO("verb " << row.name);
+        auto const opRaw = static_cast<std::uint8_t>(row.code);
+        auto const cap = OpPayloadCap(opRaw, SessionCap);
+
+        // A declared length is a `uint32_t` on the wire, so the ceiling has to be
+        // expressible as one -- which is also why a session cap above 4 GiB could
+        // never be reached by a frame that says how big it is.
+        REQUIRE(cap <= std::numeric_limits<std::uint32_t>::max() - 1);
+
+        auto const at = [&](std::size_t declared) {
+            return DecidePrePayload({ .opRaw = opRaw,
+                                      .declaredLength = static_cast<std::uint32_t>(declared),
+                                      .sessionCap = SessionCap,
+                                      .authRequired = false,
+                                      .credentialAccepted = false });
+        };
+
+        // Exactly at the ceiling is allowed; one byte over is not. Asserting the
+        // boundary rather than "a big number is refused" is what pins the ceiling to
+        // this verb's own row -- a listener-wide bound would pass the second half for
+        // every verb while getting the first half wrong for the tight ones.
+        CHECK(at(cap) == PrePayloadDecision::Serve);
+        CHECK(at(cap + 1) == PrePayloadDecision::PayloadTooLarge);
+
+        // And the row's declared bound is what produced that ceiling, rather than the
+        // session cap standing in for it.
+        if (row.maxPayload.IsBounded())
+        {
+            CHECK(cap == row.maxPayload.Bytes());
+            CHECK(cap < SessionCap);
+        }
+        else
+        {
+            CHECK(cap == SessionCap);
+        }
+    }
+}
+
+TEST_CASE("A verb's ceiling never exceeds what the operator configured", "[wire][prepayload]")
+{
+    // The per-verb bound is an ADDITIONAL restriction, never a licence to exceed the
+    // session cap. Checked with a session cap far below every row's own bound, which
+    // is the configuration an operator lowering the limit actually creates.
+    constexpr std::size_t TinySession = 512;
+
+    for (auto const& row: OpTable)
+    {
+        INFO("verb " << row.name);
+        CHECK(OpPayloadCap(static_cast<std::uint8_t>(row.code), TinySession) <= TinySession);
+    }
 }
