@@ -302,8 +302,22 @@ struct NodeConfig
     /// cache, and `NoUpstream` is what that configuration gets.
     std::string upstream;
 
+    /// The credential this node PRESENTS, from `--requirepass`.
+    ///
+    /// Outbound only: it is what the launcher half of this binary sends to an
+    /// upstream `fastcached`, and what a worker sends when it registers. What this
+    /// node REQUIRES of its own callers is `--scheduler-token-file`, and the two are
+    /// deliberately separate settings -- a node that presented and demanded the same
+    /// secret would make every client of its cache a peer of its scheduler.
+    ///
+    /// There is no username beside it. One was declared here, parsed by nothing and
+    /// read by nothing, and it is removed rather than left: a dead field next to a
+    /// live credential is what somebody later wires up on the assumption it was
+    /// always meant to work, and a half-wired username on an authentication path is
+    /// worse than no username at all
+    /// ([#385](https://github.com/LASTRADA-Software/fastcached/issues/385)). If one
+    /// is ever wanted it arrives as a row in `NodeOptions()`, like everything else.
     std::string token;
-    std::string user;
 
     /// This node's identity in the cluster, or empty to run without consensus.
     ///
