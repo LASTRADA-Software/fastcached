@@ -763,9 +763,60 @@ RaftOutput RaftNode::Tick(TimePoint now)
         return output;
     }
 
+    // Check quorum, and it is the leader's own tick that has to ask it (#437).
+    //
+    // `HasQuorumContact` already existed and was reachable from exactly one place:
+    // deciding whether to refuse somebody else's pre-vote. So a leader that had lost
+    // contact with a quorum KNEW it, and used that knowledge only on another node's
+    // behalf. Its own role never moved, and every surface built on the role went on
+    // treating it as the leader -- two nodes answering `--cluster-status`, a
+    // `--cluster-set` reported `accepted` that could never commit, the fleet page
+    // served with a 200 by a node that no longer leads, and a `NotLeader` redirect
+    // pointing at it.
+    //
+    // Raft does not require this for safety -- a partitioned leader commits nothing,
+    // because committing needs the quorum it has lost. It is required for anything
+    // that READS from a leader, which is most of what this daemon exposes.
+    if (!HasQuorumContact(now))
+    {
+        RelinquishLeadership(now, output);
+        return output;
+    }
+
     _heartbeatDeadline = now + _config.heartbeatInterval;
     ReplicateToPeers(output);
     return output;
+}
+
+void RaftNode::RelinquishLeadership(TimePoint now, RaftOutput& output)
+{
+    // The term is deliberately UNTOUCHED, and so is `_votedFor`. This is not
+    // `StepDown`, which exists for a higher term arriving and resets both: staying
+    // in the same term while clearing the vote would let this node vote a second
+    // time in a term it has already voted in, which is a safety violation rather
+    // than a tidiness question. Bumping the term instead would be worse still --
+    // this node would return with an inflated term and depose a leader that is
+    // working, which is the disruption pre-vote exists to prevent.
+    //
+    // Nothing durable moves, so there is no `MarkPersist`: role is not durable state
+    // (a recovered node comes back a follower whatever it was), and neither the term
+    // nor the vote has changed.
+    (void) output;
+
+    _role = Role::Follower;
+
+    // It does not know who leads -- that is the whole finding. Leaving the old value
+    // would have it redirect clients to itself.
+    _knownLeader.reset();
+
+    // A term this node no longer leads, so its per-follower bookkeeping is a record
+    // of one. Same argument as `StepDown` makes.
+    _votesGranted.clear();
+    _nextIndex.clear();
+    _matchIndex.clear();
+    _followerContact.clear();
+
+    ArmElectionTimer(now);
 }
 
 LogIndex RaftNode::LatestConfigurationIndex() const

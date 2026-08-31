@@ -367,6 +367,22 @@ class RaftNode
     /// @param output Where the report and any durable state are collected.
     void StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output);
 
+    /// Give up leadership without changing the term, having lost quorum contact.
+    ///
+    /// Distinct from `StepDown`, which exists for a HIGHER TERM arriving and resets
+    /// the term and the vote with it. Here the term is unchanged, so the vote must
+    /// be left alone too — clearing it would let this node vote a second time in a
+    /// term it has already voted in. Bumping the term instead would have it return
+    /// with an inflated one and depose a working leader, which is what pre-vote
+    /// exists to prevent.
+    ///
+    /// Nothing durable moves: role is not durable state, and neither the term nor
+    /// the vote changes.
+    /// @param now When it happened, for the election timer.
+    /// @param output Unused; taken so the shape matches the other transitions and a
+    ///               later one that does need to persist cannot forget it.
+    void RelinquishLeadership(TimePoint now, RaftOutput& output);
+
     /// Win the election and start heartbeating.
     void BecomeLeader(TimePoint now, RaftOutput& output);
 
