@@ -362,7 +362,7 @@ TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the p
     {
         // The early route, with no frame in hand at all: this is what the server can
         // ask before it has read a byte of payload.
-        auto const refusal = responder.RefusePeer("10.0.0.1");
+        auto const refusal = responder.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch));
         REQUIRE(refusal.has_value());
         CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::NotAMember);
 
@@ -378,8 +378,8 @@ TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the p
         // The control: a predicate that refused everyone would satisfy the section
         // above while making the node's own cache unreachable, which is the failure
         // #229 already paid for.
-        CHECK_FALSE(responder.RefusePeer("10.0.0.7").has_value());
-        CHECK_FALSE(responder.RefusePeer("127.0.0.1").has_value());
+        CHECK_FALSE(responder.RefusePeer("10.0.0.7", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+        CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
         CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 0);
     }
 }

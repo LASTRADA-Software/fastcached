@@ -426,7 +426,7 @@ namespace
                 // out (#285, #377).
                 //
                 // The predicate belongs to the responder; this only asks it earlier.
-                if (auto refusal = state->responder.RefusePeer(peer); refusal.has_value())
+                if (auto refusal = state->responder.RefusePeer(peer, decoded->opRaw); refusal.has_value())
                 {
                     // Answered first, then drained, exactly as the two refusals below
                     // and above are: draining first would make the reply contingent on
@@ -440,7 +440,7 @@ namespace
 
                 // The credential, decided from the header and this connection's state
                 // (#289). A SECOND question at the same point rather than a wider
-                // first one: `RefusePeer` answers on the peer alone, which is what
+                // first one: `RefusePeer` answers on the peer and the verb, which
                 // lets it be asked before a frame exists; this needs the verb, the
                 // declared length and per-connection state, so folding them together
                 // would make that predicate's name stop describing it.

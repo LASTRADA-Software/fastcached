@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -97,13 +98,34 @@ class IFrameResponder
     /// nothing, which is the shape this codebase records as reopening a hole by
     /// omission. A surface with no peer policy returns `std::nullopt` and says so.
     ///
+    /// **Takes the verb as well as the peer, since #290.** Each surface today serves
+    /// one verb family, so the surface *is* the policy and every implementation
+    /// ignores `opRaw` -- nothing observable changes. It is here because a merged
+    /// 0xFC listener cannot express its own acceptance criterion without it: *a cache
+    /// FETCH from another machine is refused while a compile from that same peer
+    /// succeeds*. Same peer, two verbs, two answers, and a peer-only predicate has
+    /// nowhere to put the difference.
+    ///
+    /// The verb costs nothing to supply. `ServeConnection` decodes the request header
+    /// well before it asks this, so the opcode is already in hand at the one call
+    /// site -- the earlier note that a peer-only shape is what "lets it be asked
+    /// before a frame exists" described an option nobody takes, and it was the
+    /// sentence that would have argued against this.
+    ///
+    /// Raw rather than an `Op`, for the reason `DecidePrePayload` is total over every
+    /// byte value: an unknown opcode still has to be refusable, and a policy that
+    /// could only be asked about verbs this build knows would admit the ones it does
+    /// not.
+    ///
     /// @param peer The peer's host, as `Answer` receives it.
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
     /// @return The encoded refusal to send back, or nullopt to go on and read the
     ///         payload. A refusal is answered as a **reply and a resynchronization**
     ///         by the caller -- never a close, because the frame declared its length
     ///         and a peer that cannot tell a policy refusal from a dead host retries
     ///         forever.
-    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const = 0;
+    [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+                                                                           std::uint8_t opRaw) const = 0;
 
     /// Does this surface require a credential before its gated verbs?
     ///
