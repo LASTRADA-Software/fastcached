@@ -825,6 +825,20 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
         }
 
+        # Bound, then surveyed. The first is prompt by construction since #365; the
+        # second is the include-tree walk, and it is what the next node must not be
+        # started on top of. "serving <compiler> as <fingerprint>" is logged once the
+        # survey has an identity -- for a toolchain pinned with `<name>=<compiler>`
+        # that is immediate, since an override is never probed.
+        function Wait-ForNodeUp([string]$name, $proc, [int]$bindSeconds, [int]$surveySeconds) {
+            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $bindSeconds "$name to bind its compile port" $proc)) {
+                throw "$name did not bind its compile port"
+            }
+            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc)) {
+                throw "$name did not finish its toolchain survey"
+            }
+        }
+
         # The scheduler's own worker serves a fingerprint no client asks for, so every
         # lease has to land on worker A or worker B.
         $schedProc = Start-NodeIn "sched" @(
@@ -847,18 +861,30 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # Serialising costs nothing this test is about. The collision it exists to
         # catch happens when two workers COMPILE at once, which is arranged below --
         # not when they start.
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "sched.err.log") "compile node ready" 180 "the scheduler node to come up" $schedProc)) {
-            throw "the scheduler node did not start"
-        }
+        #
+        # What that serialisation is asked OF matters, and #365 silently took it
+        # away. It used to rest on "compile node ready", which then meant SURVEYED --
+        # a node fingerprinted before it bound. Since #365 a node binds and serves
+        # first, so that same line means only "bound", every node reached it in about
+        # a second, and all three walked the same include tree AT ONCE. The rate
+        # measured on the clangcl runner fell to 2-5 file/s against the ~30 file/s
+        # #354 measured with one walker, the 600 s budget #428 had just moved here
+        # was blown at 5136 files, and an unrelated PR was ejected from the merge
+        # queue for it. Waiting on the survey is what the paragraph above always
+        # meant; it now has to say so explicitly, because the line it used to rely
+        # on no longer carries it.
+        #
+        # Both waits are kept, and separately: bind and survey are different stages
+        # with different costs, and a fixture that folds them cannot say which one
+        # stalled.
+        Wait-ForNodeUp "sched" $schedProc 180 120
 
         $workerAProc = Start-NodeIn "workerA" @(
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$workerA", "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerA.err.log") "compile node ready" 120 "worker A to bind its compile port" $workerAProc)) {
-            throw "worker A did not start"
-        }
+        Wait-ForNodeUp "workerA" $workerAProc 120 600
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $workerBProc = Start-NodeIn "workerB" @(
@@ -866,24 +892,22 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             "--port=$workerB", "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
-        if (-not (Wait-ForLogLine (Join-Path $phaseDir "workerB.err.log") "compile node ready" 120 "worker B to bind its compile port" $workerBProc)) {
-            throw "worker B did not start"
-        }
+        Wait-ForNodeUp "workerB" $workerBProc 120 600
 
         # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
         # logging "compile node ready" says its own port is bound, not that the
         # scheduler has heard from it -- dispatching on that races the first
         # heartbeat and is refused NoWorker.
         #
-        # This wait is where the toolchain walk now lives, and the budget moved here
-        # with it (#365). A node used to fingerprint before binding, so "compile node
-        # ready" meant "surveyed", and the 300 s belonged on the wait above -- which
-        # is where #354 was measured blowing through it. Since #365 the node binds and
-        # serves first and registers only once the walk yields a REAL fingerprint, so
-        # the bind is prompt and the wait for registration is the one that can take
-        # minutes on a cold machine. Leaving 120 s here would simply move the same
-        # timeout to a new line and make it look like a different bug.
-        $deadline = (Get-Date).AddSeconds(600); $regs = 0
+        # The toolchain walk is NOT in this wait. #428 moved a 600 s budget here on
+        # the reasoning that the walk had moved with it, which was half right: the
+        # walk did move past the bind, but each node is waited for individually above
+        # and is surveyed before the next one starts, so by the time control reaches
+        # this line all three identities exist. What remains is the first heartbeat,
+        # which is a round trip. A budget sized for the walk would hide a scheduler
+        # that never hears a registration behind ten minutes of nothing.
+        $registrationBudget = 120
+        $deadline = (Get-Date).AddSeconds($registrationBudget); $regs = 0
         while ((Get-Date) -lt $deadline -and $regs -lt 3) {
             Start-Sleep -Milliseconds 700
             try {
@@ -894,7 +918,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             } catch { }
         }
         if ($regs -lt 3) {
-            Write-Host "waited 600s for three worker registrations at the scheduler; saw $regs (all three nodes had bound their ports, so this covers the toolchain walk and the first heartbeat)"
+            Write-Host "waited ${registrationBudget}s for three worker registrations at the scheduler; saw $regs (all three nodes had bound their ports AND finished their toolchain surveys, so this covers the first heartbeat only)"
             foreach ($n in @("sched", "workerA", "workerB")) {
                 Write-Host "--- $n"; Get-Content (Join-Path $phaseDir "$n.err.log") -Tail 20 -ErrorAction SilentlyContinue
             }
