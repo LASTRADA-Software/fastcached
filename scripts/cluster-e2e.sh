@@ -664,6 +664,38 @@ done
     fail "the admitted node never learned who leads, so it was never replicated to: ${answer}"
 echo "cluster E2E: an admitted node is replicated to, which is being counted, and it names ${leader_endpoint}"
 
+# And that n4 counts ITSELF a member, which is a different fact from either half
+# above and is the one #388 turns on.
+#
+# Admission is two steps: the ClusterState record commits first, then the leader
+# proposes counting the node. Everything asserted above is satisfied by the FIRST
+# step alone -- a node that received the record knows who leads and will redirect
+# to it, and the leader replicates to it either way. A node that never adopted the
+# CONFIGURATION looks identical from outside, and is fatal: `HasCluster()` is false,
+# so `NextDeadline()` answers `TimePoint::max()`, so it campaigns in no election and
+# grants no pre-vote. The cluster then cannot re-elect once one more member goes.
+#
+# Asked of n4's log rather than over the wire, and that is a compromise rather than
+# a preference -- `wait_for_formation` explains why asking beats scraping. There is
+# no surface that answers it: `--cluster-status` reports the FLEET's member record,
+# not the quorum, and only a leader answers it at all, so the one node whose view is
+# needed is the one that redirects. #435 is that surface; until it exists this line
+# is what an operator has too.
+adopted=0
+for _ in $(seq 1 150); do
+    if grep -q "consensus: this node counts [0-9]* member(s)" "${workdir}/n4.log" 2>/dev/null; then
+        adopted=1
+        break
+    fi
+    sleep 0.2
+done
+if [[ "$adopted" -ne 1 ]]; then
+    echo "n4 never adopted a configuration. What it last said about its own quorum:"
+    grep -E "consensus: this node counts" "${workdir}/n4.log" 2>/dev/null || echo "  (nothing -- it never reported one at all)"
+    fail "the admitted node never counted itself a member, so it can vote in no election"
+fi
+echo "cluster E2E: the admitted node counts itself a member: $(grep -o "counts [0-9]* member(s)" "${workdir}/n4.log" | tail -1)"
+
 # --- 5. a member can be removed ----------------------------------------------
 
 answer="$(cluster "$leader_endpoint" --cluster-forget=n3)"
