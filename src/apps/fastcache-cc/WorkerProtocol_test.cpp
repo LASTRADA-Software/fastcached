@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <optional>
 #include <ranges>
@@ -631,6 +632,123 @@ TEST_CASE("A payload that does not expand to its declared size is refused as cor
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::MalformedFrame);
     CHECK(EnvelopeCounts(fix.metrics) == OnlyRaised({ EnvelopeError::Corrupt }));
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+}
+
+TEST_CASE("Every frame-level refusal moves its own counter", "[worker-protocol][metrics]")
+{
+    // The cases above assert the CODE, which is what a client acts on. This asserts
+    // the counter, which is what an operator acts on -- and six of these refusals
+    // used to answer the right code while incrementing nothing, so a port under a
+    // probe looked on `/metrics` exactly like a port nobody was talking to (#327).
+    //
+    // Driven as a table because the property is uniform and the point is coverage:
+    // one row per frame-level refusal, each asserting that ITS counter moved and
+    // that the others did not. A test that only checked "some counter rose" would
+    // pass with every refusal wired to one shared counter, which is the arrangement
+    // this split exists to prevent.
+    using Counter = IMetricsSink::Counter;
+
+    struct Row
+    {
+        std::string_view what;
+        Wire::ErrorCode code;
+        Counter counter;
+        std::function<std::vector<std::byte>()> frame;
+    };
+
+    auto const truncated = [] {
+        auto frame = CompileFrame();
+        frame.resize(Wire::RequestHeaderSize + 2);
+        return frame;
+    };
+    auto const badVersion = [] {
+        auto frame = CompileFrame();
+        frame[1] = std::byte { 99 };
+        return frame;
+    };
+    auto const unknownOp = [] {
+        auto frame = CompileFrame();
+        frame[2] = std::byte { 0xEE };
+        return frame;
+    };
+    // The production encoders, not a frame this file assembled: what is under test is
+    // which counter a refusal moves, and a hand-built frame could be refused for a
+    // reason the real encoder would never produce.
+    auto const authVerb = [] {
+        return Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s" });
+    };
+    auto const cacheVerb = [] {
+        return Wire::EncodeFetch("k");
+    };
+    auto const badPayload = [] {
+        // A COMPILE frame carrying one stray byte: it reaches the verb, so it is not a
+        // truncation, and then fails to split into fields. That is the second
+        // `MalformedFrame` site and the whole reason it needs a counter of its own.
+        //
+        // The DECLARED length has to be rewritten to match, and forgetting to is how
+        // this fixture was wrong on its first run: shortening the bytes while the
+        // header still promised the original payload produced a frame refused as
+        // TRUNCATED, so the case passed its code assertion (both answer
+        // `MalformedFrame`) and moved the neighbouring counter. Which is the exact
+        // confusion the two counters exist to end, arriving in the test written to
+        // prove they are separate.
+        auto frame = CompileFrame();
+        frame.resize(Wire::RequestHeaderSize + 1);
+        constexpr std::size_t LengthOffset = 3;
+        frame[LengthOffset + 0] = std::byte { 0 };
+        frame[LengthOffset + 1] = std::byte { 0 };
+        frame[LengthOffset + 2] = std::byte { 0 };
+        frame[LengthOffset + 3] = std::byte { 1 };
+        return frame;
+    };
+
+    std::array<Row, 6> const rows {
+        Row { .what = "an unsupported version",
+              .code = Wire::ErrorCode::UnsupportedVersion,
+              .counter = Counter::WorkerFramesRefusedUnsupportedVersion,
+              .frame = badVersion },
+        Row { .what = "a truncated frame",
+              .code = Wire::ErrorCode::MalformedFrame,
+              .counter = Counter::WorkerFramesRefusedTruncated,
+              .frame = truncated },
+        Row { .what = "an unknown opcode",
+              .code = Wire::ErrorCode::UnknownOpcode,
+              .counter = Counter::WorkerFramesRefusedUnknownOpcode,
+              .frame = unknownOp },
+        Row { .what = "AUTH on a worker",
+              .code = Wire::UnimplementedVerb,
+              .counter = Counter::WorkerFramesRefusedUnimplementedVerb,
+              .frame = authVerb },
+        Row { .what = "a verb served on another surface",
+              .code = Wire::ErrorCode::DispatchNotPermitted,
+              .counter = Counter::WorkerFramesRefusedNotPermitted,
+              .frame = cacheVerb },
+        Row { .what = "an undecodable payload",
+              .code = Wire::ErrorCode::MalformedFrame,
+              .counter = Counter::WorkerFramesRefusedMalformedPayload,
+              .frame = badPayload },
+    };
+
+    for (auto const& row: rows)
+    {
+        CAPTURE(row.what);
+        Fixture fix;
+        auto const frame = row.frame();
+        auto const answer = fix.worker.Answer(frame);
+        REQUIRE(answer.has_value());
+        CHECK(ErrorOf(Unwrap(answer)) == row.code);
+        CHECK(fix.metrics.Read(row.counter) == 1);
+
+        // And nothing else in the family moved. This is the half that matters: two
+        // of these rows share `MalformedFrame` on the wire, so a test asserting only
+        // the code would pass with both wired to one counter -- and an operator
+        // would then be unable to tell a truncated frame (a framing fault, or a
+        // hostile peer) from an undecodable payload (a version mismatch between two
+        // ends that agree on the framing).
+        for (auto const& other: rows)
+            if (other.counter != row.counter)
+                CHECK(fix.metrics.Read(other.counter) == 0);
+    }
 }
 
 TEST_CASE("A frame shorter than its declared payload is refused", "[worker-protocol]")

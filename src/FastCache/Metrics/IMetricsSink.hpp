@@ -210,6 +210,43 @@ class IMetricsSink
         WorkerJobsRefusedNotAMember,
         WorkerJobsRefusedEndpointBusy,
 
+        /// Frames refused before a job existed at all.
+        ///
+        /// A family of their own rather than more `WorkerJobsRefused*`, because they
+        /// answer a different question: the job refusals describe work this worker
+        /// could not do, while these describe a frame it could not read. A rise in
+        /// the job family points at the fleet's configuration; a rise here points at
+        /// what is on the wire -- a peer built against another version, a broken
+        /// framing, or something probing the port.
+        ///
+        /// Every refusal `WorkerProtocol` can answer with has one, and
+        /// `worker-refusals-counted` is what keeps that true: a refusal answered on
+        /// the wire while nothing rises is how a port being probed looks, on
+        /// `/metrics`, exactly like a port nobody is talking to (#327).
+
+        /// The request named a protocol version outside this build's range.
+        WorkerFramesRefusedUnsupportedVersion,
+        /// The frame was shorter than the payload length its own header declared.
+        ///
+        /// Its own counter although it shares `MalformedFrame` on the wire with
+        /// `WorkerFramesRefusedMalformedPayload` below, and the split is the point:
+        /// a truncated frame is a framing or transport fault, or a peer sending
+        /// deliberate nonsense, while a payload that will not decode is a version or
+        /// encoding mismatch between two ends that agree on the framing. One code,
+        /// because a client acts on both the same way; two counters, because an
+        /// operator does not.
+        WorkerFramesRefusedTruncated,
+        /// The opcode is in no row of `OpTable`.
+        WorkerFramesRefusedUnknownOpcode,
+        /// A verb this endpoint knowingly does not implement, such as `AUTH` on a
+        /// worker that checks no credential. Distinct from the opcode being unknown:
+        /// this one is a verb that exists and is not served here.
+        WorkerFramesRefusedUnimplementedVerb,
+        /// A verb served elsewhere on this node, sent to the compile surface.
+        WorkerFramesRefusedNotPermitted,
+        /// The payload did not decode into the fields its verb requires.
+        WorkerFramesRefusedMalformedPayload,
+
         /// Jobs refused while opening the request's codec envelope, one counter per
         /// reason — the same split, and for the same argument, that `EnvelopeError`
         /// makes one layer down.

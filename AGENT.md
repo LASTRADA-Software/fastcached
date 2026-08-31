@@ -576,7 +576,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
 - A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every
   enumerator; the renderer walks the table rather than a hand-picked list.
-- A refusal's wire code and its counter are one row — one fact, two audiences.
+- A refusal's wire code and its counter are one row — one fact, two audiences. And a
+  refusal answered while NOTHING rises is a probed port that looks unused: `Refuse`
+  takes the row, so there is no argument to pass a bare `ErrorCode` to, and every
+  refusal on the surface goes through it — including the ones that already counted,
+  which is what makes `worker-refusals-counted` exact rather than a proximity
+  heuristic. The row is the REFUSAL, not the code: two share `MalformedFrame` and must
+  not share a counter, so a table keyed on the code cannot hold them.
 - Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
   makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
   (`SchedulerService::Register`) and never repaired by a renderer — and the

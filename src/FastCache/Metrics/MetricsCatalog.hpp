@@ -208,6 +208,37 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "worker's in-flight byte budget. Distinct from no_slot: slots were "
               "free and memory was not, so more slots would not have helped.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnsupportedVersion,
+      .prometheusName = "fastcache_worker_frames_refused_unsupported_version_total",
+      .help = "Frames refused for naming a protocol version this build does not "
+              "serve: a peer built against another release.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedTruncated,
+      .prometheusName = "fastcache_worker_frames_refused_truncated_total",
+      .help = "Frames shorter than the payload their own header declared: a framing "
+              "or transport fault, or a peer sending nonsense. Never sum with "
+              "malformed_payload -- they share a wire code and nothing else.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnknownOpcode,
+      .prometheusName = "fastcache_worker_frames_refused_unknown_opcode_total",
+      .help = "Frames naming an opcode this build has no row for.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnimplementedVerb,
+      .prometheusName = "fastcache_worker_frames_refused_unimplemented_verb_total",
+      .help = "Frames naming a verb that exists and is not served here, such as AUTH "
+              "on a worker that checks no credential.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedNotPermitted,
+      .prometheusName = "fastcache_worker_frames_refused_not_permitted_total",
+      .help = "Frames naming a verb this node serves on another surface: a client "
+              "reached the compile port with a cache or scheduler request.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload,
+      .prometheusName = "fastcache_worker_frames_refused_malformed_payload_total",
+      .help = "Frames whose payload did not decode into the fields its verb "
+              "requires: a version or encoding mismatch between two ends that agree "
+              "on the framing.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
       .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",
       .help = "Jobs refused because the request's codec envelope could not be "
