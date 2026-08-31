@@ -105,6 +105,64 @@ if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
+# How a `cmake -P` check reports FAILURE.
+#
+# It cannot do it with an exit code. `message(FATAL_ERROR)` in script mode prints
+# `CMake Error ...` and then exits **0** on CMake 3.28 -- measured, not inferred:
+# 3.28.3 exits 0, 4.3.1 exits 1. So on this project's declared minimum, and on
+# every host whose CMake predates the change, `ctest` sees a clean exit and marks
+# the check PASSED however loudly it just objected. Thirteen checks were
+# registered that way, several of them named in AGENT.md as the one thing
+# standing behind a rule that has already been a bug.
+#
+# The fact was half-known: the paragraph below says a `-P` script cannot choose
+# its own exit code before 3.29, and concludes SKIP_REGULAR_EXPRESSION for the
+# skip direction. The same sentence decides the FAIL direction and nobody carried
+# it there -- which is the failure this file keeps recording in other people's
+# code, arriving in its own.
+#
+# So the verdict is read from the output, which every CMake version produces
+# identically. One spelling, here, rather than thirteen literals: a pattern that
+# drifts between checks is a check that stops matching without saying so.
+# `script-check-canary` below is a deliberately failing script that must be seen
+# to fail, and `script-check-signals` refuses a registration that omits this.
+set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error")
+
+# The canary: a check that must be seen to fail. See scripts/script-check-canary.cmake
+# for why a property needs one. WILL_FAIL inverts the verdict, so this reports
+# green exactly while the mechanism above works, and red the moment it does not.
+#
+# In the default set with the checks it guards, and cheap for the same reason
+# they are: it starts nothing and reads nothing.
+add_test(
+    NAME "script-check-canary"
+    COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/scripts/script-check-canary.cmake"
+)
+set_tests_properties("script-check-canary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    WILL_FAIL TRUE
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And the omission half. The canary proves the mechanism works; it says nothing
+# about whether a given registration USES it, and a check registered without the
+# property is inert in exactly the way all thirteen were. Derived from this file
+# rather than from a list restated in the checker -- a second copy of the set is
+# not a cross-check, it is a second thing to be wrong.
+add_test(
+    NAME "script-check-signals"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-script-check-signals.cmake"
+)
+set_tests_properties("script-check-signals" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it
@@ -133,6 +191,7 @@ add_test(
 # decoration. See the script header. TIMEOUT 60 rather than CTest's 1500s
 # default: a wedged git should report in a minute, not stall the suite.
 set_tests_properties("repository-hygiene" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 60
@@ -162,6 +221,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-net-boundary.cmake"
 )
 set_tests_properties("net-boundary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -190,6 +250,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-test-names.cmake"
 )
 set_tests_properties("test-name-hygiene" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -219,6 +280,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-target-file-guards.cmake"
 )
 set_tests_properties("target-file-guards" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -244,6 +306,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-node-config-reference.cmake"
 )
 set_tests_properties("node-config-reference" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -272,6 +335,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-scope.cmake"
 )
 set_tests_properties("tsan-scope-hygiene" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -440,6 +504,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-sccache-backend-caveat.cmake"
 )
 set_tests_properties("sccache-backend-caveat" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -474,6 +539,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-service-accounts.cmake"
 )
 set_tests_properties("service-accounts" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
 )
@@ -509,6 +575,7 @@ foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node 
                 -P "${CMAKE_SOURCE_DIR}/scripts/check-utf8-argv.cmake"
         )
         set_tests_properties("utf8-argv-${_utf8ArgvTarget}" PROPERTIES
+            FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
             LABELS "hygiene"
             TIMEOUT 60
         )
@@ -548,6 +615,7 @@ add_test(
 # 0 — see the script header for why the sandbox it needs is POSIX-only, and
 # repository-hygiene above for why a `cmake -P` script cannot return 77.
 set_tests_properties("compile-cache-autoinstall" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 600
@@ -602,6 +670,7 @@ add_test(
 # for a toolchain nobody set up. repository-hygiene above says why a `cmake -P`
 # script cannot return 77 instead.
 set_tests_properties("compile-cache-caveat" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 600
@@ -623,6 +692,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-install.cmake"
 )
 set_tests_properties("compile-cache-install" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 600
@@ -648,6 +718,7 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-staging.cmake"
 )
 set_tests_properties("compile-cache-daemon-staging" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 600

@@ -684,6 +684,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   reason it was chosen: the gate configured only when `CMakeCache.txt` was ABSENT, so a
   tree kept the first clang-tidy it ever found and re-running the gate could not repair
   it. Check the pin against the cache, not only pass it. `ctest -R local-gate-selftest`.
+- A `cmake -P` check **cannot fail its own test**: `message(FATAL_ERROR)` prints
+  `CMake Error` and exits **0** on 3.28, this project's declared minimum. Thirteen
+  hygiene checks reported PASSED whatever they found. The verdict is read from the
+  output (`FAIL_REGULAR_EXPRESSION`), one spelling defined once — and a failure
+  signal that is a *property* needs both `script-check-canary` (a script that must
+  be seen to fail, `WILL_FAIL`) and `script-check-signals` (no registration omits
+  it). The fact was already written down for the SKIP direction and never carried
+  to the FAIL one.
 - Never silence clang-tidy with `NOLINT` — fix the source.
 - A return type is not part of a function's mangled name on Linux, so two
   functions differing only in return type silently collide.
