@@ -985,6 +985,46 @@ TEST_CASE("An expansion no worker could ever hold is the decoder's refusal, not 
     }
 }
 
+TEST_CASE("The frame-level payload ceiling is counted, and not as an envelope refusal", "[worker-server][metrics]")
+{
+    // #326. The refusal itself was always right on the wire; nothing rose.
+    //
+    // Why this one matters more than an ordinary missing counter: it is the CHEAPEST
+    // probe there is. The frame-level check reads a header and refuses -- where the
+    // envelope refusals, which #298 gave counters and the operator documentation
+    // tells people to alert on, need a whole frame to have been sent and read. So an
+    // operator following that documentation watches a client hammer this port with
+    // oversized declarations, sees every one refused correctly, and reads a flat
+    // graph as "nobody is talking to us".
+    //
+    // A header declaring more than the surface accepts, and NOTHING after it: the
+    // refusal happens before a payload is read, which is the property that makes it
+    // cheap and the reason its counter is the one that must move.
+    Fixture fix;
+    auto frame = CompileFrame();
+    frame.resize(Wire::RequestHeaderSize);
+    constexpr std::size_t LengthOffset = 3;
+    auto const oversized = static_cast<std::uint32_t>(Node::WorkerMaxRequestBytes) + 1U;
+    frame[LengthOffset + 0] = static_cast<std::byte>((oversized >> 24U) & 0xFFU);
+    frame[LengthOffset + 1] = static_cast<std::byte>((oversized >> 16U) & 0xFFU);
+    frame[LengthOffset + 2] = static_cast<std::byte>((oversized >> 8U) & 0xFFU);
+    frame[LengthOffset + 3] = static_cast<std::byte>(oversized & 0xFFU);
+
+    CHECK(ErrorOf(ServeOne(fix, frame, /*slots=*/2)) == Wire::ErrorCode::PayloadTooLarge);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 1);
+
+    // And NOT under the envelope series. That is the whole point of the split: the
+    // two refusals mean different things -- one is a header this surface will not
+    // accept, the other is a frame that arrived and declared an expansion it may not
+    // have -- and an operator alerting on the wrong one sees nothing.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEnvelopeDeclaredTooLarge) == 0);
+
+    // Nor as a busy signal. A worker with free slots refusing an oversized header is
+    // not a worker under load, and reporting it as one sends an operator to add
+    // capacity that would change nothing.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 0);
+}
+
 TEST_CASE("The lease check a node applies comes from its configuration", "[worker-server][lease]")
 {
     // The wiring assertion, and this repository names the failure it exists to catch:

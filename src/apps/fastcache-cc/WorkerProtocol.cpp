@@ -85,24 +85,6 @@ namespace
     ///
     /// `Auth`, because a `--requirepass` worker was refused at `REGISTER` and never
     /// joined the fleet at all -- absent rather than idle, which is harder to notice.
-    /// One refusal this surface can answer with: the wire code a client acts on and
-    /// the counter an operator watches, as ONE row.
-    ///
-    /// The row is the REFUSAL, not the code, and that distinction is load-bearing:
-    /// two of the rows below both answer `MalformedFrame` and must not share a
-    /// counter, because a truncated frame and an undecodable payload are different
-    /// diagnoses. A table keyed on the code could not hold both (#327).
-    ///
-    /// `RefusedVerb` in `CompileCacheWire.hpp` deliberately carries no counter column
-    /// and cannot: that header is compiled into `fastcache-cc`, which does not link
-    /// `FastCache`, so `IMetricsSink::Counter` is not reachable from it. The pairing
-    /// therefore lives here, in the surface that owns the sink.
-    struct SurfaceRefusal
-    {
-        Wire::ErrorCode code;          ///< What the client is told.
-        IMetricsSink::Counter counter; ///< What the operator sees rise.
-    };
-
     constexpr SurfaceRefusal UnsupportedVersion {
         .code = Wire::ErrorCode::UnsupportedVersion,
         .counter = IMetricsSink::Counter::WorkerFramesRefusedUnsupportedVersion,
@@ -186,28 +168,7 @@ LeaseValidator UncheckedLeaseValidator()
     };
 }
 
-/// Answer a refusal, and record it.
-///
-/// The ONE way this surface refuses, which is the whole point rather than a
-/// convenience: six refusals here used to answer on the wire and increment nothing,
-/// and a seventh would have joined them by omission. A refusal answered while nothing
-/// rises is how a port being probed looks, on `/metrics`, exactly like a port nobody
-/// is talking to (#327).
-///
-/// Taking a ROW rather than a code is what makes the counter impossible to forget:
-/// there is no argument to pass a bare `ErrorCode` to.
-///
-/// **Every refusal in this file goes through here**, including the three that already
-/// counted -- the lease refusal, the envelope error and the job refusal -- which carry
-/// rows of their own tables and now convert them rather than restating the pair. That
-/// is what makes the guard exact rather than a heuristic: `Wire::EncodeErrorReply`
-/// appears exactly once in this file, on the line below, and
-/// `worker-refusals-counted` fails if a second one is ever added.
-/// @param metrics Where the refusal is recorded.
-/// @param refusal Which refusal, as one row.
-/// @param detail Words for a person, or empty when there are none to add.
-/// @return The encoded reply.
-[[nodiscard]] std::vector<std::byte> Refuse(IMetricsSink& metrics, SurfaceRefusal const& refusal, std::string_view detail)
+std::vector<std::byte> Refuse(IMetricsSink& metrics, SurfaceRefusal const& refusal, std::string_view detail)
 {
     metrics.Increment(refusal.counter);
     return Wire::EncodeErrorReply(refusal.code, detail);

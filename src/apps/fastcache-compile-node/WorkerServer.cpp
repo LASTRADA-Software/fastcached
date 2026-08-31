@@ -63,6 +63,36 @@ namespace
     /// not see it (#241).
     constexpr std::size_t MaxInFlightBytes = MaxRequestBytes;
 
+    /// What this surface refuses with, each pairing the wire code with its counter.
+    ///
+    /// The same `Cc::SurfaceRefusal` the compile protocol uses, and shared rather than
+    /// declared again: these are two surfaces of one worker, an operator reads their
+    /// counters side by side, and a second notion of "what a refusal is" is how the
+    /// two would come to disagree.
+    ///
+    /// `PayloadTooLarge` had no counter at all until #326, and it is the one that
+    /// most needed one: the frame-level check needs only a header, where the envelope
+    /// refusals need a whole frame to have been sent and read. So an operator
+    /// alerting on the envelope series watched a client hammer this port with
+    /// oversized declarations, saw every one refused correctly, and read a flat graph
+    /// as "nobody is talking to us".
+    constexpr Cc::SurfaceRefusal NotAMember {
+        .code = Wire::ErrorCode::NotAMember,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedNotAMember,
+    };
+    constexpr Cc::SurfaceRefusal NoCapacity {
+        .code = Wire::ErrorCode::NoCapacity,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedNoSlot,
+    };
+    constexpr Cc::SurfaceRefusal EndpointBusy {
+        .code = Wire::ErrorCode::EndpointBusy,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy,
+    };
+    constexpr Cc::SurfaceRefusal PayloadTooLarge {
+        .code = Wire::ErrorCode::PayloadTooLarge,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
+    };
+
     /// Take `want` bytes from `counter` without exceeding `budget`.
     /// @param counter The shared in-flight total.
     /// @param want How many bytes this job declared.
@@ -282,10 +312,8 @@ Task<void> WorkerServer::Run()
         // network.
         if (_membership.Classify(socket->PeerAddress()) != Distributed::Membership::Member)
         {
-            _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedNotAMember);
-            (void) co_await WriteAll(socket.get(),
-                                     Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember,
-                                                            "this worker compiles for its own machine and its cluster"));
+            (void) co_await WriteAll(
+                socket.get(), Cc::Refuse(_metrics, NotAMember, "this worker compiles for its own machine and its cluster"));
             socket->Close();
             continue;
         }
@@ -299,8 +327,7 @@ Task<void> WorkerServer::Run()
         if (before >= _slots)
         {
             _inFlight.fetch_sub(1, std::memory_order_acq_rel);
-            _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedNoSlot);
-            (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::NoCapacity, {}));
+            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, NoCapacity));
             socket->Close();
             continue;
         }
@@ -393,12 +420,11 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
             // maximum is still `slots` times it.
             if (!TryReserve(_bytesInFlight, decoded->payloadLength, MaxInFlightBytes))
             {
-                _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy);
                 // Its own code, not NoCapacity: this says "come back shortly", while
                 // NoCapacity says "the fleet is full". An operator sent to buy
                 // machines over a transient byte budget is being sent to fix
                 // something that was never wrong.
-                (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, {}));
+                (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, EndpointBusy));
                 socket->Close();
                 co_return;
             }
@@ -446,13 +472,12 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // one place, and the skip below stays sound.
                 if (footprint <= MaxInFlightBytes && !reserved.TryRaiseTo(footprint, MaxInFlightBytes))
                 {
-                    _metrics.Increment(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy);
                     // A REPLY, not a close, and the same code the frame-length
                     // refusal uses: the frame declared its own length and has been
                     // read in full, so the link is synchronised and the peer learns
                     // that memory -- not the fleet, and not a slot -- is what it has
                     // to wait for.
-                    (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, {}));
+                    (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, EndpointBusy));
                     socket->Close();
                     co_return;
                 }
@@ -469,7 +494,9 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
             }
         }
         else if (decoded.has_value())
-            (void) co_await WriteAll(socket.get(), Wire::EncodeErrorReply(Wire::ErrorCode::PayloadTooLarge, {}));
+            // Counted since #326. The refusal was always right on the wire; what was
+            // missing is the only thing an operator can see.
+            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, PayloadTooLarge));
     }
     socket->Close();
     co_return;
