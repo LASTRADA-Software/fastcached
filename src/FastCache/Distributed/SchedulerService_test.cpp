@@ -1060,6 +1060,52 @@ TEST_CASE("A release names a lease this scheduler actually signed", "[distribute
         CHECK(fleet.service.Release(Insider, foreign, "obj-1").error == Wire::ErrorCode::LeaseUnauthorized);
         CHECK(fleet.service.Leases().IsInFlight("obj-1"));
     }
+
+    SECTION("nor does an authentic token used to release a DIFFERENT key")
+    {
+        // #323. The token names the key it covers, and until now `Release` discarded
+        // that claim and trusted the caller's, leaving `LeaseTable` to notice.
+        //
+        // It did notice -- which is exactly the problem. The guard was correct by
+        // coincidence of another component's strictness, not by construction, and a
+        // lookup made more permissive later would have removed the only check that
+        // the released lease is the one the token names, with nothing on this path
+        // to fail.
+        //
+        // A SECOND live lease, so the release cannot be refused merely for naming
+        // something unknown: both keys are in flight, the token is authentic, and the
+        // only thing wrong is that it does not name this one.
+        //
+        // On a second WORKER, because the one above has a single slot and obj-1 is
+        // holding it -- otherwise this lease is refused for capacity and the case
+        // proves nothing about keys.
+        REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-2:7100")).status == Wire::Status::Ok);
+        REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "obj-2")).status == Wire::Status::Ok);
+        REQUIRE(fleet.service.Leases().IsInFlight("obj-2"));
+
+        // The CODE is the assertion, not the refusal. Without the claim check this
+        // is still refused -- as `UnknownLease`, measured -- because `LeaseTable`
+        // finds no live lease under obj-2 for obj-1's serial. That is the coincidence
+        // the ticket is about: the release was rejected by a lookup miss rather than
+        // by the credential, so the only thing standing between an authentic token
+        // and somebody else's key was another component's strictness.
+        //
+        // `LeaseUnauthorized` says the credential refused it. `UnknownLease` says the
+        // table did not recognise it, which is also what an expired lease looks like.
+        auto const refused = fleet.service.Release(Insider, token, "obj-2");
+        CHECK(refused.status == Wire::Status::Error);
+        CHECK(refused.error == Wire::ErrorCode::LeaseUnauthorized);
+
+        // Neither key moved: not the one the token names, and not the one the caller
+        // asked about. A refusal that freed either would be worse than the bug.
+        CHECK(fleet.service.Leases().IsInFlight("obj-1"));
+        CHECK(fleet.service.Leases().IsInFlight("obj-2"));
+
+        // And the token still works for what it actually covers, so the check is a
+        // rule about the claim rather than a token that has been spent by trying.
+        CHECK(fleet.service.Release(Insider, token, "obj-1").status == Wire::Status::Ok);
+        CHECK_FALSE(fleet.service.Leases().IsInFlight("obj-1"));
+    }
 }
 
 TEST_CASE("A scheduler with no cluster key says so, once", "[distributed][scheduler][lease]")
