@@ -399,14 +399,60 @@ class SchedulerService
     /// Where handed-over history goes; null until the admin surface sets one.
     IFleetHistorySink* _history { nullptr };
 
-    /// The two gates every verb passes, in the order that costs least to answer.
+    /// What a verb is asking for, which decides how much of the gate applies.
     ///
-    /// One function rather than a pair of checks repeated three times: these are the
-    /// security- and policy-relevant decisions of the whole surface, and a verb
+    /// **The distinction is between deciding and settling**, and it is worth stating
+    /// exactly because the same argument will be asked of every verb added later.
+    ///
+    /// Almost everything this surface does is a decision about the fleet's FUTURE:
+    /// who joins it, what it is worth scheduling next, what the cluster agrees.
+    /// A node that is not the leader must make none of those, because a demoted node
+    /// answering them is how a split fleet forms -- its registry is a stale copy of
+    /// somebody else's, so a worker admitted there heartbeats happily into a fleet
+    /// nothing schedules onto.
+    ///
+    /// A release is not that. It settles an obligation **this node itself created**,
+    /// against a record **only this node holds**: `LeaseTable` is per-node and is
+    /// never replicated, so the lease exists nowhere else and no other node can free
+    /// it. Refusing it does not stop a demoted node from doing harm -- it stops it
+    /// from cleaning up after itself, and the key stays pinned until it expires
+    /// ([#371](https://github.com/LASTRADA-Software/fastcached/issues/371)).
+    ///
+    /// So the test for a future verb is not "does this feel administrative" but a
+    /// checkable one: **does it act only on non-replicated state this node created
+    /// itself, and can it create nothing?** `Release` can erase one entry it minted
+    /// and decrement its own speculative in-flight count, and that is all it can do.
+    /// Everything else here fails that test, `Heartbeat` included -- a heartbeat
+    /// refreshes the registry the LEADER schedules from, so a demoted node's copy
+    /// going stale is the mechanism that pushes a worker to re-register with the new
+    /// leader rather than a cost.
+    enum class GateScope : std::uint8_t
+    {
+        /// A decision about the fleet's future. Leadership and membership both.
+        Scheduling = 0,
+        /// The settlement of an obligation this node already created. Membership only.
+        Settlement,
+    };
+
+    /// The gates a verb passes, in the order that costs least to answer.
+    ///
+    /// One function rather than a pair of checks repeated at every verb: these are
+    /// the security- and policy-relevant decisions of the whole surface, and a verb
     /// added without them would otherwise be a verb that quietly skips both.
+    ///
+    /// The scope defaults to `Scheduling` so a verb added without thinking about it
+    /// gets the strict gate. Relaxing it has to be typed out, which is the direction
+    /// that fails safe.
+    ///
+    /// **Membership is never relaxed.** The two rules answer different questions --
+    /// *may this node decide* and *may this caller spend the fleet's CPU* -- and only
+    /// the first stops applying at demotion. A non-member must not reach the lease
+    /// table whoever leads.
     /// @param caller Who is asking.
+    /// @param scope What they are asking for.
     /// @return A refusal, or nullopt when the caller may proceed.
-    [[nodiscard]] std::optional<SchedulerReply> Gate(CallerContext const& caller) const;
+    [[nodiscard]] std::optional<SchedulerReply> Gate(CallerContext const& caller,
+                                                     GateScope scope = GateScope::Scheduling) const;
 
     /// Drop workers that stopped heartbeating, and free what they were holding.
     ///

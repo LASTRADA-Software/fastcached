@@ -193,7 +193,7 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         CHECK(reply.message == "10.0.0.1:7000");
     }
 
-    SECTION("leadership is the gate on every verb, not only on Lease")
+    SECTION("leadership gates every verb that decides something")
     {
         // The rule is on the gate rather than on each handler, so a verb added
         // without thinking about it is refused rather than served. Asserted per
@@ -203,9 +203,26 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         CHECK(service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Heartbeat(Insider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Lease(Insider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
-        // Resolving is a write against the LEADER's own lease table, so a follower
-        // has nothing to resolve and answering anything but this would be a lie.
-        CHECK(service.Release(Insider, "l1", "abc").error == Wire::ErrorCode::NotLeader);
+    }
+
+    SECTION("and does not gate the one verb that settles rather than decides")
+    {
+        // This section used to assert the opposite, under a comment reading
+        // "resolving is a write against the LEADER's own lease table, so a follower
+        // has nothing to resolve". The second half of that is what #371 disproved: a
+        // follower that WAS the leader holds every lease it granted, in a table that
+        // is never replicated, and it is the only node that can free them. Refusing
+        // here pinned the key until it expired.
+        //
+        // `NotLeader` is what must not come back. `UnknownLease` is the right answer
+        // for this particular token, because this service never granted `l1` -- and
+        // that is asserted rather than skipped past, since "the release got through"
+        // and "the release resolved something" are the two halves that must not be
+        // confused.
+        service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
+        auto const reply = service.Release(Insider, "l1", "abc");
+        CHECK(reply.error != Wire::ErrorCode::NotLeader);
+        CHECK(reply.error == Wire::ErrorCode::UnknownLease);
     }
 }
 
@@ -242,6 +259,12 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000");
 
     CHECK(service.Lease(Outsider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
+
+    // A release is where the order becomes visible rather than cosmetic. It skips the
+    // leadership rule entirely (#371), so a non-member asking a demoted node to settle
+    // a lease is told the thing that actually applies to it -- and membership is the
+    // half that is never relaxed, whoever leads.
+    CHECK(service.Release(Outsider, "l1", "abc").error == Wire::ErrorCode::NotAMember);
 }
 
 TEST_CASE("A member registers, heartbeats and is leased", "[distributed][scheduler]")

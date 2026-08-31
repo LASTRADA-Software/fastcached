@@ -130,20 +130,74 @@ TEST_CASE("A release goes to the scheduler that issued the lease, not to the con
     // then hand it to a third.
     CHECK(fleet.IsInFlight(SchedulerA, Key));
 
-    // **And what the routing does NOT buy, pinned deliberately.** The issuer is now
-    // a follower, and `Gate()` puts leadership ahead of everything -- so B refuses
-    // its own lease's release and the key stays pinned there until it expires. The
-    // client is right, the fleet still loses the lease, and `ReleaseLease` says so
-    // in as many words: leadership moving is one of the failures it calls best-effort
-    // and recovers from by expiry.
+    // **And the release SETTLED, which is #371.** The issuer is a follower by now,
+    // and this used to be refused `NotLeader` -- so the key stayed pinned on the one
+    // machine that could free it until it expired, while the client had done exactly
+    // the right thing. A release is not a scheduling decision: it resolves a lease
+    // this node minted, in a table nobody else holds a copy of.
     //
-    // Asserted rather than left as a silent surprise, because it is not obvious from
-    // either end and it is the kind of thing a later change would "fix" without
-    // noticing what it was. Filed as #371; when that closes, this flips and the two
-    // move together.
-    CHECK(last.kind == Cc::CacheOutcomeKind::Rejected);
-    CHECK(last.code == Wire::ErrorCode::NotLeader);
+    // These three lines were written the other way round when the harness first found
+    // this, asserting the refusal and pointing at #371. They flip together, which is
+    // the point of having pinned the wrong behaviour explicitly rather than leaving it
+    // as a silent surprise.
+    CHECK(last.kind == Cc::CacheOutcomeKind::Hit);
+    CHECK_FALSE(fleet.IsInFlight(SchedulerB, Key));
+}
+
+TEST_CASE("A demoted scheduler settles its own lease and still refuses one it never issued", "[node][fleet]")
+{
+    // The other half of #371's acceptance, and the half that turns a fix into a hole
+    // if it is missing. Letting a release through after demotion must not mean letting
+    // ANY release through: a token this node never issued resolves nothing, and saying
+    // so is the only place "this job outlived its lease" can be observed.
+    Testing::FleetHarness fleet;
+    fleet.AddScheduler(std::string { SchedulerA });
+    fleet.AddScheduler(std::string { SchedulerB });
+
+    fleet.ElectLeader(SchedulerB);
+    fleet.RegisterWorker(SchedulerB, Worker, Toolchain);
+    auto const token = LeaseFrom(fleet, SchedulerB);
+    REQUIRE(fleet.IsInFlight(SchedulerB, Key));
+
+    // B is demoted with the lease still outstanding.
+    fleet.ElectLeader(SchedulerA);
+
+    // A token B never minted is refused, by name, and does not disturb the real one.
+    auto const bogus = fleet.Exchange(SchedulerB,
+                                      Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = "not-a-token", .key = Key }),
+                                      Cc::Credential {},
+                                      Cc::ExchangeBudget {});
+    CHECK(bogus.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(bogus.code == Wire::ErrorCode::UnknownLease);
     CHECK(fleet.IsInFlight(SchedulerB, Key));
+
+    // The right token against the WRONG key is refused too -- `LeaseTable` matches on
+    // both, so a release cannot free a key it does not name.
+    auto const wrongKey =
+        fleet.Exchange(SchedulerB,
+                       Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = token, .key = "obj-somebody-else" }),
+                       Cc::Credential {},
+                       Cc::ExchangeBudget {});
+    CHECK(wrongKey.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(wrongKey.code == Wire::ErrorCode::UnknownLease);
+    CHECK(fleet.IsInFlight(SchedulerB, Key));
+
+    // And the genuine one settles, from a node that is no longer the leader.
+    auto const real = fleet.Exchange(SchedulerB,
+                                     Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = token, .key = Key }),
+                                     Cc::Credential {},
+                                     Cc::ExchangeBudget {});
+    CHECK(real.kind == Cc::CacheOutcomeKind::Hit);
+    CHECK_FALSE(fleet.IsInFlight(SchedulerB, Key));
+
+    // Releasing it a second time is refused rather than silently accepted: the entry
+    // is gone, and a client told nothing has nothing to report.
+    auto const again = fleet.Exchange(SchedulerB,
+                                      Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = token, .key = Key }),
+                                      Cc::Credential {},
+                                      Cc::ExchangeBudget {});
+    CHECK(again.kind == Cc::CacheOutcomeKind::Rejected);
+    CHECK(again.code == Wire::ErrorCode::UnknownLease);
 }
 
 TEST_CASE("A lease taken from the configured leader is released back to it", "[node][fleet]")
