@@ -281,6 +281,40 @@ wait_for_log() {
     fail "${what} never logged: ${marker}"
 }
 
+# What every worker this fixture starts is told its drain may take, and what every
+# wait for one to stop is bounded by. ONE number, which is the whole of #380.
+#
+# The bound was 15 s while the node's own default drain is 30 s, so the fixture's
+# ceiling was HALF the process's configured maximum: a worker that drained for 20 s
+# and then exited was behaving exactly as configured and this fixture called it a
+# failure. It was also not the EXPECTED time -- a worker signalled with nothing in
+# flight wakes its accept loop and stops in well under a second -- so 15 sat between
+# the two numbers that mean something, catching neither case cleanly and deciding
+# itself on how loaded the runner was. It ejected #378 from the merge queue on a base
+# that had passed the same leg, and it failed #418, a change that removes a dead
+# config field.
+#
+# So the fixture STATES the drain rather than inheriting it. Every worker is started
+# with `--drain-timeout`, and the wait is that number plus a margin for the runner.
+# The contradiction is gone because both halves now read the same variable, and the
+# assertion is STRICTER than before rather than looser: ten seconds against a
+# sub-second expectation, where the old bound allowed fifteen and disagreed with the
+# process about what was legal.
+#
+# Raising the bound to 30 to stop this recurring is the one thing that must not
+# happen: it widens the window in which a genuinely wedged worker still passes, which
+# is exactly what `stop_and_require_exit` exists to catch.
+worker_drain_seconds=5
+stated_drain="--drain-timeout=${worker_drain_seconds}"
+stop_bound_seconds=$(( worker_drain_seconds + 5 ))
+
+# And the daemon's own, which is NOT derived from the above. `fastcached` takes no
+# `--drain-timeout` and runs no compiles, so it has nothing to drain: it stops as
+# soon as its loop is woken. Tying its bound to a worker's drain would be arithmetic
+# that reads as a shared rule and is a category error -- and it is the shape that
+# made the old single 15 wrong in the first place.
+daemon_stop_seconds=5
+
 # Stop a process and require it to actually exit, within a bound.
 #
 # `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
@@ -292,7 +326,8 @@ wait_for_log() {
 #
 # @param 1 pid
 # @param 2 what it is, for the message
-# @param 3 seconds to allow
+# @param 3 seconds to allow; every caller passes `$stop_bound_seconds`, which is
+#          derived from the drain the process was actually started with
 stop_and_require_exit() {
     local pid="$1" what="$2" seconds="$3"
     kill "$pid" >/dev/null 2>&1 || true
@@ -398,7 +433,7 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 dispatch_port="$(free_port)"
 sched_worker_port="$(free_port)"
 
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${dispatch_port}" --fleet-open \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$sched_worker_port" \
     --advertise="127.0.0.1:${sched_worker_port}" \
@@ -433,7 +468,7 @@ worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || ec
 
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
     --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug \
@@ -592,7 +627,7 @@ iso_daemon_pid=$!
 pids+=("$iso_daemon_pid")
 wait_for_port "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
 
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${iso_dispatch_port}" --fleet-open \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${iso_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${iso_dispatch_port}" \
     --bind=127.0.0.1 --port="$iso_sched_worker_port" \
     --advertise="127.0.0.1:${iso_sched_worker_port}" \
@@ -603,7 +638,7 @@ pids+=("$iso_scheduler_pid")
 wait_for_port "$iso_dispatch_port" "$iso_scheduler_pid" "isolation scheduler" "${workdir}/iso-scheduler.log"
 
 iso_worker_port="$(free_port)"
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${iso_dispatch_port}" \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${iso_dispatch_port}" \
     --bind=127.0.0.1 --port="$iso_worker_port" --advertise="127.0.0.1:${iso_worker_port}" \
     --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug \
     > "${workdir}/iso-worker.log" 2>&1 &
@@ -632,7 +667,7 @@ echo "   a mismatched worker was refused, and the build compiled locally"
 
 # --- 4: with every worker dead the build still succeeds ----------------------
 echo "== case 4: failover to a local compile"
-stop_and_require_exit "$iso_worker_pid" "the isolation worker" 15
+stop_and_require_exit "$iso_worker_pid" "the isolation worker" "$stop_bound_seconds"
 
 write_source "${proj}/four.cpp" "casefour"
 "$compiler" -std=c++17 -O1 -c "${proj}/four.cpp" -o "${proj}/build/four-ref.o" \
@@ -700,7 +735,7 @@ wait_for_port "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/
 # Every node is both a peer and a possible scheduler, so it always registers as a
 # worker too -- and a second MATCHING worker would give this fleet two slots when
 # the whole point of the case is that it has one.
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${cap_dispatch_port}" --fleet-open \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --listen-scheduler="127.0.0.1:${cap_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --bind=127.0.0.1 --port="$cap_sched_worker_port" \
     --advertise="127.0.0.1:${cap_sched_worker_port}" \
@@ -711,7 +746,7 @@ pids+=("$cap_scheduler_pid")
 wait_for_port "$cap_dispatch_port" "$cap_scheduler_pid" "capacity scheduler" "${workdir}/cap-scheduler.log"
 
 cap_worker_port="$(free_port)"
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${cap_dispatch_port}" \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --bind=127.0.0.1 --port="$cap_worker_port" --advertise="127.0.0.1:${cap_worker_port}" \
     --toolchain="${compiler}" --slots=1 --log-level=debug \
     > "${workdir}/cap-worker.log" 2>&1 &
@@ -796,7 +831,7 @@ echo "== case 8: a worker exits on SIGTERM"
 # SO_RCVTIMEO poll. macOS wakes the accept anyway and hides the whole thing, which
 # is why this is asserted here and not left to a developer machine.
 stop_port="$(free_port)"
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
     --toolchain="${compiler}" --slots=1 --log-level=info \
     > "${workdir}/stop-worker.log" 2>&1 &
@@ -804,7 +839,7 @@ stop_worker_pid=$!
 pids+=("$stop_worker_pid")
 wait_for_port "$stop_port" "$stop_worker_pid" "shutdown worker" "${workdir}/stop-worker.log"
 
-stop_and_require_exit "$stop_worker_pid" "the worker under test" 15
+stop_and_require_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds"
 
 # Exiting is necessary but not sufficient: a worker that died of the signal also
 # "exits". These lines are what distinguish a graceful stop from a death, and
@@ -833,7 +868,7 @@ tier_upstream_pid=$!
 pids+=("$tier_upstream_pid")
 wait_for_port "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
 
-"$node" --cluster-key-file="$cluster_key" --listen-cache="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$cache_node_worker"     --advertise="127.0.0.1:${cache_node_worker}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
+"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-cache="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$cache_node_worker"     --advertise="127.0.0.1:${cache_node_worker}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
 tier_node_pid=$!
 pids+=("$tier_node_pid")
 wait_for_port "$cache_node_port" "$tier_node_pid" "cache node" "${workdir}/tier-node.log"
@@ -859,7 +894,7 @@ grep -q "fastcache-cc: HIT" "${workdir}/case9-hit.log"     || { cat "${workdir}/
 
 # Now take the shared cache away and ask again. This is the assertion: a hit is
 # answered from the node's own tier, so it must survive an upstream that is gone.
-stop_and_require_exit "$tier_upstream_pid" "the shared cache" 15
+stop_and_require_exit "$tier_upstream_pid" "the shared cache" "$daemon_stop_seconds"
 
 rm -f "${proj}/build/nine.o"
 (
@@ -883,7 +918,7 @@ echo "   a hit was served with the shared cache stopped, and the object is right
 echo "== case 10: a worker sizes itself from its node class"
 
 sizing_port="$(free_port)"
-"$node" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
+"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
     --bind=127.0.0.1 --port="$sizing_port" --advertise="127.0.0.1:${sizing_port}" \
     --toolchain="self-sizing=${compiler}" \
     --node-class=dedicated --reserve-cores=0 --log-level=debug \
@@ -902,7 +937,7 @@ sizing_slots="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p
     || { cat "${workdir}/sizing.log" >&2; fail "a self-sizing worker offered no slots at all"; }
 echo "   a dedicated worker sized itself to ${sizing_slots} slot(s) with no --slots given"
 
-stop_and_require_exit "$sizing_pid" "the self-sizing worker" 15
+stop_and_require_exit "$sizing_pid" "the self-sizing worker" "$stop_bound_seconds"
 
 # --- case 11: a black-holed upstream does not stall the node's own clients -----
 #
@@ -936,7 +971,7 @@ blackhole_worker_port="$(free_port)"
 # `--scheduler` is required whenever a worker surface is configured -- a worker
 # nothing knows about serves nobody, and the node refuses to start rather than
 # looking healthy. It points at the scheduler this run already has.
-"$node" --cluster-key-file="$cluster_key" --listen-cache="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$blackhole_worker_port"     --advertise="127.0.0.1:${blackhole_worker_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
+"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-cache="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$blackhole_worker_port"     --advertise="127.0.0.1:${blackhole_worker_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
 blackhole_node_pid=$!
 pids+=("$blackhole_node_pid")
 wait_for_port "$blackhole_node_port" "$blackhole_node_pid" "black-hole node" "${workdir}/blackhole-node.log"
