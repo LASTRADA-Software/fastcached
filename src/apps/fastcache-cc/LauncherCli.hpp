@@ -164,6 +164,7 @@ namespace EnvName
     constexpr std::string_view Scheduler = "FASTCACHE_SCHEDULER";
     constexpr std::string_view Token = "FASTCACHE_TOKEN";
     constexpr std::string_view User = "FASTCACHE_USER";
+    constexpr std::string_view Verify = "FASTCACHE_VERIFY";
 } // namespace EnvName
 
 /// One environment variable the launcher reads.

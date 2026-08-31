@@ -48,6 +48,7 @@
 #include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "Dispatch.hpp"
+#include "HitVerification.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
 #include "ParallelFor.hpp"
@@ -147,6 +148,13 @@ struct Config
     bool verbose { false };
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
+
+    /// Verify one hit in every this many, or `VerificationOff` to verify none.
+    ///
+    /// Off by default and deliberately so: a verified hit costs a whole compile, so
+    /// this is for CI, a nightly, or somebody reproducing a report -- never for every
+    /// build (#423).
+    unsigned verifyRate { Cc::VerificationOff };
     /// Scheduler endpoint for distributed compilation, empty when not configured.
     ///
     /// Distribution is OFF unless this is set. That is the whole switch: a launcher
@@ -271,6 +279,7 @@ struct Config
     c.verbose = EnvSet(Cc::EnvName::Verbose);
     c.stats = !EnvSet(Cc::EnvName::NoStats);
     c.direct = !EnvSet(Cc::EnvName::NoDirect);
+    c.verifyRate = Cc::ParseVerificationRate(EnvOr(Cc::EnvName::Verify, ""));
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
     c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
     c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
@@ -685,6 +694,84 @@ void ReplayStreams(std::string_view out, std::string_view err)
     auto const run = RunCaptureSplit(argv);
     ReplayStreams(run.out, run.err);
     return run.exitCode == Cc::NotSpawned ? 1 : run.exitCode;
+}
+
+/// Compile the translation unit again and compare it against the object a hit put
+/// on disk.
+///
+/// **The mechanism that turns a wrong object from invisible into loud**
+/// ([#423](https://github.com/LASTRADA-Software/fastcached/issues/423)). Off unless
+/// `FASTCACHE_VERIFY` names a rate, because a verified hit costs a whole compile.
+///
+/// It compiles to the SAME output path rather than a temporary one, having first
+/// copied the served object aside. Two things fall out of that and neither is an
+/// accident: no `-o` / `/Fo` has to be rewritten, which would be a second parser for
+/// the one flag whose spelling differs most between drivers -- and on a mismatch the
+/// freshly compiled object is already where the build expects it, so "use the fresh
+/// one, never the cache's" needs no separate step. A build that has just proved its
+/// cache wrong must not go on to link the wrong thing.
+///
+/// @param cmd The parsed command line; `objPath` is what a hit wrote.
+/// @param argv What to run to compile for real.
+/// @param key The object key this hit was served under.
+/// @param rate One hit in this many is checked; `VerificationOff` checks none.
+/// @return What the comparison found.
+[[nodiscard]] Cc::HitVerdict VerifyServedObject(Cc::ParsedCommand const& cmd,
+                                                std::span<std::string const> argv,
+                                                std::string const& key,
+                                                unsigned rate)
+{
+    if (!Cc::ShouldVerifyHit(key, rate))
+        return Cc::HitVerdict::NotChecked;
+
+    auto const served = FastCache::PathFromNarrowText(cmd.objPath);
+    if (!served.has_value())
+        return Cc::HitVerdict::Inconclusive;
+
+    // Beside the object rather than in the system temp directory: the build already
+    // writes here, so it is writable and on the same filesystem, and a rename or a
+    // copy cannot cross a device.
+    auto const aside = std::filesystem::path { *served }.concat(".fastcache-verify");
+
+    std::error_code ec;
+    std::filesystem::copy_file(*served, aside, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec)
+        return Cc::HitVerdict::Inconclusive;
+
+    // The compiler's own streams are DISCARDED. It has already been served a hit, so
+    // its diagnostics were replayed; printing them a second time would make a verified
+    // build look like it compiled everything twice, which it did -- but the reader is
+    // being asked about the object, not the warnings.
+    auto const run = RunCaptureSplit(argv);
+    if (run.exitCode != 0)
+    {
+        // The fresh compile failed, which says nothing about the cached object -- and
+        // may well have left no output at all. Put back what the hit served, so a
+        // failed verification never costs the build its object.
+        std::filesystem::copy_file(aside, *served, std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(aside, ec);
+        return Cc::HitVerdict::Inconclusive;
+    }
+
+    auto const verdict = Cc::CompareObjectFiles(aside, *served);
+    std::filesystem::remove(aside, ec);
+    return verdict;
+}
+
+/// Report a verification, and say nothing when there is nothing to say.
+///
+/// **Not verbose-gated**, unlike every other launcher diagnostic. This is the one an
+/// operator must not have to have opted into: a wrong object that was detected and
+/// then only counted is a number somebody has to come back and ask about, and the
+/// whole reason #368 went unnoticed is that nothing said anything.
+/// @param verdict What the comparison found.
+/// @param key The key, so the entry can be looked at rather than only counted.
+void ReportVerification(Cc::HitVerdict verdict, std::string const& key)
+{
+    auto const line = Cc::DescribeVerdict(verdict, key);
+    if (line.empty())
+        return;
+    std::cerr << line << '\n';
 }
 
 // --- file helpers -----------------------------------------------------------
@@ -1181,6 +1268,7 @@ struct MaterializedHit
 /// @return The exit code to return on a hit, or nullopt when not served.
 [[nodiscard]] std::optional<int> TryServeFromCache(Config const& cfg,
                                                    Cc::ParsedCommand const& cmd,
+                                                   std::span<std::string const> argv,
                                                    std::string const& key,
                                                    PathCanon::Layout const& layout,
                                                    std::filesystem::path const& workingDirectory)
@@ -1201,6 +1289,10 @@ struct MaterializedHit
         return std::nullopt;
 
     invocation.valueBytes = decoded->objectBlob.size();
+    // Before the trace, so a build log reads in the order the events happened: the
+    // hit, then what verifying it found. Off unless `FASTCACHE_VERIFY` names a rate,
+    // in which case this costs a whole compile (#423).
+    ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
     TraceOutcome("HIT", key);
     return 0;
 }
@@ -1386,6 +1478,7 @@ void RecordManifest(Config const& cfg,
 /// @return The exit code if the object was served, nullopt to keep going.
 [[nodiscard]] std::optional<int> TryDirectMode(Config const& cfg,
                                                Cc::ParsedCommand const& cmd,
+                                               std::span<std::string const> argv,
                                                PathCanon::Layout const& layout,
                                                std::filesystem::path const& workingDirectory,
                                                std::vector<std::string> const& relativizedArgs,
@@ -1452,7 +1545,7 @@ void RecordManifest(Config const& cfg,
     invocation.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
-    auto served = TryServeFromCache(cfg, cmd, manifest->objectKey, layout, workingDirectory);
+    auto served = TryServeFromCache(cfg, cmd, argv, manifest->objectKey, layout, workingDirectory);
     if (served.has_value())
         invocation.directHit = true;
     return served;
@@ -1747,7 +1840,8 @@ void RecordManifest(Config const& cfg,
     workingDirectory = Cc::AnchorWorkingDirectory(workingDirectory.string(), layout);
 
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
-        if (auto served = TryDirectMode(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
+        if (auto served =
+                TryDirectMode(cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
@@ -1942,6 +2036,11 @@ void RecordManifest(Config const& cfg,
                                    key,
                                    reconciler);
 
+                // The preprocessed-key hit, verified exactly as the direct-mode one
+                // is. Both paths, because a wrong object served through either is the
+                // same defect and a feature that covered one would be a feature an
+                // operator could not rely on (#423).
+                ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
                 TraceOutcome("HIT", key);
                 return 0;
             }
