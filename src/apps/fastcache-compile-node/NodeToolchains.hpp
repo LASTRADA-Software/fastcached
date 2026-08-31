@@ -3,6 +3,7 @@
 
 #include "NodeConfig.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <cstdint>
@@ -175,6 +176,10 @@ struct ServedToolchain
 ///        `--no-toolchain-discovery` was given.
 /// @param runner Process-spawning seam, for the compiler probes.
 /// @param host The machine's filesystem, registry and environment.
+/// @param clock Where the hash phase's progress rate reads elapsed time (#354). It
+///        is the only thing here that reads a clock, and it reads one because a
+///        phase that has been observed running past 300 s without finishing cannot
+///        be diagnosed by anything that does not know how fast it is going.
 /// @param logger Startup log.
 /// @return Fingerprint to what this worker serves under it -- never empty -- or
 ///         nullopt when a `--toolchain` value is malformed or there is nothing to
@@ -183,6 +188,7 @@ struct ServedToolchain
                                                                                       Cc::IToolchainDiscovery* discovery,
                                                                                       Cc::IProcessRunner& runner,
                                                                                       Cc::IToolchainHost& host,
+                                                                                      IClock const& clock,
                                                                                       ILogger& logger);
 
 /// Which of these toolchains no longer match the machine they were derived from.
@@ -283,6 +289,7 @@ enum class RecheckDepth : std::uint8_t
 ///        `--no-toolchain-discovery` was given.
 /// @param runner Process-spawning seam, for the compiler probes.
 /// @param host The machine's filesystem, registry and environment.
+/// @param clock Where the re-survey's progress rate reads elapsed time (#354).
 /// @param logger Where the change is announced.
 /// @param depth Whether to survey unconditionally, or only on moved evidence.
 /// @return What changed, and what to serve; `changed` false when nothing moved.
@@ -295,6 +302,7 @@ enum class RecheckDepth : std::uint8_t
                                                  Cc::IToolchainDiscovery* discovery,
                                                  Cc::IProcessRunner& runner,
                                                  Cc::IToolchainHost& host,
+                                                 IClock const& clock,
                                                  ILogger& logger,
                                                  RecheckDepth depth = RecheckDepth::WhenEvidenceMoved);
 

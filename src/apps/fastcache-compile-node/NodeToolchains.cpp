@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeToolchains.hpp"
+#include "ToolchainHashProgress.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -96,11 +97,13 @@ namespace
     /// @param entries The toolchains to identify.
     /// @param runner Process-spawning seam, called from several threads at once.
     /// @param host The machine's filesystem, registry and environment.
+    /// @param clock Where the hash phase's progress rate reads elapsed time (#354).
     /// @param logger Startup log.
     /// @return One survey per entry, in the same order.
     [[nodiscard]] std::vector<SurveyedToolchain> FingerprintAll(std::vector<ToolchainEntry> const& entries,
                                                                 Cc::IProcessRunner& runner,
                                                                 Cc::IToolchainHost& host,
+                                                                IClock const& clock,
                                                                 ILogger& logger)
     {
         std::vector<SurveyedToolchain> fingerprints(entries.size());
@@ -135,22 +138,39 @@ namespace
         {
             // A constructor rather than designated initialisers: an override makes
             // this polymorphic, and a polymorphic class is not an aggregate.
-            AnnouncingParallelFor(Cc::IParallelFor& parallelFor, ILogger& sink) noexcept:
+            AnnouncingParallelFor(Cc::IParallelFor& parallelFor, IClock const& source, ILogger& sink) noexcept:
                 inner { parallelFor },
+                clock { source },
                 logger { sink }
             {
             }
 
             Cc::IParallelFor& inner;
+            IClock const& clock;
             ILogger& logger;
 
             [[nodiscard]] bool Run(std::size_t count, std::function<void(std::size_t)> const& slice) override
             {
                 logger.Logf(LogLevel::Info, "hashing {} toolchain file(s)", count);
-                return inner.Run(count, slice);
+
+                // And then, while it runs, how fast (#354). The line above marks the
+                // phase; these mark its RATE, which is what tells a cold cache from a
+                // scanner from a per-file open cost. Eight sightings of this phase
+                // stalling produced eight artefacts of the same shape and separated
+                // none of those, because a phase that logs nothing while it runs
+                // cannot say whether it is slowing down.
+                //
+                // Wrapping the slice rather than the whole run: a rate is only useful
+                // during the walk, and a figure printed after it finishes is one the
+                // failing case never reaches.
+                ToolchainHashProgress progress { count, ToolchainHashProgress::DefaultInterval, clock, logger };
+                return inner.Run(count, [&slice, &progress](std::size_t index) {
+                    slice(index);
+                    progress.Observe();
+                });
             }
         };
-        AnnouncingParallelFor announcing { parallel, logger };
+        AnnouncingParallelFor announcing { parallel, clock, logger };
 
         auto identify = [&] {
             for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
@@ -309,6 +329,7 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
                                                                         Cc::IToolchainDiscovery* discovery,
                                                                         Cc::IProcessRunner& runner,
                                                                         Cc::IToolchainHost& host,
+                                                                        IClock const& clock,
                                                                         ILogger& logger)
 {
     // One fact, stated once. The set is the machine's when the operator named none
@@ -369,7 +390,7 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
     // start where an operator is watching. Warm starts read the cache and are
     // instant, so this buys nothing on any boot after the first; it is the first one
     // that decides whether the feature looks like it works.
-    auto fingerprints = FingerprintAll(entries, runner, host, logger);
+    auto fingerprints = FingerprintAll(entries, runner, host, clock, logger);
 
     // Indexed rather than zipped: `std::views::zip` is C++23 and not uniformly
     // available across the four standard libraries this project builds against.
@@ -495,6 +516,7 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
                                    Cc::IToolchainDiscovery* discovery,
                                    Cc::IProcessRunner& runner,
                                    Cc::IToolchainHost& host,
+                                   IClock const& clock,
                                    ILogger& logger,
                                    RecheckDepth depth)
 {
@@ -512,7 +534,7 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
     // identical -- and the set is what this worker registers, so deriving it any way
     // but the startup way would give a node two identities depending on when it was
     // asked.
-    auto refreshed = ResolveToolchains(cfg, discovery, runner, host, logger);
+    auto refreshed = ResolveToolchains(cfg, discovery, runner, host, clock, logger);
 
     // `ResolveToolchains` refuses an empty result, which at startup is fatal and here
     // is a state the node has to be able to reach: the machine's only compiler was
