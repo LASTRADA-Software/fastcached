@@ -72,7 +72,11 @@ class SchedulerResponder final: public IFrameResponder
     /// listed", which a host that is not on the list can satisfy by being on the
     /// network the list was written for -- so it is an anti-leeching rule, and #289
     /// is what makes the scheduler verbs safe on a port that faces one.
-    [[nodiscard]] bool AuthRequired() const noexcept override
+    ///
+    /// The verb is ignored: this listener serves the scheduler verbs and nothing else,
+    /// so the surface-wide answer IS the per-verb one. It stops being so the moment
+    /// the surfaces merge (#290), which is why the question now carries the verb.
+    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
     {
         return _policy != nullptr && _policy->Enabled();
     }
@@ -250,7 +254,14 @@ class CacheResponder final: public IFrameResponder
     /// a default would let a surface added later inherit an open door by saying
     /// nothing, which is the shape this codebase records as reopening a hole by
     /// omission.
-    [[nodiscard]] bool AuthRequired() const noexcept override
+    ///
+    /// The verb is ignored for the same reason the scheduler's is -- this listener
+    /// carries one verb family. Note where the reason above actually attaches, though:
+    /// "a credential every local build can read is not a credential" is a fact about
+    /// the CACHE VERBS, not about the port they arrive on, so it survives a merge onto
+    /// a shared listener and the answer there has to follow the verb rather than the
+    /// surface (#290).
+    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
     {
         return false;
     }

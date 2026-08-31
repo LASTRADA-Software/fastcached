@@ -127,21 +127,31 @@ class IFrameResponder
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
                                                                            std::uint8_t opRaw) const = 0;
 
-    /// Does this surface require a credential before its gated verbs?
+    /// Does this surface require a credential before this verb?
     ///
     /// Asked once per frame rather than cached, because a surface may be
     /// reconfigured and a connection already open must not keep an answer from
     /// before. It is a field read behind a virtual call, not a probe.
     ///
-    /// Deliberately NOT folded into `RefusePeer`: that predicate answers on the peer
-    /// alone, which is what makes it answerable before a frame exists at all. A
-    /// credential gate needs the verb, the declared length and per-connection state,
-    /// none of which are peer facts -- so it is a second question asked at the same
-    /// point in the loop, not a wider version of the first
+    /// **Takes the verb, since #290.** Every implementation today ignores it, because
+    /// each surface serves one verb family -- but a merged 0xFC listener has no
+    /// surface-wide answer available. The two production responders answer this
+    /// oppositely and both are right: the scheduler requires a credential when one is
+    /// configured, and the cache requires none because *a credential readable by every
+    /// local build is not a credential*. A merged surface answering `true` refuses
+    /// every local `fastcache-cc` FETCH; answering `false` undoes #289. The cache's
+    /// reason is a property of its VERBS rather than of the port they arrive on, so it
+    /// survives the merge and the answer follows the verb.
+    ///
+    /// Still not folded into `RefusePeer`, which now also takes the verb: that one
+    /// answers before the payload is read and returns an encoded refusal, this one
+    /// feeds `DecidePrePayload` alongside the declared length and the connection's
+    /// credential state. Two questions at one point in the loop, not one wider one
     /// ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
     ///
-    /// @return True when unauthenticated peers must be refused the gated verbs.
-    [[nodiscard]] virtual bool AuthRequired() const noexcept = 0;
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return True when unauthenticated peers must be refused this verb.
+    [[nodiscard]] virtual bool AuthRequired(std::uint8_t opRaw) const noexcept = 0;
 
     /// Check an `AUTH` payload against this surface's credential.
     ///

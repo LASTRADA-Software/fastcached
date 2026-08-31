@@ -487,8 +487,16 @@ class HoldableResponder final: public IFrameResponder
     ///
     /// Off by default, so every case written before #289 keeps asserting what it did.
     /// A case that turns it on is asking about the credential gate specifically.
-    [[nodiscard]] bool AuthRequired() const noexcept override
+    ///
+    /// Answers per verb when a case named one (#290), because that is the only shape
+    /// a merged listener can have: the same connection must be able to carry an
+    /// unauthenticated cache FETCH and a scheduler verb that is refused without a
+    /// credential. `AuthRequired(true)` on such a surface locks out every local build;
+    /// `false` undoes #289.
+    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
     {
+        if (auto const only = _gatedVerb.load(std::memory_order_acquire); only >= 0)
+            return opRaw == static_cast<std::uint8_t>(only);
         return _authRequired.load(std::memory_order_acquire);
     }
 
@@ -565,10 +573,22 @@ class HoldableResponder final: public IFrameResponder
         _refusedVerb.store(op.has_value() ? static_cast<int>(*op) : -1, std::memory_order_release);
     }
 
-    /// Require a credential before the gated verbs.
+    /// Require a credential before every gated verb.
     void RequireAuth(bool required) noexcept
     {
         _authRequired.store(required, std::memory_order_release);
+    }
+
+    /// Require a credential before exactly one verb, leaving the rest open.
+    ///
+    /// The merged-listener shape (#290): a surface serving the cache AND the scheduler
+    /// has no surface-wide answer that is right, because the cache's `false` is a
+    /// property of its verbs -- a credential every local build can read is not a
+    /// credential -- and not of the port they arrive on. Overrides `RequireAuth`.
+    /// @param op The verb to gate, or nullopt to go back to the surface-wide answer.
+    void RequireAuthOnlyFor(std::optional<Wire::Op> op) noexcept
+    {
+        _gatedVerb.store(op.has_value() ? static_cast<int>(*op) : -1, std::memory_order_release);
     }
 
     /// What the next `CheckCredential` will answer.
@@ -623,6 +643,9 @@ class HoldableResponder final: public IFrameResponder
     mutable std::atomic<std::size_t> _peerRefusals { 0 };
     mutable std::atomic<std::size_t> _peerChecks { 0 };
     std::atomic<bool> _authRequired { false };
+    /// The one verb to gate, or -1 for the surface-wide answer. An `int` for the same
+    /// reason `_refusedVerb` is one.
+    std::atomic<int> _gatedVerb { -1 };
     CredentialOutcome _outcome { CredentialOutcome::NoPolicy };
     mutable std::atomic<std::size_t> _credentialChecks { 0 };
     mutable std::atomic<std::size_t> _unauthenticatedRefusals { 0 };
@@ -831,6 +854,56 @@ TEST_CASE("One peer is refused one verb and served another on the same listener"
     std::array<std::byte, Wire::RequestHeaderSize> storeHeader {};
     WireFrame::PutHeader(storeHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Store), 0);
     auto const served = conversation.Send(storeHeader);
+    REQUIRE_FALSE(served.empty());
+    CHECK(ErrorOf(served) == std::nullopt);
+    CHECK(responder.Entered() == 1);
+}
+
+TEST_CASE("One verb needs a credential and another does not on the same listener", "[node][frame]")
+{
+    // The second half of what a merged listener needs, and the half that is easy to
+    // land wrong. `RefusePeer` decides admission; this decides the CREDENTIAL, and on
+    // one surface the two production answers are opposite and both correct: the
+    // scheduler requires a credential when one is configured, the cache requires none
+    // because a credential every local build can read is not a credential.
+    //
+    // A surface-wide answer therefore has no right value once they merge. `true`
+    // refuses every local `fastcache-cc` FETCH with `Unauthenticated` -- a total
+    // outage that looks like a permissions bug -- and `false` silently undoes #289,
+    // leaving the scheduler verbs open on a port that faces the network, which is
+    // exactly the hole #289 closed and which nothing would fail to notice.
+    //
+    // So, as with the verb-aware `RefusePeer` above: no merge here, just the seam
+    // proven able to carry the distinction before the bind changes underneath it.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RequireAuthOnlyFor(Wire::Op::Lease);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // A scheduler verb, unauthenticated: refused. Both verbs are `RequiresAuth` in the
+    // wire table, so nothing here is decided by `PreAuth` -- if it were, this case
+    // would pass with `AuthRequired` ignoring its argument entirely.
+    std::array<std::byte, Wire::RequestHeaderSize> leaseHeader {};
+    WireFrame::PutHeader(leaseHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Lease), 0);
+    auto const refused = conversation.Send(leaseHeader);
+    REQUIRE_FALSE(refused.empty());
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::Unauthenticated);
+    // Counted as the credential arm specifically -- the operator reading this counter
+    // is asking whether somebody is reaching for verbs they hold no secret for, which
+    // a size or opcode refusal does not answer.
+    CHECK(responder.UnauthenticatedRefusals() == 1);
+    CHECK(responder.Entered() == 0);
+
+    // The same connection, still unauthenticated, a cache verb: served.
+    auto const served = conversation.Send(Wire::EncodeFetch("k"));
     REQUIRE_FALSE(served.empty());
     CHECK(ErrorOf(served) == std::nullopt);
     CHECK(responder.Entered() == 1);
