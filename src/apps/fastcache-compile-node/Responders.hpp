@@ -60,7 +60,8 @@ class SchedulerResponder final: public IFrameResponder
     /// the same function `Gate()` calls, so the early check and the authoritative one
     /// cannot disagree, and the `NotAMember` counter is incremented inside it exactly
     /// once per refused request.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+                                                                   std::uint8_t /*opRaw*/) const override
     {
         return _protocol.RefusePeer(Context(peer));
     }
@@ -206,7 +207,14 @@ class CacheResponder final: public IFrameResponder
         // and compiles; a new code would be an unknown one to every launcher already
         // deployed, and an unknown refusal is the one shape that has cost this tree a
         // permanent 0% hit rate before. The sentence carries what changed.
-        if (auto refusal = RefusePeer(peer); refusal.has_value())
+        // The verb, read back out of the frame this call was handed. `Answer` is
+        // reachable directly -- that is why this gate exists here as well as at the
+        // door -- so it cannot take the endpoint's word for the opcode. A frame too
+        // short to carry a header cannot name a verb, and `0xFF` is unassigned, so it
+        // asks about a verb no policy admits rather than about a verb it guessed.
+        auto const decodedHeader = CompileCacheWire::DecodeRequestHeader(frame);
+        auto const opRaw = decodedHeader.has_value() ? decodedHeader->opRaw : std::uint8_t { 0xFF };
+        if (auto refusal = RefusePeer(peer, opRaw); refusal.has_value())
             co_return *std::move(refusal);
         co_return co_await _proxy.Answer(frame);
     }
@@ -221,7 +229,8 @@ class CacheResponder final: public IFrameResponder
     /// rather than repeating it, so the early refusal and the authoritative one are
     /// the same code and the counter moves exactly once per refused request whichever
     /// path reached it.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
+                                                                   std::uint8_t /*opRaw*/) const override
     {
         if (_locality.IsThisMachine(peer))
             return std::nullopt;

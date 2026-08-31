@@ -467,9 +467,16 @@ class HoldableResponder final: public IFrameResponder
     /// refusal fired and that it fired exactly ONCE -- an uncounted refusal and a
     /// double-counted one are both worse than none, because the count is what an
     /// operator reads to know the gate works.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view /*peer*/) const override
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view /*peer*/,
+                                                                   std::uint8_t opRaw) const override
     {
         _peerChecks.fetch_add(1, std::memory_order_acq_rel);
+        if (auto const only = _refusedVerb.load(std::memory_order_acquire);
+            only >= 0 && opRaw == static_cast<std::uint8_t>(only))
+        {
+            _peerRefusals.fetch_add(1, std::memory_order_acq_rel);
+            return Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not admitted for this verb");
+        }
         if (!_refusePeers.load(std::memory_order_acquire))
             return std::nullopt;
         _peerRefusals.fetch_add(1, std::memory_order_acq_rel);
@@ -547,6 +554,17 @@ class HoldableResponder final: public IFrameResponder
         _refusePeers.store(refuse, std::memory_order_release);
     }
 
+    /// Refuse exactly one verb, admitting the rest.
+    ///
+    /// The shape a merged 0xFC listener needs: on three listeners the surface IS the
+    /// policy, so a peer-only answer suffices; on one, the same peer must be refused
+    /// a cache FETCH and served a COMPILE (#290).
+    /// @param op The verb to refuse, or nullopt to refuse none.
+    void RefuseOnlyVerb(std::optional<Wire::Op> op) noexcept
+    {
+        _refusedVerb.store(op.has_value() ? static_cast<int>(*op) : -1, std::memory_order_release);
+    }
+
     /// Require a credential before the gated verbs.
     void RequireAuth(bool required) noexcept
     {
@@ -597,6 +615,9 @@ class HoldableResponder final: public IFrameResponder
     FastCache::IReactor* _reactor { nullptr };
     std::atomic<bool> _held { false };
     std::atomic<bool> _refusePeers { false };
+    /// The one verb to refuse, or -1. An `int` because `std::atomic<std::optional<>>`
+    /// is not lock-free and this is read on the accept path.
+    std::atomic<int> _refusedVerb { -1 };
     // Mutable because `RefusePeer` is `const` -- it is a predicate, and counting how
     // often it was asked must not make it look like a mutator.
     mutable std::atomic<std::size_t> _peerRefusals { 0 };
@@ -762,6 +783,56 @@ TEST_CASE("An authenticated peer is served the same verb", "[node][frame]")
     CHECK(responder.CredentialChecks() == 1);
     CHECK(responder.UnauthenticatedRefusals() == 0);
     // Reached, which is the whole point: the gate let a credentialled caller through.
+    CHECK(responder.Entered() == 1);
+}
+
+TEST_CASE("One peer is refused one verb and served another on the same listener", "[node][frame]")
+{
+    // #290's acceptance criterion, made expressible. The merge's own test is
+    //
+    //     a cache FETCH from another machine is refused on the merged wildcard port
+    //     while a compile from that same peer succeeds
+    //
+    // -- same peer, two verbs, two answers. That could not be written at all while
+    // `RefusePeer` took the peer and nothing else: on three listeners the SURFACE is
+    // the policy, so a peer-only answer is complete; on one listener the policy
+    // belongs to the verb, and a peer-only predicate has nowhere to put the
+    // difference.
+    //
+    // No merge here. This asserts the seam can carry the question, which is the part
+    // worth landing separately: the bind change that follows looks harmless in review
+    // and this one does not.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RefuseOnlyVerb(Wire::Op::Fetch);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Cache, LoopbackFor(NodeSurface::Cache, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // A COMPLETE frame, unlike the pre-payload cases above. Those declare a payload
+    // and send none of it, which is what proves a refusal was decided from the header
+    // -- but it also leaves the server draining bytes that never arrive, so nothing
+    // else can travel on that connection. This case needs the connection afterwards,
+    // and what it asserts is the discrimination rather than the ordering, which the
+    // cases above already pin.
+    auto const refused = conversation.Send(Wire::EncodeFetch("k"));
+    REQUIRE_FALSE(refused.empty());
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
+    CHECK(responder.Entered() == 0);
+
+    // The SAME connection, the same peer, a different verb: served. Without this the
+    // case above is satisfied by a responder that refuses everything.
+    std::array<std::byte, Wire::RequestHeaderSize> storeHeader {};
+    WireFrame::PutHeader(storeHeader, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Store), 0);
+    auto const served = conversation.Send(storeHeader);
+    REQUIRE_FALSE(served.empty());
+    CHECK(ErrorOf(served) == std::nullopt);
     CHECK(responder.Entered() == 1);
 }
 
