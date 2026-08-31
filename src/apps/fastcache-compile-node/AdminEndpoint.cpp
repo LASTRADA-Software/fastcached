@@ -32,7 +32,7 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
         auto const disk = sources.host->SpaceOn(sources.scratchRoot);
         return MetricsSnapshot {
             // The node's own cache, when it has one. It usually does --
-            // `--listen-cache` is on by default and a local tier is what this
+            // `--listen-node` is on by default and a local tier is what this
             // program is FOR -- and this scrape reported `std::nullopt` regardless,
             // so a node holding a quarter of a gigabyte of objects and one holding
             // none produced the same bytes. Null only when the operator turned

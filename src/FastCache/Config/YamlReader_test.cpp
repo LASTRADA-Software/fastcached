@@ -221,7 +221,7 @@ TEST_CASE("YamlReader: listeners sequence populates cfg.binds", "[config][yaml][
 TEST_CASE("YamlReader: roles is gone, and is refused rather than ignored", "[config][yaml][listeners]")
 {
     // `roles:` existed to compose `cache` with `dispatch`, and dispatch moved to
-    // `fastcache-compile-node --listen-scheduler`. With one role left the key could
+    // `fastcache-compile-node --serve-scheduler`. With one role left the key could
     // only ever say what the default already says, so it is deleted rather than kept
     // as a spelling that does nothing.
     //

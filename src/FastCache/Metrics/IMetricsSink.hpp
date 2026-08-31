@@ -324,6 +324,15 @@ class IMetricsSink
         /// the only evidence is a client-side hit rate that fell for no visible
         /// reason. On a loopback bind it stays at zero forever, which is the answer
         /// to "is this happening to me".
+        ///
+        /// That last sentence stopped being the whole story when the cache and
+        /// scheduler surfaces merged (#290). A node running `--serve-scheduler` binds
+        /// the wildcard, so peers reach the same port the cache verbs arrive on and a
+        /// rise there is ORDINARY rather than a signal -- it is the tightening working.
+        /// A **worker** still defaults to loopback and a rise there still means what it
+        /// always did. The counter is the same fact either way; which reading applies
+        /// is a property of the node, and the help text says so rather than promising
+        /// a zero the merge made false.
         NodeCacheRequestsRefusedNotLocal,
 
         /// Scheduler requests refused because the connection presented no accepted

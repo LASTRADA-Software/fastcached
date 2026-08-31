@@ -297,8 +297,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .prometheusName = "fastcache_node_cache_requests_refused_not_local_total",
       .help = "Cache requests refused because the caller is not on this machine. A node's tier "
               "is this machine's build output and is served to this machine only, whatever the "
-              "surface is bound to and whatever the member list says. Stays at zero on the "
-              "default loopback bind; a rise means something off-box is asking.",
+              "surface is bound to and whatever the member list says. On a worker, whose node "
+              "port defaults to loopback, this stays at zero and a rise means something off-box "
+              "is asking. On a node running --serve-scheduler the port faces the network by "
+              "design, so a rise is ORDINARY -- it counts peers reaching the right host for the "
+              "wrong verb -- and what an operator watches there is the shape of the curve rather "
+              "than its existence.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
       .prometheusName = "fastcache_scheduler_requests_refused_unauthenticated_total",

@@ -501,6 +501,38 @@ inline constexpr PayloadCap SessionCapGoverns { 0 };
     return PayloadCap { bytes };
 }
 
+/// Which of this protocol's verb families a verb belongs to.
+///
+/// The `Op` enum has always carried this grouping -- as three comment blocks saying
+/// "Distributed execution", "Cluster administration" and nothing at all for the first
+/// three. A comment is enough while each family has a listener to itself, and stops
+/// being enough the moment one listener serves several
+/// ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)): a merged
+/// `0xFC` surface routes each frame to the component that owns its family, and asks
+/// that component -- rather than the port -- whether the peer is admitted, whether a
+/// credential is required, and which counter a refusal belongs to.
+///
+/// So the grouping becomes a column. It says which family a verb BELONGS to, never
+/// which process serves it: `fastcached` and a node both answer `Cache` verbs, and
+/// what differs is which of them has a component for the family, not the taxonomy.
+enum class VerbFamily : std::uint8_t
+{
+    /// Not a family. Zero is deliberately unusable, so a row added without a family
+    /// fails `EveryVerbHasAFamily` instead of silently joining whichever family
+    /// happened to be first -- the same failure mode `PreAuth` and `PayloadCap` are
+    /// spelled as unconstructible-by-default types to prevent. A wrapper class would
+    /// work here too; the table-wide assertion is the lighter of the two and this
+    /// column, unlike those, has no valid value that a `{}` could be confused for.
+    Unset = 0,
+    /// Establishes a credential for the connection, and belongs to no one surface:
+    /// on a merged listener it is answered by whichever component owns the
+    /// credential, which is the scheduler.
+    Session,
+    Cache,     ///< Reads and writes compile results.
+    Scheduler, ///< Spends the fleet's capacity, or changes what the cluster agrees.
+    Compile,   ///< Causes a compiler to run on this machine.
+};
+
 /// One row of the opcode table: everything the framing layer knows about a verb.
 struct OpDescriptor
 {
@@ -532,6 +564,12 @@ struct OpDescriptor
     /// file, and by the time it is read the peer has authenticated, so the
     /// operator's own cap is the right bound.
     PayloadCap maxPayload;
+
+    /// Which verb family this belongs to; never `Unset`.
+    ///
+    /// Read by a merged listener to pick the component that answers, admits, gates
+    /// and counts for this verb. `EveryVerbHasAFamily` refuses a row that omits it.
+    VerbFamily family;
 };
 
 /// What an endpoint answers for a verb it does not implement.
@@ -661,20 +699,23 @@ inline constexpr std::array OpTable {
                    .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = SessionCapGoverns }, // an object file; bounded by the operator's cap
+                   .maxPayload = SessionCapGoverns, // an object file; bounded by the operator's cap
+                   .family = VerbFamily::Cache },
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
                    .fieldCount = 1, // key
                    .legalStatuses =
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = SessionCapGoverns },
+                   .maxPayload = SessionCapGoverns,
+                   .family = VerbFamily::Cache },
     OpDescriptor { .code = Op::Auth,
                    .name = "auth",
                    .fieldCount = 2, // username, secret
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = OpenBeforeAuth,
-                   .maxPayload = BoundedTo(MaxAuthPayload) },
+                   .maxPayload = BoundedTo(MaxAuthPayload),
+                   .family = VerbFamily::Session },
 
     // Distributed execution. None is `preAuth`: causing a compiler to run on
     // another machine is the last thing an unauthenticated peer should reach.
@@ -683,55 +724,64 @@ inline constexpr std::array OpTable {
                    .fieldCount = 5, // fingerprint, endpoint, u32 slots, accepted codecs, capacity
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Heartbeat,
                    .name = "heartbeat",
                    .fieldCount = 3, // workerId, u32 inFlight, load
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
                    .fieldCount = 3, // fingerprint, key, accepted codecs
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Release,
                    .name = "release",
                    .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterStatus,
                    .name = "cluster-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterSet,
                    .name = "cluster-set",
                    .fieldCount = 2, // setting name, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 2, // member id, consensus endpoint
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = BoundedTo(MaxControlPayload) },
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
-                   .maxPayload = SessionCapGoverns }, // carries a preprocessed TU; the operator's cap governs
+                   .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
+                   .family = VerbFamily::Compile },
 };
 
 /// Whether every verb reachable before authentication declares a payload bound.
@@ -747,6 +797,21 @@ inline constexpr std::array OpTable {
 }
 
 static_assert(PreAuthVerbsAreBounded(), "a verb reachable before AUTH must declare its own payload ceiling");
+
+/// Whether every verb states which family it belongs to.
+///
+/// The same shape as `PreAuthVerbsAreBounded` and for the same reason: an omitted
+/// `family` value-initializes to `Unset`, and a merged listener asking an `Unset`
+/// verb's owner to answer would find none and refuse a verb this build implements.
+/// That reads to a client as a daemon too OLD to know the verb, which is the one
+/// misdiagnosis `UnimplementedVerb` exists to avoid handing out falsely.
+/// @return True when no row leaves `family` at `Unset`.
+[[nodiscard]] constexpr bool EveryVerbHasAFamily() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) { return row.family != VerbFamily::Unset; });
+}
+
+static_assert(EveryVerbHasAFamily(), "a verb belongs to a family -- see VerbFamily");
 
 /// One row of the error table: the code, its stable name, and the message sent
 /// when the caller has nothing more specific to say.
@@ -891,6 +956,19 @@ static_assert(FieldCountsAgree(), "a verb carries fields, or is listed as carryi
         if (static_cast<std::uint8_t>(row.code) == opRaw)
             return &row;
     return nullptr;
+}
+
+/// Which family a verb belongs to.
+///
+/// Takes the raw byte rather than an `Op`, because every caller has one: a byte off
+/// the wire is not yet known to be a verb at all, and a lookup that demanded an `Op`
+/// would push the "is this even a verb" question onto each call site separately.
+/// @param opRaw The third header byte, as received.
+/// @return The family, or `Unset` when the byte names no verb in this build.
+[[nodiscard]] constexpr VerbFamily FamilyOf(std::uint8_t opRaw) noexcept
+{
+    auto const* const row = FindOp(opRaw);
+    return row != nullptr ? row->family : VerbFamily::Unset;
 }
 
 /// Look up the descriptor for an error code.

@@ -141,7 +141,7 @@ class NodeMembership
     ///
     /// That default is exactly what a WORKER must be able to leave behind. It could
     /// not until #235: the startup table refused `--fleet-member` on any node
-    /// without `--listen-scheduler`, so a pure worker's oracle was an empty list by
+    /// without a scheduler, so a pure worker's oracle was an empty list by
     /// construction and its compile port refused every dispatched job.
     /// @return The oracle; valid for this object's lifetime.
     [[nodiscard]] Distributed::IMembershipOracle const& Oracle() const noexcept

@@ -96,13 +96,13 @@ if (-not $SelfTest) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Node       = (Resolve-Path $Node).Path
 
-# Every node started below turns its own cache port OFF. `--listen-cache` defaults
+# Every node started below turns its own cache tier OFF. `--listen-node` defaults
 # to 127.0.0.1:6674 -- where `fastcache-cc` looks -- which is right for the one node
 # per machine a real deployment runs and wrong here, where several share a host and
 # would race for it. Said explicitly rather than left to the default's
 # warn-and-continue, so a node that failed to bind for some OTHER reason still shows
 # up as the fault it is.
-$NoLocalCache = "--listen-cache="
+$NoLocalCache = "--cache-memory=0"
     $Launcher   = (Resolve-Path $Launcher).Path
 }
 
@@ -850,7 +850,7 @@ try {
         $schedLog = Join-Path $scratch "scheduler.log"
         $scheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
-            "--listen-scheduler=127.0.0.1:$dispatchPort", "--fleet-open",
+            "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
             "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1",
             "--port=$schedWorkerPort", "--advertise=127.0.0.1:$schedWorkerPort",
             "--toolchain=scheduler-only=$((Get-Command $cc).Source)", "--slots=1",
@@ -1091,7 +1091,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoScheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
-            "--listen-scheduler=127.0.0.1:$isoDispatch", "--fleet-open",
+            "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
             "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1",
             "--port=$isoSchedWorker", "--advertise=127.0.0.1:$isoSchedWorker",
             "--toolchain=also-not-the-compiler-this-client-uses=$((Get-Command $cc).Source)",

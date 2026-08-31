@@ -44,7 +44,6 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
 }
 
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
-    NodeIoLoop& io,
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
@@ -87,21 +86,14 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
         membership, clock, wallClock, metrics, logger, signingKey, std::move(policy) } };
 
-    // The surface, not an address. A bare port binds the WILDCARD here, the opposite
-    // of the cache's loopback, and that asymmetry is now a column of this surface's
-    // row rather than an argument this call site chooses -- so the address bound
-    // here, the one an install-time refusal judges and the one `--print-surfaces`
-    // prints are one computation instead of three that agree today.
-    auto started = FrameEndpoint::Start(io, NodeSurface::Scheduler, cfg, tier->_responder, logger);
-    if (!started.has_value())
-        return std::unexpected { started.error() };
-
-    tier->_endpoint = std::move(*started);
+    // No address in this line since #290: the scheduler verbs are answered on the
+    // node's one 0xFC listener, and that listener names itself when it binds.
+    //
     // The phrase is `AdmissionSummary`'s rather than this tier's, because the policy
     // is the NODE's: the worker's own ready line reports the identical fact, and two
     // surfaces spelling one policy differently is how an operator comes to believe
     // their compile port is configured because their scheduler said so (#235).
-    logger.Logf(LogLevel::Info, "scheduling for the fleet on {} ({})", tier->BoundEndpoint(), AdmissionSummary(cfg));
+    logger.Logf(LogLevel::Info, "scheduling for the fleet ({})", AdmissionSummary(cfg));
     return tier;
 }
 

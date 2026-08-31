@@ -97,18 +97,18 @@ expect_refusal() {
 
 # --- a setting in the file takes effect -------------------------------------
 #
-# `listen_cache` rather than something cheaper, because `--print-surfaces` prints
+# `listen_node` rather than something cheaper, because `--print-surfaces` prints
 # the address it resolves to: a key that did nothing would leave the cache row
 # reading "not served", which is a different line rather than a missing one.
 cat >"$WORK/good.yaml" <<'YAML'
 scheduler: "cache.internal:6675"
-listen_cache: "0.0.0.0:6699"
+listen_node: "0.0.0.0:6699"
 YAML
 expect_ok "a setting in the file takes effect" "0.0.0.0:6699" "--config=$WORK/good.yaml"
 
 # --- the command line wins over the file ------------------------------------
 expect_ok "the command line wins over the file" "0.0.0.0:6698" \
-    "--config=$WORK/good.yaml" "--listen-cache=0.0.0.0:6698"
+    "--config=$WORK/good.yaml" "--listen-node=0.0.0.0:6698"
 
 # --- absent ------------------------------------------------------------------
 #
@@ -171,7 +171,7 @@ if [ "$(id -u)" = "0" ]; then
     echo "skip: no configuration file anywhere is not an error (needs the case above)"
 else
 mkdir -p "$WORK/xdg/fastcache-compile-node"
-printf 'listen_cache: 0.0.0.0:6697\n' > "$WORK/xdg/fastcache-compile-node/fastcache-compile-node.yaml"
+printf 'listen_node: 0.0.0.0:6697\n' > "$WORK/xdg/fastcache-compile-node/fastcache-compile-node.yaml"
 out="$(XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK" "$NODE" --print-surfaces 2>&1)"
 case "$out" in
     *"0.0.0.0:6697"*) echo "ok: a file found by the lookup is read with no --config" ;;

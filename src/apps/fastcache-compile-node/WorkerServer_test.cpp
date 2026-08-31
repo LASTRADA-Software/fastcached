@@ -700,7 +700,7 @@ TEST_CASE("A worker admits whoever its operator's policy names, scheduler or not
     // #235, and a WIRING case rather than an oracle one: `ClusterMembership` was
     // always correct about a listed peer -- the case above proves that -- and a pure
     // worker could nonetheless never be handed one. `StartupPolicyRejection` refused
-    // `--fleet-member` on any node without `--listen-scheduler`, so the only oracle
+    // `--fleet-member` on any node without a scheduler, so the only oracle
     // such a node could construct was an empty list, which admits loopback and
     // nothing else. Every dispatched compile was refused `NotAMember` one hop after
     // the lease was granted, so no counter on either side moved.

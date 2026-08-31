@@ -139,7 +139,7 @@ struct FleetSnapshot
 /// What a fleet report is collected from.
 ///
 /// Pointers rather than references because two of them are legitimately absent: a
-/// node with no `--listen-scheduler` runs no scheduler, and one with no `--node-id`
+/// node with no `--serve-scheduler` runs no scheduler, and one with no `--node-id`
 /// runs no cluster. The bundle then has an obvious "nothing configured" spelling
 /// for a test -- the same device `NodeScrapeSources` uses for a node with no cache.
 struct FleetSources

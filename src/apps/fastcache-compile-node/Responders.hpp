@@ -10,6 +10,8 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 
+#include <algorithm>
+
 namespace FastCache::Node
 {
 
@@ -166,10 +168,11 @@ class SchedulerResponder final: public IFrameResponder
 ///
 /// The bind is not the policy and never was. A tier reachable only over loopback is
 /// closed by accident rather than by decision, and the accident evaporates the moment
-/// somebody widens `--listen-cache` -- or, once the cache, scheduler and compile
-/// surfaces share one wildcard listener, the moment they stop being separately
-/// bindable at all. Making locality a property of the **verb** is what survives that
-/// merge; "it is only bound to loopback" does not.
+/// somebody widens `--listen-node` -- and, since #290, the moment they stop being
+/// separately bindable at all: the cache and scheduler verbs now share one listener,
+/// which binds the wildcard on any node that schedules. Making locality a property of
+/// the **verb** is what survived that merge; "it is only bound to loopback" did not,
+/// and this is the layer that now carries the whole rule rather than half of it.
 ///
 /// Membership is *not* consulted here, and its absence is the fix. A
 /// `--fleet-member` names a machine that may spend this node's CPU and be leased its
@@ -332,6 +335,215 @@ class CacheResponder final: public IFrameResponder
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
     IMetricsSink& _metrics;
+};
+
+/// Serves several verb families on one `0xFC` listener.
+///
+/// The node used to open a listener per family, and the listener was then the policy:
+/// a frame that arrived on the cache port was a cache frame, so "which component
+/// answers", "who is admitted", "is a credential required" and "which counter does a
+/// refusal move" were all answered by the port it came in on. One port cannot answer
+/// any of those, so each becomes a lookup: `CompileCacheWire::FamilyOf` names the
+/// family, and this picks the component that owns it
+/// ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)).
+///
+/// **It is a router and nothing else.** Every policy stays in the component it
+/// belonged to before the merge -- the cache's locality rule, the scheduler's
+/// membership gate and credential -- and this adds none of its own. That is what
+/// keeps the merge a topology change: the answers do not move, only the question of
+/// which component is asked.
+///
+/// ## A family with no component
+///
+/// Legitimate and common: a node with no cache tier still serves the scheduler, and a
+/// worker that neither caches nor schedules serves neither. Those verbs are refused
+/// `UnimplementedVerb`, which is the honest code -- this endpoint really does not
+/// implement them -- and it is the one refusal `Cc::CacheProtocol` steps over rather
+/// than treating as fatal.
+///
+/// Note the asymmetry with `CacheProxy`'s own refusals, which stay
+/// `DispatchNotPermitted`: those name a verb served on ANOTHER port of the same node,
+/// and telling a client "unknown opcode" there says this daemon is too old when it is
+/// in fact merely configured differently. Here there is no other port, so the two
+/// facts coincide.
+class MergedResponder final: public IFrameResponder
+{
+  public:
+    /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
+    /// @param scheduler Answers the scheduler verbs, or nullptr when this node does
+    ///        not schedule. Also owns the credential, so `AUTH` goes here. Both must
+    ///        outlive this.
+    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler) noexcept:
+        _cache { cache },
+        _scheduler { scheduler }
+    {
+    }
+
+    /// The component that owns @p opRaw, or nullptr when this node serves it nowhere.
+    ///
+    /// `Session` follows the scheduler, because the credential is the scheduler's: the
+    /// cache requires none, so an `AUTH` routed to it would be answered "no policy" and
+    /// a peer holding the scheduler's secret could never present it.
+    ///
+    /// `Compile` is deliberately absent rather than forgotten -- it is served by
+    /// `WorkerServer`, on its own accept loop, because a compile blocks for seconds and
+    /// must be handed to an executor rather than run on this reactor (#213). Folding it
+    /// in is the second half of #290 and is a change to how compiles RUN, not to how
+    /// frames are routed.
+    ///
+    /// @param opRaw The third header byte, as received.
+    /// @return The owner, or nullptr.
+    [[nodiscard]] IFrameResponder* OwnerOf(std::uint8_t opRaw) const noexcept
+    {
+        switch (CompileCacheWire::FamilyOf(opRaw))
+        {
+            case CompileCacheWire::VerbFamily::Cache:
+                return _cache;
+            case CompileCacheWire::VerbFamily::Session:
+            case CompileCacheWire::VerbFamily::Scheduler:
+                return _scheduler;
+            case CompileCacheWire::VerbFamily::Compile:
+            case CompileCacheWire::VerbFamily::Unset:
+                return nullptr;
+        }
+        return nullptr;
+    }
+
+    /// @copydoc IFrameResponder::Answer
+    ///
+    /// Reachable directly as well as through the endpoint, so it decodes the header
+    /// itself rather than taking anybody's word for the verb -- the same reason
+    /// `CacheResponder::Answer` re-asks its own gate.
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    {
+        auto const header = CompileCacheWire::DecodeRequestHeader(frame);
+        if (!header.has_value())
+            // Empty is CLOSE, and it is the right answer to exactly this: a frame whose
+            // header will not decode is not this protocol, which is the one condition
+            // `CacheProxy::Answer` also closes on. Every other refusal is a reply.
+            co_return std::vector<std::byte> {};
+
+        auto* const owner = OwnerOf(header->opRaw);
+        if (owner == nullptr)
+            co_return UnservedReply();
+        co_return co_await owner->Answer(frame, std::move(peer));
+    }
+
+    /// @copydoc IFrameResponder::RefusePeer
+    ///
+    /// A verb nobody serves is refused here, at the door, before a payload is read --
+    /// which is what keeps an unserved verb from costing this surface a buffer.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        if (owner == nullptr)
+            return UnservedReply();
+        return owner->RefusePeer(peer, opRaw);
+    }
+
+    /// @copydoc IFrameResponder::AuthRequired
+    ///
+    /// The whole reason this question had to take the verb. The two owners answer it
+    /// oppositely and both are right: the scheduler requires a credential when one is
+    /// configured, the cache requires none because a credential every local build can
+    /// read is not a credential. An unowned verb answers `false` and is unreachable
+    /// anyway -- `RefusePeer` above has already refused it, and requiring a credential
+    /// for a verb nobody serves would tell a stranger that one exists.
+    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner != nullptr && owner->AuthRequired(opRaw);
+    }
+
+    /// @copydoc IFrameResponder::CheckCredential
+    ///
+    /// The scheduler's, because the credential is. A node with no scheduler has no
+    /// policy to check -- and never reaches this, since `AUTH` is then an unowned verb
+    /// refused at the door.
+    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    {
+        if (_scheduler == nullptr)
+            return CredentialOutcome::NoPolicy;
+        return _scheduler->CheckCredential(payload);
+    }
+
+    /// @copydoc IFrameResponder::RefusalReply
+    ///
+    /// Routed for the COUNTER. The wording is the same either way, but a cache STORE
+    /// that overran its ceiling counted against the scheduler names the wrong
+    /// subsystem, and naming the subsystem is what these counters are read for.
+    [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
+                                                      std::uint8_t opRaw) const override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        if (owner == nullptr)
+            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
+        return owner->RefusalReply(decision, opRaw);
+    }
+
+    /// @copydoc IFrameResponder::MaxRequestBytes
+    ///
+    /// The largest of the owners', which is safe only because #284 made the ceiling a
+    /// property of the VERB: this is the session cap, and the session cap governs
+    /// exactly the three payload-bearing verbs. Every scheduler verb declares
+    /// `BoundedTo(MaxControlPayload)` in the wire table and stays bounded in kilobytes
+    /// on a surface whose session cap is the cache's 256 MiB. Without that column this
+    /// number could not exist, which is why #284 was a blocker rather than a nicety.
+    [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return Largest(&IFrameResponder::MaxRequestBytes);
+    }
+
+    /// @copydoc IFrameResponder::MaxOpenConnections
+    ///
+    /// The largest, not the sum and not the smallest. This one surface now carries both
+    /// populations -- every local `fastcache-cc` and every peer in the fleet -- and the
+    /// smaller ceiling would close the port to one population because the other exists.
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
+    {
+        return Largest(&IFrameResponder::MaxOpenConnections);
+    }
+
+    /// @copydoc IFrameResponder::MaxInFlightBytes
+    ///
+    /// The largest, and in practice the cache's: a scheduler verb's payload is
+    /// kilobytes, so the budget that matters is the one sized for object files.
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return Largest(&IFrameResponder::MaxInFlightBytes);
+    }
+
+  private:
+    /// What a verb this node serves nowhere is answered with.
+    ///
+    /// A sentence rather than a bare code, because the operator action differs from
+    /// every other refusal here: nothing is misconfigured on the CLIENT's side, and the
+    /// node has to be told to hold a tier or to schedule before this verb exists.
+    /// @return The encoded refusal.
+    [[nodiscard]] static std::vector<std::byte> UnservedReply()
+    {
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::UnimplementedVerb,
+                                                  "this node serves no component for that verb family");
+    }
+
+    /// The largest value the present owners report for one ceiling.
+    ///
+    /// One helper rather than three near-identical folds: the three ceilings differ
+    /// only in which member function they read, and copy-pasted branches that differ
+    /// by a name are what this codebase treats as a defect.
+    /// @param ceiling Which ceiling to read.
+    /// @return The largest; 0 when no owner is present.
+    [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
+    {
+        std::size_t out = 0;
+        for (auto const* const owner: { _cache, _scheduler })
+            if (owner != nullptr)
+                out = std::max(out, (owner->*ceiling)());
+        return out;
+    }
+
+    IFrameResponder* _cache;
+    IFrameResponder* _scheduler;
 };
 
 } // namespace FastCache::Node

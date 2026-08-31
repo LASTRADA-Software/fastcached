@@ -198,21 +198,16 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     auto tier =
         std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };
 
-    // The surface, not an address. Loopback for a bare port, the OPPOSITE of the
-    // scheduler's wildcard, and that asymmetry is now a column of this surface's row
-    // rather than an argument this call site chooses -- so nothing here can open a
-    // port the operator's firewall worksheet does not list.
-    auto started = FrameEndpoint::Start(io, NodeSurface::Cache, cfg, tier->_responder, logger);
-    if (!started.has_value())
-        return std::unexpected { started.error() };
-
-    tier->_endpoint = std::move(*started);
+    // No address in this line since #290: the cache verbs are answered on the node's
+    // one 0xFC listener, and that listener names itself when it binds. A tier that
+    // announced an address of its own would be a second author of it, and the two
+    // would disagree the first time a bare port resolved differently.
+    //
     // Each half named separately, and an absent one said out loud. "256m in
     // memory, no disk" and "no memory, 10g on disk" are different deployments and
     // an operator reading one startup line has to be able to tell which they got.
     logger.Logf(LogLevel::Info,
-                "local cache on {} (memory {}, disk {}, upstream {})",
-                tier->BoundEndpoint(),
+                "local cache tier (memory {}, disk {}, upstream {})",
                 cfg.cacheMemoryBytes == 0 ? std::string { "off" }
                                           : FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
                 cfg.cacheDir.empty()
@@ -284,7 +279,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     //
     // Said out loud, for the reason the branch below already is: this was the one
     // way to reach "no cache tier" that logged NOTHING, so a node started with
-    // `--listen-cache=` had no line anywhere saying it was not caching -- while
+    // `--listen-node=` had no line anywhere saying it was not caching -- while
     // `--cache-memory` and `--cache-dir`, which an operator may well have set
     // beside it, went on reading as though they meant something. It names them
     // when they did, because a flag silently doing nothing is the shape this
@@ -294,13 +289,13 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // declines to bind. **Which sentence** an operator gets is this function's own,
     // because a row resolving to nothing cannot say which of two reasons applied, and
     // the two send an operator to different flags.
-    if (RowFor(NodeSurface::Cache).Resolve(cfg).empty())
+    if (RowFor(NodeSurface::Node).Resolve(cfg).empty() || (cfg.cacheMemoryBytes == 0 && cfg.cacheDir.empty()))
     {
-        if (cfg.cacheListen.empty())
+        if (cfg.nodeListen.empty())
         {
             auto const configured = cfg.cacheMemoryExplicit || !cfg.cacheDir.empty();
             logger.Logf(LogLevel::Info,
-                        "--listen-cache is empty; serving no local cache tier{}",
+                        "--listen-node is empty; serving no local cache tier{}",
                         configured ? " (--cache-memory/--cache-dir have no effect without a port)" : "");
         }
         else
@@ -322,32 +317,16 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // stepped over.
     // Each failure names the flag that caused it. They leave through one return
     // type, so without this a bad `--cache-dir` reached the operator as
-    // "--listen-cache cannot create /var/lib/...: permission denied" -- which
+    // "--listen-node cannot create /var/lib/...: permission denied" -- which
     // sends them to check a port.
     auto storage = BuildStorage(cfg, logger);
     if (!storage.has_value())
         return std::unexpected { std::format("--cache-dir {}", storage.error()) };
 
-    auto started = CacheTier::Start(io, cfg, std::move(*storage), locality, clock, metrics, logger);
-    if (started.has_value())
-        return std::move(*started);
-
-    // Fatal only when the operator NAMED this address -- the rule and its reasons are
-    // on `NodeConfig::cacheListen`. On the PROVENANCE bit, never on the value:
-    // comparing against the default reads `--listen-cache=127.0.0.1:6674` as a
-    // convenience nobody asked for, and the node came up healthy serving no cache
-    // (#286).
-    if (cfg.cacheListenExplicit)
-        return std::unexpected { std::format("--listen-cache {}", started.error()) };
-
-    // Never silent. The launcher will reach whatever else holds that port -- very
-    // likely the daemon -- so the build still works, but "the cache quietly did less
-    // than you configured" is the failure mode this codebase keeps a list about.
-    logger.Logf(LogLevel::Warn,
-                "default cache endpoint {}: {}; continuing without a local cache tier",
-                cfg.cacheListen,
-                started.error());
-    return std::unique_ptr<CacheTier> {};
+    // The bind, and the judgement about a failed one, moved to
+    // `StartNodeSurfaceOrExplain` with the surfaces (#290): a listener that carries
+    // two components cannot have its failure judged by one of them.
+    return CacheTier::Start(io, cfg, std::move(*storage), locality, clock, metrics, logger);
 }
 
 std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)

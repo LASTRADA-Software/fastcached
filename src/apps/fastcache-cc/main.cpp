@@ -255,7 +255,7 @@ struct Config
     // the default", which is localhost -- so the launcher caches with no
     // configuration at all against whichever of `fastcached` or
     // `fastcache-compile-node` a developer is running, and the node's
-    // `--listen-cache` defaults to the same address for exactly that reason. SET
+    // `--listen-node` defaults to the same address for exactly that reason. SET
     // BUT EMPTY still means *off*, which is the documented opt-out
     // `cmake/portable/CompileCache.cmake` exports, so `EnvOr` -- which collapses the
     // two -- cannot be used here without turning that opt-out into the default.

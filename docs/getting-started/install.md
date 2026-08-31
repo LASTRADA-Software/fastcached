@@ -319,12 +319,12 @@ Two further ports, both **off unless you ask for them**:
 
 | Port | What | Default |
 |------|------|---------|
-| **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --listen-scheduler`. Not served by `fastcached` |
+| **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --serve-scheduler`, which answers on that node's `--listen-node` rather than on a port of its own. Not served by `fastcached` |
 | **6676** | A compile worker's own port | the worker's `--port` |
 
-A compile node also serves a **cache tier of its own**, and its `--listen-cache`
-defaults to `127.0.0.1:6674` — the same address as the daemon's, deliberately,
-because that is where `fastcache-cc` already looks. On a machine running both, the
+A compile node also serves a **cache tier of its own**, on the same `--listen-node`
+port, which defaults to `6674` on loopback — the same address as the daemon's,
+deliberately, because that is where `fastcache-cc` already looks. On a machine running both, the
 node loses the bind, warns, and carries on with no local tier — the launcher
 reaches the daemon on that port instead. Give one of them a port of its own if you
 want the node's tier as well.

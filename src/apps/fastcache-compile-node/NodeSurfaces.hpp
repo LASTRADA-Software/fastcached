@@ -17,7 +17,7 @@ namespace FastCache::Node
 
 /// A port this node LISTENS on.
 ///
-/// The vocabulary is surfaces rather than flags, because two of the six are not one
+/// The vocabulary is surfaces rather than flags, because two of the five are not one
 /// flag: the compile port is `--bind` and `--port` together, and discovery is an
 /// address plus an optional private reply port. A `ListenFlag` enum would have had
 /// to leave both out, which is how the port map came to live in five places.
@@ -29,18 +29,27 @@ namespace FastCache::Node
 enum class NodeSurface : std::uint8_t
 {
     Compile = 0, ///< Where clients send translation units to be compiled.
-    Cache,       ///< Where `fastcache-cc` on this machine reads and writes objects.
-    Scheduler,   ///< Where the fleet asks this node for capacity, while it leads.
-    Admin,       ///< `/metrics`, `/healthz` and the fleet dashboard.
-    Raft,        ///< Where this node's peers send consensus traffic.
-    Discovery,   ///< The LAN beacon, and the port it is answered on.
-    Last,        ///< Count; never a surface.
+    /// This node's own `0xFC` port: the cache verbs `fastcache-cc` on this machine
+    /// reads and writes through, and -- with `--serve-scheduler` -- the verbs the
+    /// fleet asks this node for capacity with while it leads.
+    ///
+    /// **One surface where there were two** (#290). They were separated by the port
+    /// they arrived on, which made the listener the policy: a frame on the cache port
+    /// was a cache frame. That is now a lookup instead, and every question the
+    /// listener used to answer by existing -- who is admitted, whether a credential is
+    /// required, which counter a refusal moves -- is asked of the component that owns
+    /// the verb. See `MergedResponder`.
+    Node,
+    Admin,     ///< `/metrics`, `/healthz` and the fleet dashboard.
+    Raft,      ///< Where this node's peers send consensus traffic.
+    Discovery, ///< The LAN beacon, and the port it is answered on.
+    Last,      ///< Count; never a surface.
 };
 
 /// Whether a surface speaks TCP or UDP.
 ///
 /// A column rather than an assumption, and it is load-bearing for the one row that
-/// is not TCP: an operator handed a six-row worksheet writes six rules, and if one of
+/// is not TCP: an operator handed a five-row worksheet writes five rules, and if one of
 /// them silently needs UDP the beacon reaches nobody. That presents as a fleet that
 /// never forms -- a diagnosis costing hours, pointed at consensus rather than at a
 /// firewall -- because every other surface works perfectly.
@@ -99,8 +108,8 @@ struct SurfaceRow
 
     /// The flags that configure it: one, or two for the compile port and discovery.
     ///
-    /// One field rather than a `flag` plus a `secondFlag` that is empty for four rows
-    /// out of six. The second entry is empty when the surface takes one flag, and
+    /// One field rather than a `flag` plus a `secondFlag` that is empty for three rows
+    /// out of five. The second entry is empty when the surface takes one flag, and
     /// `FlagsOf` hands back only what is populated.
     std::array<std::string_view, 2> flags {};
 
@@ -235,7 +244,7 @@ struct SurfaceRow
 
 /// The single endpoint @p surface would bind, or why it would bind none.
 ///
-/// For the five surfaces served by exactly one socket, which is every one but
+/// For the four surfaces served by exactly one socket, which is every one but
 /// discovery. Written once because it was written four times: each opener resolved
 /// the row, refused an empty result and took `front()`, and the three refusals said
 /// three different things about one condition -- so an operator met a different
@@ -251,13 +260,13 @@ struct SurfaceRow
 ///
 /// **The RESOLVED configuration, never the defaults.** A worksheet naming a port
 /// nothing listens on is a wasted rule; one claiming `127.0.0.1` for a node started
-/// with `--listen-cache 0.0.0.0:6674` tells an operator a surface is loopback-only
+/// with `--listen-node 0.0.0.0:6674` tells an operator a surface is loopback-only
 /// when it is open to the network. Those are not two versions of one mistake: the
 /// first is untidy and the second is a security misstatement, which is why this
 /// takes a configuration rather than rendering the table alone.
 ///
-/// The protocol column is not decoration. Discovery is UDP and the other five are
-/// TCP, so a worksheet without it yields five correct rules and one wrong one -- and
+/// The protocol column is not decoration. Discovery is UDP and the other four are
+/// TCP, so a worksheet without it yields four correct rules and one wrong one -- and
 /// a beacon that reaches nobody presents as a fleet that never forms rather than as
 /// a firewall mistake.
 ///

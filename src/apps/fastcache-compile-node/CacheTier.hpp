@@ -56,6 +56,7 @@ class CacheTier
     /// this function would leave `StartCacheTierOrExplain` unable to tell which it
     /// was holding — and a bad `--cache-dir` on a node using the default cache port
     /// would be logged as a warning and stepped over.
+    /// @param io The node's loop; the tier's upstream dials through its connector.
     /// @param cfg The parsed configuration.
     /// @param storage Where this tier keeps objects; already opened.
     /// @param locality Decides whether a caller is on this machine -- the whole of
@@ -63,8 +64,13 @@ class CacheTier
     /// @param clock Time source for the tier's expiry; must outlive the tier.
     /// @param metrics Where hits, misses, upstream outcomes and locality refusals
     ///        are counted.
-    /// @param logger Where to announce the bound address.
-    /// @return The running tier, or why it could not be served.
+    /// @param logger Where to announce what the tier holds.
+    /// @return The tier, or why it could not be built.
+    ///
+    /// **Binds nothing since #290.** The cache verbs are answered on the node's one
+    /// `0xFC` listener, beside the scheduler's, so the tier is a component this
+    /// process owns rather than a surface it opens -- and what opens that listener is
+    /// `StartNodeSurfaceOrExplain`, which is also where a bind failure is judged.
     [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeIoLoop& io,
                                                                                       NodeConfig const& cfg,
                                                                                       std::unique_ptr<IStorage> storage,
@@ -80,10 +86,14 @@ class CacheTier
     CacheTier(CacheTier&&) = delete;
     CacheTier& operator=(CacheTier&&) = delete;
 
-    /// The address the cache surface bound.
-    [[nodiscard]] std::string const& BoundEndpoint() const noexcept
+    /// What answers the cache verbs on this node's `0xFC` listener.
+    ///
+    /// Handed to `MergedResponder`, which routes each frame to the component owning
+    /// its verb family. The tier owns no listener of its own (#290).
+    /// @return This tier's responder; outlives no longer than the tier.
+    [[nodiscard]] IFrameResponder& Responder() noexcept
     {
-        return _endpoint->BoundEndpoint();
+        return _responder;
     }
 
     /// What this node's cache holds, as one figure.
@@ -136,13 +146,12 @@ class CacheTier
     LocalCache _cache;
     CacheProxy _proxy;
     CacheResponder _responder;
-    std::unique_ptr<FrameEndpoint> _endpoint;
 };
 
 /// What @p tier is configured to hold, in the vocabulary the fleet speaks.
 ///
 /// Read off the tier that was actually built rather than off the configuration
-/// that asked for it, and the difference is the point: `--listen-cache` may have
+/// that asked for it, and the difference is the point: `--listen-node` may have
 /// been taken, `--cache-memory 0` may have turned the memory half off, and a
 /// node that announced a budget it does not have would have the leader reporting
 /// a cache that is not there.
@@ -171,22 +180,27 @@ class CacheTier
 ///
 ///   - **A tier** — it is serving.
 ///   - **Success carrying nothing** — there is deliberately no tier, either because
-///     `--listen-cache` was emptied or because its *default* address was taken. The
-///     node continues; a warning has already been logged.
-///   - **An error** — the operator NAMED an address and it could not be served, so
-///     startup must stop.
+///     `--listen-node` was emptied or because there is nowhere to keep objects.
+///     The node continues; a line has already been logged.
+///   - **An error** — the store could not be opened, so startup must stop.
+///
+/// The third outcome used to include a bind failure the operator had asked for by
+/// naming the address. That judgement moved to `StartNodeSurfaceOrExplain` with the
+/// surfaces (#290): one listener now carries the cache verbs and the scheduler's, and
+/// a failure to open it cannot be judged by one of the two components on it.
 ///
 /// That middle state is the whole reason this is a function rather than four lines
-/// in `WorkerBody`. The fatal/tolerable rule turns on whether the operator typed the
-/// address, which is a judgement worth stating once and testing, and `main.cpp` is
-/// in no test target — the lesson `CacheProtocol.cpp`, `RootReconciler.cpp` and
-/// `AdminEndpoint.cpp` were each extracted for. It also kept `WorkerBody` under
-/// clang-tidy's cognitive-complexity limit, which is the symptom that said so.
+/// in `WorkerBody`. Which of the three applies is a judgement worth stating once and
+/// testing, and `main.cpp` is in no test target — the lesson `CacheProtocol.cpp`,
+/// `RootReconciler.cpp` and `AdminEndpoint.cpp` were each extracted for. It also kept
+/// `WorkerBody` under clang-tidy's cognitive-complexity limit, which is the symptom
+/// that said so.
+/// @param io The node's loop; the tier's upstream dials through its connector.
 /// @param cfg The parsed configuration.
 /// @param locality Decides whether a caller is on this machine; must outlive it.
 /// @param clock Time source for the tier's expiry; must outlive it.
 /// @param metrics Where hits, misses and upstream outcomes are counted.
-/// @param logger Where the bound address, or the tolerated failure, is announced.
+/// @param logger Where what the tier holds, or why there is none, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
 [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
                                                                                              NodeConfig const& cfg,

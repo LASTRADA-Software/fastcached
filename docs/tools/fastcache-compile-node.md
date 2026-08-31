@@ -10,8 +10,8 @@ about one of them:
 | Role | What switches it on | Default |
 |---|---|---|
 | Compile worker | `--bind`, `--port` | on, `0.0.0.0:6676` |
-| [A cache tier of its own](#a-cache-of-its-own) | `--listen-cache` | on, `127.0.0.1:6674` |
-| [Fleet scheduler](#a-cluster-and-who-leads-it) | `--listen-scheduler` | **off** |
+| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory |
+| [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--node-id`, `--listen-raft` | **off** — a lone node leads itself |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
@@ -54,7 +54,7 @@ switched on in a fleet where machines come and go.
 configuration would bind, with its protocol, and exits without opening anything:
 
 ```console
-$ fastcache-compile-node --print-surfaces --listen-scheduler 6675 \
+$ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
 compile           0.0.0.0:6676    TCP
 cache             127.0.0.1:6674  TCP
@@ -74,7 +74,7 @@ column cannot, including the one that says this list can be **wrong** for the co
 port. Do not clip it when pasting the worksheet to somebody.
 
 Pass the flags you would actually run with. It prints what **that** configuration
-serves rather than the defaults, so a widened `--listen-cache 0.0.0.0:6674` shows
+serves rather than the defaults, so a widened `--listen-node 0.0.0.0:6674` shows
 as the wildcard and a surface you never turned on says so and names the flag that
 would. The node opens its ports from the same table this prints, so the list and
 the sockets cannot disagree — which is the whole reason to generate a firewall
@@ -85,8 +85,7 @@ The six surfaces, and what each is for:
 | Surface | Flags | Default | Protocol |
 |---|---|---|---|
 | Compile worker | `--bind` + `--port` | `0.0.0.0:6676` — **on** | TCP |
-| Cache tier | `--listen-cache` | `127.0.0.1:6674` — **on** | TCP |
-| Scheduler | `--listen-scheduler` | off; a bare port takes the **wildcard** | TCP |
+| Node port — cache verbs, and the scheduler's with `--serve-scheduler` | `--listen-node` | `6674` — **on**; a bare port takes **loopback**, or the **wildcard** with `--serve-scheduler` | TCP |
 | Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
 | Consensus peer | `--listen-raft` | off; a bare port takes the **wildcard**, and needs `--node-id` | TCP |
 | Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
@@ -103,12 +102,13 @@ Three things on that table are easy to get wrong and expensive to get wrong:
   `--discovery-reply-port` that one is kernel-chosen, which a restrictive host
   firewall has to allow as outbound, and a node that can hear beacons but not answer
   challenges completes no handshake.
-- **A bare port does not mean the same thing on every flag.** `--listen-cache 6674`
-  is loopback because a node's cache is this machine's entire build output;
-  `--listen-scheduler 6675` is the wildcard because a scheduler no peer can dial does
-  nothing. `--admin-listen`'s loopback is the sharpest of the three: it is what the
-  dashboard's credential rule turns on, so widening that address is what makes a
-  token required.
+- **A bare port does not always mean the same thing on the same flag.**
+  `--listen-node 6674` is loopback because a node's cache is this machine's entire
+  build output; the same `--listen-node 6674` beside `--serve-scheduler` is the
+  **wildcard**, because a scheduler no peer can dial does nothing. One port carries
+  both verb families, so it keeps both answers and picks on that flag.
+  `--admin-listen`'s loopback is the sharpest of the three: it is what the dashboard's
+  credential rule turns on, so widening that address is what makes a token required.
 
 **One caveat `--print-surfaces` states and cannot compute.** Under systemd socket
 activation the `.socket` unit owns the compile port, `--bind` and `--port` are read
@@ -134,7 +134,7 @@ which node that is:
 
 ```sh
 fastcache-compile-node \
-    --listen-scheduler=0.0.0.0:6675 --fleet-open \
+    --serve-scheduler --listen-node=0.0.0.0:6675 --fleet-open \
     --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6676 \
     --toolchain=/usr/bin/g++
@@ -456,7 +456,7 @@ launcher at itself:
 
 ```sh
 fastcache-compile-node \
-    --listen-cache=6677 --cache-memory=8g \
+    --listen-node=6677 --cache-memory=8g \
     --upstream=build-cache.internal:6674 \
     --scheduler=scheduler.internal:6675 \
     --advertise=worker-01.internal:6676 \
@@ -534,9 +534,10 @@ peer too old to report it is sized exactly as it always was.
 **What is subtracted is what the tier actually holds, not what you asked for.** A
 node that ends up with no tier subtracts nothing and offers the whole machine. Two
 ways of ending up there leave `--cache-memory` reading as though it still meant
-something: `--listen-cache=` turns the cache off outright, and a *default*
-`--listen-cache` that something else already holds — a `fastcached` on the same
-box, usually — is a warning the node carries on past. Both used to reserve the
+something: `--cache-memory=0` with no `--cache-dir` leaves nowhere to keep objects
+and so builds no tier, and a *default* `--listen-node` that something else already
+holds — a `fastcached` on the same box, usually — is a warning the node carries on
+past. Both used to reserve the
 configured budget regardless, so on a 32 GiB machine such a node held back the
 default 8 GiB it was not using and offered 24 slots where it could serve 32. A
 disk-only cache (`--cache-memory=0 --cache-dir=…`) is resident nowhere and so
@@ -642,15 +643,21 @@ disk tier standing empty.
 
 ### It answers where `fastcache-cc` already looks
 
-`--listen-cache` defaults to **`127.0.0.1:6674`** — the address the launcher uses
+`--listen-node` defaults to port **6674** on loopback — the address the launcher uses
 when nobody sets `FASTCACHE_ADDR`, and the one `cmake/portable/CompileCache.cmake`
 passes. So the whole thing works with no configuration: start a node, build, and
 the launcher finds it.
 
+**It is one port for two verb families.** The cache verbs are answered here always;
+the scheduler verbs are answered here too once you pass `--serve-scheduler`. That
+flag also moves where a bare port binds — loopback without it, the wildcard with it —
+because a scheduler no peer can dial does nothing. There is no second listen flag to
+set, and no way for the two to end up on addresses that disagree.
+
 That port is also `fastcached`'s, and what happens when both want it depends on
 whether **you typed the address**:
 
-| `--listen-cache` | Port already held |
+| `--listen-node` | Port already held |
 |---|---|
 | defaulted | Warned, and the node starts **with no local tier**. Your builds reach the daemon on that port instead, so nothing breaks — it just does less than a node with a tier would. |
 | named by you | Fatal. The node refuses to start and says so. |
@@ -661,14 +668,14 @@ typed is a promise and a broken promise is fatal. Neither is silent. Give one of
 them a port of its own if you want the node's tier as well.
 
 **"Named by you" means you typed the flag, not that you typed something unusual.**
-`--listen-cache=127.0.0.1:6674` — reading the address off the startup line and
+`--listen-node=127.0.0.1:6674` — reading the address off the startup line and
 typing it back to pin it — is a named address, and a port already held is fatal for
 it. Until #286 the node decided this by comparing your value against the default,
 so pinning the default port was indistinguishable from never mentioning it: the node
 started, logged a warning, reported healthy on `/healthz`, and served no cache.
 
 The distinction survives `--install-service`. The registration records
-`--listen-cache` when you typed it, whatever its value, so a service installed with
+`--listen-node` when you typed it, whatever its value, so a service installed with
 a port you named refuses to start when something else holds it — rather than warning
 past it at every boot. A port you never named is left out of the registration, so
 the service picks up a changed default rather than one frozen at install time.
@@ -678,7 +685,7 @@ the service picks up a changed default rather than one frozen at install time.
 **The cache is this machine's. The other two surfaces are this machine's and your
 fleet's.**
 
-| Caller | Cache (`--listen-cache`) | Fleet (`--listen-scheduler`) | Compile (`--port`) |
+| Caller | Cache (`--listen-node`) | Fleet (`--serve-scheduler`) | Compile (`--port`) |
 | --- | --- | --- | --- |
 | A process on this machine | always | always | always |
 | A `--fleet-member` peer | **refused** | yes | yes |
@@ -695,9 +702,10 @@ entitled to read it.
 
 The rule is a property of the **verb**, not of the bind: a `FETCH` or `STORE` whose
 peer address is not one of this host's own addresses is refused whatever
-`--listen-cache` was widened to. That is what keeps it true once the surfaces share
-one listener, where "it is only bound to loopback" stops being available as an
-argument. "This host's own addresses" is loopback plus every address on its
+`--listen-node` was widened to. That is what keeps it true now that the surfaces
+share one listener, where "it is only bound to loopback" has stopped being available
+as an argument — on a node running `--serve-scheduler` the port faces the network by
+design, and the cache verbs are closed by this rule alone. "This host's own addresses" is loopback plus every address on its
 interfaces, so a local client dialling the node at its routable address is still
 local; the set is re-read every 30 seconds, so an address the machine has just been
 given is refused for at most that long and then works.
@@ -716,7 +724,7 @@ via `--upstream`, which is what a cache several machines read is for.
 The flags are the node's, not the scheduler's. `--fleet-member` and `--fleet-open`
 are accepted on **any** node and read by all three columns above, so a plain worker
 is configured with them exactly as a scheduler is. They were once refused on a node
-running no `--listen-scheduler`, which left every worker's compile port on the first
+running no `--serve-scheduler`, which left every worker's compile port on the first
 row of that table and nothing else
 ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)).
 
@@ -734,16 +742,27 @@ Two mechanisms, and only one of them is a policy:
   rather than a dropped connection — member or not, and whatever the surface is
   bound to. A refusal, so a misconfigured client learns which it is instead of
   seeing a connection it cannot tell from a dead host.
-- **The bind** is defence in depth and nothing more. `--listen-cache` still takes
-  loopback for a bare port, the opposite of `--listen-scheduler`'s wildcard, so a
-  packet from another machine does not reach the process at all. Widening it —
-  `--listen-cache 0.0.0.0:6674` — is therefore only useful for reaching the tier
-  from *this* host under another address; it does not widen who is served.
+- **The bind** is defence in depth and nothing more — and on a scheduling node it is
+  not even that. `--listen-node` takes loopback for a bare port on a worker, so a
+  packet from another machine does not reach the process at all; widening it —
+  `--listen-node 0.0.0.0:6674` — is only useful for reaching the tier from *this* host
+  under another address, and does not widen who is served. Pass `--serve-scheduler`
+  and that bare port becomes the wildcard, because the same listener now answers the
+  fleet: the socket stops contributing anything and the locality check is the whole
+  defence.
 
 Until [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) the bind
 carried more than that: the policy admitted members, so widening the address really
 did hand the tier to your peers. It no longer does, and the flag is now a
 reachability decision rather than a trust one.
+
+That ordering mattered:
+[#290](https://github.com/LASTRADA-Software/fastcached/issues/290) put the cache and
+scheduler verbs on one listener, and could only do so once the tier stopped depending
+on its socket to stay private. On a scheduling node
+`fastcache_node_cache_requests_refused_not_local_total` therefore rises in normal
+operation — it counts peers reaching the right host for the wrong verb — where on a
+worker it stays at zero.
 
 **This machine is always a member of its own fleet**, whatever `--fleet-member`
 says. Anti-leeching exists to stop *other* machines spending capacity they do not
@@ -760,7 +779,8 @@ On a shared multi-user machine, "local" means every account on it. That is the s
 trust level the daemon assumes, and there is currently no way to narrow it: a node
 serves no `AUTH` verb, so it has no inbound credential to require
 ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). If that is
-not the trust level you want, do not serve the tier — `--listen-cache=` turns it
+not the trust level you want, do not serve the tier — `--cache-memory=0` with no
+`--cache-dir` turns it
 off.
 
 ## A cluster, and who leads it
@@ -779,7 +799,7 @@ fastcache-compile-node \
     --raft-peer=n1=10.0.0.1:6680 \
     --raft-peer=n2=10.0.0.2:6680 \
     --raft-peer=n3=10.0.0.3:6680 \
-    --listen-scheduler=6675 --fleet-open \
+    --serve-scheduler --listen-node=6675 --fleet-open \
     --advertise=10.0.0.1:6676 \
     --toolchain=/usr/bin/g++
 ```
@@ -824,9 +844,9 @@ Only the *leader's* scheduler port matters, and only the node itself knows it �
 peer ever dials it, so there is nothing to learn it from. So **a node announces its
 own record when it becomes leader**, and the address it announces is the host from
 its own `--raft-peer` entry with the port its scheduler surface actually bound.
-Neither half can supply the other: `--listen-scheduler=6675` binds the wildcard,
-which no client can dial, while the consensus endpoint is dialable by construction
-and names the wrong port.
+Neither half can supply the other: `--serve-scheduler --listen-node=6675` binds the
+wildcard, which no client can dial, while the consensus endpoint is dialable by
+construction and names the wrong port.
 
 A member that has never led carries no scheduler endpoint, which is not a fault:
 there is nowhere to redirect to a node that does not lead, and a follower answering
@@ -889,7 +909,7 @@ fastcache-compile-node \
     --listen-raft=6680 \
     --raft-peer=n4=10.0.0.4:6680 \
     --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
-    --listen-scheduler=6675 --fleet-open \
+    --serve-scheduler --listen-node=6675 --fleet-open \
     --advertise=10.0.0.4:6676 \
     --toolchain=/usr/bin/g++
 ```
@@ -1005,7 +1025,7 @@ fastcache-compile-node \
     --discovery=255.255.255.255:6681 \
     --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
-    --listen-scheduler=6675 --fleet-open --toolchain=/usr/bin/g++
+    --serve-scheduler --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
 Every node still names **itself** in `--raft-peer`, because that is the address its
@@ -1033,7 +1053,7 @@ endpoint, the toolchain, the object key and an expiry
 ([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)); and the worker
 **verifies** that MAC before it compiles anything
 ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). So every node
-wants the key, not only the one running `--listen-scheduler`.
+wants the key, not only the one running `--serve-scheduler`.
 
 A worker that another machine could dial and has no key **will not start** — the
 refusal names the flag. One nothing else can dial runs without the check and warns
@@ -1216,19 +1236,19 @@ These are specific to registering:
 | `--cluster-dir` *(only with `--listen-raft`)* | Consensus state would otherwise land in `fastcache-cluster/<node-id>` relative to the working directory, and a service does not inherit the installing shell's — it resolves under `C:\Windows\System32` for the SCM and under `/` for launchd, writable only by the privileges a worker is deliberately not given. |
 
 Everything else the worker refuses at startup — `--tls-cert` without `--tls-key`,
-`--listen-scheduler` without `--fleet-member` or `--fleet-open`, a membership flag
+`--serve-scheduler` without `--fleet-member` or `--fleet-open`, a membership flag
 on a `--scheduler` worker whose `--advertise` is still the wildcard, `--dashboard`
 without `--admin-listen`, and the rest — is refused here too. Each is decided by
 the command line alone, and a registration replays that command line forever, so
 there is nothing to gain by waiting for the first boot to say so.
 
-That includes a **value that is not an address**. `--listen-scheduler`,
-`--admin-listen`, `--listen-cache` and `--discovery` each name one, and a typo in
+That includes a **value that is not an address**. `--listen-node`,
+`--admin-listen`, `--listen-raft` and `--discovery` each name one, and a typo in
 any of them is refused where you typed it rather than when the surface is opened —
 the message names the flag and echoes what you wrote. A bare port is fine for the
 three that are bound — it takes that surface's own default host. A port with a bare
 colon in front of it is **not** the same thing and is refused: an empty host binds
-the wildcard, so `--listen-cache=:6674` would serve this node's private cache to the
+the wildcard, so `--listen-node=:6674` would serve this node's private cache to the
 whole network rather than to loopback. `--discovery` is *sent to* an address, so it
 takes `<address>:<port>` and nothing shorter.
 
@@ -1477,7 +1497,7 @@ numbers those images are drawn from.
 ```sh
 fastcache-compile-node --scheduler 127.0.0.1:6675 \
                        --advertise 10.0.0.1:6676 \
-                       --listen-scheduler 6675 --fleet-member 10.0.0.2 \
+                       --serve-scheduler --listen-node 6675 --fleet-member 10.0.0.2 \
                        --admin-listen 6677 \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
 curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
@@ -1834,7 +1854,7 @@ and a token on it is worse than no token. The credentials that *are* real:
 `--dashboard-token-file` for the fleet page, and `fastcached`'s own
 `--requirepass` for the shared cache.
 
-Keep `--listen-scheduler` off any network you would not run a compiler for. That
+Keep `--serve-scheduler` off any network you would not run a compiler for. That
 is why it is a separate process from the cache: the cache may reasonably be
 reachable across a build LAN, while the surface that makes a compiler *run* on
 another machine should be firewalled separately. A scheduling verb arriving at a

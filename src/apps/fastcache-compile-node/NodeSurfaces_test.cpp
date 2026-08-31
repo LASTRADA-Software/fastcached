@@ -103,13 +103,17 @@ TEST_CASE("A surface resolving from its own spec has a default host to resolve a
     {
         INFO("surface: " << row.name);
         if (row.defaultHost.empty())
-            // Only the compile port, whose host is `--bind` -- a flag an operator
-            // sets, never a fallback a bare port takes. An empty column is the honest
-            // answer there rather than a missing one.
-            CHECK(row.surface == NodeSurface::Compile);
+            // Two rows, and for opposite reasons. The compile port's host is `--bind`
+            // -- a flag an operator sets, never a fallback a bare port takes -- so an
+            // empty column is the honest answer. The node port HAS a default and it
+            // depends on the configuration (loopback on a worker, the wildcard on a
+            // scheduler), which one constant cannot hold: `NodeListenDefaultHost`
+            // decides it, and a value here would be a second author of that rule.
+            CHECK((row.surface == NodeSurface::Compile || row.surface == NodeSurface::Node));
     }
 
     CHECK(RowFor(NodeSurface::Compile).defaultHost.empty());
+    CHECK(RowFor(NodeSurface::Node).defaultHost.empty());
     CHECK_FALSE(RowFor(NodeSurface::Discovery).defaultHost.empty());
 }
 
@@ -128,7 +132,7 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
         if (!row.Resolve(cfg).empty())
             served.push_back(row.name);
 
-    CHECK(served == std::vector<std::string_view> { "compile", "cache" });
+    CHECK(served == std::vector<std::string_view> { "compile", "node" });
 
     auto const compile = RowFor(NodeSurface::Compile).Resolve(cfg);
     REQUIRE(compile.size() == 1);
@@ -137,10 +141,10 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
 
     // The default an operator reads off the startup line, and the address
     // `fastcache-cc` looks for when nobody sets `FASTCACHE_ADDR`.
-    auto const cache = RowFor(NodeSurface::Cache).Resolve(cfg);
-    REQUIRE(cache.size() == 1);
-    CHECK(cache.front().host == "127.0.0.1");
-    CHECK(cache.front().port == 6674);
+    auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
+    REQUIRE(node.size() == 1);
+    CHECK(node.front().host == "127.0.0.1");
+    CHECK(node.front().port == 6674);
 }
 
 TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]")
@@ -151,8 +155,7 @@ TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]"
     // this backwards would tell an operator a surface is loopback-only when it is
     // open to the network.
     NodeConfig cfg;
-    cfg.cacheListen = "6699";
-    cfg.schedulerListen = "6699";
+    cfg.nodeListen = "6699";
     cfg.adminListen = "6699";
     cfg.raftListen = "6699";
     cfg.nodeId = "n1";
@@ -163,10 +166,62 @@ TEST_CASE("A bare port takes its own surface's default host", "[node][surfaces]"
         return endpoints.front().host;
     };
 
-    CHECK(hostOf(NodeSurface::Cache) == "127.0.0.1");
+    CHECK(hostOf(NodeSurface::Node) == "127.0.0.1");
     CHECK(hostOf(NodeSurface::Admin) == "127.0.0.1");
-    CHECK(hostOf(NodeSurface::Scheduler) == "0.0.0.0");
     CHECK(hostOf(NodeSurface::Raft) == "0.0.0.0");
+}
+
+TEST_CASE("The node port's default host follows whether this node schedules", "[node][surfaces]")
+{
+    // The asymmetry SURVIVED the merge rather than being resolved by it (#290), and
+    // this is where. Two surfaces pulled one address in opposite directions -- a
+    // scheduler no peer can dial does nothing, a cache every host can dial is this
+    // machine's whole build output served to strangers -- so the one listener keeps
+    // both answers and picks between them on `--serve-scheduler`.
+    //
+    // A worksheet that got this backwards would tell an operator a port is
+    // loopback-only when it faces the network, which is a security misstatement
+    // rather than an untidy one.
+    NodeConfig worker;
+    worker.nodeListen = "6699";
+    auto const workerEndpoints = RowFor(NodeSurface::Node).Resolve(worker);
+    REQUIRE(workerEndpoints.size() == 1);
+    CHECK(workerEndpoints.front().host == "127.0.0.1");
+
+    auto scheduling = worker;
+    scheduling.serveScheduler = true;
+    auto const schedulingEndpoints = RowFor(NodeSurface::Node).Resolve(scheduling);
+    REQUIRE(schedulingEndpoints.size() == 1);
+    CHECK(schedulingEndpoints.front().host == "0.0.0.0");
+
+    // A host the operator TYPED wins over both, which is what makes the default a
+    // default rather than a policy.
+    auto named = scheduling;
+    named.nodeListen = "127.0.0.1:6699";
+    auto const namedEndpoints = RowFor(NodeSurface::Node).Resolve(named);
+    REQUIRE(namedEndpoints.size() == 1);
+    CHECK(namedEndpoints.front().host == "127.0.0.1");
+}
+
+TEST_CASE("A node that neither caches nor schedules binds no 0xFC port", "[node][surfaces]")
+{
+    // Newly expressible, and newly necessary: one row now stands for two components,
+    // so "not served" is the conjunction rather than either half. A worksheet that
+    // listed the port for a node holding neither would have an operator open a port
+    // for a socket that is never created.
+    NodeConfig worker;
+    worker.cacheMemoryBytes = 0;
+    worker.cacheDir.clear();
+    CHECK(RowFor(NodeSurface::Node).Resolve(worker).empty());
+
+    // Either half on its own is enough to open it.
+    auto caching = worker;
+    caching.cacheMemoryBytes = 64ULL * 1024ULL * 1024ULL;
+    CHECK(RowFor(NodeSurface::Node).Resolve(caching).size() == 1);
+
+    auto scheduling = worker;
+    scheduling.serveScheduler = true;
+    CHECK(RowFor(NodeSurface::Node).Resolve(scheduling).size() == 1);
 }
 
 TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[node][surfaces]")
@@ -226,17 +281,19 @@ TEST_CASE("The worksheet describes this configuration, not the defaults", "[node
     // The failure this flag exists to prevent, asserted at the parse. `--help` and
     // `--version` stop parsing because they ignore the rest of the command line;
     // `--print-surfaces` REPORTS on it, so stopping made
-    // `--print-surfaces --listen-scheduler=6675` print a node that was never
-    // configured -- a worksheet silently describing a different machine from the one
-    // the operator asked about.
-    std::vector<char const*> const argv { "--print-surfaces", "--listen-scheduler=6675" };
+    // `--print-surfaces --listen-node=6675` print a node that was never configured
+    // -- a worksheet silently describing a different machine from the one the operator
+    // asked about.
+    std::vector<char const*> const argv { "--print-surfaces", "--serve-scheduler", "--listen-node=6675" };
 
     NodeConfig cfg;
     auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
     REQUIRE(flow.has_value());
     CHECK(cfg.printSurfaces);
-    CHECK(cfg.schedulerListen == "6675");
+    CHECK(cfg.nodeListen == "6675");
 
+    // The wildcard rather than loopback, which is the second flag doing its other job:
+    // it decides where a bare port lands as well as whether the verbs are served.
     CHECK(RenderSurfaces(cfg).contains("0.0.0.0:6675"));
 }
 
@@ -264,7 +321,6 @@ TEST_CASE("A surface that is off is named, with what would turn it on", "[node][
     // Omitting it would read as a surface this build does not have, which an operator
     // cannot tell from one they simply did not switch on.
     auto const sheet = RenderSurfaces(NodeConfig {});
-    CHECK(sheet.contains("--listen-scheduler"));
     CHECK(sheet.contains("--admin-listen"));
 
     // And the compile port's caveat travels with the sheet rather than living only in
@@ -298,11 +354,11 @@ TEST_CASE("A surface that is configured and still off is not answered 'set the f
     // `StartupPolicyRejection` produces from the same columns a moment later, rather
     // than an instruction to set a flag that is already set.
     NodeConfig typo;
-    typo.cacheListen = "not-a-port";
+    typo.nodeListen = "not-a-port";
 
     auto const wrong = RenderSurfaces(typo);
-    CHECK(wrong.contains("--listen-cache=not-a-port is not [<address>:]<port>"));
-    CHECK_FALSE(wrong.contains("set --listen-cache"));
+    CHECK(wrong.contains("--listen-node=not-a-port is not [<address>:]<port>"));
+    CHECK_FALSE(wrong.contains("set --listen-node"));
 }
 
 TEST_CASE("The compile port's note says what its flags stop describing", "[node][surfaces]")

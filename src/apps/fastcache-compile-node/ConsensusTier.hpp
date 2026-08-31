@@ -534,7 +534,16 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 /// @param membership Told the replicated member set; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
 /// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
+/// @param schedulerBound What the node's `0xFC` listener bound, or empty when there
+///        is none. Passed in rather than read off the scheduler tier, which stopped
+///        owning a listener when the surfaces merged (#290) -- and it is what a leader
+///        advertises, so it must be what was BOUND: `--listen-node=0` means "pick a
+///        port", and an endpoint echoing `:0` back names nothing a client could dial.
 [[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
-    NodeConfig const& cfg, std::unique_ptr<SchedulerTier> const& schedulerTier, NodeMembership& membership, ILogger& logger);
+    NodeConfig const& cfg,
+    std::unique_ptr<SchedulerTier> const& schedulerTier,
+    std::string_view schedulerBound,
+    NodeMembership& membership,
+    ILogger& logger);
 
 } // namespace FastCache::Node

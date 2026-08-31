@@ -256,7 +256,7 @@ namespace
                                 "refusing." },
         EnvVarSpec { .name = EnvName::Scheduler,
                      .summary = "host:port of a fastcached scheduling endpoint (its\n"
-                                "--listen-scheduler port). Unset means every miss compiles\n"
+                                "--listen-node port). Unset means every miss compiles\n"
                                 "locally, which is the behaviour without this feature.\n"
                                 "On a miss the launcher asks the scheduler for a worker and\n"
                                 "sends it the preprocessed translation unit. EVERY refusal\n"

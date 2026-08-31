@@ -16,7 +16,8 @@ using FastCache::Testing::Unwrap;
 TEST_CASE("A leader advertises the port a client speaks to, at an address it can reach", "[node][consensus]")
 {
     // Neither half can supply the other, which is the whole reason this is a
-    // function. `--listen-scheduler` binds the WILDCARD for a bare port -- peers are
+    // function. A scheduling node's `--listen-node` binds the WILDCARD for a bare
+    // port -- peers are
     // on other machines by definition -- so what the surface bound names no address a
     // client can dial. The consensus endpoint is dialable by construction, every peer
     // opening a socket to it, and names the wrong port.

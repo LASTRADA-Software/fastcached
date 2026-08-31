@@ -15,6 +15,7 @@
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
@@ -771,10 +772,15 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // thread does begin there is a listener behind every port a client might dial.
     Node::NodeIoLoop nodeIo;
 
-    // The two framed surfaces this node may serve besides its worker port, each
+    // The two framed COMPONENTS this node may serve besides its worker port, each
     // owned as one object. Both are off unless asked for: handing out other machines'
     // CPU time, and caching to this machine's disk, are decisions an operator makes
     // rather than things they get by starting a worker.
+    //
+    // Components rather than surfaces since #290: they share one `0xFC` listener,
+    // opened below once both exist, and neither binds anything of its own. The order
+    // here is therefore load-bearing in a new way -- the listener holds a reference to
+    // each, so it is declared after both and destroyed before them.
     SteadyClock schedulerClock;
     SteadyClock cacheClock;
 
@@ -785,16 +791,16 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     SystemWallClock const schedulerWallClock;
 
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
-    if (!cfg.schedulerListen.empty())
+    if (cfg.serveScheduler)
     {
-        auto started = Node::SchedulerTier::Start(
-            nodeIo, cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger);
+        auto started =
+            Node::SchedulerTier::Start(cfg, membership.Oracle(), schedulerClock, schedulerWallClock, metrics, logger);
         if (!started.has_value())
         {
             // Fatal for the same reason the admin endpoint's is: an operator who asked
             // for this is relying on it, and a node that started without it looks
             // healthy to everything that would otherwise have noticed.
-            logger.Logf(LogLevel::Error, "--listen-scheduler {}; refusing to start", started.error());
+            logger.Logf(LogLevel::Error, "--serve-scheduler {}; refusing to start", started.error());
             return ExitUsage;
         }
         schedulerTier = std::move(*started);
@@ -806,6 +812,59 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     //
     // Five collaborators in a reference chain, owned as one object rather than as
     // locals whose declaration ORDER is load-bearing and silently so.
+    // Who may read this machine's build output is "this machine", full stop (#287)
+    // -- not the member list beside it, which names peers that may spend this node's
+    // CPU. The two questions were one list until a fleet peer could FETCH every
+    // object this machine had ever compiled.
+    //
+    // The answer is ambient, so it arrives through a seam with a clock, and the set
+    // is refreshed on an interval rather than per request: `GetAdaptersAddresses`
+    // costs milliseconds on Windows, and a probe a stranger could provoke by asking
+    // is a probe a stranger can bill this machine for. `CachedLocalityOracle`
+    // carries both failure directions.
+    auto const hostAddresses = MakeSystemHostAddresses();
+    CachedLocalityOracle const cacheLocality { *hostAddresses, cacheClock };
+
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, cacheLocality, cacheClock, metrics, logger);
+    if (!cacheTierOrRefusal.has_value())
+    {
+        // No flag prefix here, unlike its neighbours: this tier can fail over two
+        // different flags -- the directory and the port -- and only
+        // `StartCacheTierOrExplain` knows which, so it names it.
+        logger.Logf(LogLevel::Error, "{}; refusing to start", cacheTierOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: `StartCacheTierOrExplain` treats an emptied
+    // `--listen-node`, and nowhere to keep objects, as reasons to
+    // carry on without a tier rather than as failures. Both have been logged.
+    auto const cacheTier = std::move(*cacheTierOrRefusal);
+
+    // This node's one `0xFC` listener, opened once both components exist and holding a
+    // reference to each (#290). Before the merge each tier bound its own port, which
+    // made the listener the routing decision; now `MergedResponder` decides per frame
+    // and the port is a property of the node rather than of either component.
+    //
+    // Declared AFTER both tiers and therefore destroyed BEFORE them, which is what
+    // keeps the router from outliving what it routes to. And before consensus, because
+    // what a leader advertises for the scheduler is what this BOUND.
+    auto nodeSurfaceOrRefusal =
+        Node::StartNodeSurfaceOrExplain(nodeIo,
+                                        cfg,
+                                        cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
+                                        schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
+                                        logger);
+    if (!nodeSurfaceOrRefusal.has_value())
+    {
+        // No flag prefix: this can fail over --listen-node or over --serve-scheduler,
+        // and only `StartNodeSurfaceOrExplain` knows which, so it names the flag.
+        logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error());
+        return ExitUsage;
+    }
+    // May legitimately be null: a node with neither component serves no 0xFC port, and
+    // a DEFAULT address already taken is a warning rather than a failure. Both have
+    // been logged.
+    auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
+
     // Consensus, when the operator configured a cluster. It is what turns the
     // scheduler tier's standalone leadership into a real one: without it, every node
     // in a fleet believes it schedules, and two nodes handing out the same machine's
@@ -814,7 +873,8 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // Started AFTER the scheduler tier, because its observers push into it, and
     // declared after too, so it is destroyed first and cannot call into a tier that
     // has gone.
-    auto consensusOrRefusal = Node::StartConsensusOrExplain(cfg, schedulerTier, membership, logger);
+    auto consensusOrRefusal = Node::StartConsensusOrExplain(
+        cfg, schedulerTier, nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {}, membership, logger);
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:
@@ -845,33 +905,6 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // May legitimately be null: no `--discovery` means the cluster is the
     // `--raft-peer` list an operator typed, which is the ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
-
-    // Who may read this machine's build output is "this machine", full stop (#287)
-    // -- not the member list beside it, which names peers that may spend this node's
-    // CPU. The two questions were one list until a fleet peer could FETCH every
-    // object this machine had ever compiled.
-    //
-    // The answer is ambient, so it arrives through a seam with a clock, and the set
-    // is refreshed on an interval rather than per request: `GetAdaptersAddresses`
-    // costs milliseconds on Windows, and a probe a stranger could provoke by asking
-    // is a probe a stranger can bill this machine for. `CachedLocalityOracle`
-    // carries both failure directions.
-    auto const hostAddresses = MakeSystemHostAddresses();
-    CachedLocalityOracle const cacheLocality { *hostAddresses, cacheClock };
-
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, cacheLocality, cacheClock, metrics, logger);
-    if (!cacheTierOrRefusal.has_value())
-    {
-        // No flag prefix here, unlike its neighbours: this tier can fail over two
-        // different flags -- the directory and the port -- and only
-        // `StartCacheTierOrExplain` knows which, so it names it.
-        logger.Logf(LogLevel::Error, "{}; refusing to start", cacheTierOrRefusal.error());
-        return ExitUsage;
-    }
-    // May legitimately be null: `StartCacheTierOrExplain` treats an emptied
-    // `--listen-cache`, and a DEFAULT address that was already taken, as reasons to
-    // carry on without a tier rather than as failures. Both have been logged.
-    auto const cacheTier = std::move(*cacheTierOrRefusal);
 
     // Computed HERE and advertised, rather than left for the scheduler to derive.
     // Both would use the same `OfferableSlots`, so the numbers would agree -- but

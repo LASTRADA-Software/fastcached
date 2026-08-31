@@ -828,7 +828,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # The scheduler's own worker serves a fingerprint no client asks for, so every
         # lease has to land on worker A or worker B.
         $schedProc = Start-NodeIn "sched" @(
-            "--listen-scheduler=127.0.0.1:$schedPort", "--fleet-open",
+            "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
             "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
             "--port=$schedWork", "--advertise=127.0.0.1:$schedWork",
             "--toolchain=scheduler-only=$Compiler", "--slots=1",
