@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "RemoteUpstream.hpp"
 
-#include <FastCache/Async/DeadlineTimer.hpp>
+#include <FastCache/Net/SocketDeadline.hpp>
 
 #include <memory>
 #include <utility>
@@ -13,28 +13,6 @@ namespace FastCache::Node
 
 namespace
 {
-
-    /// Arm a deadline that closes `socket`, or nothing when there is no reactor.
-    ///
-    /// Returned as a `unique_ptr` so the caller holds it for the exchange's
-    /// lifetime and a null reactor costs an empty pointer rather than a branch at
-    /// each use.
-    /// @param reactor Where to arm it, or nullptr for none.
-    /// @param ceiling How long the exchange may take.
-    /// @param socket What to close on expiry; must outlive the returned timer.
-    /// @return The armed timer, or nullptr.
-    [[nodiscard]] std::unique_ptr<DeadlineTimer> ArmExchangeDeadline(IReactor* reactor,
-                                                                     std::chrono::milliseconds ceiling,
-                                                                     ISocket* socket)
-    {
-        if (reactor == nullptr || ceiling <= std::chrono::milliseconds::zero())
-            return nullptr;
-        return std::make_unique<DeadlineTimer>(
-            *reactor,
-            reactor->Clock().Now() + ceiling,
-            [](void* target) { static_cast<ISocket*>(target)->Close(); },
-            socket);
-    }
 
 } // namespace
 
@@ -71,7 +49,7 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
     // Only with a reactor: over a blocking connector the socket's own
     // `SO_RCVTIMEO` is already the bound, and a second mechanism for one job is
     // how the two come to disagree.
-    auto const bound = ArmExchangeDeadline(_reactor, _ioTimeout, client.get());
+    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, client.get());
 
     auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential);
     if (!outcome.IsHit())
@@ -88,7 +66,7 @@ Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::b
         // failure counter to be counting.
         co_return UpstreamStore::Declined;
 
-    auto const bound = ArmExchangeDeadline(_reactor, _ioTimeout, client.get());
+    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, client.get());
 
     // The roots travel empty, and what makes that correct is NOT what this comment
     // used to say. It claimed "the launcher rewrote its own layout out of the value
