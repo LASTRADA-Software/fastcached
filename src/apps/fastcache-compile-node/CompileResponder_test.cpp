@@ -158,14 +158,17 @@ struct Fixture
 {
     std::promise<std::thread::id> where;
     auto future = where.get_future();
-    // The promise travels BY VALUE into the frame. A coroutine's reference parameters
-    // are not kept alive by its frame, and a caller that returns the moment the value
-    // is set is exactly the shape where that bites.
-    [](IExecutor& target, std::promise<std::thread::id> out) -> DetachedTask {
-        co_await ResumeOn { target };
+    // The promise travels BY VALUE into the frame, and the executor as a POINTER. A
+    // coroutine's parameters are copied into its frame but a REFERENCE parameter is not
+    // -- the frame keeps the reference, not the referent -- so a caller that returns the
+    // moment the value is set is exactly the shape where that bites. A pointer says the
+    // lifetime is the caller's, and `cppcoreguidelines-avoid-reference-coroutine-parameters`
+    // refuses the other spelling rather than leaving it to a comment.
+    [](IExecutor* target, std::promise<std::thread::id> out) -> DetachedTask {
+        co_await ResumeOn { *target };
         out.set_value(std::this_thread::get_id());
         co_return;
-    }(pool, std::move(where));
+    }(&pool, std::move(where));
     return future.get();
 }
 
@@ -195,23 +198,26 @@ struct Answered
 {
     std::promise<Answered> done;
     auto future = done.get_future();
-    [](CompileResponder& target,
-       IExecutor& loop,
+    // Pointers, for the reason `ThreadOf` gives: a coroutine frame does not keep a
+    // reference parameter's referent alive, and both of these outlive the call by being
+    // the caller's locals rather than by anything this frame does.
+    [](CompileResponder* target,
+       IExecutor* loop,
        std::vector<std::byte> request,
        std::string caller,
        std::promise<Answered> out) -> DetachedTask {
-        co_await ResumeOn { loop };
+        co_await ResumeOn { *loop };
         auto const startedOn = std::this_thread::get_id();
 
         // `request` is a local of THIS frame, which stays alive across the suspension
         // inside `Answer` -- the contract `IFrameResponder::Answer` states for the span
         // it borrows, and the same way the endpoint's own connection task holds it.
-        auto reply = co_await target.Answer(request, std::move(caller));
+        auto reply = co_await target->Answer(request, std::move(caller));
 
         out.set_value(
             Answered { .startedOn = startedOn, .returnedOn = std::this_thread::get_id(), .reply = std::move(reply) });
         co_return;
-    }(responder, reactor, std::move(frame), std::move(peer), std::move(done));
+    }(&responder, &reactor, std::move(frame), std::move(peer), std::move(done));
     return future.get();
 }
 
