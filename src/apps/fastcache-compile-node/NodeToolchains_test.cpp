@@ -880,7 +880,8 @@ TEST_CASE("NodeToolchains: the witness is the identity's own evidence and is pro
     REQUIRE(resolved.has_value());
     auto const& served = Unwrap(resolved);
     REQUIRE(served.size() == 1);
-    auto const& witness = served.begin()->second.witness;
+    REQUIRE(served.begin()->second.witness.has_value());
+    auto const& witness = Unwrap(served.begin()->second.witness);
 
     // ONE. Two is the defect, and it is the whole of what this case exists to fail on.
     CHECK(runner.IncludeProbes() == 1);
@@ -898,6 +899,74 @@ TEST_CASE("NodeToolchains: the witness is the identity's own evidence and is pro
     // The recheck the witness exists for still answers "unchanged" over it, which is
     // the property a witness built on the wrong evidence would quietly lose.
     CHECK(StaleToolchains(served).empty());
+}
+
+TEST_CASE("NodeToolchains: never probed and probed-but-unstampable stay two states", "[node][toolchains]")
+{
+    // Issue #455. Both are skipped by `StaleToolchains`, and the node used to spell
+    // them the same way -- a value-initialised witness whose stamp is empty -- so it
+    // could not tell "an operator pinned this by hand" from "this was measured and
+    // could not be stat'd". That is exactly the collapse `Cc::ToolchainIdentity`
+    // carries an `optional` to prevent, thrown away one layer up by the type that
+    // received it.
+    //
+    // Nothing today branches on the difference, which is why nothing noticed. This
+    // pins it anyway: restoring a distinction after something starts depending on it
+    // is a schema change, and keeping it costs an `optional`.
+    FastCache::Testing::ScratchDirectory tree { "fc-node-two-states" };
+    tree.Write("inc/a.hpp", "content");
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    // Deliberately never created. `ComputeToolchainStamp` stats the binary and yields
+    // nothing for a path that is not there, which is what an unstattable compiler
+    // leaves behind -- while the include PROBE still answers, so the evidence is taken.
+    // A path under the scratch tree rather than a plausible system one, so this does
+    // not pass or fail on what happens to be installed on the machine running it.
+    auto const ghost = (tree / "ghost-clang").string();
+
+    ScopedStateDir const state;
+    ScriptedToolchainHost host;
+
+    // Probed, and unstampable.
+    NodeConfig const searched = Startable();
+    FixedDiscovery discovery { { Candidate(ghost) } };
+    SpawnScript runner;
+    runner.IncludeRoots(ghost, { root });
+    CapturingLogger probedLogger;
+    auto const probed = ResolveToolchains(searched, &discovery, runner, host, TestClock(), probedLogger);
+    REQUIRE(probed.has_value());
+    REQUIRE(Unwrap(probed).size() == 1);
+    auto const& probedWitness = Unwrap(probed).begin()->second.witness;
+
+    // Pinned, and therefore never probed at all.
+    NodeConfig pinnedCfg = Startable();
+    pinnedCfg.toolchains = { "deadbeef=" + ghost };
+    SpawnScript pinnedRunner;
+    CapturingLogger pinnedLogger;
+    auto const pinned = ResolveToolchains(pinnedCfg, nullptr, pinnedRunner, host, TestClock(), pinnedLogger);
+    REQUIRE(pinned.has_value());
+    REQUIRE(Unwrap(pinned).size() == 1);
+    auto const& pinnedWitness = Unwrap(pinned).begin()->second.witness;
+
+    // The two states, told apart.
+    //
+    // What ENFORCES the distinction is the type: with a non-optional witness there is
+    // no way to spell "absent", and every line below fails to compile rather than to
+    // assert. What this case adds is the observable consequence -- that the pinned
+    // path leaves the witness alone and the probed one fills it in -- which is the
+    // half a type cannot hold. It goes red when a pin records an empty witness
+    // (verified by staging exactly that), which is the shape the regression takes:
+    // one assignment moved above the `continue` and the collapse is back, compiling
+    // cleanly and skipping identically.
+    CHECK(probedWitness.has_value());
+    CHECK_FALSE(pinnedWitness.has_value());
+
+    // And they still take the same branch, which is the reason the collapse was
+    // invisible: asserted so that a later change making them differ has to say so.
+    REQUIRE(probedWitness.has_value());
+    CHECK_FALSE(Unwrap(probedWitness).Watchable());
+    CHECK(StaleToolchains(Unwrap(probed)).empty());
+    CHECK(StaleToolchains(Unwrap(pinned)).empty());
 }
 
 TEST_CASE("NodeToolchains: two distinct compilers stay two", "[node][toolchains]")
@@ -946,12 +1015,12 @@ void WriteFile(std::filesystem::path const& path, std::string_view bytes)
     auto const path = compiler.string();
     auto stamp = Cc::ComputeToolchainStamp("cc 1.0", path, roots);
     REQUIRE_FALSE(stamp.empty());
-    return ServedToolchain {
-        .compiler = path,
-        .label = "cc 1.0",
-        .witness =
-            ToolchainWitness { .compiler = path, .banner = "cc 1.0", .roots = std::move(roots), .stamp = std::move(stamp) }
-    };
+    return ServedToolchain { .compiler = path,
+                             .label = "cc 1.0",
+                             .witness = Cc::ToolchainEvidence { .compiler = path,
+                                                                .banner = "cc 1.0",
+                                                                .roots = std::move(roots),
+                                                                .stamp = std::move(stamp) } };
 }
 } // namespace
 
@@ -1023,7 +1092,13 @@ TEST_CASE("NodeToolchains: a toolchain patched under a running node is noticed",
         // node into a re-survey loop it could never leave.
         std::map<std::string, ServedToolchain> unstampable;
         auto entry = Witnessed(compiler, {});
-        entry.witness.stamp.clear();
+
+        // The witness EXISTS and carries no stamp, which is the state a probed
+        // compiler this process cannot stat leaves behind. Written out rather than
+        // reached by clearing a field, because the distinction from the pinned
+        // section above is precisely which of the two is present at all.
+        entry.witness =
+            Cc::ToolchainEvidence { .compiler = compiler.string(), .banner = "cc 1.0", .roots = {}, .stamp = {} };
         unstampable.emplace("fp-1", std::move(entry));
         WriteFile(compiler, "binary-v2-which-is-longer");
         CHECK(StaleToolchains(unstampable).empty());
