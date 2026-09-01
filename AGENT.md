@@ -718,6 +718,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
   reason it was chosen: the gate configured only when `CMakeCache.txt` was ABSENT, so a
   tree kept the first clang-tidy it ever found and re-running the gate could not repair
   it. Check the pin against the cache, not only pass it. `ctest -R local-gate-selftest`.
+- A **reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference
+  build** — it did not, and both its configurations were fronted by whatever launcher was
+  installed (148 and 618 `LAUNCHER = ` edges, measured). The rule was already standing in
+  `launcher-replay-e2e.sh`, which names it and cites #319; *stating a rule in the file that
+  obeys it is how the file that does not obey it never learns about it*. Pinning the other
+  two tools argues for REMOVING this one, not versioning it: their version changes the
+  verdict and has a canonical value, a cache is supposed to be verdict-neutral, and
+  requiring "the launcher built from this tree" is unsound twice — `-dirty` is not an
+  identity, and it routes the gate's objects through the change being gated. Passing the
+  flag is not the fact: `CompileCache.cmake` leaves an externally-set launcher untouched,
+  so the refusal reads `build.ninja`, never `CMakeCache.txt`, which never holds it.
 - A `cmake -P` check **cannot fail its own test**: `message(FATAL_ERROR)` prints
   `CMake Error` and exits **0** on 3.28, this project's declared minimum. Thirteen
   hygiene checks reported PASSED whatever they found. The verdict is read from the

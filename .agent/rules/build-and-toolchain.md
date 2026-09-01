@@ -125,6 +125,52 @@ determinism rests on.
     directory on the wrong analyser, one that never found any, one with no entry, one already
     correct -- because the gate itself builds two whole configurations and cannot be a test,
     while the part that can be silently wrong is pure.
+- **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
+  `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
+  so both its configurations were fronted by whichever launcher happened to be installed, at
+  whatever version, with no check and no mention. Measured: 148 `LAUNCHER = ` lines in
+  `clang-debug` and 618 in `gcc-release`, all pointing at an installed `fastcache-cc` hundreds
+  of commits behind master and subject to [#368](https://github.com/LASTRADA-Software/fastcached/issues/368)
+  ([#471](https://github.com/LASTRADA-Software/fastcached/issues/471)).
+
+  **The rule was already standing, in a file sitting beside the one that ignored it.**
+  `scripts/launcher-replay-e2e.sh` names "the standing `-DUSE_COMPILER_CACHE=OFF` rule" in its
+  own header and records what it is for: in #319 a cache-backed build of a test binary
+  segfaulted where the same commit built cache-off passed, and nothing in CI could have
+  reported it. `CMakePresets.json` carries the same value on `clang-coverage` for an
+  independent reason. The project had decided this twice and written it down twice, and the
+  gate was the only reference build in the tree that dissented. **Stating a rule in the file
+  that obeys it is how the file that does not obey it never learns about it** -- the same
+  mechanism as `tsan-gate.sh` documenting that macOS has no `timeout(1)` while `cluster-e2e.sh`
+  called it anyway. A rule with one instance is a comment; a rule with two needs a check.
+  - **Pinning the other two tools is the argument for REMOVING this one, not for versioning
+    it.** `clang-format` and `clang-tidy` are pinned because their version changes the verdict
+    and there is a canonical version to pin *to*. A compiler cache has neither: no canonical
+    version, and it is supposed to be verdict-**neutral**. When it is not, it substitutes an
+    object the tree did not produce. The tempting symmetry -- require the launcher to be the
+    build of the current tree -- is unsound twice over. `git describe` on a dirty tree yields
+    `X.Y.Z-N-gsha-dirty`, and two different working trees produce that same string, so it is
+    not an identity; and the only launcher that could ever match is one built from the tree
+    under gate, which routes the gate's objects through the very change being gated. That is
+    worse than an unknown-vintage launcher, which is at least independent of the diff.
+  - **Passing the flag is not the same fact as no launcher being in effect.**
+    `cmake/portable/CompileCache.cmake` returns early when `CMAKE_CXX_COMPILER_LAUNCHER` was
+    set externally -- a preset, a toolchain file, an older `-D` -- and leaves it untouched. So
+    the gate reads the **generated build**: `LAUNCHER = ` in `build.ninja`, which is already
+    this project's idiom for the question, since `launcher-replay-e2e.sh` checks the same
+    string from the other side to prove a launcher *is* in use. The first design read
+    `CMAKE_CXX_COMPILER_LAUNCHER` back out of `CMakeCache.txt` and would have reported "no
+    launcher" against both live gate directories: `CompileCache.cmake` sets it as an ordinary
+    directory-scope variable and never as a cache entry, so that guard could not fire -- inside
+    the fix for a ticket about guards that cannot fire. It was caught by checking the two real
+    caches rather than by reasoning about the CMake documentation.
+  - **Two questions, two observables.** Whether to re-**configure** is the `USE_COMPILER_CACHE`
+    cache entry -- pure, and absent reads as ON, since the option defaults that way. Whether to
+    **refuse** is the generated `build.ninja`. A missing `build.ninja` is `unknown` and is
+    refused, never folded into `none`: a gate that cannot check must not report.
+  - The one-time cost is stated by the run that incurs it. Dropping the launcher rewrites every
+    compile command, so ninja rebuilds the configuration from scratch once; a developer
+    watching that with no explanation files it as breakage. An explained cost is a cost.
 - **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
   preset is the only one that runs ASan, and on a host where it cannot configure at
   all the tempting conclusion is that no sanitizer coverage is available locally. It
