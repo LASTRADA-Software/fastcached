@@ -252,6 +252,27 @@ determinism rests on.
     an exit of 0 that reported no assertions. This is the same shape as a sweep that
     skips files and a `-header-filter` that matches no path: the tool ran, the
     artefact was fine, and *nothing was examined*.
+  - **A gate that is red a few percent of the time is disarmed as thoroughly as one
+    that was deleted**, and it happens through habit rather than code: people learn
+    to re-run it. The TSan canary raced two threads on one `int` and was SILENT --
+    the race happened, ThreadSanitizer said nothing -- in a few runs per thousand
+    (#473). So the acceptance for a change to `src/tests/TsanCanary.cpp` is a RATE
+    over at least a few hundred runs, recorded, and reproducible by whoever next
+    doubts it: `scripts/tsan-canary-rate.sh`, which is the deliverable rather than a
+    paragraph claiming it was checked. Measured at 5000 runs per arm, the old shape
+    was 0.220% silent unpinned and **0.700% pinned to two CPUs** -- the wrong
+    direction, since a two-core runner is the machine it has to be certain on.
+    The fix is what the numbers said, not what the mechanism suggested. The obvious
+    hypothesis -- shadow-cell eviction from hammering one address -- predicts that
+    more accesses are worse, and it is refuted: 1 increment each is 2.50% silent, 10
+    is 2.80%, 1000 is 0.20%, 100000 is 0.00%. More work on one address is SAFER, and
+    a single unsynchronised pair, which is unambiguously a race and which TSan
+    decides on happens-before rather than on overlap, is the least reliable shape of
+    all. **No mechanism is claimed in the file, deliberately** -- a wrong explanation
+    would send the next reader somewhere expensive. What the data shows is which
+    dimensions move it: distinct LOCATIONS matter most (1024 touched once each is
+    reliable where one touched 1024 times is not), repetition helps but needs orders
+    of magnitude more, so the canary uses both with margin in each.
   - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
     on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
     pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
