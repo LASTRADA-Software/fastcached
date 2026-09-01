@@ -368,9 +368,18 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
 
     // --- the cache verb: refused, and refused FOR LOCALITY ------------------------
     //
-    // The REASON is asserted, not merely that it was refused. "Was it refused" is
-    // satisfied by any refusal, so a membership bug, a routing bug or a plain failure
-    // would all pass a weaker check -- and the counter is what says which rule fired.
+    // The REASON is asserted, not merely that it was refused: "was it refused" is
+    // satisfied by any refusal at all, so a routing bug or a plain failure would pass
+    // a weaker check.
+    //
+    // **And the code is not the reason either, on this surface specifically.** The two
+    // rules this case exists to contrast BOTH answer `NotAMember` -- the cache refusing
+    // a caller that is not this machine, and `RefuseUnlessMember` refusing a caller
+    // with no claim on this machine's CPU. One code because a launcher steps over both
+    // identically; two counters because an operator does not. Since #290 they arrive on
+    // one socket, so the counter is the only thing here that says WHICH rule fired:
+    // delete the increment in `CacheResponder::RefusePeer` and the code assertion below
+    // still passes, with only the counter going red.
     auto const fetchRefusal = responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(fetchRefusal.has_value());
     CHECK(ErrorOf(Unwrap(fetchRefusal)) == Wire::ErrorCode::NotAMember);

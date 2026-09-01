@@ -108,6 +108,33 @@ Three separate errors, and only the first is about this fixture.
   as a literal outlived its rows. `std::to_array` derives it and the shape becomes
   unrepresentable, which is why the production tables use it.
 
+- **A refusal's wire CODE is not its reason, so a test asserting the code is asserting
+  something weaker than it looks.** The production side of this is already written down
+  in [`metrics-and-observability.md`](metrics-and-observability.md): *the row is the
+  refusal, not the code* -- two refusals share `MalformedFrame` and must not share a
+  counter, so a table keyed on the code cannot hold them. The test-side consequence is
+  the same fact read backwards: **where two refusals may legitimately answer one code,
+  the counter is the reason and the code is not.**
+
+  It is not hypothetical here. #290 merged the cache and compile surfaces onto one
+  listener, and that listener now carries two refusals answering `ErrorCode::NotAMember`
+  by deliberate design -- `CacheResponder::RefusePeer` refusing a caller that is not
+  this machine (`NodeCacheRequestsRefusedNotLocal`), and `RefuseUnlessMember` refusing
+  a caller with no claim on this machine's CPU (`WorkerJobsRefusedNotAMember`). One
+  code, because a launcher steps over both identically; two counters, because an
+  operator does not. A case asserting only the code cannot tell them apart, and after
+  the merge they arrive on the same socket.
+
+  Measured on #290's acceptance case, whose whole point is that those two rules
+  disagree about one peer: delete the `Increment` from the locality refusal, changing
+  nothing else, and the run reads **6 passed, 1 failed** -- the wire code assertion
+  **passes**, and the only thing that goes red is
+  `NodeCacheRequestsRefusedNotLocal == 1`. The refusal was still correct; what was
+  lost was any way for the test, or an operator, to say WHICH rule produced it.
+
+  So on a surface where codes are shared, **assert the counter as well as the code**,
+  and read a green code assertion as evidence of very little on its own.
+
 - **A cumulative figure cannot answer a question about now.** `cpuDuringWait` was
   the total over the whole wait and was read as a claim about the process's state
   **at the deadline**. 3.4s spread evenly over 300 seconds and 3.4s burned in the
