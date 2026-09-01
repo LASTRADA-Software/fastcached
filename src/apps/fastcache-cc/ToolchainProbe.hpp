@@ -621,6 +621,26 @@ struct ToolchainEvidence
     /// which is the same "refusing to stamp is refusing to cache" trade
     /// `ComputeToolchainStamp` documents. It is never a change.
     std::string stamp;
+
+    /// Whether this record can be compared against the machine later.
+    ///
+    /// Asked rather than compared against an empty field, so what counts as
+    /// re-checkable stays one decision the day a second reason to skip a toolchain
+    /// appears. The launcher never asks it -- it recomputes per invocation -- but the
+    /// fact is a property of THIS record rather than of what any consumer does with
+    /// it, so it lives beside the field it reads.
+    ///
+    /// It is a different question from whether the evidence EXISTS, which is the
+    /// enclosing `std::optional`. A record that was never taken has nothing to
+    /// compare; a record that was taken over an unstampable compiler has nothing to
+    /// compare EITHER, and the two are the same skip and different causes. Collapsing
+    /// them is what the optional exists to prevent -- see `ToolchainIdentity::evidence`.
+    ///
+    /// @return True when a stamp exists to compare against.
+    [[nodiscard]] bool Watchable() const noexcept
+    {
+        return !stamp.empty();
+    }
 };
 
 /// A toolchain fingerprint, and whether it says anything about WHICH compiler it is.

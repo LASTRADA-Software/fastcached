@@ -75,9 +75,11 @@ namespace
         std::string label; ///< Empty when there was no banner to derive one from.
 
         /// What that identity was computed from, so it can be rechecked without
-        /// paying for it again. Left empty for an operator's override, which is
-        /// never probed and must never be re-derived.
-        ToolchainWitness witness;
+        /// paying for it again. Disengaged for an operator's override, which is
+        /// never probed and must never be re-derived -- absent rather than empty,
+        /// because a probed toolchain that cannot be stamped is ALSO empty and is a
+        /// different fact. It is `identity.evidence` verbatim.
+        std::optional<Cc::ToolchainEvidence> witness;
     };
 
     /// Compute every entry's identity, several at a time.
@@ -259,21 +261,20 @@ namespace
                 // warm starts too: a cache HIT returns a digest and used to say nothing
                 // about the roots, so the second probe was unavoidable there as well.
                 //
-                // Absent evidence is a probe that did not RUN, and it leaves no witness
-                // rather than one over an empty root set -- see
-                // `Cc::ToolchainIdentity::evidence` for why that cannot be asked as an
-                // empty `roots`. Such an identity is `UnrunProbe` and is refused below
-                // anyway; the guard stays because the two facts are decided in
-                // different places and only one of them may be relaxed.
+                // Assigned whole, `optional` included, because a witness IS the
+                // launcher's evidence rather than a node-shaped copy of it (#455).
+                // The guard that used to stand here was unpacking one optional to
+                // rebuild an identical struct behind a second test of the same fact.
                 //
-                // Copied rather than moved out: the identity is read again below, and
-                // an `optional` hollowed out by a move would still answer `has_value()`
-                // -- which is exactly the "there was a probe" fact this depends on.
-                if (auto const& evidence = fingerprints[index].identity.evidence; evidence.has_value())
-                    fingerprints[index].witness = ToolchainWitness { .compiler = evidence->compiler,
-                                                                     .banner = evidence->banner,
-                                                                     .roots = evidence->roots,
-                                                                     .stamp = evidence->stamp };
+                // Absent evidence is a probe that did not RUN, and it arrives here as
+                // an absent witness -- see `Cc::ToolchainIdentity::evidence` for why
+                // that cannot be asked as an empty `roots`. Such an identity is
+                // `UnrunProbe` and is refused below anyway; carrying the absence
+                // faithfully costs nothing and is what keeps "never probed" and
+                // "probed, unstampable" two answers rather than one.
+                //
+                // Copied rather than moved: the identity is read again below.
+                fingerprints[index].witness = fingerprints[index].identity.evidence;
 
                 // Derived from the banner that was just computed, rather than by
                 // asking the compiler a second time: the digest is a hash OF this
@@ -570,7 +571,14 @@ std::vector<std::string> StaleToolchains(std::map<std::string, ServedToolchain> 
     std::vector<std::string> stale;
     for (auto const& [fingerprint, toolchain]: served)
     {
-        auto const& witness = toolchain.witness;
+        // Two tests rather than one, because they answer two questions that happen to
+        // take the same branch: a toolchain nobody probed has no record to compare,
+        // and a record that could not be stamped has nothing IN it to compare. The
+        // day one of them stops meaning "skip", the other must not follow it.
+        auto const& held = toolchain.witness;
+        if (!held.has_value())
+            continue;
+        auto const& witness = *held;
         if (!witness.Watchable())
             continue;
 

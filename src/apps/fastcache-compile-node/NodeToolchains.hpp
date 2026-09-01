@@ -17,6 +17,7 @@
 #include <IProcessRunner.hpp>
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
+#include <ToolchainProbe.hpp>
 
 namespace FastCache::Node
 {
@@ -69,57 +70,6 @@ struct DiscoveredToolchains
     ToolchainSource source;              ///< How the set was chosen.
 };
 
-/// What a toolchain's fingerprint was computed FROM, so it can be rechecked cheaply.
-///
-/// A node fingerprints once at startup and then lives for weeks, while the launcher
-/// recomputes per invocation -- so a compiler patched in place under a running
-/// service leaves the node advertising the pre-upgrade digest and spawning the
-/// post-upgrade compiler. Clients then receive objects built by a compiler they did
-/// not key against and store them in the shared cache under the old key, where the
-/// whole fleet reads them (#238).
-///
-/// Rechecking that by re-deriving the fingerprint would cost a driver spawn and a
-/// walk of the include tree. What this holds instead is the three INPUTS
-/// `ComputeToolchainStamp` folds, so re-asking is a stat of the binary plus one stat
-/// per include root and spawns nothing at all. The expensive half is paid only once
-/// the cheap half says something moved.
-///
-/// Empty for an operator's `<fingerprint>=<compiler>` override, which is never
-/// probed and must never be second-guessed: pinning a digest by hand is how an
-/// operator forces a fleet to agree while a machine is being repaired, and a node
-/// that re-derived it would undo exactly that. `Watchable()` is how that is asked.
-struct ToolchainWitness
-{
-    /// The compiler as it was STAT'd -- resolved on the search path, not as typed.
-    ///
-    /// A bare `cc` or `cl` cannot be stat'd from an arbitrary working directory, so
-    /// stamping the typed spelling would yield an empty stamp and silently give up
-    /// on the toolchain most likely to be upgraded by a package manager.
-    std::string compiler;
-
-    std::string banner;             ///< The version line the fingerprint folded.
-    std::vector<std::string> roots; ///< The include search roots it folded.
-
-    /// What those three hashed to when this node surveyed the machine.
-    ///
-    /// Empty means the toolchain could not be stamped at all -- an unstattable
-    /// compiler, or a root whose name this process cannot decode. That is not a
-    /// change and must never be read as one: an empty stamp recomputes to empty, so
-    /// such a toolchain is simply never found stale, which is the same "refusing to
-    /// stamp is refusing to cache" trade `ComputeToolchainStamp` documents.
-    std::string stamp;
-
-    /// Whether this toolchain can be rechecked at all.
-    ///
-    /// Asked rather than compared against an empty field, so what counts as watchable
-    /// stays one decision the day a second reason to skip a toolchain appears.
-    /// @return True when a stamp exists to compare against.
-    [[nodiscard]] bool Watchable() const noexcept
-    {
-        return !stamp.empty();
-    }
-};
-
 /// One toolchain this worker serves, once its identity is known.
 struct ServedToolchain
 {
@@ -138,13 +88,44 @@ struct ServedToolchain
     /// everywhere it travels, and is rendered as absent rather than as a blank.
     std::string label;
 
-    /// What this toolchain's identity was derived from, for rechecking it later.
+    /// What this toolchain's identity was derived from, so it can be rechecked cheaply.
     ///
-    /// Carried HERE rather than in a second map keyed by the same fingerprint. Two
-    /// maps that must agree about which toolchains exist are two maps that will
-    /// eventually disagree, and the one that decides what this worker serves is
-    /// this one.
-    ToolchainWitness witness;
+    /// A node fingerprints once at startup and then lives for weeks, while the launcher
+    /// recomputes per invocation -- so a compiler patched in place under a running
+    /// service leaves the node advertising the pre-upgrade digest and spawning the
+    /// post-upgrade compiler. Clients then receive objects built by a compiler they did
+    /// not key against and store them in the shared cache under the old key, where the
+    /// whole fleet reads them (#238).
+    ///
+    /// Rechecking that by re-deriving the fingerprint would cost a driver spawn and a
+    /// walk of the include tree. What this holds instead is the INPUTS
+    /// `Cc::ComputeToolchainStamp` folds, so re-asking is a stat of the binary plus one
+    /// stat per include root and spawns nothing at all. The expensive half is paid only
+    /// once the cheap half says something moved.
+    ///
+    /// It is the LAUNCHER'S record rather than a node-shaped copy of one.
+    /// `Cc::CachedToolchainFingerprint` hands back exactly these fields (#259), and this
+    /// side carried a second type holding the same four for one release -- one concept,
+    /// two spellings, kept in step only by nobody having edited either yet (#455). A
+    /// node whose record of what its digest rests on is shaped differently from the
+    /// evidence that digest was folded from is the drift this subsystem exists to
+    /// prevent, so there is no second type to drift and no alias to hide which one this
+    /// is. `witness` is what this side CALLS it; `Cc::ToolchainEvidence` is what it is.
+    ///
+    /// Carried HERE rather than in a second map keyed by the same fingerprint. Two maps
+    /// that must agree about which toolchains exist are two maps that will eventually
+    /// disagree, and the one that decides what this worker serves is this one.
+    ///
+    /// **Disengaged means nothing was ever measured**, which is not the same as a record
+    /// that was taken and cannot be stamped (`Watchable()` false). An operator's
+    /// `<fingerprint>=<compiler>` is never probed and must never be second-guessed --
+    /// pinning a digest by hand is how an operator forces a fleet to agree while a
+    /// machine is being repaired -- while an unstattable compiler WAS probed and simply
+    /// yields no stamp. Both are skipped by the recheck and they are different facts, so
+    /// they get different representations: a value-initialised witness spelled the first
+    /// as an empty version of the second, which is exactly the collapse
+    /// `Cc::ToolchainIdentity::evidence` carries an `optional` to avoid.
+    std::optional<Cc::ToolchainEvidence> witness;
 };
 
 /// Split a `--toolchain` value into its fingerprint and compiler.
@@ -329,10 +310,12 @@ struct SurveyResult
 /// headers are installed rather than edited, and the alternative is the multi-second
 /// walk this exists to avoid.
 ///
-/// A toolchain that is not `Watchable()` is skipped rather than reported: an
-/// operator's pinned `<fingerprint>=<compiler>` is never probed and must never be
-/// second-guessed, and a compiler that could not be stamped at all yields an empty
-/// stamp that would otherwise compare equal forever anyway.
+/// A toolchain with no witness, or one that is not `Watchable()`, is skipped rather
+/// than reported -- two questions and one outcome. An operator's pinned
+/// `<fingerprint>=<compiler>` is never probed and must never be second-guessed, so it
+/// carries no witness at all; a compiler that could not be stamped WAS probed and
+/// yields an empty stamp that would otherwise compare equal forever anyway. Asked as
+/// two tests because they are two facts, even where the branch they take is one.
 ///
 /// @param served What this worker is serving now, witnesses included.
 /// @return The fingerprints whose evidence moved, sorted; empty when nothing did.
