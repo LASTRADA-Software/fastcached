@@ -51,7 +51,9 @@ struct LoopbackPair
             return; // constrains the fd for the static analyzer on the ::bind path below
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
-        // Unqualified: macOS defines htonl as a macro, so ::htonl does not parse.
+        // Unqualified, and enforced by ctest -R byte-order-qualifier. These are macros
+        // on every platform here; what differs is the expansion, and a qualifier cannot
+        // attach to Darwin's. See scripts/check-byte-order-qualifier.cmake.
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0; // ephemeral
         auto const bound = ::bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));

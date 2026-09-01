@@ -256,6 +256,40 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Byte-order qualifier hygiene. Fails when a source file writes `::htonl(...)`
+# or any of its siblings.
+#
+# Those names are function-like macros on every platform this project builds on.
+# The difference is what they expand to: on glibc a bare identifier, so the `::`
+# has something to attach to and the line compiles; on Darwin an expression, so
+# it does not and clang reports `expected unqualified-id`. The rule is therefore
+# flat and lexical rather than platform-aware -- see the script's header, which
+# corrects an earlier explanation in this tree that had it as "macros on macOS,
+# functions on glibc" and would have made this check need to read `#if` guards.
+#
+# It has happened three times (#469), the second and third hours apart in
+# different lanes, each costing a CI cycle on an otherwise-green branch. Nothing
+# but CI's macOS leg can see it: local builds compile it, and clang-tidy reads
+# the files it lands in as EMPTY translation units because they sit behind
+# `#if defined(__APPLE__)` or `#if defined(_WIN32)` (#466). The rule was already
+# a comment three lines above the third occurrence, which is why it is a check.
+#
+# Not labelled "smoke", for the reason the checks above are not: it reads source
+# files and reports, so it belongs in the default `ctest` set and must survive
+# `ctest -LE smoke`. It starts nothing and finishes in well under a second.
+add_test(
+    NAME "byte-order-qualifier"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-byte-order-qualifier.cmake"
+)
+set_tests_properties("byte-order-qualifier" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The shared e2e helper library. Fails when `scripts/lib/e2e-common.sh` stops
 # drawing ports the way it says, stops distinguishing a dead process from a slow
 # one, stops keeping an HTTP body's last chunk, or stops ending the run from
