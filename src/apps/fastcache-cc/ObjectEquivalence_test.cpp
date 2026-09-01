@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -31,24 +32,39 @@ using namespace FastCache::Cc::Test;
 namespace
 {
 
-/// Locate an MSVC-family driver, if this host has one on PATH.
+/// An MSVC-family driver on this host that can actually COMPILE, if there is one.
 ///
-/// The translation unit compiled through it includes NO header, which is what makes
-/// this runnable without a developer command prompt: a bare `cl.exe` with no
-/// `INCLUDE` still compiles it, and still emits the `.debug$S` and `.chks64` records
-/// that make MSVC's output interesting here (measured).
-/// @return The driver name, or nothing when none answers.
-[[nodiscard]] std::optional<std::string> FindMsvcDriver()
+/// **Presence is not the question, and neither is a successful spawn.** A probe that
+/// asked whether the driver could be started reported `cl.exe` present on Linux and
+/// this case then FAILED where it should have skipped: on POSIX a missing binary is
+/// not a failure to spawn at all -- `fork` succeeds and the child exits 127 after
+/// `exec` fails -- so `NotSpawned` never appears. The same probe is wrong on Windows
+/// for a second reason the `dist-compile-e2e.ps1` fixture already records: a
+/// clang-cl that cannot find an MSVC SDK is on PATH and can build nothing.
+///
+/// So the question asked is the only one that answers both: **did an object appear?**
+///
+/// The translation unit is header-free on purpose, which is what makes this runnable
+/// without a developer command prompt -- a bare `cl.exe` with no `INCLUDE` compiles
+/// it, and still emits the `.debug$S` and `.chks64` records that make MSVC's output
+/// worth testing (measured).
+///
+/// @param runner How to spawn.
+/// @param dir A scratch directory to compile in.
+/// @param source The translation unit to compile.
+/// @return The driver name, or nothing when none on this host can compile.
+[[nodiscard]] std::optional<std::string> FindWorkingMsvcDriver(IProcessRunner& runner,
+                                                               std::filesystem::path const& dir,
+                                                               std::filesystem::path const& source)
 {
-    auto const runner = MakeProcessRunner();
-    for (auto const* driver: { "cl.exe", "clang-cl.exe" })
+    for (auto const* candidate: { "cl.exe", "clang-cl.exe" })
     {
-        // `cl` has no `--version` and answers its banner to a bare invocation; every
-        // other MSVC-family driver answers one too. Either way a driver that is not
-        // there cannot be spawned, and that is the whole question.
-        std::vector<std::string> const argv { driver };
-        if (runner->RunCaptureCombined(argv).exitCode != NotSpawned)
-            return std::string { driver };
+        auto const probe = dir / "probe.obj";
+        std::error_code ec;
+        std::filesystem::remove(probe, ec);
+        std::vector<std::string> const argv { candidate, "/nologo", "/c", "/Fo" + probe.string(), source.string() };
+        if (runner.RunCaptureCombined(argv).exitCode == 0 && std::filesystem::exists(probe))
+            return std::string { candidate };
     }
     return std::nullopt;
 }
@@ -303,15 +319,6 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     // describes what a compiler emits. Running the verifier on made-up bytes would
     // prove the parser self-consistent and nothing about MSVC -- which is the whole
     // way #493 survived review, as a byte comparison that was never run on Windows.
-    auto const found = FindMsvcDriver();
-    if (!found.has_value())
-        SKIP("no MSVC-family driver on PATH");
-    // `Unwrap` rather than `*found`, and the reason is not style: clang-tidy cannot
-    // see that Catch2's `SKIP` does not return, so a bare dereference is
-    // `bugprone-unchecked-optional-access` and fails the pedantic build.
-    REQUIRE(found.has_value());
-    auto const& driver = Testing::Unwrap(found);
-
     Testing::ScratchDirectory const scratch { "object-equivalence-msvc" };
     auto const& dir = scratch.Path();
     auto const source = dir / "tu.cpp";
@@ -324,8 +331,17 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
             << "int Entry(int x) { return probe::Scale(x) - 2; }\n";
     }
 
-    auto const object = dir / "tu.obj";
     auto const runner = MakeProcessRunner();
+    auto const found = FindWorkingMsvcDriver(*runner, dir, source);
+    if (!found.has_value())
+        SKIP("no MSVC-family driver on this host can compile");
+    // `Unwrap` rather than `*found`, and the reason is not style: clang-tidy cannot
+    // see that Catch2's `SKIP` does not return, so a bare dereference is
+    // `bugprone-unchecked-optional-access` and fails the pedantic build.
+    REQUIRE(found.has_value());
+    auto const& driver = Testing::Unwrap(found);
+
+    auto const object = dir / "tu.obj";
     std::vector<std::string> const argv { driver, "/nologo", "/c", "/Fo" + object.string(), source.string() };
 
     REQUIRE(runner->RunCaptureCombined(argv).exitCode == 0);
