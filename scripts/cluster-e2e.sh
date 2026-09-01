@@ -201,6 +201,12 @@ readonly JoinSeconds=60
 # default -- while the sentence still appears verbatim in any failure dump.
 readonly ProbeTimedOut="probe did not finish within ${ClusterProbeSeconds}s"
 
+# What a probe whose COMMAND never ran says. Unlike `ProbeTimedOut` this is not
+# handed back to a caller to pattern-match: it ends the run where it happens. See
+# `cluster` below for why it is a state of its own rather than a decline, and why
+# it is fatal rather than counted.
+readonly ProbeNeverStarted="probe never started: the client could not be executed"
+
 # Every probe's outcome, appended as it happens.
 #
 # A FILE and not shell variables, and that is not a style preference: every caller
@@ -213,31 +219,66 @@ probe_log="${workdir}/probes"
 
 # Ask one node a cluster question. Echoes its output; never fails the script.
 #
-# **THREE outcomes, and the third one is the point of #457.** A probe can answer,
-# fail to reach anybody, or NOT FINISH -- and the last is not the cluster saying
-# "no", it is this fixture failing to ask. Folded into a negative it would make
-# the caller retry, exhaust its budget and report "the cluster never formed" about
-# a cluster that was answering in six seconds. That is precisely the distinction
-# `.agent/rules/testing.md` requires a wait to be able to make, and precisely the
-# one every occurrence of this flake has turned on.
+# **FOUR outcomes, and the fourth one is #457 eating itself.** A probe can answer,
+# be refused, fail to FINISH, or fail to START -- and the last two are not the
+# cluster saying "no", they are this fixture failing to ask.
+#
+# The third state is what the ticket was raised for. Folded into a negative it
+# makes the caller retry, exhaust its budget and report "the cluster never formed"
+# about a cluster that was answering in six seconds.
+#
+# The fourth state is here because the first fix for the third one SHIPPED WITHOUT
+# IT and produced exactly the defect the ticket describes, one level up. It
+# bounded this probe with `timeout "$ClusterProbeSeconds" ...`; macOS has no
+# `timeout(1)`, so on that platform every probe was bash saying `command not
+# found` -- status 127, which is not 124 and so was not read as the bound
+# expiring, and text that is not the cluster's and so matched no caller's pattern.
+# 591 probes were counted as the cluster DECLINING, and the fixture reported "no
+# node ever named a leader" while its own dumped node logs showed a leader elected
+# in term 1 with both followers naming it by endpoint.
+#
+# That is worse than the opaque CTest kill it replaced. An opaque failure invites
+# an investigation; a precise wrong one ends it -- and it did, upward, as a
+# reported finding about consensus on macOS.
+#
+# So the four states are named here even though `run_bounded` has since removed
+# the specific cause (it needs no external binary, so there is nothing to be
+# missing). 126 and 127 are the POSIX statuses for "found but not executable" and
+# "not found", and they remain the shape of every way a client fails to start --
+# a wrong architecture, a missing shared library, a path that moved. A state that
+# cannot be reported is a state that gets reported as its neighbour.
 #
 # `|| true` is gone rather than kept: a refusal is still an ordinary answer and
 # still does not fail the run, but its status is now READ instead of discarded,
-# which is what lets the three outcomes be told apart at all.
+# which is what lets the outcomes be told apart at all.
 # @param 1 scheduler endpoint
 # @param 2.. the cluster flag and its operand
 cluster() {
     local endpoint="$1"; shift
     local out rc=0
-    out="$(timeout "$ClusterProbeSeconds" "$node" --scheduler="$endpoint" "$@" 2>&1)" || rc=$?
+    out="$(run_bounded "$ClusterProbeSeconds" "$node" --scheduler="$endpoint" "$@")" || rc=$?
 
-    # 124 is `timeout` reporting that it killed the probe. Checked before anything
-    # else, because every other non-zero status is the CLI having run and said
-    # something.
-    if [[ "$rc" -eq 124 ]]; then
+    # Checked before anything else, because every other non-zero status is the CLI
+    # having run and said something.
+    if [[ "$rc" -eq "$E2eBoundExceeded" ]]; then
         echo "timeout ${endpoint}" >> "$probe_log"
         printf '%s\n' "$ProbeTimedOut"
         return 0
+    fi
+
+    # A client that never ran said nothing, so its output is not an answer -- and
+    # unlike the three below, it is not a state the cluster can be in and not one a
+    # retry can improve. So it ENDS THE RUN here rather than being counted and
+    # reasoned about sixty seconds later: every sentence a wait could reach after
+    # this one would be a claim about a product nothing asked.
+    #
+    # That is the whole correction. The bug was not that 127 was mapped to the
+    # wrong bucket; it was that a bucket existed for it to be mapped into at all,
+    # so a run in which the fixture never worked could reach a verdict about the
+    # cluster.
+    if [[ "$rc" -eq 126 || "$rc" -eq 127 ]]; then
+        echo "unstarted ${endpoint}" >> "$probe_log"
+        fail "${ProbeNeverStarted} (status ${rc} for '${node}'). This says NOTHING about the cluster; it says this fixture cannot run its client. ($(probe_summary))"
     fi
 
     # A non-zero status is an ANSWER, not a failure to reach anybody, and calling
@@ -267,18 +308,25 @@ cluster() {
 # observed the cluster at all, and saying "never formed" about it would be the
 # confident wrong sentence this fixture has produced before.
 #
-# Read with one `awk` pass rather than three `grep -c` calls: `grep -c` exits 1 on
+# Read with one `awk` pass rather than four `grep -c` calls: `grep -c` exits 1 on
 # no match, which under `set -e` and `pipefail` turns an honest zero into an
 # aborted script.
+#
+# Both "did not finish" and "never started" get a sentence rather than only a
+# number, because the number alone is what a reader skims past: `591 declined`
+# looked like a fleet of refusals and was 591 clients that never ran.
 probe_summary() {
     awk '
         { kind[$1]++; total++ }
         END {
-            printf "%d probes: %d affirmed, %d declined, %d TIMED OUT",
-                   total, kind["affirmed"], kind["declined"], kind["timeout"]
+            printf "%d probes: %d affirmed, %d declined, %d TIMED OUT, %d NEVER STARTED",
+                   total, kind["affirmed"], kind["declined"], kind["timeout"], kind["unstarted"]
             if (kind["timeout"] > 0 && total > 0)
                 printf " (%.0f%% never finished, so this wait spent its budget asking rather than observing)",
                        kind["timeout"] * 100 / total
+            if (kind["unstarted"] > 0 && total > 0)
+                printf " (%.0f%% never ran at all, so NOTHING here is a statement about the cluster -- fix the client invocation, not the product)",
+                       kind["unstarted"] * 100 / total
         }
     ' "$probe_log"
 }

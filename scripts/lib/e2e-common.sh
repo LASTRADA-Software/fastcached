@@ -634,3 +634,108 @@ http_get() {
     exec 3<&-
     printf '%s' "$body"
 }
+
+# ---------------------------------------------------------------------------
+
+# The status `run_bounded` returns when the ceiling expired before the command
+# did. 124 is `timeout(1)`'s, so a reader who knows that convention reads this
+# one for free -- and it cannot collide with a status the command itself
+# returned, because a command that returned anything is one that finished.
+E2eBoundExceeded=124
+
+# Run a command under a wall-clock ceiling. Echoes its combined output.
+#
+# @param 1 the ceiling, in seconds
+# @param 2.. the command and its arguments
+# @return the command's own exit status, or `E2eBoundExceeded` if the ceiling
+#         expired first
+#
+# ---------------------------------------------------------------------------
+# Why this is bash and not `timeout(1)`
+# ---------------------------------------------------------------------------
+#
+# Because `timeout(1)` IS NOT ON macOS, and reaching for it cost this repository
+# a red CI leg with a confident wrong diagnosis attached (#457's own first fix).
+# `cluster-e2e.sh` bounded its probe with a bare `timeout`; on macOS every probe
+# was instead bash reporting `command not found`, which is a status of 127 --
+# not 124, so it was not read as a bound expiring, and not the cluster's own
+# words, so it matched none of the patterns the caller tested for. The fixture
+# then reported "no node ever named a leader" about a cluster whose own dumped
+# logs showed a leader elected in term 1 with both followers naming it.
+#
+# The obvious repair is to look for `timeout` and then `gtimeout`, which is what
+# `scripts/tsan-gate.sh` does and which this file deliberately does NOT do.
+# Measured rather than assumed: GitHub's `macos-14` image ships **neither** --
+# `gtimeout` comes from Homebrew's `coreutils`, which is not in that image, and
+# `tsan-gate.sh`'s macOS branch has never executed anywhere because the
+# `clang-tsan` job is `runs-on: ubuntu-24.04`. So a resolver that refuses when it
+# finds nothing would refuse on exactly the platform this was written for, and
+# one that falls back to running unbounded would restore the unbounded probe
+# while looking like it had a bound.
+#
+# A bound implemented here needs no binary, is the same bound on every platform
+# CI builds, and can be shown expiring on a developer's machine. That removes the
+# failure mode rather than detecting it, so there is no fourth state to report
+# and no platform to refuse.
+#
+# This function is therefore also the CHECK, in #469's sense: with a bounded run
+# in the shared library there is no reason for a fixture to spell `timeout`
+# again, and `check-e2e-helpers.sh` scans for one that does. A correct paragraph
+# in `tsan-gate.sh` did not travel to the next script that needed it, and a
+# fourth private copy is how the three `ScriptedSocket` copies each carried the
+# same defect.
+#
+# ---------------------------------------------------------------------------
+#
+# The output goes through a FILE rather than a pipe. A pipe would have to be
+# read while the command runs -- a reader blocked on it is a second thing that
+# can hang, and it is the thing that would hang first, since a wedged command is
+# precisely one that has stopped writing.
+#
+# `mktemp` and not a counter this function increments. Every caller so far
+# invokes it inside `$( ... )` to read the output, which is a SUBSHELL: a counter
+# incremented here is discarded at the closing paren, so every call would name
+# the same file and two overlapping runs would read each other's output. That is
+# the same defect `cluster-e2e.sh`'s own `probe_log` comment was written about,
+# one level down and in the helper written to fix it.
+run_bounded() {
+    local seconds="$1"; shift
+    local capture pid deadline grace status=0 exceeded=0
+
+    capture="$(mktemp "${_e2e_workdir}/bounded.XXXXXX")"
+
+    "$@" > "$capture" 2>&1 &
+    pid=$!
+
+    # Read from a CLOCK, for the reason `wait_until` states: `_e2e_poll_pause` is
+    # a pacing device and a sleep costs what the host's timer granularity says,
+    # so counting polls enforces a duration nobody chose.
+    deadline=$(( SECONDS + seconds ))
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            exceeded=1
+            break
+        fi
+        sleep "$_e2e_poll_pause"
+    done
+
+    if [ "$exceeded" -eq 1 ]; then
+        # TERM, a grace, then KILL. Waiting on a TERM the command ignores is an
+        # unbounded wait inside the thing that exists to bound one -- and a
+        # command that ignores TERM is not exotic here, it is what a wedged
+        # process looks like.
+        kill -TERM "$pid" 2>/dev/null || true
+        grace=$(( SECONDS + 2 ))
+        while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$grace" ]; do
+            sleep "$_e2e_poll_pause"
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+
+    wait "$pid" 2>/dev/null || status=$?
+    cat "$capture"
+    rm -f "$capture"
+
+    if [ "$exceeded" -eq 1 ]; then return "$E2eBoundExceeded"; fi
+    return "$status"
+}

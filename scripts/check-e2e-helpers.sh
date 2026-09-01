@@ -300,6 +300,75 @@ run_case() {
         echo "wait_for_log returned on the marker"
         ;;
 
+    # --- `run_bounded` -------------------------------------------------------
+    #
+    # The helper that exists because `cluster-e2e.sh` bounded its probe with a
+    # bare `timeout`, which macOS does not have. Every row below is a fact that
+    # bug turned on.
+
+    # A command that FINISHES owns the answer: its output and its own status
+    # reach the caller unaltered. Status 3 rather than 1, so a helper that
+    # collapsed every failure to "non-zero" would be visible.
+    bounded-returns-status)
+        rc=0
+        out="$(run_bounded 5 sh -c 'echo carried; exit 3')" || rc=$?
+        echo "run_bounded said '${out}' with status ${rc}"
+        ;;
+
+    # THE regression, and it is one line because the defect was one line. A
+    # command that cannot be executed exits 127, and 127 must not be mistakable
+    # for the bound expiring -- that confusion is what turned 591 unrun clients
+    # into 591 refusals by a cluster and produced a precise wrong finding about
+    # the product. Asserted as a NUMBER and against `E2eBoundExceeded`, because
+    # the whole failure was two integers that were not compared.
+    bounded-missing-command)
+        rc=0
+        run_bounded 5 "${scratch}/no-such-client" --cluster-status >/dev/null || rc=$?
+        echo "a missing command exited ${rc}"
+        if [ "$rc" = "$E2eBoundExceeded" ]; then
+            echo "BUG: a missing command is indistinguishable from the bound expiring"
+        fi
+        ;;
+
+    # The bound expires, and it reports that rather than the child's status. A
+    # `sleep` killed by a signal exits 143 on most shells, and 143 read as an
+    # answer is exactly the shape of the bug above.
+    bounded-expires)
+        rc=0
+        run_bounded 1 sleep 30 >/dev/null || rc=$?
+        echo "an expired bound exited ${rc}"
+        ;;
+
+    # And the child is DEAD, not merely abandoned. A helper that returns 124
+    # while leaving the process running is worse than no bound: the run
+    # continues, the process keeps competing for the machine, and the fixture's
+    # own cleanup then waits on it. Measured by having the child keep writing:
+    # the file must stop growing once `run_bounded` has returned.
+    bounded-kills-the-child)
+        marks="${scratch}/marks"
+        : > "$marks"
+        rc=0
+        run_bounded 1 sh -c 'while true; do echo tick >> "$1"; sleep 0.1; done' _ "$marks" \
+            >/dev/null || rc=$?
+        before="$(wc -c < "$marks" | tr -d ' ')"
+        sleep 1
+        after="$(wc -c < "$marks" | tr -d ' ')"
+        echo "the bound exited ${rc}; the child wrote ${before} bytes then ${after}"
+        if [ "$before" != "$after" ]; then
+            echo "BUG: the child was still running after run_bounded returned"
+        fi
+        ;;
+
+    # A command that IGNORES TERM is still stopped. Not exotic: it is what a
+    # wedged process looks like, and a helper that waits politely for such a
+    # child has put an unbounded wait inside the thing that exists to bound one.
+    # The driver times this row; the assertion here is only that it returned.
+    bounded-outlasts-a-trapped-term)
+        rc=0
+        run_bounded 1 sh -c 'trap "" TERM; sleep 30' >/dev/null || rc=$?
+        echo "a TERM-ignoring child exited ${rc}"
+        ;;
+
     # --- the real-socket cases ----------------------------------------------
     #
     # `wait_for_port` and `http_get` against a listener that really binds, really
@@ -562,6 +631,11 @@ cases=(
     "wait-timeout-no-log|1|no log was watched|!BUG:"
     "wait-nothing-watched|1|No process was watched|to listen on 127.0.0.1:|!BUG:"
     "wait-for-log|0|wait_for_log returned on the marker"
+    "bounded-returns-status|0|run_bounded said 'carried' with status 3"
+    "bounded-missing-command|0|a missing command exited 127|!BUG:"
+    "bounded-expires|0|an expired bound exited 124"
+    "bounded-kills-the-child|0|the bound exited 124|!BUG:"
+    "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
 )
 
 # Perl is what stages a real listener. Where it is absent those cases are
@@ -624,6 +698,69 @@ else
         failures=$(( failures + 1 ))
     fi
 fi
+
+# --- `run_bounded`'s ceiling is a ceiling ----------------------------------
+#
+# Timed from OUTSIDE, for the reason the block above gives, and pinned on BOTH
+# sides. Only the upper bound has teeth here and it is the whole point: the child
+# ignores TERM and would sleep for 30 s, so a helper that waits for it to die
+# politely -- or that never escalates to KILL -- takes 30 s and passes every
+# assertion inside the case. The lower bound is there so a helper that returned
+# 124 immediately, without running the command at all, cannot pass either.
+echo "== run_bounded's ceiling is wall clock, and it escalates"
+bounded_started="$SECONDS"
+out="$( bash "${BASH_SOURCE[0]}" --case bounded-outlasts-a-trapped-term 2>&1 )"
+status=$?
+bounded_took=$(( SECONDS - bounded_started ))
+ran=$(( ran + 1 ))
+if [ "$status" != "0" ]; then
+    echo "FAIL bounded-clock: exited ${status}, expected 0" >&2
+    printf '%s\n' "$out" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+elif [ "$bounded_took" -lt 1 ]; then
+    echo "FAIL bounded-clock: a 1s bound over a 30s child returned in ${bounded_took}s;" >&2
+    echo "     the command cannot have been run" >&2
+    failures=$(( failures + 1 ))
+elif [ "$bounded_took" -gt 10 ]; then
+    echo "FAIL bounded-clock: a 1s bound over a TERM-ignoring child took ${bounded_took}s;" >&2
+    echo "     the bound is waiting for a child that will not die, which is an" >&2
+    echo "     unbounded wait inside the thing that exists to bound one" >&2
+    failures=$(( failures + 1 ))
+fi
+
+# --- no fixture spells `timeout` again -------------------------------------
+#
+# `run_bounded` above is not only a helper, it is this check's subject. macOS has
+# neither `timeout(1)` nor `gtimeout` -- GitHub's `macos-14` image carries no
+# Homebrew `coreutils` -- so a fixture reaching for either gets `command not
+# found`, status 127, on the one platform nobody here can run it on. That
+# happened, in the fix for #457 itself, and the fixture then reported a confident
+# wrong finding about consensus.
+#
+# `tsan-gate.sh` had the correct paragraph about this in its own header and it
+# did not travel to the next script that needed it -- which is why this is a scan
+# and not a fourth comment. The allowlist carries a REASON per row rather than a
+# bare path, so an exemption cannot be added silently.
+echo "== no fixture invokes timeout(1)"
+timeout_allowed="tsan-gate.sh:not an e2e fixture; resolves timeout/gtimeout itself and refuses when neither exists. Its clang-tsan job is runs-on: ubuntu-24.04, so the macOS branch has never executed."
+for script in "${source_dir}"/scripts/*.sh; do
+    base="$(basename "$script")"
+    case "${timeout_allowed}" in
+        "${base}:"*) continue ;;
+    esac
+    ran=$(( ran + 1 ))
+    # A command invocation, not the word: `--drain-timeout=`, `DialTimeout` and
+    # `wait-timeout-silent` are all ordinary here. Comment lines are dropped for
+    # the reason the bash 3.2 scan drops them.
+    hits="$(grep -nE '(^|[;&|(]|\$\(|&&|\|\|)[[:space:]]*g?timeout[[:space:]]' "$script" \
+            | grep -v '^[0-9][0-9]*: *#' || true)"
+    if [ -n "$hits" ]; then
+        echo "FAIL timeout-scan: ${base} invokes timeout(1), which macOS does not have." >&2
+        echo "     Use run_bounded from scripts/lib/e2e-common.sh." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        failures=$(( failures + 1 ))
+    fi
+done
 
 if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then
     echo "== the helpers, against a real listener"
