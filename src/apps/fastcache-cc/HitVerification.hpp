@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <string_view>
 
 namespace FastCache::Cc
@@ -44,6 +45,18 @@ enum class HitVerdict : std::uint8_t
     /// that did not happen, and read as `Mismatched` it fails a build over a full
     /// disk. What it means is "ask again", and only a distinct value can say that.
     Inconclusive,
+    /// Sampled, both objects were read, and this build cannot lay out the format
+    /// its own compiler just produced -- so the clock every MSVC-family driver
+    /// stamps into an object cannot be told apart from a real difference.
+    ///
+    /// Distinct from `Inconclusive` because the two say opposite things about
+    /// asking again: `Inconclusive` means the attempt failed and the next one may
+    /// not, while this is a property of the toolchain that will hold for every hit
+    /// until this program learns the format. Answering `Mismatched` here is the
+    /// defect [#493](https://github.com/LASTRADA-Software/fastcached/issues/493)
+    /// records -- a precise wrong answer, which is worse than none, and exactly how
+    /// a verifier gets switched off for good.
+    Unsupported,
 };
 
 /// Verification is off; no hit is checked.
@@ -76,16 +89,41 @@ inline constexpr unsigned VerificationOff = 0;
 /// value is echoed on the first hit so a typo is visible rather than silent.
 [[nodiscard]] unsigned ParseVerificationRate(std::string_view text) noexcept;
 
+/// A verdict, and enough about it to act on.
+struct HitComparison
+{
+    HitVerdict verdict { HitVerdict::Inconclusive };
+    /// Where the difference was, what was overlooked, or which format could not be
+    /// read. Empty when there is nothing to add. Owned rather than viewed: the two
+    /// images it describes are read into buffers this call drops on the way out.
+    std::string detail;
+};
+
 /// Compare the object a hit produced against one a fresh compile produced.
 ///
 /// A byte comparison rather than a hash: the two files are already on this disk, the
 /// sizes are megabytes at most, and a hash would add a way for the comparison itself
 /// to be the thing that is wrong.
 ///
+/// **Not a bare `memcmp`, and that is #493.** Every MSVC-family driver stamps the
+/// wall clock into the object header, and a cached object was compiled earlier than
+/// the fresh one it is checked against by construction -- so a byte comparison
+/// answered `Mismatched` on every Windows hit, on the platform where the defect it
+/// exists to detect was observed. `ObjectEquivalence.hpp` carries the measurements
+/// and the single field that is normalised; on ELF, where the bytes are reproducible
+/// (measured, with and without `-g`), nothing is normalised and this stays the byte
+/// comparison it was.
+///
+/// The files are compared in chunks first and only read whole when they DIFFER, so
+/// the answer every hit should get still costs no allocation.
+///
 /// @param served What the cache put on disk.
-/// @param fresh What the compiler just produced.
-/// @return `Matched`, `Mismatched`, or `Inconclusive` when either could not be read.
-[[nodiscard]] HitVerdict CompareObjectFiles(std::filesystem::path const& served, std::filesystem::path const& fresh);
+/// @param fresh What the compiler just produced, at the same path the served object
+///        occupied -- which is what keeps the driver's path records out of the
+///        comparison without anything having to overlook them.
+/// @return The verdict, plus a sentence naming what it turned on.
+[[nodiscard]] HitComparison CompareObjectFiles(std::filesystem::path const& served,
+                                               std::filesystem::path const& fresh);
 
 /// What to tell an operator about @p verdict, or empty when there is nothing to say.
 ///
@@ -94,7 +132,11 @@ inline constexpr unsigned VerificationOff = 0;
 /// and ask about.
 /// @param verdict What the comparison found.
 /// @param key The object key, so the entry can be looked at rather than only counted.
+/// @param detail `HitComparison::detail` -- appended where it says something the
+///        sentence cannot. A mismatch that names `.text$mn` and one that names
+///        `.debug$S` are a stale object and a foreign build path respectively, and
+///        an operator acts on them differently.
 /// @return The line, or empty for `NotChecked` and `Matched`.
-[[nodiscard]] std::string DescribeVerdict(HitVerdict verdict, std::string_view key);
+[[nodiscard]] std::string DescribeVerdict(HitVerdict verdict, std::string_view key, std::string_view detail = {});
 
 } // namespace FastCache::Cc

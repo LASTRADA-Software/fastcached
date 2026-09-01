@@ -715,18 +715,18 @@ void ReplayStreams(std::string_view out, std::string_view err)
 /// @param argv What to run to compile for real.
 /// @param key The object key this hit was served under.
 /// @param rate One hit in this many is checked; `VerificationOff` checks none.
-/// @return What the comparison found.
-[[nodiscard]] Cc::HitVerdict VerifyServedObject(Cc::ParsedCommand const& cmd,
-                                                std::span<std::string const> argv,
-                                                std::string const& key,
-                                                unsigned rate)
+/// @return What the comparison found, and what it turned on.
+[[nodiscard]] Cc::HitComparison VerifyServedObject(Cc::ParsedCommand const& cmd,
+                                                   std::span<std::string const> argv,
+                                                   std::string const& key,
+                                                   unsigned rate)
 {
     if (!Cc::ShouldVerifyHit(key, rate))
-        return Cc::HitVerdict::NotChecked;
+        return { .verdict = Cc::HitVerdict::NotChecked, .detail = {} };
 
     auto const served = FastCache::PathFromNarrowText(cmd.objPath);
     if (!served.has_value())
-        return Cc::HitVerdict::Inconclusive;
+        return { .verdict = Cc::HitVerdict::Inconclusive, .detail = {} };
 
     // Beside the object rather than in the system temp directory: the build already
     // writes here, so it is writable and on the same filesystem, and a rename or a
@@ -736,7 +736,7 @@ void ReplayStreams(std::string_view out, std::string_view err)
     std::error_code ec;
     std::filesystem::copy_file(*served, aside, std::filesystem::copy_options::overwrite_existing, ec);
     if (ec)
-        return Cc::HitVerdict::Inconclusive;
+        return { .verdict = Cc::HitVerdict::Inconclusive, .detail = {} };
 
     // The compiler's own streams are DISCARDED. It has already been served a hit, so
     // its diagnostics were replayed; printing them a second time would make a verified
@@ -750,12 +750,12 @@ void ReplayStreams(std::string_view out, std::string_view err)
         // failed verification never costs the build its object.
         std::filesystem::copy_file(aside, *served, std::filesystem::copy_options::overwrite_existing, ec);
         std::filesystem::remove(aside, ec);
-        return Cc::HitVerdict::Inconclusive;
+        return { .verdict = Cc::HitVerdict::Inconclusive, .detail = {} };
     }
 
-    auto const verdict = Cc::CompareObjectFiles(aside, *served);
+    auto comparison = Cc::CompareObjectFiles(aside, *served);
     std::filesystem::remove(aside, ec);
-    return verdict;
+    return comparison;
 }
 
 /// Report a verification, and say nothing when there is nothing to say.
@@ -764,11 +764,18 @@ void ReplayStreams(std::string_view out, std::string_view err)
 /// operator must not have to have opted into: a wrong object that was detected and
 /// then only counted is a number somebody has to come back and ask about, and the
 /// whole reason #368 went unnoticed is that nothing said anything.
-/// @param verdict What the comparison found.
+/// @param comparison What the comparison found, and what it turned on.
 /// @param key The key, so the entry can be looked at rather than only counted.
-void ReportVerification(Cc::HitVerdict verdict, std::string const& key)
+void ReportVerification(Cc::HitComparison const& comparison, std::string const& key)
 {
-    auto const line = Cc::DescribeVerdict(verdict, key);
+    // A clean verification stays SILENT by default and still says what it saw when
+    // asked. On Windows every hit is "identical apart from the clock" (#493), so
+    // printing that unconditionally would put a line on every hit of every build and
+    // teach a reader to filter exactly the stream the loud case arrives on.
+    if (comparison.verdict == Cc::HitVerdict::Matched && !comparison.detail.empty())
+        Note(std::format("verified the hit for key {}: identical apart from {}", key, comparison.detail));
+
+    auto const line = Cc::DescribeVerdict(comparison.verdict, key, comparison.detail);
     if (line.empty())
         return;
     std::cerr << line << '\n';

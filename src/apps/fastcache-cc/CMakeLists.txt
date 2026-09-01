@@ -148,6 +148,7 @@ set(_fc_cc_sources
     DependencyProbe.cpp
     DirectManifest.cpp
     HitVerification.cpp
+    ObjectEquivalence.cpp
     ParallelFor.cpp
     PathResolve.cpp
     ReplayGuard.cpp
@@ -261,6 +262,7 @@ if(FASTCACHED_BUILD_TESTS)
         ParallelFor_test.cpp
         CacheProtocol_test.cpp
         HitVerification_test.cpp
+        ObjectEquivalence_test.cpp
         CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
         # Test infrastructure, and on THIS target only: the shipped launcher must
