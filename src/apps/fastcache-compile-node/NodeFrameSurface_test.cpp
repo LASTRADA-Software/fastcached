@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheProxy.hpp"
+#include "CompileCapacity.hpp"
+#include "CompileResponder.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "Responders.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -278,6 +290,101 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
 
     CHECK(cache.Answered().size() == 2);
     CHECK(scheduler.Answered().size() == 4);
+}
+
+TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE admitted",
+          "[node][merged-responder][cache-locality]")
+{
+    // **#290's acceptance criterion.** The ticket states it as
+    //
+    //     a cache FETCH from another machine is refused on the merged wildcard port
+    //     while a compile from that same peer succeeds
+    //
+    // -- same peer, same listener, two verbs, two answers. That is the property the
+    // merge could silently break, because before it the LISTENER was the policy: a
+    // frame on the cache port was a cache frame, and "who may do this" was answered by
+    // which socket it arrived on. One socket cannot answer that by existing.
+    //
+    // **Both components are the production ones.** The pieces are proven separately --
+    // `CacheProxy_test` pins the locality refusal and its counter, `CompileResponder_test`
+    // the admission -- and what no other case has is the CONTRAST: the two rules
+    // disagreeing about one peer, reached through the router that has to keep them
+    // apart. A fake responder cannot show it; `One peer is refused one verb and served
+    // another on the same listener` uses `RefuseOnlyVerb` and says so, which proves the
+    // seam can carry the question rather than that the real rules produce it.
+    //
+    // The peer is `10.0.0.1`, and the two things that make this case mean anything are
+    // asserted rather than assumed: it IS an admitted member, so the FETCH refusal
+    // cannot be membership, and it is NOT this machine, so the refusal is locality.
+    // Never invoked. This case stops at the peer gate, which is decided from the
+    // caller's host before a payload byte is read -- so no compiler is spawned and a
+    // runner that refuses to spawn is the honest stand-in for one that is not asked.
+    struct NeverSpawns final: Cc::IProcessRunner
+    {
+        Cc::CompileRun RunCaptureCombined(std::span<std::string const> /*argv*/) override
+        {
+            return Cc::CompileRun { .exitCode = Cc::NotSpawned, .out = {}, .err = {} };
+        }
+        Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+        {
+            return RunCaptureCombined(argv);
+        }
+    };
+
+    InMemoryLruStorage local { 64 * 1024 };
+    NoUpstream upstream;
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    LocalCache cache { local, upstream, clock, metrics };
+    CacheProxy proxy { cache };
+
+    // This machine answers on 10.0.0.7, so 10.0.0.1 is somebody else. Injected because
+    // the question is ambient: `ILocalityOracle` exists so a test can say which
+    // addresses are this host's without the host having to have them.
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, clock };
+
+    // Admitted. Without this the FETCH would be refused for membership and the case
+    // would pass having tested nothing about the merge -- and the compile would be
+    // refused too, so there would be no contrast at all.
+    Distributed::ClusterMembership const membership { { "10.0.0.1:7000" } };
+    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+    REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NeverSpawns runner;
+    FastCache::Testing::ScratchDirectory const scratch { "fc-290-acceptance" };
+    Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
+    Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    ThreadPoolExecutor pool { 1 };
+    CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, logger };
+
+    CacheResponder cacheResponder { proxy, locality, metrics };
+    CompileResponder compileResponder { protocol, capacity, membership, pool, io.Reactor(), metrics, logger };
+    MergedResponder responder { &cacheResponder, nullptr, &compileResponder };
+
+    constexpr auto* peer = "10.0.0.1";
+
+    // --- the cache verb: refused, and refused FOR LOCALITY ------------------------
+    //
+    // The REASON is asserted, not merely that it was refused. "Was it refused" is
+    // satisfied by any refusal, so a membership bug, a routing bug or a plain failure
+    // would all pass a weaker check -- and the counter is what says which rule fired.
+    auto const fetchRefusal = responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Fetch));
+    REQUIRE(fetchRefusal.has_value());
+    CHECK(ErrorOf(Unwrap(fetchRefusal)) == Wire::ErrorCode::NotAMember);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
+
+    // --- the compile verb: the SAME peer is admitted ------------------------------
+    //
+    // No refusal at the peer gate, which is as far as this layer decides: a lease and
+    // a compiler are the next questions and belong to the fixture that has both.
+    CHECK_FALSE(responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Compile)).has_value());
+
+    // And the cache tier still answers THIS machine, which is the other direction of
+    // the same rule and the one a widened bind is most likely to break in silence.
+    CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
 }
 
 TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merged-responder]")
