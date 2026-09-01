@@ -705,8 +705,13 @@ class IdleListener final: public IListener
 /// @return Whether the in-flight count reached zero.
 [[nodiscard]] bool DrainedWithin(CompileCapacity const& capacity, std::chrono::milliseconds bound)
 {
+    // Against a real deadline, not by accumulating the NOMINAL poll: a 5 ms
+    // `sleep_for` returns in about 15 ms on Windows, so counting the requested
+    // interval made this bound roughly three times what it claimed -- a figure that
+    // reads like five seconds and is not.
     constexpr auto Poll = std::chrono::milliseconds { 5 };
-    for (auto waited = std::chrono::milliseconds { 0 }; waited < bound; waited += Poll)
+    auto const deadline = std::chrono::steady_clock::now() + bound;
+    while (std::chrono::steady_clock::now() < deadline)
     {
         if (capacity.InFlight() == 0)
             return true;
@@ -743,6 +748,18 @@ struct MergedWorker
         // -- `Drain` still reaches `Abandon` and calls `std::_Exit`, so the case still
         // vanishes into two lines of banner, just sooner (#297). Five over two for
         // headroom on a loaded runner.
+        //
+        // **Whether a violation reports or vanishes is a race, and these are the three
+        // numbers.** Measured, with the body-level release removed so the slot really
+        // does not come back: at this 5 s bound the drain returned 2.5 s after
+        // `StopAndWait` began -- the holder's own 10 s self-release landing inside it --
+        // and the case reported `exit 1` with a full summary. At a 1 s bound the same
+        // violation abandoned and gave `exit 75` with no summary at all.
+        //
+        // So reporting is NOT a property of using `CHECK`; it is this bound, checked at
+        // `DrainReportInterval` granularity, being longer than however long the
+        // outstanding job takes to finish -- counted from a moment no case author can
+        // see. None of the three figures means anything quoted alone.
         //
         // It is NOT what makes these cases correct -- see the destructor.
         server { listener, protocol, 2, fix.membership, fix.metrics, fix.logger, pool, std::chrono::seconds { 5 } },
