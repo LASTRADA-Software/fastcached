@@ -9,6 +9,7 @@
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>

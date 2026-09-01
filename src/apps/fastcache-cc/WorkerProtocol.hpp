@@ -10,7 +10,6 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
-#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <cstddef>
 #include <expected>

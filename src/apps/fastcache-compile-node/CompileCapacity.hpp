@@ -5,6 +5,7 @@
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <atomic>
 #include <chrono>
