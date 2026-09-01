@@ -74,9 +74,13 @@ class IEndpointExchange
 /// is a comfortable round number.** A client waiting past its lease is waiting on
 /// one the scheduler has already reclaimed and may have re-granted for the same
 /// key, so nothing above that value can be honoured and everything below it throws
-/// away a compile the fleet is still holding capacity for. The two are coupled and
-/// cannot be `static_assert`ed together — this launcher deliberately does not link
-/// the library the scheduler lives in — so moving either means moving both.
+/// away a compile the fleet is still holding capacity for.
+///
+/// So it is DERIVED, not written beside it (#249). This comment used to say the two
+/// could not be `static_assert`ed together because the launcher does not link the
+/// library the scheduler lives in — true of `LeaseTable`'s header, and not true of
+/// the value, which now lives in `CompileCacheWire.hpp` where both ends already
+/// look. Moving either no longer means remembering to move both.
 ///
 /// Deliberately generous rather than tight, because a *flat* deadline has to cover
 /// the slowest translation unit anybody legitimately compiles: real ones here run
@@ -94,7 +98,7 @@ class IEndpointExchange
 /// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
 /// process per translation unit, so the variable IS the runtime knob: the next
 /// compile reads it. Nothing has to be reloaded, and nothing has to be restarted.
-constexpr std::chrono::milliseconds DefaultDispatchTotal { 600'000 };
+constexpr std::chrono::milliseconds DefaultDispatchTotal = CompileCacheWire::DefaultCompileLeaseTimeout;
 
 /// The deadlines a dispatch's exchanges run under.
 ///
