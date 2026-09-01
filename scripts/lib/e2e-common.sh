@@ -643,21 +643,60 @@ http_get() {
 #
 # It DOES collide with a command that exits 124 of its own accord -- one integer
 # cannot carry both facts, which is this ticket's whole subject one layer down.
-# So the status is the convenience and `E2eBoundOutcome` below is the answer: a
+# So the status is the convenience and `e2e_bound_outcome` below is the answer: a
 # caller for which the difference matters reads that instead, and `cluster-e2e`
 # does, because reporting "the probe did not finish" about a client that answered
 # is exactly the mis-bucketing #457 is about.
 E2eBoundExceeded=124
 
-# Which of the two things happened in the last `run_bounded` in THIS shell:
-# `finished` or `exceeded`. Unambiguous where the status cannot be, because it is
-# set from the loop that observed the ceiling rather than inferred from a number
-# the command chose.
+# Which of THREE things happened in the last `run_bounded`: `finished`,
+# `exceeded`, or `unstartable`. Read with `e2e_bound_outcome`, never as a
+# variable. Unambiguous where the status cannot be, because each is recorded from
+# something observed rather than inferred from a number that means several
+# things.
 #
-# Per shell, so a caller reading it must do so before its next `run_bounded` --
-# which is the same discipline `$?` already imposes. `cluster` calls both inside
-# one `$( ... )`, so the subshell that sets it is the subshell that reads it.
-E2eBoundOutcome="finished"
+# **A FILE, and the first version of this was a shell variable that could not
+# work.** Its comment claimed `cluster` "calls both inside one `$( ... )`, so the
+# subshell that sets it is the subshell that reads it". That is false and the
+# fixture proved it: `cluster` runs in one subshell, and `out="$(run_bounded …)"`
+# opens ANOTHER inside it, so the assignment was discarded at the closing paren
+# and every unstartable probe read back as `finished`. Verified end to end --
+# 870 probes filed as `declined`, `0 NEVER STARTED`, against a client that did
+# not exist.
+#
+# That is the defect this file's own `probe_log` comment was written about, in
+# the helper written to fix it, with the wrong claim spelled out beside it. The
+# self-test did not catch it because it called `run_bounded` directly while the
+# only real caller captures its output -- a test exercising the helper
+# differently from production is a test of something else.
+#
+# `unstartable` is the one that had to be measured. A command that cannot be
+# executed exits **127 on Linux and 1 on macOS** -- observed, on this repository's
+# own CI, in the commit that introduced this function. A caller matching 126/127
+# therefore files it as an ordinary refusal on macOS, which is #457's defect for
+# the third time: a state that cannot be reported gets reported as its neighbour,
+# and the platform it breaks on is the one nobody here can run.
+#
+# And 127 is doubly ambiguous even on Linux -- `wait` answers 127 for a pid it
+# cannot speak for, which `wait_until` above already records. So this is not
+# inferred at all: `run_bounded` checks that the command is executable BEFORE
+# spawning it.
+#
+# Per RUN and not per shell, so a caller must read it before its next
+# `run_bounded` -- the same discipline `$?` already imposes. These fixtures probe
+# sequentially; two concurrent `run_bounded`s would race for it, exactly as they
+# would for `probe_log`.
+_e2e_bound_outcome_path() { printf '%s' "${_e2e_workdir}/.bounded-outcome"; }
+
+# What the last `run_bounded` did: finished | exceeded | unstartable.
+#
+# Defaults to `finished` when nothing has been recorded, which is the reading a
+# caller that never bounded anything should get.
+e2e_bound_outcome() {
+    local recorded
+    recorded="$(cat "$(_e2e_bound_outcome_path)" 2>/dev/null || true)"
+    printf '%s' "${recorded:-finished}"
+}
 
 # Run a command under a wall-clock ceiling. Echoes its combined output.
 #
@@ -745,7 +784,29 @@ run_bounded() {
     local seconds="$1"; shift
     local capture pid deadline grace status=0 exceeded=0 tick=0
 
-    E2eBoundOutcome="finished"
+    printf 'finished' > "$(_e2e_bound_outcome_path)"
+
+    # ASKED, not inferred. `command -v` answers whether this name resolves to
+    # something executable -- a path, a PATH lookup, a function, a builtin -- and
+    # it answers the same on every shell. The alternative is reading the status
+    # afterwards, and that number is not a fact:
+    #
+    #   * measured on this repository's CI, a missing command surfaces as 127 on
+    #     ubuntu-24.04 and as 1 on macos-14;
+    #   * and 127 is ambiguous even on Linux, where `wait` also returns it for a
+    #     pid it cannot speak for -- which `wait_until` above already records, and
+    #     which measurement confirmed across all five layers of this function.
+    #
+    # A caller that matched 126/127 would therefore file an unstartable client as
+    # an ordinary refusal on macOS: the four-state classification silently
+    # degrading to three, on the one platform this whole function exists for.
+    # That is #457's defect returning by a different route, and it is what the
+    # self-test caught.
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'unstartable' > "$(_e2e_bound_outcome_path)"
+        return 127
+    fi
+
     capture="$(mktemp "${_e2e_workdir}/bounded.XXXXXX")"
 
     "$@" > "$capture" 2>&1 &
@@ -791,7 +852,7 @@ run_bounded() {
     rm -f "$capture"
 
     if [ "$exceeded" -eq 1 ]; then
-        E2eBoundOutcome="exceeded"
+        printf 'exceeded' > "$(_e2e_bound_outcome_path)"
         return "$E2eBoundExceeded"
     fi
     return "$status"

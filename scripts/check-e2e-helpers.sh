@@ -324,10 +324,36 @@ run_case() {
     bounded-missing-command)
         rc=0
         run_bounded 5 "${scratch}/no-such-client" --cluster-status >/dev/null || rc=$?
-        echo "a missing command exited ${rc}"
-        if [ "$rc" = "$E2eBoundExceeded" ]; then
+        # The OUTCOME is asserted; the status is printed as evidence only. This
+        # row first asserted `exited 127` and CI's macOS leg answered `exited 1`
+        # -- so the number is a platform fact and not the thing under test, while
+        # the outcome is the thing every caller actually branches on.
+        echo "a missing command: outcome=$(e2e_bound_outcome) (status ${rc} on this platform)"
+        if [ "$(e2e_bound_outcome)" = "exceeded" ]; then
             echo "BUG: a missing command is indistinguishable from the bound expiring"
         fi
+        ;;
+
+    # THE PRODUCTION SHAPE, and the row that would have caught the defect the
+    # rows around it missed.
+    #
+    # `cluster-e2e`'s probe runs `answer="$(cluster …)"`, and `cluster` runs
+    # `out="$(run_bounded …)"` inside that -- so `run_bounded` executes TWO
+    # subshells below the fixture. The first version of the outcome was a shell
+    # variable, and the assignment was discarded at the closing paren: every
+    # unstartable probe read back as `finished`, and the fixture filed 870 of them
+    # as the cluster declining. Every other row here calls `run_bounded` directly,
+    # where a variable works perfectly, so all of them passed.
+    #
+    # A test that exercises a helper differently from its only caller is a test of
+    # something else. This one is written in the caller's shape deliberately.
+    bounded-outcome-survives-capture)
+        probe() {
+            local out rc=0
+            out="$(run_bounded 5 "${scratch}/no-such-client")" || rc=$?
+            printf '%s' "$(e2e_bound_outcome)"
+        }
+        echo "two subshells down, the outcome reads $(probe)"
         ;;
 
     # The bound expires, and it reports that rather than the child's status. A
@@ -336,21 +362,21 @@ run_case() {
     bounded-expires)
         rc=0
         run_bounded 1 sleep 30 >/dev/null || rc=$?
-        echo "an expired bound exited ${rc}, outcome ${E2eBoundOutcome}"
+        echo "an expired bound exited ${rc}, outcome $(e2e_bound_outcome)"
         ;;
 
     # A command that CHOOSES to exit 124 is not the ceiling expiring, and one
-    # integer cannot say which happened -- so `E2eBoundOutcome` is what a caller
+    # integer cannot say which happened -- so `e2e_bound_outcome` is what a caller
     # reads. Both rows here, because the interesting assertion is that the two
     # cases agree on `rc` and differ on the outcome; testing either alone passes
     # under a helper that never sets the outcome at all.
     bounded-124-is-not-a-timeout)
         rc=0
         run_bounded 5 sh -c 'exit 124' >/dev/null || rc=$?
-        echo "a command exiting 124: rc=${rc} outcome=${E2eBoundOutcome}"
+        echo "a command exiting 124: rc=${rc} outcome=$(e2e_bound_outcome)"
         rc=0
         run_bounded 1 sleep 30 >/dev/null || rc=$?
-        echo "a ceiling expiring:    rc=${rc} outcome=${E2eBoundOutcome}"
+        echo "a ceiling expiring:    rc=${rc} outcome=$(e2e_bound_outcome)"
         ;;
 
     # The ramp. The first version of `run_bounded` slept `_e2e_poll_pause` (0.2s)
@@ -661,7 +687,8 @@ cases=(
     "wait-nothing-watched|1|No process was watched|to listen on 127.0.0.1:|!BUG:"
     "wait-for-log|0|wait_for_log returned on the marker"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
-    "bounded-missing-command|0|a missing command exited 127|!BUG:"
+    "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
+    "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
     "bounded-expires|0|an expired bound exited 124, outcome exceeded"
     "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"

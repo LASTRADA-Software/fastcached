@@ -255,19 +255,20 @@ probe_log="${workdir}/probes"
 # @param 2.. the cluster flag and its operand
 cluster() {
     local endpoint="$1"; shift
-    local out rc=0
+    local out outcome rc=0
     out="$(run_bounded "$ClusterProbeSeconds" "$node" --scheduler="$endpoint" "$@")" || rc=$?
 
     # Checked before anything else, because every other non-zero status is the CLI
     # having run and said something.
     #
-    # `E2eBoundOutcome` and not `rc`, because one integer cannot carry both facts:
+    # `e2e_bound_outcome` and not `rc`, because one integer cannot carry both facts:
     # `run_bounded` returns 124 for an expired ceiling AND for a command that
     # chose to exit 124, and filing the second as "the probe did not finish" is
     # this ticket's own mis-bucketing in the code written to remove it. The
     # outcome is set by the loop that watched the clock, so it cannot be forged
     # by an exit status.
-    if [[ "$E2eBoundOutcome" == "exceeded" ]]; then
+    outcome="$(e2e_bound_outcome)"
+    if [[ "$outcome" == "exceeded" ]]; then
         echo "timeout ${endpoint}" >> "$probe_log"
         printf '%s\n' "$ProbeTimedOut"
         return 0
