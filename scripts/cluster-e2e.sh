@@ -260,7 +260,14 @@ cluster() {
 
     # Checked before anything else, because every other non-zero status is the CLI
     # having run and said something.
-    if [[ "$rc" -eq "$E2eBoundExceeded" ]]; then
+    #
+    # `E2eBoundOutcome` and not `rc`, because one integer cannot carry both facts:
+    # `run_bounded` returns 124 for an expired ceiling AND for a command that
+    # chose to exit 124, and filing the second as "the probe did not finish" is
+    # this ticket's own mis-bucketing in the code written to remove it. The
+    # outcome is set by the loop that watched the clock, so it cannot be forged
+    # by an exit status.
+    if [[ "$E2eBoundOutcome" == "exceeded" ]]; then
         echo "timeout ${endpoint}" >> "$probe_log"
         printf '%s\n' "$ProbeTimedOut"
         return 0
@@ -315,8 +322,22 @@ cluster() {
 # Both "did not finish" and "never started" get a sentence rather than only a
 # number, because the number alone is what a reader skims past: `591 declined`
 # looked like a fleet of refusals and was 591 clients that never ran.
+#
+# **SUMMARISED FROM A CURSOR, not from the top of the file.** Every wait here
+# appends to one log, so a cumulative count cannot answer the question a wait's
+# own failure asks. The last wait in this fixture runs after several hundred
+# healthy probes: a wait that timed out every one of ITS probes would report
+# something like "3% never finished", which reads as a healthy run and sends the
+# reader to the product. That is the rule `.agent/rules/testing.md` states --
+# a cumulative figure cannot answer a question about now -- applied to the
+# instrument that quotes it.
+#
+# @param 1 how many lines of the log to skip; `probe_mark` at the wait's entry
+probe_mark() { wc -l < "$probe_log" | tr -d ' '; }
+
 probe_summary() {
-    awk '
+    awk -v from="${1:-0}" '
+        NR <= from { next }
         { kind[$1]++; total++ }
         END {
             printf "%d probes: %d affirmed, %d declined, %d TIMED OUT, %d NEVER STARTED",
@@ -387,8 +408,23 @@ done
 # the answer stopped matching it.
 #
 # Bounded. An election takes a few hundred milliseconds and a cold CI runner takes
-# longer; a cluster that has not settled inside ~30s has not settled.
+# longer; a cluster that has not settled inside `FormationSeconds` has not settled.
 leader_endpoint=""
+
+# An absolute `SECONDS` value past which no NESTED wait may run, or empty.
+#
+# A wait called inside another wait's loop carries its own bound, and two bounds
+# compose by the inner one winning -- so the replication loop below declared 30 s
+# while one pass of its body could call `find_leader` (60 s) twice, for a stated
+# 30 s that enforced up to 150 s. The declared number was not the quantity
+# enforced, which is the defect this whole change is about, reintroduced by
+# composition rather than by arithmetic.
+#
+# One variable rather than a bound threaded through every signature: `find_leader`
+# is also reached indirectly, through `submit_setting`, so a parameter would have
+# to be carried by functions that have no opinion about it and would be forgotten
+# by the next one added.
+enclosing_deadline=""
 
 # @param $1 What was being waited for, named by the caller.
 #
@@ -407,8 +443,14 @@ leader_endpoint=""
 find_leader() {
     local what="${1:-a leader}"
     leader_endpoint=""
-    local index answer
+    local index answer summary
+    local started="$SECONDS" budget
+    local mark; mark="$(probe_mark)"
     local deadline=$(( SECONDS + FormationSeconds ))
+    if [[ -n "$enclosing_deadline" && "$enclosing_deadline" -lt "$deadline" ]]; then
+        deadline="$enclosing_deadline"
+    fi
+    budget=$(( deadline - started ))
     while [[ "$SECONDS" -lt "$deadline" ]]; do
         for index in "${!scheduler_ports[@]}"; do
             [[ -n "${scheduler_ports[$index]}" ]] || continue
@@ -421,14 +463,20 @@ find_leader() {
         sleep 0.2
     done
 
-    echo "no live node answered as leader within ${FormationSeconds}s, waiting for ${what}."
-    echo "  $(probe_summary)"
+    # Taken ONCE, before the dump, and reused. The dump issues three more probes,
+    # so summarising again afterwards reports a different set of numbers under the
+    # same name a few lines apart -- and the second one is contaminated by the
+    # fixture's own diagnostics rather than describing the wait that failed.
+    summary="$(probe_summary "$mark")"
+
+    echo "no live node answered as leader within ${budget}s, waiting for ${what}."
+    echo "  ${summary}"
     echo "  What each was asked and said:"
     for index in "${!scheduler_ports[@]}"; do
         [[ -n "${scheduler_ports[$index]}" ]] || { echo "  slot ${index}: stopped by this fixture"; continue; }
         echo "  127.0.0.1:${scheduler_ports[$index]}: $(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
     done
-    fail "no live node answered as leader, waiting for ${what} ($(probe_summary))"
+    fail "no live node answered as leader in ${budget}s, waiting for ${what} (${summary})"
 }
 
 # The endpoint a refusal tells a client to ask instead, or empty when it names
@@ -510,7 +558,8 @@ wait_for_formation() {
     # The third state is the one a bare "never formed" hides, and it is the one
     # that decides whether raising a number is a fix or a cover-up. `at` is seconds
     # from the start of THIS wait, so the reader gets it without arithmetic.
-    local firstNamed="" firstNamedAt="" lastNamed="" namedRuns=0
+    local firstNamed="" firstNamedAt="" lastNamed="" namedRuns=0 silentPasses=0 passes=0
+    local mark; mark="$(probe_mark)"
     local started="$SECONDS"
 
     local deadline=$(( SECONDS + FormationSeconds ))
@@ -548,7 +597,18 @@ wait_for_formation() {
         # has still observed what it saw -- and recorded on CHANGE rather than every
         # pass, so `namedRuns` counts how often the answer moved rather than how
         # often it was asked.
-        if [[ -n "$named" && "$named" != "$lastNamed" ]]; then
+        #
+        # **A PASS THAT NAMED NOBODY IS A CHANGE.** Counting it as "no news" made
+        # the sequence `A, silence, silence, A` read as one unbroken run, and the
+        # sentence below then said a leader was known THROUGHOUT -- pointing the
+        # reader at the product -- about a wait in which nothing was known for most
+        # of it. Silence is exactly what the failing scenarios here produce, so the
+        # one narrative that must not be wrong was wrong precisely when it fired.
+        passes=$(( passes + 1 ))
+        if [[ -z "$named" ]]; then
+            silentPasses=$(( silentPasses + 1 ))
+            lastNamed=""
+        elif [[ "$named" != "$lastNamed" ]]; then
             if [[ -z "$firstNamed" ]]; then
                 firstNamed="$named"
                 firstNamedAt=$(( SECONDS - started ))
@@ -568,11 +628,21 @@ wait_for_formation() {
     # separates the remaining possibilities and it is cheap to state.
     local naming
     if [[ -z "$firstNamed" ]]; then
-        naming="no node ever named a leader, so none was known to any of them"
-    elif [[ "$namedRuns" -eq 1 ]]; then
+        naming="no node ever named a leader, so none was known to any of them (${passes} passes)"
+    elif [[ "$firstNamed" == "disagreed" ]]; then
+        # `named` carries this sentinel when two nodes named different leaders in
+        # one pass, so it is a state and not an endpoint. Rendered as one it read
+        # as "every decline named disagreed".
+        naming="the nodes named DIFFERENT leaders in the same pass, first at ${firstNamedAt}s -- they did not agree on who led"
+    elif [[ "$namedRuns" -eq 1 && "$silentPasses" -eq 0 ]]; then
         naming="every decline named ${firstNamed}, from ${firstNamedAt}s in and unchanged for the rest of the wait -- so a leader WAS known throughout and never answered as one"
+    elif [[ "$namedRuns" -eq 1 ]]; then
+        # The claim above is the one that sends a reader to the product, so it is
+        # made only when nothing contradicts it. One name plus silence is a
+        # cluster that lost track of its leader, which is a different finding.
+        naming="one leader was ever named, ${firstNamed} at ${firstNamedAt}s, but ${silentPasses} of ${passes} passes named nobody at all -- so it was NOT known throughout"
     else
-        naming="the named leader moved ${namedRuns} times, first ${firstNamed} at ${firstNamedAt}s, last ${lastNamed} -- the cluster was still re-electing"
+        naming="the named leader moved ${namedRuns} times, first ${firstNamed} at ${firstNamedAt}s, last ${lastNamed:-nobody}, with ${silentPasses} of ${passes} passes naming nobody -- the cluster was still re-electing"
     fi
 
     # Faults, in the order that makes each one answerable.
@@ -589,9 +659,13 @@ wait_for_formation() {
     # halves of the old sentence were false at once, and neither this fixture nor a
     # reader could tell. What it could not say, and now can, is whether that leader
     # was known early and silent or known only at the end.
+    #
+    # (Both those runs are now explained: the probes never RAN. See `cluster`.
+    # The evidence below is what would have said so, had it been able to.)
+    local summary; summary="$(probe_summary "$mark")"
     [[ "$everLed" -eq 1 ]] ||
-        fail "no node ever answered as leader in ${FormationSeconds}s: ${naming} ($(probe_summary))"
-    fail "the cluster elected but never formed in ${FormationSeconds}s: one leader and every other node naming it never held at once. ${naming} ($(probe_summary))"
+        fail "no node ever answered as leader in ${FormationSeconds}s: ${naming} (${summary})"
+    fail "the cluster elected but never formed in ${FormationSeconds}s: one leader and every other node naming it never held at once. ${naming} (${summary})"
 }
 
 wait_for_formation
@@ -645,6 +719,7 @@ echo "cluster E2E: exactly one node answers, and keeps answering"
 # and waiting it out is what tells "not yet" apart from "never".
 redirect_from() {
     local endpoint="$1" answer=""
+    local mark; mark="$(probe_mark)"
     local deadline=$(( SECONDS + RedirectSeconds ))
     while [[ "$SECONDS" -lt "$deadline" ]]; do
         answer="$(cluster "$endpoint" --cluster-status)"
@@ -659,7 +734,7 @@ redirect_from() {
         esac
         sleep 0.2
     done
-    fail "a follower at ${endpoint} never named where to ask within ${RedirectSeconds}s: ${answer} ($(probe_summary))"
+    fail "a follower at ${endpoint} never named where to ask within ${RedirectSeconds}s: ${answer} ($(probe_summary "$mark"))"
 }
 
 for index in 0 1 2; do
@@ -731,7 +806,13 @@ set_upstream
 # that by asking again. Which is what any real operator tool would do, so it is
 # also the behaviour worth having under test.
 settled=0
+replication_mark="$(probe_mark)"
 replication_deadline=$(( SECONDS + ReplicationSeconds ))
+# The nested `find_leader` calls below -- one direct, one reached through
+# `set_upstream` -> `submit_setting` -- each carry `FormationSeconds`, which is
+# twice this loop's whole budget. Capped here so the 30 s in the source is the
+# 30 s enforced.
+enclosing_deadline="$replication_deadline"
 while [[ "$SECONDS" -lt "$replication_deadline" ]]; do
     answer="$(cluster "$leader_endpoint" --cluster-status)"
     if [[ "$answer" == *"cache.example:6674"* ]]; then
@@ -748,7 +829,8 @@ while [[ "$SECONDS" -lt "$replication_deadline" ]]; do
     fi
     sleep 0.2
 done
-[[ "$settled" -eq 1 ]] || fail "a setting accepted by the leader never became visible on it"
+enclosing_deadline=""
+[[ "$settled" -eq 1 ]] || fail "a setting accepted by the leader never became visible on it within ${ReplicationSeconds}s ($(probe_summary "$replication_mark"))"
 echo "cluster E2E: a setting replicates"
 
 # A setting nobody has heard of is refused where the operator is watching, rather
@@ -848,6 +930,7 @@ answer="$(cluster "$leader_endpoint" --cluster-admit="n4=127.0.0.1:${raft_ports[
 # other -- the same shape of precondition error, and it would have been a hard one
 # to see, because n4 winning here is rare.
 joined=0
+join_mark="$(probe_mark)"
 join_deadline=$(( SECONDS + JoinSeconds ))
 while [[ "$SECONDS" -lt "$join_deadline" ]]; do
     answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
@@ -865,7 +948,7 @@ while [[ "$SECONDS" -lt "$join_deadline" ]]; do
     sleep 0.2
 done
 [[ "$joined" -eq 1 ]] ||
-    fail "the admitted node never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary))"
+    fail "the admitted node never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary "$join_mark"))"
 echo "cluster E2E: an admitted node is replicated to, which is being counted, and it names ${leader_endpoint}"
 
 # And that n4 counts ITSELF a member, which is a different fact from either half

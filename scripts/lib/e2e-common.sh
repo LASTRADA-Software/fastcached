@@ -639,9 +639,25 @@ http_get() {
 
 # The status `run_bounded` returns when the ceiling expired before the command
 # did. 124 is `timeout(1)`'s, so a reader who knows that convention reads this
-# one for free -- and it cannot collide with a status the command itself
-# returned, because a command that returned anything is one that finished.
+# one for free.
+#
+# It DOES collide with a command that exits 124 of its own accord -- one integer
+# cannot carry both facts, which is this ticket's whole subject one layer down.
+# So the status is the convenience and `E2eBoundOutcome` below is the answer: a
+# caller for which the difference matters reads that instead, and `cluster-e2e`
+# does, because reporting "the probe did not finish" about a client that answered
+# is exactly the mis-bucketing #457 is about.
 E2eBoundExceeded=124
+
+# Which of the two things happened in the last `run_bounded` in THIS shell:
+# `finished` or `exceeded`. Unambiguous where the status cannot be, because it is
+# set from the loop that observed the ceiling rather than inferred from a number
+# the command chose.
+#
+# Per shell, so a caller reading it must do so before its next `run_bounded` --
+# which is the same discipline `$?` already imposes. `cluster` calls both inside
+# one `$( ... )`, so the subshell that sets it is the subshell that reads it.
+E2eBoundOutcome="finished"
 
 # Run a command under a wall-clock ceiling. Echoes its combined output.
 #
@@ -698,25 +714,56 @@ E2eBoundExceeded=124
 # the same file and two overlapping runs would read each other's output. That is
 # the same defect `cluster-e2e.sh`'s own `probe_log` comment was written about,
 # one level down and in the helper written to fix it.
+#
+# ---------------------------------------------------------------------------
+#
+# **The cadence RAMPS, and that is a measurement.** `_e2e_poll_pause` is 0.2 s,
+# which is right for `wait_until` -- it waits on a service coming up, where a
+# fifth of a second is nothing. Here it was catastrophic: a command that returns
+# in 16 ms is still only observed on the next tick, so the FIRST version of this
+# function cost **205 ms for a command taking 0 ms** (measured: 10 x
+# `run_bounded 5 true` = 2046 ms). The healthy probe `cluster-e2e` records is
+# 16 ms and it makes 74 of them, so a fixture whose entire subject is fitting
+# inside a 300 s CTest budget had just multiplied its own polling cost by twelve.
+#
+# `wait -n` would remove the polling outright and is **bash 4.3+**, so it is out
+# on the platform this whole function exists for. A watchdog subshell
+# (`( sleep n; kill $pid ) &`) removes it too and was rejected on a worse ground
+# than portability: after `wait` reaps the child, the pid may be REUSED, and a
+# watchdog that then fires signals an unrelated process. A bound that can kill a
+# stranger is not a bound.
+#
+# So the pause starts at 10 ms and grows to `_e2e_poll_pause`. A command that
+# finishes immediately costs one 10 ms tick; a five-second wait costs about a
+# dozen `sleep` spawns instead of 250. Neither end is a compromise.
+_e2e_bounded_pauses=(0.01 0.01 0.02 0.05 0.1)
+
+# How long a TERM is given before KILL, in seconds.
+_e2e_bounded_grace=2
+
 run_bounded() {
     local seconds="$1"; shift
-    local capture pid deadline grace status=0 exceeded=0
+    local capture pid deadline grace status=0 exceeded=0 tick=0
 
+    E2eBoundOutcome="finished"
     capture="$(mktemp "${_e2e_workdir}/bounded.XXXXXX")"
 
     "$@" > "$capture" 2>&1 &
     pid=$!
 
-    # Read from a CLOCK, for the reason `wait_until` states: `_e2e_poll_pause` is
-    # a pacing device and a sleep costs what the host's timer granularity says,
-    # so counting polls enforces a duration nobody chose.
+    # Read from a CLOCK, for the reason `wait_until` states: a pause is a pacing
+    # device and a sleep costs what the host's timer granularity says, so
+    # counting polls enforces a duration nobody chose.
     deadline=$(( SECONDS + seconds ))
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$SECONDS" -ge "$deadline" ]; then
             exceeded=1
             break
         fi
-        sleep "$_e2e_poll_pause"
+        # Past the end of the ramp the subscript is empty, and the default is the
+        # shared pause. bash 3.2 has arrays; it is `declare -A` that it lacks.
+        sleep "${_e2e_bounded_pauses[$tick]:-$_e2e_poll_pause}"
+        tick=$(( tick + 1 ))
     done
 
     if [ "$exceeded" -eq 1 ]; then
@@ -724,8 +771,15 @@ run_bounded() {
         # unbounded wait inside the thing that exists to bound one -- and a
         # command that ignores TERM is not exotic here, it is what a wedged
         # process looks like.
+        #
+        # ONE PROCESS DEEP, stated rather than implied: this signals the child,
+        # not its process group, so a bounded command that forks leaves
+        # grandchildren running -- which is #239's shape. Setting up a group
+        # needs job control, and a bound that turns `set -m` on inside a fixture
+        # changes that fixture's own signal handling. Every caller here spawns a
+        # single client process; a caller that would not must not use this.
         kill -TERM "$pid" 2>/dev/null || true
-        grace=$(( SECONDS + 2 ))
+        grace=$(( SECONDS + _e2e_bounded_grace ))
         while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$grace" ]; do
             sleep "$_e2e_poll_pause"
         done
@@ -736,6 +790,9 @@ run_bounded() {
     cat "$capture"
     rm -f "$capture"
 
-    if [ "$exceeded" -eq 1 ]; then return "$E2eBoundExceeded"; fi
+    if [ "$exceeded" -eq 1 ]; then
+        E2eBoundOutcome="exceeded"
+        return "$E2eBoundExceeded"
+    fi
     return "$status"
 }

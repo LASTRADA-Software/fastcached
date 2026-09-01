@@ -336,7 +336,36 @@ run_case() {
     bounded-expires)
         rc=0
         run_bounded 1 sleep 30 >/dev/null || rc=$?
-        echo "an expired bound exited ${rc}"
+        echo "an expired bound exited ${rc}, outcome ${E2eBoundOutcome}"
+        ;;
+
+    # A command that CHOOSES to exit 124 is not the ceiling expiring, and one
+    # integer cannot say which happened -- so `E2eBoundOutcome` is what a caller
+    # reads. Both rows here, because the interesting assertion is that the two
+    # cases agree on `rc` and differ on the outcome; testing either alone passes
+    # under a helper that never sets the outcome at all.
+    bounded-124-is-not-a-timeout)
+        rc=0
+        run_bounded 5 sh -c 'exit 124' >/dev/null || rc=$?
+        echo "a command exiting 124: rc=${rc} outcome=${E2eBoundOutcome}"
+        rc=0
+        run_bounded 1 sleep 30 >/dev/null || rc=$?
+        echo "a ceiling expiring:    rc=${rc} outcome=${E2eBoundOutcome}"
+        ;;
+
+    # The ramp. The first version of `run_bounded` slept `_e2e_poll_pause` (0.2s)
+    # before its second look, so a command taking 0ms cost 205ms -- against a
+    # 16ms healthy probe made 74 times per run, in a fixture whose entire subject
+    # is fitting inside a CTest budget. Timed from the driver.
+    # TWENTY and not ten, and the count is load-bearing. `SECONDS` is a whole
+    # number and truncates at both ends, so a gap the check straddles has to be
+    # wider than that truncation: at ten, the flat-pause defect costs 2.05s, which
+    # reads as 2 against a `-gt 2` threshold and does not fire. The guard written
+    # to prove the fixture bites did not bite, on the first thing it was pointed
+    # at. At twenty the two cases are ~0.3s and ~4.1s.
+    bounded-fast-path)
+        for _ in $(seq 1 20); do run_bounded 5 true >/dev/null; done
+        echo "twenty immediate commands ran"
         ;;
 
     # And the child is DEAD, not merely abandoned. A helper that returns 124
@@ -633,7 +662,8 @@ cases=(
     "wait-for-log|0|wait_for_log returned on the marker"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command exited 127|!BUG:"
-    "bounded-expires|0|an expired bound exited 124"
+    "bounded-expires|0|an expired bound exited 124, outcome exceeded"
+    "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
 )
@@ -728,6 +758,29 @@ elif [ "$bounded_took" -gt 10 ]; then
     failures=$(( failures + 1 ))
 fi
 
+# --- `run_bounded` is not slower than what it bounds ------------------------
+#
+# The bound's cadence, timed from outside because nothing inside ten immediate
+# commands can see the pauses between them. Measured, ten `true`s: 129 ms with
+# the ramp against 2046 ms with a flat `_e2e_poll_pause`. The measurement, not the
+# constant, is what this pins -- a future pause raised "just a little" is exactly
+# how the 74 healthy probes became twenty seconds of sleeping.
+echo "== run_bounded does not sleep away the fast path"
+fast_started="$SECONDS"
+out="$( bash "${BASH_SOURCE[0]}" --case bounded-fast-path 2>&1 )"
+status=$?
+fast_took=$(( SECONDS - fast_started ))
+ran=$(( ran + 1 ))
+if [ "$status" != "0" ]; then
+    echo "FAIL bounded-fast-path: exited ${status}, expected 0" >&2
+    printf '%s\n' "$out" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+elif [ "$fast_took" -gt 2 ]; then
+    echo "FAIL bounded-fast-path: twenty immediate commands took ${fast_took}s;" >&2
+    echo "     the bound is sleeping through commands that have already finished" >&2
+    failures=$(( failures + 1 ))
+fi
+
 # --- no fixture spells `timeout` again -------------------------------------
 #
 # `run_bounded` above is not only a helper, it is this check's subject. macOS has
@@ -742,18 +795,81 @@ fi
 # and not a fourth comment. The allowlist carries a REASON per row rather than a
 # bare path, so an exemption cannot be added silently.
 echo "== no fixture invokes timeout(1)"
-timeout_allowed="tsan-gate.sh:not an e2e fixture; resolves timeout/gtimeout itself and refuses when neither exists. Its clang-tsan job is runs-on: ubuntu-24.04, so the macOS branch has never executed."
+
+# What counts as an invocation. A COMMAND POSITION, not the word: `--drain-timeout=`,
+# `DialTimeout`, `wait-timeout-silent` and `echo "timeout ${endpoint}"` are all
+# ordinary here and none of them runs anything. Command position is the start of a
+# line, or after a separator (`;` `|` `&` `(` backtick `$(`), or after one of the
+# keywords that can precede a command -- and that keyword set is the half the first
+# version of this scan omitted, so `if timeout 5 x` and `while timeout 5 x` went
+# unseen.
+#
+# What it does NOT catch, said plainly rather than left to be discovered: a command
+# reached through a variable (`"$TimeoutCommand"`). No regex over the word `timeout`
+# can, and that shape is a deliberate resolver rather than an accident -- which is
+# what the allowlist is for.
+_timeout_invocations() {
+    grep -nE '(^|[;&|(`]|\$\(|&&|\|\|)[[:space:]]*(if|then|else|elif|while|until|do|!|\{)?[[:space:]]*g?timeout[[:space:]]' "$1" \
+        | grep -v '^[0-9][0-9]*: *#' || true
+}
+
+# The canary. A scan that has never been seen to fire is a scan reporting PASS over
+# a set in which nothing could fail -- `.agent/rules/build-and-toolchain.md` on
+# `script-check-canary`. Both directions, because a pattern that matches everything
+# would pass the positive half alone.
+canary_dir="$(mktemp -d)"
+cat > "${canary_dir}/must-catch.sh" <<'CANARY'
+timeout 5 foo
+out="$(timeout 5 foo)"
+if timeout 5 foo; then :; fi
+while timeout 5 foo; do :; done
+! timeout 5 foo
+x && timeout 5 foo
+y; gtimeout 5 foo
+CANARY
+cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
+stated_drain="--drain-timeout=${worker_drain_seconds}"
+readonly DialTimeout=10
+echo "timeout ${endpoint}" >> "$probe_log"
+cases=("wait-timeout-silent|1|logged NOTHING")
+# timeout 5 foo
+TargetTimeoutSeconds=900
+CANARY
+ran=$(( ran + 1 ))
+caught="$(_timeout_invocations "${canary_dir}/must-catch.sh" | grep -c . || true)"
+if [ "$caught" -ne 7 ]; then
+    echo "FAIL timeout-scan-canary: the scan caught ${caught} of 7 staged invocations," >&2
+    echo "     so it cannot be trusted to have found none in the real scripts" >&2
+    _timeout_invocations "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+fi
+ran=$(( ran + 1 ))
+spurious="$(_timeout_invocations "${canary_dir}/must-not-catch.sh" || true)"
+if [ -n "$spurious" ]; then
+    echo "FAIL timeout-scan-canary: the scan fired on text that runs nothing" >&2
+    printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+fi
+rm -rf "$canary_dir"
+
+# One row per exemption, `basename:reason`, matched per row. A single scalar could
+# hold only ONE row however many were appended to it -- a second exemption would
+# silently fail to exempt and the check would go red for a file its author believed
+# was allowlisted.
+timeout_allowed="tsan-gate.sh:not an e2e fixture, and it resolves timeout/gtimeout itself rather than assuming one. Its clang-tsan job is runs-on: ubuntu-24.04, so its macOS branch has never executed anywhere.
+check-e2e-helpers.sh:this file, which stages the scan's own canary invocations above. They are heredoc text and run nothing; the canary asserting all seven are caught is what covers them."
 for script in "${source_dir}"/scripts/*.sh; do
     base="$(basename "$script")"
-    case "${timeout_allowed}" in
-        "${base}:"*) continue ;;
-    esac
+    exempt=0
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        case "$row" in "${base}:"*) exempt=1 ;; esac
+    done <<EOF
+${timeout_allowed}
+EOF
+    [ "$exempt" -eq 0 ] || continue
     ran=$(( ran + 1 ))
-    # A command invocation, not the word: `--drain-timeout=`, `DialTimeout` and
-    # `wait-timeout-silent` are all ordinary here. Comment lines are dropped for
-    # the reason the bash 3.2 scan drops them.
-    hits="$(grep -nE '(^|[;&|(]|\$\(|&&|\|\|)[[:space:]]*g?timeout[[:space:]]' "$script" \
-            | grep -v '^[0-9][0-9]*: *#' || true)"
+    hits="$(_timeout_invocations "$script")"
     if [ -n "$hits" ]; then
         echo "FAIL timeout-scan: ${base} invokes timeout(1), which macOS does not have." >&2
         echo "     Use run_bounded from scripts/lib/e2e-common.sh." >&2
