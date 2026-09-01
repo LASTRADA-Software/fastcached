@@ -759,6 +759,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `__tsan_func_entry`: that is per-FUNCTION, so an object whose TU has no functions
   carries none, and six of `FastCacheTest`'s 135 are exactly that. `ctest -R
   tsan-gate-selftest` drives every verdict against staged object trees.
+- The canary's job is to be caught EVERY time, so a change to it is judged by a RATE
+  and never by a green run: `scripts/tsan-canary-rate.sh`, a few hundred runs, the
+  number recorded. It used to be silent in a few runs per thousand — the race
+  happened and nothing was reported — which is worse than it sounds, because a gate
+  that is red a few percent of the time teaches people to re-run it and is then
+  disarmed as thoroughly as if it had been deleted (#473). Pinning to two CPUs made
+  the old shape WORSE (0.700% against 0.220%), which is the wrong direction for a
+  two-core runner. It now races across an array rather than one `int`, because
+  distinct LOCATIONS are what the measurements move on — and the file claims no
+  mechanism, since the obvious one (shadow-cell eviction) predicts that more
+  accesses are worse and the data says the opposite.
 - An edit script asserts its anchor **matched** — `assert count == 1`, count rather
   than presence, so "missing" and "not unique" both fire — and a generator that
   produced nothing fails instead of printing success. Three separate tools reported

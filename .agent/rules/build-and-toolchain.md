@@ -252,6 +252,44 @@ determinism rests on.
     an exit of 0 that reported no assertions. This is the same shape as a sweep that
     skips files and a `-header-filter` that matches no path: the tool ran, the
     artefact was fine, and *nothing was examined*.
+  - **A gate that is red a few percent of the time is disarmed as thoroughly as one
+    that was deleted**, and it happens through habit rather than code: people learn
+    to re-run it. The TSan canary raced two threads on one `int` and was SILENT --
+    the race happened, ThreadSanitizer said nothing -- in a few runs per thousand
+    (#473). So the acceptance for a change to `src/tests/TsanCanary.cpp` is a RATE
+    over at least a few hundred runs, recorded, and reproducible by whoever next
+    doubts it: `scripts/tsan-canary-rate.sh`, which is the deliverable rather than a
+    paragraph claiming it was checked. Measured at 5000 runs per arm, the old shape
+    was 0.220% silent unpinned and **0.700% pinned to two CPUs** -- the wrong
+    direction, since a two-core runner is the machine it has to be certain on.
+    The fix is what the numbers said, not what the mechanism suggested. The obvious
+    hypothesis -- shadow-cell eviction from hammering one address -- predicts that
+    more accesses are worse, and it is refuted: 1 increment each is 2.50% silent, 10
+    is 2.80%, 1000 is 0.20%, 100000 is 0.00%. More work on one address is SAFER, and
+    a single unsynchronised pair, which is unambiguously a race and which TSan
+    decides on happens-before rather than on overlap, is the least reliable shape of
+    all. **No mechanism is claimed in the file, deliberately** -- a wrong explanation
+    would send the next reader somewhere expensive. What the data shows is which
+    dimensions move it: distinct LOCATIONS matter most (1024 touched once each is
+    reliable where one touched 1024 times is not), repetition helps but needs orders
+    of magnitude more, so the canary uses both with margin in each.
+  - **And a figure is a quantity with an UNCERTAINTY.** This is the sibling of *a
+    performance figure is a quantity under conditions*
+    ([`compile-cache.md`](compile-cache.md)), and it was missing from it: a count
+    with no interval attached reads like a measurement and is a hope.
+    **Zero is where this is easiest to forget, because zero reads as the absence of
+    doubt rather than as a value with an interval around it.** Zero silent runs in
+    5000 is not a rate of zero -- the rule of three bounds it at ~0.06% at 95%, so a
+    300-run zero-tolerance gate built on that figure expects 0.18 events and would
+    fire about **one run in six**: red one time in six to prevent a canary that was
+    silent one time in five hundred, which is #473's own failure mode one layer up
+    and harder to argue with for looking principled. The converse omission is how
+    two honest measurements nearly became one number -- 4/100 silent on one machine
+    is P = 7.8e-5 against another's 0.220%, and 5.5e-3 against that machine's harder
+    0.700%, so the samples disagree about the MACHINES rather than about the rate
+    and both rows stand. Attach the interval, and say what it is an interval on --
+    "P is small" without naming the hypothesis it is small under is the same
+    omission wearing a number.
   - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
     on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
     pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
