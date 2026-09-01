@@ -12,6 +12,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "ClusterAdminCli.hpp"
+#include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
@@ -25,7 +26,6 @@
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerLease.hpp"
-#include "WorkerServer.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
@@ -114,27 +114,6 @@ constexpr int HeartbeatSlices = 20;
 /// a reinstalled compiler rejoins the fleet without anybody restarting a service.
 constexpr std::uint64_t SweepEveryBeats = 45;
 
-/// How often a parked `accept()` returns so the loop can observe a shutdown.
-///
-/// POSIX honours `SO_RCVTIMEO` for `accept()`, and it is the ONLY portable way to
-/// stop this loop: closing the listening socket does not unblock a parked accept
-/// on Linux. Short enough that a stop is prompt, long enough that an idle worker
-/// is not spinning.
-constexpr std::chrono::milliseconds AcceptPollInterval { 200 };
-
-/// How long a single request may take to arrive once accepted.
-///
-/// Generous, because a request carries a whole preprocessed translation unit and
-/// the client may be on the other side of a slow link -- but not unbounded, so one
-/// stalled client cannot hold a slot, and its share of the in-flight byte budget,
-/// for as long as it likes.
-///
-/// It used to justify itself by the worker serving its jobs *inline*, where a stall
-/// held up every other client. That stopped being true at 87211fe, and the bound
-/// matters more rather than less for it: the slot cap is reachable now, so a stalled
-/// client occupies one of a countable few rather than a queue nobody was in.
-constexpr std::chrono::milliseconds RequestIoTimeout { 120'000 };
-
 /// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
 ///
 /// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
@@ -177,94 +156,63 @@ void InstallNodeStopHandlers()
     std::signal(SIGTERM, &HandleNodeStopSignal);
 }
 
-/// Adopt a socket-activated listener, when a supervisor handed one over.
+/// The descriptor a supervisor handed this worker, when there was one.
 ///
-/// Separated from `main` so the whole handoff -- how many descriptors arrived,
-/// and whether the configuration can still describe this worker afterwards -- is
-/// one decision with one answer, rather than three checks interleaved with
-/// everything else a startup does.
+/// Separated from `main` so the whole handoff -- how many descriptors arrived, and
+/// whether the configuration can still describe this worker afterwards -- is one
+/// decision with one answer, rather than three checks interleaved with everything
+/// else a startup does.
+///
+/// **A descriptor rather than a listener**, since #290 stage 3. The merged `0xFC`
+/// surface runs on the reactor, and the listener that serves it is built by
+/// `FrameEndpoint::StartAdopted` from this descriptor; building one here would own
+/// it, and handing an owned descriptor on is a double close rather than a handover.
+///
+/// Nothing here closes what it returns. On the two refusal paths the process exits
+/// immediately, and on the success path ownership passes to the listener -- which
+/// takes it even when the adoption itself fails.
 /// @param cfg What the operator asked for.
-/// @param logger Where the adoption is announced.
-/// @return The adopted listener, null when nothing was handed over, or why the
+/// @param logger Where the handoff is announced.
+/// @return The descriptor, `std::nullopt` when nothing was handed over, or why the
 ///         handoff cannot be served.
-[[nodiscard]] std::expected<std::unique_ptr<IListener>, std::string> AdoptActivatedListener(NodeConfig const& cfg,
-                                                                                            ILogger& logger)
+[[nodiscard]] std::expected<std::optional<int>, std::string> ActivatedDescriptor(NodeConfig const& cfg, ILogger& logger)
 {
     // When a supervisor already bound the port and handed the descriptor over,
     // binding it again would fail with "address already in use" -- against
-    // ourselves. Falling through to Bind() when nothing was handed over is what
-    // lets one binary serve both a `.socket` unit and a plain `--port`, with no
-    // flag distinguishing them: the environment says which, and it says so
-    // unambiguously.
-    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
+    // ourselves. Falling through to the ordinary bind when nothing was handed over
+    // is what lets one binary serve both a `.socket` unit and a plain
+    // `--listen-node`, with no flag distinguishing them: the environment says which,
+    // and it says so unambiguously.
+    auto const inherited = AdoptInheritedDescriptors();
     if (inherited.empty())
-        return std::unique_ptr<IListener> {};
+        return std::optional<int> {};
 
-    // Only the first would be used. This worker answers one protocol on one port,
-    // so a unit listing several sockets is a misconfiguration -- reported rather
-    // than half-honoured, since silently ignoring the rest would leave an operator
-    // with a port that accepts nothing and no clue why.
+    // Only the first would be used. This worker answers one protocol on one port, so
+    // a unit listing several sockets is a misconfiguration -- reported rather than
+    // half-honoured, since silently ignoring the rest would leave an operator with a
+    // port that accepts nothing and no clue why.
     if (inherited.size() > 1)
         return std::unexpected { std::format("socket activation handed over {} listeners; this worker serves exactly one",
                                              inherited.size()) };
 
-    // Socket activation makes --advertise mandatory, because the fallback becomes
-    // a guess the process cannot make. `--bind` and `--port` were not used -- the
-    // socket unit chose the port and this process is never told which -- so the
-    // default would register `0.0.0.0:6676` from config values that describe
-    // nothing, and 0.0.0.0 is not an address a remote client can dial anyway.
+    // Socket activation makes --advertise mandatory, because the fallback becomes a
+    // guess the process cannot make. `--listen-node` was not used -- the socket unit
+    // chose the address and this process is never told which -- so the fallback would
+    // register a value from configuration that describes nothing, and the wildcard is
+    // not an address a remote client can dial anyway.
     //
     // The consequence of guessing is the worst-shaped failure this system has: the
-    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases
-    // that endpoint to clients, and every one of them fails to connect and
-    // compiles locally. Nothing reports an error, and the fleet looks healthy from
-    // both ends. Refusing at startup, where it can be explained, is the whole
-    // difference.
+    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases that
+    // endpoint to clients, and every one of them fails to connect and compiles
+    // locally. Nothing reports an error, and the fleet looks healthy from both ends.
+    // Refusing at startup, where it can be explained, is the whole difference.
     if (cfg.advertise.empty())
         return std::unexpected { std::string {
             "--advertise is required under socket activation: the socket unit owns the port, so this worker "
             "cannot know what address clients should use" } };
 
-    logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
-    return std::move(inherited.front());
-}
-
-/// Bind the compile port this configuration names.
-///
-/// Separated from `WorkerBody` for the reason `AdoptActivatedListener` is: `main.cpp`
-/// is in no test target, so logic left there has no coverage at all -- and this is the
-/// one surface whose address is resolved and bound in the same breath, since the
-/// compile port is served by a plain listener rather than by an endpoint class.
-///
-/// Through the surface's row, like every other port this node opens. It is the one
-/// whose host is a FLAG rather than a fallback a bare port takes -- `--bind` and
-/// `--port` are separate values of separate types -- which is why its row carries an
-/// empty `defaultHost` and a resolver reading those two fields instead of a spec, and
-/// why what an operator's firewall worksheet shows for this surface is what this
-/// binds.
-/// @param cfg What the operator asked for.
-/// @return The bound listener, or why it could not be served.
-[[nodiscard]] std::expected<std::unique_ptr<BlockingListener>, std::string> BindCompilePort(NodeConfig const& cfg)
-{
-    // Through the shared resolver, which refuses by name rather than leaving this
-    // caller to assert in a comment that the result cannot be empty. It cannot be
-    // today -- the compile port is served unless a supervisor handed a listener over,
-    // and this runs only when none was -- but a resolver that later grows a reason to
-    // return nothing would turn that comment into a crash, in the file least able to
-    // notice.
-    auto const resolved = SoleEndpointOf(NodeSurface::Compile, cfg);
-    if (!resolved.has_value())
-        return std::unexpected { resolved.error() };
-    auto const& endpoint = *resolved;
-    auto bound = BlockingListener::Bind(endpoint.host, endpoint.port, /*backlog=*/128);
-    // `IsBound()`, not a null check: `Bind` hands back a listener carrying the
-    // diagnostic rather than nothing at all.
-    if (bound == nullptr || !bound->IsBound())
-        return std::unexpected { std::format("could not bind {}:{} ({})",
-                                             endpoint.host,
-                                             endpoint.port,
-                                             bound ? bound->BindError() : std::string_view { "null listener" }) };
-    return bound;
+    logger.Logf(LogLevel::Info, "a supervisor handed over a listening socket; --listen-node is not used");
+    return std::optional { inherited.front() };
 }
 
 /// What `main` returns when the operator's configuration is wrong.
@@ -286,7 +234,7 @@ struct HeartbeatRound
 {
     NodeConfig const& cfg;                        ///< Where the scheduler is.
     std::vector<Cc::WorkerRegistrar>& registrars; ///< One per toolchain this node serves.
-    Node::WorkerServer const& server;             ///< For the in-flight count.
+    Node::CompileCapacity const& capacity;        ///< For the in-flight count.
     IHostLoadSampler& loadSampler;                ///< CPU, memory and scratch.
     Node::CacheTier const* cacheTier;             ///< Null on a node with no cache.
     IMetricsSink const& metrics;                  ///< Where the cache figures are read.
@@ -326,7 +274,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // not stop the others from being announced, or a single bad entry silently
     // un-registers the whole worker.
     std::size_t accepted = 0;
-    auto const inFlight = static_cast<std::uint32_t>(round.server.InFlight());
+    auto const inFlight = static_cast<std::uint32_t>(round.capacity.InFlight());
 
     // Sampled once per round rather than once per registrar: every entry describes
     // the SAME machine, so sampling per toolchain would report several different
@@ -553,60 +501,39 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // multi-second pause -- and it means the startup log reads in the order things
     // actually happened, so an operator watching a worker come up sees what it did
     // with the socket before the long quiet part.
-    auto activatedOrError = AdoptActivatedListener(cfg, logger);
+    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
     if (!activatedOrError.has_value())
     {
         logger.Logf(LogLevel::Error, "{}", activatedOrError.error());
         return ExitUsage;
     }
-    auto activated = std::move(*activatedOrError);
+    auto const activated = *activatedOrError;
 
     auto const runner = Cc::MakeProcessRunner();
 
     auto const toolchainHost = Cc::MakeToolchainHost();
     auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
 
-    auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
+    // The ONE derivation, shared with the startup refusal that judges it. This value
+    // goes to `MakeWorkerLeaseValidator` below and to the heartbeat's REGISTER, and a
+    // lease's MAC is taken over exactly this string -- so the endpoint the scheduler
+    // signs, the endpoint this worker verifies and the endpoint clients dial are one
+    // fact with one author. See `AdvertisedEndpoint`.
+    auto const advertise = Node::AdvertisedEndpoint(cfg);
 
-    // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
-    // listener carrying the diagnostic, for Accept() to surface later. Testing for
-    // null therefore tested nothing, and the failure it let through was silent and
-    // actively harmful: on a port conflict this worker logged "ready", registered
-    // with the scheduler advertising a port it was not listening on, and then
-    // exited 0 the first time the accept loop touched the dead socket. The
-    // scheduler would go on leasing it to clients until the heartbeat lapsed.
-    // BindError() is what says WHICH of address-in-use, permission or bad address
-    // it was.
-    std::unique_ptr<BlockingListener> bound;
-    if (activated == nullptr)
-    {
-        auto listener = BindCompilePort(cfg);
-        if (!listener.has_value())
-        {
-            logger.Logf(LogLevel::Error, "{}", listener.error());
-            return 1;
-        }
-        bound = std::move(*listener);
-    }
-
-    // Without this the accept loop cannot be stopped on Linux at all, and the way
-    // that presents is worse than a crash: POSIX does not unblock a parked
-    // `accept()` when another thread closes the socket, so `Shutdown()` would set a
-    // flag nothing ever comes back to read and `systemctl stop` would hang until
-    // the supervisor escalated to SIGKILL. macOS hides it -- there `close()` does
-    // wake the accept -- which is exactly why this was worth catching in CI rather
-    // than on one developer's machine. `WorkerServer::Run` already documents the
-    // poll timeout as the mechanism it relies on; this is what supplies it.
+    // The descriptor travels to `StartNodeSurfaceOrExplain` below and is served
+    // there. It used to be refused here, for the two months between the surfaces
+    // merging and the reactor listeners learning to adopt: `AdoptInheritedListeners`
+    // handed back a BLOCKING listener, the merged surface runs on the reactor, and
+    // there was nothing that could join the two. #464 added `PlatformListener::Adopt`
+    // and this is the last stitch of #290 stage 3 closing over it.
     //
-    // The I/O timeout is separate and larger: it bounds reading a request, which
-    // carries a whole preprocessed translation unit over a possibly slow link,
-    // while the accept poll only decides how promptly a stop is noticed.
-    // An adopted listener already has these -- AdoptInheritedListeners requires
-    // them, so there is no path to a listener that cannot be shut down.
-    if (bound != nullptr)
-        bound->SetTimeouts(AcceptPollInterval, RequestIoTimeout);
-
-    IListener& listenerRef = activated != nullptr ? *activated : static_cast<IListener&>(*bound);
+    // The interim was a refusal rather than an adoption left unserved, and that shape
+    // is worth keeping in mind for the next such gap: a packaged Linux install enables
+    // the worker THROUGH the socket unit -- the `.service` deliberately has no
+    // `[Install]` section -- so a node that took the descriptor and then answered
+    // nothing on it would have been the silent failure this whole ticket exists to
+    // remove, on the deployment path most people use.
 
     // Surveyed HERE rather than before the port is bound, and the order is the one
     // socket activation already argues for a few lines up: do the cheap, fallible
@@ -760,7 +687,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
-                                       activated != nullptr ? Node::SocketActivation::Yes : Node::SocketActivation::No,
+                                       activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
                                        logger);
     if (!validator.has_value())
@@ -893,8 +820,14 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // it was handing work to. And before the 0xFC surface below, whose compiles run
     // on this same pool.
     ThreadPoolExecutor compilePool { slots };
-    Node::WorkerServer server { listenerRef, protocol, slots,       membership.Oracle(),
-                                metrics,     logger,   compilePool, std::chrono::seconds { cfg.drainTimeoutSeconds } };
+
+    // **The accounting, with no accept loop around it.** `WorkerServer` was this object
+    // plus a listener; #290 stage 3 retires the listener, and what is left is what the
+    // merged surface was already spending. One slot cap, one byte budget, one bounded
+    // drain -- so the figure this machine advertises describes the door that exists.
+    Node::CompileCapacity compileCapacity {
+        slots, Node::WorkerMaxRequestBytes, std::chrono::seconds { cfg.drainTimeoutSeconds }, logger
+    };
 
     // The compile verbs on the node's own `0xFC` listener, which is #290's second
     // half. An ADDITIONAL door onto the worker above, never a second worker: it
@@ -914,9 +847,8 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // Declared AFTER the server whose capacity it spends and BEFORE the surface
     // that routes to it, so destruction runs surface, responder, server: the
     // listener stops admitting compiles before the drain starts counting them.
-    Node::CompileResponder compileResponder { protocol,    server.Capacity(), membership.Oracle(),
-                                              compilePool, nodeIo.Reactor(),  metrics,
-                                              logger };
+    Node::CompileResponder compileResponder { protocol, compileCapacity, membership.Oracle(), compilePool, nodeIo.Reactor(),
+                                              metrics,  logger };
 
     // This node's one `0xFC` listener, opened once every component exists and holding a
     // reference to each (#290). Before the merge each tier bound its own port, which
@@ -933,6 +865,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                                         cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
                                         schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
                                         &compileResponder,
+                                        activated,
                                         logger);
     if (!nodeSurfaceOrRefusal.has_value())
     {
@@ -1013,13 +946,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // must report NO cache rather than an empty one, and that branch has to be
     // reachable from a test. Held in a local because the sampler and the scrape
     // surface both read it, and they must not disagree about the machine.
-    auto snapshotProvider =
-        Node::MakeNodeSnapshotProvider(Node::NodeScrapeSources { .host = host.get(),
-                                                                 .busySlots = [&server] { return server.InFlight(); },
-                                                                 .cache = cacheTier.get(),
-                                                                 .slots = slots,
-                                                                 .scratchRoot = jobs.ScratchRoot() },
-                                       std::chrono::steady_clock::now());
+    auto snapshotProvider = Node::MakeNodeSnapshotProvider(
+        Node::NodeScrapeSources { .host = host.get(),
+                                  .busySlots = [&compileCapacity] { return compileCapacity.InFlight(); },
+                                  .cache = cacheTier.get(),
+                                  .slots = slots,
+                                  .scratchRoot = jobs.ScratchRoot() },
+        std::chrono::steady_clock::now());
 
     // Absent when this node runs no scheduler: there is then no registry to report,
     // so no fleet route is registered and `/fleet` is a plain 404.
@@ -1166,7 +1099,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 
     HeartbeatRound const round { .cfg = cfg,
                                  .registrars = registrars,
-                                 .server = server,
+                                 .capacity = compileCapacity,
                                  .loadSampler = *loadSampler,
                                  .cacheTier = cacheTier.get(),
                                  .metrics = metrics,
@@ -1332,24 +1265,16 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // is what makes that safe -- the surface is declared after `server`, so it stops
     // accepting first -- and the one drain covers both doors regardless, because both
     // spend the same `CompileCapacity`.
-    std::jthread const stopWatch { [&](std::stop_token const& stop) {
-        while (!stop.stop_requested() && !DaemonControls::Instance().StopRequested())
-            std::this_thread::sleep_for(StopPollInterval);
-        if (DaemonControls::Instance().StopRequested())
-        {
-            logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
-            server.Shutdown();
-        }
-    } };
-
     // The listening endpoint is described by where it CAME FROM, not by the
     // config. When a socket was adopted, `--bind` and `--port` were never used,
     // and printing them names an address this process is not listening on -- which
     // in the one line an operator reads to confirm a worker came up is worse than
     // printing nothing. What matters to a client is the advertised endpoint, and
     // that is reported either way.
-    auto const listeningOn = activated != nullptr ? std::string { "a socket-activated listener" }
-                                                  : std::format("{}:{}", cfg.bindAddress, cfg.port);
+    // The endpoint this node actually LISTENS on, which since #290 stage 3 is the one
+    // 0xFC surface -- there is no second port to disambiguate and no config value that
+    // describes a socket this process did not open.
+    auto const listeningOn = Node::AdvertisedEndpoint(cfg);
     // The admission policy is part of this line, and that is #235's second half: a
     // worker given no policy starts, binds the wildcard, registers, is leased out
     // and refuses every dispatched compile -- and until this said so, the one line
@@ -1370,7 +1295,18 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                 startupToolchainCount,
                 Node::AdmissionSummary(cfg));
 
-    SyncRun(server.Run());
+    // **Main waits here now, and there is no accept loop to interrupt.** This was
+    // `SyncRun(server.Run())` -- the dedicated listener's accept loop, which blocked
+    // this thread until a stop closed it, and which needed a watcher thread to notice
+    // the stop at all. The merged surface's loops run on `nodeIo`'s own thread, so what
+    // is left for main to do is wait for the stop and then drain.
+    //
+    // That deletes the watcher rather than rehoming it: it existed only because a
+    // parked `accept()` cannot be woken by a flag.
+    while (!DaemonControls::Instance().StopRequested())
+        std::this_thread::sleep_for(StopPollInterval);
+    logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
+    compileCapacity.BeginShutdown();
 
     // **Both doors closed and every compile drained HERE, while the node's reactor is
     // still turning.** Not tidiness and not a duplicate of the destructor: a compile
@@ -1387,7 +1323,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // surface-first, which is the opposite of what the drain needs. Separating the stop
     // from the destruction is what lets both be right, and it is why `StopAndWait`
     // exists as something callable rather than only as a destructor body.
-    server.StopAndWait();
+    compileCapacity.Drain();
 
     // Unwired BEFORE the sampler goes, and that ordering is the whole reason this
     // line exists: locals are destroyed in reverse declaration order, so the

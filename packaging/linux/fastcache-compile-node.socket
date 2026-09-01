@@ -21,10 +21,18 @@ Description=fastcache compile worker socket
 Documentation=https://github.com/LASTRADA-Software/fastcached
 
 [Socket]
-# The default port for a compile worker. It is deliberately NOT an IANA-
-# registered assignment: the scheduler hands a client the worker's endpoint
-# explicitly, so this is never a client-side default -- it is only ever what an
-# operator configured, and this file is where they change it.
+# The worker's single 0xFC port: the cache verbs, the compile verbs a scheduler
+# dispatches here, and the scheduler verbs themselves with --serve-scheduler.
+# It is deliberately NOT an IANA-registered assignment, and deliberately not
+# 6674 either -- 6674 is where fastcache-cc looks by default and where a
+# fastcached listens, so activating there would collide on a machine running
+# both. The scheduler hands a client this worker's endpoint explicitly, so this
+# is never a client-side default; it is only ever what an operator configured,
+# and this file is where they change it.
+#
+# The service must be given --advertise, because a unit owns the address and
+# never tells the service which one. Without it the worker refuses to start
+# rather than register an endpoint it cannot describe.
 ListenStream=6676
 
 # One connection carries one compile, and a compile occupies a slot for

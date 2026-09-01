@@ -89,6 +89,52 @@ budget or reduce what runs beside it.
 
 Three separate errors, and only the first is about this fixture.
 
+- **When a test binary dies mid-run the DENOMINATOR moves, and the ratio still looks
+  healthy.** `AGENT.md` says a count cannot carry a verdict -- "25 of 26 green is
+  arithmetic that is true and useless" -- and this is its sharper form: a crash does
+  not report as a crash, it reports as a *smaller suite that mostly passed*. Measured
+  while deleting a flag in #290 stage 3: removing a row from a `std::array<Row, 4>`
+  left the fourth value-initialized to null pointers, the segfault took the rest of
+  the run with it, and the summary read `171 cases | 170 passed | 1 failed` for a
+  binary holding **276**. Every instinct trained on ratios says that is fine.
+
+  The only signal was that 171 was not 276, which is a number you have to already
+  know -- so do not rely on noticing it. **Compare the case count against the previous
+  run whenever a change deletes anything**, and treat a drop as a crash until proven
+  otherwise. A shrinking suite and a passing suite look identical in the one line most
+  people read.
+
+  It is also the project's own table rule arriving in a test file: an extent written
+  as a literal outlived its rows. `std::to_array` derives it and the shape becomes
+  unrepresentable, which is why the production tables use it.
+
+- **A refusal's wire CODE is not its reason, so a test asserting the code is asserting
+  something weaker than it looks.** The production side of this is already written down
+  in [`metrics-and-observability.md`](metrics-and-observability.md): *the row is the
+  refusal, not the code* -- two refusals share `MalformedFrame` and must not share a
+  counter, so a table keyed on the code cannot hold them. The test-side consequence is
+  the same fact read backwards: **where two refusals may legitimately answer one code,
+  the counter is the reason and the code is not.**
+
+  It is not hypothetical here. #290 merged the cache and compile surfaces onto one
+  listener, and that listener now carries two refusals answering `ErrorCode::NotAMember`
+  by deliberate design -- `CacheResponder::RefusePeer` refusing a caller that is not
+  this machine (`NodeCacheRequestsRefusedNotLocal`), and `RefuseUnlessMember` refusing
+  a caller with no claim on this machine's CPU (`WorkerJobsRefusedNotAMember`). One
+  code, because a launcher steps over both identically; two counters, because an
+  operator does not. A case asserting only the code cannot tell them apart, and after
+  the merge they arrive on the same socket.
+
+  Measured on #290's acceptance case, whose whole point is that those two rules
+  disagree about one peer: delete the `Increment` from the locality refusal, changing
+  nothing else, and the run reads **6 passed, 1 failed** -- the wire code assertion
+  **passes**, and the only thing that goes red is
+  `NodeCacheRequestsRefusedNotLocal == 1`. The refusal was still correct; what was
+  lost was any way for the test, or an operator, to say WHICH rule produced it.
+
+  So on a surface where codes are shared, **assert the counter as well as the code**,
+  and read a green code assertion as evidence of very little on its own.
+
 - **A cumulative figure cannot answer a question about now.** `cpuDuringWait` was
   the total over the whole wait and was read as a claim about the process's state
   **at the deadline**. 3.4s spread evenly over 300 seconds and 3.4s burned in the

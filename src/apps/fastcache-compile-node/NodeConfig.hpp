@@ -72,8 +72,6 @@ struct NodeConfig
 {
     std::string scheduler; ///< host:port of the scheduler's dispatch endpoint.
     std::string advertise; ///< host:port clients should reach this worker on.
-    std::string bindAddress { "0.0.0.0" };
-    std::uint16_t port { 6676 };
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
     /// worker to exactly that set, and naming none means "serve what this machine
@@ -698,10 +696,10 @@ struct NodeConfig
 /// scheduler that leases the worker out sees clients fail to reach it with no
 /// error anywhere.
 ///
-/// `--advertise` is the one worth spelling out. Left empty it defaults to
-/// `{--bind}:{--port}`, and `--bind` defaults to `0.0.0.0`, which is not an
-/// address any client can dial. A worker registered that way registers happily,
-/// heartbeats happily, is leased, and never answers.
+/// `--advertise` is the one worth spelling out. Left empty it defaults to whatever
+/// the `Node` surface resolves to, which is loopback on a node that does not
+/// schedule -- not an address any other machine can dial. A worker registered that
+/// way registers happily, heartbeats happily, is leased, and never answers.
 /// @param cfg Configuration about to be baked into a registration.
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
@@ -752,6 +750,28 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 {
     return cfg.serveScheduler ? SchedulingNodeListenDefaultHost : WorkerNodeListenDefaultHost;
 }
+
+/// The endpoint this node tells other machines to dial.
+///
+/// **One derivation, because three consumers must agree or the fleet breaks in a way
+/// none of them can see.** What a lease's MAC covers is this endpoint, so the property
+/// the compile surface's `AuthRequired == false` rests on is:
+///
+///   the endpoint the scheduler SIGNS == the endpoint the worker VERIFIES ==
+///   the endpoint clients actually REACH
+///
+/// `main` passes this value to `MakeWorkerLeaseValidator` and registers it with the
+/// scheduler, and `AdvertisesWildcard` refuses a configuration on it at startup. Those
+/// three read one fact, and it was written out by hand in two places -- so a startup
+/// refusal could already judge a different endpoint from the one signed into every
+/// lease, before any of them moved. Two authors of one endpoint is not a tidiness
+/// problem here; it is a credential whose subject two components disagree about.
+///
+/// Judged on the endpoint the node WOULD advertise rather than on whether the flag was
+/// typed, so an operator who spells the default out is answered identically.
+/// @param cfg What the operator asked for.
+/// @return The advertised `host:port`.
+[[nodiscard]] std::string AdvertisedEndpoint(NodeConfig const& cfg);
 
 /// What a bare `--admin-listen` binds.
 ///

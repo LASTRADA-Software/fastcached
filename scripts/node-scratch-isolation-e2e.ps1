@@ -796,7 +796,10 @@ $clientBody = {
 function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     Write-Host "--- $label"
 
-    $cachePort = Get-FreePort; $schedPort = Get-FreePort; $schedWork = Get-FreePort
+    # One port per node: since #290 stage 3 the compile verbs arrive on
+    # --listen-node beside the cache and scheduler verbs, so the scheduler's own
+    # worker half answers on $schedPort and the separate $schedWork is gone.
+    $cachePort = Get-FreePort; $schedPort = Get-FreePort
     $workerA   = Get-FreePort; $workerB   = Get-FreePort; $adminPort = Get-FreePort
 
     $phaseDir = Join-Path $scratch $label
@@ -843,8 +846,8 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # lease has to land on worker A or worker B.
         $schedProc = Start-NodeIn "sched" @(
             "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
-            "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
-            "--port=$schedWork", "--advertise=127.0.0.1:$schedWork",
+            "--scheduler=127.0.0.1:$schedPort",
+            "--advertise=127.0.0.1:$schedPort",
             "--toolchain=scheduler-only=$Compiler", "--slots=1",
             "--admin-listen=127.0.0.1:$adminPort") $null
         $procs += $schedProc
@@ -880,16 +883,16 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         Wait-ForNodeUp "sched" $schedProc 180 120
 
         $workerAProc = Start-NodeIn "workerA" @(
-            "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
-            "--port=$workerA", "--advertise=127.0.0.1:$workerA",
+            "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerA",
+            "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
         Wait-ForNodeUp "workerA" $workerAProc 120 600
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $workerBProc = Start-NodeIn "workerB" @(
-            "--scheduler=127.0.0.1:$schedPort", "--bind=127.0.0.1",
-            "--port=$workerB", "--advertise=127.0.0.1:$workerB",
+            "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerB",
+            "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
         Wait-ForNodeUp "workerB" $workerBProc 120 600

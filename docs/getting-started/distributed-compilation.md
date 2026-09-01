@@ -53,7 +53,7 @@ different program.
           │                                  ▲
           │                                  │ register + heartbeat
           │                   ┌──────────────┴─────────┐
-          │  3. compile this ►│ fastcache-compile-node │ :6676
+          │  3. compile this ►│ fastcache-compile-node │ :6674
           │     ◄──── object  │      (a worker)        │
           │                   └────────────────────────┘
           │
@@ -204,7 +204,7 @@ fastcache-compile-node \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6676
+    --advertise=scheduler.internal:6674
 ```
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
@@ -276,14 +276,21 @@ On each machine that should take work:
 ```sh
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
-    --advertise=worker-01.internal:6676 \
+    --listen-node=0.0.0.0:6674 \
+    --advertise=worker-01.internal:6674 \
     --fleet-open
 ```
+
+**`--listen-node` is not optional on a worker that serves a fleet.** It defaults to
+**loopback**, which is right for the single-machine install and unreachable for
+everybody else — so a worker that leaves it alone advertises an address no client can
+dial. The node refuses to start rather than registering one, but the flag is the fix
+and it is easy to leave off.
 
 That is the whole of it — but **a membership flag is not optional**, and it is
 the line people leave off. (`--fleet-open` is the one a build network that is
 already your boundary wants; `--fleet-member` is the narrower alternative,
-below.) Membership gates this node's *compile port*, so a worker with neither
+below.) Membership gates this node's *compile verbs*, so a worker with neither
 admits its own machine and nothing else: the scheduler leases it out,
 the client dials it, and the compile is refused `not-a-member` and run locally
 instead. The scheduler's counters stay flat and correct while that happens,
@@ -293,8 +300,8 @@ was fixed, neither flag could be given to a worker at all). The worker says whic
 it is in its own startup line:
 
 ```
-[INFO] compile node ready on 0.0.0.0:6676, advertising worker-01.internal:6676, 16 slot(s) as a … node, 2 toolchain(s), every caller admitted
-[INFO] compile node ready on 0.0.0.0:6676, … , this machine only -- give --fleet-member or --fleet-open to admit peers
+[INFO] compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674, 16 slot(s) as a … node, 2 toolchain(s), every caller admitted
+[INFO] compile node ready on 0.0.0.0:6674, … , this machine only -- give --fleet-member or --fleet-open to admit peers
 ```
 
 Use `--fleet-open` where the build network is already your boundary. Where it is
@@ -453,7 +460,7 @@ unit:
 
 ```
 fastcache-cc: HIT key=…                                          served from cache
-fastcache-cc: DISPATCHED to worker-01.internal:6676 key=…        compiled remotely
+fastcache-cc: DISPATCHED to worker-01.internal:6674 key=…        compiled remotely
 fastcache-cc: not dispatched (rejected (no-worker)); compiling locally
 fastcache-cc: cache unavailable (fetch exchange failed); compiling this translation unit anyway
 ```
@@ -496,7 +503,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |
 | `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
 | `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
-| `fastcache_worker_jobs_refused_not_a_member_total` | A caller this worker does not admit tried to compile on it. **Check your own fleet first**: if this worker has no `--fleet-member` / `--fleet-open`, it admits its own machine and nothing else, and this counter is your clients being turned away one hop after a lease was granted. Once it names a policy, a rise here is somebody with no claim on the machine — check who can reach `--port`. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | A caller this worker does not admit tried to compile on it. **Check your own fleet first**: if this worker has no `--fleet-member` / `--fleet-open`, it admits its own machine and nothing else, and this counter is your clients being turned away one hop after a lease was granted. Once it names a policy, a rise here is somebody with no claim on the machine — check who can reach `--listen-node`. |
 | `fastcache_worker_jobs_refused_envelope_declared_too_large_total` | A request declared its payload expands past this worker's ceiling. Nothing honest does that by accident: a probe of the port, or a client with a larger ceiling than the worker. |
 | `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | A client compressed with a codec this worker was not built with. A packaging difference between two honest machines; each one cost a local compile. |
 | `fastcache_worker_jobs_refused_envelope_malformed_total` | A payload envelope that did not parse: a version skew, or something on the port that is not this protocol. |

@@ -36,7 +36,14 @@ namespace
 {
     NodeConfig cfg;
     cfg.scheduler = "cache.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
+    // BOTH halves, because since #290 stage 3 one without the other is not an
+    // installable worker. `--advertise` alone leaves `--listen-node` on its loopback
+    // default, so the node would tell peers to dial an address it never accepts on --
+    // which `StartupPolicyRejection` now refuses by name. A fixture called
+    // `Installable` that no longer installs would have every case built on it failing
+    // for a reason none of them is about.
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.advertise = "worker-01.internal:6674";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;
 }
@@ -246,9 +253,8 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // A configuration in which no field holds its default, so every emitter fires.
     NodeConfig cfg;
     cfg.scheduler = "cache.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
-    cfg.bindAddress = "10.0.0.4";
-    cfg.port = 7777;
+    cfg.advertise = "worker-01.internal:6674";
+    cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
     // Off, because this case gives every field a value differing from its default
     // so that every emitter fires -- and this one's default is on.
@@ -503,15 +509,20 @@ TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][s
     pinned.toolchainDiscovery = false;
     CHECK_FALSE(NodeServiceRejection(pinned).has_value());
 
-    // The one worth the most: left empty, --advertise defaults to
-    // {--bind}:{--port} and --bind defaults to 0.0.0.0, which no client can dial.
+    // The one worth the most: left empty, --advertise defaults to whatever
+    // --listen-node resolves to, which is LOOPBACK on a node that does not schedule.
     // Such a worker registers, heartbeats, is leased, and is never reached.
+    //
+    // The REASON changed with #290 stage 3 and the expectation is updated to match
+    // rather than loosened: the old default was `{--bind}:{--port}` and the string to
+    // look for was `0.0.0.0`. A refusal that keeps its name while its cause moves is
+    // how a rule stops meaning what it says, so this asserts the new cause by name.
     auto noAdvertise = Installable();
     noAdvertise.advertise.clear();
     auto const rejection = NodeServiceRejection(noAdvertise);
     REQUIRE(rejection.has_value());
     CHECK(Unwrap(rejection).contains("--advertise"));
-    CHECK(Unwrap(rejection).contains("0.0.0.0"));
+    CHECK(Unwrap(rejection).contains("--listen-node"));
 }
 
 TEST_CASE("NodeConfig: the daemon flag is carried apart from the arguments", "[node][service]")
@@ -924,7 +935,10 @@ TEST_CASE("NodeConfig: a listen flag that is absent, defaulted or valid is accep
     // check the grants they present (#282).
     configured.clusterKeyFile = "cluster.key";
     configured.adminListen = "127.0.0.1:6677";
-    configured.nodeListen = "[::1]:6679";
+    // The v6 WILDCARD, not `[::1]`. This node admits every machine there is, so a
+    // loopback bind behind its routable --advertise is refused since #290 stage 3 --
+    // it would tell peers to dial an address it never accepts on.
+    configured.nodeListen = "[::]:6679";
     configured.dashboard = true;
     CHECK_FALSE(StartupPolicyRejection(configured).has_value());
 }
@@ -1219,23 +1233,31 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // is `0.0.0.0`. The scheduler hands that string to clients verbatim, so a
         // client on another machine dials the wildcard and reaches ITSELF. The
         // worker registers, heartbeats, is leased out and is never reached.
+        // Each row names the REASON it expects, not merely that it was refused. Two
+        // rows answer here now -- the wildcard and, since #290 stage 3, loopback -- and
+        // both messages contain "--advertise", so asserting only that would let either
+        // stand in for the other.
         struct Row
         {
             char const* what;      ///< The shape, for the failure message.
             char const* advertise; ///< `--advertise`, or empty for the fallback.
-            char const* bind;      ///< `--bind`.
+            char const* reason;    ///< A phrase only this refusal's message carries.
         };
 
         auto const refused = std::to_array<Row>({
-            { .what = "no --advertise at all", .advertise = "", .bind = "0.0.0.0" },
+            // "no --advertise at all" is deliberately NOT here. It used to be, because
+            // the fallback was `{--bind}:{--port}` and `--bind` defaulted to the
+            // wildcard. The fallback is now the `Node` surface, which defaults to
+            // loopback -- and a node that BINDS loopback and ADVERTISES loopback is a
+            // coherent single-machine fleet, not a mistake. It is asserted below.
             // Spelled out rather than defaulted: the endpoint is judged, never the
             // question of which flag produced it.
-            { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .bind = "0.0.0.0" },
-            { .what = "the v6 wildcard", .advertise = "[::]:6676", .bind = "0.0.0.0" },
+            { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .reason = "the wildcard resolves to" },
+            { .what = "the v6 wildcard", .advertise = "[::]:6676", .reason = "the wildcard resolves to" },
             // An empty host is the wildcard too -- it reaches `getaddrinfo` as
             // nullptr -- which is the third case `--listen-node=:6674` is refused
             // for and the one that reads like an address.
-            { .what = "a bare colon", .advertise = ":6676", .bind = "0.0.0.0" },
+            { .what = "a bare colon", .advertise = ":6676", .reason = "the wildcard resolves to" },
         });
 
         for (auto const& row: refused)
@@ -1244,13 +1266,79 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
             NodeConfig cfg;
             cfg.scheduler = "scheduler.internal:6675";
             cfg.advertise = row.advertise;
-            cfg.bindAddress = row.bind;
             cfg.fleetOpen = true;
+            cfg.clusterKeyFile = "cluster.key";
 
             auto const refusal = StartupPolicyRejection(cfg);
             REQUIRE(refusal.has_value());
             CHECK(Unwrap(refusal).contains("--advertise"));
+            CHECK(Unwrap(refusal).contains(row.reason));
         }
+
+        // The three refusals stay TOLD APART, asserted together rather than inferred
+        // from the rows above: the way this regresses is one predicate widening to
+        // cover several, which passes every row individually and leaves the operator
+        // who typed nothing reading about a wildcard they never wrote. Three
+        // conditions sharing one phrase is the same defect the `reason` column above
+        // catches, one row further along.
+        NodeConfig wildcard;
+        wildcard.scheduler = "scheduler.internal:6675";
+        wildcard.fleetOpen = true;
+        wildcard.advertise = "0.0.0.0:6676";
+
+        // Bind and advertise DISAGREE in each direction. That disagreement is the
+        // rule; neither address is wrong on its own.
+        NodeConfig loopback = wildcard;
+        loopback.nodeListen = "0.0.0.0:6674";  // accepts from the network...
+        loopback.advertise = "127.0.0.1:6674"; // ...and tells peers to dial themselves
+
+        NodeConfig pastTheBind = wildcard;
+        pastTheBind.nodeListen = "127.0.0.1:6674";         // accepts only locally...
+        pastTheBind.advertise = "worker-01.internal:6674"; // ...and says otherwise
+
+        auto const wildcardRefusal = StartupPolicyRejection(wildcard);
+        auto const loopbackRefusal = StartupPolicyRejection(loopback);
+        auto const pastRefusal = StartupPolicyRejection(pastTheBind);
+        REQUIRE(wildcardRefusal.has_value());
+        REQUIRE(loopbackRefusal.has_value());
+        REQUIRE(pastRefusal.has_value());
+        CHECK(Unwrap(wildcardRefusal) != Unwrap(loopbackRefusal));
+        CHECK(Unwrap(loopbackRefusal) != Unwrap(pastRefusal));
+        CHECK(Unwrap(wildcardRefusal) != Unwrap(pastRefusal));
+
+        // And a worker that named BOTH is not refused, which is what makes the three
+        // rows a rule an operator can satisfy rather than a wall. This is the exact
+        // configuration the loopback row's message now tells them to write.
+        NodeConfig reachable = wildcard;
+        reachable.advertise = "worker-01.internal:6674";
+        reachable.nodeListen = "0.0.0.0:6674";
+        // And a key, because widening the bind is what makes the compile verbs face
+        // the network -- so the unrelated row that wants one for remote peers fires
+        // too. Naming it here keeps this assertion about the three reachability rows
+        // rather than about whichever rule happens to answer first.
+        reachable.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(reachable).has_value());
+
+        // **The single-machine fleet: loopback bind, loopback advertise, peers
+        // admitted.** Nobody else is meant to reach this node, so "no remote client can
+        // reach the advertised endpoint" is the configuration working rather than
+        // failing. An earlier draft of the loopback row refused exactly this and would
+        // have broken `dist-compile-e2e.sh`, which starts a `--fleet-open` scheduler on
+        // `127.0.0.1` advertising `127.0.0.1`. The fixture comment that caught it was
+        // right and is why the rule is about DISAGREEMENT rather than reachability.
+        NodeConfig singleMachine;
+        singleMachine.scheduler = "127.0.0.1:6675";
+        singleMachine.nodeListen = "127.0.0.1:6674";
+        singleMachine.advertise = "127.0.0.1:6674";
+        singleMachine.fleetOpen = true;
+        CHECK_FALSE(StartupPolicyRejection(singleMachine).has_value());
+
+        // The same node with no --advertise at all, which is how an operator actually
+        // reaches that shape: the fallback is the Node surface, so both halves are
+        // loopback and they agree.
+        NodeConfig defaulted = singleMachine;
+        defaulted.advertise.clear();
+        CHECK_FALSE(StartupPolicyRejection(defaulted).has_value());
 
         // And the three shapes that must NOT be refused, each of which would be a
         // working deployment this rule had broken.
@@ -1273,7 +1361,10 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // And the worker the getting-started page documents, which names both.
         NodeConfig worker;
         worker.scheduler = "scheduler.internal:6675";
-        worker.advertise = "worker-01.internal:6676";
+        // BOTH, as the getting-started page now says: --advertise alone leaves the
+        // surface on loopback and the worker unreachable.
+        worker.nodeListen = "0.0.0.0:6674";
+        worker.advertise = "worker-01.internal:6674";
         worker.fleetOpen = true;
         worker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(worker).has_value());
@@ -1348,14 +1439,16 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // refused every dispatched compile with `NotAMember`.
         NodeConfig listedWorker;
         listedWorker.scheduler = "scheduler.internal:6675";
-        listedWorker.advertise = "worker-01.internal:6676";
-        listedWorker.fleetMembers = { "10.0.0.1:6676" };
+        listedWorker.nodeListen = "0.0.0.0:6674";
+        listedWorker.advertise = "worker-01.internal:6674";
+        listedWorker.fleetMembers = { "10.0.0.1:6674" };
         listedWorker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
 
         NodeConfig openWorker;
         openWorker.scheduler = "scheduler.internal:6675";
-        openWorker.advertise = "worker-01.internal:6676";
+        openWorker.nodeListen = "0.0.0.0:6674";
+        openWorker.advertise = "worker-01.internal:6674";
         openWorker.fleetOpen = true;
         openWorker.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
@@ -1999,9 +2092,15 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
     // Which flags carry text the fleet reads is a COLUMN of the option table, and
     // this pins the column rather than the parser -- `Cli/Options_test.cpp` covers
     // what `ParseUtf8Text` does. Every one of these ends up in a peer's
-    // `ClusterState` or in a registration: `--advertise` and `--bind` become the
-    // endpoint clients dial, `--node-id` and `--raft-peer` a member's identity and
-    // the address its peers dial it at.
+    // `ClusterState` or in a registration: `--advertise` becomes the endpoint clients
+    // dial, `--node-id` and `--raft-peer` a member's identity and the address its
+    // peers dial it at.
+    //
+    // The extent is DERIVED with `to_array` rather than written down. It was
+    // `std::array<Row, 4>`, and removing the `--bind` row when #290 stage 3 deleted
+    // the flag left a fourth row value-initialized to null pointers -- which
+    // segfaulted the whole binary mid-run, taking a hundred later cases with it and
+    // reporting as a shrunken test count rather than as a crash.
     //
     // Accepted here, such a value is refused by `SchedulerService::Register` on
     // every heartbeat forever, and the operator's only recovery is to rename the
@@ -2020,13 +2119,8 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
         char const* utf8;   ///< The same value, spelled in UTF-8.
     };
 
-    constexpr std::array<Row, 4> Rows { {
+    constexpr auto Rows = std::to_array<Row>({
         { .flag = "--advertise",
-          .latin1 = "gr\xFC"
-                    "n",
-          .utf8 = "gr\xC3\xBC"
-                  "n" },
-        { .flag = "--bind",
           .latin1 = "gr\xFC"
                     "n",
           .utf8 = "gr\xC3\xBC"
@@ -2041,7 +2135,7 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
                     "n=h:1234",
           .utf8 = "gr\xC3\xBC"
                   "n=h:1234" },
-    } };
+    });
 
     for (auto const& row: Rows)
     {
@@ -2220,7 +2314,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // install into a service that registers cleanly and refuses at every boot.
     //
     // Asserted rather than reasoned about. The lease rule reads `clusterKeyFile`,
-    // `bindAddress` and the membership fields and none of the cache ones, so by
+    // `nodeListen` and the membership fields and none of the cache ones, so by
     // inspection it cannot refuse these -- but "by inspection" is what this file
     // exists to replace, and the next rule added to either table gets this case for
     // free.
@@ -2234,6 +2328,13 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     NodeConfig const defaults;
     cfg.nodeListen = defaults.nodeListen;
     cfg.nodeListenExplicit = true;
+
+    // The default `--listen-node` is LOOPBACK, so the advertise has to agree with it
+    // or the reachability rows refuse the pair -- which would fail this case for a
+    // reason it is not about. `Installable()` names a routable pair because that is
+    // the ordinary fleet worker; pinning the bind to its default makes this the
+    // single-machine one, and both halves move together.
+    cfg.advertise = "127.0.0.1:6674";
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 
@@ -2318,16 +2419,22 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         // answers on 127.0.0.1 alone. Refusing that would refuse a configuration in
         // which no other machine can dial the compile port at all.
         auto loopbackBound = Installable();
-        loopbackBound.bindAddress = "127.0.0.1";
+        // Expressed on `--listen-node`, which since #290 stage 3 is the bind. The
+        // advertise has to agree with it, or the reachability rows refuse the
+        // disagreement rather than the loopback.
+        loopbackBound.nodeListen = "127.0.0.1:6674";
+        loopbackBound.advertise = "127.0.0.1:6674";
         loopbackBound.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
 
-        // And the default bind is the WILDCARD, so the same node without that flag
-        // is refused -- which is what makes the check worth having rather than
-        // something an ordinary deployment slips past.
+        // And a node that ACCEPTS from the network while advertising loopback is
+        // refused, which is what makes the check worth having rather than something an
+        // ordinary deployment slips past. Asserted on `--listen-node` now: `--bind` is
+        // gone, and its wildcard default was what used to express this.
         auto wildcardBound = Installable();
         wildcardBound.fleetOpen = true;
-        CHECK(wildcardBound.bindAddress == "0.0.0.0");
+        wildcardBound.nodeListen = "0.0.0.0:6674";
+        wildcardBound.advertise = "127.0.0.1:6674";
         CHECK(StartupPolicyRejection(wildcardBound).has_value());
     }
 

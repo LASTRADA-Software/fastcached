@@ -109,10 +109,9 @@ TEST_CASE("A surface resolving from its own spec has a default host to resolve a
             // depends on the configuration (loopback on a worker, the wildcard on a
             // scheduler), which one constant cannot hold: `NodeListenDefaultHost`
             // decides it, and a value here would be a second author of that rule.
-            CHECK((row.surface == NodeSurface::Compile || row.surface == NodeSurface::Node));
+            CHECK(row.surface == NodeSurface::Node);
     }
 
-    CHECK(RowFor(NodeSurface::Compile).defaultHost.empty());
     CHECK(RowFor(NodeSurface::Node).defaultHost.empty());
     CHECK_FALSE(RowFor(NodeSurface::Discovery).defaultHost.empty());
 }
@@ -132,12 +131,9 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
         if (!row.Resolve(cfg).empty())
             served.push_back(row.name);
 
-    CHECK(served == std::vector<std::string_view> { "compile", "node" });
-
-    auto const compile = RowFor(NodeSurface::Compile).Resolve(cfg);
-    REQUIRE(compile.size() == 1);
-    CHECK(compile.front().host == "0.0.0.0");
-    CHECK(compile.front().port == 6676);
+    // ONE protocol surface on a default configuration, where there were two. The
+    // dedicated compile port is gone and its verbs arrive here (#290 stage 3).
+    CHECK(served == std::vector<std::string_view> { "node" });
 
     // The default an operator reads off the startup line, and the address
     // `fastcache-cc` looks for when nobody sets `FASTCACHE_ADDR`.
@@ -203,18 +199,26 @@ TEST_CASE("The node port's default host follows whether this node schedules", "[
     CHECK(namedEndpoints.front().host == "127.0.0.1");
 }
 
-TEST_CASE("A node that neither caches nor schedules binds no 0xFC port", "[node][surfaces]")
+TEST_CASE("Every node that runs binds the 0xFC port", "[node][surfaces]")
 {
-    // Newly expressible, and newly necessary: one row now stands for two components,
-    // so "not served" is the conjunction rather than either half. A worksheet that
-    // listed the port for a node holding neither would have an operator open a port
-    // for a socket that is never created.
+    // **The inverse of what this case asserted before #290 stage 3**, and the change is
+    // deliberate rather than a test relaxed to pass. It used to read "a node that
+    // neither caches nor schedules binds no 0xFC port", which was true exactly while a
+    // worker had a compile port of its own. Stage 3 retires that port, so a dispatched
+    // compile arrives here and a node holding neither component still has to open it --
+    // it is the only port it has left.
+    //
+    // What that older case protected is still protected, one layer down: a node with no
+    // cache tier builds no tier, and its FETCH verbs are refused by the component that
+    // owns them rather than by the socket being absent.
     NodeConfig worker;
     worker.cacheMemoryBytes = 0;
     worker.cacheDir.clear();
-    CHECK(RowFor(NodeSurface::Node).Resolve(worker).empty());
+    REQUIRE_FALSE(worker.serveScheduler);
+    CHECK(RowFor(NodeSurface::Node).Resolve(worker).size() == 1);
 
-    // Either half on its own is enough to open it.
+    // And neither component changes the answer any more, which is the whole point:
+    // the port is the node's, not the tier's.
     auto caching = worker;
     caching.cacheMemoryBytes = 64ULL * 1024ULL * 1024ULL;
     CHECK(RowFor(NodeSurface::Node).Resolve(caching).size() == 1);
@@ -222,6 +226,12 @@ TEST_CASE("A node that neither caches nor schedules binds no 0xFC port", "[node]
     auto scheduling = worker;
     scheduling.serveScheduler = true;
     CHECK(RowFor(NodeSurface::Node).Resolve(scheduling).size() == 1);
+
+    // The one remaining way to serve no 0xFC port: no address to bind. That is an
+    // operator naming nothing, not a component being absent.
+    auto unnamed = worker;
+    unnamed.nodeListen.clear();
+    CHECK(RowFor(NodeSurface::Node).Resolve(unnamed).empty());
 }
 
 TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[node][surfaces]")
@@ -361,14 +371,38 @@ TEST_CASE("A surface that is configured and still off is not answered 'set the f
     CHECK_FALSE(wrong.contains("set --listen-node"));
 }
 
-TEST_CASE("The compile port's note says what its flags stop describing", "[node][surfaces]")
+TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][surfaces]")
 {
     // Not a spelling check on prose -- the assertion is that the row carries the
-    // caveat at all. `--bind` and `--port` are read by nothing under socket
-    // activation, so a worksheet printing them without saying so sends an operator
-    // to open a port the node is not on, and the surface they actually need is one
-    // nothing printed. The general rule is in distributed-compilation.md; this is
-    // the third consumer of the same flag to meet it.
-    CHECK(RowFor(NodeSurface::Compile).note.contains("--advertise"));
-    CHECK(RowFor(NodeSurface::Compile).note.contains(".socket"));
+    // caveat at all. It moved here with the verbs: under socket activation the unit
+    // owns the address, so a worksheet printing this row's flag without saying so
+    // sends an operator to open a port the node is not on, and the surface they
+    // actually need is one nothing printed. The general rule is in
+    // distributed-compilation.md.
+    //
+    // **This case was built as a forcing function and did not force**, which is
+    // worth recording where the next person will meet it. While activation was
+    // unwired the note said the surface did NOT serve an inherited descriptor, and
+    // the comment here claimed both halves were asserted -- but the two `contains`
+    // below match `--advertise` and `.socket`, which the note carries in either
+    // state. The note could have flipped from "not served" to "served", or back,
+    // without a single assertion moving. A comment describing a guarantee the
+    // assertions do not make is the same defect as a refusal test that only asks
+    // `has_value()`, and it is the third time in this ticket that the obvious
+    // assertion turned out to be satisfied by the wrong thing.
+    //
+    // So the state is asserted, not merely the vocabulary. #464 gave the reactor
+    // listeners `Adopt`, this row's surface serves an activated descriptor now, and
+    // reverting either without saying so here fails.
+    auto const& note = RowFor(NodeSurface::Node).note;
+
+    // The vocabulary, which is what a worksheet needs: an operator reading this row
+    // must be told the unit owns the address and that --advertise is what clients
+    // are given.
+    CHECK(note.contains("--advertise"));
+    CHECK(note.contains(".socket"));
+
+    // And the STATE, which is what the vocabulary cannot carry.
+    CHECK(note.contains("is served on this surface"));
+    CHECK_FALSE(note.contains("NOT yet served"));
 }

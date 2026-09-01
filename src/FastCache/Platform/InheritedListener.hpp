@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Net/IListener.hpp>
-
-#include <chrono>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -17,11 +13,13 @@ namespace FastCache
 ///
 /// It lives in `Platform/` and not in `Net/`, where it used to sit, because what
 /// it integrates with is a service supervisor rather than a network: it reads the
-/// process environment, checks a pid, and applies close-on-exec. That it hands
-/// back `IListener`s does not make it a network primitive -- `Platform/` depending
-/// on `Net/` is the direction that was always intended, while the reverse put
-/// `Net/`'s only reach into `Platform/Environment.hpp` across the boundary `Net/`
-/// has to be severable along if it is ever lifted out of this tree.
+/// process environment, checks a pid, and applies close-on-exec. It used to hand
+/// back `IListener`s, which did not make it a network primitive either -- and since
+/// #290 stage 3 it hands back descriptors, so it now reaches into `Net/` not at all.
+/// The move was already right when the dependency existed: `Platform/` depending on
+/// `Net/` is the direction that was always intended, while the reverse put `Net/`'s
+/// only reach into `Platform/Environment.hpp` across the boundary `Net/` has to be
+/// severable along if it is ever lifted out of this tree.
 ///
 /// A socket-activated service does not bind its own port. The supervisor binds
 /// and listens first, then starts the service only when a connection arrives, and
@@ -90,20 +88,30 @@ inline constexpr int ActivationFirstDescriptor = 3;
 /// after the worker exits, so a restart cannot bind and reports "address already
 /// in use" with nothing visibly holding it.
 ///
-/// The timeouts are PARAMETERS rather than the caller's job afterwards, and that
-/// is a lesson rather than a preference. An accept loop on POSIX can only be
-/// woken by a receive timeout on the listening socket -- closing it does not
-/// unblock a parked `accept()` -- so a listener without one cannot be shut down
-/// at all, and the way that presents is a `systemctl stop` that hangs until the
-/// supervisor escalates to SIGKILL. That bug shipped once here already, on the
-/// ordinary bind path; requiring the values to adopt a socket is what stops it
-/// arriving a second time through this one.
+/// **Descriptors, not listeners, and that is what changed at #290 stage 3.** This
+/// used to build a `BlockingListener` per descriptor, which was right while the
+/// only thing an activated worker served was its dedicated compile port and that
+/// port ran on a thread of its own. The merged `0xFC` surface runs on the reactor,
+/// so the descriptor has to reach `PlatformListener::Adopt` instead -- and a
+/// listener built here would already OWN that descriptor, which makes handing it
+/// on a double close rather than a handover.
 ///
-/// @param acceptPoll How often a parked accept returns so a shutdown is noticed.
-/// @param ioTimeout Receive/send timeout for each accepted connection.
-/// @return One listener per handed-over descriptor, in the supervisor's order;
-///         empty when there was no handoff, which is not an error.
-[[nodiscard]] std::vector<std::unique_ptr<IListener>> AdoptInheritedListeners(std::chrono::milliseconds acceptPoll,
-                                                                              std::chrono::milliseconds ioTimeout);
+/// The two timeouts went with it, and their absence is the change rather than an
+/// omission. They existed because an accept loop on POSIX can only be woken by a
+/// receive timeout on the listening socket: closing it does not unblock a parked
+/// `accept()`, so a blocking listener without one cannot be shut down at all and
+/// a `systemctl stop` hangs until the supervisor escalates to SIGKILL. On the
+/// reactor `Close()` resolves a parked accept directly, so there is no such
+/// listener to build here and no value to require.
+///
+/// **Ownership stays with the caller until it hands a descriptor to a factory
+/// that takes it** -- `PlatformListener::Adopt`, which owns it thereafter
+/// including on its own failure paths, so a refused adoption is not a leak. A
+/// caller that adopts none of them must exit, which is what the only caller does:
+/// every path here that declines a handoff is a startup refusal.
+///
+/// @return The handed-over descriptors, in the supervisor's order, already marked
+///         close-on-exec; empty when there was no handoff, which is not an error.
+[[nodiscard]] std::vector<int> AdoptInheritedDescriptors();
 
 } // namespace FastCache

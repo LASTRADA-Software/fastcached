@@ -142,8 +142,8 @@ readable and silently ignored. Every rule below has already been one of them.
   in `NodeServiceRejection` describes a registration that would **succeed** and then
   produce a service which cannot do its job -- silent from both ends, since the
   operator is told it was installed and nothing later says otherwise. `--advertise`
-  is the one worth naming: left empty it bakes in `{--bind}:{--port}`, and `--bind`
-  defaults to `0.0.0.0`, which is not an address a client can dial. Such a worker
+  is the one worth naming: left empty it bakes in whatever `--listen-node` resolves
+  to, which on a scheduler is `0.0.0.0` -- not an address a client can dial. Such a worker
   registers, heartbeats happily, is leased out by the scheduler, and is never
   reached. `--scheduler` gets the same treatment because it would start and exit at
   every boot.
@@ -255,9 +255,31 @@ readable and silently ignored. Every rule below has already been one of them.
   did exactly that and had to be rewritten to pair each input with text only the
   answering rule produces. **Assert the message, not merely the refusal.**
 
+  **And "was it refused" is satisfied by ANY row, so it is not evidence that the row
+  you mean still exists.** That is what makes the rule above sharper than it looks:
+  the presence check and the message check fail in different circumstances, and the
+  presence check is the one that cannot fail. Measured while adding a second
+  `StartupPolicyRejection` row for an advertised endpoint no remote client can reach
+  ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)): with the new
+  row disabled, `REQUIRE(refusal.has_value())` **still passed**, because an unrelated
+  row fires for the same configuration, and only the per-row phrase went red. A test
+  written the obvious way would have gone on passing while the rule it was named after
+  had ceased to exist -- and it would have done so from the day it was written, not
+  after some later edit. So a table's test pairs every input with text **only the
+  answering row produces**, and asserting the refusal alone is worth nothing here.
+
+  **Which is also why two conditions never share one message.** A widened predicate
+  covering both passes every row of such a table individually -- each input is still
+  refused, each still matches the shared phrase -- so nothing catches the merge. The
+  operator pays for it twice over: two different mistakes with two different remedies
+  arrive as one sentence describing neither, and the person who typed nothing at all
+  reads about a value they never wrote. Two rows, and a case asserting the two
+  messages **differ**, or the split is only a comment. `--advertise` naming the
+  wildcard and `--advertise` defaulting to loopback are that pair.
+
   What stayed out needs stating carefully, because the easy reason is the wrong one.
-  `--bind`, `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are
-  addresses on the same command line, and it is tempting to say they are excluded
+  `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are addresses on
+  the same command line, and it is tempting to say they are excluded
   because they fail at `bind()` or `connect()` -- but that is about **reachability**,
   and their *grammar* is every bit as much a pure function of the command line as a
   listen flag's. The honest split is narrower: this table covers the surfaces this
@@ -540,8 +562,7 @@ readable and silently ignored. Every rule below has already been one of them.
 
 - **Which flags carry text OTHER MACHINES will read is a column of the table.**
   `ParseUtf8Text` rather than `ParseText`, and the rows in it are the ones whose
-  value leaves the machine: `--advertise` and `--bind` become the endpoint clients
-  dial, `--node-id` and `--raft-peer` a member's identity and the address its peers
+  value leaves the machine: `--advertise` becomes the endpoint clients dial, `--node-id` and `--raft-peer` a member's identity and the address its peers
   open a socket to, `--cluster-id` rides every discovery beacon, and
   `--cluster-admit`/`--cluster-set` commit their operand through consensus — where
   an entry is applied *after* it is committed, with nobody left to refuse it, so the
@@ -573,6 +594,35 @@ readable and silently ignored. Every rule below has already been one of them.
   a parser with something more specific to say — the node's log-level parser, its
   cluster appliers — keeps saying it. Without the stamp a refusal names nothing,
   which is what the node's own report used to do for an unrecognised argument.
+
+- **A flag rename is not a no-op when the flag's DEFAULT was doing the work**, and
+  the rename is silent precisely where prose depended on the value rather than the
+  name. Renaming a flag is a mechanical change — the compiler finds every use, the
+  option table finds every row, and nobody re-reads the paragraphs around them,
+  because there is nothing in a rename that looks like a behaviour change.
+
+  Measured while #290 stage 3 replaced `--bind`/`--port` with `--listen-node`.
+  `cluster-e2e.sh`'s cluster-key rationale said its nodes *"leave `--bind` at the
+  wildcard ... so another machine genuinely could dial their compile ports"*. True as
+  written: `--bind` defaulted to `0.0.0.0`. The conversion rewrote it to
+  `--listen-node=127.0.0.1:<port>` and the paragraph, now naming the new flag,
+  asserted the opposite of what the fixture did — and it was the *justification* for
+  that fixture carrying a cluster key at all, so the reasoning for a deliberate
+  choice had quietly inverted while every test stayed green.
+
+  It was found by accident: `fleet-dashboard-e2e.sh` carried the same paragraph and
+  had to be converted for an unrelated reason, which put the two side by side. Nothing
+  would otherwise have looked.
+
+  This is the *citation loses its conditions* family (see
+  [`AGENT.md`](../../AGENT.md)'s caching principle) with a mechanism attached — there, a
+  measured figure travelled without the word *warm*; here, a claim travelled without
+  the default that made it true. **So when a flag is renamed, re-read the prose that
+  names it for a claim about its VALUE**, and treat a default that changed as a
+  behaviour change even though no code did. The clue is a sentence that reads as an
+  argument rather than as a label: "leaves X at the wildcard" is a claim, "set X"
+  is not.
+
 ## The daemon host, and what a machine IS
 
 - **A daemon host wraps the body, so what must reach a terminal has to happen
@@ -625,5 +675,5 @@ readable and silently ignored. Every rule below has already been one of them.
   `--advertise` is the costly one: nothing parses it, so `--advertise=nope` installs,
   registers, heartbeats, is leased out and is never reached, which is word for word
   the failure the emptiness rule beside it was written to prevent. Deciding it needs
-  a grammar per flag (`--bind` is a host alone; `--upstream` may be empty;
-  `--fleet-member` is a list) and words other than "the surface it configures".
+  a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
+  `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".

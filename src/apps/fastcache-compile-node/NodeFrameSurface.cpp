@@ -4,20 +4,36 @@
 #include "NodeIoLoop.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
+
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Node
 {
 
-std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io, NodeConfig const& cfg, ILogger& logger)
+std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
+                                                        NodeConfig const& cfg,
+                                                        std::optional<int> inherited,
+                                                        ILogger& logger)
 {
-    // The surface, not an address. Where a bare port lands is the row's answer --
-    // loopback on a worker, the wildcard on a node that schedules -- so the address
-    // bound here, the one an install-time refusal judges and the one
+    // Two factories over one constructor, and which one runs is decided by whether a
+    // supervisor handed a descriptor over -- never by a flag. The environment says
+    // it, and it says so unambiguously; a flag would be a second author of a fact the
+    // process can already observe.
+    //
+    // On the ordinary path: the surface, not an address. Where a bare port lands is
+    // the row's answer -- loopback on a worker, the wildcard on a node that schedules
+    // -- so the address bound here, the one an install-time refusal judges and the one
     // `--print-surfaces` prints are one computation rather than three that agree
-    // today.
-    auto started = FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, logger);
+    // today. Under activation there is no such computation to do: the unit bound the
+    // port, and `--advertise` -- mandatory there, and refused at startup when absent
+    // -- is the only thing that can say where clients should go.
+    auto started = inherited.has_value()
+                       ? FrameEndpoint::StartAdopted(
+                             io, NodeSurface::Node, *inherited, HostOfEndpoint(AdvertisedEndpoint(cfg)), _responder, logger)
+                       : FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -30,6 +46,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
                                                                                         IFrameResponder* cache,
                                                                                         IFrameResponder* scheduler,
                                                                                         IFrameResponder* compile,
+                                                                                        std::optional<int> inherited,
                                                                                         ILogger& logger)
 {
     // **Whether** this surface is served is the row's answer -- the same one
@@ -47,51 +64,68 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         logger.Logf(LogLevel::Info, "no cache tier, no scheduler and no worker; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
-    if (RowFor(NodeSurface::Node).Resolve(cfg).empty())
+    // Asked BEFORE the row, because under activation the row answers about a flag
+    // that configured nothing. An operator who enables the `.socket` unit and leaves
+    // `--listen-node` empty has not asked for a closed port -- the unit is the port --
+    // so reading the row first would decline a handoff that had already happened and
+    // leave the descriptor unserved.
+    if (!inherited.has_value() && RowFor(NodeSurface::Node).Resolve(cfg).empty())
     {
         // **The row is the authority on WHETHER, and it cannot say WHY.** That is the
-        // division this function's header states, and #290's second half made the two
-        // reasons diverge rather than coincide: a node that neither holds a cache tier
-        // nor schedules still runs a worker, so it has a component for this listener
-        // and the row still resolves to nothing. Opening a port the row says is not
-        // served would put a socket on this machine that `--print-surfaces` never
-        // printed and no firewall worksheet lists -- so the row wins, and compiles on
-        // such a node reach it on the compile port exactly as they always have.
+        // division this function's header states, and there is now exactly one way for
+        // the row to answer nothing: an empty `--listen-node`.
         //
-        // Asked of the FLAG rather than re-deriving the row's other clause: the empty
-        // spelling is the one an operator typed, and it is the only half this function
-        // can attribute without becoming a second author of the rule.
-        if (cfg.nodeListen.empty())
-            logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
-        else
-            logger.Logf(LogLevel::Info,
-                        "no cache tier and no scheduler; serving no 0xFC port -- compiles are still served on the "
-                        "compile port");
+        // The second reason is GONE rather than unhandled. It used to be "neither a
+        // cache tier nor a scheduler", which was a real state while a worker had a
+        // compile port of its own to fall back on. Stage 3 retires that port, so a
+        // dispatched compile arrives here and the row is served on every node that
+        // runs -- see the row's own comment. A branch for it would be one no
+        // configuration reaches, saying compiles are served somewhere that no longer
+        // exists.
+        logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
 
     auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
-    if (auto bound = surface->Bind(io, cfg, logger); bound.has_value())
+    auto bound = surface->Bind(io, cfg, inherited, logger);
+    if (bound.has_value())
         return surface;
-    else
-    {
-        // Fatal when the operator NAMED the address, and fatal when they asked for a
-        // scheduler whatever they named: the reasons are on `StartNodeSurfaceOrExplain`
-        // in the header. A named address is a promise; a scheduler nobody can dial is a
-        // fleet that looks configured and is not.
-        if (cfg.nodeListenExplicit)
-            return std::unexpected { std::format("--listen-node {}", bound.error()) };
-        if (cfg.serveScheduler)
-            return std::unexpected { std::format("--serve-scheduler needs the node port: {}", bound.error()) };
 
-        // Never silent. The launcher will reach whatever else holds that port -- very
-        // likely the daemon -- so the build still works, but "the cache quietly did
-        // less than you configured" is the failure mode this codebase keeps a list
-        // about.
-        logger.Logf(
-            LogLevel::Warn, "default node endpoint {}: {}; continuing without a 0xFC port", cfg.nodeListen, bound.error());
-        return std::unique_ptr<NodeFrameSurface> {};
-    }
+    // **Fatal, whoever named the address and whatever else this node runs**, and that
+    // is stage 3 deleting a branch's PREMISE rather than the branch being wrong.
+    //
+    // A taken DEFAULT port used to be tolerated, and correctly: the launcher reaches
+    // whatever else holds it -- almost always a `fastcached` on this machine -- so the
+    // build still worked, and what was lost was a cache tier the operator had not
+    // asked for. That reasoning depended entirely on the worker having a compile port
+    // of its own to fall back to. It has none now. A node opens exactly one 0xFC port,
+    // and without it there is nowhere for a dispatched compile to arrive.
+    //
+    // Continuing would then produce the worst-shaped failure this system has, and it
+    // would produce it on the deployment the docs describe. `--scheduler` is required,
+    // so every node registers; `registrars` are built from `AdvertisedEndpoint(cfg)`,
+    // which is derived from the CONFIGURATION rather than from the listener, so the
+    // registration is unaffected by the bind having failed. The node would announce an
+    // address nothing answers, the scheduler would lease it out, and every client
+    // would fail to connect and fall back to compiling locally -- which is silent by
+    // design, because a client must never let distribution break a build. Green
+    // everywhere, working nowhere.
+    //
+    // So the provenance bit stops deciding this, and `--serve-scheduler` stops being
+    // the one flag that escalates it. Both were answering "is this port load-bearing",
+    // and since the merge the answer is yes unconditionally.
+    //
+    // The sentence names the REMEDY rather than the diagnosis. "cannot bind" is a wall
+    // at three in the morning; the operator needs to be told what almost certainly
+    // holds the port and that this node does not need it (#229).
+    return std::unexpected { std::format(
+        "--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
+        "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
+        "address nothing answers, which every client meets as a failed connection and a silent local "
+        "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
+        "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "
+        "daemon does, its cache verbs included",
+        bound.error()) };
 }
 
 } // namespace FastCache::Node

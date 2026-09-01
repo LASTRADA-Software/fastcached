@@ -108,23 +108,6 @@ namespace
     /// row that claims to describe surface 0.
     constexpr auto Surfaces = EnumTable<NodeSurface, SurfaceRow> {
         SurfaceRow {
-            .surface = NodeSurface::Compile,
-            .name = "compile",
-            .flags = { "--bind", "--port" },
-            .protocol = SurfaceProtocol::Tcp,
-            .defaultHost = {},
-            // No spec: the halves are a `std::string` and a `std::uint16_t` with their
-            // own value parsers, so there is no text for a grammar to judge.
-            .spec = nullptr,
-            .grammar = {},
-            .resolve = [](SurfaceRow const& /*row*/, NodeConfig const& cfg) -> SurfaceEndpoints {
-                return SurfaceEndpoints { SurfaceEndpoint { .host = cfg.bindAddress, .port = cfg.port } };
-            },
-            .note = "a systemd .socket unit overrides --bind and --port entirely; the unit then owns the "
-                    "address and this process is never told which port it got, so --advertise is what names "
-                    "where clients actually go",
-        },
-        SurfaceRow {
             .surface = NodeSurface::Node,
             .name = "node",
             .flags = { "--listen-node", {} },
@@ -146,20 +129,24 @@ namespace
                 // raft's `--node-id` gate: a surface can be configured and still not
                 // served.
                 //
-                // The worker is deliberately NOT a third half. It answers here too
-                // since #290's second half, but it has a port of its own that every
-                // client already dials, so a node whose only component is its worker
-                // would gain a listener nobody needs and every firewall worksheet
-                // would grow a row for it. What decides whether this port exists is
-                // still the two components that have nowhere else to answer.
+                // **The worker is now the third half, and it makes this surface
+                // unconditional.** It was deliberately excluded while it had a port of
+                // its own that every client dialled; #290 stage 3 retires that port, so
+                // a dispatched compile arrives HERE and a node whose only component is
+                // its worker has nowhere else to answer.
                 //
-                // `--cache-memory 0` with no `--cache-dir` leaves the tier nothing to
-                // keep objects in, so `StartCacheTierOrExplain` returns without one --
-                // and a worksheet that listed the port anyway would have an operator
-                // open a port for a socket that is never created.
-                auto const holdsCache = cfg.cacheMemoryBytes != 0 || !cfg.cacheDir.empty();
-                if (!holdsCache && !cfg.serveScheduler)
-                    return {};
+                // That leaves no configuration in which this port is not served. A node
+                // refuses to start with no toolchain to serve, so every node that runs
+                // answers compile verbs -- which is why the two-component test that
+                // stood here is gone rather than gaining a third clause. A predicate
+                // whose every branch returns the same answer is one that will drift
+                // away from the truth without anything noticing.
+                //
+                // What that test used to protect is still true and now belongs to the
+                // components rather than to the port: `--cache-memory 0` with no
+                // `--cache-dir` still leaves `StartCacheTierOrExplain` returning without
+                // a tier, and a node that does not schedule still answers no scheduler
+                // verb. Neither of those closes the socket any more.
 
                 // Its own `defaultHost` is empty by design, so the row is resolved
                 // against the one this configuration picks.
@@ -167,7 +154,10 @@ namespace
                 resolved.defaultHost = NodeListenDefaultHost(cfg);
                 return ResolveFromSpec(resolved, cfg);
             },
-            .note = "one 0xFC port for the cache verbs, this node's own compile verbs, and -- with "
+            .note = "a systemd .socket unit is served on this surface: the unit owns the address, so this "
+                    "flag configures nothing there and --advertise is what names where clients go -- it is "
+                    "required under activation and refused at startup when absent. one 0xFC port for the cache "
+                    "verbs, this node's own compile verbs, and -- with "
                     "--serve-scheduler -- the scheduler verbs. A bare "
                     "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
                     "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "

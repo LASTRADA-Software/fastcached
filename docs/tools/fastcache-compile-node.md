@@ -9,7 +9,6 @@ about one of them:
 
 | Role | What switches it on | Default |
 |---|---|---|
-| Compile worker | `--bind`, `--port` | on, `0.0.0.0:6676` |
 | [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--node-id`, `--listen-raft` | **off** — a lone node leads itself |
@@ -56,15 +55,14 @@ configuration would bind, with its protocol, and exits without opening anything:
 ```console
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
-compile           0.0.0.0:6676  TCP
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
 discovery beacon  0.0.0.0:6681  UDP
 
 notes:
-  compile: a systemd .socket unit overrides --bind and --port entirely; …
-  node: one 0xFC port for the cache verbs, this node's own compile verbs, and …
+  node: a systemd .socket unit is NOT yet served on this surface; one 0xFC port
+        for the cache verbs, this node's own compile verbs, and …
   …
 ```
 
@@ -79,12 +77,11 @@ would. The node opens its ports from the same table this prints, so the list and
 the sockets cannot disagree — which is the whole reason to generate a firewall
 worksheet from the binary rather than transcribe one from documentation.
 
-The six surfaces, and what each is for:
+The surfaces, and what each is for:
 
 | Surface | Flags | Default | Protocol |
 |---|---|---|---|
-| Compile worker | `--bind` + `--port` | `0.0.0.0:6676` — **on** | TCP |
-| Node port — cache verbs, compile jobs, and the scheduler's with `--serve-scheduler` | `--listen-node` | `6674` — **on**; a bare port takes **loopback**, or the **wildcard** with `--serve-scheduler` | TCP |
+| Node port — cache verbs, compile jobs, and the scheduler's with `--serve-scheduler` | `--listen-node` | `6674` — **always on**; a bare port takes **loopback**, or the **wildcard** with `--serve-scheduler` | TCP |
 | Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
 | Consensus peer | `--listen-raft` | off; a bare port takes the **wildcard**, and needs `--node-id` | TCP |
 | Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
@@ -110,7 +107,7 @@ Three things on that table are easy to get wrong and expensive to get wrong:
   credential rule turns on, so widening that address is what makes a token required.
 
 **One caveat `--print-surfaces` states and cannot compute.** Under systemd socket
-activation the `.socket` unit owns the compile port, `--bind` and `--port` are read
+activation the `.socket` unit owns the port, and `--listen-node` is read
 by nothing, and this process is never told which port it got — so `--advertise`
 becomes required and is what names where clients actually go. The command is run by
 hand, never under the supervisor, so it cannot detect this; it prints the note
@@ -135,7 +132,7 @@ which node that is:
 fastcache-compile-node \
     --serve-scheduler --listen-node=0.0.0.0:6675 --fleet-open \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6676 \
+    --advertise=scheduler.internal:6674 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -148,7 +145,7 @@ A worker, on each machine that should take work:
 ```sh
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
-    --advertise=worker-01.internal:6676 \
+    --advertise=worker-01.internal:6674 \
     --fleet-open \
     --toolchain=/usr/bin/g++
 ```
@@ -178,14 +175,14 @@ The scheduler hands your string to clients **verbatim**. A worker that
 advertises `127.0.0.1` is leased and then never answers, and the symptom is a
 build that mysteriously falls back to local compiles on every machine but one.
 
-It defaults to `--bind` and `--port`, which is correct only when those already
+It defaults to `--listen-node`, which is correct only when that already
 name an address other machines can reach.
 
 ## Anything the fleet reads has to be text
 
 A value that leaves this machine has to be valid UTF-8, because every other
 member reads it back: `/fleet.json` is JSON, the fleet page is HTML, and a chart
-is SVG. The flags that carry one are `--advertise`, `--bind`, `--node-id`,
+is SVG. The flags that carry one are `--advertise`, `--node-id`,
 `--raft-peer`, `--cluster-id`, `--cluster-admit`, `--cluster-set`, and the
 `<fingerprint>` half of `--toolchain=<fingerprint>=<compiler>`. A worker refuses
 to start rather than registering a value the scheduler would then reject on every
@@ -458,7 +455,7 @@ fastcache-compile-node \
     --listen-node=6677 --cache-memory=8g \
     --upstream=build-cache.internal:6674 \
     --scheduler=scheduler.internal:6675 \
-    --advertise=worker-01.internal:6676 \
+    --advertise=worker-01.internal:6674 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -647,25 +644,25 @@ when nobody sets `FASTCACHE_ADDR`, and the one `cmake/portable/CompileCache.cmak
 passes. So the whole thing works with no configuration: start a node, build, and
 the launcher finds it.
 
-**It is one port for every verb family this node answers.** The cache verbs are
-answered here always; the scheduler verbs are answered here too once you pass
-`--serve-scheduler`; and **`COMPILE` is answered here as well**, by the same worker,
-against the same slot count and the same member list as the dedicated compile port
-below. That flag also moves where a bare port binds — loopback without it, the
-wildcard with it — because a scheduler no peer can dial does nothing. There is no
-second listen flag to set, and no way for them to end up on addresses that disagree.
+**It is one port for every verb family this node answers, and it is the only one.**
+The cache verbs are answered here always; the scheduler verbs are answered here too
+once you pass `--serve-scheduler`; and **`COMPILE` is answered here as well**, by the
+same worker, against the same slot count and the same member list. That flag also
+moves where a bare port binds — loopback without it, the wildcard with it — because a
+scheduler no peer can dial does nothing. There is no second listen flag to set, and
+no way for two to end up on addresses that disagree.
 
-The compile port (`--bind` + `--port`, `0.0.0.0:6676`) is unchanged and is still
-what a worker advertises, so nothing about how a client reaches you has moved. What
-changed is that the node port is now a second way in to the same worker rather than
-a port that answered `COMPILE` with "unimplemented".
+A worker used to open a dedicated compile port beside this one, configured by flags
+of its own. It does not any more: `--listen-node` is what a worker advertises and
+what a dispatched compile arrives on, so there is one address to open in a firewall,
+one address in a lease, and one address to get wrong.
 
 That port is also `fastcached`'s, and what happens when both want it depends on
 whether **you typed the address**:
 
 | `--listen-node` | Port already held |
 |---|---|
-| defaulted | Warned, and the node starts **with no local tier** and no `COMPILE` on that port. Your builds reach the daemon on that port instead, and dispatch still reaches the compile port, so nothing breaks — it just does less than a node with a tier would. |
+| defaulted | Warned, and the node starts **with no 0xFC port at all** — no local tier and no `COMPILE`. Your builds reach the daemon on that port instead, so local caching still works; but this node no longer has a second port for dispatched compiles to arrive on, so it can serve none. It still registers with its `--scheduler` and advertises that address, which means clients are leased an endpoint nothing is listening on. Do not run a node and a `fastcached` on one machine: the node answers every verb the daemon does. |
 | named by you | Fatal. The node refuses to start and says so. |
 
 The asymmetry is the point: a node sharing a machine with `fastcached` should not
@@ -691,7 +688,7 @@ the service picks up a changed default rather than one frozen at install time.
 **The cache is this machine's. The other two surfaces are this machine's and your
 fleet's.**
 
-| Caller | Cache (`--listen-node`) | Fleet (`--serve-scheduler`) | Compile (`--port`, and `--listen-node`) |
+| Caller | Cache (`--listen-node`) | Fleet (`--serve-scheduler`) | Compile (`--listen-node`) |
 | --- | --- | --- | --- |
 | A process on this machine | always | always | always |
 | A `--fleet-member` peer | **refused** | yes | yes |
@@ -716,21 +713,30 @@ interfaces, so a local client dialling the node at its routable address is still
 local; the set is re-read every 30 seconds, so an address the machine has just been
 given is refused for at most that long and then works.
 
-The compile column reads the same on both of its ports, and that is deliberate: the
-node port answers `COMPILE` through the *same* membership check the dedicated port
-applies. A caller with no claim on this machine is refused before a byte of its
-preprocessed source is read, on either port.
+The compile column is on ONE port, which is what #290 stage 3 finished: the
+dedicated compile listener is gone, `COMPILE` arrives on `--listen-node` beside the
+cache and scheduler verbs, and it is answered through the same membership check the
+dedicated port applied. A caller with no claim on this machine is refused before a
+byte of its preprocessed source is read.
 
-**The two ports are not otherwise interchangeable, and one difference is a startup
-rule rather than a runtime one.** Whether this node verifies the lease a client
-presents is decided once, at startup, from whether a machine that is not this one
-could reach the compile verbs *at all* — and that question now has two answers to
-combine, because `--listen-node` binds the wildcard on any node running
-`--serve-scheduler`. A node that reaches either port from the network needs
-`--cluster-key-file`, and is refused at startup without it. Before the surfaces
-merged this was judged from `--bind` alone, which would have let
-`--bind 127.0.0.1 --serve-scheduler --fleet-open` serve unauthenticated compiles on
-a port facing the network.
+A non-member now reaches that refusal a step later than it used to. The dedicated
+listener classified the peer at **accept**, from the kernel's address, before any
+byte was read; the merged surface asks per FRAME, at the first point the verb is
+known — and it has to, because membership is the policy of the compile verbs while
+the same socket answers cache verbs on locality, so a gate at accept would decide
+both and make the listener the policy again. The widening is that a non-member holds
+a connection until it sends a header, bounded by the header timeout and by the
+surface's maximum open connections. That is the exposure the cache verbs have
+carried on this listener since #416.
+
+**Whether this node verifies the lease a client presents is decided once, at
+startup**, from whether a machine that is not this one could reach the compile verbs
+*at all*. `--listen-node` binds the wildcard on any
+node running `--serve-scheduler`, so such a node needs `--cluster-key-file` and is
+refused at startup without it. For one release the question had TWO answers to
+combine, and asking either alone let an open surface pass: `--bind 127.0.0.1
+--serve-scheduler --fleet-open` looked local and served unauthenticated compiles on a
+wildcard-bound port. There is one surface now, so there is one answer again.
 
 Refusals are counted, because this withdrew access somebody may have been relying
 on:
@@ -750,9 +756,9 @@ running no `--serve-scheduler`, which left every worker's compile port on the fi
 row of that table and nothing else
 ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)).
 
-The **compile port** is the one that matters most. `--bind` defaults to `0.0.0.0`
-because peers have to dial it, so without a check anybody who could route to that
-port could have this machine run their compiler on source they chose. It is refused
+The **compile verbs** matter most here. A node that widens `--listen-node` so peers
+can dial it would, without a check, let anybody who can route to that port have this
+machine run their compiler on source they chose. It is refused
 before the request payload is read — a caller with no claim on this machine must not
 be able to make it buffer a multi-megabyte translation unit first, which would be a
 memory-exhaustion hole opened by the check meant to close one.
@@ -822,7 +828,7 @@ fastcache-compile-node \
     --raft-peer=n2=10.0.0.2:6680 \
     --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
-    --advertise=10.0.0.1:6676 \
+    --advertise=10.0.0.1:6674 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -932,7 +938,7 @@ fastcache-compile-node \
     --raft-peer=n4=10.0.0.4:6680 \
     --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
-    --advertise=10.0.0.4:6676 \
+    --advertise=10.0.0.4:6674 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1234,7 +1240,7 @@ decides.
 ```sh
 fastcache-compile-node --install-service \
     --scheduler=cache.internal:6675 \
-    --advertise=worker-01.internal:6676 \
+    --advertise=worker-01.internal:6674 \
     --service-scope=user            # macOS: registers a launchd agent for you
 ```
 
@@ -1252,7 +1258,7 @@ These are specific to registering:
 
 | Missing | Why it is refused here |
 |---|---|
-| `--advertise` | Without it the registration bakes in `{--bind}:{--port}`, and the default `0.0.0.0` is not an address a client can dial. Such a worker registers, heartbeats, is leased out, and is never reached — with no error at either end. |
+| `--advertise` | Without it the registration bakes in whatever `--listen-node` resolves to, which is **loopback** on a worker and not an address another machine can dial. Such a worker registers, heartbeats, is leased out, and is never reached — with no error at either end. |
 | `--scheduler` | The service would start and exit at every boot. |
 | `--toolchain` *(only with `--no-toolchain-discovery`)* | With both, the worker has nothing to serve: it would register and then refuse every job sent to it. Without the flag the machine answers at boot, so a registration needs no toolchain at all. |
 | `--cluster-dir` *(only with `--listen-raft`)* | Consensus state would otherwise land in `fastcache-cluster/<node-id>` relative to the working directory, and a service does not inherit the installing shell's — it resolves under `C:\Windows\System32` for the SCM and under `/` for launchd, writable only by the privileges a worker is deliberately not given. |
@@ -1275,7 +1281,7 @@ whole network rather than to loopback. `--discovery` is *sent to* an address, so
 takes `<address>:<port>` and nothing shorter.
 
 Addresses this node **dials** rather than opens — `--advertise`, `--scheduler`,
-`--upstream`, `--fleet-member` — and `--bind`, are not checked at install today.
+`--upstream`, `--fleet-member` — are not checked at install today.
 Whether one *resolves* genuinely cannot be settled then: a host that is down on
 the day you install may be the right one by the time the worker boots. Whether it
 is the right *shape* could be, and is not yet
@@ -1340,7 +1346,7 @@ cannot guess:
 ```
 msiexec /i fastcached.msi ^
     FASTCACHE_NODE_SCHEDULER=build-cache.internal:6675 ^
-    FASTCACHE_NODE_ADVERTISE=worker-01.internal:6676
+    FASTCACHE_NODE_ADVERTISE=worker-01.internal:6674
 ```
 
 Both are required together or nothing is registered: a registration naming a
@@ -1494,7 +1500,7 @@ the network.
 
 ```sh
 fastcache-compile-node --scheduler scheduler.internal:6675 \
-                       --advertise worker-01.internal:6676 \
+                       --advertise worker-01.internal:6674 \
                        --admin-listen 6677
 curl -s localhost:6677/healthz     # 200 while the worker is answering
 curl -s localhost:6677/metrics     # Prometheus exposition
@@ -1518,7 +1524,7 @@ numbers those images are drawn from.
 
 ```sh
 fastcache-compile-node --scheduler 127.0.0.1:6675 \
-                       --advertise 10.0.0.1:6676 \
+                       --advertise 10.0.0.1:6674 \
                        --serve-scheduler --listen-node 6675 --fleet-member 10.0.0.2 \
                        --admin-listen 6677 \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token

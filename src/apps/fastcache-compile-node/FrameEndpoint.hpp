@@ -480,6 +480,46 @@ class FrameEndpoint
     [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(
         NodeIoLoop& io, NodeSurface surface, NodeConfig const& cfg, IFrameResponder& responder, ILogger& logger);
 
+    /// Serve a surface on a descriptor a supervisor already bound and listened.
+    ///
+    /// The socket-activation counterpart to `Start`, and everything after the
+    /// listener is obtained is the same -- which is why they are two factories over
+    /// one private constructor rather than one factory with a flag: what differs is
+    /// exactly where the listener comes from, and nothing else.
+    ///
+    /// **No row is resolved and no address is read from `cfg`.** Under activation the
+    /// unit owns the address; `--listen-node` holds a value that describes nothing,
+    /// which is the whole of the rule that a flag naming a listener this process did
+    /// not open cannot answer questions about that listener. The port comes back from
+    /// the descriptor itself, and the HOST can only come from `--advertise` -- which
+    /// is why activation makes that flag mandatory and refuses at startup without it.
+    ///
+    /// **The descriptor is handed on, never held.** `PlatformListener::Adopt` takes
+    /// ownership including on its own failure paths, so this function neither closes
+    /// it on a refusal nor lets anything else do so. A failed adoption is a startup
+    /// refusal exactly as a failed bind is: an activated node that cannot serve the
+    /// descriptor it was given is in the position that refusal exists for, and
+    /// warning past it would leave a worker registering an endpoint nothing answers.
+    ///
+    /// @param io The loop this endpoint accepts and answers on.
+    /// @param surface Which surface to serve. Its row supplies the name used in log
+    ///        lines; its address is not consulted, because the unit chose it.
+    /// @param descriptor An already-bound, already-listening descriptor. Ownership
+    ///        passes to the listener built here, whether or not that succeeds.
+    /// @param advertisedHost The host clients are told to dial, from `--advertise`.
+    ///        The only honest answer to "what address is this", since the process
+    ///        cannot ask the unit and a wildcard bind names nothing dialable.
+    /// @param responder Answers each request; must outlive the endpoint.
+    /// @param logger Where to announce the adopted address.
+    /// @return The running endpoint, or why the descriptor could not be served.
+    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> StartAdopted(
+        NodeIoLoop& io,
+        NodeSurface surface,
+        int descriptor,
+        std::string_view advertisedHost,
+        IFrameResponder& responder,
+        ILogger& logger);
+
     /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
     ~FrameEndpoint();
 

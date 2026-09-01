@@ -1,18 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheProxy.hpp"
+#include "CompileCapacity.hpp"
+#include "CompileResponder.hpp"
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "Responders.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#if !defined(_WIN32)
+    #include <sys/socket.h>
+
+    #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +46,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -280,6 +302,110 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     CHECK(scheduler.Answered().size() == 4);
 }
 
+TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE admitted",
+          "[node][merged-responder][cache-locality]")
+{
+    // **#290's acceptance criterion.** The ticket states it as
+    //
+    //     a cache FETCH from another machine is refused on the merged wildcard port
+    //     while a compile from that same peer succeeds
+    //
+    // -- same peer, same listener, two verbs, two answers. That is the property the
+    // merge could silently break, because before it the LISTENER was the policy: a
+    // frame on the cache port was a cache frame, and "who may do this" was answered by
+    // which socket it arrived on. One socket cannot answer that by existing.
+    //
+    // **Both components are the production ones.** The pieces are proven separately --
+    // `CacheProxy_test` pins the locality refusal and its counter, `CompileResponder_test`
+    // the admission -- and what no other case has is the CONTRAST: the two rules
+    // disagreeing about one peer, reached through the router that has to keep them
+    // apart. A fake responder cannot show it; `One peer is refused one verb and served
+    // another on the same listener` uses `RefuseOnlyVerb` and says so, which proves the
+    // seam can carry the question rather than that the real rules produce it.
+    //
+    // The peer is `10.0.0.1`, and the two things that make this case mean anything are
+    // asserted rather than assumed: it IS an admitted member, so the FETCH refusal
+    // cannot be membership, and it is NOT this machine, so the refusal is locality.
+    // Never invoked. This case stops at the peer gate, which is decided from the
+    // caller's host before a payload byte is read -- so no compiler is spawned and a
+    // runner that refuses to spawn is the honest stand-in for one that is not asked.
+    struct NeverSpawns final: Cc::IProcessRunner
+    {
+        Cc::CompileRun RunCaptureCombined(std::span<std::string const> /*argv*/) override
+        {
+            return Cc::CompileRun { .exitCode = Cc::NotSpawned, .out = {}, .err = {} };
+        }
+        Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+        {
+            return RunCaptureCombined(argv);
+        }
+    };
+
+    InMemoryLruStorage local { 64 * 1024 };
+    NoUpstream upstream;
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    LocalCache cache { local, upstream, clock, metrics };
+    CacheProxy proxy { cache };
+
+    // This machine answers on 10.0.0.7, so 10.0.0.1 is somebody else. Injected because
+    // the question is ambient: `ILocalityOracle` exists so a test can say which
+    // addresses are this host's without the host having to have them.
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, clock };
+
+    // Admitted. Without this the FETCH would be refused for membership and the case
+    // would pass having tested nothing about the merge -- and the compile would be
+    // refused too, so there would be no contrast at all.
+    Distributed::ClusterMembership const membership { { "10.0.0.1:7000" } };
+    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+    REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NeverSpawns runner;
+    FastCache::Testing::ScratchDirectory const scratch { "fc-290-acceptance" };
+    Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
+    Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
+    ThreadPoolExecutor pool { 1 };
+    CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, logger };
+
+    CacheResponder cacheResponder { proxy, locality, metrics };
+    CompileResponder compileResponder { protocol, capacity, membership, pool, io.Reactor(), metrics, logger };
+    MergedResponder responder { &cacheResponder, nullptr, &compileResponder };
+
+    constexpr auto* peer = "10.0.0.1";
+
+    // --- the cache verb: refused, and refused FOR LOCALITY ------------------------
+    //
+    // The REASON is asserted, not merely that it was refused: "was it refused" is
+    // satisfied by any refusal at all, so a routing bug or a plain failure would pass
+    // a weaker check.
+    //
+    // **And the code is not the reason either, on this surface specifically.** The two
+    // rules this case exists to contrast BOTH answer `NotAMember` -- the cache refusing
+    // a caller that is not this machine, and `RefuseUnlessMember` refusing a caller
+    // with no claim on this machine's CPU. One code because a launcher steps over both
+    // identically; two counters because an operator does not. Since #290 they arrive on
+    // one socket, so the counter is the only thing here that says WHICH rule fired:
+    // delete the increment in `CacheResponder::RefusePeer` and the code assertion below
+    // still passes, with only the counter going red.
+    auto const fetchRefusal = responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Fetch));
+    REQUIRE(fetchRefusal.has_value());
+    CHECK(ErrorOf(Unwrap(fetchRefusal)) == Wire::ErrorCode::NotAMember);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
+
+    // --- the compile verb: the SAME peer is admitted ------------------------------
+    //
+    // No refusal at the peer gate, which is as far as this layer decides: a lease and
+    // a compiler are the next questions and belong to the fixture that has both.
+    CHECK_FALSE(responder.RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::Compile)).has_value());
+
+    // And the cache tier still answers THIS machine, which is the other direction of
+    // the same rule and the one a widened bind is most likely to break in silence.
+    CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+}
+
 TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merged-responder]")
 {
     // Legitimate and common: a worker that neither caches nor schedules, and a
@@ -408,24 +534,24 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     CapturingLogger logger;
     auto const [cfg, port] = BaseConfig();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "serving no 0xFC port"));
 }
 
-TEST_CASE("A node whose only component is its worker opens no 0xFC port", "[node][node-surface]")
+TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[node][node-surface]")
 {
-    // #290's second half gave the compile verbs a component here, and it deliberately
-    // did NOT give this node a port. The row is what decides whether the surface is
-    // served, and it still answers on the two components with nowhere else to go -- so
-    // a worker with no tier and no scheduler binds nothing, and its compiles arrive on
-    // the compile port exactly as they always have. Opening one anyway would put a
-    // socket on the machine that `--print-surfaces` never printed.
+    // **Inverted by #290 stage 3, deliberately.** Stage 2 gave the compile verbs a
+    // component here and did NOT give this node a port, because a worker still had a
+    // compile port of its own. Stage 3 retires that port, so a worker with no tier and
+    // no scheduler now binds this one -- it is the only place its compiles can arrive.
     //
-    // The sentence matters as much as the outcome: an operator reading "--listen-node
-    // is empty" about a flag they left at its default would go looking for a
-    // configuration problem that is not there.
+    // The row is still what decides, and this asserts the surface follows it. What
+    // used to be the second reason for answering nothing -- "no cache tier and no
+    // scheduler" -- is gone rather than untested: no configuration reaches it, and a
+    // branch that said "compiles are still served on the compile port" would name a
+    // port that no longer exists.
     NodeIoLoop io;
     CapturingLogger logger;
     NamedResponder compile { "compile" };
@@ -435,10 +561,14 @@ TEST_CASE("A node whose only component is its worker opens no 0xFC port", "[node
     REQUIRE_FALSE(cfg.serveScheduler);
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, logger);
     REQUIRE(surface.has_value());
-    CHECK(*surface == nullptr);
-    CHECK(Logged(logger, "no cache tier and no scheduler"));
+    CHECK(*surface != nullptr);
+
+    // Neither sentence is said, and both matter. The old reason is unreachable, and
+    // "--listen-node is empty" about a flag left at its default would send an operator
+    // looking for a configuration problem that is not there.
+    CHECK_FALSE(Logged(logger, "no cache tier and no scheduler"));
     CHECK_FALSE(Logged(logger, "--listen-node is empty"));
 }
 
@@ -450,61 +580,211 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
 }
 
-TEST_CASE("A taken DEFAULT node port is a warning and a taken NAMED one is fatal", "[node][node-surface]")
+#if !defined(_WIN32)
+
+/// A descriptor in the state a supervisor hands one over in: bound and listening,
+/// and deliberately NOT non-blocking and NOT close-on-exec, because systemd passes
+/// them without either and correcting them is part of what adoption is for.
+struct HandedOverListenFd
 {
-    // The provenance rule, unchanged in substance by the merge (#286): a named address
-    // is a promise and a broken promise is fatal, while a default one an operator never
-    // asked for must not stop a node whose launcher will simply reach whatever else
-    // holds the port.
+    /// In the default member initializer rather than the body, because
+    /// `cppcoreguidelines-prefer-member-initializer` is an error here and the body
+    /// still has to REQUIRE the result.
+    int fd { ::socket(AF_INET, SOCK_STREAM, 0) };
+    std::uint16_t port { 0 };
+
+    HandedOverListenFd()
+    {
+        REQUIRE(fd >= 0);
+        if (fd < 0)
+            return; // constrains the fd for the static analyzer on the ::bind path below
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        // The byte-order calls are UNQUALIFIED while every syscall around them is
+        // `::`-prefixed, and that asymmetry is deliberate: macOS defines htonl and
+        // ntohs as macros, so a scope qualifier in front of one does not parse.
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0; // ephemeral, so this cannot collide with a live port
+        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd, 8) == 0);
+        socklen_t len = sizeof(addr);
+        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port = ntohs(addr.sin_port);
+    }
+
+    HandedOverListenFd(HandedOverListenFd const&) = delete;
+    HandedOverListenFd& operator=(HandedOverListenFd const&) = delete;
+    HandedOverListenFd(HandedOverListenFd&&) = delete;
+    HandedOverListenFd& operator=(HandedOverListenFd&&) = delete;
+
+    ~HandedOverListenFd()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+
+    /// Hand the descriptor to something that takes ownership of it.
+    /// @return The descriptor; this fixture no longer closes it.
+    [[nodiscard]] int Release() noexcept
+    {
+        auto const released = fd;
+        fd = -1;
+        return released;
+    }
+};
+
+TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node][node-surface]")
+{
+    // **The last stitch of #290 stage 3.** For as long as the surfaces were merged
+    // and the reactor listeners could not adopt, an activated worker was refused at
+    // startup: the merged 0xFC surface runs on the reactor and socket activation
+    // handed back a BLOCKING listener, so there was nothing that could join the two.
+    // #464 added `PlatformListener::Adopt` and this closes over it.
+    //
+    // The two facts asserted here are the ones no unit of either change can see on
+    // its own: that the node reaches `Adopt` at all rather than binding, and that the
+    // endpoint it then reports is the SUPERVISOR's port rather than anything read out
+    // of the configuration.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NamedResponder cache { "cache" };
+    HandedOverListenFd handed;
+    auto const supervisorPort = handed.port;
+
+    NodeConfig cfg;
+    // Emptied deliberately, and it is the load-bearing part of this case. Under
+    // activation the unit owns the address, so this flag configures nothing -- and a
+    // node that consulted the row would find it resolves to nothing and decline a
+    // handoff that has already happened, leaving the descriptor unserved.
+    cfg.nodeListen.clear();
+    // The only thing that can say where clients go, which is why activation makes it
+    // mandatory. The port here is deliberately NOT the supervisor's: a node that
+    // echoed this value back instead of asking the socket would pass a weaker version
+    // of this case, so the two must differ.
+    cfg.advertise = "worker-01.internal:1";
+
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+
+    // The host from --advertise, the port from the SOCKET. Asked of the descriptor
+    // because the unit never tells this process which port it chose, so `BoundPort()`
+    // is the only thing that knows -- and the advertised `:1` above proves the answer
+    // was not simply copied out of the configuration.
+    CHECK((*surface)->BoundEndpoint() == std::format("worker-01.internal:{}", supervisorPort));
+    CHECK(Logged(logger, "socket-activated"));
+
+    // And neither sentence from the ordinary path, both of which would mean the row
+    // had been consulted after all.
+    CHECK_FALSE(Logged(logger, "--listen-node is empty"));
+    CHECK_FALSE(Logged(logger, "listening on"));
+}
+
+TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node][node-surface]")
+{
+    // The same answer a failed bind gets, and for the same reason: an activated node
+    // that cannot serve its descriptor still has --scheduler, so it would register,
+    // advertise an address nothing answers, and be leased to clients that each fail
+    // to reach it and compile locally in silence. `Adopt` reports through
+    // `IsBound()`/`BindError()` rather than throwing, so this is a path a caller has
+    // to actively route into the refusal -- it does not arrive as an exception.
+    //
+    // A packaged Linux install enables the worker THROUGH the socket unit -- the
+    // `.service` deliberately carries no `[Install]` section -- so this is the
+    // ordinary deployment rather than an exotic one.
     NodeIoLoop io;
     CapturingLogger logger;
     NamedResponder cache { "cache" };
 
-    auto const [cfg, port] = BaseConfig();
-    auto holder = BlockingListener::Bind("127.0.0.1", port);
-    REQUIRE(holder);
-    REQUIRE(holder->IsBound());
+    NodeConfig cfg;
+    cfg.nodeListen.clear();
+    cfg.advertise = "worker-01.internal:6676";
 
-    auto defaulted = cfg;
-    defaulted.nodeListenExplicit = false;
-    auto tolerated = StartNodeSurfaceOrExplain(io, defaulted, &cache, nullptr, nullptr, logger);
-    REQUIRE(tolerated.has_value());
-    CHECK(*tolerated == nullptr);
-    CHECK(Logged(logger, "continuing without a 0xFC port"));
-
-    auto named = cfg;
-    named.nodeListenExplicit = true;
-    auto refused = StartNodeSurfaceOrExplain(io, named, &cache, nullptr, nullptr, logger);
+    // Not a descriptor. `Adopt` answers this without touching it, which is also why
+    // there is nothing here to close: ownership passes on every path, including the
+    // ones that fail.
+    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--listen-node"));
+    CHECK(refused.error().contains("socket-activated"));
 }
 
-TEST_CASE("A scheduler that cannot bind is fatal even on a defaulted address", "[node][node-surface]")
+#endif
+
+TEST_CASE("A node port that cannot be bound is fatal however it was configured", "[node][node-surface]")
 {
-    // The one thing the merge CHANGED about the provenance rule, and the reason it is
-    // stated rather than discovered. A default cache port already held by a fastcached
-    // stays a warning -- the launcher reaches that daemon and the build works. The same
-    // listener now also carries the scheduler verbs, and a scheduler that is not
-    // listening is the "silently cannot work" shape a fleet never recovers from.
-    NodeIoLoop io;
-    CapturingLogger logger;
-    NamedResponder scheduler { "scheduler" };
+    // **The provenance rule stopped applying here at #290 stage 3, and the reason is
+    // that its premise went away rather than that it was wrong.** A taken DEFAULT port
+    // was tolerated because the launcher reaches whatever else holds it -- a
+    // `fastcached` on this machine, almost always -- so the build still worked and
+    // what was lost was a cache tier nobody asked for. That rested on the worker
+    // having a compile port of its OWN. It has none now: one 0xFC port, and without it
+    // nowhere for a dispatched compile to arrive.
+    //
+    // Continuing would be invisible rather than merely degraded. `--scheduler` is
+    // required, so every node registers, and the registrars are built from
+    // `AdvertisedEndpoint(cfg)` -- the CONFIGURATION, not the listener -- so the bind
+    // failing does not reach them. The node advertises an address nothing answers and
+    // every client meets a failed connection and compiles locally, which is silent by
+    // design.
+    //
+    // Driven as a table over both flags that used to decide it, because the claim is
+    // that NEITHER does any more and a case per combination would be the same
+    // assertion written four times. `nodeListenExplicit` is still live elsewhere --
+    // `--install-service` emits on it (#286) -- so this is the bit ceasing to decide
+    // one thing, not the bit going away.
+    struct Shape
+    {
+        bool explicitAddress;
+        bool serveScheduler;
+        std::string_view what;
+    };
+    static constexpr auto shapes = std::to_array<Shape>({
+        { .explicitAddress = false, .serveScheduler = false, .what = "a defaulted address on a plain worker" },
+        { .explicitAddress = true, .serveScheduler = false, .what = "an address the operator named" },
+        { .explicitAddress = false, .serveScheduler = true, .what = "a defaulted address on a scheduler" },
+        { .explicitAddress = true, .serveScheduler = true, .what = "a named address on a scheduler" },
+    });
 
-    auto [cfg, port] = BaseConfig();
-    cfg.nodeListenExplicit = false;
-    cfg.serveScheduler = true;
+    for (auto const& shape: shapes)
+    {
+        CAPTURE(shape.what);
 
-    auto holder = BlockingListener::Bind("127.0.0.1", port);
-    REQUIRE(holder);
-    REQUIRE(holder->IsBound());
+        NodeIoLoop io;
+        CapturingLogger logger;
+        NamedResponder cache { "cache" };
+        NamedResponder scheduler { "scheduler" };
 
-    auto refused = StartNodeSurfaceOrExplain(io, cfg, nullptr, &scheduler, nullptr, logger);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--serve-scheduler"));
+        auto [cfg, port] = BaseConfig();
+        cfg.nodeListenExplicit = shape.explicitAddress;
+        cfg.serveScheduler = shape.serveScheduler;
+
+        auto holder = BlockingListener::Bind("127.0.0.1", port);
+        REQUIRE(holder);
+        REQUIRE(holder->IsBound());
+
+        auto refused = StartNodeSurfaceOrExplain(
+            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, logger);
+        REQUIRE_FALSE(refused.has_value());
+
+        // The flag, so an operator knows what to edit.
+        CHECK(refused.error().contains("--listen-node"));
+
+        // And the REMEDY, not merely the diagnosis. "cannot bind" is a wall; what an
+        // operator needs is what is almost certainly holding the port and that this
+        // node does not need it. Asserted because a message is the entire user
+        // interface of a startup refusal, and a diagnosis-only one passes every test
+        // that checks the refusal happened.
+        CHECK(refused.error().contains("fastcached"));
+        CHECK(refused.error().contains("stop it, or give"));
+
+        // The tolerated outcome is gone, and named so a reinstated warning fails here
+        // rather than passing as "it refused for some reason".
+        CHECK_FALSE(Logged(logger, "continuing without a 0xFC port"));
+    }
 }

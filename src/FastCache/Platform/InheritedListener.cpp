@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/InheritedListener.hpp>
 
@@ -103,10 +102,9 @@ ActivationHandoff ParseSocketActivation(std::optional<std::string_view> listenPi
     return ActivationHandoff { .firstDescriptor = ActivationFirstDescriptor, .count = static_cast<int>(*count) };
 }
 
-std::vector<std::unique_ptr<IListener>> AdoptInheritedListeners(std::chrono::milliseconds acceptPoll,
-                                                                std::chrono::milliseconds ioTimeout)
+std::vector<int> AdoptInheritedDescriptors()
 {
-    std::vector<std::unique_ptr<IListener>> listeners;
+    std::vector<int> descriptors;
 
 #if !defined(_WIN32)
     auto const pid = ReadEnvironmentVariable(std::string { ListenPidVariable });
@@ -119,12 +117,13 @@ std::vector<std::unique_ptr<IListener>> AdoptInheritedListeners(std::chrono::mil
     for (int offset = 0; offset < handoff.count; ++offset)
     {
         int const descriptor = handoff.firstDescriptor + offset;
+        // Applied HERE rather than left to whoever adopts the descriptor, because
+        // it is a property of having been handed one: systemd deliberately passes
+        // them without close-on-exec so that a service can re-exec itself, and
+        // this worker spawns a compiler per job. A reactor listener arms it again
+        // on adoption, best-effort, and the two agreeing is the point.
         MarkCloseOnExec(descriptor);
-        auto adopted = BlockingListener::Adopt(static_cast<Detail::NativeSocket>(descriptor));
-        // Not optional -- see the header. Without it this listener's accept loop
-        // has no way to observe a shutdown on POSIX.
-        adopted->SetTimeouts(acceptPoll, ioTimeout);
-        listeners.emplace_back(std::move(adopted));
+        descriptors.push_back(descriptor);
     }
 #endif
 
@@ -134,7 +133,7 @@ std::vector<std::unique_ptr<IListener>> AdoptInheritedListeners(std::chrono::mil
     // matches by coincidence of reuse.
     ClearActivationEnvironment();
 
-    return listeners;
+    return descriptors;
 }
 
 } // namespace FastCache

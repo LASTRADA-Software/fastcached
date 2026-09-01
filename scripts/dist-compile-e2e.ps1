@@ -846,13 +846,16 @@ try {
         # both a peer and a possible scheduler, so it always registers as a worker too
         # -- and a second MATCHING worker would make "which worker ran this job" a race
         # that the cases below assert against by reading one worker's counters.
-        $schedWorkerPort = $BasePort + 6
+        # One port: since #290 stage 3 the compile verbs arrive on --listen-node
+        # beside the cache and scheduler verbs, so this node's worker half answers on
+        # $dispatchPort too and --advertise names that. The dedicated compile port it
+        # used to open, and the $BasePort + 6 it used to take, are both gone.
         $schedLog = Join-Path $scratch "scheduler.log"
         $scheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
-            "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1",
-            "--port=$schedWorkerPort", "--advertise=127.0.0.1:$schedWorkerPort",
+            "--scheduler=127.0.0.1:$dispatchPort",
+            "--advertise=127.0.0.1:$dispatchPort",
             "--toolchain=scheduler-only=$((Get-Command $cc).Source)", "--slots=1",
             "--log-level=debug") $schedLog
         $procs += $scheduler
@@ -889,7 +892,7 @@ try {
         $workerLog = Join-Path $scratch "worker.log"
         $worker = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
-            "--scheduler=127.0.0.1:$dispatchPort", "--bind=127.0.0.1", "--port=$workerPort",
+            "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
@@ -1087,13 +1090,12 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         # A second SCHEDULER as well, so the mismatched worker is the only one
         # registered with it -- and it too serves a toolchain nothing here uses, or it
         # would BE a matching worker and the case would pass without testing anything.
-        $isoSchedWorker = $BasePort + 7
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoScheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
-            "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1",
-            "--port=$isoSchedWorker", "--advertise=127.0.0.1:$isoSchedWorker",
+            "--scheduler=127.0.0.1:$isoDispatch",
+            "--advertise=127.0.0.1:$isoDispatch",
             "--toolchain=also-not-the-compiler-this-client-uses=$((Get-Command $cc).Source)",
             "--slots=1", "--log-level=debug") $isoSchedLog
         $procs += $isoScheduler
@@ -1102,7 +1104,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
-            "--scheduler=127.0.0.1:$isoDispatch", "--bind=127.0.0.1", "--port=$isoWorker",
+            "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
