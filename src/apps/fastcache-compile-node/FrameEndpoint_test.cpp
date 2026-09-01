@@ -837,10 +837,20 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     // cannot silently stop covering the sweep if the cadence moves.
     auto const stillOpen = lingering.wait_for(FrameServer::SweepInterval * 2) == std::future_status::timeout;
 
-    // Closed by us either way, which is what lets the reader thread finish and the
-    // future be joined without the case ever hanging.
-    (*socket)->Close();
+    // Released by stopping the SERVER, never by closing this socket from here.
+    //
+    // Closing it would unblock the reader -- and `BlockingSocket::Close` writes members
+    // that `Read` is concurrently reading on the other thread, which is a data race on
+    // the socket object itself. Not theoretical: ThreadSanitizer reported exactly this,
+    // three times, against the first version of this case.
+    //
+    // `~FrameEndpoint` posts its closes onto the reactor, which ends the connection from
+    // the thread that owns it and makes the read return. That is the production shutdown
+    // path, it costs the case nothing, and it leaves this socket touched by exactly one
+    // thread. The close below is then ordinary cleanup, after the reader has finished.
+    endpoint->reset();
     (void) lingering.get();
+    (*socket)->Close();
 
     INFO("the responder asked for 200ms and HeaderTimeout is "
          << FrameServer::HeaderTimeout.count() << "ms; observed for " << (FrameServer::SweepInterval * 2).count()
