@@ -50,23 +50,17 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     if (RowFor(NodeSurface::Node).Resolve(cfg).empty())
     {
         // **The row is the authority on WHETHER, and it cannot say WHY.** That is the
-        // division this function's header states, and #290's second half made the two
-        // reasons diverge rather than coincide: a node that neither holds a cache tier
-        // nor schedules still runs a worker, so it has a component for this listener
-        // and the row still resolves to nothing. Opening a port the row says is not
-        // served would put a socket on this machine that `--print-surfaces` never
-        // printed and no firewall worksheet lists -- so the row wins, and compiles on
-        // such a node reach it on the compile port exactly as they always have.
+        // division this function's header states, and there is now exactly one way for
+        // the row to answer nothing: an empty `--listen-node`.
         //
-        // Asked of the FLAG rather than re-deriving the row's other clause: the empty
-        // spelling is the one an operator typed, and it is the only half this function
-        // can attribute without becoming a second author of the rule.
-        if (cfg.nodeListen.empty())
-            logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
-        else
-            logger.Logf(LogLevel::Info,
-                        "no cache tier and no scheduler; serving no 0xFC port -- compiles are still served on the "
-                        "compile port");
+        // The second reason is GONE rather than unhandled. It used to be "neither a
+        // cache tier nor a scheduler", which was a real state while a worker had a
+        // compile port of its own to fall back on. Stage 3 retires that port, so a
+        // dispatched compile arrives here and the row is served on every node that
+        // runs -- see the row's own comment. A branch for it would be one no
+        // configuration reaches, saying compiles are served somewhere that no longer
+        // exists.
+        logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
 

@@ -698,10 +698,10 @@ struct NodeConfig
 /// scheduler that leases the worker out sees clients fail to reach it with no
 /// error anywhere.
 ///
-/// `--advertise` is the one worth spelling out. Left empty it defaults to
-/// `{--bind}:{--port}`, and `--bind` defaults to `0.0.0.0`, which is not an
-/// address any client can dial. A worker registered that way registers happily,
-/// heartbeats happily, is leased, and never answers.
+/// `--advertise` is the one worth spelling out. Left empty it defaults to whatever
+/// the `Node` surface resolves to, which is loopback on a node that does not
+/// schedule -- not an address any other machine can dial. A worker registered that
+/// way registers happily, heartbeats happily, is leased, and never answers.
 /// @param cfg Configuration about to be baked into a registration.
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);

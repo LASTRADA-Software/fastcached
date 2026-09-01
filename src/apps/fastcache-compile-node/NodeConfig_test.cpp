@@ -503,15 +503,20 @@ TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][s
     pinned.toolchainDiscovery = false;
     CHECK_FALSE(NodeServiceRejection(pinned).has_value());
 
-    // The one worth the most: left empty, --advertise defaults to
-    // {--bind}:{--port} and --bind defaults to 0.0.0.0, which no client can dial.
+    // The one worth the most: left empty, --advertise defaults to whatever
+    // --listen-node resolves to, which is LOOPBACK on a node that does not schedule.
     // Such a worker registers, heartbeats, is leased, and is never reached.
+    //
+    // The REASON changed with #290 stage 3 and the expectation is updated to match
+    // rather than loosened: the old default was `{--bind}:{--port}` and the string to
+    // look for was `0.0.0.0`. A refusal that keeps its name while its cause moves is
+    // how a rule stops meaning what it says, so this asserts the new cause by name.
     auto noAdvertise = Installable();
     noAdvertise.advertise.clear();
     auto const rejection = NodeServiceRejection(noAdvertise);
     REQUIRE(rejection.has_value());
     CHECK(Unwrap(rejection).contains("--advertise"));
-    CHECK(Unwrap(rejection).contains("0.0.0.0"));
+    CHECK(Unwrap(rejection).contains("--listen-node"));
 }
 
 TEST_CASE("NodeConfig: the daemon flag is carried apart from the arguments", "[node][service]")
@@ -1219,23 +1224,33 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // is `0.0.0.0`. The scheduler hands that string to clients verbatim, so a
         // client on another machine dials the wildcard and reaches ITSELF. The
         // worker registers, heartbeats, is leased out and is never reached.
+        // Each row names the REASON it expects, not merely that it was refused. Two
+        // rows answer here now -- the wildcard and, since #290 stage 3, loopback -- and
+        // both messages contain "--advertise", so asserting only that would let either
+        // stand in for the other.
         struct Row
         {
             char const* what;      ///< The shape, for the failure message.
             char const* advertise; ///< `--advertise`, or empty for the fallback.
-            char const* bind;      ///< `--bind`.
+            char const* reason;    ///< A phrase only this refusal's message carries.
         };
 
         auto const refused = std::to_array<Row>({
-            { .what = "no --advertise at all", .advertise = "", .bind = "0.0.0.0" },
+            // **This row's reason CHANGED with #290 stage 3, updated deliberately.**
+            // `--advertise` used to fall back to `{--bind}:{--port}`, whose bind
+            // defaults to the wildcard; it now falls back to the `Node` surface, which
+            // binds loopback on a node that does not schedule. Same silent failure,
+            // different cause -- and a row still expecting "wildcard" would have gone
+            // on passing while naming a refusal that no longer fires.
+            { .what = "no --advertise at all", .advertise = "", .reason = "binds loopback" },
             // Spelled out rather than defaulted: the endpoint is judged, never the
             // question of which flag produced it.
-            { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .bind = "0.0.0.0" },
-            { .what = "the v6 wildcard", .advertise = "[::]:6676", .bind = "0.0.0.0" },
+            { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .reason = "the wildcard resolves to" },
+            { .what = "the v6 wildcard", .advertise = "[::]:6676", .reason = "the wildcard resolves to" },
             // An empty host is the wildcard too -- it reaches `getaddrinfo` as
             // nullptr -- which is the third case `--listen-node=:6674` is refused
             // for and the one that reads like an address.
-            { .what = "a bare colon", .advertise = ":6676", .bind = "0.0.0.0" },
+            { .what = "a bare colon", .advertise = ":6676", .reason = "the wildcard resolves to" },
         });
 
         for (auto const& row: refused)
@@ -1244,13 +1259,29 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
             NodeConfig cfg;
             cfg.scheduler = "scheduler.internal:6675";
             cfg.advertise = row.advertise;
-            cfg.bindAddress = row.bind;
             cfg.fleetOpen = true;
 
             auto const refusal = StartupPolicyRejection(cfg);
             REQUIRE(refusal.has_value());
             CHECK(Unwrap(refusal).contains("--advertise"));
+            CHECK(Unwrap(refusal).contains(row.reason));
         }
+
+        // The two refusals stay TOLD APART, asserted as a pair rather than inferred
+        // from the rows above: the way this regresses is one predicate widening to
+        // cover both, which passes every row individually and leaves the operator who
+        // typed nothing reading about a wildcard they never wrote.
+        NodeConfig wildcard;
+        wildcard.scheduler = "scheduler.internal:6675";
+        wildcard.fleetOpen = true;
+        wildcard.advertise = "0.0.0.0:6676";
+        NodeConfig loopback = wildcard;
+        loopback.advertise.clear();
+        auto const wildcardRefusal = StartupPolicyRejection(wildcard);
+        auto const loopbackRefusal = StartupPolicyRejection(loopback);
+        REQUIRE(wildcardRefusal.has_value());
+        REQUIRE(loopbackRefusal.has_value());
+        CHECK(Unwrap(wildcardRefusal) != Unwrap(loopbackRefusal));
 
         // And the three shapes that must NOT be refused, each of which would be a
         // working deployment this rule had broken.

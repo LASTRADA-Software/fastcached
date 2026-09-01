@@ -414,18 +414,18 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     CHECK(Logged(logger, "serving no 0xFC port"));
 }
 
-TEST_CASE("A node whose only component is its worker opens no 0xFC port", "[node][node-surface]")
+TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[node][node-surface]")
 {
-    // #290's second half gave the compile verbs a component here, and it deliberately
-    // did NOT give this node a port. The row is what decides whether the surface is
-    // served, and it still answers on the two components with nowhere else to go -- so
-    // a worker with no tier and no scheduler binds nothing, and its compiles arrive on
-    // the compile port exactly as they always have. Opening one anyway would put a
-    // socket on the machine that `--print-surfaces` never printed.
+    // **Inverted by #290 stage 3, deliberately.** Stage 2 gave the compile verbs a
+    // component here and did NOT give this node a port, because a worker still had a
+    // compile port of its own. Stage 3 retires that port, so a worker with no tier and
+    // no scheduler now binds this one -- it is the only place its compiles can arrive.
     //
-    // The sentence matters as much as the outcome: an operator reading "--listen-node
-    // is empty" about a flag they left at its default would go looking for a
-    // configuration problem that is not there.
+    // The row is still what decides, and this asserts the surface follows it. What
+    // used to be the second reason for answering nothing -- "no cache tier and no
+    // scheduler" -- is gone rather than untested: no configuration reaches it, and a
+    // branch that said "compiles are still served on the compile port" would name a
+    // port that no longer exists.
     NodeIoLoop io;
     CapturingLogger logger;
     NamedResponder compile { "compile" };
@@ -437,8 +437,12 @@ TEST_CASE("A node whose only component is its worker opens no 0xFC port", "[node
 
     auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, logger);
     REQUIRE(surface.has_value());
-    CHECK(*surface == nullptr);
-    CHECK(Logged(logger, "no cache tier and no scheduler"));
+    CHECK(*surface != nullptr);
+
+    // Neither sentence is said, and both matter. The old reason is unreachable, and
+    // "--listen-node is empty" about a flag left at its default would send an operator
+    // looking for a configuration problem that is not there.
+    CHECK_FALSE(Logged(logger, "no cache tier and no scheduler"));
     CHECK_FALSE(Logged(logger, "--listen-node is empty"));
 }
 

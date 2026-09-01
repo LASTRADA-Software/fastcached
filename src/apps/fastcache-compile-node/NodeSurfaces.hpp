@@ -23,8 +23,9 @@ namespace FastCache::Node
 /// to leave both out, which is how the port map came to live in five places.
 ///
 /// `--advertise` is deliberately **not** here. It is what this node tells other
-/// machines to dial, not a socket it opens -- it defaults to `{--bind}:{--port}` and
-/// binds nothing -- so a firewall rule derived from it would open a port twice and
+/// machines to dial, not a socket it opens -- it defaults to what the `Node` row
+/// resolves to and binds nothing -- so a firewall rule derived from it would open a
+/// port twice and
 /// still miss whatever the supervisor actually chose.
 enum class NodeSurface : std::uint8_t
 {

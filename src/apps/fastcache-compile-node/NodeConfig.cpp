@@ -1303,20 +1303,32 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
-    // The flag wins whenever it was given; the fallback is the compile port's two
-    // halves. Written ONCE -- `main` hands the result to `MakeWorkerLeaseValidator`
-    // and to the heartbeat's REGISTER, and `AdvertisesWildcard` refuses on it, so the
-    // three consumers of this endpoint cannot disagree about what it is. They already
-    // could: this expression stood character-for-character in `main.cpp` as well.
+    // The flag wins whenever it was given. Written ONCE -- `main` hands the result to
+    // `MakeWorkerLeaseValidator` and to the heartbeat's REGISTER, and the refusals
+    // below judge it -- so the three consumers of this endpoint cannot disagree about
+    // what it is. This expression once stood character-for-character in `main.cpp` too.
     if (!cfg.advertise.empty())
         return cfg.advertise;
-    return std::format("{}:{}", cfg.bindAddress, cfg.port);
+
+    // The fallback is the `Node` surface, which is where a dispatched compile now
+    // ARRIVES (#290 stage 3). It was `{--bind}:{--port}`, the dedicated compile port,
+    // and telling clients to dial a port this node no longer serves compiles on is the
+    // failure this whole stage exists to avoid -- silent at both ends, because the
+    // registration still succeeds.
+    //
+    // Resolved through the surface row rather than read off `nodeListen`, because a
+    // bare port's host depends on the configuration (`NodeListenDefaultHost`) and the
+    // row is where that is decided. Reading the flag directly would be the second
+    // author this function was written to delete.
+    auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
+    if (node.empty())
+        return {};
+    return FormatHostPort(node.front().host, node.front().port);
 }
 
 /// Whether the endpoint this node would advertise names no host a client can dial.
 ///
-/// `--advertise` falls back to `{--bind}:{--port}` and `--bind` defaults to the
-/// wildcard, so a worker that never names one registers `0.0.0.0:6676` -- which the
+/// A worker that names the wildcard registers `0.0.0.0:<port>` -- which the
 /// scheduler hands to clients verbatim, and a client on another machine dialling the
 /// wildcard reaches **itself**. `NodeServiceRejection` has always said so for an
 /// install; this is the same fact for a hand-started worker.
@@ -1367,6 +1379,26 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// scheduler -- correctly, because such a node opens no `0xFC` port and its compiles
 /// arrive only on `--bind`.
 ///
+/// Whether the endpoint this node would advertise names only THIS machine.
+///
+/// The wildcard's sibling, and the shape #290 stage 3 newly made the default. The
+/// advertised endpoint used to fall back to `{--bind}:{--port}`, whose bind defaults to
+/// the wildcard; it now falls back to the `Node` surface, whose host defaults to
+/// LOOPBACK on a node that does not schedule. Both are unreachable from another
+/// machine and both fail the same silent way -- the worker registers, heartbeats, is
+/// leased out, and every remote client dials something that is not this worker.
+///
+/// Kept a separate predicate behind a separate row rather than folded into
+/// `AdvertisesWildcard`, because the two are different operator mistakes with
+/// different remedies and one message could only serve them by describing neither. A
+/// row is the refusal here, not the predicate.
+/// @param cfg The parsed configuration.
+/// @return Whether remote clients would be told to dial their own machine.
+[[nodiscard]] bool AdvertisesLoopback(NodeConfig const& cfg)
+{
+    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+}
+
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
 /// `getaddrinfo` as nullptr under AI_PASSIVE, the same third case `AdvertisesWildcard`
 /// exists for. So it is reachable, and `IsLoopbackHost("")` answering false is the
@@ -1432,7 +1464,8 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
                      "--no-toolchain-discovery to let the machine answer at boot instead." },
         { .refuses = [](NodeConfig const& c) { return c.advertise.empty(); },
           .message = "--advertise is required to install a service: without it the registration bakes in "
-                     "{--bind}:{--port}, and the default 0.0.0.0 is not an address a client can dial. Such a worker "
+                     "whatever --listen-node resolves to, which defaults to loopback on a worker and is not an "
+                     "address another machine can dial. Such a worker "
                      "registers, heartbeats, is leased out, and is never reached -- with no error at either end." },
         { .refuses = [](NodeConfig const& c) { return !c.raftListen.empty() && c.clusterDir.empty(); },
           .message = "--listen-raft needs --cluster-dir to install a service: consensus state otherwise lands in "
@@ -1566,10 +1599,36 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                   return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesWildcard(c);
               },
           .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
-                     "names no address they can dial: it defaults to {--bind}:{--port}, and the wildcard resolves to "
+                     "names no address they can dial: the wildcard resolves to "
                      "the CALLER's own machine. This worker would register, heartbeat, be leased out and never be "
                      "reached, with no error at either end. Name --advertise, or drop the membership flags and serve "
                      "this machine alone." },
+        // The wildcard row's sibling, and it must stay a SEPARATE row. Since the bind
+        // merged, `--advertise` falls back to the `Node` surface, which defaults to
+        // loopback on a node that does not schedule -- so the shape an operator now
+        // reaches by typing nothing is `127.0.0.1`, not `0.0.0.0`. It fails exactly as
+        // silently and it is a different mistake: the wildcard is usually a bind
+        // address pasted into the wrong flag, this one is having named no address at
+        // all. One message for both would tell each operator about the other's error.
+        //
+        // Ordered after the wildcard so a configuration that is somehow both is
+        // reported as the wildcard, which is the more specific diagnosis: first match
+        // wins.
+        //
+        // The admission gate is IDENTICAL to the row above and deliberately so -- it
+        // is what keeps the one-machine install working, where advertising loopback is
+        // not a mistake but the correct answer. Widening the endpoint test while
+        // relaxing this one would refuse the deployment an operator gets by installing
+        // the package.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesLoopback(c);
+              },
+          .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
+                     "names an address only this machine can reach: it defaults to the --listen-node surface, which "
+                     "binds loopback on a node that does not schedule, so a peer dialling it reaches ITSELF. This "
+                     "worker would register, heartbeat, be leased out and never be reached, with no error at either "
+                     "end. Name --advertise with an address peers can dial." },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "

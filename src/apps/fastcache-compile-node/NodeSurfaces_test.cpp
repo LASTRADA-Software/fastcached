@@ -203,18 +203,26 @@ TEST_CASE("The node port's default host follows whether this node schedules", "[
     CHECK(namedEndpoints.front().host == "127.0.0.1");
 }
 
-TEST_CASE("A node that neither caches nor schedules binds no 0xFC port", "[node][surfaces]")
+TEST_CASE("Every node that runs binds the 0xFC port", "[node][surfaces]")
 {
-    // Newly expressible, and newly necessary: one row now stands for two components,
-    // so "not served" is the conjunction rather than either half. A worksheet that
-    // listed the port for a node holding neither would have an operator open a port
-    // for a socket that is never created.
+    // **The inverse of what this case asserted before #290 stage 3**, and the change is
+    // deliberate rather than a test relaxed to pass. It used to read "a node that
+    // neither caches nor schedules binds no 0xFC port", which was true exactly while a
+    // worker had a compile port of its own. Stage 3 retires that port, so a dispatched
+    // compile arrives here and a node holding neither component still has to open it --
+    // it is the only port it has left.
+    //
+    // What that older case protected is still protected, one layer down: a node with no
+    // cache tier builds no tier, and its FETCH verbs are refused by the component that
+    // owns them rather than by the socket being absent.
     NodeConfig worker;
     worker.cacheMemoryBytes = 0;
     worker.cacheDir.clear();
-    CHECK(RowFor(NodeSurface::Node).Resolve(worker).empty());
+    REQUIRE_FALSE(worker.serveScheduler);
+    CHECK(RowFor(NodeSurface::Node).Resolve(worker).size() == 1);
 
-    // Either half on its own is enough to open it.
+    // And neither component changes the answer any more, which is the whole point:
+    // the port is the node's, not the tier's.
     auto caching = worker;
     caching.cacheMemoryBytes = 64ULL * 1024ULL * 1024ULL;
     CHECK(RowFor(NodeSurface::Node).Resolve(caching).size() == 1);
@@ -222,6 +230,12 @@ TEST_CASE("A node that neither caches nor schedules binds no 0xFC port", "[node]
     auto scheduling = worker;
     scheduling.serveScheduler = true;
     CHECK(RowFor(NodeSurface::Node).Resolve(scheduling).size() == 1);
+
+    // The one remaining way to serve no 0xFC port: no address to bind. That is an
+    // operator naming nothing, not a component being absent.
+    auto unnamed = worker;
+    unnamed.nodeListen.clear();
+    CHECK(RowFor(NodeSurface::Node).Resolve(unnamed).empty());
 }
 
 TEST_CASE("Discovery binds the wildcard whatever address it announces to", "[node][surfaces]")
