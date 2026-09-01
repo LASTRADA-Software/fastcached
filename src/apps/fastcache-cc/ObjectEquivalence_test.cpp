@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "ObjectEquivalence.hpp"
-
 #include "IProcessRunner.hpp"
+#include "ObjectEquivalence.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -358,8 +359,7 @@ TEST_CASE("Nothing is excused in a format that has no clock", "[launcher][verify
     CHECK(CompareObjectImages(served, fresh).outcome == ObjectComparison::Different);
 }
 
-TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does not",
-          "[launcher][verify][object][msvc]")
+TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does not", "[launcher][verify][object][msvc]")
 {
     // The synthetic cases above assert the RULE; this one asserts that the rule
     // describes what a compiler emits. Running the verifier on made-up bytes would
@@ -383,13 +383,18 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
 
     auto const object = dir / "tu.obj";
     auto const runner = MakeProcessRunner();
-    std::vector<std::string> const argv {
-        *driver, "/nologo", "/c", "/Fo" + object.string(), source.string()
-    };
+    std::vector<std::string> const argv { *driver, "/nologo", "/c", "/Fo" + object.string(), source.string() };
 
     REQUIRE(runner->RunCaptureCombined(argv).exitCode == 0);
     auto const first = ReadAll(object);
     REQUIRE_FALSE(first.empty());
+
+    // Over a second, so the two objects carry DIFFERENT clocks. Without the wait both
+    // compiles land in the same second and come out byte-identical, and the case then
+    // passes without exercising the one thing it exists to demonstrate -- which is
+    // how a verifier nothing had ever run on Windows looked correct for so long.
+    // `TimeDateStamp` counts whole seconds, so a gap longer than one guarantees it.
+    std::this_thread::sleep_for(std::chrono::milliseconds { 1'200 });
 
     // The same command line again, to the same path -- which is exactly what the
     // verifier does, and why the driver's path records cannot differ.
@@ -397,15 +402,45 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     auto const second = ReadAll(object);
     REQUIRE_FALSE(second.empty());
 
+    // Asserted rather than assumed, and separately, because it is the premise of
+    // everything below: if a driver ever stops stamping the clock this fails here and
+    // says so, instead of the verdict below passing for a reason nobody checked.
+    REQUIRE(first.size() == second.size());
+    REQUIRE(first != second);
+
     auto const clean = CompareObjectImages(first, second);
-    INFO("verdict detail: " << clean.detail);
-    CHECK((clean.outcome == ObjectComparison::Identical
-           || clean.outcome == ObjectComparison::EquivalentApartFromVolatile));
+    INFO("clean verdict detail: " << clean.detail);
+    CHECK(clean.outcome == ObjectComparison::EquivalentApartFromVolatile);
 
     // And the guard bites on the same real object. One byte in the back half, which
-    // is code or data on every layout these drivers emit.
+    // is well past the four the comparison is allowed to overlook.
     auto corrupted = second;
     auto const at = corrupted.size() - (corrupted.size() / 4);
     corrupted[at] = static_cast<std::byte>(static_cast<unsigned char>(corrupted[at]) ^ 0xFFU);
-    CHECK(CompareObjectImages(first, corrupted).outcome == ObjectComparison::Different);
+    auto const caught = CompareObjectImages(first, corrupted);
+    INFO("corrupted verdict detail: " << caught.detail);
+    CHECK(caught.outcome == ObjectComparison::Different);
+    CHECK_FALSE(caught.detail.empty());
+
+    // #489 against real output: the same source compiled to ANOTHER object path, which
+    // is what a hit served from a second checkout looks like. `cl` records that path in
+    // `.debug$S` and hashes the file it opened into `.chks64` (measured); clang-cl
+    // records neither and produces the same bytes.
+    //
+    // Whichever it is, the one answer that must never come back is
+    // `EquivalentApartFromVolatile` -- excusing those sections would cure this
+    // ticket's false positives by no longer looking, and go quiet on the case an
+    // operator turns verification on to find.
+    auto const elsewhere = dir / "other" / "tu.obj";
+    std::filesystem::create_directories(elsewhere.parent_path());
+    std::vector<std::string> const argvElsewhere { *driver, "/nologo", "/c", "/Fo" + elsewhere.string(), source.string() };
+    REQUIRE(runner->RunCaptureCombined(argvElsewhere).exitCode == 0);
+    auto const foreign = ReadAll(elsewhere);
+    REQUIRE_FALSE(foreign.empty());
+
+    auto const crossPath = CompareObjectImages(foreign, second);
+    INFO("cross-path verdict detail: " << crossPath.detail);
+    CHECK(crossPath.outcome != ObjectComparison::EquivalentApartFromVolatile);
+    if (foreign != second)
+        CHECK(crossPath.outcome == ObjectComparison::Different);
 }

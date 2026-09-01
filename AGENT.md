@@ -177,6 +177,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
+- An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
+  and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
+  older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
+  object on the platform where #368 was observed. Measured: the 4-byte `TimeDateStamp`
+  and nothing else at 2 s and at 300 s; ELF is identical, `-g` included, so it keeps
+  the byte comparison. `.debug$S`/`.chks64` are volatile in the PATH, not in time, and
+  the verifier holds the path fixed — so they are NOT excused, or #489 (a hit from
+  another checkout) goes silent, which is #493 cured by no longer looking. Parsing
+  never grants an excuse; it only says WHERE. A FRESH object that will not lay out is
+  `Unsupported`, refused by name; a SERVED one that will not while the fresh one does
+  is `Mismatched`, because that is a truncated transfer. Never `/Brepro`.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,

@@ -122,8 +122,7 @@ struct HitComparison
 ///        occupied -- which is what keeps the driver's path records out of the
 ///        comparison without anything having to overlook them.
 /// @return The verdict, plus a sentence naming what it turned on.
-[[nodiscard]] HitComparison CompareObjectFiles(std::filesystem::path const& served,
-                                               std::filesystem::path const& fresh);
+[[nodiscard]] HitComparison CompareObjectFiles(std::filesystem::path const& served, std::filesystem::path const& fresh);
 
 /// What to tell an operator about @p verdict, or empty when there is nothing to say.
 ///

@@ -21,13 +21,17 @@ namespace FastCache::Cc
 /// ([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)).
 ///
 /// Measured on this tree -- MSVC 14.51 and the VS-shipped clang-cl, clang 20.1.2
-/// and GCC 14.2 -- and the numbers decide the design rather than illustrate it:
+/// and GCC 14.2 -- and the numbers decide the design rather than illustrate it.
+/// Two compiles of one translation unit, differing in:
 ///
-/// | two compiles of one TU differing in           | cl                      | clang-cl | clang / gcc |
-/// |-----------------------------------------------|-------------------------|----------|-------------|
-/// | nothing (same object path, seconds apart)     | the 4-byte `TimeDateStamp`, and nothing else | the same | identical, with and without `-g` |
-/// | the object's directory                        | + `.debug$S`, `.chks64` | nothing more | identical |
-/// | the source's directory                        | + `.debug$S`, `.chks64` | nothing more | identical |
+/// - **nothing** (one object path, two seconds AND five minutes apart): `cl` and
+///   `clang-cl` differ in the 4-byte `TimeDateStamp` and in nothing else, with
+///   `/Z7` and without, `/bigobj` included. clang and GCC are byte-identical, with
+///   `-g` and without.
+/// - **the object's directory**: `cl` additionally differs in `.debug$S` and
+///   `.chks64`. `clang-cl`, clang and GCC differ in nothing more.
+/// - **the source's directory**: the same again -- `cl` alone, in the same two
+///   sections.
 ///
 /// Two conclusions, and the second is the whole shape of this file:
 ///

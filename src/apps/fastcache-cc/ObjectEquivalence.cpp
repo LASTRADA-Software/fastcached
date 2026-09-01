@@ -50,16 +50,16 @@ namespace
     /// third layout is a row.
     struct ObjectLayout
     {
-        std::string_view name;                ///< What to call it in a message.
-        std::size_t minimumSize {};           ///< Bytes the fixed header occupies.
-        std::size_t timeDateStampAt {};       ///< Offset of the clock.
-        std::size_t sectionCountAt {};        ///< Offset of `NumberOfSections`.
-        std::size_t sectionCountWidth {};     ///< Its width -- two bytes, four on `/bigobj`.
-        std::size_t symbolPointerAt {};       ///< Offset of `PointerToSymbolTable`.
-        std::size_t symbolCountAt {};         ///< Offset of `NumberOfSymbols`.
-        std::size_t symbolRecordSize {};      ///< 18 bytes, 20 on `/bigobj`.
-        std::size_t optionalHeaderSizeAt {};  ///< Offset of `SizeOfOptionalHeader`, or `NoOptionalHeader`.
-        std::size_t sectionTableAt {};        ///< Where the section table starts, when it is fixed.
+        std::string_view name;               ///< What to call it in a message.
+        std::size_t minimumSize {};          ///< Bytes the fixed header occupies.
+        std::size_t timeDateStampAt {};      ///< Offset of the clock.
+        std::size_t sectionCountAt {};       ///< Offset of `NumberOfSections`.
+        std::size_t sectionCountWidth {};    ///< Its width -- two bytes, four on `/bigobj`.
+        std::size_t symbolPointerAt {};      ///< Offset of `PointerToSymbolTable`.
+        std::size_t symbolCountAt {};        ///< Offset of `NumberOfSymbols`.
+        std::size_t symbolRecordSize {};     ///< 18 bytes, 20 on `/bigobj`.
+        std::size_t optionalHeaderSizeAt {}; ///< Offset of `SizeOfOptionalHeader`, or `NoOptionalHeader`.
+        std::size_t sectionTableAt {};       ///< Where the section table starts, when it is fixed.
     };
 
     /// `/bigobj` has no optional header, so its section table starts at a fixed
@@ -116,10 +116,9 @@ namespace
     /// encoding, version and ABI, all constant for a given platform -- and "nearly
     /// harmless" is not a property to leave undeclared in the one function that
     /// decides what a verifier is allowed to overlook.
-    constexpr std::array<std::byte, 4> ElfMagic { std::byte { 0x7F },
-                                                  std::byte { 'E' },
-                                                  std::byte { 'L' },
-                                                  std::byte { 'F' } };
+    constexpr std::array<std::byte, 4> ElfMagic {
+        std::byte { 0x7F }, std::byte { 'E' }, std::byte { 'L' }, std::byte { 'F' }
+    };
 
     /// @param image The bytes to test.
     /// @return True when @p image opens with ELF's magic.
@@ -246,8 +245,8 @@ namespace
         // A name too long for the eight-byte field is an offset into the string
         // table, which follows the symbol table. COMDAT names reach that length
         // routinely, so this is the ordinary case rather than an exotic one.
-        auto const stringsAt = static_cast<std::size_t>(*symbolPointer)
-                               + (layout.symbolRecordSize * static_cast<std::size_t>(*symbolCount));
+        auto const stringsAt =
+            static_cast<std::size_t>(*symbolPointer) + (layout.symbolRecordSize * static_cast<std::size_t>(*symbolCount));
 
         std::vector<SectionSpan> sections;
         sections.reserve(static_cast<std::size_t>(*count));
@@ -270,9 +269,8 @@ namespace
             {
                 std::size_t offset = 0;
                 auto const digits = std::string_view { name }.substr(1);
-                auto const numeric = !digits.empty() && std::ranges::all_of(digits, [](char c) {
-                    return c >= '0' && c <= '9';
-                });
+                auto const numeric =
+                    !digits.empty() && std::ranges::all_of(digits, [](char c) { return c >= '0' && c <= '9'; });
                 if (numeric)
                 {
                     for (auto const c: digits)
@@ -423,8 +421,7 @@ namespace
 
 ObjectComparisonResult CompareObjectImages(std::span<std::byte const> served, std::span<std::byte const> fresh)
 {
-    if (served.size() == fresh.size()
-        && (served.empty() || std::memcmp(served.data(), fresh.data(), served.size()) == 0))
+    if (served.size() == fresh.size() && (served.empty() || std::memcmp(served.data(), fresh.data(), served.size()) == 0))
         return { .outcome = ObjectComparison::Identical, .detail = {} };
 
     // The FRESH image decides, and only the fresh one: it is this toolchain's own
@@ -439,29 +436,35 @@ ObjectComparisonResult CompareObjectImages(std::span<std::byte const> served, st
 
     if (served.size() != fresh.size())
         return { .outcome = ObjectComparison::Different,
-                 .detail = std::format("the cached object is {} bytes where this compile produces {}",
-                                       served.size(),
-                                       fresh.size()) };
+                 .detail = std::format(
+                     "the cached object is {} bytes where this compile produces {}", served.size(), fresh.size()) };
 
-    auto const offsets = DifferingOffsets(served, fresh, DescribeBudget);
+    auto offsets = DifferingOffsets(served, fresh, DescribeBudget);
+
+    // Drop the one normalised region, and only it: measured, two compiles of one
+    // translation unit to one object path differ here and nowhere else, on both MSVC
+    // drivers, with and without `/Z7`. A difference reaching past it is a finding --
+    // see PathRecordSections for why that includes the path records.
+    //
+    // Dropped BEFORE the description as well as before the decision, because the
+    // clock lies in the header rather than in any section: left in, it made every
+    // difference look as though it reached outside the sections, which suppressed the
+    // classification that tells a foreign build path from stale code.
     if (choice.layout != nullptr)
     {
-        // The one normalised region, and the only one: measured, two compiles of one
-        // translation unit to one object path differ here and nowhere else, on both
-        // MSVC drivers, with and without `/Z7`. A difference reaching past it is a
-        // finding -- see PathRecordSections for why that includes the path records.
         auto const stampAt = choice.layout->timeDateStampAt;
-        auto const clockOnly = std::ranges::all_of(offsets, [stampAt](std::size_t offset) {
+        auto const inStamp = [stampAt](std::size_t offset) {
             return offset >= stampAt && offset < stampAt + TimeDateStampWidth;
-        });
-        if (clockOnly)
-            return { .outcome = ObjectComparison::EquivalentApartFromVolatile,
-                     .detail = "the compiler's timestamp, which every MSVC-family driver stamps into the object "
-                               "header" };
+        };
+        auto const removed = std::ranges::remove_if(offsets, inStamp);
+        offsets.erase(removed.begin(), removed.end());
     }
 
-    return { .outcome = ObjectComparison::Different,
-             .detail = DescribeDifference(choice.layout, served, fresh, offsets) };
+    if (offsets.empty())
+        return { .outcome = ObjectComparison::EquivalentApartFromVolatile,
+                 .detail = "the compiler's timestamp, which every MSVC-family driver stamps into the object header" };
+
+    return { .outcome = ObjectComparison::Different, .detail = DescribeDifference(choice.layout, served, fresh, offsets) };
 }
 
 } // namespace FastCache::Cc

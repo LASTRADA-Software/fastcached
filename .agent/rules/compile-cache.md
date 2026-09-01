@@ -1056,6 +1056,67 @@ same on both — the same defect with no MSVC anywhere near it.
   as *missing*, which discards the hit and recompiles rather than serving one it
   could not check.
 
+## An object file is not a byte string, and `FASTCACHE_VERIFY` is where that bites
+
+`FASTCACHE_VERIFY` compiles a sampled hit again and compares the two objects. It
+compared them with `memcmp`, and on Windows that **can never succeed**: every
+MSVC-family driver stamps the wall clock into the COFF header, and a cached object
+was produced earlier than the fresh compile it is checked against *by construction*.
+So the one instrument that turns a wrong object from invisible into loud reported a
+wrong object on **every** hit, on the platform where
+[#368](https://github.com/LASTRADA-Software/fastcached/issues/368) — a wrong object
+served under a correct key — was actually observed
+([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)).
+
+The fact was already written down three times, in
+[`distributed-compilation.md`](distributed-compilation.md), in
+`scripts/dist-compile-e2e.ps1` and in `docs/tools/fastcache-compile-node.md` — and
+none of those is a file anyone editing `HitVerification.cpp` opens. **That is why it
+is repeated here**, in the launcher's own rule file, rather than linked.
+
+What was measured, on this tree, rather than reasoned from "ELF is reproducible":
+
+| two compiles of one TU differing in | `cl` 14.51 | `clang-cl` | clang 20.1 / GCC 14.2 |
+|---|---|---|---|
+| nothing — same object path, 2 s and 300 s apart | the 4-byte `TimeDateStamp`, and **nothing else** | the same | **identical**, with and without `-g` |
+| the object's directory | + `.debug$S`, `.chks64` | nothing more | identical |
+| the source's directory | + `.debug$S`, `.chks64` | nothing more | identical |
+
+Five rules follow, and the second is the one an obvious fix gets wrong:
+
+- **ELF keeps the byte comparison.** This is a platform gap, not a total failure.
+  Normalising a field there would overlook a real difference to fix a problem that
+  platform does not have.
+- **`.debug$S` and `.chks64` are volatile with respect to the PATH, not to time —
+  so they are NOT excused.** The verifier copies the served object aside and
+  compiles to the *same* output path, so a hit this machine produced differs in the
+  clock alone and there is nothing to overlook. Excusing them anyway would buy
+  nothing and would go silent on
+  [#489](https://github.com/LASTRADA-Software/fastcached/issues/489): a hit served
+  from another checkout, whose entire difference lives in `.debug$S`. That is the
+  case an operator turns verification on to catch, and excusing it is #493 cured by
+  no longer looking — which passes every test written for #493 itself.
+- **Parsing never grants an excuse.** The one normalised region is a single header
+  field whose offset is read from a two-row layout table (`/bigobj` is an allowed
+  argument, so such a build is cacheable and its clock is at offset 8). The section
+  walk exists only to say WHERE a difference was, so a parser defect can make a
+  message vague and cannot make a wrong object pass.
+- **Which image is unreadable decides the answer, and it is asymmetric.** A FRESH
+  object this build cannot lay out is this build's blind spot — `HitVerdict::Unsupported`,
+  refusing by name, because an operator who reads "cannot verify" as "your cache is
+  broken" switches the instrument off and the guarded class goes invisible again. A
+  SERVED object that will not parse while the fresh one does is `Mismatched`: that is
+  a truncated transfer, and a real finding.
+- **Not `/Brepro`**, for the reason `dist-compile-e2e.ps1` already gives about
+  itself: it would make the comparison true about a command line no build uses.
+
+And the acceptance shape, because a verifier is the one component whose *failure to
+fire* is invisible: a correct hit verifying clean proves nothing on its own — a
+verifier that stops crying wolf by no longer looking passes that perfectly. Every
+change here also shows a deliberately corrupted object still answering `Mismatched`,
+and an object from another checkout still answering `Mismatched`, on **real compiler
+output** rather than only on synthetic bytes.
+
 ## Accepted trade-offs
 
 These are argued in place above and are **not** open work — do not "fix" one

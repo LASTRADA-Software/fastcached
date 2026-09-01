@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "HitVerification.hpp"
-
 #include "ObjectEquivalence.hpp"
 
 #include <array>
@@ -91,9 +90,12 @@ namespace
         switch (outcome)
         {
             case ObjectComparison::Identical:
-            case ObjectComparison::EquivalentApartFromVolatile: return HitVerdict::Matched;
-            case ObjectComparison::Different: return HitVerdict::Mismatched;
-            case ObjectComparison::Unsupported: return HitVerdict::Unsupported;
+            case ObjectComparison::EquivalentApartFromVolatile:
+                return HitVerdict::Matched;
+            case ObjectComparison::Different:
+                return HitVerdict::Mismatched;
+            case ObjectComparison::Unsupported:
+                return HitVerdict::Unsupported;
         }
         return HitVerdict::Inconclusive;
     }
@@ -215,10 +217,9 @@ std::string DescribeVerdict(HitVerdict verdict, std::string_view key, std::strin
                             "entry is wrong and this build is unaffected",
                             key));
         case HitVerdict::Inconclusive:
-            return withDetail(
-                std::format("fastcache-cc: could not verify the hit for key {} -- the fresh compile or the "
-                            "comparison did not complete. Nothing is known about the cached object either way",
-                            key));
+            return withDetail(std::format("fastcache-cc: could not verify the hit for key {} -- the fresh compile or the "
+                                          "comparison did not complete. Nothing is known about the cached object either way",
+                                          key));
         case HitVerdict::Unsupported:
             // NOT phrased as a finding about the cache, and that is the whole point of
             // the state: an operator who reads this as a mismatch turns verification
