@@ -25,6 +25,16 @@ namespace FastCache
 namespace
 {
 
+    /// What `Detach` writes over a withdrawn batch entry. The twin of the epoll
+    /// one -- a distinct value rather than `nullptr`, which already means "the
+    /// wake pipe", so that a withdrawal is not two facts sharing one
+    /// representation.
+    [[nodiscard]] void* WithdrawnBatchEntry() noexcept
+    {
+        static char tombstone = 0;
+        return &tombstone;
+    }
+
     constexpr auto EntryGreater = [](KqueueReactor::TimerEntry const& a, KqueueReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
@@ -189,7 +199,7 @@ void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
     for (int i = 0; i < _batch.count; ++i)
     {
         if (_batch.events[i].udata == handler)
-            _batch.events[i].udata = nullptr;
+            _batch.events[i].udata = WithdrawnBatchEntry();
     }
 
     if (handler->fd < 0 || _kq < 0)
@@ -339,6 +349,13 @@ void KqueueReactor::Run()
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
+            if (ev.udata == WithdrawnBatchEntry())
+            {
+                // `Detach` withdrew this entry after the batch was dequeued: the
+                // handler it named is being torn down. Its filters are already
+                // deleted from the kqueue.
+                continue;
+            }
             if (ev.udata == nullptr)
             {
                 // Wake-up pipe — drain any bytes so the level-triggered

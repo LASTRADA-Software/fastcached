@@ -21,6 +21,24 @@ namespace FastCache
 namespace
 {
 
+    /// What `Detach` writes over a withdrawn batch entry.
+    ///
+    /// A distinct value rather than `nullptr`, which already means "the wake
+    /// event": reusing it would send every withdrawn entry through the wake
+    /// branch and drain the eventfd counter for a reason that has nothing to do
+    /// with a wake. That happens to be harmless today -- `DrainPendingSubmits()`
+    /// runs unconditionally at the end of every iteration, so a consumed wake
+    /// costs nothing -- but it is two facts sharing one representation, which is
+    /// how the next reader is misled.
+    ///
+    /// The address of a private object, so it can equal no handler and no
+    /// nullptr.
+    [[nodiscard]] void* WithdrawnBatchEntry() noexcept
+    {
+        static char tombstone = 0;
+        return &tombstone;
+    }
+
     /// Min-heap comparator: earlier deadline wins, FIFO on ties.
     constexpr auto EntryGreater = [](EpollReactor::TimerEntry const& a, EpollReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
@@ -137,7 +155,7 @@ void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
     for (int i = 0; i < _batch.count; ++i)
     {
         if (_batch.events[i].data.ptr == handler)
-            _batch.events[i].data.ptr = nullptr;
+            _batch.events[i].data.ptr = WithdrawnBatchEntry();
     }
 }
 
@@ -253,12 +271,16 @@ void EpollReactor::Run()
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
+            if (ev.data.ptr == WithdrawnBatchEntry())
+            {
+                // `Detach` withdrew this entry after the batch was dequeued: the
+                // handler it named is being torn down and must not be dispatched
+                // on. Its fd is already out of the epoll set.
+                continue;
+            }
             if (ev.data.ptr == nullptr)
             {
-                // Either the wake event, or an entry `Detach` withdrew after this
-                // batch was dequeued. Draining the eventfd is harmless in the
-                // second case: it is level-triggered and re-reports if it still
-                // has a count.
+                // Wake event — drain the eventfd counter and move on.
                 std::uint64_t buf {};
                 std::ignore = ::read(_wakeFd, &buf, sizeof(buf));
                 continue;
