@@ -594,6 +594,35 @@ readable and silently ignored. Every rule below has already been one of them.
   a parser with something more specific to say — the node's log-level parser, its
   cluster appliers — keeps saying it. Without the stamp a refusal names nothing,
   which is what the node's own report used to do for an unrecognised argument.
+
+- **A flag rename is not a no-op when the flag's DEFAULT was doing the work**, and
+  the rename is silent precisely where prose depended on the value rather than the
+  name. Renaming a flag is a mechanical change — the compiler finds every use, the
+  option table finds every row, and nobody re-reads the paragraphs around them,
+  because there is nothing in a rename that looks like a behaviour change.
+
+  Measured while #290 stage 3 replaced `--bind`/`--port` with `--listen-node`.
+  `cluster-e2e.sh`'s cluster-key rationale said its nodes *"leave `--bind` at the
+  wildcard ... so another machine genuinely could dial their compile ports"*. True as
+  written: `--bind` defaulted to `0.0.0.0`. The conversion rewrote it to
+  `--listen-node=127.0.0.1:<port>` and the paragraph, now naming the new flag,
+  asserted the opposite of what the fixture did — and it was the *justification* for
+  that fixture carrying a cluster key at all, so the reasoning for a deliberate
+  choice had quietly inverted while every test stayed green.
+
+  It was found by accident: `fleet-dashboard-e2e.sh` carried the same paragraph and
+  had to be converted for an unrelated reason, which put the two side by side. Nothing
+  would otherwise have looked.
+
+  This is the *citation loses its conditions* family (see
+  [`AGENT.md`](../../AGENT.md)'s caching principle) with a mechanism attached — there, a
+  measured figure travelled without the word *warm*; here, a claim travelled without
+  the default that made it true. **So when a flag is renamed, re-read the prose that
+  names it for a claim about its VALUE**, and treat a default that changed as a
+  behaviour change even though no code did. The clue is a sentence that reads as an
+  argument rather than as a label: "leaves X at the wildcard" is a claim, "set X"
+  is not.
+
 ## The daemon host, and what a machine IS
 
 - **A daemon host wraps the body, so what must reach a terminal has to happen
