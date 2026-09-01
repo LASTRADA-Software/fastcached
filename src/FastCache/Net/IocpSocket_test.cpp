@@ -122,4 +122,49 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
     REQUIRE(peer == "127.0.0.1");
 }
 
+// The listener releases its listening socket when it is destroyed, whether or
+// not `Close()` was called first.
+//
+// Worth a test because the code says the opposite at a glance: `~IocpListener`
+// is `= default`, and `Close()` is what closes the socket -- which is exactly
+// the shape that WAS a defect in `EpollListener` and `KqueueListener`, fixed in
+// #464. Here it is not one, because `Impl::~Impl()` closes both `listenSock`
+// and a half-built `current.acceptSock`, so destruction already does strictly
+// more than `Close()`. Reading `= default` and stopping there is how this got
+// filed as a leak (#465) that it never was.
+//
+// Asserted through the PORT rather than the handle, which is the Windows
+// spelling of what #464's epoll test does with `fcntl` on the raw descriptor:
+// `Detail::BindAndListen` claims the address with `SO_EXCLUSIVEADDRUSE`, so a
+// listening socket that outlived its owner would refuse the second bind with
+// `WSAEADDRINUSE`. Verified to do exactly that against a deliberately leaking
+// `~Impl`, so this passing is a reading and not a vacuum.
+//
+// It does NOT cover the separate, real hazard that an in-flight `AcceptEx`
+// completion is delivered after the owner is gone; `Close()` does not prevent
+// that either, so it is not a destructor question at all.
+TEST_CASE("An IocpListener destroyed without Close releases its listening socket", "[net][iocp][listener]")
+{
+    FastCache::Detail::EnsureNetworkInitialised();
+    FastCache::SteadyClock clock;
+    FastCache::IocpReactor reactor { clock };
+
+    std::uint16_t port = 0;
+    {
+        auto const listener = FastCache::IocpListener::Bind(reactor, "127.0.0.1", 0);
+        REQUIRE(listener);
+        INFO("BindError: " << listener->BindError());
+        REQUIRE(listener->IsBound());
+        port = listener->BoundPort();
+        REQUIRE(port != 0);
+        // Deliberately no Close(): that omission is the whole question.
+    }
+
+    auto const rebound = FastCache::IocpListener::Bind(reactor, "127.0.0.1", port);
+    REQUIRE(rebound);
+    INFO("rebind error: " << rebound->BindError());
+    REQUIRE(rebound->IsBound());
+    rebound->Close();
+}
+
 #endif // _WIN32
