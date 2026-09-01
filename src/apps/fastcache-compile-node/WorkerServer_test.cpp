@@ -764,7 +764,11 @@ TEST_CASE("A worker admits whoever its operator's policy names, scheduler or not
         // worker rather than a bare struct, and a worker is the shape under test.
         NodeConfig cfg;
         cfg.scheduler = "scheduler.internal:6675";
-        cfg.advertise = "worker-01.internal:6676";
+        // Both halves, since #290 stage 3: a routable --advertise over --listen-node's
+        // loopback default is refused, because the worker would never accept the
+        // connections it told peers to make.
+        cfg.nodeListen = "0.0.0.0:6674";
+        cfg.advertise = "worker-01.internal:6674";
         cfg.fleetMembers = row.members;
         cfg.fleetOpen = row.open;
 

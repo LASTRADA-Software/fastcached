@@ -1379,7 +1379,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// scheduler -- correctly, because such a node opens no `0xFC` port and its compiles
 /// arrive only on `--bind`.
 ///
-/// Whether the endpoint this node would advertise names only THIS machine.
+/// Whether this node accepts from the network and then tells peers to dial loopback.
 ///
 /// The wildcard's sibling, and the shape #290 stage 3 newly made the default. The
 /// advertised endpoint used to fall back to `{--bind}:{--port}`, whose bind defaults to
@@ -1388,15 +1388,81 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// machine and both fail the same silent way -- the worker registers, heartbeats, is
 /// leased out, and every remote client dials something that is not this worker.
 ///
+/// **The bind must DISAGREE with the advertise, and that clause is the whole rule.**
+/// An earlier draft refused a loopback advertise outright, on the reasoning that
+/// loopback is unreachable from another machine. True, and not a defect when the
+/// SURFACE is on loopback too: nobody else is meant to reach that node, which is the
+/// single-machine fleet this project supports and tests. The three reachability rows
+/// are one idea -- refuse when what a peer is TOLD and what this node ACCEPTS ON do
+/// not agree -- and this one is its second cell, `AdvertisesPastALoopbackBind` the
+/// third.
+///
 /// Kept a separate predicate behind a separate row rather than folded into
 /// `AdvertisesWildcard`, because the two are different operator mistakes with
 /// different remedies and one message could only serve them by describing neither. A
 /// row is the refusal here, not the predicate.
 /// @param cfg The parsed configuration.
 /// @return Whether remote clients would be told to dial their own machine.
-[[nodiscard]] bool AdvertisesLoopback(NodeConfig const& cfg)
+[[nodiscard]] bool AdvertisesLoopbackFromAReachableBind(NodeConfig const& cfg)
 {
-    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+    if (!IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg))))
+        return false;
+
+    // **And the bind has to disagree with it.** A node whose surface is ALSO on
+    // loopback is a coherent single-machine fleet, not a mistake: no remote client is
+    // supposed to reach it, so "no remote client can reach the advertised endpoint" is
+    // the configuration working rather than failing. This repository runs whole fleets
+    // that way -- `dist-compile-e2e.sh` starts a `--fleet-open` scheduler on
+    // `127.0.0.1` and advertises `127.0.0.1` -- and an earlier draft of this rule
+    // refused it, which would have broken the fixture that exercises the fleet.
+    auto const bound = RowFor(NodeSurface::Node).Resolve(cfg);
+    return std::ranges::any_of(bound, [](SurfaceEndpoint const& endpoint) { return !IsLoopbackHost(endpoint.host); });
+}
+
+/// Whether this node advertises an address peers can dial and then binds where it
+/// cannot accept them.
+///
+/// The rule's THIRD spelling, and the one reached by obeying the second's advice. A
+/// worker told to "name --advertise with an address peers can dial" sets
+/// `worker-01.internal:6674` and stops -- and `--listen-node` still defaults to
+/// loopback, so the advertised host is neither loopback nor the wildcard, both rows
+/// above pass, and the surface is bound to `127.0.0.1`. The worker registers, is
+/// leased out, and every dispatch fails to connect. Same silent shape, same
+/// consequence, arrived at from the other side.
+///
+/// **Routable is decided SYNTACTICALLY and the host is never resolved.**
+/// `StartupPolicyRejection` is a table of pure functions of the parsed configuration,
+/// and a lookup here would make this daemon's ability to start depend on the network:
+/// a resolver outage would become a refusal to boot, and an unbounded call would sit
+/// in a table whose whole contract is that it needs nothing but argv. "Neither
+/// loopback nor a wildcard" is enough -- a host that does not resolve today can be the
+/// right one at the next boot (#208), exactly as `AdvertisesWildcard` documents.
+///
+/// **Its own conditions, never "not the other two".** An earlier draft defined this as
+/// the negation of its siblings, on the reasoning that it made the three cases
+/// mutually exclusive by construction. It did -- and then row 2 was narrowed, the
+/// loopback/loopback cell stopped matching it, and fell straight through into THIS
+/// row: a coherent single-machine fleet refused with a message about an address peers
+/// cannot dial. A predicate defined by what its neighbours are not changes meaning
+/// silently whenever a neighbour does, which is the same defect as two authors of one
+/// fact, wearing the costume of a tidy invariant. Each row states what it is about.
+/// @param cfg The parsed configuration.
+/// @return Whether peers are told an address this node will not accept on.
+[[nodiscard]] bool AdvertisesPastALoopbackBind(NodeConfig const& cfg)
+{
+    // A ROUTABLE advertise, decided syntactically: neither the wildcard nor loopback.
+    // Both of those are other rows' business, and a loopback advertise over a loopback
+    // bind is not any row's business at all -- it is the single-machine fleet.
+    if (AdvertisesWildcard(cfg))
+        return false;
+    if (IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg))))
+        return false;
+
+    // The row is asked rather than `nodeListen` read, for the reason
+    // `AdvertisedEndpoint` gives: a bare port's host is decided by
+    // `NodeListenDefaultHost`, and the row is where that lives.
+    auto const bound = RowFor(NodeSurface::Node).Resolve(cfg);
+    return std::ranges::any_of(bound, [](SurfaceEndpoint const& endpoint) { return IsLoopbackHost(endpoint.host); });
 }
 
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
@@ -1622,15 +1688,38 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the package.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesLoopback(c);
+                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty())
+                         && AdvertisesLoopbackFromAReachableBind(c);
               },
-          .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
-                     "names an address only this machine can reach: it defaults to the --listen-node surface, which "
-                     "binds loopback on a node that does not schedule, so a peer dialling it reaches ITSELF. This "
-                     "worker would register, heartbeat, be leased out and never be reached, with no error at either "
-                     "end. Name BOTH: --listen-node=0.0.0.0:6674 so this worker accepts from the network, and "
-                     "--advertise=<this host>:6674 so peers are told where to find it. Naming --advertise alone "
-                     "leaves the surface on loopback and the worker still unreachable, and nothing refuses that." },
+          .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, --listen-node "
+                     "accepts from the network, and --advertise names loopback -- so every peer is told to dial "
+                     "ITSELF. This worker would register, heartbeat, be leased out and never be reached, with no "
+                     "error at either end. Give --advertise=<this host>:6674, an address peers can dial. (A node "
+                     "that binds loopback AND advertises loopback is a single-machine fleet and is fine; it is the "
+                     "disagreement between the two that cannot work.)" },
+        // The rule's third spelling, and the one an operator reaches by DOING WHAT THE
+        // ROW ABOVE TELLS THEM: name --advertise with a routable address and stop.
+        // Both rows above then pass while the surface is still on loopback, so the
+        // worker is registered, leased out and unreachable -- the same silent shape,
+        // entered through the remedy for it.
+        //
+        // A refusal that steers an operator into an unrefused failure is worse than no
+        // refusal, which is why this is part of the same change rather than a
+        // follow-up: the configuration could not arise before #290 stage 3, because
+        // --bind defaulted to the wildcard.
+        //
+        // Disjoint from its siblings by construction -- `AdvertisesPastALoopbackBind`
+        // is false whenever either of them is true -- so the order of the three is not
+        // load-bearing and no configuration can be answered by the wrong one.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesPastALoopbackBind(c);
+              },
+          .message = "--advertise names an address peers can dial, but --listen-node binds loopback, so this worker "
+                     "would never accept the connections it told them to make: it registers, heartbeats, is leased "
+                     "out, and every dispatched compile fails to connect with no error at either end. Give "
+                     "--listen-node=0.0.0.0:6674 so it accepts from the network, or drop the membership flags and "
+                     "serve this machine alone." },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "
