@@ -140,8 +140,27 @@ class EpollReactor: public IReactor
     /// no-interest (used to mute an fd after one-shot completion).
     [[nodiscard]] bool UpdateInterest(EpollFdHandler* handler, bool read, bool write) const noexcept;
 
-    /// Remove the fd from the epoll set. Safe even if Attach was never
-    /// called.
+    /// Remove the fd from the epoll set, and withdraw the handler from the batch
+    /// `Run()` is currently walking.
+    ///
+    /// The second half is the load-bearing one. `epoll_ctl(EPOLL_CTL_DEL)` stops
+    /// FUTURE reports; it does not retract what `epoll_wait` has already written
+    /// into the caller's array. So a callback that detaches and then frees its
+    /// owner leaves a dangling pointer in an entry the loop has not reached yet,
+    /// and the loop then dereferences it -- reproduced under ASan, issue #475.
+    ///
+    /// Withdrawing here rather than validating at dispatch is deliberate: at this
+    /// moment the handler is still ALIVE, so comparing pointers against it is
+    /// unambiguous and needs no generation counter. A scheme that validated a
+    /// dequeued pointer after the fact would have to survive address reuse, which
+    /// a bare pointer set cannot.
+    ///
+    /// This is why `Detach` must be called BEFORE the owner is freed. Every path
+    /// does: `EpollSocket::Close` and `EpollListener::Close` both detach, and both
+    /// destructors call `Close`.
+    ///
+    /// Safe even if Attach was never called.
+    /// @param handler The handler to remove. Must still be alive.
     void Detach(EpollFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
@@ -156,6 +175,16 @@ class EpollReactor: public IReactor
   private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
+
+    /// The batch `Run()` is walking, published so `Detach` can withdraw an entry
+    /// from it. Null whenever no batch is in flight. Reactor-thread only, like
+    /// the loop itself -- see the note on `Detach`.
+    struct DequeuedBatch
+    {
+        epoll_event* events { nullptr };
+        int count { 0 };
+    };
+    DequeuedBatch _batch;
 
     IClock& _clock;
     int _epollFd { -1 };

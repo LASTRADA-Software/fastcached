@@ -25,6 +25,16 @@ namespace FastCache
 namespace
 {
 
+    /// What `Detach` writes over a withdrawn batch entry. The twin of the epoll
+    /// one -- a distinct value rather than `nullptr`, which already means "the
+    /// wake pipe", so that a withdrawal is not two facts sharing one
+    /// representation.
+    [[nodiscard]] void* WithdrawnBatchEntry() noexcept
+    {
+        static char tombstone = 0;
+        return &tombstone;
+    }
+
     constexpr auto EntryGreater = [](KqueueReactor::TimerEntry const& a, KqueueReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
             return a.deadline > b.deadline;
@@ -176,7 +186,23 @@ bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool wri
 
 void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
 {
-    if (!handler || handler->fd < 0 || _kq < 0)
+    if (!handler)
+        return;
+
+    // Withdraw this handler from the batch Run() is walking, before anything
+    // else. EV_DELETE below stops future reports and does not retract entries
+    // kevent() has already written -- #475. The handler is still alive here, so
+    // the comparison is against a live pointer.
+    //
+    // The whole array is scanned, already-dispatched entries included: nulling
+    // one of those is a no-op and it avoids an off-by-one against the cursor.
+    for (int i = 0; i < _batch.count; ++i)
+    {
+        if (_batch.events[i].udata == handler)
+            _batch.events[i].udata = WithdrawnBatchEntry();
+    }
+
+    if (handler->fd < 0 || _kq < 0)
         return;
     // EV_RECEIPT for the same reason as UpdateInterest: without an eventlist an
     // ENOENT on the first delete (a filter that was never armed) would abort the
@@ -306,12 +332,30 @@ void KqueueReactor::Run()
         // embedded in, which makes the second entry's `udata` dangle. Whatever is
         // skipped is re-reported on the next kevent(), because these filters are
         // level-triggered, so the cost is one extra loop turn.
+        //
+        // This covers ONE handler reported twice. It does NOT cover handler i
+        // freeing the owner of handler j -- this comment read as though it did,
+        // which is how #475 stayed invisible on both POSIX reactors. What covers
+        // that is `Detach` nulling the entry, not anything here.
+        // Published so `Detach` can withdraw an entry from this array: a callback
+        // below can free the object another entry's handler lives in, and
+        // EV_DELETE does not retract what kevent() already wrote here (#475).
+        // Cleared before leaving the batch.
+        _batch = DequeuedBatch { .events = events, .count = n };
+
         std::array<void*, Batch> serviced {};
         std::size_t servicedCount = 0;
 
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
+            if (ev.udata == WithdrawnBatchEntry())
+            {
+                // `Detach` withdrew this entry after the batch was dequeued: the
+                // handler it named is being torn down. Its filters are already
+                // deleted from the kqueue.
+                continue;
+            }
             if (ev.udata == nullptr)
             {
                 // Wake-up pipe — drain any bytes so the level-triggered
@@ -343,6 +387,8 @@ void KqueueReactor::Run()
             serviced[servicedCount++] = ev.udata;
             callback(handler);
         }
+
+        _batch = DequeuedBatch {};
 
         DrainPendingSubmits();
         FireExpiredTimers();

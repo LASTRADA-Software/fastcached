@@ -6,6 +6,8 @@
 
 #if defined(__APPLE__)
 
+    #include <sys/event.h> // struct kevent, named by the dequeued-batch member below
+
     #include <atomic>
     #include <coroutine>
     #include <cstdint>
@@ -78,6 +80,22 @@ class KqueueReactor: public IReactor
     [[nodiscard]] bool UpdateInterest(KqueueFdHandler* handler, bool read, bool write) const noexcept;
 
     /// Remove the fd from the kqueue.
+    /// Remove the fd from the kqueue, and withdraw the handler from the batch
+    /// `Run()` is currently walking.
+    ///
+    /// The second half is the load-bearing one, and it is the twin of
+    /// `EpollReactor::Detach` -- see there for the full reasoning. In short:
+    /// `EV_DELETE` stops FUTURE reports and does not retract what `kevent` has
+    /// already written into the caller's array, so a callback that detaches and
+    /// then frees its owner leaves a dangling `udata` in an entry the loop has
+    /// not reached yet. Issue #475.
+    ///
+    /// The `serviced` array in `Run()` does NOT cover this. It dedupes one
+    /// handler reported under two filters in the same batch, which is a
+    /// different case.
+    ///
+    /// Must be called BEFORE the owner is freed; every path does.
+    /// @param handler The handler to remove. Must still be alive.
     void Detach(KqueueFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
@@ -92,6 +110,17 @@ class KqueueReactor: public IReactor
   private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
+
+    /// The batch `Run()` is walking, published so `Detach` can withdraw an entry
+    /// from it. Null whenever no batch is in flight.
+    struct DequeuedBatch
+    {
+        struct kevent* events { nullptr }; // ::kevent is also a FUNCTION on Darwin, so the
+                                           // elaborated form is required, and it resolves to the
+                                           // declaration <sys/event.h> above already made
+        int count { 0 };
+    };
+    DequeuedBatch _batch;
 
     IClock& _clock;
     int _kq { -1 };

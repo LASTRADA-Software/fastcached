@@ -21,6 +21,24 @@ namespace FastCache
 namespace
 {
 
+    /// What `Detach` writes over a withdrawn batch entry.
+    ///
+    /// A distinct value rather than `nullptr`, which already means "the wake
+    /// event": reusing it would send every withdrawn entry through the wake
+    /// branch and drain the eventfd counter for a reason that has nothing to do
+    /// with a wake. That happens to be harmless today -- `DrainPendingSubmits()`
+    /// runs unconditionally at the end of every iteration, so a consumed wake
+    /// costs nothing -- but it is two facts sharing one representation, which is
+    /// how the next reader is misled.
+    ///
+    /// The address of a private object, so it can equal no handler and no
+    /// nullptr.
+    [[nodiscard]] void* WithdrawnBatchEntry() noexcept
+    {
+        static char tombstone = 0;
+        return &tombstone;
+    }
+
     /// Min-heap comparator: earlier deadline wins, FIFO on ties.
     constexpr auto EntryGreater = [](EpollReactor::TimerEntry const& a, EpollReactor::TimerEntry const& b) noexcept {
         if (a.deadline != b.deadline)
@@ -117,10 +135,28 @@ bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write
 
 void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 {
-    if (!handler || handler->fd < 0 || _epollFd < 0)
+    if (!handler)
         return;
-    epoll_event ev {};
-    ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, handler->fd, &ev);
+
+    if (handler->fd >= 0 && _epollFd >= 0)
+    {
+        epoll_event ev {};
+        ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, handler->fd, &ev);
+    }
+
+    // Withdraw this handler from the batch Run() is walking. EPOLL_CTL_DEL above
+    // stops future reports and does nothing about entries epoll_wait has already
+    // written, which is the whole of #475. The handler is still alive here, so
+    // the comparison is against a live pointer and needs no generation counter.
+    //
+    // The whole array is scanned, including entries already dispatched: nulling
+    // one of those is a no-op, and it keeps this free of an off-by-one against
+    // the loop's cursor.
+    for (int i = 0; i < _batch.count; ++i)
+    {
+        if (_batch.events[i].data.ptr == handler)
+            _batch.events[i].data.ptr = WithdrawnBatchEntry();
+    }
 }
 
 void EpollReactor::Submit(std::coroutine_handle<> handle)
@@ -225,9 +261,23 @@ void EpollReactor::Run()
             return;
         }
 
+        // Published so `Detach` can withdraw an entry from this array. A callback
+        // below can free the object another entry's handler lives in, and
+        // EPOLL_CTL_DEL does not retract what epoll_wait already wrote here --
+        // #475, reproduced under ASan. Cleared before leaving the batch so a
+        // Detach outside the loop scans nothing.
+        _batch = DequeuedBatch { .events = events, .count = n };
+
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
+            if (ev.data.ptr == WithdrawnBatchEntry())
+            {
+                // `Detach` withdrew this entry after the batch was dequeued: the
+                // handler it named is being torn down and must not be dispatched
+                // on. Its fd is already out of the epoll set.
+                continue;
+            }
             if (ev.data.ptr == nullptr)
             {
                 // Wake event — drain the eventfd counter and move on.
@@ -242,9 +292,17 @@ void EpollReactor::Run()
             // level-triggered fd is re-reported forever and the loop spins, and a
             // second callback must not run because the first may have resumed a
             // coroutine that freed the object `handler` lives in.
+            //
+            // That covers ONE handler reported twice in this batch. It does NOT
+            // cover handler i freeing the owner of handler j -- for years this
+            // comment read as though it did, which is how #475 stayed invisible.
+            // What covers that is `Detach` nulling the entry above, not anything
+            // here.
             if (auto* const callback = SelectEpollCallback(*handler, ev.events); callback != nullptr)
                 callback(handler);
         }
+
+        _batch = DequeuedBatch {};
 
         DrainPendingSubmits();
         FireExpiredTimers();
