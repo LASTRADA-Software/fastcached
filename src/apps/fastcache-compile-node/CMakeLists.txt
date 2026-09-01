@@ -58,7 +58,6 @@ add_executable(fastcache-compile-node
     WorkerLease.cpp
     CompileCapacity.cpp
     CompileResponder.cpp
-    WorkerServer.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -76,7 +75,7 @@ install(TARGETS fastcache-compile-node
     COMPONENT Runtime
 )
 
-# The node's own unit tests. WorkerServer, AdminEndpoint and SchedulerEndpoint are
+# The node's own unit tests. AdminEndpoint and SchedulerEndpoint are
 # the only sources here that the launcher's test binary does not already cover --
 # and each of the last two lives outside main.cpp precisely so that it can be.
 if(FASTCACHED_BUILD_TESTS)
@@ -122,8 +121,6 @@ if(FASTCACHED_BUILD_TESTS)
         CompileCapacity.cpp
         CompileResponder.cpp
         CompileResponder_test.cpp
-        WorkerServer.cpp
-        WorkerServer_test.cpp
         ${_fc_node_shared}
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE

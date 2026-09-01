@@ -109,10 +109,9 @@ TEST_CASE("A surface resolving from its own spec has a default host to resolve a
             // depends on the configuration (loopback on a worker, the wildcard on a
             // scheduler), which one constant cannot hold: `NodeListenDefaultHost`
             // decides it, and a value here would be a second author of that rule.
-            CHECK((row.surface == NodeSurface::Compile || row.surface == NodeSurface::Node));
+            CHECK(row.surface == NodeSurface::Node);
     }
 
-    CHECK(RowFor(NodeSurface::Compile).defaultHost.empty());
     CHECK(RowFor(NodeSurface::Node).defaultHost.empty());
     CHECK_FALSE(RowFor(NodeSurface::Discovery).defaultHost.empty());
 }
@@ -132,12 +131,9 @@ TEST_CASE("A default configuration serves the two surfaces that are on", "[node]
         if (!row.Resolve(cfg).empty())
             served.push_back(row.name);
 
-    CHECK(served == std::vector<std::string_view> { "compile", "node" });
-
-    auto const compile = RowFor(NodeSurface::Compile).Resolve(cfg);
-    REQUIRE(compile.size() == 1);
-    CHECK(compile.front().host == "0.0.0.0");
-    CHECK(compile.front().port == 6676);
+    // ONE protocol surface on a default configuration, where there were two. The
+    // dedicated compile port is gone and its verbs arrive here (#290 stage 3).
+    CHECK(served == std::vector<std::string_view> { "node" });
 
     // The default an operator reads off the startup line, and the address
     // `fastcache-cc` looks for when nobody sets `FASTCACHE_ADDR`.
@@ -375,14 +371,20 @@ TEST_CASE("A surface that is configured and still off is not answered 'set the f
     CHECK_FALSE(wrong.contains("set --listen-node"));
 }
 
-TEST_CASE("The compile port's note says what its flags stop describing", "[node][surfaces]")
+TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][surfaces]")
 {
     // Not a spelling check on prose -- the assertion is that the row carries the
-    // caveat at all. `--bind` and `--port` are read by nothing under socket
-    // activation, so a worksheet printing them without saying so sends an operator
-    // to open a port the node is not on, and the surface they actually need is one
-    // nothing printed. The general rule is in distributed-compilation.md; this is
-    // the third consumer of the same flag to meet it.
-    CHECK(RowFor(NodeSurface::Compile).note.contains("--advertise"));
-    CHECK(RowFor(NodeSurface::Compile).note.contains(".socket"));
+    // caveat at all. It moved here with the verbs: under socket activation the unit
+    // owns the address, so a worksheet printing this row's flag without saying so
+    // sends an operator to open a port the node is not on, and the surface they
+    // actually need is one nothing printed. The general rule is in
+    // distributed-compilation.md.
+    //
+    // **Both halves stay asserted while activation is unwired**, which is the point
+    // of keeping this case rather than deleting it with the row it used to name: the
+    // note currently records that this surface does not serve an inherited
+    // descriptor yet, and the last stitch of #290 stage 3 has to change the note and
+    // this case together.
+    CHECK(RowFor(NodeSurface::Node).note.contains("--advertise"));
+    CHECK(RowFor(NodeSurface::Node).note.contains(".socket"));
 }

@@ -17,10 +17,10 @@ namespace FastCache::Node
 
 /// A port this node LISTENS on.
 ///
-/// The vocabulary is surfaces rather than flags, because two of the five are not one
-/// flag: the compile port is `--bind` and `--port` together, and discovery is an
-/// address plus an optional private reply port. A `ListenFlag` enum would have had
-/// to leave both out, which is how the port map came to live in five places.
+/// The vocabulary is surfaces rather than flags, because one of the four is not one
+/// flag: discovery is an address plus an optional private reply port. A `ListenFlag`
+/// enum would have had to leave it out, which is how the port map came to live in
+/// five places.
 ///
 /// `--advertise` is deliberately **not** here. It is what this node tells other
 /// machines to dial, not a socket it opens -- it defaults to what the `Node` row
@@ -29,19 +29,21 @@ namespace FastCache::Node
 /// still miss whatever the supervisor actually chose.
 enum class NodeSurface : std::uint8_t
 {
-    Compile = 0, ///< Where clients send translation units to be compiled.
     /// This node's own `0xFC` port: the cache verbs `fastcache-cc` on this machine
-    /// reads and writes through, this node's own compile verbs, and -- with
+    /// reads and writes through, the compiles clients dispatch to it, and -- with
     /// `--serve-scheduler` -- the verbs the fleet asks this node for capacity with
     /// while it leads.
     ///
-    /// **One surface where there were two** (#290). They were separated by the port
-    /// they arrived on, which made the listener the policy: a frame on the cache port
-    /// was a cache frame. That is now a lookup instead, and every question the
+    /// **One surface where there were three** (#290). They were separated by the port
+    /// a frame arrived on, which made the listener the policy: a frame on the cache
+    /// port was a cache frame. That is now a lookup instead, and every question the
     /// listener used to answer by existing -- who is admitted, whether a credential is
     /// required, which counter a refusal moves -- is asked of the component that owns
     /// the verb. See `MergedResponder`.
-    Node,
+    ///
+    /// It is the ONLY port a worker opens for the protocol, so a node serving nothing
+    /// else still binds it: there is nowhere else for a compile to arrive.
+    Node = 0,
     Admin,     ///< `/metrics`, `/healthz` and the fleet dashboard.
     Raft,      ///< Where this node's peers send consensus traffic.
     Discovery, ///< The LAN beacon, and the port it is answered on.
@@ -108,10 +110,10 @@ struct SurfaceRow
     /// The operator-facing label, and the tag the startup lines already use.
     std::string_view name;
 
-    /// The flags that configure it: one, or two for the compile port and discovery.
+    /// The flags that configure it: one, or two for discovery.
     ///
     /// One field rather than a `flag` plus a `secondFlag` that is empty for three rows
-    /// out of five. The second entry is empty when the surface takes one flag, and
+    /// out of four. The second entry is empty when the surface takes one flag, and
     /// `FlagsOf` hands back only what is populated.
     std::array<std::string_view, 2> flags {};
 

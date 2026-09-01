@@ -253,9 +253,8 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // A configuration in which no field holds its default, so every emitter fires.
     NodeConfig cfg;
     cfg.scheduler = "cache.internal:6675";
-    cfg.advertise = "worker-01.internal:6676";
-    cfg.bindAddress = "10.0.0.4";
-    cfg.port = 7777;
+    cfg.advertise = "worker-01.internal:6674";
+    cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
     // Off, because this case gives every field a value differing from its default
     // so that every emitter fires -- and this one's default is on.
@@ -1329,9 +1328,6 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // right and is why the rule is about DISAGREEMENT rather than reachability.
         NodeConfig singleMachine;
         singleMachine.scheduler = "127.0.0.1:6675";
-        // Still named until stage 3 deletes the flag: `CompilePortFacesTheNetwork`
-        // asks BOTH doors, and `--bind` still defaults to the wildcard.
-        singleMachine.bindAddress = "127.0.0.1";
         singleMachine.nodeListen = "127.0.0.1:6674";
         singleMachine.advertise = "127.0.0.1:6674";
         singleMachine.fleetOpen = true;
@@ -2096,9 +2092,15 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
     // Which flags carry text the fleet reads is a COLUMN of the option table, and
     // this pins the column rather than the parser -- `Cli/Options_test.cpp` covers
     // what `ParseUtf8Text` does. Every one of these ends up in a peer's
-    // `ClusterState` or in a registration: `--advertise` and `--bind` become the
-    // endpoint clients dial, `--node-id` and `--raft-peer` a member's identity and
-    // the address its peers dial it at.
+    // `ClusterState` or in a registration: `--advertise` becomes the endpoint clients
+    // dial, `--node-id` and `--raft-peer` a member's identity and the address its
+    // peers dial it at.
+    //
+    // The extent is DERIVED with `to_array` rather than written down. It was
+    // `std::array<Row, 4>`, and removing the `--bind` row when #290 stage 3 deleted
+    // the flag left a fourth row value-initialized to null pointers -- which
+    // segfaulted the whole binary mid-run, taking a hundred later cases with it and
+    // reporting as a shrunken test count rather than as a crash.
     //
     // Accepted here, such a value is refused by `SchedulerService::Register` on
     // every heartbeat forever, and the operator's only recovery is to rename the
@@ -2117,13 +2119,8 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
         char const* utf8;   ///< The same value, spelled in UTF-8.
     };
 
-    constexpr std::array<Row, 4> Rows { {
+    constexpr auto Rows = std::to_array<Row>({
         { .flag = "--advertise",
-          .latin1 = "gr\xFC"
-                    "n",
-          .utf8 = "gr\xC3\xBC"
-                  "n" },
-        { .flag = "--bind",
           .latin1 = "gr\xFC"
                     "n",
           .utf8 = "gr\xC3\xBC"
@@ -2138,7 +2135,7 @@ TEST_CASE("A flag whose value other machines read refuses one that is not text",
                     "n=h:1234",
           .utf8 = "gr\xC3\xBC"
                   "n=h:1234" },
-    } };
+    });
 
     for (auto const& row: Rows)
     {
@@ -2317,7 +2314,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // install into a service that registers cleanly and refuses at every boot.
     //
     // Asserted rather than reasoned about. The lease rule reads `clusterKeyFile`,
-    // `bindAddress` and the membership fields and none of the cache ones, so by
+    // `nodeListen` and the membership fields and none of the cache ones, so by
     // inspection it cannot refuse these -- but "by inspection" is what this file
     // exists to replace, and the next rule added to either table gets this case for
     // free.
@@ -2337,7 +2334,6 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // reason it is not about. `Installable()` names a routable pair because that is
     // the ordinary fleet worker; pinning the bind to its default makes this the
     // single-machine one, and both halves move together.
-    cfg.bindAddress = "127.0.0.1";
     cfg.advertise = "127.0.0.1:6674";
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
@@ -2423,21 +2419,22 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         // answers on 127.0.0.1 alone. Refusing that would refuse a configuration in
         // which no other machine can dial the compile port at all.
         auto loopbackBound = Installable();
-        // Expressed on `--listen-node` since #290 stage 3: that is the bind now, and
-        // the advertise has to agree with it or the reachability rows refuse the
+        // Expressed on `--listen-node`, which since #290 stage 3 is the bind. The
+        // advertise has to agree with it, or the reachability rows refuse the
         // disagreement rather than the loopback.
-        loopbackBound.bindAddress = "127.0.0.1";
         loopbackBound.nodeListen = "127.0.0.1:6674";
         loopbackBound.advertise = "127.0.0.1:6674";
         loopbackBound.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
 
-        // And the default bind is the WILDCARD, so the same node without that flag
-        // is refused -- which is what makes the check worth having rather than
-        // something an ordinary deployment slips past.
+        // And a node that ACCEPTS from the network while advertising loopback is
+        // refused, which is what makes the check worth having rather than something an
+        // ordinary deployment slips past. Asserted on `--listen-node` now: `--bind` is
+        // gone, and its wildcard default was what used to express this.
         auto wildcardBound = Installable();
         wildcardBound.fleetOpen = true;
-        CHECK(wildcardBound.bindAddress == "0.0.0.0");
+        wildcardBound.nodeListen = "0.0.0.0:6674";
+        wildcardBound.advertise = "127.0.0.1:6674";
         CHECK(StartupPolicyRejection(wildcardBound).has_value());
     }
 

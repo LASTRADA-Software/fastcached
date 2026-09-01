@@ -108,23 +108,6 @@ namespace
     /// row that claims to describe surface 0.
     constexpr auto Surfaces = EnumTable<NodeSurface, SurfaceRow> {
         SurfaceRow {
-            .surface = NodeSurface::Compile,
-            .name = "compile",
-            .flags = { "--bind", "--port" },
-            .protocol = SurfaceProtocol::Tcp,
-            .defaultHost = {},
-            // No spec: the halves are a `std::string` and a `std::uint16_t` with their
-            // own value parsers, so there is no text for a grammar to judge.
-            .spec = nullptr,
-            .grammar = {},
-            .resolve = [](SurfaceRow const& /*row*/, NodeConfig const& cfg) -> SurfaceEndpoints {
-                return SurfaceEndpoints { SurfaceEndpoint { .host = cfg.bindAddress, .port = cfg.port } };
-            },
-            .note = "a systemd .socket unit overrides --bind and --port entirely; the unit then owns the "
-                    "address and this process is never told which port it got, so --advertise is what names "
-                    "where clients actually go",
-        },
-        SurfaceRow {
             .surface = NodeSurface::Node,
             .name = "node",
             .flags = { "--listen-node", {} },
@@ -171,7 +154,10 @@ namespace
                 resolved.defaultHost = NodeListenDefaultHost(cfg);
                 return ResolveFromSpec(resolved, cfg);
             },
-            .note = "one 0xFC port for the cache verbs, this node's own compile verbs, and -- with "
+            .note = "a systemd .socket unit is NOT yet served on this surface: the unit owns the address and "
+                    "--advertise is what names where clients go, but an inherited descriptor cannot be adopted "
+                    "onto the reactor yet, so an activated worker is refused at startup rather than left "
+                    "listening on nothing. one 0xFC port for the cache verbs, this node's own compile verbs, and -- with "
                     "--serve-scheduler -- the scheduler verbs. A bare "
                     "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
                     "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "

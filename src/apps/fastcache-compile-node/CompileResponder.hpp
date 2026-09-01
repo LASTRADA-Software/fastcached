@@ -3,7 +3,6 @@
 
 #include "CompileCapacity.hpp"
 #include "FrameEndpoint.hpp"
-#include "WorkerServer.hpp"
 
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>

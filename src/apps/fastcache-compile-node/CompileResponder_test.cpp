@@ -345,7 +345,7 @@ TEST_CASE("A stopping worker admits no more compiles", "[node][compile-responder
 {
     // `CompileCapacity::BeginShutdown` closes the accept loop's door by making its
     // condition false; this surface has no loop, so it has to ask. Without it a compile
-    // admitted after `~WorkerServer` began waiting would be a job the drain had already
+    // admitted after `~CompileCapacity` began waiting would be a job the drain had already
     // stopped counting on -- started against members it is about to free.
     Fixture fix;
     ThreadPoolExecutor reactor { 1 };
@@ -739,12 +739,15 @@ class IdleListener final: public IListener
 /// thing three cases would each have to get right.
 struct MergedWorker
 {
-    IdleListener listener;
     HoldingRunner runner;
     Cc::CompileJobRunner jobs;
     Cc::WorkerProtocol protocol;
     ThreadPoolExecutor pool { 2 };
-    WorkerServer server;
+    // The accounting on its own. It was reached through a `WorkerServer`, which was
+    // this object plus the accept loop #290 stage 3 retired -- and the loop was never
+    // what these cases were about: they exercise the merged surface's responder, which
+    // has always spent the capacity rather than the listener.
+    CompileCapacity capacity;
     CompileResponder responder;
 
     /// @param fix Supplies the scratch directory, metrics, logger and membership.
@@ -773,8 +776,8 @@ struct MergedWorker
         // see. None of the three figures means anything quoted alone.
         //
         // It is NOT what makes these cases correct -- see the destructor.
-        server { listener, protocol, 2, fix.membership, fix.metrics, fix.logger, pool, std::chrono::seconds { 5 } },
-        responder { protocol, server.Capacity(), fix.membership, pool, io.Reactor(), fix.metrics, fix.logger }
+        capacity { 2, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fix.logger },
+        responder { protocol, capacity, fix.membership, pool, io.Reactor(), fix.metrics, fix.logger }
     {
     }
 
@@ -819,7 +822,7 @@ struct MergedWorker
         // for the whole of a destructor BODY, since member destruction happens after it.
         // `Release` is idempotent, so the cases that already released pay nothing.
         runner.Release();
-        server.StopAndWait();
+        capacity.Drain();
     }
 };
 
@@ -906,8 +909,8 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // abandons. Measured: the assertion text survived, the exit code was still 75 and
     // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
     // BODY, where the endpoint is alive and the reactor still turning.
-    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
-    worker.server.StopAndWait();
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
 }
 
 TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][compile-responder]")
@@ -968,8 +971,8 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     // abandons. Measured: the assertion text survived, the exit code was still 75 and
     // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
     // BODY, where the endpoint is alive and the reactor still turning.
-    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
-    worker.server.StopAndWait();
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
 }
 
 TEST_CASE("A compile in flight is drained before anything can stop the reactor", "[node][compile-responder]")
@@ -1005,7 +1008,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
 
     // The compile is on the pool and its slot is held, so the drain below has something
     // real to wait for rather than passing vacuously.
-    REQUIRE(worker.server.Capacity().InFlight() == 1);
+    REQUIRE(worker.capacity.InFlight() == 1);
 
     worker.runner.Release();
 
@@ -1021,11 +1024,11 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     // abandons. Measured: the assertion text survived, the exit code was still 75 and
     // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
     // BODY, where the endpoint is alive and the reactor still turning.
-    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
-    worker.server.StopAndWait();
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
 
     // 1. The drain waited for the hop HOME, not merely for the compiler to exit.
-    CHECK(worker.server.Capacity().InFlight() == 0);
+    CHECK(worker.capacity.InFlight() == 0);
 
     // 2. And it returned while the reactor was still turning -- the ordering itself
     //    rather than a proxy for it. A drain finishing after the loops had ended would

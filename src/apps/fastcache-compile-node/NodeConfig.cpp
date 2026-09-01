@@ -486,28 +486,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .operand = "=<host:port>",
             .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
             .description = "host:port CLIENTS should use to reach this worker.\n"
-                           "Defaults to --bind and --port, which is wrong behind NAT\n"
-                           "or on a multi-homed host: the scheduler hands this string\n"
-                           "to clients verbatim, so a worker that advertises an\n"
-                           "address only it can reach is leased and then never\n"
-                           "answers.",
+                           "Defaults to --listen-node, which binds loopback unless\n"
+                           "widened: the scheduler hands this string to clients\n"
+                           "verbatim, so a worker that advertises an address only it\n"
+                           "can reach is leased and then never answers.",
             .yamlKey = "advertise",
-        },
-        {
-            .primary = "--bind",
-            .arity = Arity::Value,
-            .operand = "=<address>",
-            .apply = AssignFrom<&NodeConfig::bindAddress, ParseUtf8Text>(),
-            .description = "address to listen on (default 0.0.0.0)",
-            .yamlKey = "bind",
-        },
-        {
-            .primary = "--port",
-            .arity = Arity::Value,
-            .operand = "=<n>",
-            .apply = AssignFrom<&NodeConfig::port, ParseNodePort>(),
-            .description = "port to listen on (default 6676)",
-            .yamlKey = "port",
         },
         {
             .primary = "--toolchain",
@@ -1151,8 +1134,6 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
 
     emitIfSet("scheduler", cfg.scheduler, defaults.scheduler);
     emitIfSet("advertise", cfg.advertise, defaults.advertise);
-    emitIfSet("bind", cfg.bindAddress, defaults.bindAddress);
-    emitIfSet("port", cfg.port, defaults.port);
     emitIfSet("slots", cfg.slots, defaults.slots);
     emitIfSet("node-class",
               std::string { Distributed::TraitsFor(cfg.nodeClass).name },
@@ -1311,9 +1292,8 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
         return cfg.advertise;
 
     // The fallback is the `Node` surface, which is where a dispatched compile now
-    // ARRIVES (#290 stage 3). It was `{--bind}:{--port}`, the dedicated compile port,
-    // and telling clients to dial a port this node no longer serves compiles on is the
-    // failure this whole stage exists to avoid -- silent at both ends, because the
+    // ARRIVES. It was `{--bind}:{--port}`, a dedicated compile port that no longer
+    // exists -- telling clients to dial one would be silent at both ends, because the
     // registration still succeeds.
     //
     // Resolved through the surface row rather than read off `nodeListen`, because a
@@ -1363,13 +1343,16 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 
 /// Whether a machine that is not this one could reach this node's COMPILE verbs.
 ///
-/// **TWO ports answer them, and asking about one is how an open surface passes a
-/// startup table.** `--bind` was the whole answer until #290's second half gave the
-/// compile verbs a second door on the merged `0xFC` listener -- whose bare-port host
-/// is the WILDCARD on any node passing `--serve-scheduler`. So
+/// **ONE port answers them now**, and this function is what is left of a rule that
+/// once had to ask two. `--bind` was the whole answer until the compile verbs gained a
+/// second door on the merged `0xFC` listener, and for one release the question was the
+/// disjunction: asking either half alone let an open surface pass this table --
 /// `--bind 127.0.0.1 --serve-scheduler --fleet-open` with no `--cluster-key-file`
 /// looked local, passed, and served unauthenticated compiles on a wildcard-bound port
-/// with every `worker_jobs_refused_lease_*` counter reading zero.
+/// with every `worker_jobs_refused_lease_*` counter reading zero. #290 stage 3 retires
+/// the dedicated port, so the surface row is the whole answer again -- and it is the
+/// row rather than `--listen-node`, because a bare port's host is decided by
+/// `NodeListenDefaultHost`.
 ///
 /// The node surface is asked of its own ROW rather than re-deriving the host here,
 /// which is the rule the dashboard credential rule below already follows: that row's
@@ -1475,9 +1458,6 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 ///         machine.
 [[nodiscard]] bool CompilePortFacesTheNetwork(NodeConfig const& cfg)
 {
-    if (!IsLoopbackHost(cfg.bindAddress))
-        return true;
-
     auto const nodePort = RowFor(NodeSurface::Node).Resolve(cfg);
     return std::ranges::any_of(nodePort, [](SurfaceEndpoint const& endpoint) { return !IsLoopbackHost(endpoint.host); });
 }

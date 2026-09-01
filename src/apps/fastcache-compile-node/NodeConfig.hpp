@@ -72,8 +72,6 @@ struct NodeConfig
 {
     std::string scheduler; ///< host:port of the scheduler's dispatch endpoint.
     std::string advertise; ///< host:port clients should reach this worker on.
-    std::string bindAddress { "0.0.0.0" };
-    std::uint16_t port { 6676 };
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
     /// worker to exactly that set, and naming none means "serve what this machine
