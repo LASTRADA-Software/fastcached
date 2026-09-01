@@ -69,6 +69,18 @@
 #
 # Exit codes: 0 always. The verdict is the presence of `CMake Error` in the output.
 
+# A `cmake -P` script has no project, so every policy starts unset and CMP0057
+# (`if(... IN_LIST ...)`) is one of them -- unset, the operator is an unknown
+# argument and the script errors out rather than answering. Stated as a minimum
+# version so the whole set moves together with the project's own.
+#
+# This was already written down in `check-node-config-reference.cmake`, and this
+# script shipped without it: green on CMake 4.3.1, dead on 3.28, which is the
+# version this project declares and the one CI runs. A check that errors out is
+# not a check that passed -- but it reports through the same channel, so only the
+# gate on the OTHER platform could tell the difference.
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -127,8 +139,16 @@ endforeach()
 # Read and split by hand rather than with `file(STRINGS)`, which returns a LIST: a
 # line containing a semicolon becomes two elements and every line number after it
 # drifts. C++ is made of semicolons, so this is not a corner case here.
+# Backslashes are escaped FIRST, and that ordering is the whole point. A source line
+# ending in `\` -- a macro continuation -- otherwise leaves a trailing escape in its
+# list element, `foreach(... IN LISTS ...)` reads it as escaping the separator, and the
+# line merges with the next one. Detection survives that (the text is still there) but
+# every reported line number after it is wrong, and the `file:line` is the only thing a
+# person has to act on. Inherited from when this ran over four named files; it now runs
+# over 413.
 function(fastcached_read_lines path outVar)
     file(READ "${path}" content)
+    string(REPLACE "\\" "\\\\" content "${content}")
     string(REPLACE ";" "\\;" content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
     string(REPLACE "\n" ";" lines "${content}")
@@ -171,9 +191,10 @@ set(excludePatterns
 # The scan: every call to the raw encoder, every untriaged refusal, and every
 # refusal spelling the primitive actually offers.
 set(violations "")
-set(encoderSeen FALSE)
+set(refusalEncoderCalls 0)
+set(wireEncoderCalls 0)
 set(untriaged "")
-set(issueTokens "")
+set(untriagedFiles "")
 set(definedSpellings "")
 set(scannedCount 0)
 
@@ -202,10 +223,19 @@ foreach(relative IN LISTS sources)
     # of them cost 2.9 s of a DEFAULT-set ctest entry, on every platform, to find
     # matches in ten files. Whole-file `FIND` first takes that to ~0.3 s.
     #
-    # Exact, not approximate: each needle is a strict prefix of the regex that would
-    # have matched it, so no hit can be lost. The `constexpr std::uint32_t` scan is
-    # exempt because its results are only ever read back keyed on the SAME file, and a
-    # file with no `.issue` has nothing to read them.
+    # **This is not an approximation, and the difference matters to whoever reads it
+    # next.** A substring filter in front of a regex pass usually IS one -- a cheap
+    # guess that trades recall for speed -- and a reader who assumes that will either
+    # "fix" it or stop trusting the check. This one cannot skip a match: each needle is
+    # a strict PREFIX of the regex it guards, so any line the regex would match
+    # contains the needle, and a file containing no needle contains no such line. The
+    # filter can therefore produce false POSITIVES -- files opened and split for
+    # nothing, which costs only time -- and never a false negative. A filter that
+    # cannot hide a call site is a different object from one that probably will not.
+    #
+    # The `constexpr std::uint32_t` scan is exempt because its results are only ever
+    # read back keyed on the SAME file, and a file with no `.issue` has nothing to read
+    # them.
     string(FIND "${content}" "EncodeErrorReply" foundEncoder)
     string(FIND "${content}" "RefuseUntriaged" foundUntriaged)
     string(FIND "${content}" ".issue" foundIssue)
@@ -227,7 +257,9 @@ foreach(relative IN LISTS sources)
         if(line MATCHES "EncodeErrorReply[ \t]*\\(")
             if(allowed)
                 if("${relative}" STREQUAL "${refusalHeader}")
-                    set(encoderSeen TRUE)
+                    math(EXPR refusalEncoderCalls "${refusalEncoderCalls} + 1")
+                elseif("${relative}" STREQUAL "${wireHeader}")
+                    math(EXPR wireEncoderCalls "${wireEncoderCalls} + 1")
                 endif()
             else()
                 list(APPEND violations "${relative}:${lineNumber}")
@@ -238,17 +270,34 @@ foreach(relative IN LISTS sources)
         # added to this header would otherwise be a spelling that passes the scan,
         # joins no backlog and asserts nothing -- this ticket's defect one level up.
         if("${relative}" STREQUAL "${refusalHeader}")
-            if(line MATCHES "std::vector<std::byte>[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\\(")
+            # Matched on `[[nodiscard]]` and the identifier before the parameter
+            # list, NOT on the return type. Keying on `std::vector<std::byte> Name(`
+            # read the one syntax the three happen to use, so a fourth declared with
+            # a trailing return type -- `inline auto RefuseDeferred(...) ->
+            # std::vector<std::byte>` -- was derived as nothing, left the derived set
+            # equal to the known one, and passed. A guard that fires only when
+            # nothing is wrong, inside the fix for a guard that fired only when
+            # nothing was wrong.
+            if(line MATCHES "^\\[\\[nodiscard\\]\\].*[ \t*&]([A-Za-z_][A-Za-z0-9_]*)[ \t]*\\(")
                 list(APPEND definedSpellings "${CMAKE_MATCH_1}")
             endif()
         endif()
 
         # The backlog. Counted everywhere except where the spelling is DEFINED.
-        if(NOT allowed AND line MATCHES "RefuseUntriaged[ \t]*\\(")
-            list(APPEND untriaged "${relative}:${lineNumber}")
-        endif()
-        if(NOT allowed AND line MATCHES "\\.issue[ \t]*=[ \t]*([A-Za-z_][A-Za-z0-9_]*|[0-9]+)")
-            list(APPEND issueTokens "${relative}|${CMAKE_MATCH_1}")
+        #
+        # MATCHALL rather than MATCHES: `if(... MATCHES ...)` answers once per line, so
+        # two untriaged refusals on one line counted as one and the backlog -- the only
+        # thing making the third spelling safe -- silently ran short.
+        if(NOT allowed)
+            string(REGEX MATCHALL "RefuseUntriaged[ \t]*\\(" callsOnLine "${line}")
+            foreach(ignored IN LISTS callsOnLine)
+                list(APPEND untriaged "${relative}:${lineNumber}")
+                list(APPEND untriagedFiles "${relative}")
+            endforeach()
+
+            if(line MATCHES "\\.issue[ \t]*=[ \t]*([A-Za-z_][A-Za-z0-9_]*|[0-9]+)")
+                list(APPEND fileIssueTokens_${relative} "${CMAKE_MATCH_1}")
+            endif()
         endif()
 
         # An issue number named once and used many times. Resolved so the tally can
@@ -271,7 +320,7 @@ endforeach()
 # one each, so zero means a renamed function, a moved file or a changed spelling.
 # Reported as its own failure rather than folded into success, which is the direction
 # this project keeps getting wrong.
-if(NOT encoderSeen)
+if(refusalEncoderCalls EQUAL 0)
     message("")
     message("  No `EncodeErrorReply` call was found in ${refusalHeader}.")
     message("")
@@ -294,6 +343,41 @@ list(REMOVE_DUPLICATES definedSpellings)
 list(SORT definedSpellings)
 set(expectedSpellings ${knownSpellings})
 list(SORT expectedSpellings)
+list(LENGTH definedSpellings definedSpellingCount)
+
+# The names and the encoder calls, counted independently and required to agree.
+#
+# Reading NAMES is syntax-dependent however carefully the regex is written, and this
+# check has already shipped one that matched a single declaration style. Counting
+# CALLS is not: a spelling that answers a refusal has to encode one, so the two
+# numbers are one fact and disagreeing means a spelling exists that the name scan did
+# not see. It closes both remaining evasions at once -- a definition the regex misses
+# raises the calls and not the names, and a spelling that delegates to another one
+# instead of encoding raises the names and not the calls.
+if(NOT refusalEncoderCalls EQUAL definedSpellingCount)
+    message("")
+    message("  ${refusalHeader} defines ${definedSpellingCount} refusal spelling(s)")
+    message("  but calls `EncodeErrorReply` ${refusalEncoderCalls} time(s).")
+    message("")
+    message("Each spelling is built on exactly one. Disagreeing means there is a way to")
+    message("answer a refusal that the name scan above did not see -- so the derived set")
+    message("is not the set a surface can actually reach, and every verdict drawn from it")
+    message("is worth nothing.")
+    message(FATAL_ERROR "worker refusals: the refusal spellings and their encoder calls disagree")
+endif()
+
+# The wire header is allowed to name the encoder because it DEFINES it -- once. A
+# second call there would be a refusal spelling living in the one file this check
+# waves through, which is the shortest path around everything above.
+if(NOT wireEncoderCalls EQUAL 1)
+    message("")
+    message("  ${wireHeader} names `EncodeErrorReply` ${wireEncoderCalls} time(s); exactly one is the definition.")
+    message("")
+    message("That file is waved through because it defines the encoder, not because it is")
+    message("a place to answer refusals from. A second call there is a refusal nothing in")
+    message("this check would ever look at.")
+    message(FATAL_ERROR "worker refusals: the wire header holds more than the encoder definition")
+endif()
 
 if(NOT "${definedSpellings}" STREQUAL "${expectedSpellings}")
     set(extraSpellings ${definedSpellings})
@@ -359,44 +443,73 @@ if(violations)
 endif()
 
 list(LENGTH untriaged untriagedCount)
-list(LENGTH issueTokens issueTokenCount)
-
-# The backlog is read twice -- once from the calls, once from the issue each names --
-# and a tally that reported one of two disagreeing readings would be worse than no
-# tally. A call with no issue, or an issue outside a call, means this scan's idea of
-# the construct has drifted from the construct.
-if(NOT untriagedCount EQUAL issueTokenCount)
-    message("")
-    message("  ${untriagedCount} `RefuseUntriaged` call(s) but ${issueTokenCount} `.issue =` field(s).")
-    message("")
-    message("Every untriaged refusal names the issue that will decide it, so these two")
-    message("counts are one fact read two ways. Disagreeing, neither can be reported as")
-    message("the backlog -- and the backlog is the only reason the third spelling is safe")
-    message("to have.")
-    message(FATAL_ERROR "worker refusals: the triage tally read one fact two ways and they disagree")
-endif()
 
 if(untriagedCount EQUAL 0)
     message(STATUS "worker refusals: ${scannedCount} file(s) scanned, every refusal routed, none awaiting triage")
     return()
 endif()
 
+# Attribution is PER FILE, not per line.
+#
+# It was a global equality -- one `.issue =` field per `RefuseUntriaged(` call -- and
+# that reads a construct rather than a rule. A row built once and reused, which is this
+# project's own idiom for `SurfaceRefusal` rows two files away, is two calls and one
+# field: correct code, aborting the whole check with "the scan has drifted". A stray
+# `.issue` on any scanned line failed it the same way. Both are the instrument
+# mistaking its own reading for the tree.
+#
+# What actually has to hold is that every file with untriaged refusals NAMES the issue
+# that will decide them. That is the property the backlog rests on, it is per file, and
+# it holds however the calls are spelled.
+set(untriagedFilesUnique ${untriagedFiles})
+list(REMOVE_DUPLICATES untriagedFilesUnique)
+
+set(unnamed "")
+set(ambiguous "")
+foreach(owner IN LISTS untriagedFilesUnique)
+    set(numbers "")
+    foreach(name IN LISTS fileIssueTokens_${owner})
+        if(name MATCHES "^[0-9]+$")
+            list(APPEND numbers "${name}")
+        elseif(DEFINED issueConstant_${owner}_${name})
+            list(APPEND numbers "${issueConstant_${owner}_${name}}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES numbers)
+    list(LENGTH numbers numberCount)
+
+    if(numberCount EQUAL 0)
+        list(APPEND unnamed "${owner}")
+    elseif(numberCount GREATER 1)
+        string(REPLACE ";" ", " named "${numbers}")
+        list(APPEND ambiguous "${owner} (names ${named})")
+    else()
+        set(fileIssue_${owner} "${numbers}")
+    endif()
+endforeach()
+
+if(unnamed OR ambiguous)
+    message("")
+    foreach(owner IN LISTS unnamed)
+        message("  ${owner}: refuses as untriaged and names no issue this scan can resolve")
+    endforeach()
+    foreach(owner IN LISTS ambiguous)
+        message("  ${owner}: one file, more than one triage issue -- this scan cannot say which sites belong to which")
+    endforeach()
+    message("")
+    message("An untriaged refusal is only honest while somebody can find the decision it")
+    message("is waiting for. Name the issue as a `constexpr std::uint32_t` beside the")
+    message("calls, or inline in `.issue`, and keep one file to one issue.")
+    message(FATAL_ERROR "worker refusals: the triage backlog cannot be attributed")
+endif()
+
 # Group the backlog by the issue that will decide it. A total alone says how much is
 # undecided; the split says who decides it, and gives each issue a completion test
 # that is measured rather than asserted.
 set(issueList "")
-foreach(token IN LISTS issueTokens)
-    string(REPLACE "|" ";" parts "${token}")
-    list(GET parts 0 owner)
-    list(GET parts 1 name)
-    if(name MATCHES "^[0-9]+$")
-        set(number "${name}")
-    elseif(DEFINED issueConstant_${owner}_${name})
-        set(number "${issueConstant_${owner}_${name}}")
-    else()
-        set(number "unresolved")
-    endif()
-    list(APPEND issueList "${number}")
+foreach(site IN LISTS untriaged)
+    string(REGEX REPLACE ":[0-9]+$" "" owner "${site}")
+    list(APPEND issueList "${fileIssue_${owner}}")
 endforeach()
 
 message(STATUS "worker refusals: ${scannedCount} file(s) scanned, every refusal routed")

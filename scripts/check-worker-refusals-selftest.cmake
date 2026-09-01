@@ -39,6 +39,18 @@
 #
 # Exit codes: 0 always. The verdict is the presence of `CMake Error` in the output.
 
+# A `cmake -P` script has no project, so every policy starts unset and CMP0057
+# (`if(... IN_LIST ...)`) is one of them -- unset, the operator is an unknown
+# argument and the script errors out rather than answering. Stated as a minimum
+# version so the whole set moves together with the project's own.
+#
+# This was already written down in `check-node-config-reference.cmake`, and this
+# script shipped without it: green on CMake 4.3.1, dead on 3.28, which is the
+# version this project declares and the one CI runs. A check that errors out is
+# not a check that passed -- but it reports through the same channel, so only the
+# gate on the OTHER platform could tell the difference.
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
