@@ -897,6 +897,21 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .description = "trace, debug, info, warn, error, fatal (default info)",
             .yamlKey = "log_level",
         },
+        {
+            // Beside `--log-level` because they are one concern, and two flags
+            // because they are not one question: a level is a FILTER and this is a
+            // FORMAT. Folding them into one grammar would invent a spelling neither
+            // binary has.
+            //
+            // Spelled exactly as `fastcached`'s. An operator who learned it there
+            // must not find the worker wanting a different word for the same thing --
+            // the rule `--service-scope` already follows here.
+            .primary = "--log-timestamps",
+            .arity = Arity::None,
+            .apply = SetTrue<&NodeConfig::logTimestamps>(),
+            .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)",
+            .yamlKey = "log_timestamps",
+        },
         { .primary = "--daemon",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::daemon>(),
@@ -1184,6 +1199,14 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.push_back(std::format("--fleet-member={}", member));
     emitIfSet("drain-timeout", cfg.drainTimeoutSeconds, defaults.drainTimeoutSeconds);
     emitIfSet("log-level", LogLevelName(cfg.logLevel), LogLevelName(defaults.logLevel));
+
+    // Presence IS the setting, so it is emitted as a bare switch when it is on and
+    // omitted when it is not -- the shape `--no-toolchain-discovery` below uses. No
+    // `explicitBit`: the default is false and the flag only ever sets true, so there
+    // is no value an operator could arrive at without having asked for it, which is
+    // the whole thing a provenance bit exists to tell apart.
+    if (cfg.logTimestamps)
+        argv.emplace_back("--log-timestamps");
     emitPathIfSet("pidfile", cfg.pidfile);
 
     // Repeatable, so one token per toolchain rather than one joined value: a

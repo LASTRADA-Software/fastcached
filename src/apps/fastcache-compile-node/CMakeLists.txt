@@ -38,6 +38,7 @@ set(_fc_node_shared
 
 add_executable(fastcache-compile-node
     main.cpp
+    NodeLogging.cpp
     AdminEndpoint.cpp
     CacheProxy.cpp
     CacheTier.cpp
@@ -102,6 +103,8 @@ if(FASTCACHED_BUILD_TESTS)
         LocalCache_test.cpp
         RemoteUpstream.cpp
         NodeConfig.cpp
+        NodeLogging.cpp
+        NodeLogging_test.cpp
         NodeFrameSurface.cpp
         NodeFrameSurface_test.cpp
         AuthRefusalContract_test.cpp

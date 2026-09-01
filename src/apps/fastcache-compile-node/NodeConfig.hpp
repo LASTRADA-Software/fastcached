@@ -475,6 +475,32 @@ struct NodeConfig
     /// How chatty the log is.
     LogLevel logLevel { LogLevel::Info };
 
+    /// Whether every console line carries an ISO 8601 UTC time.
+    ///
+    /// **Off by default, and that is a decision with the supervisor cases in front of
+    /// it rather than the daemon's default copied across** (#485). This node's console
+    /// logger is the sink in three deployments and only one of them stamps:
+    ///
+    /// - **systemd** runs the unit `Type=simple` with no `--daemon`, so stderr is
+    ///   journald's and journald stamps every entry. On by default would put a second
+    ///   time inside the message.
+    /// - **launchd** points `StandardErrorPath` at a plain file
+    ///   (`ServiceControl.cpp`), so nothing stamps it at all.
+    /// - **The Windows SCM** path never reaches this logger: `--daemon` selects
+    ///   `MakeWindowsEventLogger`, and an event record carries its own time.
+    ///
+    /// So the honest reading is that one sink stamps and two do not, which argues for
+    /// ON. It is OFF anyway, for a reason outside this flag: the unstamped file is
+    /// `ServiceControl`'s plist, which `fastcached` shares byte for byte, so the two
+    /// binaries defaulting oppositely would paper over one packaging defect in the one
+    /// binary that noticed it and leave the other writing timeless files forever. One
+    /// spelling, one default, and the plist is its own ticket.
+    ///
+    /// A foreground run is the case this exists for -- fleet bring-up and a CI
+    /// artefact, where nothing else knows the time and a completed run cannot be asked
+    /// afterwards (#457).
+    bool logTimestamps { false };
+
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };
 

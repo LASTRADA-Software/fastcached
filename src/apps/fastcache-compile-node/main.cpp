@@ -19,6 +19,7 @@
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
@@ -1500,7 +1501,13 @@ int main(int argc, char** argv)
     // is therefore exactly what somebody copies out of `sc qc` to try by hand. Their
     // refusals going to the event log while the terminal showed only an exit code
     // would be the same defect this file is fixing, pointed the other way.
-    ConsoleLogger consoleLogger { std::cerr, cfg.logLevel };
+    // Built by the factory, never here. The third argument used to be absent at this
+    // very line -- so the node could not emit a time and no flag existed to ask for
+    // one (#485) -- and `ctest -R node-logger-single-path` is what keeps a second
+    // construction from reappearing beside it. A logger built here again would leave
+    // `MakeNodeConsoleLogger` tested and uncalled, which reads as coverage.
+    auto const consoleLoggerOwned = MakeNodeConsoleLogger(std::cerr, cfg);
+    ConsoleLogger& consoleLogger = *consoleLoggerOwned;
 
     // Service registration, before anything that costs time. A misconfiguration is
     // decided in microseconds while a toolchain fingerprint takes seconds, which is
