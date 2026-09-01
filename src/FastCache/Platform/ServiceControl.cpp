@@ -1377,6 +1377,13 @@ namespace
     {
         // Generous enough to cover a graceful shutdown, short enough that a
         // genuinely stuck job still reports rather than hanging the installer.
+        //
+        // Considered for `Core/BoundedDrain.hpp`'s `DrainWithin` and deliberately
+        // left alone (#452). That defect was a loop STATING a wall-clock ceiling
+        // and counting requested polls towards it; this budgets ATTEMPTS and says
+        // so, which is an honest budget rather than a false claim. Converting it
+        // would trade probes for seconds on a macOS installer path with no
+        // coverage, which is a different decision from fixing a lie.
         constexpr auto Attempts = 100;
         constexpr auto Interval = std::chrono::milliseconds { 50 };
 
