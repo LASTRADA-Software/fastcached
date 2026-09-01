@@ -150,6 +150,21 @@ void DestroyTheOtherPeer(EpollFdHandler* self)
 // Without the fix this is a use-after-free rather than a failed assertion, so it
 // reports as a crash under a sanitizer and can pass silently without one. That is
 // the nature of the defect and is why the case exists.
+//
+// NO PRODUCTION PATH REACHED THIS WHEN IT WAS FIXED, and that is a bounded
+// statement rather than a reason to doubt the case. It was a search over call
+// sites, not a proof: every reactor socket was owned by exactly one coroutine
+// frame -- `Connection`, `ServeAdminConnection`, `FrameEndpoint`,
+// `WorkerServer::Serve`, `RaftPeerServer::ServePeer` all take a
+// `unique_ptr<ISocket>` -- with no shared container to reach into, and listeners
+// outlived `Run()`.
+//
+// One connection registry undoes all of that. An admin verb that closes other
+// clients' connections, or a peer directory that drops a socket on demotion, are
+// ordinary things to want and each makes this live on the day it lands. So the
+// absence of a caller is not evidence this was never a real defect, and it is
+// specifically not a reason to delete this case as testing something that cannot
+// happen. See issue #475, where the search and its limits are recorded in full.
 TEST_CASE("A handler freed earlier in the same batch is not dispatched", "[epoll][reactor]")
 {
     SteadyClock clock;
