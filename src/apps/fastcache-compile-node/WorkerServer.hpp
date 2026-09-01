@@ -10,6 +10,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -18,6 +19,9 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string_view>
+#include <vector>
 
 #include <WorkerProtocol.hpp>
 
@@ -73,6 +77,69 @@ enum class DrainAction : std::uint8_t
 /// constant, the two are two literals that must agree forever, and lowering one
 /// silently stops bounding the other.
 inline constexpr std::size_t WorkerMaxRequestBytes = 256ULL * 1024ULL * 1024ULL;
+
+/// What a compile surface refuses with, each pairing the wire code with its counter.
+///
+/// **Two surfaces spend these now.** They were a file-local table in `WorkerServer.cpp`
+/// while an accept loop was the only way a compile could arrive; since #290 a
+/// `CompileResponder` on the merged `0xFC` listener admits compiles too, and it refuses
+/// the same callers for the same reasons. Two tables would be two answers to "what does
+/// this worker refuse with", read side by side on one `/metrics` page -- the drift this
+/// codebase treats as a defect rather than a coincidence.
+///
+/// Distinct from `WorkerProtocol`'s own rows, which are about a frame that was ADMITTED
+/// and then would not decode. These are the admission refusals: who is asking, whether
+/// a core is free, and whether the memory is.
+///
+/// `PayloadTooLarge` had no counter at all until #326, and it is the one that most
+/// needed one: the frame-level check needs only a header, where the envelope refusals
+/// need a whole frame to have been sent and read. So an operator alerting on the
+/// envelope series watched a client hammer this port with oversized declarations, saw
+/// every one refused correctly, and read a flat graph as "nobody is talking to us".
+namespace CompileRefusal
+{
+    /// The caller has no claim on this machine's CPU.
+    inline constexpr Cc::SurfaceRefusal NotAMember {
+        .code = CompileCacheWire::ErrorCode::NotAMember,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedNotAMember,
+    };
+    /// Every slot is taken; the fleet is full and the scheduler should route around it.
+    inline constexpr Cc::SurfaceRefusal NoCapacity {
+        .code = CompileCacheWire::ErrorCode::NoCapacity,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedNoSlot,
+    };
+    /// A slot was free and the memory was not; come back shortly.
+    inline constexpr Cc::SurfaceRefusal EndpointBusy {
+        .code = CompileCacheWire::ErrorCode::EndpointBusy,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy,
+    };
+    /// The declared frame is above what this surface will buffer at all.
+    inline constexpr Cc::SurfaceRefusal PayloadTooLarge {
+        .code = CompileCacheWire::ErrorCode::PayloadTooLarge,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
+    };
+} // namespace CompileRefusal
+
+/// Refuse a caller with no claim on this machine's CPU, or admit it.
+///
+/// **The one implementation of the anti-leeching rule**, asked by both doors into this
+/// worker: `WorkerServer`'s accept loop and, since #290, `CompileResponder` on the
+/// merged `0xFC` listener. Written twice it would be two policies that agree today, on
+/// a question whose wrong answer is "this machine ran a stranger's compiler for them".
+///
+/// Answered on the peer's HOST alone, which is what lets both callers ask it before a
+/// payload byte is read -- a caller with no claim here must not be able to make this
+/// process buffer a multi-megabyte preprocessed translation unit on the way to being
+/// refused. It is a *reply* rather than a close, so a misconfigured peer learns which
+/// of the two it is instead of seeing a connection it cannot tell from a dead host.
+///
+/// @param membership Decides who may spend this machine's CPU.
+/// @param metrics Where the refusal is counted, exactly once.
+/// @param peer The caller's peer host.
+/// @return The encoded refusal, or nullopt when the caller is admitted.
+[[nodiscard]] std::optional<std::vector<std::byte>> RefuseUnlessMember(Distributed::IMembershipOracle const& membership,
+                                                                       IMetricsSink& metrics,
+                                                                       std::string_view peer);
 
 /// Accepts connections and answers each with one compile.
 ///
@@ -196,6 +263,24 @@ class WorkerServer
 
     /// Compiles running right now, for the heartbeat.
     [[nodiscard]] std::size_t InFlight() const noexcept;
+
+    /// The slot cap, byte budget and drain this worker answers to.
+    ///
+    /// Handed out rather than kept private, because a worker has two doors since #290
+    /// and **both must spend the same accounting**: this accept loop and the
+    /// `CompileResponder` on the merged `0xFC` listener. A second `CompileCapacity`
+    /// would make the worker answer to two caps depending on which door a client came
+    /// through, and the slot figure it advertises to the fleet would describe neither.
+    ///
+    /// It is also what makes one drain cover both. `~WorkerServer` closes this door and
+    /// then waits on the count, and a compile admitted through the other door holds a
+    /// slot in the very same counter -- so the bounded stop (#239) covers the merged
+    /// surface without a second wait that would have to be ordered against this one.
+    /// @return The shared accounting.
+    [[nodiscard]] CompileCapacity& Capacity() noexcept
+    {
+        return _capacity;
+    }
 
   private:
     /// Give back one slot and wake a drain that may be waiting for it.

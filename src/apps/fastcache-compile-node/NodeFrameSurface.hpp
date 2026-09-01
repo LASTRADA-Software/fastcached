@@ -18,10 +18,14 @@ struct NodeConfig;
 
 /// This node's one `0xFC` listener, and the router in front of it.
 ///
-/// The two used to be three things: a cache surface, a scheduler surface, and no
-/// router at all -- because the listener a frame arrived on WAS the routing decision.
-/// One listener cannot decide that by existing, so `MergedResponder` decides it per
-/// frame and this owns the pair (#290).
+/// The two used to be four things: a cache surface, a scheduler surface, a worker's
+/// own accept loop, and no router at all -- because the listener a frame arrived on WAS
+/// the routing decision. One listener cannot decide that by existing, so
+/// `MergedResponder` decides it per frame and this owns the pair (#290).
+///
+/// The worker's dedicated port has not gone: `WorkerServer` still accepts on it, and
+/// retiring it is a step of its own. What changed is that a compile can now arrive here
+/// too, spending the same slot accounting through `CompileResponder`.
 ///
 /// Owned as one object for the reason `CacheTier` and `SchedulerTier` are: the two
 /// members form a reference chain whose declaration order is load-bearing and silently
@@ -32,9 +36,11 @@ class NodeFrameSurface
   public:
     /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
     /// @param scheduler Answers the scheduler verbs and owns the credential, or
-    ///        nullptr when this node does not schedule. Both must outlive this.
-    NodeFrameSurface(IFrameResponder* cache, IFrameResponder* scheduler) noexcept:
-        _responder { cache, scheduler }
+    ///        nullptr when this node does not schedule.
+    /// @param compile Answers the compile verbs, or nullptr when this node runs no
+    ///        worker. All three must outlive this.
+    NodeFrameSurface(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
+        _responder { cache, scheduler, compile }
     {
     }
 
@@ -81,8 +87,8 @@ class NodeFrameSurface
 /// once and testing:
 ///
 ///   - **A surface** — it is serving.
-///   - **Success carrying nothing** — deliberately no listener, because this node
-///     neither holds a cache tier nor schedules, or because a DEFAULT address was
+///   - **Success carrying nothing** — deliberately no listener, because this node has
+///     no component for any verb family at all, or because a DEFAULT address was
 ///     already taken. The node continues; a line has already been logged.
 ///   - **An error** — the operator NAMED an address, or asked for a scheduler, and it
 ///     could not be served, so startup must stop.
@@ -104,9 +110,20 @@ class NodeFrameSurface
 /// @param cfg What the operator asked for.
 /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
 /// @param scheduler Answers the scheduler verbs, or nullptr when it does not schedule.
+/// @param compile Answers the compile verbs, or nullptr when this node runs no worker.
+///        In this binary it is never null -- a node compiles, that is what it is -- so
+///        the "no component at all" outcome below is now reachable only from a test.
+///        The predicate stays honest rather than being narrowed to the two that can
+///        still be absent: a component this function stopped asking about is a listener
+///        opened for verbs nobody answers.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The surface, a null surface meaning "carry on without one", or the reason.
 [[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(
-    NodeIoLoop& io, NodeConfig const& cfg, IFrameResponder* cache, IFrameResponder* scheduler, ILogger& logger);
+    NodeIoLoop& io,
+    NodeConfig const& cfg,
+    IFrameResponder* cache,
+    IFrameResponder* scheduler,
+    IFrameResponder* compile,
+    ILogger& logger);
 
 } // namespace FastCache::Node

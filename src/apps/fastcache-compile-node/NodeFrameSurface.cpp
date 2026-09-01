@@ -25,8 +25,12 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io, NodeConf
     return {};
 }
 
-std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(
-    NodeIoLoop& io, NodeConfig const& cfg, IFrameResponder* cache, IFrameResponder* scheduler, ILogger& logger)
+std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(NodeIoLoop& io,
+                                                                                        NodeConfig const& cfg,
+                                                                                        IFrameResponder* cache,
+                                                                                        IFrameResponder* scheduler,
+                                                                                        IFrameResponder* compile,
+                                                                                        ILogger& logger)
 {
     // **Whether** this surface is served is the row's answer -- the same one
     // `--print-surfaces` reads -- so a worksheet cannot name a port this function then
@@ -38,9 +42,9 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // that would not open has already stopped startup, and a tier the row expects but
     // that does not exist would leave this listener answering `UnimplementedVerb` to
     // every FETCH behind an open port.
-    if (cache == nullptr && scheduler == nullptr)
+    if (cache == nullptr && scheduler == nullptr && compile == nullptr)
     {
-        logger.Logf(LogLevel::Info, "no cache tier and no scheduler; serving no 0xFC port");
+        logger.Logf(LogLevel::Info, "no cache tier, no scheduler and no worker; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
     if (RowFor(NodeSurface::Node).Resolve(cfg).empty())
@@ -51,7 +55,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         return std::unique_ptr<NodeFrameSurface> {};
     }
 
-    auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler);
+    auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
     if (auto bound = surface->Bind(io, cfg, logger); bound.has_value())
         return surface;
     else

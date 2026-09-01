@@ -180,7 +180,9 @@ class SchedulerResponder final: public IFrameResponder
 /// which is what a cache tier is. Those were one list answering two questions, and
 /// the second answer was wrong: a peer could `FETCH` every object this machine had
 /// ever compiled. The compile surface still asks membership, because "may you run a
-/// job here" is the question membership is actually about.
+/// job here" is the question membership is actually about -- and since #290's second
+/// half it asks it on this same listener, which is precisely why the two answers have
+/// to follow the verb rather than the port.
 ///
 /// Deliberately *stricter* than `fastcached`'s own cache, which serves non-members on
 /// purpose. That one is shared infrastructure somebody operates; this is a
@@ -355,8 +357,8 @@ class CacheResponder final: public IFrameResponder
 ///
 /// ## A family with no component
 ///
-/// Legitimate and common: a node with no cache tier still serves the scheduler, and a
-/// worker that neither caches nor schedules serves neither. Those verbs are refused
+/// Legitimate and common: a node with no cache tier still serves the scheduler and its
+/// own compiles. Those verbs are refused
 /// `UnimplementedVerb`, which is the honest code -- this endpoint really does not
 /// implement them -- and it is the one refusal `Cc::CacheProtocol` steps over rather
 /// than treating as fatal.
@@ -371,11 +373,13 @@ class MergedResponder final: public IFrameResponder
   public:
     /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
     /// @param scheduler Answers the scheduler verbs, or nullptr when this node does
-    ///        not schedule. Also owns the credential, so `AUTH` goes here. Both must
-    ///        outlive this.
-    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler) noexcept:
+    ///        not schedule. Also owns the credential, so `AUTH` goes here.
+    /// @param compile Answers the compile verbs, or nullptr when this node runs no
+    ///        worker. All three must outlive this.
+    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
         _cache { cache },
-        _scheduler { scheduler }
+        _scheduler { scheduler },
+        _compile { compile }
     {
     }
 
@@ -385,11 +389,13 @@ class MergedResponder final: public IFrameResponder
     /// cache requires none, so an `AUTH` routed to it would be answered "no policy" and
     /// a peer holding the scheduler's secret could never present it.
     ///
-    /// `Compile` is deliberately absent rather than forgotten -- it is served by
-    /// `WorkerServer`, on its own accept loop, because a compile blocks for seconds and
-    /// must be handed to an executor rather than run on this reactor (#213). Folding it
-    /// in is the second half of #290 and is a change to how compiles RUN, not to how
-    /// frames are routed.
+    /// `Compile` is a row here like any other, and that was the second half of #290 --
+    /// but the routing was never the work. It is served by `CompileResponder`, which
+    /// hops onto an executor before it compiles and back onto the reactor before it
+    /// answers: a compile blocks for seconds, and neither running it on this reactor
+    /// (#213) nor returning its reply off that reactor is visible at any call site.
+    /// `WorkerServer` still serves its own dedicated port; this is an additional door
+    /// onto the same worker, the same policy and the same slot accounting.
     ///
     /// @param opRaw The third header byte, as received.
     /// @return The owner, or nullptr.
@@ -403,6 +409,7 @@ class MergedResponder final: public IFrameResponder
             case CompileCacheWire::VerbFamily::Scheduler:
                 return _scheduler;
             case CompileCacheWire::VerbFamily::Compile:
+                return _compile;
             case CompileCacheWire::VerbFamily::Unset:
                 return nullptr;
         }
@@ -536,7 +543,7 @@ class MergedResponder final: public IFrameResponder
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
     {
         std::size_t out = 0;
-        for (auto const* const owner: { _cache, _scheduler })
+        for (auto const* const owner: { _cache, _scheduler, _compile })
             if (owner != nullptr)
                 out = std::max(out, (owner->*ceiling)());
         return out;
@@ -544,6 +551,7 @@ class MergedResponder final: public IFrameResponder
 
     IFrameResponder* _cache;
     IFrameResponder* _scheduler;
+    IFrameResponder* _compile;
 };
 
 } // namespace FastCache::Node
