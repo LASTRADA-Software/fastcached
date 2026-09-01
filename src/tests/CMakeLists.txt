@@ -358,22 +358,29 @@ set_tests_properties("target-file-guards" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# Every refusal the compile surface answers with moves a counter.
+# Every refusal a `0xFC` surface answers with is routed, and says which fact it is
+# asserting.
 #
 # Six sites in `WorkerProtocol.cpp` answered on the wire and incremented nothing
-# (#327), which is not six oversights but the default: `Wire::EncodeErrorReply` takes
-# a code and knows nothing about a sink, so counting was something each author had to
+# (#327), which is not six oversights but the default: `EncodeErrorReply` takes a code
+# and knows nothing about a sink, so counting was something each author had to
 # remember. A refusal answered while nothing rises is indistinguishable, on
 # `/metrics`, from a port nobody is talking to.
 #
-# `Refuse(metrics, row, detail)` takes a ROW carrying both the code and the counter,
-# so there is no argument to pass a bare `ErrorCode` to. This covers the door the type
-# system cannot close: `EncodeErrorReply` is a free function in a header every surface
-# includes, and remains callable. The rule is exact rather than approximate --
-# EXACTLY ONE call in that file, inside `Refuse` -- because the three refusals that
-# already counted were routed through it too. See the script's header.
+# This check used to scan a hand-maintained LIST of the source files somebody had
+# remembered, and grew by hand twice -- the second time after `FrameEndpoint.cpp` had
+# accumulated five uncounted sites through an entire surface migration with the check
+# green throughout (#447). A list is exact about the files it knows and silent about
+# the ones it does not, and silence reads identically to complete coverage (#492). It
+# now GLOBS `src/`, headers included, so a new file answering a refusal fails it on
+# the first bare call with nobody editing anything.
 #
-# In the default set with the other hygiene checks: it reads one file and compares
+# It also tallies `RefuseUntriaged` and prints the total, because "deliberately not
+# counted" and "forgot to count" were the same text until #492 gave each its own
+# spelling -- and the third spelling is only safe while the backlog it creates is
+# visible. See the script's header.
+#
+# In the default set with the other hygiene checks: it reads files and compares
 # strings.
 add_test(
     NAME "worker-refusals-counted"
@@ -385,6 +392,36 @@ set_tests_properties("worker-refusals-counted" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
+)
+
+# And the check above must be SEEN to fail, on a file nobody listed.
+#
+# A glob is only worth more than the list it replaced if it actually bites on a file
+# that was never named, and a guard nobody has seen fire is not a guard. This drives
+# the real check against six synthetic source trees and asserts each verdict
+# separately -- clean, a new `.cpp`, a new `.hpp`, an untriaged site that must PASS
+# while being counted, an untriaged site naming no issue, and a tree whose spellings
+# have been renamed away, which must be reported as a broken scan rather than as a
+# clean tree.
+#
+# It asserts each direction rather than inverting the whole test with `WILL_FAIL`: a
+# check that stopped refusing and a check that started refusing everything are
+# opposite defects and a bare inversion reports them identically. Same argument as
+# `node-scratch-isolation-e2e-selftest`.
+#
+# In the default set: it writes a handful of small files and runs `cmake -P` six
+# times.
+add_test(
+    NAME "worker-refusals-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/worker-refusals-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-worker-refusals-selftest.cmake"
+)
+set_tests_properties("worker-refusals-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
 )
 
 # ---------------------------------------------------------------------------
