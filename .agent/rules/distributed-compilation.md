@@ -1521,7 +1521,19 @@ then fetch.
 rather than relaxed.** Both MSVC drivers write the **clock** into the COFF header
 (two compiles of one file to one path two seconds apart differ in exactly byte 4;
 only `/Brepro` suppresses it, and a fixture that passed `/Brepro` would be asserting
-something about a command line no build uses). `cl` additionally records the
+something about a command line no build uses).
+
+> **The launcher's `FASTCACHE_VERIFY` answers a different question with the same
+> fact**, and for a long time answered it wrongly — it compared objects with
+> `memcmp`, so every Windows hit reported a wrong object
+> ([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)). This
+> paragraph existed then, in this file and two others, and none of them is one
+> somebody editing `HitVerification.cpp` opens. The launcher's copy —
+> including why `.debug$S` and `.chks64` are **not** excused there, which is the
+> opposite of the conclusion this fixture reaches from the same measurements — is
+> [`compile-cache.md`](compile-cache.md#an-object-file-is-not-a-byte-string-and-fastcache_verify-is-where-that-bites).
+> Change either and read the other: they share the facts and not the conclusions.
+ `cl` additionally records the
 **absolute path of the object file** in `.debug$S` and hashes the file it opened
 into `.chks64`, with no debug flag asked for — and a worker compiles its own scratch
 file to its own scratch path, so neither can ever match. Everything carrying code or

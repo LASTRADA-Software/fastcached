@@ -344,6 +344,27 @@ TEST_CASE("An unreadable SERVED object is a finding, not a refusal", "[launcher]
     CHECK(result.outcome == ObjectComparison::Different);
 }
 
+TEST_CASE("A served header that claims more than it holds is walked safely", "[launcher][verify][object]")
+{
+    // The served image's header is whatever a cache handed over, and the section walk
+    // reaches it -- only to make a message more specific. A `/bigobj`
+    // `NumberOfSections` is a full 32 bits, so a header claiming four billion of them
+    // would size a container for four billion and take the process down: a launcher
+    // crashing on a corrupt cache entry, from the one code path whose entire job is
+    // to describe corruption.
+    // `/bigobj` on purpose: its `NumberOfSections` is the 32-bit one, and a standard
+    // header's 16-bit field cannot express a count large enough to hurt. A case built
+    // on the narrow layout would pass with the guard removed and prove nothing.
+    auto const fresh = BuildCoff(ClSections("CODE"), 1000, StubLayout::BigObj);
+    auto served = fresh;
+    for (auto const at: { 44U, 45U, 46U, 47U })
+        served[at] = static_cast<std::byte>(0xFF);
+
+    auto const result = CompareObjectImages(served, fresh);
+    CHECK(result.outcome == ObjectComparison::Different);
+    CHECK_FALSE(result.detail.empty());
+}
+
 TEST_CASE("Nothing is excused in a format that has no clock", "[launcher][verify][object]")
 {
     // Measured: clang and GCC objects are byte-identical between two compiles of one

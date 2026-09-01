@@ -234,6 +234,15 @@ namespace
     ///         cannot be followed.
     [[nodiscard]] std::vector<SectionSpan> SectionsOf(ObjectLayout const& layout, std::span<std::byte const> image)
     {
+        // Asked of THIS image rather than inherited from the caller's, and that is
+        // not belt-and-braces: the only image known to be consistent is `fresh`, and
+        // this also walks `served`, whose header is whatever a cache handed over. A
+        // `/bigobj` `NumberOfSections` is a full 32 bits, so an unchecked one reserves
+        // for four billion sections and takes the process down -- from a function
+        // whose entire job is to make an error message more specific.
+        if (!IsConsistent(layout, image))
+            return {};
+
         auto const count = layout.sectionCountWidth == 2 ? ReadLe<2>(image, layout.sectionCountAt)
                                                          : ReadLe<4>(image, layout.sectionCountAt);
         auto const tableAt = SectionTableAt(layout, image);
@@ -384,7 +393,9 @@ namespace
                                                  std::span<std::byte const> fresh,
                                                  std::vector<std::size_t> const& offsets)
     {
-        auto const positions = std::format("{} differing byte(s), first at offset {}", offsets.size(), offsets.front());
+        // Not `const`: it is returned by value on two paths, and constness would turn
+        // each of those into a copy rather than a move.
+        auto positions = std::format("{} differing byte(s), first at offset {}", offsets.size(), offsets.front());
         if (layout == nullptr)
             return positions;
 
