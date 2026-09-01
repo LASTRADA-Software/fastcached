@@ -143,15 +143,144 @@ export XDG_STATE_HOME="${workdir}/state"
 
 # --- helpers ----------------------------------------------------------------
 
+# How long ONE cluster probe may take before it is abandoned.
+#
+# **5 s, and the number is a measurement with its conditions attached rather than
+# a round figure.** All three readings below are from the ASan build, which is the
+# configuration this fixture fails in, on an otherwise idle machine:
+#
+#   a live node that answers          16 ms   (74 probes, 1.18 s, one healthy run)
+#   a port nothing listens on        ~900 ms
+#   a port that accepts, never replies ~12.7 s (`ClusterAdminCli`'s own 10 s
+#                                               `DialTimeout`, plus startup)
+#
+# The bound is chosen off the HEALTHY cost with a very wide margin, never off the
+# pathological one. At 5 s a node taking three hundred times its measured time is
+# still served, and the only case cut short is the one that would otherwise cost
+# 12.7 s. A node that cannot answer a status query in five seconds is not a slow
+# node, it is a finding.
+#
+# **Why bound it at all.** The waits below poll, and an unbounded probe lets ONE
+# unhealthy node eat a whole wait's budget: 150 passes x 12.7 s is thirty-one
+# minutes against this fixture's 300 s CTest timeout, so the run is killed from
+# outside and the failure arrives as a status with no diagnosis. That is #457's
+# actual mechanism -- not the probe COUNT, which is 74 on the healthy path and
+# 11% of the run.
+#
+# A third row is what makes the second column dangerous: a node that is merely
+# slow under a loaded runner presents exactly as "accepts, never replies", because
+# its listener is bound -- `wait_for_port` has already passed -- while the process
+# is too starved to answer inside the client's window. So the probe's cost rises
+# by three orders of magnitude precisely when the machine is busy, and each slow
+# probe is itself another sanitizer-instrumented process on the same cores.
+readonly ClusterProbeSeconds=5
+
+# What the waits below are allowed, in SECONDS of wall clock.
+#
+# Seconds and not passes, which is the other half of #457. `for _ in $(seq 1 150)`
+# with a `sleep 0.2` reads as thirty seconds and enforces no such thing: each pass
+# also pays for its probes, so the real bound was 30 s plus however long asking
+# took -- unbounded, and largest exactly when the answers were slowest. A failing
+# run measured 52.04 s against a loop whose message said 30 s, and the pathological
+# case ran to thirty-one minutes. The number in the source is now the quantity
+# enforced, which is the rule `.agent/rules/testing.md` states for #452.
+#
+# Generous rather than tight: these are deadlock bounds, not performance budgets. A
+# healthy cluster forms in well under a second and every wait here exits on its
+# first or second pass.
+readonly FormationSeconds=60
+readonly RedirectSeconds=30
+readonly ReplicationSeconds=30
+readonly JoinSeconds=60
+
+
+# What a probe that did not finish says, in the output stream callers already read.
+#
+# Deliberately matches none of the patterns the callers test for, so a caller that
+# only looks at the text treats it as "not the answer I wanted" -- the safe
+# default -- while the sentence still appears verbatim in any failure dump.
+readonly ProbeTimedOut="probe did not finish within ${ClusterProbeSeconds}s"
+
+# Every probe's outcome, appended as it happens.
+#
+# A FILE and not shell variables, and that is not a style preference: every caller
+# invokes `cluster` inside `$( ... )`, which is a subshell, so a counter
+# incremented in the function is discarded at the closing paren. Silently -- the
+# summary would report zero of everything, which is the exact shape of defect this
+# fixture exists to catch in the product.
+probe_log="${workdir}/probes"
+: > "$probe_log"
+
 # Ask one node a cluster question. Echoes its output; never fails the script.
 #
-# `|| true` because a refusal is an ordinary answer here -- a follower saying
-# "ask somebody else" is a case this fixture asserts, not an error.
+# **THREE outcomes, and the third one is the point of #457.** A probe can answer,
+# fail to reach anybody, or NOT FINISH -- and the last is not the cluster saying
+# "no", it is this fixture failing to ask. Folded into a negative it would make
+# the caller retry, exhaust its budget and report "the cluster never formed" about
+# a cluster that was answering in six seconds. That is precisely the distinction
+# `.agent/rules/testing.md` requires a wait to be able to make, and precisely the
+# one every occurrence of this flake has turned on.
+#
+# `|| true` is gone rather than kept: a refusal is still an ordinary answer and
+# still does not fail the run, but its status is now READ instead of discarded,
+# which is what lets the three outcomes be told apart at all.
 # @param 1 scheduler endpoint
 # @param 2.. the cluster flag and its operand
 cluster() {
     local endpoint="$1"; shift
-    "$node" --scheduler="$endpoint" "$@" 2>&1 || true
+    local out rc=0
+    out="$(timeout "$ClusterProbeSeconds" "$node" --scheduler="$endpoint" "$@" 2>&1)" || rc=$?
+
+    # 124 is `timeout` reporting that it killed the probe. Checked before anything
+    # else, because every other non-zero status is the CLI having run and said
+    # something.
+    if [[ "$rc" -eq 124 ]]; then
+        echo "timeout ${endpoint}" >> "$probe_log"
+        printf '%s\n' "$ProbeTimedOut"
+        return 0
+    fi
+
+    # A non-zero status is an ANSWER, not a failure to reach anybody, and calling
+    # it one would put a confident wrong number in the summary below. Measured on a
+    # healthy run: 47 of 74 probes exit non-zero, and every one of them is the
+    # cluster talking -- 34 "this node does not lead the cluster", 12 "the cluster
+    # has no leader right now", 1 "rejected (invalid-cluster-change)". All three are
+    # states this fixture asserts.
+    #
+    # What the status cannot tell apart is a follower's redirect from a genuinely
+    # refused connection: both are rc=2, and only the TEXT separates them. So this
+    # counts what it can defend -- the probe finished, or it did not -- and does not
+    # invent a reachability reading it has no evidence for.
+    if [[ "$rc" -ne 0 ]]; then
+        echo "declined ${endpoint}" >> "$probe_log"
+    else
+        echo "affirmed ${endpoint}" >> "$probe_log"
+    fi
+    printf '%s\n' "$out"
+    return 0
+}
+
+# One line saying how the probes went, for a failure message to carry.
+#
+# The counts are what separate "this runner was too slow to ask" from "the cluster
+# never formed": a wait that expired having timed out most of its probes has not
+# observed the cluster at all, and saying "never formed" about it would be the
+# confident wrong sentence this fixture has produced before.
+#
+# Read with one `awk` pass rather than three `grep -c` calls: `grep -c` exits 1 on
+# no match, which under `set -e` and `pipefail` turns an honest zero into an
+# aborted script.
+probe_summary() {
+    awk '
+        { kind[$1]++; total++ }
+        END {
+            printf "%d probes: %d affirmed, %d declined, %d TIMED OUT",
+                   total, kind["affirmed"], kind["declined"], kind["timeout"]
+            if (kind["timeout"] > 0 && total > 0)
+                printf " (%.0f%% never finished, so this wait spent its budget asking rather than observing)",
+                       kind["timeout"] * 100 / total
+        }
+    ' "$probe_log"
 }
 
 # --- the cluster ------------------------------------------------------------
@@ -231,7 +360,8 @@ find_leader() {
     local what="${1:-a leader}"
     leader_endpoint=""
     local index answer
-    for _ in $(seq 1 150); do
+    local deadline=$(( SECONDS + FormationSeconds ))
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
         for index in "${!scheduler_ports[@]}"; do
             [[ -n "${scheduler_ports[$index]}" ]] || continue
             answer="$(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
@@ -243,12 +373,14 @@ find_leader() {
         sleep 0.2
     done
 
-    echo "no live node answered as leader within 30s, waiting for ${what}. What each was asked and said:"
+    echo "no live node answered as leader within ${FormationSeconds}s, waiting for ${what}."
+    echo "  $(probe_summary)"
+    echo "  What each was asked and said:"
     for index in "${!scheduler_ports[@]}"; do
         [[ -n "${scheduler_ports[$index]}" ]] || { echo "  slot ${index}: stopped by this fixture"; continue; }
         echo "  127.0.0.1:${scheduler_ports[$index]}: $(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
     done
-    fail "no live node answered as leader, waiting for ${what}"
+    fail "no live node answered as leader, waiting for ${what} ($(probe_summary))"
 }
 
 # The endpoint a refusal tells a client to ask instead, or empty when it names
@@ -312,7 +444,8 @@ named_endpoint() {
 # ever answered as leader at all.
 wait_for_formation() {
     local index endpoint answer named led followers live everLed=0
-    for _ in $(seq 1 150); do
+    local deadline=$(( SECONDS + FormationSeconds ))
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
         led=""
         named=""
         followers=0
@@ -351,9 +484,14 @@ wait_for_formation() {
 
     # Two different faults, and telling them apart is most of the value: nothing
     # ever led at all, or something led and the rest never came to name it.
+    # Three faults now, not two, and the new one comes first because it makes the
+    # other two unanswerable: if the probes did not finish, this fixture never
+    # observed the cluster and cannot say what it did. Reporting "never elected"
+    # from a run that never asked is the confident wrong sentence #388 already cost
+    # half an hour to.
     [[ "$everLed" -eq 1 ]] ||
-        fail "no node ever answered a cluster question; the cluster never elected a leader"
-    fail "the cluster elected but never formed: one leader and every other node naming it never held at once"
+        fail "no node ever answered a cluster question in ${FormationSeconds}s; either the cluster never elected a leader, or this run never managed to ask -- $(probe_summary)"
+    fail "the cluster elected but never formed in ${FormationSeconds}s: one leader and every other node naming it never held at once ($(probe_summary))"
 }
 
 wait_for_formation
@@ -407,7 +545,8 @@ echo "cluster E2E: exactly one node answers, and keeps answering"
 # and waiting it out is what tells "not yet" apart from "never".
 redirect_from() {
     local endpoint="$1" answer=""
-    for _ in $(seq 1 100); do
+    local deadline=$(( SECONDS + RedirectSeconds ))
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
         answer="$(cluster "$endpoint" --cluster-status)"
         case "$answer" in
             *"ask --scheduler="*)
@@ -420,7 +559,7 @@ redirect_from() {
         esac
         sleep 0.2
     done
-    fail "a follower at ${endpoint} never named where to ask: ${answer}"
+    fail "a follower at ${endpoint} never named where to ask within ${RedirectSeconds}s: ${answer} ($(probe_summary))"
 }
 
 for index in 0 1 2; do
@@ -492,7 +631,8 @@ set_upstream
 # that by asking again. Which is what any real operator tool would do, so it is
 # also the behaviour worth having under test.
 settled=0
-for _ in $(seq 1 100); do
+replication_deadline=$(( SECONDS + ReplicationSeconds ))
+while [[ "$SECONDS" -lt "$replication_deadline" ]]; do
     answer="$(cluster "$leader_endpoint" --cluster-status)"
     if [[ "$answer" == *"cache.example:6674"* ]]; then
         settled=1
@@ -608,7 +748,8 @@ answer="$(cluster "$leader_endpoint" --cluster-admit="n4=127.0.0.1:${raft_ports[
 # other -- the same shape of precondition error, and it would have been a hard one
 # to see, because n4 winning here is rare.
 joined=0
-for _ in $(seq 1 150); do
+join_deadline=$(( SECONDS + JoinSeconds ))
+while [[ "$SECONDS" -lt "$join_deadline" ]]; do
     answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
     named="$(named_endpoint "$answer")"
     if [[ "$answer" == *"known settings:"* ]]; then
@@ -624,7 +765,7 @@ for _ in $(seq 1 150); do
     sleep 0.2
 done
 [[ "$joined" -eq 1 ]] ||
-    fail "the admitted node never learned who leads, so it was never replicated to: ${answer}"
+    fail "the admitted node never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary))"
 echo "cluster E2E: an admitted node is replicated to, which is being counted, and it names ${leader_endpoint}"
 
 # And that n4 counts ITSELF a member, which is a different fact from either half
@@ -645,7 +786,8 @@ echo "cluster E2E: an admitted node is replicated to, which is being counted, an
 # needed is the one that redirects. #435 is that surface; until it exists this line
 # is what an operator has too.
 adopted=0
-for _ in $(seq 1 150); do
+adopted_deadline=$(( SECONDS + JoinSeconds ))
+while [[ "$SECONDS" -lt "$adopted_deadline" ]]; do
     if grep -q "consensus: this node counts [0-9]* member(s)" "${workdir}/n4.log" 2>/dev/null; then
         adopted=1
         break
@@ -655,7 +797,7 @@ done
 if [[ "$adopted" -ne 1 ]]; then
     echo "n4 never adopted a configuration. What it last said about its own quorum:"
     grep -E "consensus: this node counts" "${workdir}/n4.log" 2>/dev/null || echo "  (nothing -- it never reported one at all)"
-    fail "the admitted node never counted itself a member, so it can vote in no election"
+    fail "the admitted node never counted itself a member within ${JoinSeconds}s, so it can vote in no election"
 fi
 echo "cluster E2E: the admitted node counts itself a member: $(grep -o "counts [0-9]* member(s)" "${workdir}/n4.log" | tail -1)"
 
@@ -698,4 +840,12 @@ done
 find_leader "a new leader after the old one was stopped"
 echo "cluster E2E: a new leader is elected at ${leader_endpoint}"
 
+# What the probing actually cost, on the SUCCESS path.
+#
+# `.agent/rules/testing.md` asks for this directly and nothing here recorded it:
+# without it no budget in this file could be set from data, and every number was a
+# guess that survived by not being tested. It is also the baseline that makes a
+# future regression legible -- a run whose probe count has grown by an order of
+# magnitude has changed behaviour even while it passes.
+echo "cluster E2E: $(probe_summary)"
 echo "cluster E2E: OK"
