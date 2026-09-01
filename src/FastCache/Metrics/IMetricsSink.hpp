@@ -272,6 +272,22 @@ class IMetricsSink
         /// (#326).
         WorkerFramesRefusedPayloadTooLarge,
 
+        /// `AUTH` payloads on a compile surface that would not decode at all.
+        ///
+        /// Its own row rather than `WorkerFramesRefusedMalformedPayload`, although
+        /// both answer `MalformedFrame`: that one is a request body that did not
+        /// decode into the fields its verb requires, this one is a credential. An
+        /// operator told only "a malformed frame arrived" cannot tell a client version
+        /// skew from somebody malforming AUTH at the door, which is the #327 confusion
+        /// re-created one refusal further along.
+        ///
+        /// Zero on every configuration this build ships, exactly as the counter below
+        /// is and for the same reason: `MergedResponder` routes the `Session` family
+        /// to the scheduler, so a compile surface is never asked about a credential.
+        /// A tally's zero is the truth about events that did not happen; a rise means
+        /// what may compile here has changed.
+        WorkerFramesRefusedMalformedCredential,
+
         /// Frames refused for reaching a compile verb before a credential.
         ///
         /// Zero on every configuration this build ships, and that is the point rather
@@ -482,6 +498,22 @@ class IMetricsSink
         /// accept -- before a header exists -- so it names no verb and no owning
         /// component can be asked for it.
         NodeFrameConnectionsRefusedAtCapacity,
+
+        /// Frames naming a verb family this node runs no component for.
+        ///
+        /// A node holds a cache tier, a scheduler and a worker independently, so a
+        /// verb can be well-formed, known to this build, and served nowhere here --
+        /// a `LEASE` at a plain worker, a `FETCH` at a node built with no tier. The
+        /// operator action is to give this node the component, which is why it is not
+        /// summed with the worker's `UnimplementedVerb`: that one says a verb exists
+        /// and this SURFACE does not serve it, this says the whole node does not.
+        ///
+        /// It rises for the cheapest probe there is as well: a 24-byte header naming
+        /// an unknown opcode is refused before its declared length is even weighed,
+        /// and until #447 every route to that refusal encoded a reply and moved
+        /// nothing -- so a node being scanned for the verbs it answers looked exactly
+        /// like a node nobody was dialling.
+        NodeFrameRequestsRefusedUnservedVerb,
 
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those

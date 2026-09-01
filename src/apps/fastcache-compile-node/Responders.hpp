@@ -11,15 +11,58 @@
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
+#include <ranges>
+
+#include <WorkerProtocol.hpp>
 
 namespace FastCache::Node
 {
+
+namespace Detail
+{
+    /// What the SCHEDULER surface answers each endpoint-decided refusal with.
+    ///
+    /// `Cc::SurfaceRefusal` rows and `Cc::Refuse`, not an `Increment` beside an
+    /// `EncodeErrorReply`: the row IS the refusal, so there is no argument to pass a
+    /// bare code to and the counter cannot be left out. That is the property #447
+    /// reinstates elsewhere in this change, and a file holding two new security
+    /// counters is the last place to ship the other spelling.
+    ///
+    /// A `std::optional` per row rather than a switch with a silent arm, because one
+    /// refusal here deliberately counts NOTHING: the byte budget says this surface is
+    /// momentarily full, which the peer retries past, and summed into a credential
+    /// series it would make that series unreadable. `nullopt` says so where a missing
+    /// `case` would only imply it. `EnumTable` takes its extent from
+    /// `EndpointRefusal::Last`, so a fourth enumerator leaves an empty row here rather
+    /// than silently borrowing a neighbour's.
+    inline constexpr EnumTable<EndpointRefusal, std::optional<Cc::SurfaceRefusal>> SchedulerEndpointRefusals { {
+        std::nullopt,
+        Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
+                             .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed },
+        Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
+                             .counter = IMetricsSink::Counter::SchedulerCredentialsRejected },
+    } };
+
+    // A row states the code a second time, and a second statement of one fact is a
+    // second thing to be wrong. Checked rather than trusted, against the one place
+    // that property lives.
+    static_assert(std::ranges::all_of(std::views::iota(std::size_t { 0 }, SchedulerEndpointRefusals.size()),
+                                      [](std::size_t index) {
+                                          auto const& row = SchedulerEndpointRefusals[index];
+                                          return !row.has_value()
+                                                 || row->code == ErrorCodeFor(static_cast<EndpointRefusal>(index));
+                                      }),
+                  "a scheduler refusal row must answer the code `ErrorCodeFor` names for its refusal");
+} // namespace Detail
 
 /// Serves the fleet's scheduling verbs.
 ///
 /// The peer's host reaches the membership oracle here and nowhere else, which is
 /// what keeps `FrameServer` free of any policy: it hands over an identity and does
 /// not know what anybody does with it.
+
 class SchedulerResponder final: public IFrameResponder
 {
   public:
@@ -128,24 +171,16 @@ class SchedulerResponder final: public IFrameResponder
     /// The byte budget is not counted, for the reason the size and opcode arms of
     /// `RefusalReply` are not: it says this surface is momentarily full, which the
     /// peer sees and retries, and summing it into a security series is what makes
-    /// that series unreadable.
+    /// that series unreadable. `Detail::SchedulerEndpointRefusals` is where that is
+    /// said, and where the two that ARE counted carry their rows.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        switch (refusal)
-        {
-            case EndpointRefusal::CredentialMalformed:
-                _metrics.Increment(IMetricsSink::Counter::SchedulerCredentialsMalformed);
-                return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::MalformedFrame, detail);
-            case EndpointRefusal::CredentialRejected:
-                _metrics.Increment(IMetricsSink::Counter::SchedulerCredentialsRejected);
-                return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::Unauthenticated, detail);
-            case EndpointRefusal::InFlightBudget:
-            case EndpointRefusal::Last:
-                break;
-        }
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::EndpointBusy, detail);
+        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)];
+        if (!row.has_value())
+            return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
+        return Cc::Refuse(_metrics, *row, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -367,17 +402,7 @@ class CacheResponder final: public IFrameResponder
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        switch (refusal)
-        {
-            case EndpointRefusal::CredentialMalformed:
-                return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::MalformedFrame, detail);
-            case EndpointRefusal::CredentialRejected:
-                return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::Unauthenticated, detail);
-            case EndpointRefusal::InFlightBudget:
-            case EndpointRefusal::Last:
-                break;
-        }
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::EndpointBusy, detail);
+        return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -485,10 +510,18 @@ class MergedResponder final: public IFrameResponder
     ///        not schedule. Also owns the credential, so `AUTH` goes here.
     /// @param compile Answers the compile verbs, or nullptr when this node runs no
     ///        worker. All three must outlive this.
-    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
+    /// @param metrics Where a verb no component here serves is counted. The router's
+    ///        own, because that refusal belongs to no owner by definition -- and it is
+    ///        reachable by the cheapest probe there is, so answering it uncounted is
+    ///        the whole of #447 on the one path routing cannot close.
+    MergedResponder(IFrameResponder* cache,
+                    IFrameResponder* scheduler,
+                    IFrameResponder* compile,
+                    IMetricsSink& metrics) noexcept:
         _cache { cache },
         _scheduler { scheduler },
-        _compile { compile }
+        _compile { compile },
+        _metrics { metrics }
     {
     }
 
@@ -588,13 +621,20 @@ class MergedResponder final: public IFrameResponder
     /// Routed for the COUNTER. The wording is the same either way, but a cache STORE
     /// that overran its ceiling counted against the scheduler names the wrong
     /// subsystem, and naming the subsystem is what these counters are read for.
+    /// **The unowned arm answers `UnservedReply()`, not the decision's own code**, and
+    /// it is reachable: the endpoint weighs its surface-wide frame ceiling BEFORE it
+    /// asks `RefusePeer`, so a 24-byte header naming a verb nothing here serves and
+    /// declaring a gigabyte arrives at this arm. What that peer needs told is that the
+    /// verb is served nowhere on this node -- "too large" would send them to shrink a
+    /// frame that was never going to be answered -- and it is the same sentence every
+    /// other route to an unowned verb gives.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t opRaw,
                                                       std::string_view detail) const override
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
-            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), detail);
+            return UnservedReply();
         return owner->RefusalReply(decision, opRaw, detail);
     }
 
@@ -694,12 +734,25 @@ class MergedResponder final: public IFrameResponder
     /// A sentence rather than a bare code, because the operator action differs from
     /// every other refusal here: nothing is misconfigured on the CLIENT's side, and the
     /// node has to be told to hold a tier or to schedule before this verb exists.
+    ///
+    /// **And it is counted**, through the one row every route to it shares. Four
+    /// methods reach this -- `Answer`, `RefusePeer`, `RefusalReply` and
+    /// `EndpointRefusalReply` -- and each used to encode its own reply, so a node being
+    /// scanned for the verbs it answers refused every probe correctly and left
+    /// `/metrics` flat (#447). It is the router's own counter rather than an owner's
+    /// because there is, by definition, no owner to route it to; the same argument
+    /// `FrameServer` makes about the refusal it decides before a header exists.
     /// @return The encoded refusal.
-    [[nodiscard]] static std::vector<std::byte> UnservedReply()
+    [[nodiscard]] std::vector<std::byte> UnservedReply() const
     {
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::UnimplementedVerb,
-                                                  "this node serves no component for that verb family");
+        return Cc::Refuse(_metrics, UnservedVerb, "this node serves no component for that verb family");
     }
+
+    /// The row pairing that refusal's wire code with its counter.
+    static constexpr Cc::SurfaceRefusal UnservedVerb {
+        .code = CompileCacheWire::UnimplementedVerb,
+        .counter = IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb,
+    };
 
     /// The largest value the present owners report for one ceiling.
     ///
@@ -720,6 +773,7 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _cache;
     IFrameResponder* _scheduler;
     IFrameResponder* _compile;
+    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Node

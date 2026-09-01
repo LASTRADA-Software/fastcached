@@ -39,8 +39,14 @@ class NodeFrameSurface
     ///        nullptr when this node does not schedule.
     /// @param compile Answers the compile verbs, or nullptr when this node runs no
     ///        worker. All three must outlive this.
-    NodeFrameSurface(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
-        _responder { cache, scheduler, compile }
+    /// @param metrics Where the router counts a verb no component here serves, and
+    ///        where the endpoint counts the connection it has no room for. Both are
+    ///        refusals that belong to no owning component.
+    NodeFrameSurface(IFrameResponder* cache,
+                     IFrameResponder* scheduler,
+                     IFrameResponder* compile,
+                     IMetricsSink& metrics) noexcept:
+        _responder { cache, scheduler, compile, metrics }
     {
     }
 
@@ -62,11 +68,8 @@ class NodeFrameSurface
     /// @param metrics Where the endpoint's own at-capacity refusal is counted.
     /// @param logger Where to announce the bound address.
     /// @return Nothing, or why it could not be served.
-    [[nodiscard]] std::expected<void, std::string> Bind(NodeIoLoop& io,
-                                                        NodeConfig const& cfg,
-                                                        std::optional<int> inherited,
-                                                        IMetricsSink& metrics,
-                                                        ILogger& logger);
+    [[nodiscard]] std::expected<void, std::string> Bind(
+        NodeIoLoop& io, NodeConfig const& cfg, std::optional<int> inherited, IMetricsSink& metrics, ILogger& logger);
 
     /// The address this node's `0xFC` listener bound.
     /// @return The endpoint, or an empty string before `Bind` succeeded.

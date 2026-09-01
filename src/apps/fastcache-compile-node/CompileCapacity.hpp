@@ -357,9 +357,14 @@ namespace CompileRefusal
     /// credential. It carries a row anyway, so that a shape in which a compile surface
     /// did check one cannot answer on the wire while nothing rises -- which is the
     /// whole of #327 and, on the merged listener, of #447.
+    ///
+    /// Its OWN counter rather than the undecodable-payload one, although both answer
+    /// `MalformedFrame`. That is the rulebook's load-bearing clause -- the row is the
+    /// refusal, not the code -- and a dead row is exactly where it is easiest to get
+    /// wrong: nothing would ever have shown the two summed.
     inline constexpr Cc::SurfaceRefusal MalformedCredential {
         .code = CompileCacheWire::ErrorCode::MalformedFrame,
-        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedCredential,
     };
     /// A compile verb reached before a credential. Zero on every shipped shape.
     inline constexpr Cc::SurfaceRefusal Unauthenticated {

@@ -298,7 +298,8 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     // listener cannot decide that by existing.
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+    MergedResponder responder { &cache, &scheduler, nullptr, metrics };
 
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Fetch))) == "cache");
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Store))) == "cache");
@@ -385,7 +386,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
 
     CacheResponder cacheResponder { proxy, locality, metrics };
     CompileResponder compileResponder { protocol, capacity, membership, pool, io.Reactor(), metrics, logger };
-    MergedResponder responder { &cacheResponder, nullptr, &compileResponder };
+    MergedResponder responder { &cacheResponder, nullptr, &compileResponder, metrics };
 
     constexpr auto* peer = "10.0.0.1";
 
@@ -427,7 +428,8 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // `Cc::CacheProtocol` steps over rather than treating as fatal, so a launcher that
     // meets it carries on and compiles.
     NamedResponder scheduler { "scheduler" };
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr, metrics };
 
     auto const fetch = AnswerNow(schedulerOnly, HeaderFor(Wire::Op::Fetch));
     CHECK(ErrorOf(fetch) == Wire::UnimplementedVerb);
@@ -438,8 +440,14 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // #290's second half -- so the refusal is about a MISSING COMPONENT exactly as the
     // cache one above is, and a node passing a null one gets the honest code.
     NamedResponder cache { "cache" };
-    MergedResponder both { &cache, &scheduler, nullptr };
+    MergedResponder both { &cache, &scheduler, nullptr, metrics };
     CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::UnimplementedVerb);
+
+    // And every one of them is COUNTED, on the router's own row (#447). Four methods
+    // reach this refusal and each used to encode its own reply, so a node being scanned
+    // for the verbs it answers refused every probe correctly and left the series flat.
+    // Two routers here, one counter apiece: the sink is shared, so the total is two.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb) == 2);
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")
@@ -448,16 +456,30 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     // nowhere from costing the surface a buffer -- the property #285 is about, held for
     // the new refusal as well as for the old ones.
     NamedResponder scheduler { "scheduler" };
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr, metrics };
 
     auto const refusal = schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(refusal.has_value());
     CHECK(ErrorOf(Unwrap(refusal)) == Wire::UnimplementedVerb);
 
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb) == 1);
+
     // And an owned verb is still the owner's question to answer, not this one's.
     CHECK_FALSE(schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
     REQUIRE(scheduler.Admitted().size() == 1);
     CHECK(scheduler.Admitted().front() == static_cast<std::uint8_t>(Wire::Op::Lease));
+
+    // Admission is not a refusal, so nothing rose for it.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb) == 1);
+
+    // The fourth route, and the one #447 added: an endpoint-decided refusal about a
+    // verb nobody owns. Same row, same sentence -- a router asked about a verb it
+    // cannot place has one honest answer however the question arrived.
+    auto const budget =
+        schedulerOnly.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Fetch), {});
+    CHECK(ErrorOf(budget) == Wire::UnimplementedVerb);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb) == 2);
 }
 
 TEST_CASE("The credential answer follows the verb, not the surface", "[node][merged-responder]")
@@ -468,7 +490,8 @@ TEST_CASE("The credential answer follows the verb, not the surface", "[node][mer
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
     scheduler.RequireAuth(true);
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+    MergedResponder responder { &cache, &scheduler, nullptr, metrics };
 
     CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Fetch)));
     CHECK(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Lease)));
@@ -485,22 +508,33 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     // wrong subsystem, and naming the subsystem is what these counters are read for.
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+    MergedResponder responder { &cache, &scheduler, nullptr, metrics };
 
-    (void) responder.RefusalReply(
-        Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store), {});
-    (void) responder.RefusalReply(
-        Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease), {});
+    (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store), {});
+    (void) responder.RefusalReply(Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease), {});
 
     CHECK(cache.Refusals() == std::vector<std::string> { "cache" });
     CHECK(scheduler.Refusals() == std::vector<std::string> { "scheduler" });
 
-    // An unowned verb still gets a reply, and moves nobody's counter: there is no
-    // component whose refusal it would be.
+    // An unowned verb still gets a reply, and it is no component's: there is nobody
+    // whose refusal it would be, so neither fake sees it.
+    //
+    // **It is the ROUTER's own, and it says the verb is unserved rather than repeating
+    // the decision** (#447). Both halves changed here. This arm is reachable -- the
+    // endpoint weighs its surface-wide frame ceiling before it asks `RefusePeer`, so a
+    // header naming a verb nothing here serves and declaring a gigabyte arrives at
+    // exactly this call -- and it used to encode `payload-too-large` and move nothing
+    // at all. That is the cheapest probe there is answered while `/metrics` stayed
+    // flat, which is the whole defect, surviving on the one path routing cannot close.
+    //
+    // "Too large" would also have sent that peer to shrink a frame that was never
+    // going to be answered, so the sentence every other route to an unowned verb gives
+    // is the one this gives too.
     auto const orphan =
-        responder.RefusalReply(
-            Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
-    CHECK(ErrorOf(orphan) == Wire::ErrorCode::PayloadTooLarge);
+        responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
+    CHECK(ErrorOf(orphan) == Wire::UnimplementedVerb);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb) == 1);
     CHECK(cache.Refusals().size() == 1);
     CHECK(scheduler.Refusals().size() == 1);
 }
@@ -523,7 +557,9 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
     NamedResponder scheduler { "scheduler" };
     scheduler.PlaceCeilings(SchedulerRequest, SchedulerOpen, SchedulerInFlight);
 
-    MergedResponder both { &cache, &scheduler, nullptr };
+    AtomicMetricsSink metrics;
+
+    MergedResponder both { &cache, &scheduler, nullptr, metrics };
     CHECK(both.MaxRequestBytes() == CacheRequest);
     CHECK(both.MaxInFlightBytes() == CacheInFlight);
     // The largest, not the smallest: this one surface carries both populations, and
@@ -532,7 +568,7 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
 
     // A surface with one component reports that component's, never a fold over a
     // null one.
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr, metrics };
     CHECK(schedulerOnly.MaxRequestBytes() == SchedulerRequest);
     CHECK(schedulerOnly.MaxOpenConnections() == SchedulerOpen);
     CHECK(schedulerOnly.MaxInFlightBytes() == SchedulerInFlight);
@@ -689,7 +725,8 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of this case, so the two must differ.
     cfg.advertise = "worker-01.internal:1";
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, metrics, logger);
+    auto surface =
+        StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
 
@@ -778,7 +815,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
 
         NodeIoLoop io;
         CapturingLogger logger;
-    AtomicMetricsSink metrics;
+        AtomicMetricsSink metrics;
         NamedResponder cache { "cache" };
         NamedResponder scheduler { "scheduler" };
 

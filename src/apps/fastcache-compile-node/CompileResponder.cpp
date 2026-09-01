@@ -5,6 +5,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -92,8 +93,8 @@ namespace
     /// One row per `EndpointRefusal`, in enumerator order.
     struct EndpointRefusalRow
     {
-        EndpointRefusal refusal;    ///< Which endpoint decision this describes.
-        Cc::SurfaceRefusal answer;  ///< What the client is told, and what the operator sees rise.
+        EndpointRefusal refusal;   ///< Which endpoint decision this describes.
+        Cc::SurfaceRefusal answer; ///< What the client is told, and what the operator sees rise.
     };
 
     /// Which refusal each endpoint-decided outcome answers with on this surface.
@@ -111,6 +112,17 @@ namespace
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusalTable, &EndpointRefusalRow::refusal),
                   "EndpointRefusalTable must hold one row per EndpointRefusal, in enumerator order");
+
+    // The rows above are CONVERTED from `CompileRefusal`, which already pairs a code
+    // with a counter -- the rulebook's instruction rather than restating the pair. What
+    // that conversion cannot check is that the row picked answers what this refusal is
+    // supposed to answer, so it is checked here against the one place that property
+    // lives.
+    static_assert(std::ranges::all_of(EndpointRefusalTable,
+                                      [](EndpointRefusalRow const& row) {
+                                          return row.answer.code == ErrorCodeFor(row.refusal);
+                                      }),
+                  "a converted row must answer the code `ErrorCodeFor` names for its refusal");
 } // namespace
 
 std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const

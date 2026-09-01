@@ -4,6 +4,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
@@ -70,6 +71,42 @@ enum class EndpointRefusal : std::uint8_t
     /// The count. See `Core/EnumTable.hpp`.
     Last,
 };
+
+/// One row per `EndpointRefusal`, in enumerator order.
+struct EndpointRefusalCode
+{
+    EndpointRefusal refusal;          ///< Which endpoint decision this describes.
+    CompileCacheWire::ErrorCode code; ///< What every surface tells the client about it.
+};
+
+/// What the client is told, per refusal.
+///
+/// **A property of the refusal, not of the surface**, which is why it is one table
+/// here rather than an arm in each responder: three surfaces answering the same
+/// question separately is three answers that agree today, and a divergence between
+/// two of them would be one listener telling a client different things about one
+/// decision, which nothing could see. The COUNTER is the half that legitimately
+/// differs -- the scheduler moves one for a wrong credential, the cache cannot
+/// produce that refusal at all -- so it stays with the surface.
+///
+/// The direct counterpart of `CompileCacheWire::ErrorCodeFor(PrePayloadDecision)`,
+/// which the same call sites ask two lines away.
+inline constexpr EnumTable<EndpointRefusal, EndpointRefusalCode> EndpointRefusalCodes { {
+    { .refusal = EndpointRefusal::InFlightBudget, .code = CompileCacheWire::ErrorCode::EndpointBusy },
+    { .refusal = EndpointRefusal::CredentialMalformed, .code = CompileCacheWire::ErrorCode::MalformedFrame },
+    { .refusal = EndpointRefusal::CredentialRejected, .code = CompileCacheWire::ErrorCode::Unauthenticated },
+} };
+
+static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::refusal),
+              "EndpointRefusalCodes must hold one row per EndpointRefusal, in enumerator order");
+
+/// The wire code @p refusal is answered with.
+/// @param refusal Any enumerator but `Last`.
+/// @return The code every surface tells the client.
+[[nodiscard]] constexpr CompileCacheWire::ErrorCode ErrorCodeFor(EndpointRefusal refusal) noexcept
+{
+    return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
+}
 
 /// Answers one framed request.
 ///

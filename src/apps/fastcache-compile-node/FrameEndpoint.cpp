@@ -122,12 +122,9 @@ struct FrameServer::State
     /// bound after the endpoint claims to have stopped.
     std::atomic<std::size_t> loopsAlive { 0 };
 
-    State(NodeIoLoop& loop,
-          IListener& l,
-          IFrameResponder& r,
-          std::string_view name,
-          IMetricsSink& sink,
-          ILogger& log) noexcept:
+    State(
+        NodeIoLoop& loop, IListener& l, IFrameResponder& r, std::string_view name, IMetricsSink& sink, ILogger& log) noexcept
+        :
         io { loop },
         listener { l },
         responder { r },
@@ -454,11 +451,11 @@ namespace
                     // one counter and one decision rather than splitting.
                     if (!co_await WriteAll(socket.get(),
                                            state->responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge,
-                                                                        decoded->opRaw,
-                                                                        std::format("{} exceeds the {} {}-byte request cap",
-                                                                                    decoded->payloadLength,
-                                                                                    state->what,
-                                                                                    cap))))
+                                                                         decoded->opRaw,
+                                                                         std::format("{} exceeds the {} {}-byte request cap",
+                                                                                     decoded->payloadLength,
+                                                                                     state->what,
+                                                                                     cap))))
                         break;
 
                     // Then the body is STEPPED OVER so the connection stays usable,
@@ -533,8 +530,9 @@ namespace
                     continue;
                 }
 
-                if (auto const budget = state->responder.MaxInFlightBytes();
-                    budget != 0 && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
+                if (auto const budget = state->responder.MaxInFlightBytes(),
+                    held = state->inFlightBytes.load(std::memory_order_acquire);
+                    budget != 0 && held + decoded->payloadLength > budget)
                 {
                     // Checked on the DECLARED length, before a payload byte is read,
                     // so an over-budget request costs no allocation at all. The
@@ -547,21 +545,23 @@ namespace
                     // to reconnect over a transient budget. Answered first, for the
                     // reason the oversize branch is.
                     //
+                    // The figure in the message is the one the DECISION was taken on,
+                    // read once. Loaded a second time to format it, the refusal could
+                    // name a number that does not explain it -- another connection
+                    // releasing in between yields "has 0 of N bytes in flight" beside
+                    // a refusal for having too many.
+                    //
                     // Counted by the surface too, and it is the same regression the
                     // oversize branch above was: the dedicated compile port answered
                     // this with `CompileRefusal::EndpointBusy` and moved
                     // `worker_jobs_refused_endpoint_busy_total`, which the operator
                     // documentation still promises, and the merged listener answered
                     // it with a bare code (#447).
-                    if (!co_await WriteAll(
-                            socket.get(),
-                            state->responder.EndpointRefusalReply(
-                                EndpointRefusal::InFlightBudget,
-                                decoded->opRaw,
-                                std::format("{} has {} of {} bytes in flight",
-                                            state->what,
-                                            state->inFlightBytes.load(std::memory_order_acquire),
-                                            budget))))
+                    if (!co_await WriteAll(socket.get(),
+                                           state->responder.EndpointRefusalReply(
+                                               EndpointRefusal::InFlightBudget,
+                                               decoded->opRaw,
+                                               std::format("{} has {} of {} bytes in flight", state->what, held, budget))))
                         break;
                     if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
                         break;
@@ -602,7 +602,8 @@ namespace
                 // one flag is exactly the part that reads fine without the framing.
                 if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
                 {
-                    if (!co_await WriteAll(socket.get(), AnswerAuth(state->responder, *payload, decoded->opRaw, credentialAccepted)))
+                    if (!co_await WriteAll(socket.get(),
+                                           AnswerAuth(state->responder, *payload, decoded->opRaw, credentialAccepted)))
                         break;
                     continue;
                 }

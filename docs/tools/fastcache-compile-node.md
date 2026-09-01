@@ -1531,6 +1531,8 @@ that is said explicitly.
 | `fastcache_scheduler_credentials_rejected_total` | Somebody presented a scheduler token and it was **wrong**. |
 | `fastcache_scheduler_credentials_malformed_total` | An `AUTH` frame that would not decode at all — a client built against another release. |
 | `fastcache_scheduler_requests_refused_unauthenticated_total` | A verb was reached *without* a credential ever having been presented. |
+| `fastcache_node_frame_requests_refused_unserved_verb_total` | A verb family this node runs no component for — a `LEASE` at a plain worker, a `FETCH` at a node with no tier. Rises for an unknown opcode too, which makes it the series a port scan shows up on. |
+| `fastcache_worker_frames_refused_malformed_credential_total` | An `AUTH` payload the *compile* surface could not decode. Flat at zero by construction — `AUTH` is the scheduler's — so a rise means what may compile here has changed. |
 
 Two pairs must never be summed, and both pairs share a wire code, so a dashboard
 grouping by the code an operator sees in a client log gets them wrong:
@@ -1545,7 +1547,14 @@ grouping by the code an operator sees in a client log gets them wrong:
   being answerable — and the *rejection* half is the half that means somebody is
   trying.
 
-All six were once answered correctly on the wire while moving nothing, on the
+`malformed-frame` is the third such code, shared by a request body that would not
+decode and by an `AUTH` payload that would not; those are
+`fastcache_worker_frames_refused_malformed_payload_total` and
+`..._malformed_credential_total`, and an operator told only "a malformed frame
+arrived" cannot tell a client version skew from somebody malforming `AUTH` at the
+door.
+
+All of them were once answered correctly on the wire while moving nothing, on the
 merged listener that is now the only `0xFC` port a node opens
 ([#447](https://github.com/LASTRADA-Software/fastcached/issues/447)). Two of them
 had counted on the dedicated compile port that
