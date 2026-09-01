@@ -253,9 +253,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
       .prometheusName = "fastcache_worker_frames_refused_unauthenticated_total",
-      .help = "Frames refused for reaching a compile verb before a credential. Zero "
-              "on every shipped configuration, because a compile carries its own "
-              "per-job lease instead; a rise means who may compile here has changed.",
+      .help = "Frames refused for reaching a compile verb before a credential. Flat at "
+              "zero BY CONSTRUCTION, not for want of anybody probing: the compile "
+              "surface answers AuthRequired false -- a compile carries its own per-job "
+              "lease instead -- so the pre-payload gate never reaches this. Do not read "
+              "the flat line as 'nothing is asking'. A rise means that answer changed, "
+              "which is a change to who may compile here.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
       .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",
