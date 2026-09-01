@@ -23,12 +23,17 @@
 # author would check said yes. A `ctest` invocation cannot tell that apart from a
 # tree with no races. This script can, and refuses to.
 #
-# It asks that question twice, because it is two questions. `__tsan_init` in the
-# TEST BINARIES answers "was this artefact instrumented" -- the artefact actually
-# under test, not some other build in the same tree. The canary answers "does the
-# runtime detect and report" -- which `TSAN_OPTIONS`, a suppressions file, or a
-# stripped runtime can each break while leaving the instrumentation intact.
-# Neither substitutes for the other.
+# It asks that question twice, because it is two questions. An undefined
+# `__tsan_init` reference in each artefact's OWN OBJECT FILES answers "was this
+# artefact instrumented" -- the artefact actually under test, not some other build
+# in the same tree, and not the sanitizer runtime the link pulled in. The canary
+# answers "does the runtime detect and report" -- which `TSAN_OPTIONS`, a
+# suppressions file, or a stripped runtime can each break while leaving the
+# instrumentation intact. Neither substitutes for the other.
+#
+# The first question used to be asked of the BINARIES, and could not be answered
+# there: `__tsan_init` is DEFINED by the runtime, so it is present whether or not
+# any translation unit was instrumented (#472). See `AssertInstrumented`.
 #
 # Every way this refuses has a message of its own, because each is fixed
 # somewhere different, and each was verified by making it happen rather than
@@ -40,8 +45,11 @@
 #   `nm` is unavailable                   -> "nm is required"
 #   no COMPILE line carried -fsanitize    -> "instrumented nothing"
 #   a target is not built                 -> "not built"
-#   a target's symbols cannot be read     -> "no symbol table"
-#   a target has no __tsan_init           -> "built WITHOUT instrumentation"
+#   a target's object dir is missing      -> "no <target>.dir under"
+#   two dirs could be a target's objects  -> "cannot tell which is current"
+#   a target has no objects at all        -> "no object files under"
+#   an object's symbols cannot be read    -> "nm could not read"
+#   an object has no undefined __tsan_init-> "built WITHOUT ThreadSanitizer"
 #   the canary does not go red            -> "the deliberate race was NOT reported"
 #   the canary dies of something else     -> "reported no data race"
 #   a tag expression matches nothing      -> "tested NOTHING"
@@ -171,32 +179,142 @@ trap cleanup EXIT
 
 BinaryPath() { printf '%s' "${BUILD_DIR}/target/$1"; }
 
+# Where CMake put a target's object files.
+#
+# Found rather than tabulated, because the three targets do not share a parent:
+# `tsan-canary` and `FastCacheTest` sit under `src/tests/CMakeFiles/`, while
+# `fastcache-compile-node-tests` is under `src/apps/fastcache-compile-node/`. A
+# table would be a second place to edit when a target moves, and the kind that
+# goes stale silently.
+#
+# `find` is used here where `BinaryPath` deliberately refuses it, and the
+# difference is the check: taking the FIRST match would be the guess that comment
+# objects to, so this requires EXACTLY ONE and refuses otherwise. Zero means the
+# layout moved or the target was never built; two means a stale `.dir` from a
+# renamed target is still on disk and the gate cannot know which is current.
+# Either way it stops with the paths in the message rather than verifying an
+# artefact nobody asked about.
+ObjectDir() {
+    local name="$1" matches count
+    matches="$(find "$BUILD_DIR" -type d -name "${name}.dir" 2>/dev/null || true)"
+    if [[ -z "$matches" ]]; then
+        fatal "${name}: no ${name}.dir under ${BUILD_DIR}, so its objects cannot be checked for instrumentation.
+    Either the target was not built, or CMake's object layout moved. This gate
+    reads the OBJECTS rather than the binary (see below), so it needs them."
+    fi
+    count="$(printf '%s\n' "$matches" | grep -c .)"
+    if [[ "$count" != "1" ]]; then
+        fatal "${name}: ${count} directories named ${name}.dir under ${BUILD_DIR}; cannot tell which is current:
+${matches}
+    A stale directory from a renamed target will do this. Remove it, or reconfigure."
+    fi
+    printf '%s' "$matches"
+}
+
+# ---------------------------------------------------------------------------
+# Question one: is the artefact under test instrumented?
+#
+# ASKED OF THE OBJECTS, NOT THE BINARY, and that distinction is the whole of
+# #472. `__tsan_init` is DEFINED by the sanitizer runtime, which the link pulls in
+# whenever `-fsanitize=thread` is on the link line -- so `nm --defined-only` on a
+# binary answers yes whether or not a single translation unit was instrumented.
+# Measured, same source, two objects, two binaries:
+#
+#     inst.o   U __tsan_init  yes      inst  binary: __tsan_init defined = YES
+#     plain.o  U __tsan_init  no       plain binary: __tsan_init defined = YES
+#
+# `plain.o` was compiled with no sanitizer flag at all and its binary passed the
+# old proof. An object cannot borrow a symbol from a runtime it is not linked to,
+# so the UNDEFINED reference is the one that means something. Same symbol as
+# before; what changed is `--undefined-only` and looking at the object.
+#
+# WHY THAT MATTERED MORE FOR THE SUITES THAN FOR THE CANARY. An uninstrumented
+# canary fails closed -- it exits 0, reports no race, and `AssertCanaryFires`
+# refuses -- though it used to do so while blaming `TSAN_OPTIONS`, the
+# suppressions file or the runtime, all three of which were fine. The test
+# binaries had no such backstop: `RunTarget` checks the timeout, that the tag
+# filter matched, and that assertions were reported, and not one of those can
+# tell an instrumented run from an uninstrumented one. An uninstrumented
+# `FastCacheTest` linked against the runtime runs, reports assertions, exits 0,
+# and the gate prints `all scoped targets clean`. That is the silent fail-open,
+# and it is why this check covers every artefact rather than only the canary.
+#
+# WHY `__tsan_init` AND NOT `__tsan_func_entry`. The latter is emitted per
+# instrumented FUNCTION, so an object whose translation unit has no functions
+# carries none -- six of `FastCacheTest`'s 135 are exactly that, the
+# platform-gated `Iocp*`, `Kqueue*` and `Tls*` test files, which compile to
+# nothing on Linux. A rule built on `__tsan_func_entry` needs an
+# empty-TU exemption and would otherwise refuse a correct build. Those six DO
+# carry `U __tsan_init` and a `tsan.module_ctor`: they were instrumented, there
+# was simply nothing to instrument. Measured across the three targets, 185 of 185
+# objects carry it and none needs an exemption.
+#
+# The existence check on the binary comes FIRST and stays. `nm` on a path that
+# does not exist prints nothing, and "no symbols" is character-for-character what
+# an uninstrumented artefact looks like; a missing file must not be reportable as
+# a missing sanitizer, because they need different fixes.
+#
+# `target/` is where this project's CMake puts executables
+# (CMAKE_RUNTIME_OUTPUT_DIRECTORY, set in the top-level CMakeLists). No `find`
+# fallback for the binary, on purpose -- see `ObjectDir` above for where a search
+# is used and what makes it safe there.
+# ---------------------------------------------------------------------------
+
 AssertInstrumented() {
-    local name="$1" path
+    local name="$1" path objdir
     path="$(BinaryPath "$name")"
     [[ -f "$path" ]] || fatal "${name}: not built (looked in ${BUILD_DIR}/target). Build it before running this gate."
-    # `nm` into a variable and match afterwards, never `nm | grep -q`: under
-    # `set -o pipefail` a `grep -q` that matches EARLY closes the pipe, `nm` dies
-    # of SIGPIPE, and the pipeline reports failure -- so a correctly instrumented
-    # binary is diagnosed as an uninstrumented one. Verified here, not theorised:
-    # that is exactly how this function first behaved.
-    #
-    # `--no-demangle`, and only the defined global symbols: `__tsan_init` is a C
-    # symbol that is never mangled, so demangling buys nothing at all. Measured on
-    # this tree, `FastCacheTest` has ~81k symbol table entries and ~42k defined
-    # globals -- a few MB into a bash variable, three times a run, well under a
-    # second in total.
-    local symbols
-    symbols="$(nm -g --defined-only --no-demangle "$path" 2>/dev/null || true)"
-    [[ -n "$symbols" ]] || fatal "${name}: nm produced no symbol table for ${path}; cannot verify instrumentation (stripped binary, or the wrong nm for this object format)."
-    if [[ "$symbols" != *__tsan_init* ]]; then
-        fatal "${name}: built WITHOUT ThreadSanitizer instrumentation (no __tsan_init).
-    The build carries no -fsanitize=thread even though this gate was invoked.
-    Check ENABLE_SANITIZER_THREAD reached the compile line, not just the cache:
-        grep -c fsanitize=thread ${BUILD_DIR}/build.ninja
+    objdir="$(ObjectDir "$name")"
+
+    local total=0 uninstrumented=0 offenders="" obj undefined nm_rc
+    while IFS= read -r obj; do
+        total=$(( total + 1 ))
+        # `nm` into a variable and match with `case`, never `nm | grep -q`. Under
+        # `set -o pipefail` a `grep -q` that matches EARLY closes the pipe, `nm`
+        # dies of SIGPIPE, and the pipeline reports failure -- so an instrumented
+        # object is diagnosed as an uninstrumented one, ON THE SUCCESS PATH.
+        #
+        # Measured while writing this, in the census scripts that produced the
+        # numbers above: it is not merely a false negative, it is RACY. `printf`
+        # sometimes wins the exit race and sometimes does not, so two runs over
+        # the same 135 objects returned 129 and 108, and a listing built the same
+        # way named 27 offenders against a true 6. A deterministic wrong answer
+        # gets caught by whoever checks it once; a racy one gets blamed on the
+        # subject.
+        nm_rc=0
+        undefined="$(nm --undefined-only --no-demangle "$obj" 2>/dev/null)" || nm_rc=$?
+        if [[ "$nm_rc" -ne 0 ]]; then
+            fatal "${name}: nm could not read ${obj}; cannot verify instrumentation.
+    An unreadable object is not an uninstrumented one, so this refuses rather
+    than guessing which it was."
+        fi
+        case "$undefined" in
+            *__tsan_init*) ;;
+            *)
+                uninstrumented=$(( uninstrumented + 1 ))
+                offenders="${offenders}        ${obj}
+"
+                ;;
+        esac
+    done < <(find "$objdir" -name '*.o')
+
+    # An empty object directory is not a clean bill: it is a target whose objects
+    # this gate never saw, which is the same shape as the missing-file case above.
+    [[ "$total" -gt 0 ]] \
+        || fatal "${name}: no object files under ${objdir}, so nothing proves this artefact was instrumented."
+
+    if [[ "$uninstrumented" -ne 0 ]]; then
+        fatal "${name}: ${uninstrumented} of ${total} object files were built WITHOUT ThreadSanitizer
+    instrumentation (no undefined __tsan_init reference):
+${offenders}    The BINARY may still carry a defined __tsan_init -- the link pulls the runtime
+    in whole -- so the binary is not evidence here and this gate no longer asks it.
+    A per-file flag override, a stale object in an incremental directory, or a
+    compiler-cache replay of a non-instrumented object all land here.
+    Check the compile line the generator actually wrote:
+        grep -c -- -fsanitize=thread ${BUILD_DIR}/build.ninja
     See cmake/portable/Sanitizers.cmake for the precedent."
     fi
-    note "${name}: instrumented"
+    note "${name}: instrumented (${total} object files)"
 }
 
 # ---------------------------------------------------------------------------
@@ -218,9 +336,13 @@ AssertCanaryFires() {
 
     if [[ "$canary_rc" -eq 0 ]]; then
         fatal "the deliberate race in src/tests/TsanCanary.cpp was NOT reported.
-    The binary is instrumented, so the runtime is not reporting: TSAN_OPTIONS, the
-    suppressions file, or the sanitizer runtime itself. A clean suite would be
-    meaningless, so this gate fails instead of passing.
+    Every object of this canary carries an undefined __tsan_init, which was checked
+    before this ran, so the translation unit WAS instrumented -- that is not the
+    cause and is not worth investigating. What is left is the runtime side:
+    TSAN_OPTIONS, the suppressions file, or the sanitizer runtime itself.
+    (Before #472 this message named those three while an uninstrumented canary
+    could still reach it, which sent readers to three places that were all fine.)
+    A clean suite would be meaningless, so this gate fails instead of passing.
     Canary output:
 ${canary_out}"
     fi
@@ -304,6 +426,176 @@ RunTarget() {
 }
 
 # ---------------------------------------------------------------------------
+# `--self-test`: drive AssertInstrumented's verdicts against staged trees.
+#
+# A guard that has never been seen to fire is the thing this repository keeps
+# finding, and #472 is precisely that -- a proof that had never been shown to
+# refuse anything, because it structurally could not. So each refusal is staged
+# here and required to happen.
+#
+# THE ONE THAT MATTERS IS THE SUITE, NOT THE CANARY. An uninstrumented canary
+# already failed closed before #472: it exits 0, reports no race, and
+# `AssertCanaryFires` refuses. The test binaries had no backstop at all --
+# `RunTarget` checks the timeout, the tag filter and the assertion count, none of
+# which can tell an instrumented run from an uninstrumented one -- so a guard
+# demonstrated only on the canary would be a guard nobody has seen fire where it
+# matters. `suite-object-uninstrumented` is that case and is deliberately first.
+#
+# HOW THE OBJECTS ARE STAGED. `AssertInstrumented` asks exactly one question of
+# each object: what does `nm --undefined-only` print. So a staged `.o` here is a
+# TEXT FILE whose content is that output, and a stub `nm` earlier on PATH prints
+# it. No compiler, no sanitizer runtime, no build -- which is what lets this run
+# in the default `ctest` set on every platform rather than only where a TSan
+# toolchain exists. It exercises the real decision code; only the reading of the
+# symbol table is stood in for, and that half has no branches.
+#
+# The binary is a plain file, because `AssertInstrumented` only checks that it
+# EXISTS. That is the point of #472 restated: the binary's own symbols answer
+# nothing, so the gate no longer reads them, so a staged binary needs no symbols.
+# ---------------------------------------------------------------------------
+
+SelfTest() {
+    local scratch stub failures=0 ran=0
+    scratch="$(mktemp -d)"
+
+    # The stub. `nm` is called as `nm --undefined-only --no-demangle <path>`; the
+    # flags do not change what a staged object should answer, so it takes the last
+    # argument and prints that file. A file named `*unreadable*` exits non-zero,
+    # which is how "nm could not read this" is staged -- an unreadable object must
+    # not be reportable as an uninstrumented one.
+    stub="${scratch}/stub"
+    mkdir -p "$stub"
+    cat > "${stub}/nm" <<'STUB'
+#!/bin/bash
+for arg in "$@"; do :; done
+case "$arg" in
+    *unreadable*) exit 1 ;;
+esac
+cat "$arg"
+STUB
+    chmod +x "${stub}/nm"
+
+    # @param 1 case name
+    # @param 2 expected exit status
+    # @param 3.. text the output must contain; a leading `!` means must NOT
+    Case() {
+        local name="$1" want="$2"; shift 2
+        local out rc=0 pattern
+        out="$(PATH="${stub}:$PATH" AssertInstrumented "$SelfTestTarget" 2>&1)" || rc=$?
+        ran=$(( ran + 1 ))
+        if [[ "$rc" != "$want" ]]; then
+            echo "  FAIL ${name}: exited ${rc}, expected ${want}" >&2
+            printf '%s\n' "$out" | sed 's/^/       | /' >&2
+            failures=$(( failures + 1 ))
+            return
+        fi
+        for pattern in "$@"; do
+            if [[ "${pattern:0:1}" == "!" ]]; then
+                if [[ "$out" == *"${pattern:1}"* ]]; then
+                    echo "  FAIL ${name}: output contains '${pattern:1}' and must not" >&2
+                    printf '%s\n' "$out" | sed 's/^/       | /' >&2
+                    failures=$(( failures + 1 ))
+                    return
+                fi
+            elif [[ "$out" != *"$pattern"* ]]; then
+                echo "  FAIL ${name}: output lacks '${pattern}'" >&2
+                printf '%s\n' "$out" | sed 's/^/       | /' >&2
+                failures=$(( failures + 1 ))
+                return
+            fi
+        done
+        echo "  ok   ${name}"
+    }
+
+    # Build a staged build directory. @param 1 target, @param 2.. object specs of
+    # the form `name:instrumented|plain|empty|unreadable`.
+    Stage() {
+        local target="$1"; shift
+        local dir spec obj kind
+        BUILD_DIR="${scratch}/build-$RANDOM$RANDOM"
+        SelfTestTarget="$target"
+        mkdir -p "${BUILD_DIR}/target"
+        # The staged binary DEFINES __tsan_init, exactly as a real one does --
+        # the link pulls the runtime in whole. Every refusal below therefore
+        # happens with the old proof's evidence sitting right there and saying
+        # "instrumented". That is #472 reproduced in the fixture rather than
+        # merely described in its comment.
+        printf '%s
+' "0000000000001234 T __tsan_init" > "${BUILD_DIR}/target/${target}"
+        dir="${BUILD_DIR}/src/tests/CMakeFiles/${target}.dir"
+        mkdir -p "$dir"
+        for spec in "$@"; do
+            obj="${spec%%:*}"; kind="${spec#*:}"
+            case "$kind" in
+                # A real instrumented object: an undefined __tsan_init, plus the
+                # per-function hooks a TU with code also gets.
+                instrumented) printf '%s\n' "                 U __tsan_init" \
+                                              "                 U __tsan_func_entry" \
+                                              "                 U __tsan_read4" > "${dir}/${obj}.o" ;;
+                # An instrumented TU with NO functions -- the six platform-gated
+                # files in FastCacheTest. It carries __tsan_init and nothing else,
+                # which is why the rule is built on that symbol and not on
+                # __tsan_func_entry: a rule using the hooks would refuse this.
+                empty)        printf '%s\n' "                 U __tsan_init" > "${dir}/${obj}.o" ;;
+                # Compiled with no sanitizer flag at all. Its BINARY would still
+                # define __tsan_init, which is the whole of #472.
+                plain)        printf '%s\n' "                 U _ZSt4cout" > "${dir}/${obj}.o" ;;
+                unreadable)   printf '%s\n' "unreadable" > "${dir}/${obj}-unreadable.o" ;;
+            esac
+        done
+    }
+
+    echo "== AssertInstrumented, against staged object trees"
+
+    # THE CASE #472 IS ABOUT. A suite binary with one uninstrumented object.
+    # Before this change nothing anywhere refused it: the binary carries a defined
+    # __tsan_init from the runtime, and RunTarget cannot tell the difference.
+    Stage FastCacheTest a:instrumented b:plain c:instrumented
+    Case "suite-object-uninstrumented" 1 \
+        "1 of 3 object files were built WITHOUT" "b.o" "the binary is not evidence here"
+
+    Stage tsan-canary only:plain
+    Case "canary-object-uninstrumented" 1 "1 of 1 object files were built WITHOUT"
+
+    Stage FastCacheTest a:instrumented b:instrumented c:instrumented
+    Case "all-instrumented" 0 "instrumented (3 object files)" "!WITHOUT"
+
+    # No false positive on a translation unit with nothing to instrument.
+    Stage FastCacheTest a:instrumented b:empty c:empty
+    Case "empty-tu-is-not-a-failure" 0 "instrumented (3 object files)" "!WITHOUT"
+
+    Stage FastCacheTest a:instrumented b:unreadable
+    Case "object-cannot-be-read" 1 "nm could not read" "!WITHOUT"
+
+    Stage FastCacheTest a:instrumented
+    rm -rf "${BUILD_DIR}/src/tests/CMakeFiles/FastCacheTest.dir"
+    Case "no-object-directory" 1 "no FastCacheTest.dir under"
+
+    Stage FastCacheTest a:instrumented
+    mkdir -p "${BUILD_DIR}/src/apps/CMakeFiles/FastCacheTest.dir"
+    Case "two-object-directories" 1 "cannot tell which is current"
+
+    Stage FastCacheTest a:instrumented
+    rm -f "${BUILD_DIR}"/src/tests/CMakeFiles/FastCacheTest.dir/*.o
+    Case "no-objects-at-all" 1 "no object files under"
+
+    Stage FastCacheTest a:instrumented
+    rm -f "${BUILD_DIR}/target/FastCacheTest"
+    Case "binary-not-built" 1 "not built"
+
+    rm -rf "$scratch"
+    echo
+    echo "tsan-gate --self-test: ${ran} cases ran, ${failures} failed"
+    [[ "$failures" -eq 0 ]] || exit 1
+    exit 0
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+    SelfTestTarget=""
+    SelfTest
+fi
+
+# ---------------------------------------------------------------------------
 
 [[ -d "$BUILD_DIR" ]] || fatal "build directory not found: ${BUILD_DIR}"
 [[ -f "$SUPPRESSIONS" ]] || fatal "suppressions file not found: ${SUPPRESSIONS}"
@@ -322,13 +614,16 @@ command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
 
 note "build directory: ${BUILD_DIR}"
 
-# `__tsan_init` is defined by the sanitizer RUNTIME, which the link line pulls in
-# whole -- so it answers "was this artefact linked against TSan" and, on its own,
-# would still say yes for a build that dropped `add_compile_options` and kept
-# `add_link_options`. That asymmetry is precisely the shape of the defect
-# `cmake/portable/Sanitizers.cmake` records. The compile line is the other half of
-# the answer, and the rulebook already names where to read it: `build.ninja`, not
-# the cache and not the configure log, which are the two places that lied.
+# A build that dropped `add_compile_options` and kept `add_link_options` is the
+# shape of the defect `cmake/portable/Sanitizers.cmake` records, and this is the
+# cheap half of catching it: the rulebook names where to read the compile line --
+# `build.ninja`, not the cache and not the configure log, which are the two places
+# that lied.
+#
+# It is the cheap half and not the whole answer. `build.ninja` says what the build
+# WOULD compile; the objects on disk are what it DID, and a stale object or a
+# compiler-cache replay can differ from both. `AssertInstrumented` reads the
+# objects, and is what actually decides.
 NINJA_FILE="${BUILD_DIR}/build.ninja"
 [[ -f "$NINJA_FILE" ]] || fatal "no ${NINJA_FILE}: this gate reads the COMPILE line from the generator's own file, and only the Ninja generator writes one. Configure with the clang-tsan preset."
 if ! grep -q -- '-fsanitize=thread' "$NINJA_FILE"; then

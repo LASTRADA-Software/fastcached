@@ -582,6 +582,54 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# The TSan gate's instrumentation proof. Fails when `scripts/tsan-gate.sh` would
+# accept an artefact whose objects were built without `-fsanitize=thread`.
+#
+# The gate's whole purpose is that a sanitizer job proves nothing until something
+# proves the sanitizer -- and until #472 its proof could not refuse anything. It
+# looked for `__tsan_init` in the BINARY, where the symbol is DEFINED by the
+# runtime that the link pulls in whenever `-fsanitize=thread` is on the link line.
+# Measured: a canary whose translation unit was compiled with no sanitizer flag at
+# all produced a binary carrying `__tsan_init`, and passed. So this is a guard
+# that had never been seen to fire because it structurally could not, which is the
+# shape this repository keeps finding.
+#
+# `--self-test` drives the verdicts against staged object trees: a suite binary
+# with one uninstrumented object, an uninstrumented canary, a fully instrumented
+# target, an instrumented translation unit with no functions (the six
+# platform-gated files in FastCacheTest, which carry `__tsan_init` and no
+# per-function hooks -- a rule built on `__tsan_func_entry` would refuse them), an
+# unreadable object, a missing object directory, two candidate directories, an
+# empty one, and a binary that was never built.
+#
+# The suite case is the one that matters and is deliberately first. An
+# uninstrumented CANARY already failed closed -- it exits 0, reports no race, and
+# the gate refuses. The test binaries had no backstop at all, so an uninstrumented
+# `FastCacheTest` ran, reported assertions, exited 0, and the gate printed
+# "all scoped targets clean". A guard demonstrated only on the backstopped half
+# would be a guard nobody has seen fire where it matters.
+#
+# Needs no compiler, no sanitizer runtime and no build: a staged object is a text
+# file holding what `nm --undefined-only` should print, read through a stub `nm`
+# on PATH. Only the reading of the symbol table is stood in for, and that half has
+# no branches. So it belongs in the default `ctest` set, where whoever edits the
+# gate is the one who sees it break -- rather than only on a machine with a TSan
+# toolchain, which is how a gate this important would otherwise go unchecked.
+#
+# `if(NOT WIN32)` for the reason `local-gate-selftest` above carries it: the
+# script is POSIX and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "tsan-gate-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tsan-gate.sh" --self-test
+    )
+    set_tests_properties("tsan-gate-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and
