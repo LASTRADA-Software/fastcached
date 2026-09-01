@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -576,55 +577,75 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
     CHECK(Logged(logger, "--listen-node is empty"));
 }
 
-TEST_CASE("A taken DEFAULT node port is a warning and a taken NAMED one is fatal", "[node][node-surface]")
+TEST_CASE("A node port that cannot be bound is fatal however it was configured", "[node][node-surface]")
 {
-    // The provenance rule, unchanged in substance by the merge (#286): a named address
-    // is a promise and a broken promise is fatal, while a default one an operator never
-    // asked for must not stop a node whose launcher will simply reach whatever else
-    // holds the port.
-    NodeIoLoop io;
-    CapturingLogger logger;
-    NamedResponder cache { "cache" };
+    // **The provenance rule stopped applying here at #290 stage 3, and the reason is
+    // that its premise went away rather than that it was wrong.** A taken DEFAULT port
+    // was tolerated because the launcher reaches whatever else holds it -- a
+    // `fastcached` on this machine, almost always -- so the build still worked and
+    // what was lost was a cache tier nobody asked for. That rested on the worker
+    // having a compile port of its OWN. It has none now: one 0xFC port, and without it
+    // nowhere for a dispatched compile to arrive.
+    //
+    // Continuing would be invisible rather than merely degraded. `--scheduler` is
+    // required, so every node registers, and the registrars are built from
+    // `AdvertisedEndpoint(cfg)` -- the CONFIGURATION, not the listener -- so the bind
+    // failing does not reach them. The node advertises an address nothing answers and
+    // every client meets a failed connection and compiles locally, which is silent by
+    // design.
+    //
+    // Driven as a table over both flags that used to decide it, because the claim is
+    // that NEITHER does any more and a case per combination would be the same
+    // assertion written four times. `nodeListenExplicit` is still live elsewhere --
+    // `--install-service` emits on it (#286) -- so this is the bit ceasing to decide
+    // one thing, not the bit going away.
+    struct Shape
+    {
+        bool explicitAddress;
+        bool serveScheduler;
+        std::string_view what;
+    };
+    static constexpr auto shapes = std::to_array<Shape>({
+        { .explicitAddress = false, .serveScheduler = false, .what = "a defaulted address on a plain worker" },
+        { .explicitAddress = true, .serveScheduler = false, .what = "an address the operator named" },
+        { .explicitAddress = false, .serveScheduler = true, .what = "a defaulted address on a scheduler" },
+        { .explicitAddress = true, .serveScheduler = true, .what = "a named address on a scheduler" },
+    });
 
-    auto const [cfg, port] = BaseConfig();
-    auto holder = BlockingListener::Bind("127.0.0.1", port);
-    REQUIRE(holder);
-    REQUIRE(holder->IsBound());
+    for (auto const& shape: shapes)
+    {
+        CAPTURE(shape.what);
 
-    auto defaulted = cfg;
-    defaulted.nodeListenExplicit = false;
-    auto tolerated = StartNodeSurfaceOrExplain(io, defaulted, &cache, nullptr, nullptr, logger);
-    REQUIRE(tolerated.has_value());
-    CHECK(*tolerated == nullptr);
-    CHECK(Logged(logger, "continuing without a 0xFC port"));
+        NodeIoLoop io;
+        CapturingLogger logger;
+        NamedResponder cache { "cache" };
+        NamedResponder scheduler { "scheduler" };
 
-    auto named = cfg;
-    named.nodeListenExplicit = true;
-    auto refused = StartNodeSurfaceOrExplain(io, named, &cache, nullptr, nullptr, logger);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--listen-node"));
-}
+        auto [cfg, port] = BaseConfig();
+        cfg.nodeListenExplicit = shape.explicitAddress;
+        cfg.serveScheduler = shape.serveScheduler;
 
-TEST_CASE("A scheduler that cannot bind is fatal even on a defaulted address", "[node][node-surface]")
-{
-    // The one thing the merge CHANGED about the provenance rule, and the reason it is
-    // stated rather than discovered. A default cache port already held by a fastcached
-    // stays a warning -- the launcher reaches that daemon and the build works. The same
-    // listener now also carries the scheduler verbs, and a scheduler that is not
-    // listening is the "silently cannot work" shape a fleet never recovers from.
-    NodeIoLoop io;
-    CapturingLogger logger;
-    NamedResponder scheduler { "scheduler" };
+        auto holder = BlockingListener::Bind("127.0.0.1", port);
+        REQUIRE(holder);
+        REQUIRE(holder->IsBound());
 
-    auto [cfg, port] = BaseConfig();
-    cfg.nodeListenExplicit = false;
-    cfg.serveScheduler = true;
+        auto refused =
+            StartNodeSurfaceOrExplain(io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, logger);
+        REQUIRE_FALSE(refused.has_value());
 
-    auto holder = BlockingListener::Bind("127.0.0.1", port);
-    REQUIRE(holder);
-    REQUIRE(holder->IsBound());
+        // The flag, so an operator knows what to edit.
+        CHECK(refused.error().contains("--listen-node"));
 
-    auto refused = StartNodeSurfaceOrExplain(io, cfg, nullptr, &scheduler, nullptr, logger);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--serve-scheduler"));
+        // And the REMEDY, not merely the diagnosis. "cannot bind" is a wall; what an
+        // operator needs is what is almost certainly holding the port and that this
+        // node does not need it. Asserted because a message is the entire user
+        // interface of a startup refusal, and a diagnosis-only one passes every test
+        // that checks the refusal happened.
+        CHECK(refused.error().contains("fastcached"));
+        CHECK(refused.error().contains("stop it, or give"));
+
+        // The tolerated outcome is gone, and named so a reinstated warning fails here
+        // rather than passing as "it refused for some reason".
+        CHECK_FALSE(Logged(logger, "continuing without a 0xFC port"));
+    }
 }

@@ -87,24 +87,32 @@ class NodeFrameSurface
 /// once and testing:
 ///
 ///   - **A surface** — it is serving.
-///   - **Success carrying nothing** — deliberately no listener, because this node has
-///     no component for any verb family at all, or because a DEFAULT address was
-///     already taken. The node continues; a line has already been logged.
-///   - **An error** — the operator NAMED an address, or asked for a scheduler, and it
-///     could not be served, so startup must stop.
+///   - **Success carrying nothing** — deliberately no listener, because the operator
+///     emptied `--listen-node`, or because this node has no component for any verb
+///     family at all. Both are configurations, not failures; a line has been logged.
+///   - **An error** — an address that was asked for could not be served, so startup
+///     must stop.
 ///
-/// **The tolerated case narrowed when the surfaces merged (#290), and that is a
-/// consequence worth stating rather than discovering.** A default cache port already
-/// held by a `fastcached` on the same machine was, and still is, a warning: the
-/// launcher reaches that daemon instead and the build works. But this listener now
-/// also carries the scheduler verbs, and a scheduler that is not listening is the
-/// "silently cannot work" shape -- so `--serve-scheduler` makes the same failure
-/// fatal. One flag decides it, rather than the bind failure being judged twice by two
-/// components that would each have been right about half of it.
+/// **A bind failure is fatal unconditionally, and #290 stage 3 is what made it so.**
+/// A taken DEFAULT port used to be tolerated, and the reasoning was sound while it
+/// held: the launcher reaches whatever else has the port -- almost always a
+/// `fastcached` on this machine -- so the build still worked, and what was lost was a
+/// cache tier nobody had asked for. That rested entirely on the worker having a
+/// compile port of its OWN to fall back to. There is one 0xFC port now, so without it
+/// there is nowhere for a dispatched compile to arrive.
 ///
-/// Judged on the PROVENANCE bit, never on the value: comparing against the default
-/// reads `--listen-node=127.0.0.1:6674` as a convenience nobody asked for, and the
-/// node came up healthy serving no cache (#286).
+/// And the node would not fail quietly, it would fail invisibly. `--scheduler` is
+/// required, so every node registers; the registrars are built from
+/// `AdvertisedEndpoint(cfg)`, which reads the CONFIGURATION and not the listener, so
+/// a failed bind does not reach them. The node announces an address nothing answers,
+/// the scheduler leases it out, and every client meets a failed connection and
+/// compiles locally -- silently, because a client must never let distribution break a
+/// build.
+///
+/// So `nodeListenExplicit` and `--serve-scheduler` stop deciding this. Both were
+/// answering "is this port load-bearing", and since the merge the answer is yes
+/// whatever the operator typed. The provenance bit is still what
+/// `--install-service` emits on, which is where #286 needed it.
 ///
 /// @param io The loop this surface accepts and answers on.
 /// @param cfg What the operator asked for.
@@ -117,11 +125,11 @@ class NodeFrameSurface
 ///        be absent: a component this function stopped asking about is a listener
 ///        opened for verbs nobody answers.
 ///
-///        **A worker with no tier and no scheduler still opens nothing**, and that is
-///        the row's answer rather than this one's: `NodeSurfaceTable()` resolves the
-///        node surface to no address for such a node, so a port would be one
-///        `--print-surfaces` never printed. Its compiles arrive on the compile port,
-///        exactly as before.
+///        **A worker with no tier and no scheduler still opens this port**, because
+///        since #290 stage 3 it is the only place its compiles can arrive. That is the
+///        row's answer rather than this one's: `NodeSurfaceTable()` resolves the node
+///        surface unconditionally, so `--print-surfaces` names the same address this
+///        binds.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The surface, a null surface meaning "carry on without one", or the reason.
 [[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(

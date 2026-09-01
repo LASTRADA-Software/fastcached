@@ -65,27 +65,45 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     }
 
     auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
-    if (auto bound = surface->Bind(io, cfg, logger); bound.has_value())
+    auto bound = surface->Bind(io, cfg, logger);
+    if (bound.has_value())
         return surface;
-    else
-    {
-        // Fatal when the operator NAMED the address, and fatal when they asked for a
-        // scheduler whatever they named: the reasons are on `StartNodeSurfaceOrExplain`
-        // in the header. A named address is a promise; a scheduler nobody can dial is a
-        // fleet that looks configured and is not.
-        if (cfg.nodeListenExplicit)
-            return std::unexpected { std::format("--listen-node {}", bound.error()) };
-        if (cfg.serveScheduler)
-            return std::unexpected { std::format("--serve-scheduler needs the node port: {}", bound.error()) };
 
-        // Never silent. The launcher will reach whatever else holds that port -- very
-        // likely the daemon -- so the build still works, but "the cache quietly did
-        // less than you configured" is the failure mode this codebase keeps a list
-        // about.
-        logger.Logf(
-            LogLevel::Warn, "default node endpoint {}: {}; continuing without a 0xFC port", cfg.nodeListen, bound.error());
-        return std::unique_ptr<NodeFrameSurface> {};
-    }
+    // **Fatal, whoever named the address and whatever else this node runs**, and that
+    // is stage 3 deleting a branch's PREMISE rather than the branch being wrong.
+    //
+    // A taken DEFAULT port used to be tolerated, and correctly: the launcher reaches
+    // whatever else holds it -- almost always a `fastcached` on this machine -- so the
+    // build still worked, and what was lost was a cache tier the operator had not
+    // asked for. That reasoning depended entirely on the worker having a compile port
+    // of its own to fall back to. It has none now. A node opens exactly one 0xFC port,
+    // and without it there is nowhere for a dispatched compile to arrive.
+    //
+    // Continuing would then produce the worst-shaped failure this system has, and it
+    // would produce it on the deployment the docs describe. `--scheduler` is required,
+    // so every node registers; `registrars` are built from `AdvertisedEndpoint(cfg)`,
+    // which is derived from the CONFIGURATION rather than from the listener, so the
+    // registration is unaffected by the bind having failed. The node would announce an
+    // address nothing answers, the scheduler would lease it out, and every client
+    // would fail to connect and fall back to compiling locally -- which is silent by
+    // design, because a client must never let distribution break a build. Green
+    // everywhere, working nowhere.
+    //
+    // So the provenance bit stops deciding this, and `--serve-scheduler` stops being
+    // the one flag that escalates it. Both were answering "is this port load-bearing",
+    // and since the merge the answer is yes unconditionally.
+    //
+    // The sentence names the REMEDY rather than the diagnosis. "cannot bind" is a wall
+    // at three in the morning; the operator needs to be told what almost certainly
+    // holds the port and that this node does not need it (#229).
+    return std::unexpected { std::format(
+        "--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
+        "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
+        "address nothing answers, which every client meets as a failed connection and a silent local "
+        "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
+        "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "
+        "daemon does, its cache verbs included",
+        bound.error()) };
 }
 
 } // namespace FastCache::Node
