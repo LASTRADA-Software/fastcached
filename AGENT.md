@@ -55,9 +55,10 @@ src/FastCache/
                 what the leader can see as a page, as SVG and as JSON
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
-                CompileCacheHandler (the 0xFC executor) and CompileCacheWire
+                CompileCacheHandler (the 0xFC executor), CompileCacheWire
                 (header-only and dependency-free, shared verbatim by every
-                binary)
+                binary) and SurfaceRefusal (the three ways a 0xFC surface
+                refuses: counted, decided-not-to, not-yet-decided)
   Server/       Connection (per-client coroutine), Server, ReactorServerLoop,
                 AdminHttpServer (its routes are a table) + AdminCredential
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
@@ -617,6 +618,23 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   token counted nothing: three outcomes, three rows. But not every refusal is an EVENT
   — a verb this node runs no component for is what a HEALTHY build gets, once per
   exchange, so counting it buries the scan it would be read for.
+- That scan is a GLOB over `src/`, never a file list. It was a hand-kept list of `.cpp`
+  files, grown by hand twice and unable to reach a header at all — which is where #447
+  then put two security counters. **A list is exact about the files it knows and silent
+  about the ones it does not, and silence reads identically to complete coverage**
+  (#492). An over-broad scan fails CLOSED, so the only rows left are the two ends of one
+  function: the header defining the encoder and `Protocol/SurfaceRefusal.hpp`, the
+  primitive's shared home — out of `fastcache-cc`'s private header so coverage is a
+  property of the TYPE. Header-only, so `_fc_cc_core` gains no row.
+- And "deliberately uncounted" must not be spelled like "forgot": both were a bare
+  `EncodeErrorReply`, so no scan could tell four considered decisions from five
+  defects. THREE spellings, three claims — `Refuse` (a rise means something),
+  `RefuseWithoutCounter` (a rise would mean nothing, and why), `RefuseUntriaged`
+  (nobody has decided, and which issue will). The third is safe only because the check
+  TALLIES it and prints the total per issue on every run: a placeholder `why` would
+  spell *forgot* in the vocabulary of *decided*, which is worse than the bare encoder.
+  The `why` is a forcing function, not a dead field. `worker-refusals-selftest` drives
+  six synthetic trees, because a guard nobody has watched refuse is not a guard.
 - Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
   makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
   (`SchedulerService::Register`) and never repaired by a renderer — and the

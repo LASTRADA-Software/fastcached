@@ -523,9 +523,55 @@ looks exactly like a port nobody is talking to.
   increment belongs to another branch or drifts out of range.
 - **`worker-refusals-counted` closes the door the type system cannot**, because
   `EncodeErrorReply` is a free function every surface includes and stays callable. It
-  fails in BOTH directions: a second call site is named by line, and a scan that
-  matches NOTHING is its own failure rather than a pass — `Refuse` is built on one, so
-  zero means the scan stopped seeing the file it thinks it is reading.
+  fails in BOTH directions: a call site outside the primitive is named by line, and a
+  scan that matches NOTHING is its own failure rather than a pass — the spellings are
+  built on one each, so zero means the scan stopped seeing the file it thinks it is
+  reading.
+- **It GLOBS `src/`, and the thing it used to be is why.** For three years of this
+  file's history it scanned a hand-maintained list of `.cpp` files, which grew by hand
+  twice — `CompileResponder.cpp` after arriving with uncounted refusals in it, then
+  `FrameEndpoint.cpp` after accumulating FIVE through an entire surface migration with
+  the check green throughout — and could not reach a header at all, which is where
+  #447 then had to put two security counters. **A list is exact about the files it
+  knows and silent about the ones it does not, and silence reads identically to
+  complete coverage** (#492). An over-broad scan fails CLOSED: a file that should not
+  be scanned produces a visible failure somebody investigates, where a file that should
+  be scanned and is not produces nothing. The only rows left are the two ends of one
+  function — the header that DEFINES the encoder and `Protocol/SurfaceRefusal.hpp`,
+  which wraps it — so adding a row is the only way to weaken the check, which makes
+  weakening it an argued edit rather than an omission.
+- **The primitive has a shared home for that reason**, not for tidiness.
+  `SurfaceRefusal` and `Refuse` lived in `fastcache-cc`'s private `WorkerProtocol.hpp`,
+  which the node's generic frame listener included for two symbols; with them in
+  `Protocol/SurfaceRefusal.hpp` coverage is a property of the TYPE rather than of
+  somebody's memory. Header-only, because `Refuse` reaches only `CompileCacheWire.hpp`
+  and `IMetricsSink.hpp` — so it costs `_fc_cc_core` no row, and `CompileCacheWire.hpp`
+  stays dependency-free.
+- **"Deliberately uncounted" and "forgot to count" must not be the same text**, and
+  they were. The considered decisions below — the byte budget, the framing arms, the
+  unserved verb — were spelled as a bare `EncodeErrorReply`, exactly like the five
+  defects, so no scan could separate them and any list admitting one admitted the
+  other. **Three spellings, three different claims**: `Refuse` says a rise here means
+  something; `RefuseWithoutCounter` says a rise would mean nothing and carries the
+  reason; `RefuseUntriaged` says nobody has decided and carries the issue that will.
+- **The third is safe only because the check TALLIES it.** It prints the outstanding
+  total, split by issue, on every run — so the backlog is visible and monotonic, a new
+  one cannot be added silently, and the issues it points at get a completion test that
+  is measured rather than asserted. Marking a site untriaged buys nothing except
+  honesty, which is what makes it safe to have. Spelling an undecided site
+  `RefuseWithoutCounter` with a placeholder reason is WORSE than the bare encoder: it
+  carries the appearance of a decision and a dead link to prove it.
+- **The `why` is a forcing function, not a dead field.** Nothing sends it and nothing
+  reads it at run time; what it does is make the author answer "would a rise here mean
+  something happened" before the call compiles. `StartupPolicyRejection` carries a
+  per-row reason for the same purpose, and the option table carries `why` text nothing
+  transmits.
+- **And the check is SEEN to fire.** `worker-refusals-selftest` drives it against six
+  synthetic source trees and asserts each verdict separately — a guard nobody has
+  watched refuse is not a guard, and a glob is only worth more than the list it
+  replaced if it bites on a file that was never named. Per case rather than
+  `WILL_FAIL`, because a check that stopped refusing and one that refuses everything
+  are opposite defects a bare inversion reports identically.
 - **Assert that no OTHER counter moved.** A test checking only the wire code passes
   with every refusal wired to one shared counter — and it passed, on the first run of
   the very test written to prove the two `MalformedFrame` refusals are separate: the
@@ -543,11 +589,12 @@ looks exactly like a port nobody is talking to.
   documentation still naming both (#447). The scan could not see the file: it covered
   three, and the listener was not one of them.
 - **The check is EXACT, so a file with one uncovered refusal cannot be covered at
-  all.** That is a property of the instrument rather than a matter of thoroughness,
-  and it is what decides scope when a file like this is found: fixing the refusal the
-  ticket names and deferring the rest leaves the scan permanently blind to the file
-  that made the omission possible, so the next one joins them silently. All of them,
-  or the door stays open.
+  all.** That was a property of the instrument rather than a matter of thoroughness,
+  and it decided scope whenever such a file was found: fixing the refusal the ticket
+  names and deferring the rest left the scan permanently blind to the file that made
+  the omission possible. It is also what made the list unfixable in halves — and #492
+  is the exactness kept while the all-or-nothing goes away, since a site nobody has
+  decided can now join as `RefuseUntriaged` instead of holding the whole file out.
 - **The endpoint owns WHEN a refusal is answered; the surface owns WHAT, counter
   included.** A listener serving several components cannot know which counter a
   refusal belongs to — a cache `STORE` over the byte budget counted against the
@@ -677,12 +724,10 @@ outright rather than drawing with a gap.
   reaches: `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's, in
   practice the cache's, so the byte-budget refusal that fires on a node with a tier is
   a cache `STORE` — the uncounted one. #326's scenario, one surface over.
-- **[#492](https://github.com/LASTRADA-Software/fastcached/issues/492)** —
-  `worker-refusals-counted` scans a hand-kept list of `.cpp` files. Its own header
-  records that list growing by hand once already, and #447 grew it a second time and
-  still could not cover `Responders.hpp`, where the two new credential counters live,
-  because it is a header. An over-broad scan fails CLOSED — a wrongly-included file
-  reports, a wrongly-excluded one is silent — so globbing with named exclusions beats
-  enumeration even though both are lists. Retiring the class rather than patching it
-  needs `Cc::SurfaceRefusal` out of `fastcache-cc`'s private header and into a shared
-  home, so the scan can target the type instead of somebody's memory.
+- **[#494](https://github.com/LASTRADA-Software/fastcached/issues/494)** — the fleet
+  scheduler's and the daemon's own `0xFC` surfaces answer eight refusals that count
+  nothing; `SchedulerProtocol.cpp` references no metrics sink at all, on the surface
+  carrying lease grants and worker registration. Neither #447 nor #491 reaches them —
+  different components, different binaries. They are marked `RefuseUntriaged` since
+  #492, so `worker-refusals-counted` prints them on every run and closing this issue
+  is the printed count for those files dropping to zero.
