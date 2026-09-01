@@ -61,12 +61,8 @@
 # reads as "distribution is broken" when it means "something else was listening".
 #
 # All twelve of those are loopback end to end, and `--case membership` is the one
-# body of assertions that is not: it binds a worker on this host's own
-# non-loopback address so the peer address the worker classifies falls outside
-# 127.0.0.0/8, which is the only way to reach the member-list branch of
-# `ClusterMembership::Classify`. It is a separate ctest test because it is the only
-# thing here with a prerequisite a machine may lack, and "no non-loopback address"
-# has to report SKIPPED rather than passed. Its own block carries the reasoning.
+# body of assertions that is not. Its own block below carries the whole argument;
+# `.agent/rules/testing.md` carries the rule it came from.
 #
 # Usage:
 #   dist-compile-e2e.sh --fastcached <path> --node <path> --launcher <path>
@@ -437,19 +433,100 @@ run_launcher() {
     "$launcher" "$compiler" "$@" > "$logfile" 2>&1
 }
 
-# Read one counter off a worker's admin endpoint.
+# Pull one counter out of a Prometheus body.
+#
+# The grammar lives HERE and nowhere else. It was written out at three call sites
+# before this function existed, and the day the exporter grows a label or renders
+# `1` as `1.0` a copy that still matches nothing does not say "the series changed
+# shape" -- it says "the counter did not move", which is a statement about the
+# subject rather than about the instrument.
 #
 # Nothing on stdout means the series was ABSENT, which is a different fact from a
 # reading of zero and must not be folded into one: a counter is a tally, so zero is
 # the truth about events that never happened, while an absent series is a counter
 # nothing exports. Every caller checks for the empty string separately.
 #
+# @param 1 a whole /metrics body
+# @param 2 the Prometheus series name
+metric_value() {
+    local body="$1" name="$2"
+    sed -n "s/^${name} \([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
+}
+
+# Read one counter off a worker's admin endpoint.
+#
+# Separate from `metric_value` because the suite's assertions deliberately fetch
+# ONE body and read three series out of it -- three requests would be three
+# different instants, and a fixture comparing series taken a round trip apart is
+# asserting something nobody meant.
+#
 # @param 1 admin port
 # @param 2 the Prometheus series name
 worker_counter() {
     local port="$1" name="$2" body=""
     body="$(http_get "$port" /metrics)" || return 1
-    sed -n "s/^${name} \([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
+    metric_value "$body" "$name"
+}
+
+# Wait until a worker's counter reaches a floor, the way `wait_for_port` waits for
+# a listener, and echo the reading.
+#
+# The third member of the bounded-wait family rather than a fourth hand-written
+# poll loop, for exactly the reason `wait_for_log`'s header gives: two of the three
+# loops it replaced never checked that the process was still alive. A counter makes
+# that worse, not better -- a worker that DIED simply stops changing its reading,
+# so an open-coded poll runs out its bound and then explains the silence with a
+# confident sentence about what the counter means.
+#
+# @param 1 admin port
+# @param 2 the Prometheus series name
+# @param 3 the floor the reading must reach
+# @param 4 pid
+# @param 5 what it is, for the message
+# @param 6 the log to dump when it does not get there
+# A failed scrape does not end the wait, because ending it is what a retry loop
+# exists to avoid -- but it is remembered, so a bound that expires having never
+# had an answer says THAT rather than blaming the counter. Three outcomes, three
+# sentences: nothing ever answered, the series is absent, the reading never rose.
+wait_for_counter() {
+    local port="$1" name="$2" floor="$3" pid="$4" what="$5" logfile="$6"
+    local seconds=10 value="" answered=0
+    for _ in $(seq 1 $(( seconds * 5 ))); do
+        if value="$(worker_counter "$port" "$name")"; then
+            answered=1
+            if [[ -n "$value" && "$value" -ge "$floor" ]]; then
+                printf '%s\n' "$value"
+                return 0
+            fi
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            cat "$logfile" >&2
+            fail "${what} exited while ${name} was still below ${floor}"
+        fi
+        sleep 0.2
+    done
+    cat "$logfile" >&2
+    [[ "$answered" == "1" ]] || fail "${what} never answered a /metrics request within ${seconds}s"
+    [[ -n "$value" ]] || fail "${what} exports no ${name} series"
+    fail "${what} never reached ${name} >= ${floor} within ${seconds}s; last reading ${value}"
+}
+
+# Wait until a node's heartbeat round was ACCEPTED by its scheduler.
+#
+# Never the bare word `registered`: the summary line is logged after every round
+# whatever the outcome, so `0 of 1 toolchain(s) registered` matches it too and a
+# wait built on it returns for a worker the scheduler turned away. That matters
+# most where scheduler-side admission is itself under test, and it is a silent
+# pass everywhere else -- the failure surfaces two steps later as a dispatch fault.
+#
+# Every node this fixture starts serves exactly one toolchain, so the accepted
+# count is always `1 of 1`.
+#
+# @param 1 pid
+# @param 2 what it is, for the message
+# @param 3 the log to watch
+wait_for_registration() {
+    wait_for_log "1 of 1 toolchain(s) registered" "$1" "$2" "$3"
 }
 
 # Slots enough that background CPU cannot withdraw all of them.
@@ -537,8 +614,17 @@ if [[ "$mode" == "membership" ]]; then
     # probes rather than one command because none of them is portable: `ip` is
     # Linux-only, `hostname -I` is Linux-only and absent from busybox, and
     # `ifconfig` prints three layouts across macOS and two vintages of net-tools.
-    # Each row prints candidates one per line, is allowed to fail, and the first
-    # usable answer wins.
+    # Each row is allowed to fail and the first usable answer wins; the loop below
+    # word-splits, so a row may print one candidate per line (`ip`, `ifconfig`) or
+    # all of them on one line (`hostname -I`) and neither has to be normalised.
+    #
+    # This asks the SHELL a question the tree already answers in C++:
+    # `Platform/LocalAddresses.hpp`'s `QueryLocalAddresses()` is the authority, and
+    # is what the node's own locality oracle consults. Nothing exposes it to a
+    # script -- `--print-surfaces` prints configured surfaces, not the machine's
+    # addresses -- so this is a second definition of one question, and the two could
+    # disagree about a host neither of them was written for. Naming the authority
+    # here is what makes that visible when it happens.
     #
     # `up` is part of the `ip` filter, and it is not tidiness: an address on an
     # administratively-down interface is still enumerated, and binding it succeeds
@@ -587,10 +673,17 @@ if [[ "$mode" == "membership" ]]; then
 
     echo "== membership: a dispatched compile arriving from ${lan_address}, which is not loopback"
 
-    # A cache of this mode's own. Not shared with the suite -- the two never run in
-    # one process -- and not omitted, because an unset FASTCACHE_ADDR sends the
-    # launcher to 127.0.0.1:6674, which on a developer machine is very likely a real
-    # node serving real builds.
+    # A cache of this mode's own, and a real one rather than a drawn port nothing
+    # binds.
+    #
+    # Nothing here asserts anything about the cache, so an unreachable one would
+    # also do -- case 12 proves a compile still dispatches around one. What that
+    # would give up is the control: with a daemon answering, the admitted leg walks
+    # exactly the path the suite's case 1 walks (fetch, miss, dispatch, store), so
+    # the refusing leg differs from it in ONE flag rather than in a flag and a
+    # cache. Leaving `FASTCACHE_ADDR` unset is the option that is simply wrong: it
+    # sends the launcher to 127.0.0.1:6674, which on a developer machine is very
+    # likely a real node serving real builds.
     mem_cache_port="$(free_port)"
     "$fastcached" --listen="127.0.0.1:${mem_cache_port}" \
         --storage-max-value=64M --log-level=info \
@@ -617,11 +710,21 @@ if [[ "$mode" == "membership" ]]; then
     # reached from a non-loopback address too. The client dials it at $lan_address,
     # and so does the worker when it registers.
     #
+    # The pid of the process the last `start_membership_*` call started, and the
+    # only way it is handed back. A function that PRINTED its pid would have to be
+    # called in a command substitution, and `fail` inside one of those ends the
+    # subshell rather than the run -- so a start that failed would hand its caller
+    # an empty pid and carry on.
+    started_pid=""
+
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch (`--listen-node`) port
-    # @param 3 the scheduler node's own worker port
     start_membership_scheduler() {
-        local tag="$1" dispatch="$2" own_port="$3" pid=""
+        local tag="$1" dispatch="$2" own_port="" pid=""
+        # Its own worker surface's port is drawn here rather than by the caller: no
+        # assertion in either leg names it, and a port nothing reads is scaffolding
+        # the reader has to carry to the end of the block to find out.
+        own_port="$(free_port)"
         "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" \
             --serve-scheduler --listen-node="${lan_address}:${dispatch}" \
             --fleet-member="$lan_address" \
@@ -631,6 +734,7 @@ if [[ "$mode" == "membership" ]]; then
             --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
             > "${workdir}/${tag}.log" 2>&1 &
         pid=$!
+        started_pid="$pid"
         pids+=("$pid")
         wait_for_port "$dispatch" "$pid" "${tag} scheduler" "${workdir}/${tag}.log" "$lan_address"
         wait_for_log "scheduling for the fleet" "$pid" "${tag} scheduler" "${workdir}/${tag}.log"
@@ -652,12 +756,14 @@ if [[ "$mode" == "membership" ]]; then
     #
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch port to register with
-    # @param 3 compile port
-    # @param 4 admin port
-    # @param 5.. the membership flags under test, if any
+    # @param 3 admin port
+    # @param 4.. the membership flags under test, if any
     start_membership_worker() {
-        local tag="$1" dispatch="$2" port="$3" admin="$4" pid=""
-        shift 4
+        local tag="$1" dispatch="$2" admin="$3" port="" pid=""
+        shift 3
+        # As above: the compile port is the worker's own business, since the client
+        # is told where to dial by the lease rather than by this fixture.
+        port="$(free_port)"
         "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" \
             --scheduler="${lan_address}:${dispatch}" \
             --bind="$lan_address" --port="$port" --advertise="${lan_address}:${port}" \
@@ -665,32 +771,26 @@ if [[ "$mode" == "membership" ]]; then
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
             ${@+"$@"} > "${workdir}/${tag}.log" 2>&1 &
         pid=$!
+        started_pid="$pid"
         pids+=("$pid")
         # Bind and registration are waited for separately, because a stall in one is
         # a different fault from a stall in the other and a fixture that folds them
         # cannot say which happened.
         wait_for_port "$port" "$pid" "${tag} worker" "${workdir}/${tag}.log" "$lan_address"
         wait_for_log "compile node ready" "$pid" "${tag} worker" "${workdir}/${tag}.log"
-        # The ACCEPTED count, not the word `registered`. The summary line is logged
-        # after every heartbeat round whatever the outcome -- `0 of 1 toolchain(s)
-        # registered` contains it too -- and here that is not a detail: whether the
-        # scheduler admits this worker's own non-loopback address is part of what
-        # the mode tests, so a wait satisfied by a REFUSED round would report the
-        # failure two steps later as a dispatch fault.
-        wait_for_log "1 of 1 toolchain(s) registered" "$pid" "${tag} worker" "${workdir}/${tag}.log"
+        wait_for_registration "$pid" "${tag} worker" "${workdir}/${tag}.log"
         wait_for_port "$admin" "$pid" "${tag} worker admin endpoint" "${workdir}/${tag}.log"
     }
 
     # --- leg 1: the address is a member, and the compile is served ---------------
     echo "== membership leg 1: ${lan_address} listed as a member"
     admit_dispatch_port="$(free_port)"
-    admit_sched_port="$(free_port)"
-    admit_worker_port="$(free_port)"
     admit_admin_port="$(free_port)"
 
-    start_membership_scheduler "mem-admit-scheduler" "$admit_dispatch_port" "$admit_sched_port"
-    start_membership_worker "mem-admit-worker" "$admit_dispatch_port" "$admit_worker_port" "$admit_admin_port" \
+    start_membership_scheduler "mem-admit-scheduler" "$admit_dispatch_port"
+    start_membership_worker "mem-admit-worker" "$admit_dispatch_port" "$admit_admin_port" \
         --fleet-member="$lan_address"
+    admit_worker_pid="$started_pid"
 
     # The policy the worker actually adopted, from its own ready line. Asserted
     # because the two legs differ in exactly one flag, and a leg that silently
@@ -716,14 +816,22 @@ if [[ "$mode" == "membership" ]]; then
     cmp -s "${proj}/build/admitted-ref.o" "${proj}/build/admitted.o" \
         || fail "the object built for a member address differs from the local one"
 
-    admit_completed="$(worker_counter "$admit_admin_port" fastcache_worker_jobs_completed_total)" \
+    # The job counter is polled and the refusal counter is read from the same
+    # instant -- one scrape, two series. The worker completes a job on the thread
+    # that ran it, after the client already has its object, so a single read of
+    # `jobs_completed_total` races the reply; and the two readings must come from
+    # ONE body, because "it served a job and refused nobody" is a statement about a
+    # moment rather than about two scrapes a round trip apart.
+    #
+    # This is also where the pair earns its keep from the other side: the fixture's
+    # own `wait_for_port` dialled this worker from $lan_address, and here that is
+    # ADMITTED -- the flat zero below is that probe passing the member list, against
+    # leg 2 where the identical probe is refused.
+    admit_completed="$(wait_for_counter "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
+        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log")"
+    admit_metrics="$(http_get "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
-    [[ -n "$admit_completed" ]] \
-        || fail "the admitting worker exports no fastcache_worker_jobs_completed_total series"
-    [[ "$admit_completed" -ge 1 ]] \
-        || fail "the admitting worker served a compile and its jobs counter did not move"
-    admit_refused="$(worker_counter "$admit_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
-        || fail "the admitting worker's admin endpoint refused a /metrics request"
+    admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
     # Absent is not zero, and here it would read as one: an empty string compares
     # unequal to "0" and the failure would name a count nobody exported.
     [[ -n "$admit_refused" ]] \
@@ -740,12 +848,11 @@ if [[ "$mode" == "membership" ]]; then
     # refusal has to come from the worker.
     echo "== membership leg 2: ${lan_address} absent from the worker's policy"
     refuse_dispatch_port="$(free_port)"
-    refuse_sched_port="$(free_port)"
-    refuse_worker_port="$(free_port)"
     refuse_admin_port="$(free_port)"
 
-    start_membership_scheduler "mem-refuse-scheduler" "$refuse_dispatch_port" "$refuse_sched_port"
-    start_membership_worker "mem-refuse-worker" "$refuse_dispatch_port" "$refuse_worker_port" "$refuse_admin_port"
+    start_membership_scheduler "mem-refuse-scheduler" "$refuse_dispatch_port"
+    start_membership_worker "mem-refuse-worker" "$refuse_dispatch_port" "$refuse_admin_port"
+    refuse_worker_pid="$started_pid"
 
     grep -q "this machine only" "${workdir}/mem-refuse-worker.log" \
         || { cat "${workdir}/mem-refuse-worker.log" >&2; fail "the refusing worker did not report a loopback-only policy"; }
@@ -754,31 +861,16 @@ if [[ "$mode" == "membership" ]]; then
     #
     # `wait_for_port` dials the compile port from this same non-loopback address to
     # decide the worker is up, and that probe is a caller like any other: leg 1
-    # admits it (which is why the assertion there is a flat zero) and this leg
-    # refuses it. So the branch under test is already observable here, and what the
-    # compile has to add is a FURTHER refusal -- measured as a delta from this
-    # reading rather than against zero, which is why the reading is taken after
-    # every process is up and before the compile runs.
-    # Polled rather than read once, and bounded like every other wait here.
-    # `wait_for_port` returns when the kernel completes the handshake, which the
-    # accept loop's `Classify` and `Refuse` follow -- so a single read can lose that
-    # race and fail with a confident wrong sentence about loopback when the truth is
-    # a few milliseconds.
-    refuse_before=""
-    for _ in $(seq 1 50); do
-        refuse_before="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
-            || fail "the refusing worker's admin endpoint refused a /metrics request"
-        if [[ -n "$refuse_before" && "$refuse_before" -ge 1 ]]; then break; fi
-        sleep 0.2
-    done
-    [[ -n "$refuse_before" ]] \
-        || fail "the refusing worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
-    [[ "$refuse_before" -ge 1 ]] \
-        || fail "waited 10s and the refusing worker never refused this fixture's own liveness probe from ${lan_address}: that probe reached it as an admitted caller, so this leg would prove nothing"
+    # admits it -- which is what the flat zero up there says -- and this leg refuses
+    # it. So the branch under test is already observable here, the floor of 1 is an
+    # assertion rather than a formality, and what the compile has to add is a
+    # FURTHER refusal, measured as a delta from this reading.
+    refuse_before="$(wait_for_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total 1 \
+        "$refuse_worker_pid" \
+        "the refusing worker (it never refused this fixture's own probe from ${lan_address}, so that probe reached it as an admitted caller and this leg would prove nothing)" \
+        "${workdir}/mem-refuse-worker.log")"
 
     write_source "${proj}/refused.cpp" "memberrefused"
-    "$compiler" -std=c++17 -O1 -c "${proj}/refused.cpp" -o "${proj}/build/refused-ref.o" \
-        || fail "the membership refusal reference compile failed"
 
     export FASTCACHE_SCHEDULER="${lan_address}:${refuse_dispatch_port}"
     run_launcher "${workdir}/mem-refused.log" -std=c++17 -O1 -c "${proj}/refused.cpp" -o "${proj}/build/refused.o" \
@@ -799,22 +891,26 @@ if [[ "$mode" == "membership" ]]; then
         }
     grep -q "; compiling locally" "${workdir}/mem-refused.log" \
         || { cat "${workdir}/mem-refused.log" >&2; fail "a refused compile did not fall back to a local one"; }
-    cmp -s "${proj}/build/refused-ref.o" "${proj}/build/refused.o" \
-        || fail "the object built after a membership refusal is wrong"
+    # An object exists and is not empty, and deliberately no `cmp` against a
+    # reference. Both sides of such a comparison would be this machine's own
+    # compiler on the same source with the same flags, so it asserts compiler
+    # determinism at the price of a second full compile; that the local fallback
+    # produces a CORRECT object is case 4's, which owns it.
+    [[ -s "${proj}/build/refused.o" ]] \
+        || fail "no object was written after a membership refusal"
 
     # The worker's half, and the reason this leg exists. #235 was invisible from
     # every other vantage point -- the lease was granted, so no scheduler counter
     # moved and the build went green -- and this counter was the one signal that
-    # would have named it.
-    refuse_after="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
+    # would have named it. Bounded rather than read once, because the refusal is
+    # counted on the worker's accept loop and the client has its answer first.
+    refuse_after="$(wait_for_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
+        $(( refuse_before + 1 )) "$refuse_worker_pid" \
+        "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
+        "${workdir}/mem-refuse-worker.log")"
+    refuse_metrics="$(http_get "$refuse_admin_port" /metrics)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
-    [[ -n "$refuse_after" && "$refuse_after" -gt "$refuse_before" ]] \
-        || {
-            cat "${workdir}/mem-refuse-worker.log" >&2
-            fail "the worker refused the compile and fastcache_worker_jobs_refused_not_a_member_total did not move past ${refuse_before}"
-        }
-    refuse_completed="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_completed_total)" \
-        || fail "the refusing worker's admin endpoint refused a /metrics request"
+    refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"
     [[ -n "$refuse_completed" ]] \
         || fail "the refusing worker exports no fastcache_worker_jobs_completed_total series"
     [[ "$refuse_completed" == "0" ]] \
@@ -910,7 +1006,7 @@ done
     || fail "worker and launcher disagree on the toolchain fingerprint: '${worker_fingerprint}' vs '${fingerprint}'"
 echo "== toolchain fingerprint agreed by launcher and worker"
 
-wait_for_log "registered" "$worker_pid" "worker" "${workdir}/worker.log"
+wait_for_registration "$worker_pid" "worker" "${workdir}/worker.log"
 
 # --- the worker's own admin endpoint -----------------------------------------
 #
@@ -1000,13 +1096,13 @@ echo "   served from the cache on the second compile"
 # catalog exists to prevent, one layer up: it exports a permanent zero, which
 # reads as "distribution is not happening" rather than as "nobody wired this".
 after="$(http_get "$worker_admin_port" /metrics)"     || fail "worker admin endpoint stopped answering after serving a compile"
-completed="$(sed -n 's/^fastcache_worker_jobs_completed_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+completed="$(metric_value "$after" fastcache_worker_jobs_completed_total)"
 [[ -n "$completed" && "$completed" -ge 1 ]] \
     || { printf '%s\n' "$after" >&2; fail "worker completed a compile but its jobs counter did not move"; }
-millis="$(sed -n 's/^fastcache_worker_compile_milliseconds_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+millis="$(metric_value "$after" fastcache_worker_compile_milliseconds_total)"
 [[ -n "$millis" ]] \
     || { printf '%s\n' "$after" >&2; fail "worker reports no compile wall time"; }
-bytes="$(sed -n 's/^fastcache_worker_bytes_received_total \([0-9][0-9]*\)$/\1/p' <<< "$after" | tail -1)"
+bytes="$(metric_value "$after" fastcache_worker_bytes_received_total)"
 [[ -n "$bytes" && "$bytes" -ge 1 ]] \
     || { printf '%s\n' "$after" >&2; fail "worker received a job but its byte counter did not move"; }
 echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes in"
@@ -1047,7 +1143,7 @@ iso_worker_port="$(free_port)"
 iso_worker_pid=$!
 pids+=("$iso_worker_pid")
 wait_for_port "$iso_worker_port" "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
-wait_for_log "registered" "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
+wait_for_registration "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
 
 write_source "${proj}/three.cpp" "casethree"
 "$compiler" -std=c++17 -O1 -c "${proj}/three.cpp" -o "${proj}/build/three-ref.o" \
@@ -1155,7 +1251,7 @@ cap_worker_port="$(free_port)"
 cap_worker_pid=$!
 pids+=("$cap_worker_pid")
 wait_for_port "$cap_worker_port" "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
-wait_for_log "registered" "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
+wait_for_registration "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
 
 cap_pids=()
 for i in 1 2 3 4; do

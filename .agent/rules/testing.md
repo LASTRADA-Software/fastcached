@@ -447,6 +447,13 @@ here"*, which is not the same question as *"can I bind here"* — and the gap be
 the two is exactly where a smoke test fails for a reason that has nothing to do
 with what it tests.
 
+**A body of assertions with a prerequisite the host may lack becomes its own ctest
+test**, not another case in an existing one. A script exits once, so a case inside a
+suite can do no more than print a line and let the run go green, and skipped and
+passed are then the same result. `dist-compile-membership-e2e` is that shape — one
+script, two registrations, `--case membership` — and the reasoning is under *A
+fixture whose client is always local cannot test who is admitted*, below.
+
 ## A shared failure message describes one caller, and lies to the others
 
 `cluster-e2e`'s `find_leader` ended with:
