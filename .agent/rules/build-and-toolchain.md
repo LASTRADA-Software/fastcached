@@ -181,6 +181,23 @@ determinism rests on.
   - The one-time cost is stated by the run that incurs it. Dropping the launcher rewrites every
     compile command, so ninja rebuilds the configuration from scratch once; a developer
     watching that with no explanation files it as breakage. An explained cost is a cost.
+  - **What it costs, measured rather than asserted** -- and as a table of conditions, because a
+    single number here is the wrong quantity in whichever direction it is quoted. One
+    `gcc-release` configuration, 630 object edges, from scratch, 32 jobs, WSL2 on a 9p mount:
+
+    | leg | wall clock |
+    |---|---|
+    | launcher on, nothing stored yet (629 fronted edges) | 224 s |
+    | **launcher off** (0 fronted edges) | **230 s** |
+    | launcher on, everything replayed | 94 s |
+
+    So a **full** rebuild of one configuration costs ~136 s more, about 2.4x -- and a MISSING
+    cache costs the same as no cache, which is why the first row must not be quoted as the
+    price of this change. Neither may the third: the gate is incremental, so a from-scratch
+    build happens once when this lands, and thereafter only when something invalidates
+    everything anyway. Note also that the warm row is exactly the exposure -- 629 objects
+    replayed from an earlier build is the state in which "the objects need not match this tree"
+    is a live claim rather than a theoretical one.
 - **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
   preset is the only one that runs ASan, and on a host where it cannot configure at
   all the tempting conclusion is that no sanitizer coverage is available locally. It
