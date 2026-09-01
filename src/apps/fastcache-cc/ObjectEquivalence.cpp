@@ -102,24 +102,42 @@ namespace
     /// refused by name rather than walked as though it were this one.
     constexpr std::uint16_t BigObjMinimumVersion = 2;
 
-    /// ELF's magic, so an ELF object is never mistaken for a COFF one.
+    /// Magics of formats that are definitely NOT COFF.
     ///
-    /// The collision is not hypothetical enough to leave to a heuristic: ELF's bytes
-    /// 8..11 are zero padding, which reads as `PointerToSymbolTable == 0` and
-    /// satisfies the structural check below, and a large enough object would satisfy
-    /// the rest. It would be nearly harmless -- ELF bytes 4..7 are the class, data
-    /// encoding, version and ABI, all constant for a given platform -- and "nearly
-    /// harmless" is not a property to leave undeclared in the one function that
-    /// decides what a verifier is allowed to overlook.
-    constexpr std::array<std::byte, 4> ElfMagic {
-        std::byte { 0x7F }, std::byte { 'E' }, std::byte { 'L' }, std::byte { 'F' }
-    };
+    /// An exclusion list rather than a list of accepted `Machine` values, and the
+    /// direction is the whole point: an unrecognised format falls through to a strict
+    /// byte comparison, which is the right answer for every reproducible format, while
+    /// an unrecognised COFF *machine* would fall through to the same strict comparison
+    /// and reproduce this ticket's own defect on the next architecture MSVC targets.
+    /// So the list fails toward comparing too strictly on formats that do not need
+    /// normalising, never toward refusing a hit that is fine.
+    ///
+    /// The collision is not hypothetical enough to leave to `IsConsistent`, which is a
+    /// plausibility test rather than a positive identification. ELF's bytes 8..11 are
+    /// zero padding, which reads as `PointerToSymbolTable == 0`; a 64-bit Mach-O's
+    /// `NumberOfSections` reads as 0xFEED, its `PointerToSymbolTable` as the CPU
+    /// subtype and its `NumberOfSymbols` as the file type -- so a large enough object
+    /// of either satisfies every bound and is laid out as a COFF file, after which the
+    /// message invents a section table. Neither can produce a false `Matched` (the
+    /// excused bytes are constant on a given host), but an invented message is worse
+    /// than a vague one.
+    constexpr std::array<std::array<std::byte, 4>, 5> NotCoffMagics { {
+        // ELF, either endianness of the following fields -- the magic itself is fixed.
+        { std::byte { 0x7F }, std::byte { 'E' }, std::byte { 'L' }, std::byte { 'F' } },
+        // Mach-O, 32- and 64-bit, and their byte-swapped spellings.
+        { std::byte { 0xFE }, std::byte { 0xED }, std::byte { 0xFA }, std::byte { 0xCE } },
+        { std::byte { 0xFE }, std::byte { 0xED }, std::byte { 0xFA }, std::byte { 0xCF } },
+        { std::byte { 0xCE }, std::byte { 0xFA }, std::byte { 0xED }, std::byte { 0xFE } },
+        { std::byte { 0xCF }, std::byte { 0xFA }, std::byte { 0xED }, std::byte { 0xFE } },
+    } };
 
     /// @param image The bytes to test.
-    /// @return True when @p image opens with ELF's magic.
-    [[nodiscard]] bool IsElf(std::span<std::byte const> image) noexcept
+    /// @return True when @p image opens with the magic of a format that is not COFF.
+    [[nodiscard]] bool IsKnownNonCoff(std::span<std::byte const> image) noexcept
     {
-        return image.size() >= ElfMagic.size() && std::ranges::equal(image.first(ElfMagic.size()), ElfMagic);
+        return std::ranges::any_of(NotCoffMagics, [image](auto const& magic) {
+            return image.size() >= magic.size() && std::ranges::equal(image.first(magic.size()), magic);
+        });
     }
 
     /// Whether @p image carries a `/bigobj` signature, whatever its version.
@@ -207,7 +225,7 @@ namespace
     ///         recognised and still not laid out.
     [[nodiscard]] ObjectLayout const* ChooseLayout(std::span<std::byte const> image) noexcept
     {
-        if (IsElf(image))
+        if (IsKnownNonCoff(image))
             return nullptr;
         if (HasBigObjSignature(image))
         {
@@ -288,6 +306,21 @@ namespace
     /// unrelated objects do not walk a megabyte to say "these differ".
     constexpr std::size_t DescribeBudget = 4096;
 
+    /// Where two images differ, and whether that list is the whole story.
+    struct DifferenceMap
+    {
+        /// The differing offsets, in order.
+        std::vector<std::size_t> offsets;
+        /// True when the budget cut the scan short, so `offsets` is a PREFIX.
+        ///
+        /// Carried rather than inferred from `offsets.size() == DescribeBudget`,
+        /// because two conclusions below are only sound over a COMPLETE list: that a
+        /// difference is confined to the driver's path records (so the code is
+        /// identical), and that a count is a total. Both are stated to an operator as
+        /// facts, and a prefix would let each of them be confidently wrong.
+        bool truncated { false };
+    };
+
     /// The offsets at which @p left and @p right differ, up to `DescribeBudget`.
     ///
     /// Driven by `std::mismatch` rather than a byte loop, because the equal RUNS are
@@ -297,22 +330,33 @@ namespace
     ///
     /// @param left One image.
     /// @param right The other, of the same length.
-    /// @return The differing offsets, in order.
-    [[nodiscard]] std::vector<std::size_t> DifferingOffsets(std::span<std::byte const> left,
-                                                            std::span<std::byte const> right)
+    /// @return The differing offsets, in order, and whether the budget cut them short.
+    [[nodiscard]] DifferenceMap DifferingOffsets(std::span<std::byte const> left, std::span<std::byte const> right)
     {
         std::vector<std::size_t> offsets;
         std::size_t at = 0;
-        while (at < left.size() && offsets.size() < DescribeBudget)
+        auto truncated = false;
+        while (at < left.size())
         {
-            auto const [l, r] = std::ranges::mismatch(left.subspan(at), right.subspan(at));
-            if (l == left.subspan(at).end())
+            auto const tail = left.subspan(at);
+            auto const [l, r] = std::ranges::mismatch(tail, right.subspan(at));
+            // No further difference: the list is COMPLETE, however far through the
+            // images this stopped. Deriving truncation from `at < left.size()` instead
+            // called every ordinary comparison truncated -- the scan stops one byte
+            // past the last difference, which is almost never the end of the file --
+            // and that suppressed the classification these flags exist to protect.
+            if (l == tail.end())
                 break;
-            at += static_cast<std::size_t>(std::ranges::distance(left.subspan(at).begin(), l));
+            if (offsets.size() == DescribeBudget)
+            {
+                truncated = true;
+                break;
+            }
+            at += static_cast<std::size_t>(std::ranges::distance(tail.begin(), l));
             offsets.push_back(at);
             ++at;
         }
-        return offsets;
+        return { .offsets = std::move(offsets), .truncated = truncated };
     }
 
     /// Sections `cl` fills with a record of WHERE it compiled rather than WHAT.
@@ -386,11 +430,19 @@ namespace
     [[nodiscard]] std::string DescribeDifference(ObjectLayout const* layout,
                                                  std::span<std::byte const> served,
                                                  std::span<std::byte const> fresh,
-                                                 std::vector<std::size_t> const& offsets)
+                                                 DifferenceMap const& difference)
     {
+        auto const& offsets = difference.offsets;
         // Not `const`: it is returned by value on three paths, and constness would
         // turn each of those into a copy.
-        auto positions = std::format("{} differing byte(s), first at offset {}", offsets.size(), offsets.front());
+        //
+        // "at least" when the scan was cut short. A capped count rendered as a total
+        // is a precise-looking wrong number, in the one message this feature exists
+        // to produce.
+        auto positions = std::format("{}{} differing byte(s), first at offset {}",
+                                     difference.truncated ? "at least " : "",
+                                     offsets.size(),
+                                     offsets.front());
         if (layout == nullptr)
             return positions;
 
@@ -414,9 +466,18 @@ namespace
         if (touched.names.empty())
             return std::format("{}, outside every section (the header or the symbol table)", positions);
 
-        auto const onlyPathRecords = !touched.anyOutside && std::ranges::all_of(touched.names, [](auto const& name) {
-            return std::ranges::find(PathRecordSections, name) != PathRecordSections.end();
-        });
+        // A TRUNCATED list cannot support this conclusion, because the conclusion is a
+        // claim about bytes nobody looked at. `.debug$S` precedes `.text$mn` in a `cl`
+        // object and carries the whole of `/Z7`'s debug info, which a launcher-active
+        // build forces -- so a genuinely stale object can differ there by more than the
+        // budget and have its `.text$mn` difference fall off the end. The operator
+        // would then be told the code is identical and sent to hunt for a checkout that
+        // is not the problem. Refused rather than hedged: this sentence is only worth
+        // printing when it is certain.
+        auto const onlyPathRecords =
+            !difference.truncated && !touched.anyOutside && std::ranges::all_of(touched.names, [](auto const& name) {
+                return std::ranges::find(PathRecordSections, name) != PathRecordSections.end();
+            });
         if (onlyPathRecords)
             return std::format("{} -- which record WHERE the compile happened, not what it compiled. The cached "
                                "object was built at a different path, in another checkout or on another machine "
@@ -437,18 +498,23 @@ ObjectComparisonResult CompareObjectImages(std::span<std::byte const> served, st
     // blind spot. Deciding from the served image instead would let a damaged or
     // foreign object talk the verifier out of answering, which is the same silence
     // by another route.
+    // Before any layout question, because it does not need one: two files of
+    // different lengths are not the same compile whatever format they are in, and
+    // answering `Unsupported` here would throw away unambiguous evidence of a wrong
+    // object -- a truncated cache entry on a toolchain this build cannot lay out
+    // would then be reported as "cannot verify" rather than as the finding it is.
+    if (served.size() != fresh.size())
+        return { .outcome = ObjectComparison::Different,
+                 .detail = std::format(
+                     "the cached object is {} bytes where this compile produces {}", served.size(), fresh.size()) };
+
     auto const* layout = ChooseLayout(fresh);
     if (layout == nullptr && HasBigObjSignature(fresh))
         return { .outcome = ObjectComparison::Unsupported,
                  .detail = "this compiler writes an MSVC object format this build cannot lay out, so the clock it "
                            "stamps into every object cannot be told apart from a real difference" };
 
-    if (served.size() != fresh.size())
-        return { .outcome = ObjectComparison::Different,
-                 .detail = std::format(
-                     "the cached object is {} bytes where this compile produces {}", served.size(), fresh.size()) };
-
-    auto offsets = DifferingOffsets(served, fresh);
+    auto difference = DifferingOffsets(served, fresh);
 
     // Drop the one normalised region, and only it. A difference reaching past it is a
     // finding -- see PathRecordSections for why that includes the path records.
@@ -460,16 +526,17 @@ ObjectComparisonResult CompareObjectImages(std::span<std::byte const> served, st
     if (layout != nullptr)
     {
         auto const stampAt = layout->timeDateStampAt;
-        auto const removed = std::ranges::remove_if(
-            offsets, [stampAt](std::size_t offset) { return offset >= stampAt && offset < stampAt + TimeDateStampWidth; });
-        offsets.erase(removed.begin(), removed.end());
+        auto const removed = std::ranges::remove_if(difference.offsets, [stampAt](std::size_t offset) {
+            return offset >= stampAt && offset < stampAt + TimeDateStampWidth;
+        });
+        difference.offsets.erase(removed.begin(), removed.end());
     }
 
-    if (offsets.empty())
+    if (difference.offsets.empty())
         return { .outcome = ObjectComparison::EquivalentApartFromVolatile,
                  .detail = "the compiler's timestamp, which every MSVC-family driver stamps into the object header" };
 
-    return { .outcome = ObjectComparison::Different, .detail = DescribeDifference(layout, served, fresh, offsets) };
+    return { .outcome = ObjectComparison::Different, .detail = DescribeDifference(layout, served, fresh, difference) };
 }
 
 } // namespace FastCache::Cc

@@ -480,13 +480,16 @@ A hit that *does* differ there was built somewhere else — another checkout, or
 another machine — and is reported, with the message saying so rather than leaving
 "wrong object" to mean either that or stale code.
 
-Three outcomes reach you, and the third is not a finding:
+Four outcomes reach you, and only one of them is a finding. The last two are
+different from each other in the way that decides what to do next — one is worth
+retrying, the other never will be:
 
 | Outcome | Meaning |
 |---|---|
 | *(silence)* | The cached object is the object this compiler produces. |
 | `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. |
-| `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing either way. Not a statement about your cache. |
+| `could not verify the hit for key …` | The check did not complete: the fresh compile failed, or a file could not be read. Nothing is known about the cached object either way, and the next hit may well answer. |
+| `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing about any hit — not this one and not the next. A property of the toolchain, not a statement about your cache. |
 
 ## Known limitations
 

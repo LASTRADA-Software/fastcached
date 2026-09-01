@@ -237,6 +237,50 @@ TEST_CASE("A served header that claims more than it holds is walked safely", "[l
     CHECK_FALSE(result.detail.empty());
 }
 
+TEST_CASE("A difference too large to scan does not claim the code is identical", "[launcher][verify][object]")
+{
+    // The scan stops at a budget, so its offset list can be a PREFIX -- and two of the
+    // sentences built from it are claims about bytes nobody looked at.
+    //
+    // `.debug$S` precedes `.text$mn` in a `cl` object and carries the whole of `/Z7`'s
+    // debug info, which a launcher-active build forces. So a genuinely stale object
+    // can differ in `.debug$S` by more than the budget and have its `.text$mn`
+    // difference fall off the end -- at which point the operator is told the code is
+    // identical and sent to hunt for a checkout that is not the problem.
+    auto const bulk = std::string(64 * 1024, 'A');
+    auto other = bulk;
+    std::ranges::fill(other, 'B');
+    auto const served = BuildCoff(ClSections("CODE", bulk), 1000);
+    auto const fresh = BuildCoff(ClSections("C0DE", other), 1000);
+    REQUIRE(served.size() == fresh.size());
+
+    auto const result = CompareObjectImages(served, fresh);
+    CHECK(result.outcome == ObjectComparison::Different);
+    // Still a finding, and still `.debug$S`-flavoured -- but it must NOT assert that
+    // the code and data are identical, because the scan never reached them.
+    CHECK_FALSE(result.detail.contains("code and data are identical"));
+    // And a capped count is rendered as a floor rather than as a total.
+    CHECK(result.detail.contains("at least"));
+}
+
+TEST_CASE("A Mach-O object is not laid out as COFF", "[launcher][verify][object]")
+{
+    // `IsConsistent` is a plausibility test, not an identification: a 64-bit Mach-O's
+    // `NumberOfSections` reads as 0xFEED, its `PointerToSymbolTable` as the CPU
+    // subtype and its `NumberOfSymbols` as the file type, so a large enough one
+    // satisfies every bound and would be walked as a COFF file -- inventing a section
+    // table for the message. macOS is a supported host for this launcher.
+    std::vector<std::byte> served(4L * 1024 * 1024, std::byte { 0x11 });
+    std::ranges::copy(std::array { std::byte { 0xCF }, std::byte { 0xFA }, std::byte { 0xED }, std::byte { 0xFE } },
+                      served.begin());
+    auto fresh = served;
+    fresh[5] = std::byte { 0x99 };
+
+    auto const result = CompareObjectImages(served, fresh);
+    CHECK(result.outcome == ObjectComparison::Different);
+    CHECK_FALSE(result.detail.contains("section(s)"));
+}
+
 TEST_CASE("Nothing is excused in a format that has no clock", "[launcher][verify][object]")
 {
     // Measured: clang and GCC objects are byte-identical between two compiles of one
@@ -320,10 +364,12 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     // `.debug$S` and hashes the file it opened into `.chks64` (measured); clang-cl
     // records neither and produces the same bytes.
     //
-    // Whichever it is, the one answer that must never come back is
-    // `EquivalentApartFromVolatile` -- excusing those sections would cure this
-    // ticket's false positives by no longer looking, and go quiet on the case an
-    // operator turns verification on to find.
+    // So the assertion is per driver, and both branches state a MEASURED fact rather
+    // than one branch asserting and the other waving through. Asserting
+    // `!= EquivalentApartFromVolatile` for both would be wrong AND flaky on clang-cl:
+    // its two objects are then the same compile, so that verdict is correct, and
+    // whether it appears at all depends on which side of a one-second boundary the two
+    // compiles land -- a case that fails on a correct implementation, occasionally.
     auto const elsewhere = dir / "other" / "tu.obj";
     std::filesystem::create_directories(elsewhere.parent_path());
     std::vector<std::string> const argvElsewhere { *driver, "/nologo", "/c", "/Fo" + elsewhere.string(), source.string() };
@@ -333,7 +379,19 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
 
     auto const crossPath = CompareObjectImages(foreign, second);
     INFO("cross-path verdict detail: " << crossPath.detail);
-    CHECK(crossPath.outcome != ObjectComparison::EquivalentApartFromVolatile);
-    if (foreign != second)
+    if (*driver == "cl.exe")
+    {
+        // #489's case: `cl` writes the object's absolute path into `.debug$S` and the
+        // source's hash into `.chks64`, so two output paths are two different images.
+        // Reported, never excused.
         CHECK(crossPath.outcome == ObjectComparison::Different);
+        CHECK_FALSE(crossPath.detail.empty());
+    }
+    else
+    {
+        // Measured: clang-cl records neither, so a different object path really is the
+        // same compile and must not be reported as a wrong object. The converse
+        // false positive, and the one a driver-blind assertion would create.
+        CHECK(crossPath.outcome != ObjectComparison::Different);
+    }
 }
