@@ -90,90 +90,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() {
-    echo "FAIL: $*" >&2
+# The shared helpers: `fail`, `free_port`, `wait_for_port`, `wait_until` and the
+# plain-HTTP half of `http_get`, one copy for every POSIX fixture (#449).
+#
+# Two of this file's copies had learnt things the others never did, and both
+# travel into the shared version rather than being lost: the issued-port ledger,
+# and -- the one with teeth -- that `read` returns non-zero on a final chunk with
+# no trailing newline, so a naive loop drops it. The JSON document this fixture
+# reads is ONE line with no newline at all, so without that the whole body
+# vanishes and every assertion about it fails for a reason that has nothing to do
+# with the server.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "fleet dashboard E2E" "$workdir"
+
+# Every failure dumps the node's log first; cleanup takes it away.
+dump_node_log() {
     [[ -f "${workdir}/node.log" ]] && { echo "--- node log ---" >&2; cat "${workdir}/node.log" >&2; }
-    exit 1
+    return 0
 }
+e2e_on_fail dump_node_log
 
-# Ports are allocated per run rather than fixed: four more fixed ports are four
-# more ways to collide with whatever else a CI runner is doing, and the failure
-# reads as "the dashboard is broken" when it means "something else was listening".
-#
-# The range stops below the kernel's ephemeral port range: a port can be an
-# outbound connection's local endpoint with nothing listening on it, so this probe
-# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
-# reasoning, and the CI failure that found it, are above `free_port` in
-# dist-compile-e2e.sh -- as is the issued-port ledger below, which this fixture
-# went without for two releases while both siblings had it.
-free_port() {
-    local port ledger="${workdir}/.issued-ports"
-    local floor=20000 ceiling=32000
-    for _ in $(seq 1 200); do
-        port=$(( floor + RANDOM % (ceiling - floor) ))
-        # A port handed out but not yet bound still probes as free, and this
-        # fixture draws three in a row before starting anything. Without the
-        # ledger the second draw can repeat the first, and the collision surfaces
-        # as a node dying with `bind(...) failed` -- which reads as an unrelated
-        # flake rather than as this.
-        if grep -qx "$port" "$ledger" 2>/dev/null; then
-            continue
-        fi
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-            echo "$port" >> "$ledger"
-            echo "$port"
-            return 0
-        fi
-    done
-    fail "could not find a free port"
-}
-
-# GET one path and echo the whole response, headers included.
-#
-# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
-# tests nothing on the machine that lacks it. Every read is bounded with `read -t`:
-# the endpoint closes the connection itself, so a healthy server ends the loop --
-# and a WEDGED one, which is part of what this probe exists to detect, would
-# otherwise hang the suite instead of failing it.
-# @param 1 port
-# @param 2 path
-# @param 3 optional Authorization header value
-http_get() {
-    local port="$1" path="$2" auth="${3:-}" etag="${4:-}" line="" body=""
-
-    # Over TLS `/dev/tcp` cannot help, so the HTTPS run goes through curl. `-k`
-    # because the checked-in fixture certificate is self-signed for 'localhost'
-    # and what this asserts is that the handshake happens and the routes answer
-    # behind it, not that a test fixture chains to a public root.
-    if [[ -n "$tls" ]]; then
-        local args=(-sk -i -m 10)
-        [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
-        [[ -n "$etag" ]] && args+=(-H "If-None-Match: ${etag}")
-        curl "${args[@]}" "https://127.0.0.1:${port}${path}"
-        return 0
-    fi
-
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || return 1
-    {
-        printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n' "$path"
-        [[ -n "$auth" ]] && printf 'Authorization: %s\r\n' "$auth"
-        # Second header on purpose: the parse loop used to stop at the first one it
-        # recognised, which stayed correct exactly until there were two.
-        [[ -n "$etag" ]] && printf 'If-None-Match: %s\r\n' "$etag"
-        printf 'Connection: close\r\n\r\n'
-    } >&3
-    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
-    # `read` sets `line` and returns non-zero on a final chunk with no trailing
-    # newline, so the loop above drops it. That matters here more than it looks:
-    # the JSON document is ONE line with no newline at all, so without this the
-    # whole body vanishes and every assertion about it fails for a reason that has
-    # nothing to do with the server.
-    [[ -n "$line" ]] && body+="$line"
-    exec 3<&-
-    printf '%s' "$body"
-}
-
-# How long a bounded wait may take, in tenths of a second.
+# How long a bounded wait in this fixture may take.
 #
 # 240 seconds, and the number is what it is because of what happens BEFORE the
 # admin surface binds: the node resolves each `--toolchain` first, which walks
@@ -197,20 +134,39 @@ http_get() {
 # naming nothing, which this repository has already paid for once. This one
 # named the port, the elapsed time and the node's own last log line, and that is
 # what made two runner failures diagnosable from the output alone.
-readonly WAIT_TICKS=2400
+e2e_wait_seconds 240
 
-# Block until something answers on a port, or the process behind it dies.
+# GET one path off the admin surface, with this fixture's two optional headers.
 #
-# Waiting on the listener rather than sleeping a fixed amount: a fixed sleep is
-# either flaky or slow. Bounded, and it says what it waited for.
-wait_for_port() {
-    local port="$1" pid="$2" what="$3"
-    for _ in $(seq 1 "$WAIT_TICKS"); do
-        if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then return 0; fi
-        if ! kill -0 "$pid" 2>/dev/null; then fail "$what died before it listened on ${port}"; fi
-        sleep 0.1
-    done
-    fail "timed out after $((WAIT_TICKS / 10))s waiting for $what to listen on ${port}"
+# A thin adapter rather than a second implementation: the plain-HTTP path is the
+# shared `http_get`, which takes header lines variadically. What stays here is
+# the part that is about THIS fixture -- that one of its three ctest
+# registrations serves the same routes over TLS, where `/dev/tcp` cannot help.
+# `-k` because the checked-in fixture certificate is self-signed for 'localhost'
+# and what this asserts is that the handshake happens and the routes answer
+# behind it, not that a test fixture chains to a public root.
+#
+# @param 1 port
+# @param 2 path
+# @param 3 optional Authorization header value
+# @param 4 optional If-None-Match value. Second header on purpose: the parse loop
+#          used to stop at the first one it recognised, which stayed correct
+#          exactly until there were two.
+dash_get() {
+    local port="$1" path="$2" auth="${3:-}" etag="${4:-}"
+
+    if [[ -n "$tls" ]]; then
+        local args=(-sk -i -m 10)
+        [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
+        [[ -n "$etag" ]] && args+=(-H "If-None-Match: ${etag}")
+        curl "${args[@]}" "https://127.0.0.1:${port}${path}"
+        return 0
+    fi
+
+    local headers=()
+    [[ -n "$auth" ]] && headers+=("Authorization: ${auth}")
+    [[ -n "$etag" ]] && headers+=("If-None-Match: ${etag}")
+    http_get 127.0.0.1 "$port" "$path" ${headers[@]+"${headers[@]}"}
 }
 
 admin_port="$(free_port)"
@@ -253,40 +209,40 @@ tls_args=()
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!
 
-wait_for_port "$admin_port" "$node_pid" "the node's admin surface"
+wait_for_port 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
 
 # ---------------------------------------------------------------- 2. /metrics
 # First, because it is the assertion that protects every existing deployment: the
 # dashboard shares this port, and a credential or a route leaking onto /metrics
 # breaks every scraper an operator has pointed at it.
-metrics="$(http_get "$admin_port" /metrics)"
+metrics="$(dash_get "$admin_port" /metrics)"
 [[ "$metrics" == HTTP/1.1\ 200* ]] || fail "/metrics did not answer 200 without a credential: ${metrics%%$'\n'*}"
 [[ "$metrics" == *fastcached_* ]] || fail "/metrics answered 200 but carried no series"
 
-health="$(http_get "$admin_port" /healthz)"
+health="$(dash_get "$admin_port" /healthz)"
 [[ "$health" == HTTP/1.1\ 200* ]] || fail "/healthz did not answer 200 without a credential"
 
 # ------------------------------------------------------------- 3. credential
-anonymous="$(http_get "$admin_port" /fleet)"
+anonymous="$(dash_get "$admin_port" /fleet)"
 [[ "$anonymous" == HTTP/1.1\ 401* ]] || fail "/fleet served without a credential: ${anonymous%%$'\n'*}"
 # A 401 with no challenge is one a browser shows as a broken page rather than
 # prompting for -- which would make the page unreachable from the laptop it exists
 # to be opened on.
 [[ "$anonymous" == *WWW-Authenticate:\ Basic* ]] || fail "/fleet refused without a challenge a browser can act on"
 
-wrong="$(http_get "$admin_port" /fleet "Bearer not-the-token")"
+wrong="$(dash_get "$admin_port" /fleet "Bearer not-the-token")"
 [[ "$wrong" == HTTP/1.1\ 401* ]] || fail "/fleet accepted the wrong token"
 
 # Both spellings, because one is what a script sends and the other is what a
 # browser can be made to prompt for.
 basic_value="$(printf ':%s' "$TOKEN" | base64 | tr -d '\n')"
 for auth in "Bearer ${TOKEN}" "Basic ${basic_value}"; do
-    page="$(http_get "$admin_port" /fleet "$auth")"
+    page="$(dash_get "$admin_port" /fleet "$auth")"
     [[ "$page" == HTTP/1.1\ 200* ]] || fail "/fleet refused a valid credential (${auth%% *}): ${page%%$'\n'*}"
 done
 
 # ------------------------------------------------------- 1, 4, 5. the document
-page="$(http_get "$admin_port" /fleet "Bearer ${TOKEN}")"
+page="$(dash_get "$admin_port" /fleet "Bearer ${TOKEN}")"
 [[ "$page" == *Content-Type:\ text/html* ]] || fail "/fleet did not answer HTML"
 [[ "$page" == *'<!doctype html>'* ]] || fail "/fleet answered HTML without a doctype"
 
@@ -301,21 +257,22 @@ page="$(http_get "$admin_port" /fleet "Bearer ${TOKEN}")"
 [[ "$page" != *'href="http'* ]] || fail "the dashboard links a stylesheet from another host"
 [[ "$page" != *'@import'* ]] || fail "the dashboard imports a stylesheet"
 
-json="$(http_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
+json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
 [[ "$json" == *Content-Type:\ application/json* ]] || fail "/fleet.json did not answer JSON"
 [[ "$json" == *'"role":"leader"'* ]] || fail "the node did not report itself as the fleet's leader"
 
 # The node registers with its own scheduler on its heartbeat, so the machine
 # appears once the first REGISTER lands. Bounded, and it says what it waited for.
-registered=""
-for _ in $(seq 1 "$WAIT_TICKS"); do
-    json="$(http_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
-    if [[ "$json" == *"127.0.0.1:${worker_port}"* ]]; then registered="yes"; break; fi
-    if ! kill -0 "$node_pid" 2>/dev/null; then fail "the node died before it registered with its own scheduler"; fi
-    sleep 0.1
-done
-[[ -n "$registered" ]] \
-    || fail "timed out after $((WAIT_TICKS / 10))s waiting for the worker to appear in /fleet.json"
+# A bespoke CONDITION through the shared loop, rather than a bespoke loop. The
+# hand-written one this replaces reported `timed out after $((WAIT_TICKS / 10))s`
+# -- a duration computed from the loop shape and never observed, which is the one
+# reading that would have said whether the runner was slow.
+worker_is_listed() {
+    json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
+    [[ "$json" == *"127.0.0.1:${worker_port}"* ]]
+}
+wait_until worker_is_listed "the worker to appear in /fleet.json" \
+    "$node_pid" "${workdir}/node.log" 240
 
 # And it is one MACHINE, whatever it serves: the grain a fleet total is computed
 # over. A page listing registry entries would double-count a node's cores.
@@ -337,11 +294,11 @@ for chart in dispatched refusals capacity hit-rate; do
     # **Unauthenticated first.** An image URL that answered without a credential
     # would leak the fleet's whole history while /fleet itself stayed locked --
     # which is the one way this feature could have made the surface less safe.
-    open_chart="$(http_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h")"
+    open_chart="$(dash_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h")"
     [[ "$open_chart" == HTTP/1.1\ 401* ]] \
         || fail "/fleet/chart/${chart}.svg served without a credential: ${open_chart%%$'\n'*}"
 
-    svg="$(http_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h" "Bearer ${TOKEN}")"
+    svg="$(dash_get "$admin_port" "/fleet/chart/${chart}.svg?range=24h" "Bearer ${TOKEN}")"
     [[ "$svg" == HTTP/1.1\ 200* ]] || fail "/fleet/chart/${chart}.svg did not answer 200: ${svg%%$'\n'*}"
     [[ "$svg" == *Content-Type:\ image/svg+xml* ]] || fail "/fleet/chart/${chart}.svg did not answer SVG"
     [[ "$svg" == *'<svg '* ]] || fail "/fleet/chart/${chart}.svg answered without an SVG root"
@@ -349,12 +306,12 @@ for chart in dispatched refusals capacity hit-rate; do
 done
 
 # The conditional GET the whole arrangement exists for.
-svg="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}")"
+svg="$(dash_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}")"
 etag="$(printf '%s' "$svg" | tr -d '\r' | sed -n 's/^ETag: //p' | head -1)"
 [[ -n "$etag" ]] || fail "a chart was served with no ETag, so a browser can never revalidate it"
 [[ "$svg" == *Cache-Control:\ max-age=* ]] || fail "a chart was served with no Cache-Control"
 
-cached="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}" "$etag")"
+cached="$(dash_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}" "$etag")"
 [[ "$cached" == HTTP/1.1\ 304* ]] || fail "a chart did not answer 304 to its own ETag: ${cached%%$'\n'*}"
 # RFC 9110 forbids content on a 304, and a Content-Length a client reads before
 # finding the connection closed is reported as a truncated response.
@@ -363,17 +320,17 @@ cached="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer
 [[ "$cached" == *ETag:* ]] || fail "a 304 dropped the validator the client needs next time"
 
 # An unknown range is refused rather than quietly served as a different one.
-bad_range="$(http_get "$admin_port" "/fleet/chart/dispatched.svg?range=30d" "Bearer ${TOKEN}")"
+bad_range="$(dash_get "$admin_port" "/fleet/chart/dispatched.svg?range=30d" "Bearer ${TOKEN}")"
 [[ "$bad_range" == HTTP/1.1\ 400* ]] || fail "an unknown range was not refused: ${bad_range%%$'\n'*}"
 # An unknown chart is a 404, not whichever chart happened to be first in the table.
-bad_chart="$(http_get "$admin_port" "/fleet/chart/nonesuch.svg?range=24h" "Bearer ${TOKEN}")"
+bad_chart="$(dash_get "$admin_port" "/fleet/chart/nonesuch.svg?range=24h" "Bearer ${TOKEN}")"
 [[ "$bad_chart" == HTTP/1.1\ 404* ]] || fail "an unknown chart was not refused: ${bad_chart%%$'\n'*}"
 
 # And the series behind those charts, so anything on the page can be checked
 # without a browser.
-open_series="$(http_get "$admin_port" "/fleet/series.json?range=24h")"
+open_series="$(dash_get "$admin_port" "/fleet/series.json?range=24h")"
 [[ "$open_series" == HTTP/1.1\ 401* ]] || fail "/fleet/series.json served without a credential"
-series="$(http_get "$admin_port" "/fleet/series.json?range=24h" "Bearer ${TOKEN}")"
+series="$(dash_get "$admin_port" "/fleet/series.json?range=24h" "Bearer ${TOKEN}")"
 [[ "$series" == HTTP/1.1\ 200* ]] || fail "/fleet/series.json did not answer 200: ${series%%$'\n'*}"
 [[ "$series" == *Content-Type:\ application/json* ]] || fail "/fleet/series.json did not answer JSON"
 [[ "$series" == *'"range":"24h"'* ]] || fail "/fleet/series.json did not name the range it answered for"
@@ -384,7 +341,7 @@ series="$(http_get "$admin_port" "/fleet/series.json?range=24h" "Bearer ${TOKEN}
     || fail "/fleet did not reference the chart resources"
 
 # An unknown path is still a plain 404 rather than anything the dashboard added.
-missing="$(http_get "$admin_port" /nope "Bearer ${TOKEN}")"
+missing="$(dash_get "$admin_port" /nope "Bearer ${TOKEN}")"
 [[ "$missing" == HTTP/1.1\ 404* ]] || fail "an unknown path no longer answers 404"
 
 if [[ -n "$tls" ]]; then

@@ -911,6 +911,15 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
   copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
   them, found a day apart — a fake nothing exercises does not report its own bugs.
+- The POSIX shell fixtures share `scripts/lib/e2e-common.sh`, tested by
+  `ctest -R e2e-helpers-selftest`. It was seven copies that had already diverged three
+  ways, one of them a `wait_for_port` with no liveness check at all. A wait's bound is
+  read from a **clock** and its timeout reports the **measured** elapsed: `100 x 0.2s`
+  is not 20s, and `timed out after $((WAIT_TICKS / 10))s` was a duration nobody ever
+  observed — the one reading that says whether the machine was slow, derived from
+  assuming it was fast. A bespoke condition is a predicate passed to `wait_until`,
+  never a new loop. And `fail` signals the top-level shell unconditionally rather than
+  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2.
 - A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
   `OnCompile` places the interleaving rather than waiting for one. It is in
   `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library

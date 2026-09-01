@@ -70,18 +70,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "macOS service E2E FAILED: $*" >&2; exit 1; }
-
-# Wait for the port to accept a connection rather than sleeping a fixed amount:
-# a cold CI runner is much slower than a warm developer machine.
-wait_for_port() {
-    local p="$1"
-    for _ in $(seq 1 100); do
-        if (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null; then return 0; fi
-        sleep 0.1
-    done
-    return 1
-}
+# The shared helpers: `fail` and `wait_for_port`, one copy for every POSIX
+# fixture (#449). Neither of the two this file had was wrong; both were the
+# smallest of the seven, and small is how a copy loses a guard -- this
+# `wait_for_port` had no liveness check and no bound of its own worth the name,
+# so a job launchd had started and lost was reported as a port that never
+# answered.
+#
+# WHAT CHANGED FOR THIS FIXTURE, deliberately: the local `wait_for_port`
+# RETURNED 1 and both call sites wrote `|| fail "nothing listening ..."`. The
+# shared one fails the run itself, with a message naming the bound, the measured
+# elapsed and whether the job was still alive. The two call sites therefore lose
+# their `|| fail`, which was the only use either made of the return value, so
+# the step still fails at the same point with the same status 1 and a better
+# sentence. Nothing here treats a closed port as an ordinary outcome; a caller
+# that did would use `port_answers`.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "macOS service E2E" "$workdir"
 
 # --- 1. install -------------------------------------------------------------
 echo "== installing the launchd agent"
@@ -124,7 +129,10 @@ kill -0 "$pid" 2>/dev/null || fail "pid $pid is not alive; the job forked and wa
 ! grep -q -- "--daemon" "$PLIST" || fail "plist contains --daemon; launchd would reap the forked process"
 
 # --- 4. it actually serves --------------------------------------------------
-wait_for_port "$port" || fail "nothing listening on 127.0.0.1:${port}"
+# `$pid` is launchd's, not this shell's child, so `wait` cannot report an exit
+# status for it and the verdict prints `-` rather than inventing one. `kill -0`
+# still answers, which is the reading that separates a dead job from a slow one.
+wait_for_port 127.0.0.1 "$port" "$pid" "the installed agent" "-"
 reply="$(printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | nc -w 5 127.0.0.1 "$port" || true)"
 [[ "$reply" == *"STORED"* ]] || fail "no STORED in reply: $reply"
 [[ "$reply" == *"hello"*  ]] || fail "value did not round-trip: $reply"
@@ -139,7 +147,10 @@ newport=$((port + 1))
     --storage="${workdir}/cache" > "${workdir}/reinstall.log" 2>&1 \
     || fail "reinstall exited non-zero: $(cat "${workdir}/reinstall.log")"
 
-wait_for_port "$newport" || fail "reinstall did not take effect; nothing on ${newport}"
+# `-` for the pid: the reinstall bootstrapped a NEW job, so `$pid` above names
+# the process this very step replaced. A stale pid is worse than no pid -- it
+# would report the old job's death as the new job's.
+wait_for_port 127.0.0.1 "$newport" "-" "the reinstalled agent" "-"
 
 # --- 6. uninstall leaves nothing behind ------------------------------------
 echo "== uninstalling"
