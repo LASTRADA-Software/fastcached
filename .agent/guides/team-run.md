@@ -110,6 +110,41 @@ Each of these is a scar, not a preference.
 - **Local gate caveat.** A worktree created from Windows is unreadable by WSL git, so
   `scripts/local-gate.sh` dies at step one and `repository-hygiene` silently *skips*.
   Create worktrees from **inside WSL**, or rely on CI as the gate — and say which you did.
+- **The expensive event is the PR being open, not the push.** This is a property of
+  `.github/workflows/build.yml`'s triggers, so check it there rather than trusting this
+  sentence — and re-check it if they ever move:
+
+  ```yaml
+  on:
+    push:
+      branches: [master, "fix-ci"]
+      tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    pull_request:        # no branches: filter — any PR, any base
+    merge_group:
+      branches: [master]
+  ```
+
+  So a push to an ordinary lane branch with **no PR open** creates no check run at all.
+  The same push to a branch that **has** one fires the whole job matrix, because
+  `pull_request` triggers on `synchronize`. Measured on one afternoon: two pushes to
+  branches with #477 and #478 open cost a matrix each, while a push to a branch with no
+  PR cost nothing. Same action, opposite cost, and nothing in the action itself tells
+  you which you just did.
+
+  **The rule is not "pushing is free".** Recording only the cheap half is what gets a
+  lane into trouble in the expensive direction. Three ways an ordinary-looking push is
+  expensive: a PR is already open on that branch; the branch is `master` or `fix-ci`,
+  the second of which a lane can hit by naming its branch after the thing it is fixing;
+  or the ref is a version tag.
+
+  **What this buys, and it is the reason to know it:** during a saturated queue you can
+  still finish the work, commit it, and push it. Only *opening the PR* has to wait for
+  the manager's call. A lane that reads "hold" as "stop working" idles for no reason;
+  a lane that reads it as "pushing is fine" while its PR is open starves the entry the
+  manager is trying to land.
+
+  Written down because a manager gave a lane the over-broad version of this rule from
+  not having it, and the lane checked the triggers instead of complying.
 - **Merging is the manager's.** `gh pr merge --merge --auto`, then
   `gh pr update-branch --rebase` on every `BEHIND`; auto-merge alone never makes a branch
   up to date.
