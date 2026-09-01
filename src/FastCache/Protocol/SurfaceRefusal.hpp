@@ -85,15 +85,22 @@ struct SurfaceRefusal
 
 /// One refusal a surface answers and deliberately does not count.
 ///
-/// The `why` is never sent and never read at run time. It is a **forcing function**:
-/// the author cannot write the call without answering "would a rise here mean
-/// something happened", which is the question #447 extracted and #491 is about. This
-/// project already spells decisions that way -- `StartupPolicyRejection` carries a
-/// per-row reason, and the option table carries `why` text nothing transmits.
+/// The `rationale` is never sent and never read at run time. It is a **forcing
+/// function**: the author cannot write the call without answering "would a rise here
+/// mean something happened", which is the question #447 extracted and #491 is about.
+/// This project already spells decisions that way -- `StartupPolicyRejection` carries
+/// a per-row reason, and the option table carries `why` text nothing transmits.
 struct UncountedRefusal
 {
     CompileCacheWire::ErrorCode code; ///< What the client is told.
-    std::string_view why;             ///< Why no counter moves. For a person reading this code.
+
+    /// Why no counter moves. Never sent, never read at run time -- see the type's own
+    /// documentation for why it is here at all.
+    ///
+    /// **Not spelled `why`**, which on `CompileCacheWire::RefusedVerb` is the text a
+    /// CLIENT is sent. The two meet in one expression at several call sites, and one
+    /// word carrying two opposite contracts is how a reader comes to send this one.
+    std::string_view rationale;
 };
 
 /// One refusal nobody has decided the counter policy for yet.

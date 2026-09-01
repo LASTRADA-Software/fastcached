@@ -164,17 +164,16 @@ class SchedulerResponder final: public IFrameResponder
         // what a message could say is which verb the caller failed to reach, and an
         // unauthenticated peer learns nothing from being told that.
         if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
-            return Cc::Refuse(
-                _metrics,
-                Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCodeFor(decision),
-                                     .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated },
-                detail);
-        return Cc::RefuseWithoutCounter(
-            Cc::UncountedRefusal { .code = CompileCacheWire::ErrorCodeFor(decision),
-                                   .why = "a size or opcode refusal says the peer is confused; an operator watching "
-                                          "for somebody reaching after verbs they hold no secret for does not want "
-                                          "it summed into that series" },
-            detail);
+            return Cc::Refuse(_metrics,
+                              { .code = CompileCacheWire::ErrorCodeFor(decision),
+                                .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated },
+                              detail);
+        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::ErrorCodeFor(decision),
+                                          .rationale =
+                                              "a size or opcode refusal says the peer is confused; an operator watching "
+                                              "for somebody reaching after verbs they hold no secret for does not want "
+                                              "it summed into that series" },
+                                        detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
@@ -202,12 +201,12 @@ class SchedulerResponder final: public IFrameResponder
     {
         auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)].answer;
         if (!row.has_value())
-            return Cc::RefuseWithoutCounter(
-                Cc::UncountedRefusal { .code = ErrorCodeFor(refusal),
-                                       .why = "the byte budget says this surface is momentarily full, which the peer "
-                                              "sees and retries; summed into a security series it is what makes that "
-                                              "series unreadable" },
-                detail);
+            return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal),
+                                              .rationale =
+                                                  "the byte budget says this surface is momentarily full, which the peer "
+                                                  "sees and retries; summed into a security series it is what makes that "
+                                                  "series unreadable" },
+                                            detail);
         return Cc::Refuse(_metrics, *row, detail);
     }
 
@@ -369,8 +368,8 @@ class CacheResponder final: public IFrameResponder
         if (_locality.IsThisMachine(peer))
             return std::nullopt;
         return Cc::Refuse(_metrics,
-                          Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::NotAMember,
-                                               .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal },
+                          { .code = CompileCacheWire::ErrorCode::NotAMember,
+                            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal },
                           "this node serves its cache to its own machine only");
     }
 
@@ -417,12 +416,12 @@ class CacheResponder final: public IFrameResponder
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
-        return Cc::RefuseWithoutCounter(
-            Cc::UncountedRefusal { .code = CompileCacheWire::ErrorCodeFor(decision),
-                                   .why = "this surface requires no credential, so it can never produce the one "
-                                          "refusal that carries a counter; the size and opcode arms are framing "
-                                          "errors and are already visible as such to the peer" },
-            detail);
+        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::ErrorCodeFor(decision),
+                                          .rationale =
+                                              "this surface requires no credential, so it can never produce the one "
+                                              "refusal that carries a counter; the size and opcode arms are framing "
+                                              "errors and are already visible as such to the peer" },
+                                        detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
@@ -436,11 +435,11 @@ class CacheResponder final: public IFrameResponder
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        return Cc::RefuseWithoutCounter(
-            Cc::UncountedRefusal { .code = ErrorCodeFor(refusal),
-                                   .why = "the credential arms are unreachable on a surface that requires none, and "
-                                          "the byte budget is a transient the peer retries past" },
-            detail);
+        return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal),
+                                          .rationale =
+                                              "the credential arms are unreachable on a surface that requires none, and "
+                                              "the byte budget is a transient the peer retries past" },
+                                        detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -786,12 +785,12 @@ class MergedResponder final: public IFrameResponder
     /// @return The encoded refusal.
     [[nodiscard]] static std::vector<std::byte> UnservedReply()
     {
-        return Cc::RefuseWithoutCounter(
-            Cc::UncountedRefusal { .code = CompileCacheWire::UnimplementedVerb,
-                                   .why = "an ANSWER healthy traffic produces continuously, not an event: a node runs "
-                                          "its components independently, so one it does not hold refuses every "
-                                          "exchange of a whole build and a port scan would be invisible inside it" },
-            "this node serves no component for that verb family");
+        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
+                                          .rationale =
+                                              "an ANSWER healthy traffic produces continuously, not an event: a node runs "
+                                              "its components independently, so one it does not hold refuses every "
+                                              "exchange of a whole build and a port scan would be invisible inside it" },
+                                        "this node serves no component for that verb family");
     }
 
     /// The largest value the present owners report for one ceiling.

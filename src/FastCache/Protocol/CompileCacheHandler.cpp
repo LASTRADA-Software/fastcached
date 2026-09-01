@@ -152,7 +152,7 @@ namespace
     /// @return true when the whole reply reached the socket.
     [[nodiscard]] Task<bool> ReplyError(ISocket* socket, Wire::ErrorCode code, std::string message)
     {
-        auto const frame = Cc::RefuseUntriaged(Cc::UntriagedRefusal { .code = code, .issue = DaemonRefusalTriage }, message);
+        auto const frame = Cc::RefuseUntriaged({ .code = code, .issue = DaemonRefusalTriage }, message);
         co_return co_await WriteAll(socket, frame);
     }
 

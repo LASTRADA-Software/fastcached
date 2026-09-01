@@ -60,29 +60,25 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
         co_return std::vector<std::byte> {};
 
     if (!Wire::IsSupported(header->version))
-        co_return Cc::RefuseUntriaged(
-            Cc::UntriagedRefusal { .code = Wire::ErrorCode::UnsupportedVersion, .issue = CacheRefusalTriage },
-            std::format("supported versions {}..{}",
-                        static_cast<unsigned>(Wire::MinSupportedVersion),
-                        static_cast<unsigned>(Wire::CurrentVersion)));
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnsupportedVersion, .issue = CacheRefusalTriage },
+                                      std::format("supported versions {}..{}",
+                                                  static_cast<unsigned>(Wire::MinSupportedVersion),
+                                                  static_cast<unsigned>(Wire::CurrentVersion)));
 
     auto const* descriptor = Wire::FindOp(header->opRaw);
     if (descriptor == nullptr)
-        co_return Cc::RefuseUntriaged(
-            Cc::UntriagedRefusal { .code = Wire::ErrorCode::UnknownOpcode, .issue = CacheRefusalTriage });
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnknownOpcode, .issue = CacheRefusalTriage });
 
     auto const payload = frame.subspan(Wire::RequestHeaderSize);
     if (payload.size() != header->payloadLength)
-        co_return Cc::RefuseUntriaged(
-            Cc::UntriagedRefusal { .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
     switch (descriptor->code)
     {
         case Wire::Op::Fetch: {
             auto const key = Wire::DecodeFetchPayload(payload);
             if (!key.has_value())
-                co_return Cc::RefuseUntriaged(
-                    Cc::UntriagedRefusal { .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
             auto const found = co_await _cache.Fetch(Wire::AsStringView(*key));
             if (!found.has_value())
@@ -96,8 +92,7 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
         case Wire::Op::Store: {
             auto const fields = Wire::DecodeStorePayload(payload);
             if (!fields.has_value())
-                co_return Cc::RefuseUntriaged(
-                    Cc::UntriagedRefusal { .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
             // Canonicalized against the roots the client sent, through the one
             // recipe both servers on this wire share.
@@ -120,23 +115,20 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
-                co_return Cc::RefuseUntriaged(
-                    Cc::UntriagedRefusal { .code = Wire::ErrorCode::StorageWriteFailed, .issue = CacheRefusalTriage });
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::StorageWriteFailed, .issue = CacheRefusalTriage });
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }
         default:
             if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-                co_return Cc::RefuseUntriaged(Cc::UntriagedRefusal { .code = row->code, .issue = CacheRefusalTriage },
-                                              row->why);
+                co_return Cc::RefuseUntriaged({ .code = row->code, .issue = CacheRefusalTriage }, row->why);
 
             // A scheduler or worker verb at the cache port. Answered rather than
             // dropped, so a client that reached the wrong one of this node's ports
             // learns which instead of seeing something indistinguishable from a dead
             // host.
-            co_return Cc::RefuseUntriaged(
-                Cc::UntriagedRefusal { .code = Wire::ErrorCode::DispatchNotPermitted, .issue = CacheRefusalTriage },
-                "this endpoint is the node's cache; scheduling and compiles are served on "
-                "their own ports");
+            co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::DispatchNotPermitted, .issue = CacheRefusalTriage },
+                                          "this endpoint is the node's cache; scheduling and compiles are served on "
+                                          "their own ports");
     }
 }
 
