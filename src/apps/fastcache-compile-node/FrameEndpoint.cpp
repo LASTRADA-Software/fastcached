@@ -782,9 +782,8 @@ void FrameServer::Shutdown() noexcept
     // accumulating the requested poll instead of measuring it, so the 5 s it named
     // was 15 s on a host whose timer granularity is 15 ms, and the cadence it
     // claimed to share was 5 ms rather than 10 (#452).
-    auto const outcome = DrainWithin([&state = *_state] {
-        return state.loopsAlive.load(std::memory_order_acquire) != 0 || state.OpenCount() != 0;
-    });
+    auto const outcome = DrainWithin(
+        [&state = *_state] { return state.loopsAlive.load(std::memory_order_acquire) != 0 || state.OpenCount() != 0; });
 
     if (auto const stuck = _state->loopsAlive.load(std::memory_order_acquire) + _state->OpenCount();
         outcome == DrainResult::Ceiling && stuck != 0)

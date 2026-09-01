@@ -1406,6 +1406,26 @@ spelled it the same way, which is what makes this a drift rather than a discover
     `::socket()` returns an inheritable handle. POSIX marks both pipe ends
     close-on-exec, under a lock that also covers the spawn, because the window between
     creating a descriptor and marking it is a window a sibling can spawn in.
+  - **A bounded wait MEASURES its ceiling; it does not count polls towards it.**
+    `waited += poll` is the obvious spelling and it is wrong, because a sleep costs
+    what the platform's timer granularity says rather than what it asked for: on
+    Windows a 5 ms request costs ~15 ms, so `FrameServer::Shutdown` stated a 5 s
+    ceiling and enforced 15, and `RaftPeerTransport::Stop` enforced 7.5 (#452).
+    Nothing observes this. Every drain still ends, every reply is still correct, and
+    the only symptom is a stop that takes three times as long as the code says --
+    which reads as a slow machine, and on a supervisor with a stop timeout is the
+    difference between stopping and being killed. Both copies carried a comment
+    citing `RaftPeerServer::Shutdown`, which is correct, and which they had
+    reimplemented rather than called; one of them cited its cadence while using a
+    different one. **A comment naming the implementation it duplicates vouches for
+    whatever the duplicate got wrong**, so the fix is the call, not a better
+    comment: `Core/BoundedDrain.hpp`'s `DrainWithin` is the one bounded drain here
+    and the four shutdown paths take it. Its ceiling and cadence are `DrainBound`'s
+    defaults, so a site states neither. And the blocking and the clock arrive on one
+    injected seam (`IDrainWait`) rather than two, because a test whose sleeps cost
+    what they requested cannot tell the counting implementation from the measuring
+    one on ANY platform -- the fake that makes a request and its cost disagree is
+    the entire regression test.
   - **A drain must not wake on an atomic it is about to destroy.** `~WorkerServer`
     waited on `_inFlight.wait()`; an atomic wait can return on observing the store
     alone, so the destructor could finish and free the object while the job that

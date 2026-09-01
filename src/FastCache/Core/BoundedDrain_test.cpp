@@ -119,8 +119,7 @@ TEST_CASE("DrainWithin: a ceiling is measured, not counted", "[core][drain]")
     constexpr auto Poll = 10ms;
 
     auto wait = OverrunningDrainWait { Overrun };
-    CHECK(DrainWithin([] { return true; }, DrainBound { .ceiling = Ceiling, .poll = Poll }, wait)
-          == DrainResult::Ceiling);
+    CHECK(DrainWithin([] { return true; }, DrainBound { .ceiling = Ceiling, .poll = Poll }, wait) == DrainResult::Ceiling);
 
     // Bounded on both sides: it must not give up early either, or a drain that
     // stops instantly would pass the upper bound trivially. Elapsed is exactly

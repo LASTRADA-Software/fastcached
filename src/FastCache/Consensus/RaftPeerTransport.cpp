@@ -463,8 +463,7 @@ void RaftPeerTransport::Stop() noexcept
     // 15 (#452).
     auto const outcome = DrainWithin([this] { return _sendersRunning.load(std::memory_order_acquire) != 0; });
 
-    if (auto const stuck = _sendersRunning.load(std::memory_order_acquire);
-        outcome == DrainResult::Ceiling && stuck != 0)
+    if (auto const stuck = _sendersRunning.load(std::memory_order_acquire); outcome == DrainResult::Ceiling && stuck != 0)
     {
         // Released rather than destroyed. The reactor may still hold these
         // handles, so destroying the frames is undefined behaviour while leaking
@@ -473,7 +472,7 @@ void RaftPeerTransport::Stop() noexcept
         _logger.Log(LogLevel::Error,
                     std::format("raft: {} peer sender(s) did not finish within {} ms; leaking their frames",
                                 stuck,
-                                Ceiling.count() * 1000));
+                                DrainBound {}.ceiling.count()));
         auto const guard = std::unique_lock { _peersMutex };
         for (auto& [id, peer]: _peers)
             std::ignore = peer->sender.Release();

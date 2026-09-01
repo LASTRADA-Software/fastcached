@@ -129,9 +129,7 @@ enum class DrainResult : std::uint8_t
 ///               and its cost disagree.
 /// @return `Drained` if `busy` reported false, `Ceiling` if it did not in time.
 template <std::predicate Predicate>
-[[nodiscard]] DrainResult DrainWithin(Predicate busy,
-                                      DrainBound bound = {},
-                                      IDrainWait& wait = DefaultDrainWait())
+[[nodiscard]] DrainResult DrainWithin(Predicate busy, DrainBound bound = {}, IDrainWait& wait = DefaultDrainWait())
 {
     auto const deadline = wait.Now() + bound.ceiling;
     while (busy())
