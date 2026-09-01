@@ -146,6 +146,13 @@ namespace
                 // raft's `--node-id` gate: a surface can be configured and still not
                 // served.
                 //
+                // The worker is deliberately NOT a third half. It answers here too
+                // since #290's second half, but it has a port of its own that every
+                // client already dials, so a node whose only component is its worker
+                // would gain a listener nobody needs and every firewall worksheet
+                // would grow a row for it. What decides whether this port exists is
+                // still the two components that have nowhere else to answer.
+                //
                 // `--cache-memory 0` with no `--cache-dir` leaves the tier nothing to
                 // keep objects in, so `StartCacheTierOrExplain` returns without one --
                 // and a worksheet that listed the port anyway would have an operator
@@ -160,7 +167,8 @@ namespace
                 resolved.defaultHost = NodeListenDefaultHost(cfg);
                 return ResolveFromSpec(resolved, cfg);
             },
-            .note = "one 0xFC port for the cache verbs and, with --serve-scheduler, the scheduler verbs. A bare "
+            .note = "one 0xFC port for the cache verbs, this node's own compile verbs, and -- with "
+                    "--serve-scheduler -- the scheduler verbs. A bare "
                     "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
                     "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "
                     "so widening it admits nobody new to them. Not bound at all by a node that neither holds a "

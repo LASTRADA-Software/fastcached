@@ -208,6 +208,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "worker's in-flight byte budget. Distinct from no_slot: slots were "
               "free and memory was not, so more slots would not have helped.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedStopping,
+      .prometheusName = "fastcache_worker_jobs_refused_stopping_total",
+      .help = "Jobs refused because this worker had begun stopping. Never sum with "
+              "no_slot: that one says the fleet is too small, this one says a node is "
+              "draining and a retry will land somewhere else.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnsupportedVersion,
       .prometheusName = "fastcache_worker_frames_refused_unsupported_version_total",
       .help = "Frames refused for naming a protocol version this build does not "
@@ -244,6 +250,15 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Frames whose header declared a payload larger than this surface "
               "accepts, refused without being read. The cheapest probe there is: it "
               "needs only a header, where the envelope series needs a whole frame.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
+      .prometheusName = "fastcache_worker_frames_refused_unauthenticated_total",
+      .help = "Frames refused for reaching a compile verb before a credential. Flat at "
+              "zero BY CONSTRUCTION, not for want of anybody probing: the compile "
+              "surface answers AuthRequired false -- a compile carries its own per-job "
+              "lease instead -- so the pre-payload gate never reaches this. Do not read "
+              "the flat line as 'nothing is asking'. A rise means that answer changed, "
+              "which is a change to who may compile here.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
       .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",

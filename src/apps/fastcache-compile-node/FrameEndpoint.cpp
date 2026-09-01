@@ -321,10 +321,17 @@ namespace
         // half a header is swept rather than holding a frame until the process dies.
         // `Rearm` below moves it forward once per request -- not once per read; see
         // its note for what the window then covers.
-        auto const deadlineFor = [state] {
-            return state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
+        //
+        // TWO windows, and which one is armed depends on whether a verb has been
+        // named. Until it has, this peer has told the surface nothing, so it gets the
+        // short one whatever the surface goes on to serve -- that is where the
+        // slow-loris property lives. Once the header decodes, the owner of the verb
+        // says how long ITS answer may take, because a cache exchange is a round trip
+        // and a dispatched compile is however long a compiler runs (#223, #290).
+        auto const deadlineFor = [state](std::chrono::milliseconds window) {
+            return state->io.Reactor().Clock().Now() + window;
         };
-        state->Track(socket.get(), deadlineFor());
+        state->Track(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
 
         // The firewall: this is a DetachedTask, whose unhandled_exception terminates
         // the process, so one client's answer must not take the node with it.
@@ -358,7 +365,7 @@ namespace
                 // Whatever a pipelined peer has already sent is kept.
                 reader.ReleaseSpareCapacity();
 
-                state->Rearm(socket.get(), deadlineFor());
+                state->Rearm(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
 
                 auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
                 if (!header.has_value())
@@ -490,6 +497,26 @@ namespace
                         break;
                     continue;
                 }
+
+                // **The verb's own window, armed at the point this surface decides to
+                // SERVE and not one line earlier.** It covers the payload read and the
+                // answer, which are the two things a compile makes long.
+                //
+                // Every branch above is a refusal, and every one of them ends in
+                // `reader.Skip(decoded->payloadLength)` -- a read of whatever the peer
+                // declared, from a peer that may dribble it. Armed after the header
+                // decoded, as it first was, a stranger who merely NAMES `Op::Compile`
+                // in a seven-byte header would be handed the compile window before
+                // `RefusePeer` had been asked whether they are a member at all: a
+                // hundred-and-twentyfold longer hold, pre-admission, on a surface whose
+                // whole purpose here was to be harder to exhaust. The comment that used
+                // to sit up there reasoned the refusals were "all fast" -- true of the
+                // `WriteAll`, false of the skip that follows it.
+                //
+                // So `HeaderTimeout` governs everything up to this line, which is the
+                // rule stated positively: a peer gets the generous window by being
+                // SERVED, never by asking.
+                state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
 
                 BudgetedBytes const bytes { state, decoded->payloadLength };
                 auto const payload = co_await reader.ReadExactly(decoded->payloadLength);

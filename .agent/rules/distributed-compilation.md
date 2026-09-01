@@ -1331,6 +1331,36 @@ spelled it the same way, which is what makes this a drift rather than a discover
     `Serve` stays on the pool thread. Move that port onto a reactor and every read
     would resume the coroutine on the reactor thread -- putting the compile back
     there, invisibly, with no call site changed.
+  - **On the merged `0xFC` surface it is TWO hops, and the second one is the invisible
+    one.** #290 gave the compile verbs a second door, and that door is a reactor: a
+    frame arrives on the reactor thread, so the compile has to leave it (the bullet
+    above, one layer over again) *and* the reply has to come back to it, because
+    `FrameEndpoint` writes what a responder returns to a **reactor socket**. Returning
+    from the pool thread leaves the connection task's writes, its deadline rearm and
+    its close running off the loop that owns them -- and nothing reports it. The object
+    is correct, the write usually succeeds, and no call site changes. So
+    `CompileResponder`'s test asserts the **thread identities**: that the compiler ran
+    somewhere other than the reactor, and that the reply was produced on it. Both
+    mutations were staged, and each was caught by exactly one assertion while every
+    other assertion in the case -- the object included -- still passed. A test that
+    checked only the reply passes under both bugs.
+  - **The second door spends the FIRST door's accounting.** `CompileResponder` holds
+    `WorkerServer::Capacity()`, never a `CompileCapacity` of its own: two counters
+    would make one machine answer to two caps depending on which door a client used,
+    and the slot figure it advertises to the fleet would describe neither. It is also
+    what makes one bounded drain cover both -- `~WorkerServer` waits on a count both
+    doors raise -- and it is why `main.cpp` declares the worker BEFORE the surface, so
+    the listener stops admitting compiles before the drain starts counting them. The
+    responder asks `IsShuttingDown()` itself, because it has no accept loop whose
+    condition would have done it.
+  - **A merged door is an ADDITIONAL door onto one policy, never a relaxed one.**
+    Membership is the accept loop's own `RefuseUnlessMember`, moved beside the refusal
+    rows rather than restated, and the lease is checked where it always was, inside
+    `WorkerProtocol`. `AuthRequired` answers **false** for `Op::Compile` -- which is a
+    `RequiresAuth` row, so that answer is what decides it -- because a compile already
+    carries a per-job credential the scheduler signed for this worker's endpoint, and a
+    connection-scoped secret would be strictly weaker while refusing every client the
+    dedicated port serves.
   - **The pool is sized to the cap, and the cap is what refuses.** The pool does not
     bound admission -- it runs what it is given -- so an unsized pool would queue
     silently and hide the overload from the scheduler trying to route around it.

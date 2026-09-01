@@ -12,6 +12,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "ClusterAdminCli.hpp"
+#include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
@@ -863,19 +864,75 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // carry on without a tier rather than as failures. Both have been logged.
     auto const cacheTier = std::move(*cacheTierOrRefusal);
 
-    // This node's one `0xFC` listener, opened once both components exist and holding a
+    // Computed HERE and advertised, rather than left for the scheduler to derive.
+    // Both would use the same `OfferableSlots`, so the numbers would agree -- but
+    // this worker has to enforce a limit before it has a scheduler to ask, and a
+    // worker running to one number while the scheduler leases against another is
+    // exactly the "fuller and slower than the scheduler believes" failure `--slots`
+    // documents. One call, one answer, used for both.
+    // The machine arrives through a seam rather than through `hardware_concurrency()`
+    // and `QueryHostTotalMemoryBytes()` directly: `NodeCapacityOf` is what decides
+    // which facts come from the operator and which from the hardware, and that rule
+    // is only checkable if a test can present a two-core laptop and a 128-thread
+    // server in one run. It also lives in `NodeConfig.cpp` rather than here, because
+    // this file is in no test target.
+    //
+    // And it is computed BELOW the cache tier, which is the whole of #167: what a
+    // compile cannot have is what the tier actually HOLDS, which is what the
+    // configuration asked for only sometimes. `NodeCapacityOf`'s contract carries the
+    // three ways those differ; this is the ordering that lets it be honoured.
+    auto const host = MakeSystemHostFacts();
+    auto const capacity = Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()));
+    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
+
+    // Sized to the slot cap, which is what makes an admitted job always find a
+    // thread: the cap admits at most `slots` at once, so one is free by
+    // construction and nothing an operator can configure makes a job queue behind
+    // another. Declared BEFORE the server, so the server -- which waits for its own
+    // jobs in its destructor -- is torn down first and never outlived by the pool
+    // it was handing work to. And before the 0xFC surface below, whose compiles run
+    // on this same pool.
+    ThreadPoolExecutor compilePool { slots };
+    Node::WorkerServer server { listenerRef, protocol, slots,       membership.Oracle(),
+                                metrics,     logger,   compilePool, std::chrono::seconds { cfg.drainTimeoutSeconds } };
+
+    // The compile verbs on the node's own `0xFC` listener, which is #290's second
+    // half. An ADDITIONAL door onto the worker above, never a second worker: it
+    // spends `server.Capacity()` -- the same slot cap, the same byte budget, the
+    // same bounded drain -- so what this machine advertises to the fleet describes
+    // both doors rather than neither.
+    //
+    // The two executors are not interchangeable and the pair is the whole point. A
+    // frame arrives on the reactor thread; the compile has to leave it, because a
+    // process that blocks for seconds would stall every other connection that
+    // reactor owns (#213); and the reply has to come BACK to it, because
+    // `FrameEndpoint` writes what the responder returns to a reactor socket. The
+    // second hop is the invisible one -- nothing in the type system or in a
+    // functional test reports a reactor socket written from a pool thread -- which
+    // is why `CompileResponder_test.cpp` asserts the thread identities.
+    //
+    // Declared AFTER the server whose capacity it spends and BEFORE the surface
+    // that routes to it, so destruction runs surface, responder, server: the
+    // listener stops admitting compiles before the drain starts counting them.
+    Node::CompileResponder compileResponder { protocol,    server.Capacity(), membership.Oracle(),
+                                              compilePool, nodeIo.Reactor(),  metrics,
+                                              logger };
+
+    // This node's one `0xFC` listener, opened once every component exists and holding a
     // reference to each (#290). Before the merge each tier bound its own port, which
     // made the listener the routing decision; now `MergedResponder` decides per frame
-    // and the port is a property of the node rather than of either component.
+    // and the port is a property of the node rather than of any one component.
     //
-    // Declared AFTER both tiers and therefore destroyed BEFORE them, which is what
-    // keeps the router from outliving what it routes to. And before consensus, because
-    // what a leader advertises for the scheduler is what this BOUND.
+    // Declared AFTER every component it routes to -- both tiers, the worker and its
+    // responder -- and therefore destroyed BEFORE them, which is what keeps the router
+    // from outliving what it routes to. And before consensus, because what a leader
+    // advertises for the scheduler is what this BOUND.
     auto nodeSurfaceOrRefusal =
         Node::StartNodeSurfaceOrExplain(nodeIo,
                                         cfg,
                                         cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
                                         schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
+                                        &compileResponder,
                                         logger);
     if (!nodeSurfaceOrRefusal.has_value())
     {
@@ -929,37 +986,6 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // May legitimately be null: no `--discovery` means the cluster is the
     // `--raft-peer` list an operator typed, which is the ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
-
-    // Computed HERE and advertised, rather than left for the scheduler to derive.
-    // Both would use the same `OfferableSlots`, so the numbers would agree -- but
-    // this worker has to enforce a limit before it has a scheduler to ask, and a
-    // worker running to one number while the scheduler leases against another is
-    // exactly the "fuller and slower than the scheduler believes" failure `--slots`
-    // documents. One call, one answer, used for both.
-    // The machine arrives through a seam rather than through `hardware_concurrency()`
-    // and `QueryHostTotalMemoryBytes()` directly: `NodeCapacityOf` is what decides
-    // which facts come from the operator and which from the hardware, and that rule
-    // is only checkable if a test can present a two-core laptop and a 128-thread
-    // server in one run. It also lives in `NodeConfig.cpp` rather than here, because
-    // this file is in no test target.
-    //
-    // And it is computed BELOW the cache tier, which is the whole of #167: what a
-    // compile cannot have is what the tier actually HOLDS, which is what the
-    // configuration asked for only sometimes. `NodeCapacityOf`'s contract carries the
-    // three ways those differ; this is the ordering that lets it be honoured.
-    auto const host = MakeSystemHostFacts();
-    auto const capacity = Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()));
-    auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
-
-    // Sized to the slot cap, which is what makes an admitted job always find a
-    // thread: the cap admits at most `slots` at once, so one is free by
-    // construction and nothing an operator can configure makes a job queue behind
-    // another. Declared BEFORE the server, so the server -- which waits for its own
-    // jobs in its destructor -- is torn down first and never outlived by the pool
-    // it was handing work to.
-    ThreadPoolExecutor compilePool { slots };
-    Node::WorkerServer server { listenerRef, protocol, slots,       membership.Oracle(),
-                                metrics,     logger,   compilePool, std::chrono::seconds { cfg.drainTimeoutSeconds } };
 
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a
@@ -1300,6 +1326,12 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // detached onto `compilePool`, so jobs admitted before the listener closed are
     // still running. ~WorkerServer is what waits for them, and it runs before
     // ~ThreadPoolExecutor because `server` is declared after the pool.
+    //
+    // Nor does it mean nothing more can arrive: since #290 a compile also reaches the
+    // merged 0xFC surface, which this loop knows nothing about. The declaration order
+    // is what makes that safe -- the surface is declared after `server`, so it stops
+    // accepting first -- and the one drain covers both doors regardless, because both
+    // spend the same `CompileCapacity`.
     std::jthread const stopWatch { [&](std::stop_token const& stop) {
         while (!stop.stop_requested() && !DaemonControls::Instance().StopRequested())
             std::this_thread::sleep_for(StopPollInterval);
@@ -1339,6 +1371,23 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                 Node::AdmissionSummary(cfg));
 
     SyncRun(server.Run());
+
+    // **Both doors closed and every compile drained HERE, while the node's reactor is
+    // still turning.** Not tidiness and not a duplicate of the destructor: a compile
+    // admitted through the merged `0xFC` surface finishes on `compilePool` and then
+    // hops back onto `nodeIo`'s reactor to hand back its reply. That reactor stops when
+    // the last ADOPTED loop ends, and a connection task parked off-reactor is not one
+    // of them -- so tearing the surface down first can stop the reactor with a compile
+    // still out, losing the hop home, the slot and the byte reservation, and leaving
+    // this worker to wait out its whole drain timeout and `_Exit` reporting compiles
+    // still running that had already finished.
+    //
+    // Destruction order cannot express this: the surface points at the responder and
+    // the responder at this worker's capacity, so those three must be destroyed
+    // surface-first, which is the opposite of what the drain needs. Separating the stop
+    // from the destruction is what lets both be right, and it is why `StopAndWait`
+    // exists as something callable rather than only as a destructor body.
+    server.StopAndWait();
 
     // Unwired BEFORE the sampler goes, and that ordering is the whole reason this
     // line exists: locals are destroyed in reverse declaration order, so the

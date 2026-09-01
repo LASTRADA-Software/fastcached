@@ -350,6 +350,16 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
   inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
   the cap it advertises was unreachable while every client still got a correct object.
+  On the merged `0xFC` surface that is TWO hops, because a frame arrives on a reactor:
+  off to the pool, and **back before the reply is returned**, since `FrameEndpoint`
+  writes it to a reactor socket. The hop back is invisible at every call site — correct
+  object, successful write — so a test asserts the THREAD IDENTITIES, not the reply.
+  That door spends `WorkerServer::Capacity()`, never a second `CompileCapacity`, so one
+  drain covers both and the advertised slot figure describes both; the worker is
+  declared before the surface so the listener stops admitting before the drain counts.
+  It admits nobody the dedicated port refuses: one `RefuseUnlessMember`, the lease still
+  checked inside `WorkerProtocol`, and `AuthRequired` **false** for `Op::Compile`
+  because the lease is already a per-job credential.
 - Detaching the compiles made the per-request payload cap a per-connection one; the
   in-flight byte budget lands in the same change, refusing with `EndpointBusy` because
   a slot was free and memory was not.

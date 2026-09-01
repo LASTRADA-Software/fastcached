@@ -193,6 +193,34 @@ class IFrameResponder
     [[nodiscard]] virtual std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                               std::uint8_t opRaw) const = 0;
 
+    /// How long serving @p opRaw may take before the socket is abandoned.
+    ///
+    /// **Per responder and per VERB, because one number cannot bound both things this
+    /// endpoint now carries.** A cache exchange is bounded by a round trip; a
+    /// dispatched compile is bounded by how long a COMPILER runs. That is #223,
+    /// recorded in `distributed-compilation.md` for the client side -- and it arrived
+    /// on the server side the moment a compile could reach a reactor surface (#290).
+    ///
+    /// The endpoint's own `HeaderTimeout` covers everything before a verb is named,
+    /// which is where the slow-loris property lives: a peer that connects and sends
+    /// half a header is swept on that short window whatever it might have been about
+    /// to ask for. This one is armed only once the header has decoded, so a surface
+    /// generous to compiles gives a stranger nothing.
+    ///
+    /// **A missing hop here is silent in the worst way.** `ServeConnection` is not
+    /// parked on the socket while a responder answers, so a sweep closes it without
+    /// waking anything: the compile runs to completion, hops home, and its `WriteAll`
+    /// fails. Every translation unit worth distributing would be compiled, paid for
+    /// and thrown away, while short ones succeeded -- so a smoke test passes.
+    ///
+    /// Pure virtual for the reason the ceilings below are: a surface that inherits
+    /// this answer inherits five seconds, and five seconds is exactly the value that
+    /// makes the failure above.
+    ///
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return The window covering the payload read and the answer.
+    [[nodiscard]] virtual std::chrono::milliseconds RequestTimeout(std::uint8_t opRaw) const noexcept = 0;
+
     /// Largest request this surface will buffer.
     ///
     /// Per-responder rather than one constant, and the spread is the point: a
@@ -269,7 +297,7 @@ class IFrameResponder
 class FrameServer
 {
   public:
-    /// How long one request may take to arrive before its socket is abandoned.
+    /// How long a peer may take to NAME a verb before its socket is abandoned.
     ///
     /// This used to be `SO_RCVTIMEO`, applied to every accepted socket by
     /// `BlockingListener::SetTimeouts`. A reactor socket has no such option -- its
@@ -278,11 +306,20 @@ class FrameServer
     /// until the process dies. A slow-loris on the node's cache port, free.
     ///
     /// Armed once per REQUEST rather than once per connection, so a conversation is
-    /// not swept mid-flight. One window covers a request from its first byte to its
-    /// answer, and the idle gap before it -- so an attached peer that stops talking is
-    /// still swept, which is what keeps the slow-loris property once a connection is
-    /// long-lived.
-    static constexpr std::chrono::milliseconds RequestTimeout { 5'000 };
+    /// not swept mid-flight. This window covers the idle gap before a request and its
+    /// header -- so an attached peer that stops talking is still swept, which is what
+    /// keeps the slow-loris property once a connection is long-lived.
+    ///
+    /// **It stops there, and it used to not.** It was `RequestTimeout` and it covered
+    /// the answer as well, which is a five-second ceiling on how long a responder may
+    /// take -- correct for a cache round trip and fatal for a compile, which runs for
+    /// minutes. `IFrameResponder::RequestTimeout` is what covers the answer now, and
+    /// the split is deliberate rather than cosmetic: everything decided BEFORE a verb
+    /// is named is decided about a peer that has told this surface nothing, so it must
+    /// stay short whatever the surface goes on to serve. Renamed rather than
+    /// redocumented, because a name that has quietly stopped describing its own fact is
+    /// how #365 happened.
+    static constexpr std::chrono::milliseconds HeaderTimeout { 5'000 };
 
     /// How often the sweeper looks for connections past their deadline.
     ///
@@ -291,11 +328,11 @@ class FrameServer
     /// `IReactor::Schedule` cannot be cancelled, so a per-connection timer would
     /// stay on the wheel for the full interval after its connection had already
     /// finished -- the leak `Async/DeadlineTimer` documents at length.
-    static constexpr std::chrono::milliseconds SweepInterval { RequestTimeout / 4 };
+    static constexpr std::chrono::milliseconds SweepInterval { HeaderTimeout / 4 };
 
     /// How long a REFUSED connection is given to read its refusal and hang up.
     ///
-    /// Shorter than `RequestTimeout` because there is less to wait for: the peer has
+    /// Shorter than `HeaderTimeout` because there is less to wait for: the peer has
     /// its answer already and has only to close, which is a round trip rather than a
     /// request. A refusal takes no connection slot, so nothing counts one -- and a
     /// surface that is refusing is one already at capacity, which is exactly when a

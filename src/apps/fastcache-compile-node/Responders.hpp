@@ -107,6 +107,16 @@ class SchedulerResponder final: public IFrameResponder
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
 
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// A round trip. `SchedulerProtocol::Answer` never suspends -- it answers from its
+    /// own tables -- so what this covers is a peer sending a payload it already has in
+    /// hand, and the endpoint's own header window is the right size for that.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return FrameServer::HeaderTimeout;
+    }
+
     /// Kilobytes, not megabytes.
     ///
     /// Membership is checked *inside* the service — after the frame is read — so an
@@ -180,7 +190,9 @@ class SchedulerResponder final: public IFrameResponder
 /// which is what a cache tier is. Those were one list answering two questions, and
 /// the second answer was wrong: a peer could `FETCH` every object this machine had
 /// ever compiled. The compile surface still asks membership, because "may you run a
-/// job here" is the question membership is actually about.
+/// job here" is the question membership is actually about -- and since #290's second
+/// half it asks it on this same listener, which is precisely why the two answers have
+/// to follow the verb rather than the port.
 ///
 /// Deliberately *stricter* than `fastcached`'s own cache, which serves non-members on
 /// purpose. That one is shared infrastructure somebody operates; this is a
@@ -292,6 +304,18 @@ class CacheResponder final: public IFrameResponder
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
 
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// A round trip, and it is one even though answering may dial an upstream: that
+    /// dial has a ceiling of its own well inside this, and a cache exchange that has
+    /// not finished in five seconds has already lost to compiling locally -- which is
+    /// what the launcher does the moment this surface stops being worth a second
+    /// command.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return FrameServer::HeaderTimeout;
+    }
+
     /// Megabytes, because a STORE carries a whole object file.
     ///
     /// Matches the daemon's own default value ceiling: a node that refused what the
@@ -355,8 +379,8 @@ class CacheResponder final: public IFrameResponder
 ///
 /// ## A family with no component
 ///
-/// Legitimate and common: a node with no cache tier still serves the scheduler, and a
-/// worker that neither caches nor schedules serves neither. Those verbs are refused
+/// Legitimate and common: a node with no cache tier still serves the scheduler and its
+/// own compiles. Those verbs are refused
 /// `UnimplementedVerb`, which is the honest code -- this endpoint really does not
 /// implement them -- and it is the one refusal `Cc::CacheProtocol` steps over rather
 /// than treating as fatal.
@@ -371,11 +395,13 @@ class MergedResponder final: public IFrameResponder
   public:
     /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
     /// @param scheduler Answers the scheduler verbs, or nullptr when this node does
-    ///        not schedule. Also owns the credential, so `AUTH` goes here. Both must
-    ///        outlive this.
-    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler) noexcept:
+    ///        not schedule. Also owns the credential, so `AUTH` goes here.
+    /// @param compile Answers the compile verbs, or nullptr when this node runs no
+    ///        worker. All three must outlive this.
+    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
         _cache { cache },
-        _scheduler { scheduler }
+        _scheduler { scheduler },
+        _compile { compile }
     {
     }
 
@@ -385,11 +411,13 @@ class MergedResponder final: public IFrameResponder
     /// cache requires none, so an `AUTH` routed to it would be answered "no policy" and
     /// a peer holding the scheduler's secret could never present it.
     ///
-    /// `Compile` is deliberately absent rather than forgotten -- it is served by
-    /// `WorkerServer`, on its own accept loop, because a compile blocks for seconds and
-    /// must be handed to an executor rather than run on this reactor (#213). Folding it
-    /// in is the second half of #290 and is a change to how compiles RUN, not to how
-    /// frames are routed.
+    /// `Compile` is a row here like any other, and that was the second half of #290 --
+    /// but the routing was never the work. It is served by `CompileResponder`, which
+    /// hops onto an executor before it compiles and back onto the reactor before it
+    /// answers: a compile blocks for seconds, and neither running it on this reactor
+    /// (#213) nor returning its reply off that reactor is visible at any call site.
+    /// `WorkerServer` still serves its own dedicated port; this is an additional door
+    /// onto the same worker, the same policy and the same slot accounting.
     ///
     /// @param opRaw The third header byte, as received.
     /// @return The owner, or nullptr.
@@ -403,6 +431,7 @@ class MergedResponder final: public IFrameResponder
             case CompileCacheWire::VerbFamily::Scheduler:
                 return _scheduler;
             case CompileCacheWire::VerbFamily::Compile:
+                return _compile;
             case CompileCacheWire::VerbFamily::Unset:
                 return nullptr;
         }
@@ -481,6 +510,24 @@ class MergedResponder final: public IFrameResponder
         return owner->RefusalReply(decision, opRaw);
     }
 
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// **Routed to the owner, and deliberately NOT the largest.** The three ceilings
+    /// below fold with `Largest` because #284 made the payload cap a property of the
+    /// verb, so a generous session cap cannot make a scheduler verb generous. There is
+    /// no such column for time: a surface-wide maximum would hand every cache and
+    /// scheduler verb the compile window, which is the slow-loris property given away
+    /// to buy nothing.
+    ///
+    /// A verb nobody owns takes the endpoint's own header window. It is unreachable --
+    /// `RefusePeer` has already refused it -- and the short answer is the safe one for
+    /// a question asked about a peer this surface will not serve.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner == nullptr ? FrameServer::HeaderTimeout : owner->RequestTimeout(opRaw);
+    }
+
     /// @copydoc IFrameResponder::MaxRequestBytes
     ///
     /// The largest of the owners', which is safe only because #284 made the ceiling a
@@ -536,7 +583,7 @@ class MergedResponder final: public IFrameResponder
     [[nodiscard]] std::size_t Largest(std::size_t (IFrameResponder::*ceiling)() const noexcept) const noexcept
     {
         std::size_t out = 0;
-        for (auto const* const owner: { _cache, _scheduler })
+        for (auto const* const owner: { _cache, _scheduler, _compile })
             if (owner != nullptr)
                 out = std::max(out, (owner->*ceiling)());
         return out;
@@ -544,6 +591,7 @@ class MergedResponder final: public IFrameResponder
 
     IFrameResponder* _cache;
     IFrameResponder* _scheduler;
+    IFrameResponder* _compile;
 };
 
 } // namespace FastCache::Node

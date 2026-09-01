@@ -57,6 +57,7 @@ add_executable(fastcache-compile-node
     NodeIoLoop.cpp
     WorkerLease.cpp
     CompileCapacity.cpp
+    CompileResponder.cpp
     WorkerServer.cpp
     ${_fc_node_shared}
 )
@@ -119,6 +120,8 @@ if(FASTCACHED_BUILD_TESTS)
         FrameEndpoint_test.cpp
         WorkerLease.cpp
         CompileCapacity.cpp
+        CompileResponder.cpp
+        CompileResponder_test.cpp
         WorkerServer.cpp
         WorkerServer_test.cpp
         ${_fc_node_shared}

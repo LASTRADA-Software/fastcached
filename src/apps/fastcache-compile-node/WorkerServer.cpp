@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -46,36 +48,6 @@ namespace
     /// not see it (#241).
     constexpr std::size_t MaxInFlightBytes = MaxRequestBytes;
 
-    /// What this surface refuses with, each pairing the wire code with its counter.
-    ///
-    /// The same `Cc::SurfaceRefusal` the compile protocol uses, and shared rather than
-    /// declared again: these are two surfaces of one worker, an operator reads their
-    /// counters side by side, and a second notion of "what a refusal is" is how the
-    /// two would come to disagree.
-    ///
-    /// `PayloadTooLarge` had no counter at all until #326, and it is the one that
-    /// most needed one: the frame-level check needs only a header, where the envelope
-    /// refusals need a whole frame to have been sent and read. So an operator
-    /// alerting on the envelope series watched a client hammer this port with
-    /// oversized declarations, saw every one refused correctly, and read a flat graph
-    /// as "nobody is talking to us".
-    constexpr Cc::SurfaceRefusal NotAMember {
-        .code = Wire::ErrorCode::NotAMember,
-        .counter = IMetricsSink::Counter::WorkerJobsRefusedNotAMember,
-    };
-    constexpr Cc::SurfaceRefusal NoCapacity {
-        .code = Wire::ErrorCode::NoCapacity,
-        .counter = IMetricsSink::Counter::WorkerJobsRefusedNoSlot,
-    };
-    constexpr Cc::SurfaceRefusal EndpointBusy {
-        .code = Wire::ErrorCode::EndpointBusy,
-        .counter = IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy,
-    };
-    constexpr Cc::SurfaceRefusal PayloadTooLarge {
-        .code = Wire::ErrorCode::PayloadTooLarge,
-        .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
-    };
-
     /// Write every byte, or report failure.
     [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
     {
@@ -106,9 +78,19 @@ WorkerServer::WorkerServer(IListener& listener,
 
 WorkerServer::~WorkerServer()
 {
+    // Normally a second call that finds nothing to do: `WorkerBody` stops and drains
+    // explicitly, while the reactor a merged-surface compile has to hop home onto is
+    // still turning. See `StopAndWait`. This is what covers every other way out.
+    StopAndWait();
+}
+
+void WorkerServer::StopAndWait()
+{
     // Close the door before counting who is still inside. Draining without this
     // races the accept loop: it can admit one more job just as the count reaches
-    // zero, and the wait then returns while that job is starting.
+    // zero, and the wait then returns while that job is starting. `BeginShutdown`
+    // closes the OTHER door in the same call -- `CompileResponder` asks it -- which
+    // is what makes one drain cover both.
     Shutdown();
 
     // Every job holds a slot until it ends, so zero means nothing is still running
@@ -125,6 +107,21 @@ DrainAction NextDrainAction(std::size_t outstanding,
     if (timeout == std::chrono::seconds::zero())
         return DrainAction::Report;
     return waited >= timeout ? DrainAction::Abandon : DrainAction::Report;
+}
+
+std::optional<std::vector<std::byte>> RefuseUnlessMember(Distributed::IMembershipOracle const& membership,
+                                                         IMetricsSink& metrics,
+                                                         std::string_view peer)
+{
+    if (membership.Classify(peer) == Distributed::Membership::Member)
+        return std::nullopt;
+
+    // This machine and this cluster's members. Everyone else is refused as a *reply*
+    // rather than by closing, so a misconfigured peer learns which of the two it is
+    // instead of seeing a connection it cannot tell from a dead host. Without this the
+    // port accepted anybody who could route to it and ran their compiler for them:
+    // `--bind` defaults to 0.0.0.0, so that was the network.
+    return Cc::Refuse(metrics, CompileRefusal::NotAMember, "this worker compiles for its own machine and its cluster");
 }
 
 void WorkerServer::Shutdown() noexcept
@@ -178,10 +175,13 @@ Task<void> WorkerServer::Run()
         // host. Without this the port accepted anybody who could route to it and ran
         // their compiler for them: `--bind` defaults to 0.0.0.0, so that was the
         // network.
-        if (_membership.Classify(socket->PeerAddress()) != Distributed::Membership::Member)
+        //
+        // The predicate itself is `RefuseUnlessMember`, shared with the responder that
+        // admits compiles on the merged `0xFC` listener: one worker, two doors, and a
+        // rule written twice is two policies that agree today.
+        if (auto refusal = RefuseUnlessMember(_membership, _metrics, socket->PeerAddress()); refusal.has_value())
         {
-            (void) co_await WriteAll(
-                socket.get(), Cc::Refuse(_metrics, NotAMember, "this worker compiles for its own machine and its cluster"));
+            (void) co_await WriteAll(socket.get(), *refusal);
             socket->Close();
             continue;
         }
@@ -193,7 +193,7 @@ Task<void> WorkerServer::Run()
         // compile waiting either way.
         if (!_capacity.TryTakeSlot())
         {
-            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, NoCapacity));
+            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, CompileRefusal::NoCapacity));
             socket->Close();
             continue;
         }
@@ -288,7 +288,7 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // NoCapacity says "the fleet is full". An operator sent to buy
                 // machines over a transient byte budget is being sent to fix
                 // something that was never wrong.
-                (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, EndpointBusy));
+                (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, CompileRefusal::EndpointBusy));
                 socket->Close();
                 co_return;
             }
@@ -332,14 +332,14 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // ceiling would accept, and allocate, precisely the frames skipped
                 // here -- unbudgeted, which is this whole defect again. One number,
                 // one place, and the skip below stays sound.
-                if (footprint <= _capacity.ByteBudget() && !reserved->TryRaiseTo(footprint))
+                if (_capacity.IsChargeable(footprint) && !reserved->TryRaiseTo(footprint))
                 {
                     // A REPLY, not a close, and the same code the frame-length
                     // refusal uses: the frame declared its own length and has been
                     // read in full, so the link is synchronised and the peer learns
                     // that memory -- not the fleet, and not a slot -- is what it has
                     // to wait for.
-                    (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, EndpointBusy));
+                    (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, CompileRefusal::EndpointBusy));
                     socket->Close();
                     co_return;
                 }
@@ -358,7 +358,7 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
         else if (decoded.has_value())
             // Counted since #326. The refusal was always right on the wire; what was
             // missing is the only thing an operator can see.
-            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, PayloadTooLarge));
+            (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, CompileRefusal::PayloadTooLarge));
     }
     socket->Close();
     co_return;
