@@ -168,12 +168,6 @@ LeaseValidator UncheckedLeaseValidator()
     };
 }
 
-std::vector<std::byte> Refuse(IMetricsSink& metrics, SurfaceRefusal const& refusal, std::string_view detail)
-{
-    metrics.Increment(refusal.counter);
-    return Wire::EncodeErrorReply(refusal.code, detail);
-}
-
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,
                                LeaseValidator validator,
                                Wire::CodecList acceptedCodecs,
