@@ -76,6 +76,55 @@ class KqueueListener final: public IListener
                                                               IAddressResolver& resolver = DefaultAddressResolver(),
                                                               ReusePort reusePort = ReusePort::No);
 
+    /// Take ownership of a descriptor that is already bound and listening, and
+    /// drive its accepts from `reactor`.
+    ///
+    /// For socket activation, where a supervisor bound the port before this
+    /// process existed. It performs no bind, no listen and no `SO_REUSEADDR`:
+    /// the supervisor did all three, and repeating any of them on an
+    /// already-listening socket fails. It also asks the socket nothing about
+    /// what it *is* -- whether the descriptor really is a listener is decided by
+    /// `ParseSocketActivation`'s `LISTEN_PID` check, which is the only thing that
+    /// can answer it.
+    ///
+    /// The reactor-driven counterpart to `BlockingListener::Adopt`, and the
+    /// reason both have to exist: a blocking listener handed to a reactor
+    /// endpoint parks the reactor thread inside `::accept()`, and that thread
+    /// carries every other connection this process is serving.
+    ///
+    /// **Ownership transfers.** The returned listener closes the descriptor in
+    /// its destructor, exactly as a `Bind`-ed one closes the descriptor it
+    /// created -- including on the failure paths below, so a refusal is not a
+    /// descriptor leak in the caller.
+    ///
+    /// The descriptor is switched to non-blocking and marked close-on-exec here,
+    /// which is exactly what `Bind` does to its own listening socket via
+    /// `PrepareOwnedFd` -- macOS has no `SOCK_NONBLOCK` socket-type flag, so the
+    /// bound path applies both after the fact too. The difference is that a
+    /// failure to switch is **fatal** here rather than ignored: every accept path
+    /// is written around `EAGAIN`, and on a blocking descriptor the first
+    /// `::accept` parks the reactor thread instead, which is the one outcome this
+    /// factory exists to avoid.
+    ///
+    /// `Detail::ApplyHotSocketOptions` is deliberately NOT applied to the
+    /// listening descriptor, because `Bind` does not apply it to its own either:
+    /// it tunes a *connected* socket, and sockets accepted from this listener go
+    /// through the same two accept paths a bound one's do, so they end up tuned
+    /// identically.
+    ///
+    /// macOS is not in fact reachable from `AdoptInheritedListeners` today --
+    /// only systemd's protocol is implemented, and launchd's
+    /// `launch_activate_socket` is not -- so this exists as the platform twin of
+    /// the epoll factory rather than as a live path.
+    ///
+    /// @param reactor The reactor that will drive this listener's accepts.
+    /// @param fd An already-bound, already-listening descriptor. Ownership
+    ///        transfers to the returned listener.
+    /// @return A listener over that descriptor; on failure one with
+    ///         `IsBound() == false` and `BindError()` saying what failed, which
+    ///         is the convention `Bind` uses rather than throwing.
+    [[nodiscard]] static std::unique_ptr<KqueueListener> Adopt(KqueueReactor& reactor, int fd);
+
     ~KqueueListener() override;
 
     KqueueListener(KqueueListener const&) = delete;

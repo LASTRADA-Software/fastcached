@@ -646,7 +646,17 @@ void EpollListener::Impl::OnReadable(EpollFdHandler* base)
 }
 
 EpollListener::EpollListener() noexcept = default;
-EpollListener::~EpollListener() = default;
+
+EpollListener::~EpollListener()
+{
+    // The listener owns its descriptor and, while attached, is the `data.ptr`
+    // the kernel hands back for it. Leaving both to a `= default` destructor
+    // leaked the fd AND left the epoll set pointing at freed memory, so a
+    // connection arriving after the listener went away resumed through a
+    // dangling handler. `Close()` is idempotent, so an explicit close first --
+    // which is what every current owner does -- costs nothing here.
+    EpollListener::Close();
+}
 
 std::unique_ptr<EpollListener> EpollListener::Bind(EpollReactor& reactor,
                                                    std::string_view bindAddress,
@@ -672,6 +682,48 @@ std::unique_ptr<EpollListener> EpollListener::Bind(EpollReactor& reactor,
     if (!reactor.Attach(&listener->_impl->handler))
     {
         listener->_impl->bindError = "epoll_ctl ADD failed";
+        ::close(fd);
+        listener->_impl->handler.fd = -1;
+        return listener;
+    }
+
+    return listener;
+}
+
+std::unique_ptr<EpollListener> EpollListener::Adopt(EpollReactor& reactor, int fd)
+{
+    std::unique_ptr<EpollListener> listener { new EpollListener {} };
+    listener->_impl = std::make_unique<Impl>(reactor);
+
+    if (fd < 0)
+    {
+        listener->_impl->bindError = "adopt: not a descriptor";
+        return listener;
+    }
+
+    // No bind, no listen, no SO_REUSEADDR -- the supervisor did all three, and
+    // repeating any of them on an already-listening socket fails. What is left
+    // is the pair of descriptor properties `Bind` gets from
+    // SOCK_NONBLOCK | SOCK_CLOEXEC and a handed-over descriptor arrives without.
+    //
+    // `PrepareOwnedFd` would be the obvious call here and is deliberately not
+    // used: it ignores the non-blocking result, and on a listening descriptor
+    // that is the failure this whole factory exists to prevent -- a blocking
+    // accept parks the reactor thread that carries every other connection. Fatal
+    // rather than best-effort, so the descriptor is closed and the listener says
+    // why instead of coming up as a latent stall.
+    if (!Detail::SetNonBlocking(static_cast<Detail::NativeSocket>(fd)))
+    {
+        listener->_impl->bindError = "adopt: cannot switch the inherited descriptor to non-blocking";
+        ::close(fd);
+        return listener;
+    }
+    Detail::ArmCloseOnExec(static_cast<Detail::NativeSocket>(fd));
+
+    listener->_impl->handler.fd = fd;
+    if (!reactor.Attach(&listener->_impl->handler))
+    {
+        listener->_impl->bindError = "adopt: epoll_ctl ADD failed";
         ::close(fd);
         listener->_impl->handler.fd = -1;
         return listener;
