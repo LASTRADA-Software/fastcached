@@ -11,53 +11,29 @@ namespace FastCache::Cc
 
 /// Deciding whether two object files are the same compile, when the bytes differ.
 ///
-/// **Why this exists.** `FASTCACHE_VERIFY` compared object files with a `memcmp`,
-/// which is exactly right on ELF and can never succeed on Windows: every
-/// MSVC-family driver stamps the wall clock into the COFF header, and a cached
-/// object was produced earlier than the fresh compile it is checked against **by
-/// construction**. So the one instrument that turns a wrong object from invisible
-/// into loud reported a wrong object on every hit, on the platform where the defect
-/// it exists to detect was observed
+/// `FASTCACHE_VERIFY` compared object files with a `memcmp`, which is exactly right
+/// on ELF and can never succeed on Windows: every MSVC-family driver stamps the wall
+/// clock into the COFF header, and a cached object was produced earlier than the
+/// fresh compile it is checked against **by construction**. So the one instrument
+/// that turns a wrong object from invisible into loud reported a wrong object on
+/// every hit, on the platform where the defect it exists to detect was observed
 /// ([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)).
 ///
-/// Measured on this tree -- MSVC 14.51 and the VS-shipped clang-cl, clang 20.1.2
-/// and GCC 14.2 -- and the numbers decide the design rather than illustrate it.
-/// Two compiles of one translation unit, differing in:
+/// **The measurements this is built on, the reasoning, and the two conclusions that
+/// are easiest to get backwards live in ONE place**:
+/// `.agent/rules/compile-cache.md`, "An object file is not a byte string". They are
+/// not restated here -- a figure others refer to belongs where they point at it,
+/// never copied. The two worth knowing before reading this file:
 ///
-/// - **nothing** (one object path, two seconds AND five minutes apart): `cl` and
-///   `clang-cl` differ in the 4-byte `TimeDateStamp` and in nothing else, with
-///   `/Z7` and without, `/bigobj` included. clang and GCC are byte-identical, with
-///   `-g` and without.
-/// - **the object's directory**: `cl` additionally differs in `.debug$S` and
-///   `.chks64`. `clang-cl`, clang and GCC differ in nothing more.
-/// - **the source's directory**: the same again -- `cl` alone, in the same two
-///   sections.
+/// - ELF keeps the byte comparison. This is a platform gap, not a total failure.
+/// - `.debug$S` and `.chks64` are volatile in the PATH, not in time, and the
+///   verifier holds the path fixed -- so they are **not** excused, or a hit served
+///   from another checkout goes unreported.
 ///
-/// Two conclusions, and the second is the whole shape of this file:
-///
-/// **On ELF the byte comparison is correct and is kept.** This is a platform gap,
-/// not a total failure, and a correct answer must not be replaced by a parser.
-///
-/// **`.debug$S` and `.chks64` are volatile with respect to the PATH, not to time,**
-/// and the verifier holds the path fixed -- it copies the served object aside and
-/// compiles to the *same* output path. So a hit produced by this machine in this
-/// checkout differs in the clock **alone**, and excusing those two sections would
-/// buy nothing while blinding the verifier to
-/// [#489](https://github.com/LASTRADA-Software/fastcached/issues/489): a hit served
-/// from another checkout's object, whose entire difference lives in `.debug$S`.
-/// That is the case an operator runs this to catch, so it is reported, and the
-/// message says which of the two it is rather than leaving "wrong object" to mean
-/// either.
-///
-/// **`/Brepro` is not the fix**, for the reason `scripts/dist-compile-e2e.ps1`
-/// already gives about itself: it would make the comparison true about a command
-/// line no build uses. What is compared here is what real builds produce.
-///
-/// The one normalised region is therefore a single header field, whose offset is
-/// the only thing the format table below is consulted for. **Parsing never grants
-/// an excuse beyond it** -- the section walk exists solely to say where a
-/// difference was, so a parser defect can make a message vague and cannot make a
-/// wrong object pass.
+/// The one normalised region is therefore a single header field, whose offset is the
+/// only thing the layout table is consulted for. **Parsing never grants an excuse
+/// beyond it** -- the section walk exists solely to say where a difference was, so a
+/// parser defect can make a message vague and cannot make a wrong object pass.
 
 /// What comparing two object images found.
 ///

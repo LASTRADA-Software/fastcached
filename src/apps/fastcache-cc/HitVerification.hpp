@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ObjectEquivalence.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -93,6 +96,16 @@ inline constexpr unsigned VerificationOff = 0;
 struct HitComparison
 {
     HitVerdict verdict { HitVerdict::Inconclusive };
+    /// What the image comparison found, or nothing when no images were compared --
+    /// the hit was not sampled, or one of the two files could not be read.
+    ///
+    /// A disengaged optional rather than an extra enumerator, because "there was no
+    /// comparison" is not a comparison outcome. Carried at all because `verdict`
+    /// deliberately folds `Identical` and `EquivalentApartFromVolatile` into
+    /// `Matched`, and one caller needs them apart again: recovering that from
+    /// `detail` being non-empty would rebuild a state from prose, which is the exact
+    /// collapse `HitVerdict` refuses two enumerators above.
+    std::optional<ObjectComparison> comparison;
     /// Where the difference was, what was overlooked, or which format could not be
     /// read. Empty when there is nothing to add. Owned rather than viewed: the two
     /// images it describes are read into buffers this call drops on the way out.
@@ -114,8 +127,10 @@ struct HitComparison
 /// (measured, with and without `-g`), nothing is normalised and this stays the byte
 /// comparison it was.
 ///
-/// The files are compared in chunks first and only read whole when they DIFFER, so
-/// the answer every hit should get still costs no allocation.
+/// Both files are read whole. A streaming pass that answered "identical" without
+/// allocating was tried and removed: on every MSVC driver the clock guarantees a
+/// difference, so it fell through to reading both files anyway on the one platform
+/// this exists for, while claiming in a comment to have saved the read.
 ///
 /// @param served What the cache put on disk.
 /// @param fresh What the compiler just produced, at the same path the served object
@@ -129,13 +144,15 @@ struct HitComparison
 /// One spelling, because the message is the entire product of this feature: a
 /// mismatch that is counted and not described is a number somebody has to come back
 /// and ask about.
-/// @param verdict What the comparison found.
+/// Takes the whole `HitComparison` rather than a verdict and an optional detail:
+/// the two always travel together, a defaulted detail existed only so tests could
+/// omit it, and the pairing is load-bearing prose -- a mismatch naming `.text$mn`
+/// and one naming `.debug$S` are a stale object and a foreign build path, acted on
+/// differently. Passing them separately made a mismatched pairing spellable.
+///
+/// @param comparison What the comparison found, and what it turned on.
 /// @param key The object key, so the entry can be looked at rather than only counted.
-/// @param detail `HitComparison::detail` -- appended where it says something the
-///        sentence cannot. A mismatch that names `.text$mn` and one that names
-///        `.debug$S` are a stale object and a foreign build path respectively, and
-///        an operator acts on them differently.
 /// @return The line, or empty for `NotChecked` and `Matched`.
-[[nodiscard]] std::string DescribeVerdict(HitVerdict verdict, std::string_view key, std::string_view detail = {});
+[[nodiscard]] std::string DescribeVerdict(HitComparison const& comparison, std::string_view key);
 
 } // namespace FastCache::Cc

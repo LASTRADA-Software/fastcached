@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "FileBytes.hpp"
 #include "HitVerification.hpp"
 #include "ObjectEquivalence.hpp"
 
-#include <array>
-#include <cstring>
 #include <format>
-#include <fstream>
-#include <iterator>
 #include <limits>
-#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace FastCache::Cc
 {
@@ -45,34 +41,6 @@ namespace
             hash *= Prime;
         }
         return hash;
-    }
-
-    /// How many bytes to compare at a time.
-    ///
-    /// An object file is kilobytes to a few megabytes, so this is about not holding
-    /// two whole files in memory rather than about throughput.
-    constexpr std::size_t CompareChunk = 64U * 1024U;
-
-    /// Read a whole file.
-    ///
-    /// Reached only once the chunked pass has found a difference, so the "do not
-    /// hold two object files in memory" property above still holds for every hit
-    /// that verifies clean -- which is all of them, when the cache is right.
-    /// @param path What to read.
-    /// @return Its bytes, or nothing when it could not be read.
-    [[nodiscard]] std::optional<std::vector<std::byte>> ReadWholeFile(std::filesystem::path const& path)
-    {
-        std::ifstream in { path, std::ios::binary };
-        if (!in)
-            return std::nullopt;
-        std::vector<char> raw { std::istreambuf_iterator<char> { in }, std::istreambuf_iterator<char> {} };
-        if (in.bad())
-            return std::nullopt;
-        std::vector<std::byte> bytes;
-        bytes.reserve(raw.size());
-        for (auto const c: raw)
-            bytes.push_back(static_cast<std::byte>(c));
-        return bytes;
     }
 
     /// What an image comparison means for a hit.
@@ -140,69 +108,29 @@ unsigned ParseVerificationRate(std::string_view text) noexcept
 
 HitComparison CompareObjectFiles(std::filesystem::path const& served, std::filesystem::path const& fresh)
 {
-    std::ifstream a { served, std::ios::binary };
-    std::ifstream b { fresh, std::ios::binary };
-    // Inconclusive rather than Mismatched. A file that cannot be opened says nothing
+    auto const servedBytes = ReadFileBytes(served);
+    auto const freshBytes = ReadFileBytes(fresh);
+    // Inconclusive rather than Mismatched. A file that cannot be read says nothing
     // about whether the cache is right, and failing a build over a full disk would
     // make this feature the thing operators turn off.
-    if (!a || !b)
-        return { .verdict = HitVerdict::Inconclusive, .detail = {} };
-
-    // The chunked pass answers the question every hit should get -- identical -- and
-    // answers it without holding either file in memory. Only a DIFFERENCE is worth
-    // the two buffers, and on ELF a difference is already the whole answer.
-    auto differs = false;
-    {
-        std::array<char, CompareChunk> left {};
-        std::array<char, CompareChunk> right {};
-        for (;;)
-        {
-            a.read(left.data(), static_cast<std::streamsize>(left.size()));
-            b.read(right.data(), static_cast<std::streamsize>(right.size()));
-
-            auto const readLeft = a.gcount();
-            if (readLeft != b.gcount())
-            {
-                differs = true;
-                break;
-            }
-            if (readLeft == 0)
-                break;
-            if (std::memcmp(left.data(), right.data(), static_cast<std::size_t>(readLeft)) != 0)
-            {
-                differs = true;
-                break;
-            }
-        }
-    }
-
-    // `bad()` and not `fail()`: a stream that hit end-of-file sets `failbit` on the
-    // last short read, which is the ordinary way this loop ends. Only `badbit` says
-    // the read itself went wrong, which is the one condition that makes the
-    // comparison unanswerable rather than complete.
-    if (a.bad() || b.bad())
-        return { .verdict = HitVerdict::Inconclusive, .detail = {} };
-    if (!differs)
-        return { .verdict = HitVerdict::Matched, .detail = {} };
-
-    auto const servedBytes = ReadWholeFile(served);
-    auto const freshBytes = ReadWholeFile(fresh);
     if (!servedBytes.has_value() || !freshBytes.has_value())
-        return { .verdict = HitVerdict::Inconclusive, .detail = {} };
+        return { .verdict = HitVerdict::Inconclusive };
 
     auto comparison = CompareObjectImages(*servedBytes, *freshBytes);
-    return { .verdict = VerdictOf(comparison.outcome), .detail = std::move(comparison.detail) };
+    return { .verdict = VerdictOf(comparison.outcome),
+             .comparison = comparison.outcome,
+             .detail = std::move(comparison.detail) };
 }
 
-std::string DescribeVerdict(HitVerdict verdict, std::string_view key, std::string_view detail)
+std::string DescribeVerdict(HitComparison const& comparison, std::string_view key)
 {
     // One place decides whether a detail is appended, so a new verdict cannot ship a
     // sentence that trails a bare full stop or swallows what the comparison found.
-    auto const withDetail = [detail](std::string sentence) {
-        return detail.empty() ? sentence : std::format("{} -- {}", sentence, detail);
+    auto const withDetail = [&comparison](std::string sentence) {
+        return comparison.detail.empty() ? std::move(sentence) : std::format("{} -- {}", sentence, comparison.detail);
     };
 
-    switch (verdict)
+    switch (comparison.verdict)
     {
         case HitVerdict::NotChecked:
         case HitVerdict::Matched:

@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "HitVerification.hpp"
+#include "StubCoffTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cc;
+using namespace FastCache::Cc::Test;
 
 namespace
 {
@@ -47,51 +52,35 @@ namespace
     return sampled;
 }
 
-/// A minimal structurally valid COFF object with one section of code.
+/// The sections the file-layer cases use: one, carrying data.
 ///
-/// The full builder lives in `ObjectEquivalence_test.cpp`, which is where the format
-/// itself is asserted. This is the smallest thing that reaches the object comparison
-/// through the FILE layer, which is what the cases here are about.
+/// The builder itself is `StubCoffTestSupport.hpp` -- shared with
+/// `ObjectEquivalence_test.cpp`, where the format is asserted. These cases are about
+/// reaching the object comparison through the FILE layer, not about COFF.
+/// @return One section of data.
+[[nodiscard]] std::vector<StubSection> OneCodeSection()
+{
+    return { { .name = ".text$mn", .data = "CODE-AND-DATA" } };
+}
+
+/// A stub object as a byte string, for `WriteFile`.
 /// @param timestamp What to put in `TimeDateStamp`.
-/// @return The image, as bytes.
+/// @return The image.
 [[nodiscard]] std::string StubCoff(std::uint32_t timestamp)
 {
-    constexpr std::size_t Header = 20;
-    constexpr std::size_t SectionHeader = 40;
-    std::string const code = "CODE-AND-DATA";
-    auto const dataAt = Header + SectionHeader;
-    auto const stringsAt = dataAt + code.size();
-
-    std::string image(stringsAt + 4, '\0');
-    auto put = [&image](std::size_t at, std::size_t width, std::uint64_t value) {
-        for (std::size_t index = 0; index < width; ++index)
-            image[at + index] = static_cast<char>((value >> (8U * index)) & 0xFFU);
-    };
-    put(0, 2, 0x8664); // Machine
-    put(2, 2, 1);      // NumberOfSections
-    put(4, 4, timestamp);
-    put(8, 4, 0);  // PointerToSymbolTable -- none, which is legal
-    put(12, 4, 0); // NumberOfSymbols
-    put(16, 2, 0); // SizeOfOptionalHeader
-    put(18, 2, 0); // Characteristics
-
-    std::string const name = ".text$mn";
-    for (std::size_t index = 0; index < name.size(); ++index)
-        image[Header + index] = name[index];
-    put(Header + 16, 4, code.size());
-    put(Header + 20, 4, dataAt);
-    for (std::size_t index = 0; index < code.size(); ++index)
-        image[dataAt + index] = code[index];
-    put(stringsAt, 4, 4);
-    return image;
+    auto const image = BuildCoff(OneCodeSection(), timestamp);
+    std::string bytes;
+    std::ranges::transform(image, std::back_inserter(bytes), [](std::byte byte) { return static_cast<char>(byte); });
+    return bytes;
 }
 
 /// Where `StubCoff` puts a byte that is section DATA.
 ///
-/// Named rather than spelled at the call site, so a corruption case cannot quietly
-/// start flipping a byte in the header -- part of which the comparison is allowed to
-/// overlook, which would make the case pass for the wrong reason.
-constexpr std::size_t CodeByteOffset = 20 + 40 + 2;
+/// Derived from the builder's own constants rather than spelled out, so a corruption
+/// case cannot quietly start flipping a byte in the header -- part of which the
+/// comparison is allowed to overlook, which would make the case pass for the
+/// opposite of its stated reason.
+constexpr std::size_t CodeByteOffset = StubFirstSectionDataAt(1) + 2;
 
 } // namespace
 
@@ -180,10 +169,9 @@ TEST_CASE("Identical objects match and differing ones do not", "[launcher][verif
     auto const same = WriteFile(dir, "same.o", std::string(4096, '\x7f'));
     CHECK(CompareObjectFiles(served, same).verdict == HitVerdict::Matched);
 
-    // A single byte, deep inside, and past the first comparison chunk: a comparison
-    // that only checked a prefix, or a length, would pass this and is exactly what a
-    // wrong object looks like -- an object file that differs in one instruction still
-    // links.
+    // A single byte, deep inside: a comparison that only checked a prefix, or a
+    // length, would pass this and is exactly what a wrong object looks like -- an
+    // object file that differs in one instruction still links.
     auto differing = std::string(4096, '\x7f');
     differing[3000] = '\x00';
     CHECK(CompareObjectFiles(served, WriteFile(dir, "differs.o", differing)).verdict == HitVerdict::Mismatched);
@@ -240,7 +228,7 @@ TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verif
     // described is a number somebody has to come back and ask about -- and the second
     // half, that the fresh object was used, is what tells a reader whether the build
     // they are holding is trustworthy.
-    auto const line = DescribeVerdict(HitVerdict::Mismatched, "objkey-v3:abcdef");
+    auto const line = DescribeVerdict({ .verdict = HitVerdict::Mismatched }, "objkey-v3:abcdef");
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("WRONG OBJECT"));
     CHECK(line.contains("freshly compiled"));
@@ -248,12 +236,12 @@ TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verif
     // Nothing to say about the two ordinary outcomes -- a line per hit would make the
     // one that matters unreadable. Including when the comparison overlooked a clock,
     // which on Windows is EVERY hit.
-    CHECK(DescribeVerdict(HitVerdict::NotChecked, "k").empty());
-    CHECK(DescribeVerdict(HitVerdict::Matched, "k").empty());
-    CHECK(DescribeVerdict(HitVerdict::Matched, "k", "the compiler's timestamp").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::NotChecked }, "k").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched }, "k").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched, .detail = "the compiler's timestamp" }, "k").empty());
 
     // And the inconclusive one is described too, because it is not a pass.
-    CHECK_FALSE(DescribeVerdict(HitVerdict::Inconclusive, "objkey-v3:abcdef").empty());
+    CHECK_FALSE(DescribeVerdict({ .verdict = HitVerdict::Inconclusive }, "objkey-v3:abcdef").empty());
 }
 
 TEST_CASE("What differed is carried into the line, not left to be asked about", "[launcher][verify]")
@@ -261,7 +249,8 @@ TEST_CASE("What differed is carried into the line, not left to be asked about", 
     // `.debug$S` and `.text$mn` mean a foreign build path and stale code, and those
     // are acted on differently -- so a mismatch naming neither makes an operator come
     // back and ask a question the comparison had already answered.
-    auto const line = DescribeVerdict(HitVerdict::Mismatched, "k", "3 differing byte(s), in .text$mn");
+    auto const line =
+        DescribeVerdict({ .verdict = HitVerdict::Mismatched, .detail = "3 differing byte(s), in .text$mn" }, "k");
     CHECK(line.contains(".text$mn"));
     CHECK(line.contains("WRONG OBJECT"));
 }
@@ -271,7 +260,7 @@ TEST_CASE("A toolchain that cannot be compared is not reported as a wrong object
     // The state that must never read as a finding. An operator who takes "cannot
     // verify" for "your cache is broken" switches verification off, and the class it
     // guards goes invisible again -- which is #493 restated one level up.
-    auto const line = DescribeVerdict(HitVerdict::Unsupported, "objkey-v3:abcdef", "some format");
+    auto const line = DescribeVerdict({ .verdict = HitVerdict::Unsupported, .detail = "some format" }, "objkey-v3:abcdef");
     CHECK_FALSE(line.empty());
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("cannot verify"));

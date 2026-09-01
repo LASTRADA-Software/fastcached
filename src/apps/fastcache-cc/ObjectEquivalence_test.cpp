@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "FileBytes.hpp"
 #include "IProcessRunner.hpp"
 #include "ObjectEquivalence.hpp"
+#include "StubCoffTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,126 +25,10 @@
 
 using namespace FastCache;
 using namespace FastCache::Cc;
+using namespace FastCache::Cc::Test;
 
 namespace
 {
-
-/// One section of a stub object.
-struct StubSection
-{
-    std::string name;
-    std::string data;
-};
-
-/// Write @p value into @p bytes at @p at, little-endian, over @p width bytes.
-/// @param bytes The image being built.
-/// @param at Where the field starts.
-/// @param width How wide it is.
-/// @param value What to store.
-void PutLe(std::vector<std::byte>& bytes, std::size_t at, std::size_t width, std::uint64_t value)
-{
-    for (std::size_t index = 0; index < width; ++index)
-        bytes[at + index] = static_cast<std::byte>((value >> (8U * index)) & 0xFFU);
-}
-
-/// Which of the two COFF header layouts a stub is built to.
-enum class StubLayout : std::uint8_t
-{
-    Standard,
-    BigObj,
-};
-
-/// Build a structurally valid COFF object.
-///
-/// Synthetic rather than compiled, because most of what has to be asserted here
-/// cannot be produced on demand by a compiler: an object whose `.text$mn` differs
-/// while everything else matches is what a WRONG object looks like, and no
-/// arrangement of flags makes `cl` emit one. The real-compiler cases below cover the
-/// other half -- that the shape assumed here is the shape a compiler actually emits.
-///
-/// @param sections The sections, in file order.
-/// @param timestamp What to put in `TimeDateStamp`.
-/// @param layout Which header layout to write.
-/// @param version The `/bigobj` version field; ignored for the standard layout.
-/// @return The image.
-[[nodiscard]] std::vector<std::byte> BuildCoff(std::vector<StubSection> const& sections,
-                                               std::uint32_t timestamp,
-                                               StubLayout layout = StubLayout::Standard,
-                                               std::uint16_t version = 2)
-{
-    constexpr std::size_t SectionHeader = 40;
-    constexpr std::size_t Symbols = 2;
-    auto const big = layout == StubLayout::BigObj;
-    auto const headerSize = big ? std::size_t { 56 } : std::size_t { 20 };
-    auto const symbolRecord = big ? std::size_t { 20 } : std::size_t { 18 };
-
-    auto const tableAt = headerSize;
-    auto const dataAt = tableAt + (SectionHeader * sections.size());
-
-    std::size_t payload = 0;
-    for (auto const& section: sections)
-        payload += section.data.size();
-
-    auto const symbolsAt = dataAt + payload;
-    auto const stringsAt = symbolsAt + (symbolRecord * Symbols);
-    // The string table opens with its own size, INCLUDING those four bytes, and is
-    // the last thing in the file -- which is what makes a truncated object detectable.
-    std::vector<std::byte> image(stringsAt + 4, std::byte { 0 });
-
-    if (big)
-    {
-        PutLe(image, 0, 2, 0);
-        PutLe(image, 2, 2, 0xFFFF);
-        PutLe(image, 4, 2, version);
-        PutLe(image, 6, 2, 0x8664);
-        PutLe(image, 8, 4, timestamp);
-        PutLe(image, 44, 4, sections.size());
-        PutLe(image, 48, 4, symbolsAt);
-        PutLe(image, 52, 4, Symbols);
-    }
-    else
-    {
-        PutLe(image, 0, 2, 0x8664);
-        PutLe(image, 2, 2, sections.size());
-        PutLe(image, 4, 4, timestamp);
-        PutLe(image, 8, 4, symbolsAt);
-        PutLe(image, 12, 4, Symbols);
-        PutLe(image, 16, 2, 0);
-        PutLe(image, 18, 2, 0);
-    }
-
-    auto cursor = dataAt;
-    for (std::size_t index = 0; index < sections.size(); ++index)
-    {
-        auto const at = tableAt + (SectionHeader * index);
-        auto const& section = sections[index];
-        for (std::size_t byte = 0; byte < 8 && byte < section.name.size(); ++byte)
-            image[at + byte] = static_cast<std::byte>(section.name[byte]);
-        PutLe(image, at + 16, 4, section.data.size());
-        PutLe(image, at + 20, 4, section.data.empty() ? 0 : cursor);
-        for (std::size_t byte = 0; byte < section.data.size(); ++byte)
-            image[cursor + byte] = static_cast<std::byte>(section.data[byte]);
-        cursor += section.data.size();
-    }
-
-    PutLe(image, stringsAt, 4, 4);
-    return image;
-}
-
-/// The sections a `cl` object carries, near enough for these cases.
-/// @param code What `.text$mn` holds.
-/// @param objectPath What the driver's path record holds.
-/// @param sourceHash What the source checksum record holds.
-/// @return The sections, in the order `cl` emits them.
-[[nodiscard]] std::vector<StubSection> ClSections(std::string code,
-                                                  std::string objectPath = "C:\\build\\tu.obj",
-                                                  std::string sourceHash = "01234567")
-{
-    return { { .name = ".drectve", .data = "-defaultlib:libcpmt" },
-             { .name = ".debug$S", .data = std::move(objectPath) },
-             { .name = ".text$mn", .data = std::move(code) },
-             { .name = ".chks64", .data = std::move(sourceHash) } };
-}
 
 /// Locate an MSVC-family driver, if this host has one on PATH.
 ///
@@ -164,20 +50,6 @@ enum class StubLayout : std::uint8_t
             return std::string { driver };
     }
     return std::nullopt;
-}
-
-/// Read a whole file.
-/// @param path What to read.
-/// @return Its bytes; empty when it could not be read.
-[[nodiscard]] std::vector<std::byte> ReadAll(std::filesystem::path const& path)
-{
-    std::ifstream in { path, std::ios::binary };
-    std::vector<char> raw { std::istreambuf_iterator<char> { in }, std::istreambuf_iterator<char> {} };
-    std::vector<std::byte> bytes;
-    bytes.reserve(raw.size());
-    for (auto const c: raw)
-        bytes.push_back(static_cast<std::byte>(c));
-    return bytes;
 }
 
 } // namespace
@@ -407,7 +279,7 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     std::vector<std::string> const argv { *driver, "/nologo", "/c", "/Fo" + object.string(), source.string() };
 
     REQUIRE(runner->RunCaptureCombined(argv).exitCode == 0);
-    auto const first = ReadAll(object);
+    auto const first = ReadFileBytes(object).value_or(std::vector<std::byte> {});
     REQUIRE_FALSE(first.empty());
 
     // Over a second, so the two objects carry DIFFERENT clocks. Without the wait both
@@ -420,7 +292,7 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     // The same command line again, to the same path -- which is exactly what the
     // verifier does, and why the driver's path records cannot differ.
     REQUIRE(runner->RunCaptureCombined(argv).exitCode == 0);
-    auto const second = ReadAll(object);
+    auto const second = ReadFileBytes(object).value_or(std::vector<std::byte> {});
     REQUIRE_FALSE(second.empty());
 
     // Asserted rather than assumed, and separately, because it is the premise of
@@ -456,7 +328,7 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     std::filesystem::create_directories(elsewhere.parent_path());
     std::vector<std::string> const argvElsewhere { *driver, "/nologo", "/c", "/Fo" + elsewhere.string(), source.string() };
     REQUIRE(runner->RunCaptureCombined(argvElsewhere).exitCode == 0);
-    auto const foreign = ReadAll(elsewhere);
+    auto const foreign = ReadFileBytes(elsewhere).value_or(std::vector<std::byte> {});
     REQUIRE_FALSE(foreign.empty());
 
     auto const crossPath = CompareObjectImages(foreign, second);
