@@ -634,7 +634,10 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // rather than a platform branch — and `effective.daemon` rather than "am I on
     // Windows", so a foreground run keeps its terminal output on a machine that has
     // one (#179).
-    FastCache::ConsoleLogger consoleLogger { std::cerr, effective.logLevel, effective.logTimestamps };
+    FastCache::ConsoleLogger consoleLogger { std::cerr,
+                                             effective.logLevel,
+                                             effective.logTimestamps ? FastCache::LogTimestamps::Yes
+                                                                     : FastCache::LogTimestamps::No };
     auto const eventLogger =
         effective.daemon ? FastCache::MakeWindowsEventLogger(effective.serviceName, effective.logLevel) : nullptr;
     FastCache::ILogger& logger =

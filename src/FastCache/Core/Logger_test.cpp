@@ -10,7 +10,7 @@
 TEST_CASE("ConsoleLogger writes formatted lines to its sink", "[logger]")
 {
     std::ostringstream sink;
-    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Trace };
+    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Trace, FastCache::LogTimestamps::No };
 
     logger.Log(FastCache::LogLevel::Info, "hello");
     logger.Log(FastCache::LogLevel::Warn, "watch out");
@@ -22,7 +22,7 @@ TEST_CASE("ConsoleLogger writes formatted lines to its sink", "[logger]")
 TEST_CASE("ConsoleLogger respects MinLevel and SetMinLevel", "[logger]")
 {
     std::ostringstream sink;
-    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Warn };
+    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Warn, FastCache::LogTimestamps::No };
 
     logger.Log(FastCache::LogLevel::Debug, "dropped");
     logger.Log(FastCache::LogLevel::Info, "also dropped");
@@ -70,7 +70,7 @@ TEST_CASE("CapturingLogger Clear removes all records", "[logger]")
 TEST_CASE("ConsoleLogger prefixes lines with ISO 8601 UTC timestamp when enabled", "[logger]")
 {
     std::ostringstream sink;
-    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Trace, /*timestamps=*/true };
+    FastCache::ConsoleLogger logger { sink, FastCache::LogLevel::Trace, FastCache::LogTimestamps::Yes };
 
     logger.Log(FastCache::LogLevel::Info, "hello");
 

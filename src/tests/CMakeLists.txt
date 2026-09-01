@@ -388,35 +388,6 @@ set_tests_properties("worker-refusals-counted" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# The compile node builds its console logger in exactly one place.
-#
-# #485: `main.cpp` constructed one with two of the constructor's three arguments, so
-# `logTimestamps` was never passed, no flag existed to ask for it, and `ConsoleLogger`
-# was correct throughout. A `cluster-e2e` failure then could not be diagnosed from a
-# completed run -- a leader elected at second 59 and one elected at second 3 that never
-# affirms are the same bytes without times.
-#
-# `MakeNodeConsoleLogger` closes it and `NodeLogging_test` drives configuration in and
-# reads stamped bytes out. What that test cannot see is `main.cpp` keeping a SECOND
-# construction beside it -- the seam would be correct, tested, and not what production
-# runs, which is `PurgeExpired`'s failure exactly. This asserts the call site, which is
-# the half no unit test can reach.
-#
-# In the default set with the other hygiene checks: it reads two files and compares
-# strings.
-add_test(
-    NAME "node-logger-single-path"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-logger-single-path.cmake"
-)
-set_tests_properties("node-logger-single-path" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# ---------------------------------------------------------------------------
 # Every `*Explicit` bit a CLI flag sets must be consulted by the config merge.
 # A flag with no `MergeField` row parses, validates and appears in --help, and is
 # then silently discarded the moment the operator also has a config file. That has

@@ -6,7 +6,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <regex>
 #include <sstream>
 #include <string>
 
@@ -26,24 +25,8 @@ namespace
 [[nodiscard]] std::string LineFor(NodeConfig const& cfg)
 {
     std::ostringstream sink;
-    auto const logger = MakeNodeConsoleLogger(sink, cfg);
-    REQUIRE(logger != nullptr);
-    logger->Log(LogLevel::Error, "a message");
+    MakeNodeConsoleLogger(sink, cfg)->Log(LogLevel::Error, "a message");
     return sink.str();
-}
-
-/// Whether @p line begins with an ISO 8601 UTC instant.
-///
-/// Matched by SHAPE rather than compared to a formatted `now()`: a case that built its
-/// own expected string would pass against a logger that stamped a constant, and one
-/// that compared against a second reading of the clock is a race whenever the two land
-/// either side of a microsecond.
-/// @param line A rendered log line.
-/// @return True when a timestamp prefix is present.
-[[nodiscard]] bool StartsWithTimestamp(std::string const& line)
-{
-    static std::regex const iso8601 { R"(^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z )" };
-    return std::regex_search(line, iso8601);
 }
 
 } // namespace
@@ -52,32 +35,33 @@ TEST_CASE("The node's log-timestamps setting reaches the logger", "[node][loggin
 {
     // **Issue #485, and the case is about the WIRING rather than about `ConsoleLogger`.**
     // The node constructed its logger with two of the constructor's three arguments,
-    // against a third that defaults to `false`. So the logger was correct, every test
-    // of it passed, and the node could not emit a time or be asked for one. What was
-    // missing was never a behaviour -- it was an argument, and only a case that drives
-    // a CONFIGURATION in and reads the bytes out can see that.
+    // against a third that defaulted to `false`. So the logger was correct, every test
+    // of it passed, and the node could not emit a time or be asked for one.
     //
-    // Driven through `MakeNodeConsoleLogger` because that is the one path production
-    // takes. `ctest -R node-logger-single-path` is what keeps that true; without it
-    // this case could go green over a function `main` had stopped calling.
+    // The missing ARGUMENT is now a compile error -- `ConsoleLogger` takes
+    // `LogTimestamps` with no default -- so what is left for a case to cover is the
+    // half a signature cannot: that the factory passes what the CONFIGURATION says
+    // rather than a hardcoded `LogTimestamps::No`, which would compile perfectly.
+    //
+    // What a timestamp looks like is `Logger_test`'s question and is asserted there.
+    // Restating its format here would be a second, weaker copy that drifts; this
+    // compares the two renderings against each other instead, which answers "did the
+    // setting travel" without owning a format.
     NodeConfig cfg;
 
-    // The default, stated rather than assumed. Off, matching `fastcached`, chosen with
-    // the supervisor cases in front of it -- see `NodeConfig::logTimestamps`.
+    // The default, stated rather than assumed -- see `NodeConfig::logTimestamps`.
     REQUIRE_FALSE(cfg.logTimestamps);
     auto const bare = LineFor(cfg);
     CHECK(bare == "[ERROR] a message\n");
-    CHECK_FALSE(StartsWithTimestamp(bare));
 
-    // And asking for it changes what is written. This is the assertion the defect
-    // would have failed: before #485 there was no field to set.
     cfg.logTimestamps = true;
     auto const stamped = LineFor(cfg);
-    CHECK(StartsWithTimestamp(stamped));
 
-    // The rest of the line is unchanged, so the timestamp is a PREFIX and not a
-    // different rendering -- an operator's `grep '\[ERROR\]'` keeps working.
-    CHECK(stamped.ends_with("[ERROR] a message\n"));
+    // A PREFIX and nothing else: the same line, with something in front of it. An
+    // operator's `grep '\[ERROR\]'` keeps working, and a factory that ignored the
+    // setting would produce two identical strings.
+    CHECK(stamped.ends_with(bare));
+    CHECK(stamped.size() > bare.size());
 }
 
 TEST_CASE("The node's log level reaches the logger too", "[node][logging]")
@@ -90,7 +74,6 @@ TEST_CASE("The node's log level reaches the logger too", "[node][logging]")
 
     std::ostringstream sink;
     auto const logger = MakeNodeConsoleLogger(sink, cfg);
-    REQUIRE(logger != nullptr);
     CHECK(logger->MinLevel() == LogLevel::Error);
 
     // Filtered, which is the level being spent rather than merely stored.

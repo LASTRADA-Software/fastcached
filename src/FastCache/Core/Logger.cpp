@@ -11,7 +11,7 @@ namespace FastCache
 
 // -- ConsoleLogger ---------------------------------------------------------
 
-ConsoleLogger::ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel, bool timestamps) noexcept:
+ConsoleLogger::ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel, LogTimestamps timestamps) noexcept:
     _sink { sink },
     _minLevel { initialMinLevel },
     _timestamps { timestamps }
@@ -24,7 +24,7 @@ void ConsoleLogger::Log(LogLevel level, std::string_view message)
         return;
 
     std::string line;
-    if (_timestamps)
+    if (_timestamps == LogTimestamps::Yes)
     {
         auto const now = std::chrono::floor<std::chrono::microseconds>(std::chrono::system_clock::now());
         line = std::format("{:%FT%T}Z [{}] {}\n", now, ToStringView(level), message);

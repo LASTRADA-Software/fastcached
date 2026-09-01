@@ -477,27 +477,19 @@ struct NodeConfig
 
     /// Whether every console line carries an ISO 8601 UTC time.
     ///
-    /// **Off by default, and that is a decision with the supervisor cases in front of
-    /// it rather than the daemon's default copied across** (#485). This node's console
-    /// logger is the sink in three deployments and only one of them stamps:
+    /// **Off, matching `fastcached`** -- chosen rather than inherited (#485). The
+    /// short of it: of the three deployments whose sink is this logger, only systemd
+    /// stamps for you, and the one that stamps nothing is a plain file written by the
+    /// launchd plist that `fastcached` shares byte for byte (#496). Two binaries
+    /// defaulting oppositely would paper over that in whichever one noticed.
     ///
-    /// - **systemd** runs the unit `Type=simple` with no `--daemon`, so stderr is
-    ///   journald's and journald stamps every entry. On by default would put a second
-    ///   time inside the message.
-    /// - **launchd** points `StandardErrorPath` at a plain file
-    ///   (`ServiceControl.cpp`), so nothing stamps it at all.
-    /// - **The Windows SCM** path never reaches this logger: `--daemon` selects
-    ///   `MakeWindowsEventLogger`, and an event record carries its own time.
+    /// The full four-row table -- which supervisor stamps, which does not, and which
+    /// never reaches this logger at all -- is in
+    /// `.agent/rules/platform-service-and-config.md`, and is deliberately not repeated
+    /// here: a fact restated in three places loses a condition in two of them.
     ///
-    /// So the honest reading is that one sink stamps and two do not, which argues for
-    /// ON. It is OFF anyway, for a reason outside this flag: the unstamped file is
-    /// `ServiceControl`'s plist, which `fastcached` shares byte for byte, so the two
-    /// binaries defaulting oppositely would paper over one packaging defect in the one
-    /// binary that noticed it and leave the other writing timeless files forever. One
-    /// spelling, one default, and the plist is its own ticket.
-    ///
-    /// A foreground run is the case this exists for -- fleet bring-up and a CI
-    /// artefact, where nothing else knows the time and a completed run cannot be asked
+    /// Turn it on for a foreground run, a redirected file, or a CI artefact -- the
+    /// cases where nothing else knows the time and a completed run cannot be asked
     /// afterwards (#457).
     bool logTimestamps { false };
 

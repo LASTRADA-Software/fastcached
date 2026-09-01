@@ -1506,28 +1506,19 @@ The timestamp is a *prefix*, so anything already grepping for `[ERROR]` keeps
 working.
 
 **Turn it on whenever this node's log is going somewhere that does not stamp it
-for you** — which is most places, and the reason the default is worth
-understanding rather than accepting. The node's console logger is the sink in
-three deployments and exactly one of them adds a time:
+for you.** Of the three deployments whose lines come from this logger, only
+systemd adds a time — its journal stamps every entry, which is why the default is
+off. macOS's launchd sends them to a plain file that nothing stamps, and the
+Windows service does not use this logger at all. So turn it on for a foreground
+run during fleet bring-up, for anything you redirect to a file, for CI artefacts,
+and on a launchd-installed node until
+[#496](https://github.com/LASTRADA-Software/fastcached/issues/496) closes.
 
-| where it runs | where the lines go | who stamps them |
-|---|---|---|
-| systemd | stderr → journald (`Type=simple`, no `--daemon`) | **journald** — `--log-timestamps` would write a second time inside the message |
-| launchd (macOS) | stderr → a plain file, `StandardErrorPath` | **nobody** |
-| Windows SCM (`--daemon`) | the Windows event log — this logger is not used at all | the event record |
-| foreground, or stderr redirected | your terminal, or a file | **nobody** |
-
-So it is off because the deployment the packaging documents most, systemd, already
-stamps — and on is right for the two that do not. Turn it on for a foreground run
-during fleet bring-up, for anything whose output you redirect to a file, and for CI
-artefacts. A completed run cannot be asked afterwards what time anything happened:
-a leader elected at second 59 and one elected at second 3 that never affirms are
-the same bytes without times, which is
+A completed run cannot be asked afterwards what time anything happened: a leader
+elected at second 59 and one elected at second 3 that never affirms are the same
+bytes without times, which is
 [#485](https://github.com/LASTRADA-Software/fastcached/issues/485) and cost a real
-diagnosis. That the macOS service writes to an unstamped file is a packaging gap
-shared with `fastcached` and tracked separately
-([#496](https://github.com/LASTRADA-Software/fastcached/issues/496)); until it
-closes, a launchd-installed node wants this flag on.
+diagnosis.
 
 `--install-service` carries the setting into the registration, so a node installed
 with timestamps on comes back with them on — they are most wanted exactly when

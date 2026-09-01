@@ -906,6 +906,18 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             // Spelled exactly as `fastcached`'s. An operator who learned it there
             // must not find the worker wanting a different word for the same thing --
             // the rule `--service-scope` already follows here.
+            //
+            // **No `explicitBit`, and that is the node's shape rather than an
+            // omission.** The daemon carries `logTimestampsExplicit` because its
+            // merge is `MergeField` copying field by field, so a file value and a
+            // typed value are told apart per field or the command line stops winning.
+            // This table applies a FILE and then argv through the same appliers, in
+            // that order, so "the command line wins" is which loop runs second. The
+            // node has no explicit-bit layer for booleans at all -- `--daemon`,
+            // `--dashboard` and `--no-toolchain-discovery` have none either -- and a
+            // default of false that only ever sets true has nothing to arrive at
+            // without being asked for, which is the whole question a provenance bit
+            // answers.
             .primary = "--log-timestamps",
             .arity = Arity::None,
             .apply = SetTrue<&NodeConfig::logTimestamps>(),
