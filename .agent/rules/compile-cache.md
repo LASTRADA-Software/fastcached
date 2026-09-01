@@ -1147,3 +1147,22 @@ which conditions?" gets asked.
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
   arguments even though their dependency sets now agree.
+
+- **[#368](https://github.com/LASTRADA-Software/fastcached/issues/368)** — two
+  installed launcher/daemon pairs serve objects that do not match the tree, and
+  **no change to master repairs an existing install.** That last part is the one
+  that gets lost: "the cache serves wrong objects" reads like something a fix on
+  master covers, and it does not. Both ends of an install agree on `objkey-v5`, so
+  they address the namespace the poisoned values live in, and the `v5` → `v6`
+  retirement protects a NEW build from old bytes rather than an old build from its
+  own — which cannot know the new tag. Reinstalling is the only remedy, and both
+  installs need naming: the Windows launcher/node pair is 304 commits behind, the
+  Linux launcher 396. Both predate the node-side `CanonicalizeStoredRegions` and
+  the launcher-side `NoProjectDeps` guard, so a value stored through a node keeps
+  the producing checkout's paths, every one of those paths classifies as a
+  toolchain header, and the manifest that survives names the translation unit and
+  no header — which then revalidates forever. The Linux launcher carries one
+  exposure more: it predates `CacheCompilerId`, so its key is the driver banner
+  alone and is blind to the target the compiler generates for, which is
+  [#188](https://github.com/LASTRADA-Software/fastcached/issues/188) reached from
+  the other side.

@@ -1304,3 +1304,19 @@ the live one are in the script header.
   `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
   project's Catch2 (3.6) predates `ADD_TAGS_AS_LABELS` and so exports no tag to
   CTest. When Catch2 moves, both collapse into a label filter.
+
+- **[#471](https://github.com/LASTRADA-Software/fastcached/issues/471)** —
+  `scripts/local-gate.sh` pins `clang-format` and `clang-tidy` to the version CI
+  uses, and then hands its OBJECT FILES to whatever launcher happens to be on
+  `PATH`. It calls `cmake --preset` without overriding `USE_COMPILER_CACHE`, whose
+  default is `ON`, so `clang-debug` and `gcc-release` are both launcher-fronted —
+  measured, 148 `LAUNCHER =` lines in the first and present in the second. This is
+  the rule above about naming a tool version **everywhere the version matters**,
+  carried one call short for the third time in the same script: a stale launcher
+  reports clean in exactly the way a stale analyser does. It survives
+  [#368](https://github.com/LASTRADA-Software/fastcached/issues/368) being closed,
+  because reinstalling today's two stale installs leaves the gate with no opinion
+  about the next drift. The choice is a real one — `-DUSE_COMPILER_CACHE=OFF` is
+  total and slow, while asserting that the launcher matches the tree keeps the gate
+  fast and is the same shape as the clang-tidy refusal the script already carries.
+  Either way it has to SAY which it did.

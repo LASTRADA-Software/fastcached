@@ -767,3 +767,19 @@ Four things about the shape, and the last two are the ones that generalise.
   toolchain(s) registered` wait — **moves into** `lib/e2e-common.sh` rather than
   being written an eighth time, and that file's `http_get` takes the shared one's
   final-chunk fix rather than keeping its own version of the bug.
+
+- **[#457](https://github.com/LASTRADA-Software/fastcached/issues/457)** —
+  `cluster-e2e.sh`'s `wait_for_formation` asks whether the cluster has formed by
+  SPAWNING the node binary: three nodes × 150 passes is 450 process spawns,
+  interleaved with the sleeps. Two defects, and the second is the one that costs
+  sessions. The bound counts iterations rather than time, so `150 × 0.2` reads as
+  30 s while a failing run measured 52.04 s — the same shape as
+  [#452](https://github.com/LASTRADA-Software/fastcached/issues/452) from the other
+  end, a number in the source that is not the quantity being enforced. And under
+  `clang-asan-ubsan` that poller is 450 sanitizer-instrumented startups competing
+  for the cores of the three sanitizer-instrumented nodes it is waiting on, so the
+  instrument loads the system it measures, hardest exactly when the runner is
+  already busy. The fixture therefore cannot separate "the cluster did not form"
+  from "the runner was busy", which is the distinction this file already requires a
+  wait to report. Bound on a clock, poll without a spawn, and say what the poll
+  itself cost.
