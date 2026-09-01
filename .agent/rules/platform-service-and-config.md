@@ -644,6 +644,34 @@ readable and silently ignored. Every rule below has already been one of them.
   `space.free`: the difference is the root-reserved portion, which an unprivileged
   worker cannot write and must not offer to a scheduler as room it has.
 
+## Which supervisor stamps a log line, and which does not
+
+Measured while closing #485, and expensive to rediscover — the ticket that raised it
+guessed, and guessed wrong in both directions. **A binary's console logger is not the
+sink in every deployment, and the supervisors do not agree about times.** For
+`fastcache-compile-node`, which is the shape both binaries have:
+
+| deployment | the sink | who stamps |
+|---|---|---|
+| systemd | `ConsoleLogger` → stderr → journald. The unit is `Type=simple` and deliberately passes **no** `--daemon` — a double-fork silences journald | **journald** |
+| launchd (macOS) | `ConsoleLogger` → stderr → **a plain file**: `BuildLaunchdPlist` writes `StandardOutPath`/`StandardErrorPath` at `<label>.{out,err}.log` | **nobody** |
+| Windows SCM | `--daemon` selects `MakeWindowsEventLogger`; the console logger is **never reached** | the event record |
+| foreground / redirected | `ConsoleLogger` → tty or file | **nobody** |
+
+Three consequences, and none is obvious from either end:
+
+- **A timestamp flag changes nothing on the Windows service.** It is the one
+  deployment where the console logger is not the sink, so a default reasoned from "a
+  supervisor stamps for us" is reasoning about a path the flag cannot reach.
+- **launchd stamps nothing**, and that plist is built by the shared
+  `ServiceControl.cpp` — so it is the same gap in `fastcached`. A per-binary default
+  chosen to work around it papers over one packaging defect in whichever binary
+  noticed and leaves the other writing timeless files
+  ([#496](https://github.com/LASTRADA-Software/fastcached/issues/496)).
+- **So a log default cannot be picked per binary.** Two binaries with the same flag
+  and opposite defaults is a vocabulary split over a bug that lives in neither of
+  them. One spelling, one default, and fix the plist where the plist is.
+
 ## Open work
 
 - **[#384](https://github.com/LASTRADA-Software/fastcached/issues/384)** — the
