@@ -566,7 +566,12 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     auto const toolchainHost = Cc::MakeToolchainHost();
     auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
 
-    auto const advertise = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
+    // The ONE derivation, shared with the startup refusal that judges it. This value
+    // goes to `MakeWorkerLeaseValidator` below and to the heartbeat's REGISTER, and a
+    // lease's MAC is taken over exactly this string -- so the endpoint the scheduler
+    // signs, the endpoint this worker verifies and the endpoint clients dial are one
+    // fact with one author. See `AdvertisedEndpoint`.
+    auto const advertise = Node::AdvertisedEndpoint(cfg);
 
     // `IsBound()`, not a null check: Bind() NEVER returns null -- it hands back a
     // listener carrying the diagnostic, for Accept() to surface later. Testing for

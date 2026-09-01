@@ -753,6 +753,28 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
     return cfg.serveScheduler ? SchedulingNodeListenDefaultHost : WorkerNodeListenDefaultHost;
 }
 
+/// The endpoint this node tells other machines to dial.
+///
+/// **One derivation, because three consumers must agree or the fleet breaks in a way
+/// none of them can see.** What a lease's MAC covers is this endpoint, so the property
+/// the compile surface's `AuthRequired == false` rests on is:
+///
+///   the endpoint the scheduler SIGNS == the endpoint the worker VERIFIES ==
+///   the endpoint clients actually REACH
+///
+/// `main` passes this value to `MakeWorkerLeaseValidator` and registers it with the
+/// scheduler, and `AdvertisesWildcard` refuses a configuration on it at startup. Those
+/// three read one fact, and it was written out by hand in two places -- so a startup
+/// refusal could already judge a different endpoint from the one signed into every
+/// lease, before any of them moved. Two authors of one endpoint is not a tidiness
+/// problem here; it is a credential whose subject two components disagree about.
+///
+/// Judged on the endpoint the node WOULD advertise rather than on whether the flag was
+/// typed, so an operator who spells the default out is answered identically.
+/// @param cfg What the operator asked for.
+/// @return The advertised `host:port`.
+[[nodiscard]] std::string AdvertisedEndpoint(NodeConfig const& cfg);
+
 /// What a bare `--admin-listen` binds.
 ///
 /// Loopback, and it is what the dashboard's credential rule turns on: reaching loopback

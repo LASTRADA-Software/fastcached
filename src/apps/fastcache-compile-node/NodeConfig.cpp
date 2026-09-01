@@ -1301,6 +1301,18 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
 }
 
+std::string AdvertisedEndpoint(NodeConfig const& cfg)
+{
+    // The flag wins whenever it was given; the fallback is the compile port's two
+    // halves. Written ONCE -- `main` hands the result to `MakeWorkerLeaseValidator`
+    // and to the heartbeat's REGISTER, and `AdvertisesWildcard` refuses on it, so the
+    // three consumers of this endpoint cannot disagree about what it is. They already
+    // could: this expression stood character-for-character in `main.cpp` as well.
+    if (!cfg.advertise.empty())
+        return cfg.advertise;
+    return std::format("{}:{}", cfg.bindAddress, cfg.port);
+}
+
 /// Whether the endpoint this node would advertise names no host a client can dial.
 ///
 /// `--advertise` falls back to `{--bind}:{--port}` and `--bind` defaults to the
@@ -1318,7 +1330,11 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 /// @return Whether remote clients would be told to dial a wildcard.
 [[nodiscard]] bool AdvertisesWildcard(NodeConfig const& cfg)
 {
-    auto const advertised = cfg.advertise.empty() ? std::format("{}:{}", cfg.bindAddress, cfg.port) : cfg.advertise;
+    // Through the one derivation, never spelled again here. This function is a startup
+    // REFUSAL, so a copy of the rule would let it pass a configuration whose advertised
+    // endpoint differs from the one it judged -- and that endpoint is what every lease's
+    // MAC is taken over. See `AdvertisedEndpoint`.
+    auto const advertised = AdvertisedEndpoint(cfg);
 
     // `HostOfEndpoint` rather than `SplitHostPort` plus a fallback: an endpoint that
     // will not split is a bare host rather than a parse failure, and that rule is
