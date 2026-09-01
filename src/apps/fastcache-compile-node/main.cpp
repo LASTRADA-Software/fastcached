@@ -114,27 +114,6 @@ constexpr int HeartbeatSlices = 20;
 /// a reinstalled compiler rejoins the fleet without anybody restarting a service.
 constexpr std::uint64_t SweepEveryBeats = 45;
 
-/// How often a parked `accept()` returns so the loop can observe a shutdown.
-///
-/// POSIX honours `SO_RCVTIMEO` for `accept()`, and it is the ONLY portable way to
-/// stop this loop: closing the listening socket does not unblock a parked accept
-/// on Linux. Short enough that a stop is prompt, long enough that an idle worker
-/// is not spinning.
-constexpr std::chrono::milliseconds AcceptPollInterval { 200 };
-
-/// How long a single request may take to arrive once accepted.
-///
-/// Generous, because a request carries a whole preprocessed translation unit and
-/// the client may be on the other side of a slow link -- but not unbounded, so one
-/// stalled client cannot hold a slot, and its share of the in-flight byte budget,
-/// for as long as it likes.
-///
-/// It used to justify itself by the worker serving its jobs *inline*, where a stall
-/// held up every other client. That stopped being true at 87211fe, and the bound
-/// matters more rather than less for it: the slot cap is reachable now, so a stalled
-/// client occupies one of a countable few rather than a queue nobody was in.
-constexpr std::chrono::milliseconds RequestIoTimeout { 120'000 };
-
 /// Per-call send/recv ceiling on the heartbeat's own connection to the scheduler.
 ///
 /// Was ten seconds passed as BOTH the dial bound and the I/O bound, which is the
