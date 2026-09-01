@@ -141,22 +141,28 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
     // bytes declaring a 256 MiB expansion would pass the endpoint's own frame-length
     // budget having reserved almost nothing (#241).
     //
-    // A price above the whole budget is deliberately NOT charged: it is the per-request
-    // ceiling, which the decoder answers by name and without allocating a byte, and
-    // charged here it would come back `EndpointBusy` on a completely idle worker and
-    // send the client off to retry a frame that can never fit. That hand-off is sound
-    // only while the decoder's ceiling is no larger than this budget, which is why
-    // `WorkerMaxRequestBytes` is one exported constant rather than a literal per side.
+    // A price above the whole budget is deliberately not charged AS A FOOTPRINT: it is
+    // the per-request ceiling, which the decoder answers by name and without allocating
+    // a byte, and charged here it would come back `EndpointBusy` on a completely idle
+    // worker and send the client off to retry a frame that can never fit. That hand-off
+    // is sound only while the decoder's ceiling is no larger than this budget, which is
+    // why `WorkerMaxRequestBytes` is one exported constant rather than a literal per
+    // side.
+    //
+    // It is not charged NOTHING either, which is the distinction `ChargeFor` carries:
+    // the frame has arrived and is held, so it costs its own length whatever the
+    // decoder is about to decide. Charging zero here while the accept loop kept the
+    // frame length it had already reserved made one worker account two ways depending
+    // on which door was used (#448).
     //
     // Initialized in ONE declaration rather than assigned into: a reservation is
     // move-constructible and deliberately not move-assignable, because a release is
     // owed exactly once and an assignment would be a second object's claim landing on
     // the first one's storage.
     auto const footprint = Cc::DeclaredRequestFootprint(frame);
-    auto const chargeable = _capacity.IsChargeable(footprint);
-    auto const reserved =
-        chargeable ? _capacity.TryTakeBytes(footprint) : std::optional<CompileCapacity::Bytes> { std::nullopt };
-    if (chargeable && !reserved.has_value())
+    auto const reserved = _capacity.TryTakeBytes(
+        _capacity.ChargeFor(footprint, header.has_value() ? std::size_t { header->payloadLength } : frame.size()));
+    if (!reserved.has_value())
         // Its own code, not `NoCapacity`: this says "come back shortly", while
         // `NoCapacity` says "the fleet is full". An operator sent to buy machines over
         // a transient byte budget is being sent to fix something that was never wrong.

@@ -243,7 +243,25 @@ namespace
 
         ~BudgetedBytes()
         {
+            Release();
+        }
+
+        /// Give the reservation back now, rather than at the end of the scope.
+        ///
+        /// For a verb whose owner accounts for the same bytes itself
+        /// (`IFrameResponder::HoldsOwnByteBudget`), holding this across `Answer`
+        /// counts one buffer in two pools for as long as the answer takes -- which
+        /// for a compile is the compile (#448).
+        ///
+        /// Idempotent, and it must be: the destructor still runs, and a release owed
+        /// once that ran twice would underflow the budget to near `SIZE_MAX` and
+        /// refuse the surface's every subsequent request with `EndpointBusy`.
+        void Release() noexcept
+        {
+            if (_bytes == 0)
+                return;
             _state->inFlightBytes.fetch_sub(_bytes, std::memory_order_acq_rel);
+            _bytes = 0;
         }
 
       private:
@@ -518,7 +536,7 @@ namespace
                 // SERVED, never by asking.
                 state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
 
-                BudgetedBytes const bytes { state, decoded->payloadLength };
+                BudgetedBytes bytes { state, decoded->payloadLength };
                 auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
                 if (!payload.has_value())
                     break;
@@ -539,6 +557,25 @@ namespace
 
                 std::vector<std::byte> frame { header->begin(), header->end() };
                 frame.insert(frame.end(), payload->begin(), payload->end());
+
+                // Handed over, for a verb whose owner charges these same bytes itself.
+                //
+                // The endpoint's budget covers the READ -- which nothing else can, the
+                // owner having no frame until this line -- and the owner's covers the
+                // answer. Held across `Answer` as well, one buffer sits in two pools
+                // for as long as the answer takes, and for a compile that is minutes;
+                // this pool is per LISTENER, so compiles filling it refuse the
+                // scheduler verbs sharing it (#448).
+                //
+                // Placed as the last statement before the await, and the gap is empty
+                // by construction rather than by timing: `Task` is lazy with symmetric
+                // transfer, so the body below runs on THIS thread without returning to
+                // the loop, and the node's framed surfaces share one reactor thread --
+                // so no suspension point and no other thread can observe the lowered
+                // figure. `IFrameResponder::HoldsOwnByteBudget` carries the reasoning
+                // and what a broken invariant would cost.
+                if (state->responder.HoldsOwnByteBudget(decoded->opRaw))
+                    bytes.Release();
 
                 // Awaited: answering may reach the network -- the cache surface
                 // consults an upstream -- and that suspends rather than blocking
@@ -777,6 +814,11 @@ FrameEndpoint::~FrameEndpoint()
     // is what lets the accept loop and its connection tasks reach their own ends.
     // The reactor thread itself is joined by `NodeIoLoop`, which outlives this.
     _server->Shutdown();
+}
+
+std::size_t FrameEndpoint::InFlightBytes() const noexcept
+{
+    return _server->InFlightBytes();
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(

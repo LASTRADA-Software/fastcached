@@ -592,6 +592,17 @@ class ShortWindowResponder final: public IFrameResponder
         return _inner.MaxInFlightBytes();
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// Forwarded, like every other question this decorator does not itself answer.
+    /// It overrides the WINDOW and nothing else, and a decorator that answered this
+    /// on its own behalf would detach the endpoint's accounting from the surface
+    /// actually doing the charging (#448).
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t opRaw) const noexcept override
+    {
+        return _inner.HoldsOwnByteBudget(opRaw);
+    }
+
   private:
     IFrameResponder& _inner;
     std::chrono::milliseconds _window;
@@ -1026,4 +1037,40 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     auto const reply = pending.get();
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
+}
+
+TEST_CASE("Both doors charge one number for a frame the budget cannot afford", "[node][compile]")
+{
+    // Issue #448, second half. The two doors into this worker reached the charge by
+    // different routes and disagreed about exactly one case: the accept loop reserves
+    // the frame length before reading and RAISES, so an unpayable footprint left it
+    // holding the frame length; `CompileResponder` takes its reservation in one go
+    // once it has the whole frame, so an unpayable footprint left it holding NOTHING.
+    //
+    // Both were defensible alone and the pair was not -- the whole thesis of one
+    // worker behind two doors is that the accounting does not depend on which door
+    // was used. `ChargeFor` is now the one number both reach, so this pins the rule
+    // rather than either call site.
+    NullLogger logger;
+    constexpr std::size_t Budget = 1024;
+    CompileCapacity capacity { /*slots*/ 4, Budget, std::chrono::seconds { 1 }, logger };
+
+    // An affordable footprint is charged as the footprint: the codec envelope's
+    // declared expansion is what the request costs, and it is the larger number.
+    CHECK(capacity.ChargeFor(/*footprint*/ 800, /*framed*/ 100) == 800);
+
+    // The boundary is inclusive on both sides, and both sides are pinned -- a guard
+    // checked on one side only fires when nothing is wrong.
+    CHECK(capacity.ChargeFor(Budget, /*framed*/ 100) == Budget);
+    CHECK(capacity.ChargeFor(Budget + 1, /*framed*/ 100) == 100);
+
+    // The case the doors disagreed about. Not the footprint, because `EndpointBusy`
+    // on an idle worker is a retry loop against a frame that can never fit; and not
+    // ZERO either, because the frame has arrived and is held.
+    CHECK(capacity.ChargeFor(/*footprint*/ 1'000'000, /*framed*/ 500) == 500);
+
+    // And it agrees with `IsChargeable`, which is what decides between them: two
+    // predicates over one budget that disagreed would be this defect again.
+    CHECK_FALSE(capacity.IsChargeable(Budget + 1));
+    CHECK(capacity.IsChargeable(Budget));
 }

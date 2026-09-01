@@ -164,16 +164,38 @@ class CompileCapacity
     ///
     /// Both doors into this worker ask it -- the accept loop and the merged surface's
     /// responder -- and that is the whole reason it is here rather than spelled at each.
-    /// What they do with the answer still differs, and legitimately: the accept loop
-    /// reserves the frame length first and RAISES to the footprint, because it has not
-    /// read the payload yet; the responder is handed a complete frame and charges once.
-    /// Those are different computations over one rule, so the rule moves and the
-    /// arithmetic does not.
+    /// They still REACH the charge differently, and legitimately: the accept loop
+    /// reserves the frame length first and raises, because it has not read the payload
+    /// yet; the responder is handed a complete frame and charges once. What they arrive
+    /// at is `ChargeFor` below, and it is the same number.
     /// @param footprint What the request declares it will cost.
     /// @return False when no state of this budget could ever afford it.
     [[nodiscard]] bool IsChargeable(std::size_t footprint) const noexcept
     {
         return footprint <= _byteBudget;
+    }
+
+    /// What a request declaring @p footprint over @p framed bytes is charged.
+    ///
+    /// One number, asked by both doors, and it exists because they disagreed about
+    /// exactly one case (#448). An unpayable footprint is not charged as a footprint
+    /// -- `IsChargeable` above says why -- but the frame has still arrived and is
+    /// still held, so the bytes are real and something must carry them. The accept
+    /// loop kept the frame length it had already reserved; the responder, which takes
+    /// its reservation in one go, charged nothing at all. Both were defensible alone
+    /// and the pair was not: the whole thesis of one worker behind two doors is that
+    /// the accounting does not depend on which door was used.
+    ///
+    /// `framed` is the floor rather than a second policy: `DeclaredRequestFootprint`
+    /// already returns exactly this for a frame it cannot look inside, so the
+    /// unpayable case is charged what an undecodable one is.
+    ///
+    /// @param footprint What the request declares it will cost.
+    /// @param framed The declared payload length of the frame that carried it.
+    /// @return The figure to reserve; never more than the budget could hold.
+    [[nodiscard]] std::size_t ChargeFor(std::size_t footprint, std::size_t framed) const noexcept
+    {
+        return IsChargeable(footprint) ? footprint : framed;
     }
 
     /// Wait for the running compiles to finish, reporting and then abandoning.

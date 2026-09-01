@@ -147,6 +147,16 @@ class SchedulerResponder final: public IFrameResponder
         return 256ULL * 64ULL * 1024ULL;
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// No: a scheduler verb is answered from memory in microseconds, so the
+    /// endpoint's reservation is released almost as soon as it is taken and there is
+    /// nothing a second accounting would add.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return false;
+    }
+
   private:
     /// Who is asking, as both the gate and the early refusal need it.
     ///
@@ -355,6 +365,17 @@ class CacheResponder final: public IFrameResponder
         return 256ULL * 1024ULL * 1024ULL;
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// No, and this is the surface the endpoint's budget was SIZED for: a cache
+    /// answer is a lookup, or at worst one upstream round trip with a multi-second
+    /// ceiling. It holds no accounting of its own, so releasing here would leave the
+    /// object file it is buffering counted by nothing at all.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return false;
+    }
+
   private:
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
@@ -558,6 +579,27 @@ class MergedResponder final: public IFrameResponder
     [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
     {
         return Largest(&IFrameResponder::MaxInFlightBytes);
+    }
+
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// **Routed to the owner, and emphatically NOT folded**, which is the same split
+    /// `RequestTimeout` makes: the three ceilings fold with `Largest` because they
+    /// are properties of the surface, and this is a property of the VERB. `Largest`
+    /// has no meaning here, and either fold would be a defect -- an `any_of` would
+    /// release the endpoint's reservation for cache and scheduler verbs the moment a
+    /// worker is configured, leaving their buffers counted by nothing; an `all_of`
+    /// would double-charge every compile the moment a cache tier is, which is #448
+    /// with an extra condition on it.
+    ///
+    /// A verb nobody owns answers `false` and keeps the endpoint's accounting. It is
+    /// unreachable -- `RefusePeer` has already refused it -- and `false` is the
+    /// answer that accounts for a buffer rather than the one that assumes somebody
+    /// else will.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner != nullptr && owner->HoldsOwnByteBudget(opRaw);
     }
 
   private:

@@ -322,8 +322,10 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // `Unenvelope` answers by name with `payload-too-large` and without
                 // allocating a byte; charged here it would come back `EndpointBusy` on
                 // a completely idle worker and send the client off to retry a frame
-                // that can never fit. So an unpayable price is not charged at all --
-                // it is left to the decoder, which refuses it before it is spent.
+                // that can never fit. So an unpayable price is not charged as a
+                // footprint -- it is left to the decoder, which refuses it before it
+                // is spent, and this reservation stays at the frame length it already
+                // holds.
                 //
                 // **That hand-off is only safe while the decoder's ceiling is no larger
                 // than this budget**, and it is exactly why `WorkerMaxRequestBytes` is
@@ -332,7 +334,12 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // ceiling would accept, and allocate, precisely the frames skipped
                 // here -- unbudgeted, which is this whole defect again. One number,
                 // one place, and the skip below stays sound.
-                if (_capacity.IsChargeable(footprint) && !reserved->TryRaiseTo(footprint))
+                //
+                // Expressed as a RAISE to `ChargeFor` rather than as a condition around
+                // the raise, so this door and `CompileResponder` reach one number by
+                // one route: `TryRaiseTo` is a no-op when the figure is not above what
+                // is held, which is exactly the unpayable case (#448).
+                if (!reserved->TryRaiseTo(_capacity.ChargeFor(footprint, decoded->payloadLength)))
                 {
                     // A REPLY, not a close, and the same code the frame-length
                     // refusal uses: the frame declared its own length and has been

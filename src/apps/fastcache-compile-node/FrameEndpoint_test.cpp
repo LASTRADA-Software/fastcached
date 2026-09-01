@@ -459,6 +459,14 @@ class HoldableResponder final: public IFrameResponder
   public:
     [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> /*frame*/, std::string /*peer*/) override
     {
+        // Read BEFORE anything else in this body, and before the first `co_await`:
+        // this is the handoff instant, and a suspension here would let the very
+        // interleaving under test change the figure being read.
+        if (_endpoint != nullptr)
+        {
+            _inFlightAtEntry.store(_endpoint->InFlightBytes(), std::memory_order_release);
+            _sawEntry.store(true, std::memory_order_release);
+        }
         _entered.fetch_add(1, std::memory_order_acq_rel);
         while (_held.load(std::memory_order_acquire))
             co_await FastCache::SleepFor(*_reactor, std::chrono::milliseconds { 1 });
@@ -576,9 +584,47 @@ class HoldableResponder final: public IFrameResponder
         return _budget;
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// False by default, so every case written before #448 keeps asserting what it
+    /// did. A case that turns it on is standing in for `CompileResponder`: a surface
+    /// whose answer takes minutes and which charges the same frame itself.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _ownBudget.load(std::memory_order_acquire);
+    }
+
+    /// Claim, or stop claiming, that this surface accounts for its own request bytes.
+    /// @param own What `HoldsOwnByteBudget` should answer.
+    void ClaimOwnByteBudget(bool own) noexcept
+    {
+        _ownBudget.store(own, std::memory_order_release);
+    }
+
     void UseReactor(FastCache::IReactor& reactor) noexcept
     {
         _reactor = &reactor;
+    }
+
+    /// Watch the endpoint's in-flight total from inside `Answer`.
+    ///
+    /// The handoff between the endpoint's budget and a self-accounting surface's own
+    /// is an ORDERING, and the only place it is observable is the top of `Answer` --
+    /// which is the instant after the endpoint released and the instant before a real
+    /// owner charges. Nothing outside can see it: the two events have no suspension
+    /// point between them, which is exactly the property being asserted.
+    /// @param endpoint The endpoint serving this responder; must outlive it.
+    void WatchEndpoint(FrameEndpoint const& endpoint) noexcept
+    {
+        _endpoint = &endpoint;
+    }
+
+    /// @return The endpoint's in-flight byte total as of the last `Answer` entry.
+    [[nodiscard]] std::optional<std::size_t> InFlightAtEntry() const noexcept
+    {
+        if (!_sawEntry.load(std::memory_order_acquire))
+            return std::nullopt;
+        return _inFlightAtEntry.load(std::memory_order_acquire);
     }
 
     void Hold(bool held) noexcept
@@ -693,6 +739,12 @@ class HoldableResponder final: public IFrameResponder
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     std::size_t _concurrent { 8 };
     std::size_t _budget { 0 };
+    std::atomic<bool> _ownBudget { false };
+    FrameEndpoint const* _endpoint { nullptr };
+    std::atomic<std::size_t> _inFlightAtEntry { 0 };
+    /// Separate from the figure, because zero is a legitimate reading and "never
+    /// entered" must not be reported as "entered with an empty budget".
+    std::atomic<bool> _sawEntry { false };
 };
 
 /// A FETCH frame, the smallest thing the cache surface answers.
@@ -1355,4 +1407,157 @@ TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
     foreign.fill(std::byte { 0x7F });
 
     CHECK(conversation.Send(foreign).empty());
+}
+
+TEST_CASE("A self-accounting surface stops holding the endpoint's budget while it answers", "[node][frame]")
+{
+    // Issue #448, and the ORDERING half of it. `BudgetedBytes` covered the whole of
+    // `Answer`, which is a round trip on the cache and scheduler surfaces and the
+    // entire compile on the third -- so one buffer sat in the endpoint's pool AND in
+    // `CompileCapacity` for minutes.
+    //
+    // The only place the handoff is observable is the top of `Answer`: the instant
+    // after the endpoint released and the instant before a real owner charges, with
+    // no suspension point between them. So the responder reads the figure from
+    // inside itself rather than a case reading it from outside.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.ClaimOwnByteBudget(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    responder.WatchEndpoint(**endpoint);
+    fleet.Serve();
+
+    auto const request = Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes");
+    auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
+    REQUIRE(declared > 0); // Or the assertions below hold vacuously.
+
+    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(responder.Entered() == 1);
+
+    // Released BEFORE the answer began. Read from inside `Answer`, which is the
+    // handoff instant itself.
+    auto const atEntry = responder.InFlightAtEntry();
+    REQUIRE(atEntry.has_value()); // "never entered" is not "entered holding nothing".
+    CHECK(Unwrap(atEntry) == 0);
+
+    // And still released while the answer runs, which is the minutes-long window the
+    // ticket is about. Read from outside, so the two are independent observations.
+    CHECK((*endpoint)->InFlightBytes() == 0);
+
+    responder.Hold(false);
+    REQUIRE(client.wait_for(15s) == std::future_status::ready);
+    CHECK_FALSE(client.get().empty());
+}
+
+TEST_CASE("A surface that does not account for itself keeps the endpoint's budget", "[node][frame]")
+{
+    // The control for the case above, and it is not decoration: that one asserts a
+    // figure is ZERO, and a probe that always reads zero -- a fake never wired to an
+    // endpoint, a release that fires for everybody -- would pass it while measuring
+    // nothing. This is the same probe reading the same field on the same surface with
+    // one answer flipped, so the zero above is a property of the column rather than
+    // of the instrument.
+    //
+    // It is also the cache and scheduler behaviour, which #448 must not change: those
+    // hold no accounting of their own, and releasing for them would leave the object
+    // file being buffered counted by nothing at all.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.ClaimOwnByteBudget(false);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    responder.WatchEndpoint(**endpoint);
+    fleet.Serve();
+
+    auto const request = Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes");
+    auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
+
+    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(responder.Entered() == 1);
+
+    auto const atEntry = responder.InFlightAtEntry();
+    REQUIRE(atEntry.has_value());
+    CHECK(Unwrap(atEntry) == declared);
+    CHECK((*endpoint)->InFlightBytes() == declared);
+
+    responder.Hold(false);
+    REQUIRE(client.wait_for(15s) == std::future_status::ready);
+    CHECK_FALSE(client.get().empty());
+}
+
+TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing its listener", "[node][frame]")
+{
+    // **The most important case in #448**, and the consequence the ticket's own
+    // headline did not state. The endpoint's pool is per LISTENER, and since #290 one
+    // listener carries the cache, the scheduler AND the compile verbs. A compile
+    // holding its declared bytes for minutes therefore fills a pool that a 64 KiB
+    // REGISTER has to pass through.
+    //
+    // What that costs is not a slow heartbeat. `EndpointBusy` is not `NotLeader`: it
+    // carries no redirect and the worker half does not follow it, so the peer expires
+    // out of the registry and every lease answers `NoWorker` -- a fleet outage caused
+    // by this node's own compile load, on the default single-machine install, behind a
+    // green build.
+    //
+    // Held answers rather than sleeps: the property is ordering, not timing.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.ClaimOwnByteBudget(true);
+    responder.Hold(true);
+
+    auto const big = Fetch(std::string(400, 'x'));
+    auto const bigDeclared = Unwrap(Wire::DecodeRequestHeader(big)).payloadLength;
+
+    // A budget two big frames would exhaust, so the third caller below is refused
+    // under the defect and served once the handoff lands. Derived from the frame
+    // rather than a literal, or the case stops meaning this when `Fetch` changes.
+    responder.Limit(/*concurrent*/ 0, /*budget*/ (bigDeclared * 2) + 1);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // Two long answers in flight, which under the defect is the whole budget spent.
+    auto firstBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
+    auto secondBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(responder.Entered() == 2);
+
+    // The small verb: a heartbeat's shape, arriving while both compiles run. It must
+    // REACH the responder -- passing the budget gate is exactly what it could not do
+    // under the defect, and a refusal is answered before `Answer` is entered at all.
+    auto small = std::async(std::launch::async, [port] { return Exchange(port, Fetch("k")); });
+    for (auto spin = 0; spin < 2000 && responder.Entered() < 3; ++spin)
+        std::this_thread::sleep_for(1ms);
+    CHECK(responder.Entered() == 3);
+
+    responder.Hold(false);
+    REQUIRE(firstBig.wait_for(15s) == std::future_status::ready);
+    REQUIRE(secondBig.wait_for(15s) == std::future_status::ready);
+    REQUIRE(small.wait_for(15s) == std::future_status::ready);
+
+    // And it was SERVED, not refused: reaching the responder and being answered are
+    // two facts, and only the pair rules out a busy signal encoded further along.
+    auto const reply = small.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(ErrorOf(reply) != Wire::ErrorCode::EndpointBusy);
 }
