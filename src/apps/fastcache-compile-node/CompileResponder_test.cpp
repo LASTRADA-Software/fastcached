@@ -685,6 +685,36 @@ class IdleListener final: public IListener
     return cfg;
 }
 
+/// Wait, bounded, for every compile to have given its slot back.
+///
+/// **This is the DIAGNOSTIC; the drain bound below it is only the net.** A case that
+/// ends with a compile still counted in flight does not fail -- `CompileCapacity::Drain`
+/// reaches `Abandon` and calls `std::_Exit`, so the case VANISHES: a nonzero exit, two
+/// lines of Catch2 banner, no assertion, and the one line that explains it written to a
+/// test logger nobody reads. Shortening the bound only makes that happen sooner; it is
+/// the same unreadable failure, which is #297's whole complaint. A `REQUIRE` on this
+/// gives a person a red case with a number instead.
+///
+/// **Bounded rather than sampled once**, and that is not timidity: a compile released a
+/// moment earlier is legitimately still hopping back onto the reactor, so an instant
+/// check would be flaky in the opposite direction and would report a working fixture as
+/// broken. What is being asserted is that the slot comes back *at all*, which is exactly
+/// the condition whose absence makes the drain vanish.
+/// @param capacity The worker's accounting.
+/// @param bound How long to allow.
+/// @return Whether the in-flight count reached zero.
+[[nodiscard]] bool DrainedWithin(CompileCapacity const& capacity, std::chrono::milliseconds bound)
+{
+    constexpr auto Poll = std::chrono::milliseconds { 5 };
+    for (auto waited = std::chrono::milliseconds { 0 }; waited < bound; waited += Poll)
+    {
+        if (capacity.InFlight() == 0)
+            return true;
+        std::this_thread::sleep_for(Poll);
+    }
+    return capacity.InFlight() == 0;
+}
+
 /// The worker, the responder and the router a merged-surface case drives.
 ///
 /// Held together because their declaration ORDER is load-bearing and silently so: the
@@ -706,7 +736,16 @@ struct MergedWorker
     MergedWorker(Fixture& fix, NodeIoLoop& io):
         jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
         protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics },
-        server { listener, protocol, 2, fix.membership, fix.metrics, fix.logger, pool },
+        // **Five seconds rather than the thirty-second default: the NET, not the
+        // diagnostic.** `DrainedWithin` above is what reports a slot that never came
+        // back, as an ordinary red assertion with a number. This only bounds how long a
+        // violation that got past it costs, and it cannot be made legible by shortening
+        // -- `Drain` still reaches `Abandon` and calls `std::_Exit`, so the case still
+        // vanishes into two lines of banner, just sooner (#297). Five over two for
+        // headroom on a loaded runner.
+        //
+        // It is NOT what makes these cases correct -- see the destructor.
+        server { listener, protocol, 2, fix.membership, fix.metrics, fix.logger, pool, std::chrono::seconds { 5 } },
         responder { protocol, server.Capacity(), fix.membership, pool, io.Reactor(), fix.metrics, fix.logger }
     {
     }
@@ -716,9 +755,40 @@ struct MergedWorker
     MergedWorker(MergedWorker&&) = delete;
     MergedWorker& operator=(MergedWorker&&) = delete;
 
-    /// Stops and drains, so no case leaves a compile running into its own teardown.
+    /// A safety net, and deliberately not the mechanism.
+    ///
+    /// **Every case must drain EXPLICITLY, before its endpoint goes out of scope.** The
+    /// endpoint is a local declared after this fixture, so it is destroyed first --
+    /// `~FrameEndpoint` stops accepting, its loops end, and `NodeIoLoop` then stops the
+    /// reactor. A compile still out on the pool at that moment has nowhere to hop home
+    /// to: its slot is never released, and this destructor then waits out the whole
+    /// bound and ends the process.
+    ///
+    /// That is #290's own 1b hazard, reproduced in a fixture by not following the
+    /// ordering `WorkerBody` follows -- which is the point worth keeping. It cost a red
+    /// CI leg that reproduced on `cl` and not `clang-cl`, because whether the hop home
+    /// wins that race is a timing question and nothing about it is compiler-specific.
     ~MergedWorker()
     {
+        // **Released BEFORE the drain, so this path can never destroy evidence.**
+        //
+        // Without it the net is a shredder. A case whose `DrainedWithin` assertion fires
+        // unwinds into here; the job still is not draining -- that is WHY it fired --
+        // so `Drain` reaches `Abandon` and calls `std::_Exit`, which flushes nothing.
+        // ctest captures stdout through a pipe, so it is block-buffered, and the red
+        // assertion written to make the failure legible would still be sitting in that
+        // buffer when the process died. The diagnostic would be swallowed by exactly the
+        // thing it was added to diagnose, and the next person would see two banner lines
+        // again.
+        //
+        // Releasing first means the job always completes, the drain always finishes, and
+        // `Abandon` is unreachable from a test -- which is what makes the sentence above
+        // about a safety net true rather than aspirational.
+        //
+        // Safe here on stronger grounds than declaration order: every member is alive
+        // for the whole of a destructor BODY, since member destruction happens after it.
+        // `Release` is idempotent, so the cases that already released pay nothing.
+        runner.Release();
         server.StopAndWait();
     }
 };
@@ -782,6 +852,32 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedStopping) == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 0);
+
+    // **Drained HERE, while the endpoint is alive and its reactor still turning.**
+    //
+    // This case is the one that needs it: the connection is swept at about one sweep
+    // interval, so `pending` becomes ready long before `Release()` lets the compile
+    // finish. The compile is therefore still on the pool as this case ends, and the
+    // destructors race its hop home -- endpoint first, which stops the reactor, then
+    // the drain, which waits for a slot nothing will ever release. It cost a red CI
+    // leg, at forty-four seconds, reporting nothing but the Catch2 banner.
+    //
+    // The same ordering `WorkerBody` uses in production, and for the same reason.
+    //
+    // Asserted BEFORE the drain, never left to it: if the slot never comes back this
+    // says so with a number, where `StopAndWait` would take the whole binary down
+    // without reporting anything at all.
+    INFO("the slot taken by this compile never came back, so the drain below would "
+         "abandon it and _Exit(75) -- a vanished binary rather than a red case (#297)");
+    // CHECK, not REQUIRE, and that is the difference between a red case and a vanished
+    // binary. A `REQUIRE` aborts the case here -- unwinding past the drain below and
+    // into `~MergedWorker`, which runs AFTER `~endpoint` has already stopped the
+    // reactor, so the released job's hop home has nowhere to land and the drain
+    // abandons. Measured: the assertion text survived, the exit code was still 75 and
+    // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
+    // BODY, where the endpoint is alive and the reactor still turning.
+    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
+    worker.server.StopAndWait();
 }
 
 TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][compile-responder]")
@@ -828,6 +924,22 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     auto const reply = pending.get();
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
+
+    // No race here today -- this connection is SERVED, so waiting for the reply above
+    // already means the compile finished and hopped home. Asserted and drained anyway,
+    // because that is a property of what this case happens to assert rather than of how
+    // it is built, and the next edit to it need not preserve it.
+    INFO("the slot taken by this compile never came back, so the drain below would "
+         "abandon it and _Exit(75) -- a vanished binary rather than a red case (#297)");
+    // CHECK, not REQUIRE, and that is the difference between a red case and a vanished
+    // binary. A `REQUIRE` aborts the case here -- unwinding past the drain below and
+    // into `~MergedWorker`, which runs AFTER `~endpoint` has already stopped the
+    // reactor, so the released job's hop home has nowhere to land and the drain
+    // abandons. Measured: the assertion text survived, the exit code was still 75 and
+    // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
+    // BODY, where the endpoint is alive and the reactor still turning.
+    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
+    worker.server.StopAndWait();
 }
 
 TEST_CASE("A compile in flight is drained before anything can stop the reactor", "[node][compile-responder]")
@@ -866,6 +978,20 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     REQUIRE(worker.server.Capacity().InFlight() == 1);
 
     worker.runner.Release();
+
+    // The precondition, before the drain is relied on for it. This case asserts the
+    // drain's BEHAVIOUR below; without this line a broken one would vanish here rather
+    // than fail, and the assertions that follow would never run.
+    INFO("the slot taken by this compile never came back, so the drain below would "
+         "abandon it and _Exit(75) -- a vanished binary rather than a red case (#297)");
+    // CHECK, not REQUIRE, and that is the difference between a red case and a vanished
+    // binary. A `REQUIRE` aborts the case here -- unwinding past the drain below and
+    // into `~MergedWorker`, which runs AFTER `~endpoint` has already stopped the
+    // reactor, so the released job's hop home has nowhere to land and the drain
+    // abandons. Measured: the assertion text survived, the exit code was still 75 and
+    // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
+    // BODY, where the endpoint is alive and the reactor still turning.
+    CHECK(DrainedWithin(worker.server.Capacity(), std::chrono::seconds { 5 }));
     worker.server.StopAndWait();
 
     // 1. The drain waited for the hop HOME, not merely for the compiler to exit.
