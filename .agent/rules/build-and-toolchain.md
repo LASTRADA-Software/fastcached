@@ -175,9 +175,28 @@ determinism rests on.
     build too, through the same `launcher_verdict` the refusal uses: one observable, not two
     that can disagree, and the refusal's message is then true because the only state that
     reaches it is one that survived a configure which actually ran.
-  - A missing `build.ninja` is `unknown` and is never folded into a count of zero: zero is a
-    reading, `unknown` is the absence of one, and a gate that cannot check must not report.
-    `USE_COMPILER_CACHE` absent reads as ON, since that is the option's default.
+  - A missing `build.ninja` is `unknown`, one that cannot be READ is `unreadable`, and neither
+    is ever folded into a count of zero: zero is a reading, the other two are the absence of
+    one and the failure to take one. `awk` on a file it cannot open exits **without running
+    its `END` block**, so it prints nothing -- and an empty answer reaching the caller's
+    default arm renders a failed reading as the worst positive one, refusing a build nobody
+    could read while blaming a launcher nobody set. A `[[ -f ]]` that passes for a file whose
+    permissions deny it is exactly where the fourth state hides. `USE_COMPILER_CACHE` absent
+    reads as ON, since that is the option's default.
+  - The match is **not** anchored to ninja's two-space indent, deliberately: anchoring fails
+    OPEN if that spelling ever changes, because a count of zero reads as a clean build. Loose
+    can only over-count, which for a gate is the safe direction -- and since
+    `CMAKE_<LANG>_LINKER_LAUNCHER` emits the same binding, the number is reported as
+    launcher-fronted **edges** rather than as compile edges.
+  - **The gate does not own its build directories, and says so.** Every preset has one
+    `binaryDir`, `out/build/${presetName}`, and these are the trees this project tells
+    developers and agents to build in; `-D` writes a cache entry and `option()` never
+    overrides one, so a gate run turns the compiler cache off there *permanently*. That is
+    accepted as a STATED cost -- the run prints what it did, that it is permanent, and how to
+    undo it -- and gate-owned directories are
+    [#487](https://github.com/LASTRADA-Software/fastcached/issues/487). A silent change to how
+    a tree builds is the defect this whole entry is about, so the fix for it must not commit a
+    quieter version of it one directory over.
   - The one-time cost is stated by the run that incurs it. Dropping the launcher rewrites every
     compile command, so ninja rebuilds the configuration from scratch once; a developer
     watching that with no explanation files it as breakage. An explained cost is a cost.

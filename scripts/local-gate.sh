@@ -187,13 +187,38 @@ cached_entry() {
 # nothing worth saving: measured at 22.4ms against a 19.7ms bare `awk` spawn on a
 # 1.3MB `build.ninja`, so ~2.7ms is the scan. Stopping early cannot help the only
 # path a passing gate takes anyway -- answering zero means reading to EOF.
+# `unreadable` is the fourth answer and is not optional. `awk` on a file it cannot
+# open exits WITHOUT running its `END` block, so it prints nothing -- and an empty
+# string falling through to the caller's default arm would render a failed READING
+# as the worst positive one, refusing with "(launcher-fronted edges: )" and blaming
+# an external launcher nobody set. Skipped, absent, unstarted and failed are four
+# states; a `[[ -f ]]` that passes for a file whose permissions deny it is exactly
+# where the fourth hides.
+#
+# The match is deliberately NOT anchored to ninja's two-space indent. Anchoring
+# would fail OPEN if that spelling ever changed -- a count of zero reads as a clean
+# build -- and this is a gate, so the loose match is the safe direction: it can
+# only over-count. `CMAKE_<LANG>_LINKER_LAUNCHER` emits the same binding, which is
+# why the number is reported as launcher-fronted EDGES rather than as compile
+# edges; a linker cache in a reference build is a thing to refuse too.
 # @param 1 Path to a generated build.ninja.
 launcher_verdict() {
     if [[ ! -f "$1" ]]; then
         echo "unknown"
         return 0
     fi
-    awk 'index($0, "LAUNCHER = ") { n++ } END { print n+0 }' "$1"
+    local n
+    # stderr discarded because the failure is CONVERTED into a named state below:
+    # `awk` writes "cannot open file ... Permission denied" and the classification
+    # is what reports that, so the raw line would be noise in a ctest log rather
+    # than information. Nothing is being hidden -- an unreadable file still fails
+    # the gate, by name.
+    n="$(awk 'index($0, "LAUNCHER = ") { n++ } END { print n+0 }' "$1" 2>/dev/null)"
+    if [[ "$n" =~ ^[0-9]+$ ]]; then
+        echo "$n"
+    else
+        echo "unreadable"
+    fi
 }
 
 # Why this preset has to be configured, or empty when it does not.
@@ -259,12 +284,16 @@ configure_reason() {
     # Through `launcher_verdict`, so the decision and the refusal read the same
     # observable rather than two that can disagree. What survives a configure that
     # actually RAN is the only state the refusal's message is true about.
+    #
+    # `unreadable` is deliberately NOT a reason: a configure cannot repair a file
+    # this process may not read, and the refusal names that state itself. Only the
+    # two states a configure can actually fix are reasons to run one.
     local fronted
     fronted="$(launcher_verdict "$dir/build.ninja")"
     case "$fronted" in
-        0) ;;
+        0|unreadable) ;;
         unknown) reasons="${reasons:+$reasons; }there is no build.ninja to check" ;;
-        *)       reasons="${reasons:+$reasons; }the generated build is launcher-fronted (compile edges: $fronted)" ;;
+        *)       reasons="${reasons:+$reasons; }the generated build is launcher-fronted (edges: $fronted)" ;;
     esac
 
     # Several clauses can hold at once, and a run that re-configures for more than
@@ -307,6 +336,13 @@ if [[ "$self_test" -eq 1 ]]; then
             fronted)
                 printf 'build x.o: CXX_COMPILER__foo x.cpp\n  LAUNCHER = /usr/bin/cmake -E env /usr/bin/fastcache-cc \n' \
                     > "$scratch/$1/build.ninja" ;;
+            none) ;;
+            # A mistyped or newly-invented mode would otherwise produce a directory
+            # with no build.ninja -- silently the `none` fixture rather than the one
+            # the caller named, and every expectation written against it would be
+            # testing something else. A generator that produced nothing fails.
+            *) echo "SELF-TEST BROKEN: fixture '$1' asked for unknown mode '$3'" >&2
+               exit 1 ;;
         esac
     }
 
@@ -398,10 +434,10 @@ if [[ "$self_test" -eq 1 ]]; then
         "there is no build.ninja to check" \
         "$(configure_reason "$scratch/no-ninja" tidy /usr/bin/clang-tidy-22)"
     expect "a correct cache beside a launcher-fronted build is re-configured" \
-        "the generated build is launcher-fronted (compile edges: 1)" \
+        "the generated build is launcher-fronted (edges: 1)" \
         "$(configure_reason "$scratch/stale-fronted" tidy /usr/bin/clang-tidy-22)"
     expect "a no-tidy preset is re-configured over a stale fronted build too" \
-        "the generated build is launcher-fronted (compile edges: 1)" \
+        "the generated build is launcher-fronted (edges: 1)" \
         "$(configure_reason "$scratch/stale-fronted" no-tidy /usr/bin/clang-tidy-22)"
 
     # The refusal. `-DUSE_COMPILER_CACHE=OFF` does not settle this on its own --
@@ -422,6 +458,26 @@ if [[ "$self_test" -eq 1 ]]; then
         "0" "$(launcher_verdict "$scratch/right/build.ninja")"
     expect "a build.ninja that is not there is unknown, never zero" \
         "unknown" "$(launcher_verdict "$scratch/no-ninja/build.ninja")"
+
+    # The fourth state. `awk` on a file it cannot open exits without running `END`,
+    # so it prints NOTHING -- and an empty answer reaching the caller's default arm
+    # would refuse a build nobody could read while blaming a launcher nobody set.
+    #
+    # Only meaningful where the permission actually bites: root reads everything, so
+    # on such a host this case is reported SKIPPED rather than passing vacuously. A
+    # check that cannot fail is not a check, and saying so is the difference between
+    # a state that was tested and one that merely did not complain.
+    fixture denied 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n' fronted
+    chmod 000 "$scratch/denied/build.ninja" 2>/dev/null
+    if [[ -r "$scratch/denied/build.ninja" ]]; then
+        echo "SELF-TEST SKIPPED: unreadable build.ninja (this user can read a 0000 file)" >&2
+    else
+        expect "a build.ninja that cannot be READ is its own answer, not a count" \
+            "unreadable" "$(launcher_verdict "$scratch/denied/build.ninja")"
+        expect "and it is not a reason to configure, because no configure fixes it" \
+            "" "$(configure_reason "$scratch/denied" no-tidy /usr/bin/clang-tidy-22)"
+    fi
+    chmod 644 "$scratch/denied/build.ninja" 2>/dev/null
 
     # The table drives both of the above, so a row that stopped parsing would make
     # every check here vacuous while every one of them passed.
@@ -516,6 +572,31 @@ run_preset() {
     reason="$(configure_reason "$build_dir" "$analyser" "$tidy_path")"
     if [[ -n "$reason" ]]; then
         echo "== $preset: configure ($reason)"
+
+        # This gate does not own its build directories: `CMakePresets.json` gives
+        # every preset one `binaryDir`, `out/build/${presetName}`, and AGENT.md
+        # tells developers and agents to build in these very two. `-D` writes a
+        # cache entry and `option()` never overrides one, so turning the compiler
+        # cache off here turns it off for every ORDINARY build in this directory
+        # from now on, until somebody sets it back or reconfigures `--fresh`.
+        #
+        # That is a real standing cost -- roughly 2.4x on a full rebuild by this
+        # branch's own measurements -- and it is being accepted as a STATED one.
+        # Gate-owned directories are issue #487. Said here because a silent change
+        # to how a tree builds is the whole defect this script was just fixed for,
+        # and a developer whose builds slowed should find the answer in their
+        # scrollback rather than a mystery in the repository that makes caches.
+        #
+        # Decided from the cache entry rather than from the reason text: this is a
+        # statement about what the configure is ABOUT TO change, and the entry is
+        # what it changes.
+        if [[ "$(cached_entry "$build_dir/CMakeCache.txt" USE_COMPILER_CACHE)" != "OFF" ]]; then
+            echo "== $preset: NOTE -- this turns the compiler cache off in $build_dir"
+            echo "==   PERMANENTLY, not just for this run: ordinary 'cmake --build --preset"
+            echo "==   $preset' in this tree is uncached from here on. Undo with"
+            echo "==   -DUSE_COMPILER_CACHE=ON. Why, and the plan to stop it: issue #487."
+        fi
+
         # Turning the launcher off rewrites every compile command, so ninja rebuilds
         # the whole configuration once. Said HERE, at the moment it is decided,
         # because a developer watching both presets rebuild from scratch with no
@@ -555,8 +636,11 @@ run_preset() {
         unknown)
             fail "$preset: $ninja is not there after configuring, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report"
             ;;
+        unreadable)
+            fail "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
+            ;;
         *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (compile edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
             ;;
     esac
 
