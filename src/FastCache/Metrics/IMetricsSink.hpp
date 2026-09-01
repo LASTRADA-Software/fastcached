@@ -444,6 +444,45 @@ class IMetricsSink
         /// with a stale token moves this and not that.
         SchedulerRequestsRefusedUnauthenticated,
 
+        /// `AUTH` attempts on the scheduler surface that decoded and did not verify.
+        ///
+        /// **The credential-guessing signal**, and the one
+        /// `SchedulerRequestsRefusedUnauthenticated` above cannot carry: that one
+        /// counts a peer reaching a verb WITHOUT having authenticated, which is a
+        /// misconfigured fleet member. This counts a peer that presented a token and
+        /// got it wrong -- a rotated key, or somebody trying. An operator does
+        /// opposite things about the two, so they are two rows although a client is
+        /// told `unauthenticated` either way.
+        ///
+        /// Until #447 this rose nowhere at all: the endpoint answered the wire code
+        /// itself, so a fleet being probed for its scheduler token read a flat zero on
+        /// the exact series an operator would go looking at.
+        SchedulerCredentialsRejected,
+
+        /// `AUTH` payloads on the scheduler surface that would not decode at all.
+        ///
+        /// Separate from the rejection above because it says something different: a
+        /// peer that cannot form the frame is a version or client-library mismatch,
+        /// while one forming it correctly with the wrong secret is the security
+        /// question. Summed, the second hides inside the first whenever an old client
+        /// is in the fleet.
+        SchedulerCredentialsMalformed,
+
+        /// Connections turned away because the `0xFC` listener already holds every
+        /// connection it will.
+        ///
+        /// **Never summed with `WorkerJobsRefusedEndpointBusy`**, which shares its
+        /// wire code (`endpoint-busy`) and nothing else. That one says one request was
+        /// too big for the bytes currently in flight and a smaller or later one would
+        /// be served; this says the surface has no room for another *conversation* at
+        /// all. An operator raises a connection ceiling for one and looks at request
+        /// sizes for the other.
+        ///
+        /// Counted by the endpoint rather than by a surface, because it is decided at
+        /// accept -- before a header exists -- so it names no verb and no owning
+        /// component can be asked for it.
+        NodeFrameConnectionsRefusedAtCapacity,
+
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those
         /// keys were never published.

@@ -572,9 +572,17 @@ class ShortWindowResponder final: public IFrameResponder
     {
         return _inner.CheckCredential(payload);
     }
-    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t opRaw) const override
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override
     {
-        return _inner.RefusalReply(decision, opRaw);
+        return _inner.RefusalReply(decision, opRaw, detail);
+    }
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override
+    {
+        return _inner.EndpointRefusalReply(refusal, opRaw, detail);
     }
     [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
     {
@@ -859,7 +867,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     MergedResponder merged { nullptr, nullptr, &tooShort };
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -942,7 +950,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile)) > FrameServer::HeaderTimeout);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -1000,7 +1008,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -1096,7 +1104,7 @@ TEST_CASE("The merged listener counts the frame it refuses without reading", "[n
     MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 

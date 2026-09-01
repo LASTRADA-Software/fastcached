@@ -2,11 +2,15 @@
 #include "CompileResponder.hpp"
 
 #include <FastCache/Async/ResumeOn.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -84,6 +88,29 @@ namespace
         }
         return CompileRefusal::Unauthenticated;
     }
+
+    /// One row per `EndpointRefusal`, in enumerator order.
+    struct EndpointRefusalRow
+    {
+        EndpointRefusal refusal;    ///< Which endpoint decision this describes.
+        Cc::SurfaceRefusal answer;  ///< What the client is told, and what the operator sees rise.
+    };
+
+    /// Which refusal each endpoint-decided outcome answers with on this surface.
+    ///
+    /// A table, unlike `RefusalFor` above, and the difference is the enum rather than
+    /// a preference: `EndpointRefusal` is this tree's own and states its own `Last`,
+    /// so `RowsInEnumeratorOrder` can check the extent AND every row's position.
+    /// `PrePayloadDecision` is a wire enum shared with the launcher and states no
+    /// count, which is why its lookup has to stay a switch.
+    constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusalTable { {
+        { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy },
+        { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential },
+        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::Unauthenticated },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(EndpointRefusalTable, &EndpointRefusalRow::refusal),
+                  "EndpointRefusalTable must hold one row per EndpointRefusal, in enumerator order");
 } // namespace
 
 std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
@@ -95,11 +122,21 @@ std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_v
     return RefuseUnlessMember(_membership, _metrics, peer);
 }
 
-std::vector<std::byte> CompileResponder::RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t /*opRaw*/) const
+std::vector<std::byte> CompileResponder::RefusalReply(Wire::PrePayloadDecision decision,
+                                                      std::uint8_t /*opRaw*/,
+                                                      std::string_view detail) const
 {
-    // No detail. What a message could add is which verb the caller failed to reach, and
-    // a caller that got this far learns nothing useful from being told.
-    return Cc::Refuse(_metrics, RefusalFor(decision));
+    // The caller's wording, and it is empty for every decision but the frame ceiling.
+    // That one names both numbers -- a 256 MiB cap is not guessable from "too large" --
+    // and it arrives from the endpoint because the endpoint is what enforced it.
+    return Cc::Refuse(_metrics, RefusalFor(decision), detail);
+}
+
+std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t /*opRaw*/,
+                                                              std::string_view detail) const
+{
+    return Cc::Refuse(_metrics, EndpointRefusalTable[static_cast<std::size_t>(refusal)].answer, detail);
 }
 
 Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)

@@ -166,7 +166,27 @@ class CompileResponder final: public IFrameResponder
     /// produce: `ctest -R worker-refusals-counted` covers this file now, and it covers
     /// it by there being no `EncodeErrorReply` here to leave a refusal uncounted.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
-                                                      std::uint8_t opRaw) const override;
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override;
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// The byte-budget arm is the one that matters and the one that regressed: the
+    /// dedicated compile port refused an unaffordable frame with
+    /// `CompileRefusal::EndpointBusy` and the merged listener answered a bare code, so
+    /// `worker_jobs_refused_endpoint_busy_total` -- which the operator documentation
+    /// still tells a reader to watch -- stopped moving when that port was retired
+    /// (#447).
+    ///
+    /// The credential arms cannot fire here: `AUTH` belongs to the `Session` family,
+    /// which `MergedResponder` routes to the scheduler, and this surface answers
+    /// `AuthRequired` false because a compile carries its own per-job lease. They are
+    /// counted anyway, for the reason `RefusalFor` gives about its own two dead arms:
+    /// if either ever fires, what changed is who may compile here, and a counter is how
+    /// an operator would find out.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override;
 
     /// @copydoc IFrameResponder::RequestTimeout
     ///

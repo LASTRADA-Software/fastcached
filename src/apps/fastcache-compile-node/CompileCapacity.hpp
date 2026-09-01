@@ -350,6 +350,17 @@ namespace CompileRefusal
         .code = CompileCacheWire::ErrorCode::UnknownOpcode,
         .counter = IMetricsSink::Counter::WorkerFramesRefusedUnknownOpcode,
     };
+    /// An `AUTH` payload that would not decode.
+    ///
+    /// Unreachable on this surface for the reason `Unauthenticated` below is:
+    /// `MergedResponder` routes the `Session` family to the scheduler, which owns the
+    /// credential. It carries a row anyway, so that a shape in which a compile surface
+    /// did check one cannot answer on the wire while nothing rises -- which is the
+    /// whole of #327 and, on the merged listener, of #447.
+    inline constexpr Cc::SurfaceRefusal MalformedCredential {
+        .code = CompileCacheWire::ErrorCode::MalformedFrame,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedPayload,
+    };
     /// A compile verb reached before a credential. Zero on every shipped shape.
     inline constexpr Cc::SurfaceRefusal Unauthenticated {
         .code = CompileCacheWire::ErrorCode::Unauthenticated,

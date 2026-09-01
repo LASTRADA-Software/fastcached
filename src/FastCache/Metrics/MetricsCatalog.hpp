@@ -382,6 +382,29 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "because there is then nothing to fail -- so zero here on a "
               "non-loopback bind means the port is open, not that it is quiet.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerCredentialsRejected,
+      .prometheusName = "fastcache_scheduler_credentials_rejected_total",
+      .help = "AUTH attempts on the scheduler surface that decoded and did not "
+              "verify: a rotated key, or somebody guessing. Never sum with "
+              "requests_refused_unauthenticated -- that one is a peer that never "
+              "authenticated at all, which is a misconfigured member rather than a "
+              "probe.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed,
+      .prometheusName = "fastcache_scheduler_credentials_malformed_total",
+      .help = "AUTH payloads on the scheduler surface that would not decode: a "
+              "version or client-library mismatch. Kept apart from "
+              "credentials_rejected so an old client in the fleet cannot hide a peer "
+              "presenting wrong secrets.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity,
+      .prometheusName = "fastcache_node_frame_connections_refused_at_capacity_total",
+      .help = "Connections turned away because the node's 0xFC listener already holds "
+              "every connection it will. Never sum with "
+              "worker_jobs_refused_endpoint_busy: they share a wire code and nothing "
+              "else -- that one says one request was too big right now, this says the "
+              "surface has no room for another conversation.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
       .help = "Reclaimed keys whose expired/evicted keyspace event was never published, because "

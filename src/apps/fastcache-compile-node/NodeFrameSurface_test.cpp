@@ -96,10 +96,23 @@ class NamedResponder final: public IFrameResponder
     }
 
     [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
-                                                      std::uint8_t /*opRaw*/) const override
+                                                      std::uint8_t /*opRaw*/,
+                                                      std::string_view /*detail*/) const override
     {
         _refusals.push_back(_name);
         return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), _name);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// Records the same name, so the routing cases below assert the attribution of an
+    /// endpoint-decided refusal exactly as they do a pre-payload one.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal /*refusal*/,
+                                                              std::uint8_t /*opRaw*/,
+                                                              std::string_view /*detail*/) const override
+    {
+        _refusals.push_back(_name);
+        return Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, _name);
     }
 
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
@@ -474,8 +487,10 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     NamedResponder scheduler { "scheduler" };
     MergedResponder responder { &cache, &scheduler, nullptr };
 
-    (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store));
-    (void) responder.RefusalReply(Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease));
+    (void) responder.RefusalReply(
+        Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store), {});
+    (void) responder.RefusalReply(
+        Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease), {});
 
     CHECK(cache.Refusals() == std::vector<std::string> { "cache" });
     CHECK(scheduler.Refusals() == std::vector<std::string> { "scheduler" });
@@ -483,7 +498,8 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     // An unowned verb still gets a reply, and moves nobody's counter: there is no
     // component whose refusal it would be.
     auto const orphan =
-        responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile));
+        responder.RefusalReply(
+            Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
     CHECK(ErrorOf(orphan) == Wire::ErrorCode::PayloadTooLarge);
     CHECK(cache.Refusals().size() == 1);
     CHECK(scheduler.Refusals().size() == 1);
@@ -532,9 +548,10 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     // absent.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     auto const [cfg, port] = BaseConfig();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "serving no 0xFC port"));
@@ -554,6 +571,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     // port that no longer exists.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder compile { "compile" };
     auto [cfg, port] = BaseConfig();
     cfg.cacheMemoryBytes = 0; // nowhere to keep objects, so no tier is built
@@ -561,7 +579,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     REQUIRE_FALSE(cfg.serveScheduler);
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface != nullptr);
 
@@ -576,11 +594,12 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
 {
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
@@ -653,6 +672,7 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of the configuration.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
     HandedOverListenFd handed;
     auto const supervisorPort = handed.port;
@@ -669,7 +689,7 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of this case, so the two must differ.
     cfg.advertise = "worker-01.internal:1";
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
 
@@ -700,6 +720,7 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // ordinary deployment rather than an exotic one.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
 
     NodeConfig cfg;
@@ -709,7 +730,7 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // Not a descriptor. `Adopt` answers this without touching it, which is also why
     // there is nothing here to close: ownership passes on every path, including the
     // ones that fail.
-    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, logger);
+    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("socket-activated"));
 }
@@ -757,6 +778,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
 
         NodeIoLoop io;
         CapturingLogger logger;
+    AtomicMetricsSink metrics;
         NamedResponder cache { "cache" };
         NamedResponder scheduler { "scheduler" };
 
@@ -769,7 +791,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE(holder->IsBound());
 
         auto refused = StartNodeSurfaceOrExplain(
-            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, logger);
+            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, metrics, logger);
         REQUIRE_FALSE(refused.has_value());
 
         // The flag, so an operator knows what to edit.
