@@ -533,6 +533,44 @@ looks exactly like a port nobody is talking to.
   declared length, so it was refused as TRUNCATED, answered the same code, and moved
   the neighbouring counter. The confusion the split exists to end, inside the test
   written to prove the split.
+- **A surface MERGING is how this rule gets undone without anybody writing a bug**,
+  and it is the direction the check was blind to. #290 stage 3 retired the dedicated
+  compile port; `FrameEndpoint` — the merged listener that replaced it — held five
+  refusals encoded with a bare `Wire::EncodeErrorReply`, and two of those had counted
+  on the port that went away. So #326's counter and
+  `worker_jobs_refused_endpoint_busy_total` stopped moving at a *migration*, on the
+  surface that had just become the only one, with no test failing and the operator
+  documentation still naming both (#447). The scan could not see the file: it covered
+  three, and the listener was not one of them.
+- **The check is EXACT, so a file with one uncovered refusal cannot be covered at
+  all.** That is a property of the instrument rather than a matter of thoroughness,
+  and it is what decides scope when a file like this is found: fixing the refusal the
+  ticket names and deferring the rest leaves the scan permanently blind to the file
+  that made the omission possible, so the next one joins them silently. All of them,
+  or the door stays open.
+- **The endpoint owns WHEN a refusal is answered; the surface owns WHAT, counter
+  included.** A listener serving several components cannot know which counter a
+  refusal belongs to — a cache `STORE` over the byte budget counted against the
+  scheduler names the wrong subsystem, and naming the subsystem is the whole reason
+  these are read. So the endpoint asks the owner (`IFrameResponder::RefusalReply` for
+  the wire-shared `PrePayloadDecision`, `EndpointRefusalReply` for the decisions only
+  this process can make) and encodes nothing itself.
+- **A refusal decided before a header exists belongs to the ENDPOINT, and gets its own
+  row.** The at-capacity refusal is answered at accept, so it names no verb and the
+  router has no input to route it by. Do not contort the router into answering it: a
+  router asked a question it cannot have the input for grows a default arm that is
+  wrong later. Two categories — verb-owned and endpoint-owned — which also makes it
+  *impossible* for the byte-budget and at-capacity refusals to share a counter,
+  although they share `EndpointBusy` on the wire and say opposite things to an
+  operator. The types keep them apart rather than a comment asking somebody to.
+- **A refusal counter can be a SECURITY signal, and the one that was missing is.**
+  `SchedulerRequestsRefusedUnauthenticated` fires only at the pre-payload gate — a
+  peer reaching a verb having never authenticated, which is a misconfigured member.
+  A peer presenting a token and getting it WRONG was answered `unauthenticated` on
+  the wire and moved nothing, so credential guessing against a token-configured
+  scheduler was invisible to the exact series whose own documentation tells an
+  operator to read zero there as "the port is not being reached". Three outcomes,
+  three rows: never presented, presented and wrong, presented and undecodable.
 
 ## Text a peer sent is text, or the fleet refuses it
 

@@ -1515,6 +1515,45 @@ cache rather than as no cache at all.
 tell that the process is alive but not that it is *answering*, which is the state
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
+### What a refused connection looks like
+
+Every refusal the `0xFC` listener answers moves exactly one counter, and the ones
+below are the whole of what a probe of that port looks like from outside the
+machine. They are separate series rather than one `refused_total` because an
+operator does a different thing about each; where two of them share a wire code,
+that is said explicitly.
+
+| Series | Says |
+|---|---|
+| `fastcache_worker_frames_refused_payload_too_large_total` | A header declared more payload than the surface will buffer, so nothing was read. **The cheapest probe there is** — it needs 24 bytes where the envelope series needs a whole frame sent and read — which is why it has its own counter rather than leaning on them. |
+| `fastcache_worker_jobs_refused_endpoint_busy_total` | A request would not fit in the bytes already in flight. A slot was free and the memory was not, so more machines would not have helped. |
+| `fastcache_node_frame_connections_refused_at_capacity_total` | The listener already holds every *connection* it will, so a new one was turned away before it sent anything. |
+| `fastcache_scheduler_credentials_rejected_total` | Somebody presented a scheduler token and it was **wrong**. |
+| `fastcache_scheduler_credentials_malformed_total` | An `AUTH` frame that would not decode at all — a client built against another release. |
+| `fastcache_scheduler_requests_refused_unauthenticated_total` | A verb was reached *without* a credential ever having been presented. |
+
+Two pairs must never be summed, and both pairs share a wire code, so a dashboard
+grouping by the code an operator sees in a client log gets them wrong:
+
+- **`endpoint-busy`** is answered by both byte-budget and connection-capacity
+  refusals. The first says *one request was too big right now* and is fixed by
+  looking at request sizes; the second says *this surface has no room for another
+  conversation* and is fixed by raising a connection ceiling.
+- **`unauthenticated`** is answered both by a wrong token and by never having
+  presented one. The first is a rotated key or somebody trying; the second is a
+  fleet member misconfigured. Summed, "is my scheduler port being probed" stops
+  being answerable — and the *rejection* half is the half that means somebody is
+  trying.
+
+All six were once answered correctly on the wire while moving nothing, on the
+merged listener that is now the only `0xFC` port a node opens
+([#447](https://github.com/LASTRADA-Software/fastcached/issues/447)). Two of them
+had counted on the dedicated compile port that
+[#290](https://github.com/LASTRADA-Software/fastcached/issues/290) retired, so the
+series went flat at a migration rather than at a code change, and nothing failed. A
+refusal answered while nothing rises makes a port being hammered look, on
+`/metrics`, exactly like a port nobody is talking to.
+
 ## Looking at the whole fleet
 
 `--dashboard` adds four more routes to that same endpoint: `/fleet`, a page;

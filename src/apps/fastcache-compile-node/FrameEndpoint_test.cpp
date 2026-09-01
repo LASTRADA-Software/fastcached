@@ -4,6 +4,7 @@
 #include "Responders.hpp"
 
 #include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -1308,6 +1309,69 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     CHECK(Wire::DecodeReplyHeader(after).has_value());
 }
 
+TEST_CASE("A wrong token is counted apart from never having presented one", "[node][scheduler]")
+{
+    // Issue #447, and the half of it that is a security-observability hole rather than
+    // bookkeeping. `SchedulerRequestsRefusedUnauthenticated` says "somebody is reaching
+    // for verbs they hold no secret for", and its own documentation tells an operator
+    // that zero there on a non-loopback bind means the port is open. What it could not
+    // say is that somebody had presented a secret and got it WRONG: the endpoint
+    // encoded that refusal itself, so credential guessing against a token-configured
+    // scheduler moved nothing at all, on the exact series an operator would go
+    // looking at.
+    //
+    // Three outcomes, three counters, and the case asserts all three together --
+    // separately, any one of them passes against an implementation that sums them.
+    Fleet fleet;
+    auto const policy = std::make_shared<AuthPolicy const>(std::string {}, std::string { "the-real-token" });
+    SchedulerResponder responder { fleet.protocol, fleet.membership, fleet.metrics, policy };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // A well-formed credential that is simply wrong. The connection survives it, which
+    // is what lets the same peer go on to get it right -- and what lets this case send
+    // the malformed one down the same connection.
+    auto const rejected = conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "guessing" }));
+    REQUIRE_FALSE(rejected.empty());
+    CHECK(ErrorOf(rejected) == Wire::ErrorCode::Unauthenticated);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
+
+    // An AUTH payload that will not decode at all: one field where the verb needs two.
+    // A different operator problem -- a client built against another release -- and so
+    // a different row, or an old client in the fleet hides every wrong secret inside
+    // its own noise.
+    std::vector<std::byte> stunted(Wire::RequestHeaderSize + 1, std::byte { 0 });
+    WireFrame::PutHeader(std::span<std::byte> { stunted }.first(Wire::RequestHeaderSize),
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Auth),
+                         1);
+    auto const malformed = conversation.Send(stunted);
+    REQUIRE_FALSE(malformed.empty());
+    CHECK(ErrorOf(malformed) == Wire::ErrorCode::MalformedFrame);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsMalformed) == 1);
+
+    // Neither is the pre-payload refusal, which nothing here has triggered: no verb was
+    // reached before a credential. Summed with either of the above, "is my scheduler
+    // port being probed" stops being answerable.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated) == 0);
+
+    // And the right secret still works, so none of the counting is in the way of the
+    // thing being counted.
+    auto const accepted =
+        conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "the-real-token" }));
+    auto const header = Wire::DecodeReplyHeader(accepted);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
+}
+
 TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
 {
     // What the loop for #176 changed about the cap, made explicit so it cannot drift
@@ -1385,6 +1449,17 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     auto const refusal = Exchange(port, Fetch("while-attached"));
     REQUIRE_FALSE(refusal.empty());
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // Counted, and counted by the ENDPOINT (#447). This is the one refusal here that
+    // belongs to no surface: it is decided at accept, before a header exists, so it
+    // names no verb and there is no owner to route it to. Uncounted, a surface turning
+    // every arrival away looked on /metrics exactly like a surface nobody was dialling.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity) == 1);
+
+    // And it is NOT the byte budget's counter, although the two share `endpoint-busy`
+    // on the wire. An operator raises a connection ceiling for this one and looks at
+    // request sizes for the other; summed, neither question can be answered.
+    CHECK(responder.EndpointRefusals() == 0);
 }
 
 TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
@@ -1416,6 +1491,15 @@ TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
     auto const refusal = conversation.Send(Fetch("over-budget"));
     REQUIRE_FALSE(refusal.empty());
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // And the SURFACE answered it, which is the half #447 was about. The endpoint used
+    // to encode this refusal itself, so it moved no counter on any surface -- and on
+    // the compile surface it had moved one on the dedicated port the merge retired,
+    // which is what made the regression silent. Asserted through the fake rather than
+    // through a counter, because what this case can see is the routing; the counter it
+    // reaches is `CompileResponder`'s and has its own case.
+    CHECK(responder.EndpointRefusals() == 1);
+    CHECK(responder.LastEndpointRefusal() == EndpointRefusal::InFlightBudget);
 
     // Never reached the responder: the budget is weighed on the DECLARED length,
     // before a payload byte is read, which is the whole reason it can bound anything.

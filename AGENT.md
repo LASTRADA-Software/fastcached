@@ -603,6 +603,18 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   which is what makes `worker-refusals-counted` exact rather than a proximity
   heuristic. The row is the REFUSAL, not the code: two share `MalformedFrame` and must
   not share a counter, so a table keyed on the code cannot hold them.
+- A surface MERGING undoes that without anybody writing a bug. `FrameEndpoint` encoded
+  five refusals itself, two of which had counted on the compile port #290 retired, so
+  #326's counter went flat at a *migration* while the docs still named it and nothing
+  failed (#447). The scan covered three files and not the listener. It is EXACT, so a
+  file with one uncovered site cannot be covered at all — all of them or the door stays
+  open, and a partial fix leaves the instrument blind to the file that allowed the
+  omission. The endpoint owns WHEN, the surface owns WHAT including the counter
+  (`RefusalReply` / `EndpointRefusalReply`); a refusal decided before a header exists
+  names no verb, so it is the ENDPOINT's own row rather than a default arm on the
+  router — which is also what keeps the two `EndpointBusy` refusals from ever summing.
+  And `SchedulerRequestsRefusedUnauthenticated` fires only pre-payload, so a WRONG
+  token counted nothing: three outcomes, three rows.
 - Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
   makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
   (`SchedulerService::Register`) and never repaired by a renderer — and the
