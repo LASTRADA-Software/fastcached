@@ -741,13 +741,24 @@ what differs between compilers, standard libraries, hosts and tool versions.
   to MSVC Debug, so its absence on other platforms is normal rather than a lost
   registration.
 - So a sanitizer job proves nothing until something proves the sanitizer.
-  `scripts/tsan-gate.sh` refuses to report clean until the test binaries show
-  `__tsan_init` **and** a deliberate race (`src/tests/TsanCanary.cpp`, built by the
-  same `add_compile_options`) has gone red — run **with** `.tsan-suppressions`
-  active, so no pattern broad enough to swallow an obvious race can disarm it. Do
-  not repair that file. A known race lives in `.tsan-suppressions` with its issue
-  number; deleting the entry is part of closing the issue, never part of going
-  green.
+  `scripts/tsan-gate.sh` refuses to report clean until every artefact's OWN OBJECT
+  FILES carry an **undefined** `__tsan_init` reference **and** a deliberate race
+  (`src/tests/TsanCanary.cpp`, built by the same `add_compile_options`) has gone red
+  — run **with** `.tsan-suppressions` active, so no pattern broad enough to swallow
+  an obvious race can disarm it. Do not repair that file. A known race lives in
+  `.tsan-suppressions` with its issue number; deleting the entry is part of closing
+  the issue, never part of going green.
+- That proof is asked of the OBJECTS because it cannot be answered by a binary:
+  `__tsan_init` is DEFINED by the sanitizer runtime, which the link pulls in whole,
+  so a canary whose TU was compiled with no sanitizer flag at all still produced a
+  binary carrying it and PASSED (#472). An object cannot borrow the symbol, so its
+  undefined reference is the one that means something. The canary was never the
+  exposed half — an uninstrumented one fails closed — the SUITES were, since
+  `RunTarget` checks the timeout, the tag filter and the assertion count and none of
+  those tells an instrumented run from an uninstrumented one. Not
+  `__tsan_func_entry`: that is per-FUNCTION, so an object whose TU has no functions
+  carries none, and six of `FastCacheTest`'s 135 are exactly that. `ctest -R
+  tsan-gate-selftest` drives every verdict against staged object trees.
 - An edit script asserts its anchor **matched** — `assert count == 1`, count rather
   than presence, so "missing" and "not unique" both fire — and a generator that
   produced nothing fails instead of printing success. Three separate tools reported
