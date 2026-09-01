@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include <WorkerProtocol.hpp>
+
 namespace FastCache::Node
 {
 
@@ -68,6 +70,18 @@ namespace
         co_return;
     }
 
+    /// What this endpoint answers a connection it has no room for.
+    ///
+    /// A `Cc::SurfaceRefusal` like every other refusal row on this wire -- the wire
+    /// code and the counter as ONE fact with two audiences -- and it lives here rather
+    /// than in `CompileRefusal` because it is not a compile refusal: it is decided
+    /// before a verb exists, and it is answered identically whether this endpoint
+    /// serves compiles, a cache tier, a scheduler or all three.
+    constexpr Cc::SurfaceRefusal ConnectionsExhausted {
+        .code = Wire::ErrorCode::EndpointBusy,
+        .counter = IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity,
+    };
+
 } // namespace
 
 /// Everything the accept loop and its connection tasks share.
@@ -81,6 +95,7 @@ struct FrameServer::State
     IListener& listener;
     IFrameResponder& responder;
     std::string what;
+    IMetricsSink& metrics;
     ILogger& logger;
 
     std::atomic<bool> shuttingDown { false };
@@ -107,11 +122,14 @@ struct FrameServer::State
     /// bound after the endpoint claims to have stopped.
     std::atomic<std::size_t> loopsAlive { 0 };
 
-    State(NodeIoLoop& loop, IListener& l, IFrameResponder& r, std::string_view name, ILogger& log) noexcept:
+    State(
+        NodeIoLoop& loop, IListener& l, IFrameResponder& r, std::string_view name, IMetricsSink& sink, ILogger& log) noexcept
+        :
         io { loop },
         listener { l },
         responder { r },
         what { name },
+        metrics { sink },
         logger { log }
     {
     }
@@ -299,10 +317,13 @@ namespace
     ///
     /// @param responder The surface whose credential this is.
     /// @param payload The AUTH request body, already bounded by `MaxAuthPayload`.
+    /// @param opRaw The AUTH opcode as received, so the refusal reaches the surface
+    ///        that owns the credential rather than being encoded here.
     /// @param credentialAccepted This connection's flag; set only on `Accepted`.
     /// @return The reply frame to write.
     [[nodiscard]] std::vector<std::byte> AnswerAuth(IFrameResponder const& responder,
                                                     std::span<std::byte const> payload,
+                                                    std::uint8_t opRaw,
                                                     bool& credentialAccepted)
     {
         auto const outcome = responder.CheckCredential(payload);
@@ -317,12 +338,19 @@ namespace
         // Total over the enumerators, so a fifth outcome cannot be answered by
         // falling through to Ok -- the one wrong answer here, because it would tell a
         // client its credential was accepted.
+        //
+        // Both refusals are ANSWERED BY THE SURFACE, which owns the credential and so
+        // owns the counter. Encoded here they moved nothing at all, and the second one
+        // is the expensive silence: a peer presenting a WRONG token is exactly what
+        // `SchedulerRequestsRefusedUnauthenticated` exists to make visible, that
+        // counter fires only on the pre-payload gate, and so credential guessing was
+        // invisible to the one series an operator would go looking at (#447).
         switch (outcome)
         {
             case CredentialOutcome::Malformed:
-                return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame, {});
+                return responder.EndpointRefusalReply(EndpointRefusal::CredentialMalformed, opRaw, {});
             case CredentialOutcome::Rejected:
-                return Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed");
+                return responder.EndpointRefusalReply(EndpointRefusal::CredentialRejected, opRaw, "authentication failed");
             case CredentialOutcome::NoPolicy:
             case CredentialOutcome::Accepted:
                 break;
@@ -411,12 +439,23 @@ namespace
                     // usefully. Writing first costs nothing and the resynchronization
                     // is just as good: a peer that sends what it declared is still
                     // stepped over exactly.
+                    //
+                    // Encoded and counted by the SURFACE, exactly as the pre-payload
+                    // refusal below is, and this branch was the one that was not:
+                    // it answered `payload-too-large` correctly and moved nothing, so
+                    // the cheapest probe there is -- a header and no body -- left the
+                    // series an operator alerts on perfectly flat (#326, undone by the
+                    // merge and reinstated by #447). Two ceilings, one fact: this is
+                    // the surface-wide cap and `DecidePrePayload` holds the per-verb
+                    // one, an operator does the same thing about both, so they share
+                    // one counter and one decision rather than splitting.
                     if (!co_await WriteAll(socket.get(),
-                                           Wire::EncodeErrorReply(Wire::ErrorCode::PayloadTooLarge,
-                                                                  std::format("{} exceeds the {} {}-byte request cap",
-                                                                              decoded->payloadLength,
-                                                                              state->what,
-                                                                              cap))))
+                                           state->responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge,
+                                                                         decoded->opRaw,
+                                                                         std::format("{} exceeds the {} {}-byte request cap",
+                                                                                     decoded->payloadLength,
+                                                                                     state->what,
+                                                                                     cap))))
                         break;
 
                     // Then the body is STEPPED OVER so the connection stays usable,
@@ -484,15 +523,16 @@ namespace
                 {
                     // Encoded and counted by the surface, not here: the endpoint owns
                     // WHEN the question is asked, the responder owns the answer.
-                    if (!co_await WriteAll(socket.get(), state->responder.RefusalReply(decision, decoded->opRaw)))
+                    if (!co_await WriteAll(socket.get(), state->responder.RefusalReply(decision, decoded->opRaw, {})))
                         break;
                     if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
                         break;
                     continue;
                 }
 
-                if (auto const budget = state->responder.MaxInFlightBytes();
-                    budget != 0 && state->inFlightBytes.load(std::memory_order_acquire) + decoded->payloadLength > budget)
+                if (auto const budget = state->responder.MaxInFlightBytes(),
+                    held = state->inFlightBytes.load(std::memory_order_acquire);
+                    budget != 0 && held + decoded->payloadLength > budget)
                 {
                     // Checked on the DECLARED length, before a payload byte is read,
                     // so an over-budget request costs no allocation at all. The
@@ -504,13 +544,24 @@ namespace
                     // have accepted, so the peer is told to come back rather than made
                     // to reconnect over a transient budget. Answered first, for the
                     // reason the oversize branch is.
-                    if (!co_await WriteAll(
-                            socket.get(),
-                            Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
-                                                   std::format("{} has {} of {} bytes in flight",
-                                                               state->what,
-                                                               state->inFlightBytes.load(std::memory_order_acquire),
-                                                               budget))))
+                    //
+                    // The figure in the message is the one the DECISION was taken on,
+                    // read once. Loaded a second time to format it, the refusal could
+                    // name a number that does not explain it -- another connection
+                    // releasing in between yields "has 0 of N bytes in flight" beside
+                    // a refusal for having too many.
+                    //
+                    // Counted by the surface too, and it is the same regression the
+                    // oversize branch above was: the dedicated compile port answered
+                    // this with `CompileRefusal::EndpointBusy` and moved
+                    // `worker_jobs_refused_endpoint_busy_total`, which the operator
+                    // documentation still promises, and the merged listener answered
+                    // it with a bare code (#447).
+                    if (!co_await WriteAll(socket.get(),
+                                           state->responder.EndpointRefusalReply(
+                                               EndpointRefusal::InFlightBudget,
+                                               decoded->opRaw,
+                                               std::format("{} has {} of {} bytes in flight", state->what, held, budget))))
                         break;
                     if (!(co_await reader.Skip(decoded->payloadLength)).has_value())
                         break;
@@ -551,7 +602,8 @@ namespace
                 // one flag is exactly the part that reads fine without the framing.
                 if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
                 {
-                    if (!co_await WriteAll(socket.get(), AnswerAuth(state->responder, *payload, credentialAccepted)))
+                    if (!co_await WriteAll(socket.get(),
+                                           AnswerAuth(state->responder, *payload, decoded->opRaw, credentialAccepted)))
                         break;
                     continue;
                 }
@@ -632,11 +684,22 @@ namespace
         state->Track(socket.get(), deadline);
         try
         {
+            // **The one refusal on this endpoint that belongs to the endpoint.**
+            // Decided at accept, before a header exists, so it names no verb and
+            // `MergedResponder` has nothing to route it by -- and contorting the
+            // router into answering a question it cannot have the input for is how a
+            // default arm ends up wrong later. So `FrameServer` counts it against its
+            // own row, which is also what keeps it apart from
+            // `EndpointRefusal::InFlightBudget`: the two share `EndpointBusy` on the
+            // wire and say opposite things to an operator -- one request is too big
+            // right now, against this surface is full -- so they must never sum. Two
+            // categories rather than a comment asking somebody to remember (#447).
             if (co_await WriteAll(socket.get(),
-                                  Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy,
-                                                         std::format("{} is already holding {} connections",
-                                                                     state->what,
-                                                                     state->responder.MaxOpenConnections()))))
+                                  Cc::Refuse(state->metrics,
+                                             ConnectionsExhausted,
+                                             std::format("{} is already holding {} connections",
+                                                         state->what,
+                                                         state->responder.MaxOpenConnections()))))
                 co_await DrainUntilPeerCloses(socket.get(), state->responder.MaxRequestBytes());
         }
         catch (...)
@@ -672,9 +735,13 @@ namespace
 
 } // namespace
 
-FrameServer::FrameServer(
-    NodeIoLoop& io, IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept:
-    _state { std::make_shared<State>(io, listener, responder, what, logger) }
+FrameServer::FrameServer(NodeIoLoop& io,
+                         IListener& listener,
+                         IFrameResponder& responder,
+                         std::string_view what,
+                         IMetricsSink& metrics,
+                         ILogger& logger) noexcept:
+    _state { std::make_shared<State>(io, listener, responder, what, metrics, logger) }
 {
 }
 
@@ -796,9 +863,10 @@ FrameEndpoint::FrameEndpoint(NodeIoLoop& io,
                              IFrameResponder& responder,
                              std::string_view what,
                              std::string boundEndpoint,
+                             IMetricsSink& metrics,
                              ILogger& logger):
     _listener { std::move(listener) },
-    _server { std::make_unique<FrameServer>(io, *_listener, responder, what, logger) },
+    _server { std::make_unique<FrameServer>(io, *_listener, responder, what, metrics, logger) },
     _boundEndpoint { std::move(boundEndpoint) }
 {
     // Adopted rather than started here. The loop is run once, by its owner, after
@@ -821,8 +889,12 @@ std::size_t FrameEndpoint::InFlightBytes() const noexcept
     return _server->InFlightBytes();
 }
 
-std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
-    NodeIoLoop& io, NodeSurface surface, NodeConfig const& cfg, IFrameResponder& responder, ILogger& logger)
+std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(NodeIoLoop& io,
+                                                                                NodeSurface surface,
+                                                                                NodeConfig const& cfg,
+                                                                                IFrameResponder& responder,
+                                                                                IMetricsSink& metrics,
+                                                                                ILogger& logger)
 {
     // The row resolves it, so the address this binds and the address
     // `--print-surfaces` prints are the same computation rather than two that agree
@@ -863,7 +935,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     // reach it are this factory and `StartAdopted`, each of which has already proved
     // its listener is bound, and nothing else.
     return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, row.name, std::move(bound), logger } };
+        io, std::move(listener), responder, row.name, std::move(bound), metrics, logger } };
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartAdopted(NodeIoLoop& io,
@@ -871,6 +943,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
                                                                                        int descriptor,
                                                                                        std::string_view advertisedHost,
                                                                                        IFrameResponder& responder,
+                                                                                       IMetricsSink& metrics,
                                                                                        ILogger& logger)
 {
     auto const& row = RowFor(surface);
@@ -895,6 +968,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     (void) descriptor;
     (void) advertisedHost;
     (void) responder;
+    (void) metrics;
     (void) logger;
     (void) row;
     return std::unexpected { std::string { "socket activation is not available on this platform" } };
@@ -912,7 +986,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     logger.Logf(LogLevel::Info, "{} serving a socket-activated listener, advertised as {}", row.name, bound);
 
     return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, row.name, std::move(bound), logger } };
+        io, std::move(listener), responder, row.name, std::move(bound), metrics, logger } };
 #endif
 }
 

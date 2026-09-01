@@ -866,6 +866,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                                         schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
                                         &compileResponder,
                                         activated,
+                                        metrics,
                                         logger);
     if (!nodeSurfaceOrRefusal.has_value())
     {

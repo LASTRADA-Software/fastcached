@@ -96,10 +96,23 @@ class NamedResponder final: public IFrameResponder
     }
 
     [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
-                                                      std::uint8_t /*opRaw*/) const override
+                                                      std::uint8_t /*opRaw*/,
+                                                      std::string_view /*detail*/) const override
     {
         _refusals.push_back(_name);
         return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), _name);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// Records the same name, so the routing cases below assert the attribution of an
+    /// endpoint-decided refusal exactly as they do a pre-payload one.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal /*refusal*/,
+                                                              std::uint8_t /*opRaw*/,
+                                                              std::string_view /*detail*/) const override
+    {
+        _refusals.push_back(_name);
+        return Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, _name);
     }
 
     [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
@@ -427,6 +440,15 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     NamedResponder cache { "cache" };
     MergedResponder both { &cache, &scheduler, nullptr };
     CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::UnimplementedVerb);
+
+    // **And none of them is counted, which was decided rather than left out** (#447).
+    // Every other refusal on this listener is an event; this one is the answer ordinary
+    // traffic gets. A worker with no scheduler refuses every `AUTH` a `FASTCACHE_TOKEN`
+    // launcher sends, once per exchange for a whole build, and a node with no tier
+    // refuses every local `FETCH` -- so a counter here would be dominated by a healthy
+    // build and a port scan would be invisible inside it. That is this ticket's own
+    // failure reached from the other side: a series nothing can be read out of is no
+    // better than one that never moves.
 }
 
 TEST_CASE("An unowned verb is refused before its payload is read", "[node][merged-responder]")
@@ -445,6 +467,15 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     CHECK_FALSE(schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
     REQUIRE(scheduler.Admitted().size() == 1);
     CHECK(scheduler.Admitted().front() == static_cast<std::uint8_t>(Wire::Op::Lease));
+
+    // The fourth route, and the one #447 added: an endpoint-decided refusal about a
+    // verb nobody owns. One sentence however the question arrived -- a router asked
+    // about a verb it cannot place has only the one honest answer, and giving it here
+    // is what keeps a peer from being told its frame was too large for a verb that was
+    // never going to be answered at all.
+    auto const budget =
+        schedulerOnly.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Fetch), {});
+    CHECK(ErrorOf(budget) == Wire::UnimplementedVerb);
 }
 
 TEST_CASE("The credential answer follows the verb, not the surface", "[node][merged-responder]")
@@ -474,17 +505,28 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     NamedResponder scheduler { "scheduler" };
     MergedResponder responder { &cache, &scheduler, nullptr };
 
-    (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store));
-    (void) responder.RefusalReply(Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease));
+    (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store), {});
+    (void) responder.RefusalReply(Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease), {});
 
     CHECK(cache.Refusals() == std::vector<std::string> { "cache" });
     CHECK(scheduler.Refusals() == std::vector<std::string> { "scheduler" });
 
-    // An unowned verb still gets a reply, and moves nobody's counter: there is no
-    // component whose refusal it would be.
+    // An unowned verb still gets a reply, and it is no component's: there is nobody
+    // whose refusal it would be, so neither fake sees it.
+    //
+    // **It says the verb is unserved rather than repeating the decision** (#447). This
+    // arm is reachable -- the endpoint weighs its surface-wide frame ceiling before it
+    // asks `RefusePeer`, so a header naming a verb nothing here serves and declaring a
+    // gigabyte arrives at exactly this call -- and it used to answer
+    // `payload-too-large`, which sends that peer to shrink a frame that was never going
+    // to be answered at all.
+    //
+    // It moves no counter, and that is deliberate: see `UnservedReply`, and the case
+    // above for why counting an answer ordinary traffic produces continuously would
+    // bury the thing a counter here would be read for.
     auto const orphan =
-        responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile));
-    CHECK(ErrorOf(orphan) == Wire::ErrorCode::PayloadTooLarge);
+        responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Compile), {});
+    CHECK(ErrorOf(orphan) == Wire::UnimplementedVerb);
     CHECK(cache.Refusals().size() == 1);
     CHECK(scheduler.Refusals().size() == 1);
 }
@@ -532,9 +574,10 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     // absent.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     auto const [cfg, port] = BaseConfig();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "serving no 0xFC port"));
@@ -554,6 +597,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     // port that no longer exists.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder compile { "compile" };
     auto [cfg, port] = BaseConfig();
     cfg.cacheMemoryBytes = 0; // nowhere to keep objects, so no tier is built
@@ -561,7 +605,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     REQUIRE_FALSE(cfg.serveScheduler);
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface != nullptr);
 
@@ -576,11 +620,12 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
 {
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
@@ -653,6 +698,7 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of the configuration.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
     HandedOverListenFd handed;
     auto const supervisorPort = handed.port;
@@ -669,7 +715,8 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of this case, so the two must differ.
     cfg.advertise = "worker-01.internal:1";
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, logger);
+    auto surface =
+        StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
 
@@ -700,6 +747,7 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // ordinary deployment rather than an exotic one.
     NodeIoLoop io;
     CapturingLogger logger;
+    AtomicMetricsSink metrics;
     NamedResponder cache { "cache" };
 
     NodeConfig cfg;
@@ -709,7 +757,7 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // Not a descriptor. `Adopt` answers this without touching it, which is also why
     // there is nothing here to close: ownership passes on every path, including the
     // ones that fail.
-    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, logger);
+    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("socket-activated"));
 }
@@ -757,6 +805,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
 
         NodeIoLoop io;
         CapturingLogger logger;
+        AtomicMetricsSink metrics;
         NamedResponder cache { "cache" };
         NamedResponder scheduler { "scheduler" };
 
@@ -769,7 +818,7 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE(holder->IsBound());
 
         auto refused = StartNodeSurfaceOrExplain(
-            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, logger);
+            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, metrics, logger);
         REQUIRE_FALSE(refused.has_value());
 
         // The flag, so an operator knows what to edit.

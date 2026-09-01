@@ -13,10 +13,8 @@
 namespace FastCache::Node
 {
 
-std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
-                                                        NodeConfig const& cfg,
-                                                        std::optional<int> inherited,
-                                                        ILogger& logger)
+std::expected<void, std::string> NodeFrameSurface::Bind(
+    NodeIoLoop& io, NodeConfig const& cfg, std::optional<int> inherited, IMetricsSink& metrics, ILogger& logger)
 {
     // Two factories over one constructor, and which one runs is decided by whether a
     // supervisor handed a descriptor over -- never by a flag. The environment says
@@ -30,10 +28,11 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     // today. Under activation there is no such computation to do: the unit bound the
     // port, and `--advertise` -- mandatory there, and refused at startup when absent
     // -- is the only thing that can say where clients should go.
-    auto started = inherited.has_value()
-                       ? FrameEndpoint::StartAdopted(
-                             io, NodeSurface::Node, *inherited, HostOfEndpoint(AdvertisedEndpoint(cfg)), _responder, logger)
-                       : FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, logger);
+    auto started =
+        inherited.has_value()
+            ? FrameEndpoint::StartAdopted(
+                  io, NodeSurface::Node, *inherited, HostOfEndpoint(AdvertisedEndpoint(cfg)), _responder, metrics, logger)
+            : FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, metrics, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -47,6 +46,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
                                                                                         IFrameResponder* scheduler,
                                                                                         IFrameResponder* compile,
                                                                                         std::optional<int> inherited,
+                                                                                        IMetricsSink& metrics,
                                                                                         ILogger& logger)
 {
     // **Whether** this surface is served is the row's answer -- the same one
@@ -87,7 +87,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     }
 
     auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
-    auto bound = surface->Bind(io, cfg, inherited, logger);
+    auto bound = surface->Bind(io, cfg, inherited, metrics, logger);
     if (bound.has_value())
         return surface;
 

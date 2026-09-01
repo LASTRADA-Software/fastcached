@@ -11,6 +11,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
@@ -571,9 +572,17 @@ class ShortWindowResponder final: public IFrameResponder
     {
         return _inner.CheckCredential(payload);
     }
-    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t opRaw) const override
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override
     {
-        return _inner.RefusalReply(decision, opRaw);
+        return _inner.RefusalReply(decision, opRaw, detail);
+    }
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override
+    {
+        return _inner.EndpointRefusalReply(refusal, opRaw, detail);
     }
     [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
     {
@@ -858,7 +867,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     MergedResponder merged { nullptr, nullptr, &tooShort };
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -941,7 +950,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile)) > FrameServer::HeaderTimeout);
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -999,7 +1008,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
     REQUIRE(endpoint.has_value());
     io.Start();
 
@@ -1076,4 +1085,52 @@ TEST_CASE("Both doors charge one number for a frame the budget cannot afford", "
     // predicates over one budget that disagreed would be this defect again.
     CHECK_FALSE(capacity.IsChargeable(Budget + 1));
     CHECK(capacity.IsChargeable(Budget));
+}
+
+TEST_CASE("The merged listener counts the frame it refuses without reading", "[node][compile]")
+{
+    // Issue #447, and it is #326 undone by a migration rather than a fresh omission.
+    //
+    // The frame-level ceiling is the CHEAPEST probe there is -- a 24-byte header
+    // declaring more than this surface will ever buffer -- so it is the likeliest
+    // thing to be pointed at a node, and on the dedicated compile port #326 gave it
+    // the one counter an operator can see. #290 stage 3 retired that port. The merged
+    // `0xFC` listener answers the same refusal correctly on the wire and moves
+    // nothing, so the series went flat on the surface that became the primary one,
+    // with no test failing.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    // A header alone, naming COMPILE and declaring more than the surface's own cap.
+    // The bytes are never sent, which is the whole point: the refusal costs the peer
+    // a header and costs this node one reply.
+    std::array<std::byte, Wire::RequestHeaderSize> frame {};
+    WireFrame::PutHeader(frame,
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Compile),
+                         static_cast<std::uint32_t>(merged.MaxRequestBytes() + 1));
+
+    auto const reply = Exchange(port, std::vector<std::byte> { frame.begin(), frame.end() });
+    REQUIRE(ErrorOf(reply) == Wire::ErrorCode::PayloadTooLarge);
+
+    // The reply still names BOTH numbers: "too large" without the ceiling tells an
+    // operator nothing about the limit they are up against.
+    auto const body = std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize);
+    auto const decoded = Wire::DecodeErrorPayload(body);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).second.contains(std::to_string(merged.MaxRequestBytes())));
+
+    // And the only thing an operator can see rose. Without this the node refuses every
+    // probe correctly and looks, on /metrics, exactly like a port nobody is talking to.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 1);
+
+    REQUIRE(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
 }

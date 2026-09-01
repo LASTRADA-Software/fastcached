@@ -23,13 +23,28 @@
 # **`Wire::EncodeErrorReply` appears exactly once across the surfaces, inside
 # `Refuse`.**
 #
-# Three files are covered, and an operator reads their counters side by side:
+# Four files are covered, and an operator reads their counters side by side:
 # `WorkerProtocol.cpp` answers the verbs, `CompileResponder.cpp` answers the peer and
-# capacity questions for compiles arriving on the merged `0xFC` listener, and
+# capacity questions for compiles arriving on the merged `0xFC` listener,
 # `CompileCapacity.cpp` holds the predicates both of them share -- admission and the
-# drain decision ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)).
+# drain decision ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290))
+# -- and `FrameEndpoint.cpp` is the listener itself.
 # `CompileResponder.cpp` is why this list is a list rather than a pair: it was added
 # with uncounted refusals in it, and the scan said nothing because it was not looking.
+#
+# `FrameEndpoint.cpp` is why that happened TWICE, and it is the file this check was
+# most needed on. It held five refusals that answered on the wire and counted nothing
+# -- the frame ceiling, the in-flight byte budget, the two credential outcomes and the
+# at-capacity refusal -- and the scan could see none of them, so #326's counter stopped
+# moving the moment the dedicated compile port was retired and no test failed
+# ([#447](https://github.com/LASTRADA-Software/fastcached/issues/447)).
+#
+# It could not be added while ONE site remained, and that is a property of this check
+# rather than a matter of thoroughness: the rule below is exactness, so a file with one
+# uncovered refusal cannot be covered at all. Four of the five now ask the surface that
+# owns the verb, through `IFrameResponder::RefusalReply` and `EndpointRefusalReply`; the
+# fifth is decided at accept with no verb in hand, so the endpoint counts it itself,
+# against its own `Cc::SurfaceRefusal` row.
 #
 # `WorkerServer.cpp` used to be the second row, answering before a verb was reached on
 # the DEDICATED compile port. #290 stage 3 retired that port -- the compile verbs now
@@ -75,7 +90,8 @@ endif()
 set(surfaces
     "src/apps/fastcache-cc/WorkerProtocol.cpp"
     "src/apps/fastcache-compile-node/CompileCapacity.cpp"
-    "src/apps/fastcache-compile-node/CompileResponder.cpp")
+    "src/apps/fastcache-compile-node/CompileResponder.cpp"
+    "src/apps/fastcache-compile-node/FrameEndpoint.cpp")
 
 foreach(relative IN LISTS surfaces)
     if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")
@@ -114,7 +130,7 @@ list(LENGTH callSites siteCount)
 # into success, which is the direction this project keeps getting wrong.
 if(siteCount EQUAL 0)
     message("")
-    message("  No `EncodeErrorReply` call was found on either covered surface.")
+    message("  No `EncodeErrorReply` call was found on any covered surface.")
     message("")
     message("`Refuse` is built on one, so zero means this scan is no longer looking at")
     message("what it thinks it is -- a renamed function, a moved file, a changed")

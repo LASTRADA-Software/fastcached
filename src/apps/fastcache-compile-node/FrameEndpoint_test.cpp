@@ -4,6 +4,7 @@
 #include "Responders.hpp"
 
 #include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -269,7 +270,8 @@ TEST_CASE("A surface with no address to bind is refused, not guessed at", "[node
     // an address rather than to nothing.
     NodeConfig unserved;
     unserved.nodeListen.clear();
-    auto const started = FrameEndpoint::Start(fleet.io, NodeSurface::Node, unserved, fleet.responder, fleet.logger);
+    auto const started =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, unserved, fleet.responder, fleet.metrics, fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     // Naming the flag, because an operator reading it has to know which surface went
@@ -286,8 +288,12 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     // it is set, and is asserted there (SocketAddress_test.cpp, issue #85).
     Fleet fleet;
     auto const unreachable = std::string { "192.0.2.1:6674" };
-    auto const started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, ConfigFor(NodeSurface::Node, unreachable), fleet.responder, fleet.logger);
+    auto const started = FrameEndpoint::Start(fleet.io,
+                                              NodeSurface::Node,
+                                              ConfigFor(NodeSurface::Node, unreachable),
+                                              fleet.responder,
+                                              fleet.metrics,
+                                              fleet.logger);
 
     REQUIRE_FALSE(started.has_value());
     CHECK(started.error().contains(unreachable));
@@ -306,7 +312,7 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     probe.reset();
 
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(started.has_value());
     fleet.Serve();
 
@@ -339,7 +345,7 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -375,7 +381,7 @@ TEST_CASE("This machine is admitted whatever the member list says", "[node][sche
 
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -419,7 +425,7 @@ TEST_CASE("An oversize frame is refused with both numbers, and never buffered", 
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(started.has_value());
 
     // Bound and adopted; now let the loop accept. Separating the two is the ordering
@@ -535,12 +541,45 @@ class HoldableResponder final: public IFrameResponder
     /// Records the verb as well, which is what a merged listener has to get right: the
     /// refusal is counted against the surface that OWNED the verb, so a case can assert
     /// the attribution rather than only the reply (#290).
-    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t opRaw) const override
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override
     {
         _refusedOp.store(static_cast<int>(opRaw), std::memory_order_release);
         if (decision == Wire::PrePayloadDecision::Unauthenticated)
             _unauthenticatedRefusals.fetch_add(1, std::memory_order_acq_rel);
-        return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), {});
+        return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), detail);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// Records that the surface was asked, and which verb it was asked about. The
+    /// point of the seam is that the endpoint encodes none of these itself (#447), and
+    /// a fake that answered without recording could not tell a case whether the
+    /// endpoint had routed the refusal or quietly encoded its own.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override
+    {
+        _refusedOp.store(static_cast<int>(opRaw), std::memory_order_release);
+        _endpointRefusals.fetch_add(1, std::memory_order_acq_rel);
+        _lastEndpointRefusal.store(static_cast<int>(refusal), std::memory_order_release);
+        return Wire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
+    }
+
+    /// @return How many refusals the endpoint routed here rather than encoding.
+    [[nodiscard]] std::size_t EndpointRefusals() const noexcept
+    {
+        return _endpointRefusals.load(std::memory_order_acquire);
+    }
+
+    /// @return The last endpoint refusal this fake was asked to answer.
+    [[nodiscard]] std::optional<EndpointRefusal> LastEndpointRefusal() const noexcept
+    {
+        auto const raw = _lastEndpointRefusal.load(std::memory_order_acquire);
+        if (raw < 0)
+            return std::nullopt;
+        return static_cast<EndpointRefusal>(raw);
     }
 
     /// @return The verb of the last refusal, or nullopt if nothing was refused.
@@ -731,6 +770,8 @@ class HoldableResponder final: public IFrameResponder
     CredentialOutcome _outcome { CredentialOutcome::NoPolicy };
     mutable std::atomic<std::size_t> _credentialChecks { 0 };
     mutable std::atomic<std::size_t> _unauthenticatedRefusals { 0 };
+    mutable std::atomic<std::size_t> _endpointRefusals { 0 };
+    mutable std::atomic<int> _lastEndpointRefusal { -1 };
     /// The verb of the last refusal, or -1. An `int` for the same reason the two
     /// verb selectors above are.
     mutable std::atomic<int> _refusedOp { -1 };
@@ -779,8 +820,8 @@ TEST_CASE("A peer the surface refuses never gets its payload read", "[node][fram
     responder.Limit(8, 1024);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -846,8 +887,8 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     responder.Limit(8, 64ULL * 1024ULL);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -930,8 +971,8 @@ TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][
     responder.RefuseEveryPeer(false);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -970,8 +1011,8 @@ TEST_CASE("An authenticated peer is served the same verb", "[node][frame]")
     responder.CredentialAnswers(CredentialOutcome::Accepted);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1019,8 +1060,8 @@ TEST_CASE("One peer is refused one verb and served another on the same listener"
     responder.RefuseOnlyVerb(Wire::Op::Fetch);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1069,8 +1110,8 @@ TEST_CASE("One verb needs a credential and another does not on the same listener
     responder.RequireAuthOnlyFor(Wire::Op::Lease);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1115,8 +1156,8 @@ TEST_CASE("A refusal is reported with the verb that caused it", "[node][frame]")
     responder.RequireAuth(true);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1144,8 +1185,8 @@ TEST_CASE("An admitted peer is asked once and served normally", "[node][frame]")
     responder.RefuseEveryPeer(false);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1172,8 +1213,8 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     responder.Hold(true);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1217,7 +1258,7 @@ TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1243,7 +1284,7 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1271,6 +1312,69 @@ TEST_CASE("A connection survives a recoverable refusal", "[node][frame]")
     CHECK(Wire::DecodeReplyHeader(after).has_value());
 }
 
+TEST_CASE("A wrong token is counted apart from never having presented one", "[node][scheduler]")
+{
+    // Issue #447, and the half of it that is a security-observability hole rather than
+    // bookkeeping. `SchedulerRequestsRefusedUnauthenticated` says "somebody is reaching
+    // for verbs they hold no secret for", and its own documentation tells an operator
+    // that zero there on a non-loopback bind means the port is open. What it could not
+    // say is that somebody had presented a secret and got it WRONG: the endpoint
+    // encoded that refusal itself, so credential guessing against a token-configured
+    // scheduler moved nothing at all, on the exact series an operator would go
+    // looking at.
+    //
+    // Three outcomes, three counters, and the case asserts all three together --
+    // separately, any one of them passes against an implementation that sums them.
+    Fleet fleet;
+    auto const policy = std::make_shared<AuthPolicy const>(std::string {}, std::string { "the-real-token" });
+    SchedulerResponder responder { fleet.protocol, fleet.membership, fleet.metrics, policy };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation conversation { port };
+
+    // A well-formed credential that is simply wrong. The connection survives it, which
+    // is what lets the same peer go on to get it right -- and what lets this case send
+    // the malformed one down the same connection.
+    auto const rejected = conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "guessing" }));
+    REQUIRE_FALSE(rejected.empty());
+    CHECK(ErrorOf(rejected) == Wire::ErrorCode::Unauthenticated);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
+
+    // An AUTH payload that will not decode at all: one field where the verb needs two.
+    // A different operator problem -- a client built against another release -- and so
+    // a different row, or an old client in the fleet hides every wrong secret inside
+    // its own noise.
+    std::vector<std::byte> stunted(Wire::RequestHeaderSize + 1, std::byte { 0 });
+    WireFrame::PutHeader(std::span<std::byte> { stunted }.first(Wire::RequestHeaderSize),
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Auth),
+                         1);
+    auto const malformed = conversation.Send(stunted);
+    REQUIRE_FALSE(malformed.empty());
+    CHECK(ErrorOf(malformed) == Wire::ErrorCode::MalformedFrame);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsMalformed) == 1);
+
+    // Neither is the pre-payload refusal, which nothing here has triggered: no verb was
+    // reached before a credential. Summed with either of the above, "is my scheduler
+    // port being probed" stops being answerable.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated) == 0);
+
+    // And the right secret still works, so none of the counting is in the way of the
+    // thing being counted.
+    auto const accepted =
+        conversation.Send(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "the-real-token" }));
+    auto const header = Wire::DecodeReplyHeader(accepted);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerCredentialsRejected) == 1);
+}
+
 TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
 {
     // What the loop for #176 changed about the cap, made explicit so it cannot drift
@@ -1287,8 +1391,8 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1334,8 +1438,8 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     responder.Limit(/*concurrent*/ 1, /*budget*/ 0);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1348,6 +1452,17 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     auto const refusal = Exchange(port, Fetch("while-attached"));
     REQUIRE_FALSE(refusal.empty());
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // Counted, and counted by the ENDPOINT (#447). This is the one refusal here that
+    // belongs to no surface: it is decided at accept, before a header exists, so it
+    // names no verb and there is no owner to route it to. Uncounted, a surface turning
+    // every arrival away looked on /metrics exactly like a surface nobody was dialling.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity) == 1);
+
+    // And it is NOT the byte budget's counter, although the two share `endpoint-busy`
+    // on the wire. An operator raises a connection ceiling for this one and looks at
+    // request sizes for the other; summed, neither question can be answered.
+    CHECK(responder.EndpointRefusals() == 0);
 }
 
 TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
@@ -1369,8 +1484,8 @@ TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
     responder.Limit(/*concurrent*/ 0, /*budget*/ 1);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1379,6 +1494,15 @@ TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
     auto const refusal = conversation.Send(Fetch("over-budget"));
     REQUIRE_FALSE(refusal.empty());
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
+
+    // And the SURFACE answered it, which is the half #447 was about. The endpoint used
+    // to encode this refusal itself, so it moved no counter on any surface -- and on
+    // the compile surface it had moved one on the dedicated port the merge retired,
+    // which is what made the regression silent. Asserted through the fake rather than
+    // through a counter, because what this case can see is the routing; the counter it
+    // reaches is `CompileResponder`'s and has its own case.
+    CHECK(responder.EndpointRefusals() == 1);
+    CHECK(responder.LastEndpointRefusal() == EndpointRefusal::InFlightBudget);
 
     // Never reached the responder: the budget is weighed on the DECLARED length,
     // before a payload byte is read, which is the whole reason it can bound anything.
@@ -1397,7 +1521,7 @@ TEST_CASE("A foreign magic still closes the connection", "[node][frame]")
     Fleet fleet;
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.logger);
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
@@ -1427,8 +1551,8 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
     responder.Hold(true);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     responder.WatchEndpoint(**endpoint);
     fleet.Serve();
@@ -1476,8 +1600,8 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
     responder.Hold(true);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     responder.WatchEndpoint(**endpoint);
     fleet.Serve();
@@ -1530,8 +1654,8 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     responder.Limit(/*concurrent*/ 0, /*budget*/ (bigDeclared * 2) + 1);
 
     auto const port = FreePort();
-    auto endpoint =
-        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 

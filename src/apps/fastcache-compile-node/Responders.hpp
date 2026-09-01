@@ -11,15 +11,72 @@
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
+#include <ranges>
+
+#include <WorkerProtocol.hpp>
 
 namespace FastCache::Node
 {
+
+namespace Detail
+{
+    /// What the SCHEDULER surface answers each endpoint-decided refusal with.
+    ///
+    /// `Cc::SurfaceRefusal` rows and `Cc::Refuse`, not an `Increment` beside an
+    /// `EncodeErrorReply`: the row IS the refusal, so there is no argument to pass a
+    /// bare code to and the counter cannot be left out. That is the property #447
+    /// reinstates elsewhere in this change, and a file holding two new security
+    /// counters is the last place to ship the other spelling.
+    ///
+    /// A `std::optional` per row rather than a switch with a silent arm, because one
+    /// refusal here deliberately counts NOTHING: the byte budget says this surface is
+    /// momentarily full, which the peer retries past, and summed into a credential
+    /// series it would make that series unreadable. `nullopt` says so where a missing
+    /// `case` would only imply it. `EnumTable` takes its extent from
+    /// `EndpointRefusal::Last`, so a fourth enumerator leaves an empty row here rather
+    /// than silently borrowing a neighbour's.
+    struct SchedulerEndpointRefusal
+    {
+        EndpointRefusal refusal;                  ///< Which endpoint decision this describes.
+        std::optional<Cc::SurfaceRefusal> answer; ///< The row, or nothing where this surface counts none.
+    };
+
+    inline constexpr EnumTable<EndpointRefusal, SchedulerEndpointRefusal> SchedulerEndpointRefusals { {
+        { .refusal = EndpointRefusal::InFlightBudget, .answer = std::nullopt },
+        { .refusal = EndpointRefusal::CredentialMalformed,
+          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed } },
+        { .refusal = EndpointRefusal::CredentialRejected,
+          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected } },
+    } };
+
+    // Positional rows alone would not have caught this: appending an enumerator leaves
+    // a value-initialised row here, whose `answer` is `nullopt` -- so a guard that
+    // short-circuits on the absent case passes VACUOUSLY and the new refusal ships
+    // uncounted, which is this ticket's own defect re-entering through its fix. The row
+    // carries its enumerator so the position is checked whatever the answer is.
+    static_assert(RowsInEnumeratorOrder(SchedulerEndpointRefusals, &SchedulerEndpointRefusal::refusal),
+                  "SchedulerEndpointRefusals must hold one row per EndpointRefusal, in enumerator order");
+
+    // A row states the code a second time, and a second statement of one fact is a
+    // second thing to be wrong. Checked rather than trusted, against the one place
+    // that property lives.
+    static_assert(std::ranges::all_of(SchedulerEndpointRefusals,
+                                      [](SchedulerEndpointRefusal const& row) {
+                                          return !row.answer.has_value() || row.answer->code == ErrorCodeFor(row.refusal);
+                                      }),
+                  "a scheduler refusal row must answer the code `ErrorCodeFor` names for its refusal");
+} // namespace Detail
 
 /// Serves the fleet's scheduling verbs.
 ///
 /// The peer's host reaches the membership oracle here and nowhere else, which is
 /// what keeps `FrameServer` free of any policy: it hands over an identity and does
 /// not know what anybody does with it.
+
 class SchedulerResponder final: public IFrameResponder
 {
   public:
@@ -97,14 +154,47 @@ class SchedulerResponder final: public IFrameResponder
     /// for, and an operator watching for the second does not want the first summed
     /// into it.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
-                                                      std::uint8_t /*opRaw*/) const override
+                                                      std::uint8_t /*opRaw*/,
+                                                      std::string_view detail) const override
     {
         if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
             _metrics.Increment(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated);
 
-        // No detail. What a message could add is which verb the caller failed to
-        // reach, and an unauthenticated peer learns nothing from being told that.
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
+        // The caller's wording, which is empty for every decision but the frame
+        // ceiling -- and that one names both numbers, because "too large" without the
+        // limit tells an operator nothing about a kilobyte cap. Nothing is added here:
+        // what a message could say is which verb the caller failed to reach, and an
+        // unauthenticated peer learns nothing from being told that.
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), detail);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// The credential refusals are this surface's, because the credential is: `AUTH`
+    /// routes here on the merged listener, so a peer presenting a wrong token is
+    /// refused by this component and has to be counted against it.
+    ///
+    /// **They are two counters and not one**, and neither is
+    /// `SchedulerRequestsRefusedUnauthenticated` above. That one counts a peer that
+    /// never authenticated -- a member with no token file, which is a configuration
+    /// mistake; these count a peer that tried and failed, which is a rotated key or a
+    /// probe. A client is told `unauthenticated` for all three and an operator does
+    /// three different things, which is the whole argument for a row being the
+    /// refusal rather than the code.
+    ///
+    /// The byte budget is not counted, for the reason the size and opcode arms of
+    /// `RefusalReply` are not: it says this surface is momentarily full, which the
+    /// peer sees and retries, and summing it into a security series is what makes
+    /// that series unreadable. `Detail::SchedulerEndpointRefusals` is where that is
+    /// said, and where the two that ARE counted carry their rows.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t /*opRaw*/,
+                                                              std::string_view detail) const override
+    {
+        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)].answer;
+        if (!row.has_value())
+            return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
+        return Cc::Refuse(_metrics, *row, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -309,9 +399,24 @@ class CacheResponder final: public IFrameResponder
     /// produce the one refusal that carries a counter. The size and opcode arms are
     /// framing errors and are already visible as such to the peer.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
-                                                      std::uint8_t /*opRaw*/) const override
+                                                      std::uint8_t /*opRaw*/,
+                                                      std::string_view detail) const override
     {
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), detail);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// Nothing to count here either, and for two different reasons. The credential
+    /// arms are unreachable: this surface requires none, so `AUTH` never routes to it
+    /// and `CheckCredential` answers `NoPolicy` unconditionally. The byte budget is
+    /// reachable and is a transient the peer retries past, not a signal -- the same
+    /// position `RefusalReply` above takes on the framing arms.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t /*opRaw*/,
+                                                              std::string_view detail) const override
+    {
+        return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -437,8 +542,9 @@ class MergedResponder final: public IFrameResponder
     /// hops onto an executor before it compiles and back onto the reactor before it
     /// answers: a compile blocks for seconds, and neither running it on this reactor
     /// (#213) nor returning its reply off that reactor is visible at any call site.
-    /// `WorkerServer` still serves its own dedicated port; this is an additional door
-    /// onto the same worker, the same policy and the same slot accounting.
+    /// The worker's dedicated port is gone (#290 stage 3), so this is not an additional
+    /// door onto the worker -- it is the only one, and the same policy and slot
+    /// accounting reach it here.
     ///
     /// @param opRaw The third header byte, as received.
     /// @return The owner, or nullptr.
@@ -522,13 +628,40 @@ class MergedResponder final: public IFrameResponder
     /// Routed for the COUNTER. The wording is the same either way, but a cache STORE
     /// that overran its ceiling counted against the scheduler names the wrong
     /// subsystem, and naming the subsystem is what these counters are read for.
+    /// **The unowned arm answers `UnservedReply()`, not the decision's own code**, and
+    /// it is reachable: the endpoint weighs its surface-wide frame ceiling BEFORE it
+    /// asks `RefusePeer`, so a 24-byte header naming a verb nothing here serves and
+    /// declaring a gigabyte arrives at this arm. What that peer needs told is that the
+    /// verb is served nowhere on this node -- "too large" would send them to shrink a
+    /// frame that was never going to be answered -- and it is the same sentence every
+    /// other route to an unowned verb gives.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
-                                                      std::uint8_t opRaw) const override
+                                                      std::uint8_t opRaw,
+                                                      std::string_view detail) const override
     {
         auto const* const owner = OwnerOf(opRaw);
         if (owner == nullptr)
-            return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
-        return owner->RefusalReply(decision, opRaw);
+            return UnservedReply();
+        return owner->RefusalReply(decision, opRaw, detail);
+    }
+
+    /// @copydoc IFrameResponder::EndpointRefusalReply
+    ///
+    /// Routed for the counter, exactly as `RefusalReply` is and for the same reason:
+    /// the wording is the same either way, and a cache STORE that overran the byte
+    /// budget counted against the scheduler names the wrong subsystem.
+    ///
+    /// A verb is always known here -- the endpoint decodes the header before it asks
+    /// any of these -- so unlike `MaxRequestBytes` and its two siblings there is
+    /// nothing to fold and no surface-wide answer to invent.
+    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        if (owner == nullptr)
+            return UnservedReply();
+        return owner->EndpointRefusalReply(refusal, opRaw, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -608,6 +741,24 @@ class MergedResponder final: public IFrameResponder
     /// A sentence rather than a bare code, because the operator action differs from
     /// every other refusal here: nothing is misconfigured on the CLIENT's side, and the
     /// node has to be told to hold a tier or to schedule before this verb exists.
+    ///
+    /// **Deliberately not counted, and that is the hard half of #447 rather than an
+    /// omission.** Every other refusal here is an event; this one is an ANSWER that
+    /// ordinary, healthy traffic produces continuously. A node runs its components
+    /// independently, so a worker with no scheduler refuses every `AUTH` a
+    /// `FASTCACHE_TOKEN` launcher sends -- which is per exchange, for a whole build --
+    /// and a node with no cache tier refuses every local `FETCH` the same way. Counted,
+    /// the series would be dominated by a normal build and a port scan would be
+    /// invisible inside it, which is the failure this ticket is about arrived at from
+    /// the opposite direction: a signal nothing can be read out of is no better than a
+    /// counter that never moves.
+    ///
+    /// Splitting it into "the ordinary absences" and "the rest" is a real counter and
+    /// out of this ticket's scope; #447's own residue is recorded rather than guessed
+    /// at. What DID change is that all four routes here -- `Answer`, `RefusePeer`,
+    /// `RefusalReply` and `EndpointRefusalReply` -- give one sentence: a peer asking
+    /// for a verb served nowhere is told that, rather than being told its frame was
+    /// too large and sent to shrink one that was never going to be answered.
     /// @return The encoded refusal.
     [[nodiscard]] static std::vector<std::byte> UnservedReply()
     {

@@ -4,7 +4,9 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
 
@@ -23,6 +25,88 @@ namespace FastCache::Node
 {
 
 class NodeIoLoop;
+
+/// A refusal the endpoint decides and the surface owning the verb answers.
+///
+/// Its own enum rather than more `CompileCacheWire::PrePayloadDecision` enumerators,
+/// because that one is a WIRE enum: it describes a frame's own header, both binaries
+/// compile it in, and the daemon reaches the same decisions from the same
+/// `DecidePrePayload`. These describe **this process** -- the memory it is already
+/// holding, and what this connection has proved -- so a peer cannot compute them and
+/// there is nothing for the daemon to agree about. Widening a shared header to carry
+/// a local decision would be a wire change bought for nothing.
+///
+/// Every one of these was answered in the accept loop with `Wire::EncodeErrorReply`
+/// and counted nothing, which is
+/// [#447](https://github.com/LASTRADA-Software/fastcached/issues/447): the merged
+/// listener refused correctly on the wire while the only thing an operator can see
+/// stayed flat.
+///
+/// **The endpoint's refusal for a connection it has no room for is deliberately not
+/// here.** That one is decided at accept, before a header exists, so it names no verb
+/// and no owner can be asked for it; `FrameServer` counts it itself. See
+/// `IFrameResponder::EndpointRefusalReply`.
+enum class EndpointRefusal : std::uint8_t
+{
+    /// A slot was free and the memory was not: this request's declared length does
+    /// not fit in what the surface is already holding in flight.
+    ///
+    /// Answered `EndpointBusy`, which it shares on the wire with the endpoint's
+    /// own at-capacity refusal and must never share a counter with: this says one
+    /// request is too big *right now* and that one says the surface is full. A
+    /// client does the same thing about both, an operator does not.
+    InFlightBudget,
+
+    /// An `AUTH` payload that would not decode into a credential at all.
+    CredentialMalformed,
+
+    /// An `AUTH` payload that decoded and did not verify.
+    ///
+    /// **The credential-guessing signal**, and it is the one refusal here that is not
+    /// merely bookkeeping: a peer presenting a wrong token is exactly what an
+    /// operator asking "is my scheduler port being probed" is looking for, and until
+    /// #447 it answered `Unauthenticated` on the wire and moved nothing at all.
+    CredentialRejected,
+
+    /// The count. See `Core/EnumTable.hpp`.
+    Last,
+};
+
+/// One row per `EndpointRefusal`, in enumerator order.
+struct EndpointRefusalCode
+{
+    EndpointRefusal refusal;          ///< Which endpoint decision this describes.
+    CompileCacheWire::ErrorCode code; ///< What every surface tells the client about it.
+};
+
+/// What the client is told, per refusal.
+///
+/// **A property of the refusal, not of the surface**, which is why it is one table
+/// here rather than an arm in each responder: three surfaces answering the same
+/// question separately is three answers that agree today, and a divergence between
+/// two of them would be one listener telling a client different things about one
+/// decision, which nothing could see. The COUNTER is the half that legitimately
+/// differs -- the scheduler moves one for a wrong credential, the cache cannot
+/// produce that refusal at all -- so it stays with the surface.
+///
+/// The direct counterpart of `CompileCacheWire::ErrorCodeFor(PrePayloadDecision)`,
+/// which the same call sites ask two lines away.
+inline constexpr EnumTable<EndpointRefusal, EndpointRefusalCode> EndpointRefusalCodes { {
+    { .refusal = EndpointRefusal::InFlightBudget, .code = CompileCacheWire::ErrorCode::EndpointBusy },
+    { .refusal = EndpointRefusal::CredentialMalformed, .code = CompileCacheWire::ErrorCode::MalformedFrame },
+    { .refusal = EndpointRefusal::CredentialRejected, .code = CompileCacheWire::ErrorCode::Unauthenticated },
+} };
+
+static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::refusal),
+              "EndpointRefusalCodes must hold one row per EndpointRefusal, in enumerator order");
+
+/// The wire code @p refusal is answered with.
+/// @param refusal Any enumerator but `Last`.
+/// @return The code every surface tells the client.
+[[nodiscard]] constexpr CompileCacheWire::ErrorCode ErrorCodeFor(EndpointRefusal refusal) noexcept
+{
+    return EndpointRefusalCodes[static_cast<std::size_t>(refusal)].code;
+}
 
 /// Answers one framed request.
 ///
@@ -187,11 +271,57 @@ class IFrameResponder
     /// stays verb-blind on purpose -- a peer that failed to authenticate learns
     /// nothing from being told which verb it failed to reach.
     ///
+    /// **Takes the wording, since #447**, because the endpoint now reaches this from
+    /// the surface-wide frame ceiling as well as from `DecidePrePayload`'s per-verb
+    /// one, and that refusal names both numbers: "too large" without the ceiling
+    /// tells an operator nothing about the limit they are up against. The two
+    /// ceilings are one fact at two heights and share one counter -- an operator does
+    /// the same thing about both -- so they are one `PayloadTooLarge` rather than a
+    /// second enumerator. Empty where the caller has nothing to add, which is every
+    /// pre-payload decision: a peer that failed to authenticate learns nothing from
+    /// being told which verb it failed to reach.
+    ///
     /// @param decision Any value other than `Serve`.
     /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @param detail Words for a person, or empty when there are none to add.
     /// @return The encoded refusal to send back. Never empty.
     [[nodiscard]] virtual std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
-                                                              std::uint8_t opRaw) const = 0;
+                                                              std::uint8_t opRaw,
+                                                              std::string_view detail) const = 0;
+
+    /// Encode -- and count -- a refusal the ENDPOINT decided about a known verb.
+    ///
+    /// The companion to `RefusalReply`, and separate from it because the two answer
+    /// about different things. `PrePayloadDecision` is a wire enum: it describes the
+    /// frame's own header, both binaries compile it in, and the daemon reaches the
+    /// same decisions from the same function. These are about **this process** -- the
+    /// memory it is already holding, and what this connection has proved -- so they
+    /// are decided here and cannot be expressed there.
+    ///
+    /// What they share is the division of labour, which is the whole point: the
+    /// endpoint owns WHEN the question is asked, the surface owns the answer,
+    /// including which counter moves. Every one of these used to be encoded in the
+    /// accept loop with `Wire::EncodeErrorReply` and counted nothing, so a merged
+    /// listener answered them correctly and left the series flat
+    /// ([#447](https://github.com/LASTRADA-Software/fastcached/issues/447)).
+    ///
+    /// **A verb is always known here**, which is what separates these from the
+    /// endpoint's one verbless refusal. A connection turned away because the surface
+    /// already holds every connection it will is decided before a byte is read, so
+    /// there is no owner to route it to and no responder is asked -- `FrameServer`
+    /// counts that one itself, against its own row. Splitting them that way is also
+    /// what keeps the two `EndpointBusy` refusals apart: `InFlightBudget` says one
+    /// request is too big *right now* and `OpenConnections` says the surface is full,
+    /// an operator acts on them oppositely, and they share a wire code. Two
+    /// categories, so they cannot reach one counter by anybody forgetting.
+    ///
+    /// @param refusal Which refusal the endpoint decided.
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @param detail Words for a person, or empty when there are none to add.
+    /// @return The encoded refusal to send back. Never empty.
+    [[nodiscard]] virtual std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
+                                                                      std::uint8_t opRaw,
+                                                                      std::string_view detail) const = 0;
 
     /// How long serving @p opRaw may take before the socket is abandoned.
     ///
@@ -389,9 +519,19 @@ class FrameServer
     /// @param responder Answers each request; must outlive the run.
     /// @param what Names this surface in log lines, so three endpoints in one
     ///        process are distinguishable when one of them stops accepting.
+    /// @param metrics Where this endpoint's OWN refusal is recorded. Exactly one
+    ///        refusal here belongs to the endpoint rather than to a surface: a
+    ///        connection turned away because every connection slot is taken is
+    ///        decided at accept, before a header exists, so it names no verb and
+    ///        `MergedResponder` has nothing to route it by. Every other refusal is
+    ///        the owning surface's and reaches its counter through `IFrameResponder`.
     /// @param logger Shared logger.
-    FrameServer(
-        NodeIoLoop& io, IListener& listener, IFrameResponder& responder, std::string_view what, ILogger& logger) noexcept;
+    FrameServer(NodeIoLoop& io,
+                IListener& listener,
+                IFrameResponder& responder,
+                std::string_view what,
+                IMetricsSink& metrics,
+                ILogger& logger) noexcept;
 
     FrameServer(FrameServer const&) = delete;
     FrameServer(FrameServer&&) = delete;
@@ -475,10 +615,16 @@ class FrameEndpoint
     ///        build output served to strangers.
     /// @param cfg What the operator asked for; the row resolves the endpoint from it.
     /// @param responder Answers each request; must outlive the endpoint.
+    /// @param metrics Where this endpoint's own at-capacity refusal is counted; see
+    ///        the `FrameServer` constructor for why exactly one refusal is its own.
     /// @param logger Where to announce the bound address.
     /// @return The running endpoint, or why it could not be served.
-    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(
-        NodeIoLoop& io, NodeSurface surface, NodeConfig const& cfg, IFrameResponder& responder, ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> Start(NodeIoLoop& io,
+                                                                                          NodeSurface surface,
+                                                                                          NodeConfig const& cfg,
+                                                                                          IFrameResponder& responder,
+                                                                                          IMetricsSink& metrics,
+                                                                                          ILogger& logger);
 
     /// Serve a surface on a descriptor a supervisor already bound and listened.
     ///
@@ -510,6 +656,8 @@ class FrameEndpoint
     ///        The only honest answer to "what address is this", since the process
     ///        cannot ask the unit and a wildcard bind names nothing dialable.
     /// @param responder Answers each request; must outlive the endpoint.
+    /// @param metrics Where this endpoint's own at-capacity refusal is counted; see
+    ///        the `FrameServer` constructor for why exactly one refusal is its own.
     /// @param logger Where to announce the adopted address.
     /// @return The running endpoint, or why the descriptor could not be served.
     [[nodiscard]] static std::expected<std::unique_ptr<FrameEndpoint>, std::string> StartAdopted(
@@ -518,6 +666,7 @@ class FrameEndpoint
         int descriptor,
         std::string_view advertisedHost,
         IFrameResponder& responder,
+        IMetricsSink& metrics,
         ILogger& logger);
 
     /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
@@ -551,6 +700,7 @@ class FrameEndpoint
                   IFrameResponder& responder,
                   std::string_view what,
                   std::string boundEndpoint,
+                  IMetricsSink& metrics,
                   ILogger& logger);
 
     /// `IListener` and not the platform type, deliberately: naming the concrete one

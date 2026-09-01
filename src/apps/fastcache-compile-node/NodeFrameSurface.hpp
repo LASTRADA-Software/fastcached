@@ -24,9 +24,8 @@ struct NodeConfig;
 /// the routing decision. One listener cannot decide that by existing, so
 /// `MergedResponder` decides it per frame and this owns the pair (#290).
 ///
-/// The worker's dedicated port has not gone: `WorkerServer` still accepts on it, and
-/// retiring it is a step of its own. What changed is that a compile can now arrive here
-/// too, spending the same slot accounting through `CompileResponder`.
+/// The worker's dedicated port is gone (#290 stage 3): every compile arrives here too,
+/// spending the same slot accounting through `CompileResponder`.
 ///
 /// Owned as one object for the reason `CacheTier` and `SchedulerTier` are: the two
 /// members form a reference chain whose declaration order is load-bearing and silently
@@ -60,12 +59,11 @@ class NodeFrameSurface
     /// @param inherited A descriptor a supervisor already bound and listened, or
     ///        `std::nullopt` for the ordinary path. Ownership passes to the listener
     ///        built from it, including when that fails.
+    /// @param metrics Where the endpoint's own at-capacity refusal is counted.
     /// @param logger Where to announce the bound address.
     /// @return Nothing, or why it could not be served.
-    [[nodiscard]] std::expected<void, std::string> Bind(NodeIoLoop& io,
-                                                        NodeConfig const& cfg,
-                                                        std::optional<int> inherited,
-                                                        ILogger& logger);
+    [[nodiscard]] std::expected<void, std::string> Bind(
+        NodeIoLoop& io, NodeConfig const& cfg, std::optional<int> inherited, IMetricsSink& metrics, ILogger& logger);
 
     /// The address this node's `0xFC` listener bound.
     /// @return The endpoint, or an empty string before `Bind` succeeded.
@@ -139,6 +137,7 @@ class NodeFrameSurface
 ///        row's answer rather than this one's: `NodeSurfaceTable()` resolves the node
 ///        surface unconditionally, so `--print-surfaces` names the same address this
 ///        binds.
+/// @param metrics Where the endpoint's own at-capacity refusal is counted.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The surface, a null surface meaning "carry on without one", or the reason.
 [[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(
@@ -148,6 +147,7 @@ class NodeFrameSurface
     IFrameResponder* scheduler,
     IFrameResponder* compile,
     std::optional<int> inherited,
+    IMetricsSink& metrics,
     ILogger& logger);
 
 } // namespace FastCache::Node

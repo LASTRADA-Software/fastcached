@@ -533,6 +533,55 @@ looks exactly like a port nobody is talking to.
   declared length, so it was refused as TRUNCATED, answered the same code, and moved
   the neighbouring counter. The confusion the split exists to end, inside the test
   written to prove the split.
+- **A surface MERGING is how this rule gets undone without anybody writing a bug**,
+  and it is the direction the check was blind to. #290 stage 3 retired the dedicated
+  compile port; `FrameEndpoint` — the merged listener that replaced it — held five
+  refusals encoded with a bare `Wire::EncodeErrorReply`, and two of those had counted
+  on the port that went away. So #326's counter and
+  `worker_jobs_refused_endpoint_busy_total` stopped moving at a *migration*, on the
+  surface that had just become the only one, with no test failing and the operator
+  documentation still naming both (#447). The scan could not see the file: it covered
+  three, and the listener was not one of them.
+- **The check is EXACT, so a file with one uncovered refusal cannot be covered at
+  all.** That is a property of the instrument rather than a matter of thoroughness,
+  and it is what decides scope when a file like this is found: fixing the refusal the
+  ticket names and deferring the rest leaves the scan permanently blind to the file
+  that made the omission possible, so the next one joins them silently. All of them,
+  or the door stays open.
+- **The endpoint owns WHEN a refusal is answered; the surface owns WHAT, counter
+  included.** A listener serving several components cannot know which counter a
+  refusal belongs to — a cache `STORE` over the byte budget counted against the
+  scheduler names the wrong subsystem, and naming the subsystem is the whole reason
+  these are read. So the endpoint asks the owner (`IFrameResponder::RefusalReply` for
+  the wire-shared `PrePayloadDecision`, `EndpointRefusalReply` for the decisions only
+  this process can make) and encodes nothing itself.
+- **A refusal decided before a header exists belongs to the ENDPOINT, and gets its own
+  row.** The at-capacity refusal is answered at accept, so it names no verb and the
+  router has no input to route it by. Do not contort the router into answering it: a
+  router asked a question it cannot have the input for grows a default arm that is
+  wrong later. Two categories — verb-owned and endpoint-owned — which also makes it
+  *impossible* for the byte-budget and at-capacity refusals to share a counter,
+  although they share `EndpointBusy` on the wire and say opposite things to an
+  operator. The types keep them apart rather than a comment asking somebody to.
+- **Not every refusal is an EVENT, and one that ordinary traffic produces must not be
+  counted.** The merged listener answers `UnimplementedVerb` to a verb this node runs
+  no component for — and that is what a *healthy* deployment gets: a worker with no
+  scheduler refuses every `AUTH` a `FASTCACHE_TOKEN` launcher sends, once per exchange
+  for a whole build, and a node with no cache tier refuses every local `FETCH` the same
+  way. Counted, the series is a build's traffic and a port scan is invisible inside it
+  — which is this rule's own failure reached from the opposite side: a signal nothing
+  can be read out of is no better than a counter that never moves. The test is not "is
+  this a refusal" but "would a rise mean something happened". Splitting such an answer
+  into its ordinary and its alarming halves is a real design question and never a
+  by-the-way row.
+- **A refusal counter can be a SECURITY signal, and the one that was missing is.**
+  `SchedulerRequestsRefusedUnauthenticated` fires only at the pre-payload gate — a
+  peer reaching a verb having never authenticated, which is a misconfigured member.
+  A peer presenting a token and getting it WRONG was answered `unauthenticated` on
+  the wire and moved nothing, so credential guessing against a token-configured
+  scheduler was invisible to the exact series whose own documentation tells an
+  operator to read zero there as "the port is not being reached". Three outcomes,
+  three rows: never presented, presented and wrong, presented and undecodable.
 
 ## Text a peer sent is text, or the fleet refuses it
 
@@ -619,3 +668,21 @@ outright rather than drawing with a gap.
   every compile. Deliberately a *measurement* ticket: a TTL buys latency and pays
   in staleness on the one page that exists to be current, and the charts already
   avoid the cost with a validator rather than a lifetime.
+
+- **[#491](https://github.com/LASTRADA-Software/fastcached/issues/491)** — the merged
+  listener's frame ceiling and byte budget are counted for **compile** verbs and
+  answered uncounted for cache and scheduler ones. #447 routed every refusal to the
+  surface that owns it and deliberately did not change what the other two surfaces
+  count, which is their own older position. The catch is which refusal a real node
+  reaches: `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's, in
+  practice the cache's, so the byte-budget refusal that fires on a node with a tier is
+  a cache `STORE` — the uncounted one. #326's scenario, one surface over.
+- **[#492](https://github.com/LASTRADA-Software/fastcached/issues/492)** —
+  `worker-refusals-counted` scans a hand-kept list of `.cpp` files. Its own header
+  records that list growing by hand once already, and #447 grew it a second time and
+  still could not cover `Responders.hpp`, where the two new credential counters live,
+  because it is a header. An over-broad scan fails CLOSED — a wrongly-included file
+  reports, a wrongly-excluded one is silent — so globbing with named exclusions beats
+  enumeration even though both are lists. Retiring the class rather than patching it
+  needs `Cc::SurfaceRefusal` out of `fastcache-cc`'s private header and into a shared
+  home, so the scan can target the type instead of somebody's memory.

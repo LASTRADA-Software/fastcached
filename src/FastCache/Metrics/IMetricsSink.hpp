@@ -272,6 +272,36 @@ class IMetricsSink
         /// (#326).
         WorkerFramesRefusedPayloadTooLarge,
 
+        /// `AUTH` payloads on a compile surface that would not decode at all.
+        ///
+        /// Its own row rather than `WorkerFramesRefusedMalformedPayload`, although
+        /// both answer `MalformedFrame`: that one is a request body that did not
+        /// decode into the fields its verb requires, this one is a credential. An
+        /// operator told only "a malformed frame arrived" cannot tell a client version
+        /// skew from somebody malforming AUTH at the door, which is the #327 confusion
+        /// re-created one refusal further along.
+        ///
+        /// Zero on every configuration this build ships, exactly as the counter below
+        /// is and for the same reason: `MergedResponder` routes the `Session` family
+        /// to the scheduler, so a compile surface is never asked about a credential.
+        /// A tally's zero is the truth about events that did not happen; a rise means
+        /// what may compile here has changed.
+        WorkerFramesRefusedMalformedCredential,
+
+        /// `AUTH` payloads on a compile surface that decoded and did not verify.
+        ///
+        /// Its own row rather than `WorkerFramesRefusedUnauthenticated` below, although
+        /// both answer `unauthenticated`: that one is a peer that reached a verb having
+        /// never presented a credential, this one is a peer that presented one and got
+        /// it wrong. The same split the scheduler surface carries, and for the same
+        /// reason -- an operator acts on a misconfigured member and on somebody trying
+        /// secrets differently.
+        ///
+        /// Zero on every configuration this build ships, exactly as its two neighbours
+        /// are: the `Session` verb family is routed to the scheduler, so a compile
+        /// surface is never asked for a credential at all.
+        WorkerFramesRefusedRejectedCredential,
+
         /// Frames refused for reaching a compile verb before a credential.
         ///
         /// Zero on every configuration this build ships, and that is the point rather
@@ -443,6 +473,45 @@ class IMetricsSink
         /// on the operator's list, this one says a caller held no secret. A fleet peer
         /// with a stale token moves this and not that.
         SchedulerRequestsRefusedUnauthenticated,
+
+        /// `AUTH` attempts on the scheduler surface that decoded and did not verify.
+        ///
+        /// **The credential-guessing signal**, and the one
+        /// `SchedulerRequestsRefusedUnauthenticated` above cannot carry: that one
+        /// counts a peer reaching a verb WITHOUT having authenticated, which is a
+        /// misconfigured fleet member. This counts a peer that presented a token and
+        /// got it wrong -- a rotated key, or somebody trying. An operator does
+        /// opposite things about the two, so they are two rows although a client is
+        /// told `unauthenticated` either way.
+        ///
+        /// Until #447 this rose nowhere at all: the endpoint answered the wire code
+        /// itself, so a fleet being probed for its scheduler token read a flat zero on
+        /// the exact series an operator would go looking at.
+        SchedulerCredentialsRejected,
+
+        /// `AUTH` payloads on the scheduler surface that would not decode at all.
+        ///
+        /// Separate from the rejection above because it says something different: a
+        /// peer that cannot form the frame is a version or client-library mismatch,
+        /// while one forming it correctly with the wrong secret is the security
+        /// question. Summed, the second hides inside the first whenever an old client
+        /// is in the fleet.
+        SchedulerCredentialsMalformed,
+
+        /// Connections turned away because the `0xFC` listener already holds every
+        /// connection it will.
+        ///
+        /// **Never summed with `WorkerJobsRefusedEndpointBusy`**, which shares its
+        /// wire code (`endpoint-busy`) and nothing else. That one says one request was
+        /// too big for the bytes currently in flight and a smaller or later one would
+        /// be served; this says the surface has no room for another *conversation* at
+        /// all. An operator raises a connection ceiling for one and looks at request
+        /// sizes for the other.
+        ///
+        /// Counted by the endpoint rather than by a surface, because it is decided at
+        /// accept -- before a header exists -- so it names no verb and no owning
+        /// component can be asked for it.
+        NodeFrameConnectionsRefusedAtCapacity,
 
         /// Reclaim reports the buffer between the storage tiers and the keyspace
         /// notifier could not hold, so the `expired` / `evicted` events for those
