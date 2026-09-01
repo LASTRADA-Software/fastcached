@@ -58,17 +58,13 @@
 # knows about serves nobody.
 #scheduler:
 
-# host:port CLIENTS should use to reach this worker. Defaults to --bind and
-# --port, which is wrong behind NAT or on a multi-homed host: the scheduler
-# hands this string to clients verbatim, so a worker that advertises an
-# address only it can reach is leased and then never answers.
+# host:port CLIENTS should use to reach this worker. Defaults to
+# listen_node, which is wrong behind NAT or on a multi-homed host: the
+# scheduler hands this string to clients verbatim, so a worker that
+# advertises an address only it can reach is leased and then never answers.
+# It is also wrong when listen_node is the wildcard, which names no host any
+# client can dial -- the node refuses to start rather than advertise it.
 #advertise:
-
-# address to listen on (default 0.0.0.0)
-#bind:
-
-# port to listen on (default 6676)
-#port:
 
 # a toolchain this worker serves; repeatable. An OVERRIDE: naming any pins
 # this worker to exactly that set, and naming none means serve whatever this
@@ -208,11 +204,12 @@
 # have to reach it, and loopback without it.
 #serve_scheduler: false
 
-# a peer this node serves; repeatable. Gates all three surfaces -- the
-# compile port, the cache tier and the scheduler -- so a WORKER needs it
-# too, or it compiles for its own machine alone. Only the host is matched: a
-# peer dials from an ephemeral port, so an endpoint is not something a
-# connection can be compared to.
+# a peer whose compiles this node runs; repeatable. A WORKER needs it too,
+# or it compiles for its own machine alone. It does NOT open the cache tier:
+# that is this machine's build output and is served to this machine only,
+# whatever is listed here and whatever listen_node is bound to. Only the
+# host is matched: a peer dials from an ephemeral port, so an endpoint is
+# not something a connection can be compared to.
 #fleet_member:
 #  - <host>[:<port>]
 #  - <host>[:<port>]
@@ -240,13 +237,16 @@
 # it refuses to start.
 #cache_dir:
 
-# this node's 0xFC port: cache verbs, and the scheduler verbs with
+# this node's 0xFC port, and its only one: the cache verbs, the compile
+# verbs a scheduler dispatches here, and the scheduler verbs themselves with
 # --serve-scheduler (default port 6674, where fastcache-cc already looks;
 # empty closes it). A bare port binds LOOPBACK on a worker -- a cache any
 # host can dial is this machine's whole build output served to strangers --
 # and the wildcard with --serve-scheduler, whose peers are elsewhere by
-# definition. Widening it admits nobody new to the cache: those verbs answer
-# this machine alone whatever this is bound to.
+# definition. Widening it admits nobody new to the CACHE: those verbs answer
+# this machine alone whatever this is bound to. What widening it does open
+# is the compile verbs, which answer fleet_member -- so a wildcard bind
+# without a member policy is refused at startup rather than served.
 #listen_node:
 
 # the shared fastcached this node reads through to. Empty is honest rather

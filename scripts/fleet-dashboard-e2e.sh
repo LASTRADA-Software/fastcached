@@ -70,12 +70,16 @@ node_pid=""
 
 # The cluster's pre-shared key, which every node here shares.
 #
-# Not decoration and not a workaround for the startup rule: these nodes leave
-# `--bind` at the wildcard and say `--fleet-open`, so another machine genuinely
-# could dial their compile ports, and a node in that shape has to be able to check
-# the lease a client presents it (#282). Giving them the key is what a real fleet in
-# this shape does, and it means these fixtures exercise the SIGNING scheduler and
-# the VERIFYING worker rather than the unchecked pair.
+# Not decoration: these nodes say `--fleet-open`, so their compile verbs admit
+# every caller that can reach the port, and a node in that shape has to be able to
+# check the lease a client presents it (#282). Giving them the key is what a real
+# fleet in this shape does, and it means these fixtures exercise the SIGNING
+# scheduler and the VERIFYING worker rather than the unchecked pair.
+#
+# The bind is loopback, which is the OTHER half of #282's rule and is why the key is
+# a choice here rather than a requirement: either a loopback bind or a loopback-only
+# policy closes the port on its own, and this fixture has the first and deliberately
+# not the second. The key is still what makes the exchange a checked one.
 #
 # Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
 # with the key's value, and a per-run secret would make a failure look like a flake.
@@ -170,8 +174,12 @@ dash_get() {
 }
 
 admin_port="$(free_port)"
+# One port, because since #290 stage 3 a node has one 0xFC surface: the cache verbs,
+# the compile verbs and -- with --serve-scheduler -- the scheduler verbs all arrive
+# on --listen-node, and --advertise names that same surface. There used to be a
+# second `worker_port` here for the dedicated compile listener, which no longer
+# exists.
 sched_port="$(free_port)"
-worker_port="$(free_port)"
 readonly TOKEN="dashboard-e2e-secret-token"
 printf '%s\n' "$TOKEN" > "${workdir}/token"
 
@@ -195,10 +203,9 @@ tls_args=()
 "$node" \
     --scheduler "127.0.0.1:${sched_port}" \
     --toolchain "$toolchain" \
-    --port "$worker_port" \
-    --advertise "127.0.0.1:${worker_port}" \
+    --advertise "127.0.0.1:${sched_port}" \
     --serve-scheduler \
-    --listen-node "$sched_port" \
+    --listen-node "127.0.0.1:${sched_port}" \
     --fleet-open \
     --cluster-key-file "$cluster_key" \
     --admin-listen "$admin_port" \
@@ -269,7 +276,7 @@ json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
 # reading that would have said whether the runner was slow.
 worker_is_listed() {
     json="$(dash_get "$admin_port" /fleet.json "Bearer ${TOKEN}")"
-    [[ "$json" == *"127.0.0.1:${worker_port}"* ]]
+    [[ "$json" == *"127.0.0.1:${sched_port}"* ]]
 }
 wait_until worker_is_listed "the worker to appear in /fleet.json" \
     "$node_pid" "${workdir}/node.log" 240

@@ -23,14 +23,20 @@
 # **`Wire::EncodeErrorReply` appears exactly once across the surfaces, inside
 # `Refuse`.**
 #
-# Three files are covered, because a worker has three 0xFC surfaces and an operator
-# reads their counters side by side: `WorkerProtocol.cpp` answers the verbs,
-# `WorkerServer.cpp` answers before a verb is reached on the dedicated compile port --
-# admission, capacity, the in-flight budget, and the frame-level payload ceiling -- and
-# `CompileResponder.cpp` answers the same questions for compiles arriving on the merged
-# `0xFC` listener ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)).
-# That last surface is why this list is a list rather than a pair: it was added with
-# uncounted refusals in it, and the scan said nothing because it was not looking.
+# Three files are covered, and an operator reads their counters side by side:
+# `WorkerProtocol.cpp` answers the verbs, `CompileResponder.cpp` answers the peer and
+# capacity questions for compiles arriving on the merged `0xFC` listener, and
+# `CompileCapacity.cpp` holds the predicates both of them share -- admission and the
+# drain decision ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)).
+# `CompileResponder.cpp` is why this list is a list rather than a pair: it was added
+# with uncounted refusals in it, and the scan said nothing because it was not looking.
+#
+# `WorkerServer.cpp` used to be the second row, answering before a verb was reached on
+# the DEDICATED compile port. #290 stage 3 retired that port -- the compile verbs now
+# arrive on the merged listener with everything else -- and its two shared predicates
+# moved into `CompileCapacity.cpp`, which is what took its place here. The row was not
+# simply dropped: a covered surface that stops existing has to be replaced by wherever
+# its refusals went, or this check quietly narrows to what is left.
 #
 # The frame-level payload ceiling is the CHEAPEST probe there is, needing only a header
 # where the envelope refusals need a whole frame read, so it is the likeliest thing to
@@ -64,11 +70,11 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
 endif()
 
 # The surfaces, and the number of `Refuse` definitions to expect across them. One:
-# `WorkerServer` calls the one `WorkerProtocol` defines, because two surfaces of one
+# the node's files call the one `WorkerProtocol` defines, because two surfaces of one
 # worker must not hold two notions of what a refusal is.
 set(surfaces
     "src/apps/fastcache-cc/WorkerProtocol.cpp"
-    "src/apps/fastcache-compile-node/WorkerServer.cpp"
+    "src/apps/fastcache-compile-node/CompileCapacity.cpp"
     "src/apps/fastcache-compile-node/CompileResponder.cpp")
 
 foreach(relative IN LISTS surfaces)
