@@ -49,9 +49,24 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     }
     if (RowFor(NodeSurface::Node).Resolve(cfg).empty())
     {
-        // Reachable only by emptying the flag: every other way for the row to resolve
-        // to nothing is a node with neither component, which the branch above caught.
-        logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
+        // **The row is the authority on WHETHER, and it cannot say WHY.** That is the
+        // division this function's header states, and #290's second half made the two
+        // reasons diverge rather than coincide: a node that neither holds a cache tier
+        // nor schedules still runs a worker, so it has a component for this listener
+        // and the row still resolves to nothing. Opening a port the row says is not
+        // served would put a socket on this machine that `--print-surfaces` never
+        // printed and no firewall worksheet lists -- so the row wins, and compiles on
+        // such a node reach it on the compile port exactly as they always have.
+        //
+        // Asked of the FLAG rather than re-deriving the row's other clause: the empty
+        // spelling is the one an operator typed, and it is the only half this function
+        // can attribute without becoming a second author of the rule.
+        if (cfg.nodeListen.empty())
+            logger.Logf(LogLevel::Info, "--listen-node is empty; serving no 0xFC port");
+        else
+            logger.Logf(LogLevel::Info,
+                        "no cache tier and no scheduler; serving no 0xFC port -- compiles are still served on the "
+                        "compile port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
 

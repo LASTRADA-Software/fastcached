@@ -367,7 +367,7 @@ client's own cache connection.
 |---|---|---|---|---|
 | `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
 | `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, conventionally `:6675` | on a cache miss, when dispatch is configured | `LEASE` |
-| `fastcache-cc` | the worker named in the grant | whatever that worker advertises; `--port`, default `6676` | once per dispatched compile, held for its duration | `COMPILE` |
+| `fastcache-cc` | the worker named in the grant | whatever that worker advertises; `--port`, default `6676` | once per dispatched compile, held for its duration | `COMPILE` — also answered on `--listen-node`, by the same worker |
 | `fastcache-cc` | the leader's scheduler | `:6675` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | `--scheduler`, `:6675` | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
@@ -380,8 +380,14 @@ Two of those numbers are real defaults and one is not. A node's `0xFC` port list
 on `6674` and a worker's compile port on `6676` unless you say otherwise; **`6675` is
 only a convention this documentation follows** — a scheduler does not exist until you
 ask for one with `--serve-scheduler`, and when you do it is answered on
-`--listen-node`, beside the cache verbs, rather than on a port of its own. Neither does a consensus or
-discovery port: those have no conventional number at all. See
+`--listen-node`, beside the cache and compile verbs, rather than on a port of its own. Neither does a consensus or
+discovery port: those have no conventional number at all.
+
+The node port answers `COMPILE` as well, against the same slot count and the same
+member list as the compile port. It is a second door onto one worker rather than a
+second worker, so the number this machine advertises to the fleet still describes
+all of it — and a worker advertises its compile port, so this changes nothing about
+where a client goes. See
 [Install](../getting-started/install.md#distributed-compilation) for the
 port summary, and
 [the compile-cache protocol](../protocols/compile-cache.md) for the verbs.

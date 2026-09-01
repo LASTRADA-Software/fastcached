@@ -30,8 +30,9 @@ enum class NodeSurface : std::uint8_t
 {
     Compile = 0, ///< Where clients send translation units to be compiled.
     /// This node's own `0xFC` port: the cache verbs `fastcache-cc` on this machine
-    /// reads and writes through, and -- with `--serve-scheduler` -- the verbs the
-    /// fleet asks this node for capacity with while it leads.
+    /// reads and writes through, this node's own compile verbs, and -- with
+    /// `--serve-scheduler` -- the verbs the fleet asks this node for capacity with
+    /// while it leads.
     ///
     /// **One surface where there were two** (#290). They were separated by the port
     /// they arrived on, which made the listener the policy: a frame on the cache port

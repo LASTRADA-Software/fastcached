@@ -12,10 +12,10 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "ClusterAdminCli.hpp"
+#include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
 #include "NodeConfig.hpp"
-#include "CompileResponder.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
@@ -914,9 +914,9 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // Declared AFTER the server whose capacity it spends and BEFORE the surface
     // that routes to it, so destruction runs surface, responder, server: the
     // listener stops admitting compiles before the drain starts counting them.
-    Node::CompileResponder compileResponder {
-        protocol, server.Capacity(), membership.Oracle(), compilePool, nodeIo.Reactor(), metrics, logger
-    };
+    Node::CompileResponder compileResponder { protocol,    server.Capacity(), membership.Oracle(),
+                                              compilePool, nodeIo.Reactor(),  metrics,
+                                              logger };
 
     // This node's one `0xFC` listener, opened once every component exists and holding a
     // reference to each (#290). Before the merge each tier bound its own port, which
@@ -986,7 +986,6 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // May legitimately be null: no `--discovery` means the cluster is the
     // `--raft-peer` list an operator typed, which is the ordinary deployment.
     auto const discoveryTier = std::move(*discoveryOrRefusal);
-
 
     // The admin endpoint, when the operator asked for one. Off by default and on
     // loopback for a bare port: a scrape surface reachable from the network is a

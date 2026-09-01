@@ -112,10 +112,16 @@ class NodeFrameSurface
 /// @param scheduler Answers the scheduler verbs, or nullptr when it does not schedule.
 /// @param compile Answers the compile verbs, or nullptr when this node runs no worker.
 ///        In this binary it is never null -- a node compiles, that is what it is -- so
-///        the "no component at all" outcome below is now reachable only from a test.
-///        The predicate stays honest rather than being narrowed to the two that can
-///        still be absent: a component this function stopped asking about is a listener
+///        the "no component at all" outcome below is reachable only from a test. The
+///        predicate stays honest rather than being narrowed to the two that can still
+///        be absent: a component this function stopped asking about is a listener
 ///        opened for verbs nobody answers.
+///
+///        **A worker with no tier and no scheduler still opens nothing**, and that is
+///        the row's answer rather than this one's: `NodeSurfaceTable()` resolves the
+///        node surface to no address for such a node, so a port would be one
+///        `--print-surfaces` never printed. Its compiles arrive on the compile port,
+///        exactly as before.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The surface, a null surface meaning "carry on without one", or the reason.
 [[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(

@@ -382,6 +382,34 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     CHECK(Logged(logger, "serving no 0xFC port"));
 }
 
+TEST_CASE("A node whose only component is its worker opens no 0xFC port", "[node][node-surface]")
+{
+    // #290's second half gave the compile verbs a component here, and it deliberately
+    // did NOT give this node a port. The row is what decides whether the surface is
+    // served, and it still answers on the two components with nowhere else to go -- so
+    // a worker with no tier and no scheduler binds nothing, and its compiles arrive on
+    // the compile port exactly as they always have. Opening one anyway would put a
+    // socket on the machine that `--print-surfaces` never printed.
+    //
+    // The sentence matters as much as the outcome: an operator reading "--listen-node
+    // is empty" about a flag they left at its default would go looking for a
+    // configuration problem that is not there.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NamedResponder compile { "compile" };
+    auto [cfg, port] = BaseConfig();
+    cfg.cacheMemoryBytes = 0; // nowhere to keep objects, so no tier is built
+    cfg.cacheDir.clear();
+    REQUIRE_FALSE(cfg.serveScheduler);
+    REQUIRE_FALSE(cfg.nodeListen.empty());
+
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, logger);
+    REQUIRE(surface.has_value());
+    CHECK(*surface == nullptr);
+    CHECK(Logged(logger, "no cache tier and no scheduler"));
+    CHECK_FALSE(Logged(logger, "--listen-node is empty"));
+}
+
 TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-surface]")
 {
     NodeIoLoop io;

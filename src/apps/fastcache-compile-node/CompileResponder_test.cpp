@@ -8,11 +8,12 @@
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
-#include <FastCache/Metrics/AtomicMetricsSink.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -207,9 +208,8 @@ struct Answered
         // it borrows, and the same way the endpoint's own connection task holds it.
         auto reply = co_await target.Answer(request, std::move(caller));
 
-        out.set_value(Answered { .startedOn = startedOn,
-                                 .returnedOn = std::this_thread::get_id(),
-                                 .reply = std::move(reply) });
+        out.set_value(
+            Answered { .startedOn = startedOn, .returnedOn = std::this_thread::get_id(), .reply = std::move(reply) });
         co_return;
     }(responder, reactor, std::move(frame), std::move(peer), std::move(done));
     return future.get();
@@ -238,7 +238,9 @@ TEST_CASE("A compile leaves the reactor and the reply comes back to it", "[node]
     Fixture fix;
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
-    CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
+    CompileCapacity capacity {
+        /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger
+    };
     CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
 
     auto const reactorThread = ThreadOf(reactor);

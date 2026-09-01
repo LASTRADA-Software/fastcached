@@ -120,18 +120,20 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
     // send the client off to retry a frame that can never fit. That hand-off is sound
     // only while the decoder's ceiling is no larger than this budget, which is why
     // `WorkerMaxRequestBytes` is one exported constant rather than a literal per side.
+    //
+    // Initialized in ONE declaration rather than assigned into: a reservation is
+    // move-constructible and deliberately not move-assignable, because a release is
+    // owed exactly once and an assignment would be a second object's claim landing on
+    // the first one's storage.
     auto const footprint = Cc::DeclaredRequestFootprint(frame);
-    std::optional<CompileCapacity::Bytes> reserved;
-    if (footprint <= _capacity.ByteBudget())
-    {
-        reserved = _capacity.TryTakeBytes(footprint);
-        if (!reserved.has_value())
-            // Its own code, not `NoCapacity`: this says "come back shortly", while
-            // `NoCapacity` says "the fleet is full". An operator sent to buy machines
-            // over a transient byte budget is being sent to fix something that was
-            // never wrong.
-            co_return Cc::Refuse(_metrics, CompileRefusal::EndpointBusy);
-    }
+    auto const chargeable = footprint <= _capacity.ByteBudget();
+    auto const reserved =
+        chargeable ? _capacity.TryTakeBytes(footprint) : std::optional<CompileCapacity::Bytes> { std::nullopt };
+    if (chargeable && !reserved.has_value())
+        // Its own code, not `NoCapacity`: this says "come back shortly", while
+        // `NoCapacity` says "the fleet is full". An operator sent to buy machines over
+        // a transient byte budget is being sent to fix something that was never wrong.
+        co_return Cc::Refuse(_metrics, CompileRefusal::EndpointBusy);
 
     // --- Off the reactor. ---
     //

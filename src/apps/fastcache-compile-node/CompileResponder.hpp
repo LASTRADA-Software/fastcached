@@ -119,8 +119,7 @@ class CompileResponder final: public IFrameResponder
     /// the scheduler issued for this worker's endpoint, and that is a property of the
     /// payload rather than of the peer. It is checked where it always was, inside
     /// `Cc::WorkerProtocol`.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
-                                                                   std::uint8_t opRaw) const override;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override;
 
     /// @copydoc IFrameResponder::AuthRequired
     ///
