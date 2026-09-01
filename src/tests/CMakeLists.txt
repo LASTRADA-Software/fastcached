@@ -1075,6 +1075,47 @@ else()
         TIMEOUT 900
     )
 
+    # The one body of assertions in that fixture that is NOT loopback.
+    #
+    # Every case in the run above dispatches over 127.0.0.1, and
+    # `ClusterMembership::Classify` admits the whole of 127.0.0.0/8 before it ever
+    # consults a member list -- so the suite could not have noticed a worker that
+    # admitted only its own machine, which is #235. This mode binds a worker on
+    # this host's own non-loopback address and asserts both directions of the
+    # branch below that check: listed and served, unlisted and refused with the
+    # refusal counter moving.
+    #
+    # Its own test rather than a thirteenth case in the same run, because it is the
+    # only body here with a prerequisite the machine may lack, and "this host has
+    # no non-loopback address" has to report SKIPPED. A script exits once, so a
+    # case inside the suite could do no more than print a line and let the run go
+    # green -- a pass reported for a case that never ran, which is the defect #252
+    # is about rather than a way of reporting it.
+    #
+    # POSIX-only for now, the way `cluster-e2e` records for itself: the property is
+    # platform-independent and the fixture is not, and `dist-compile-e2e.ps1`
+    # carries no such mode, so a Windows entry would be a translation rather than
+    # new coverage.
+    if(NOT WIN32)
+        add_test(
+            NAME "dist-compile-membership-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+                --fastcached "$<TARGET_FILE:fastcached>"
+                --node "$<TARGET_FILE:fastcache-compile-node>"
+                --launcher "$<TARGET_FILE:fastcache-cc>"
+                --compiler "${CMAKE_CXX_COMPILER}"
+                --case membership
+        )
+        # Two schedulers, two workers and a daemon, all binding real ports and
+        # driving real compiles, so it takes the same serialisation the suite does.
+        set_tests_properties("dist-compile-membership-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 600
+        )
+    endif()
+
     # The Windows fixture's object comparison, against synthetic COFF input.
     #
     # NOT labelled "smoke", deliberately: it starts no daemon, opens no socket and
