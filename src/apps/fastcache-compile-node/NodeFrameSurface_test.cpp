@@ -606,13 +606,16 @@ struct HandedOverListenFd
             return; // constrains the fd for the static analyzer on the ::bind path below
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        // The byte-order calls are UNQUALIFIED while every syscall around them is
+        // `::`-prefixed, and that asymmetry is deliberate: macOS defines htonl and
+        // ntohs as macros, so a scope qualifier in front of one does not parse.
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0; // ephemeral, so this cannot collide with a live port
         REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
         REQUIRE(::listen(fd, 8) == 0);
         socklen_t len = sizeof(addr);
         REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
-        port = ::ntohs(addr.sin_port);
+        port = ntohs(addr.sin_port);
     }
 
     HandedOverListenFd(HandedOverListenFd const&) = delete;
