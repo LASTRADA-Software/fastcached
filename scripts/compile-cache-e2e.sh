@@ -409,6 +409,105 @@ if grep -q "${deep}" "${shallow}/build/t.d"; then
 fi
 echo "   depfile localized to the consuming checkout"
 
+# --- 4b: one root nested inside another --------------------------------------
+# Split out of #108 and filed as #116. Both existing root cases cover ALIASING --
+# two spellings naming one location, where the right answer is "these are the
+# same tree". Nesting is the opposite: two genuinely different trees where one
+# root is a strict string PREFIX of the other.
+#
+# It matters because every root test in `PathCanon` is a prefix comparison, so
+# from the outer layout's point of view every file in the inner tree is in-tree
+# source, and both trees canonicalize their own `src/inc/h.hpp` to the identical
+# token `<SRCROOT>/src/inc/h.hpp`. Two different files, one token.
+#
+# Sharing is nonetheless CORRECT, because the preprocessed text is part of the
+# key -- but that is an argument, and arguments are what regression tests are
+# for. Anyone running `git worktree add .worktrees/foo` inside their checkout
+# produces exactly this shape, which makes it a good deal more ordinary than a
+# symlinked or substituted root.
+#
+# `FASTCACHE_NO_DIRECT=1` throughout, so what is exercised is the OBJECT key
+# rather than the manifest -- the manifest path would answer from recorded
+# dependencies and never reach the prefix comparison this is about.
+outer="${workdir}/nest/outer"
+inner="${outer}/nested/inner"
+mkdir -p "${outer}/src/inc" "${outer}/build" "${inner}/src/inc" "${inner}/build"
+
+write_nest_tree() {
+    local root="$1" value="$2"
+    cat > "${root}/src/inc/h.hpp" <<EOF
+#pragma once
+inline int nested() { return ${value}; }
+EOF
+    cat > "${root}/src/t.cpp" <<'EOF'
+#include "inc/h.hpp"
+int main() { return nested(); }
+EOF
+}
+
+compile_nest() {
+    local root="$1" tag="$2"
+    export FASTCACHE_SOURCE_DIR="$root" FASTCACHE_BINARY_DIR="${root}/build"
+    FASTCACHE_NO_DIRECT=1 "$launcher" "$compiler" -std=c++23 -MD -MF "${root}/build/t.d"         -c "${root}/src/t.cpp" -o "${root}/build/t.o" 2> "${workdir}/${tag}.log"         || fail "nested-root compile ${tag} returned non-zero"
+    cat "${workdir}/${tag}.log"
+}
+
+write_nest_tree "$outer" 41
+write_nest_tree "$inner" 41
+
+echo "== nested roots: store from the OUTER tree =="
+compile_nest "$outer" nest-outer
+grep -q "STORED" "${workdir}/nest-outer.log" || fail "the outer tree did not store its result"
+
+echo "== nested roots: identical content in the INNER tree (expect HIT) =="
+compile_nest "$inner" nest-inner
+grep -q "fastcache-cc: HIT" "${workdir}/nest-inner.log"     || fail "a nested root did not share with its parent: identical content missed"
+cmp "${outer}/build/t.o" "${inner}/build/t.o" || fail "nested-root hit did not reproduce the object"
+echo "   a root nested inside another shares with it, and the object is identical"
+
+# The depfile must name the CONSUMER's tree. This is the assertion nesting makes
+# sharp: the producer's paths are a strict prefix of the consumer's, so a depfile
+# replayed verbatim would still "contain the consumer root" by accident when
+# tested loosely. Assert the inner path is present AND that no line names the
+# outer tree's own `src/` -- which only the producer's spelling can.
+[[ -f "${inner}/build/t.d" ]] || fail "nested-root hit did not restore the depfile"
+grep -q "${inner}" "${inner}/build/t.d" || fail "restored depfile was not localized to the nested tree"
+if grep -qE "${outer}/src/" "${inner}/build/t.d"; then
+    fail "restored depfile names the OUTER tree's sources from inside the nested one"
+fi
+echo "   the depfile is localized to the nested tree, not the enclosing one"
+
+echo "== nested roots: a changed HEADER in the inner tree must not be served =="
+write_nest_tree "$inner" 41
+cat > "${inner}/src/inc/h.hpp" <<'EOF'
+#pragma once
+inline int nested() { return 99; }
+EOF
+compile_nest "$inner" nest-hdr
+# BOTH directions, deliberately. `STORED` present is not by itself proof that
+# nothing was served -- that would be reading the absence of a HIT out of the
+# presence of a STORE, and these two lines being mutually exclusive is an
+# assumption about the launcher's logging rather than about its behaviour. The
+# mis-serve this case exists to catch shows up as a HIT, so say so.
+grep -q "STORED" "${workdir}/nest-hdr.log"     || fail "a changed header in the nested tree did not store a new object"
+if grep -q "fastcache-cc: HIT" "${workdir}/nest-hdr.log"; then
+    fail "a changed header in the nested tree was SERVED the enclosing tree's object"
+fi
+echo "   a changed header misses, so one token for two files is not a mis-serve"
+
+echo "== nested roots: a changed SOURCE in the inner tree must not be served =="
+write_nest_tree "$inner" 41
+cat > "${inner}/src/t.cpp" <<'EOF'
+#include "inc/h.hpp"
+int main() { return nested() + 1; }
+EOF
+compile_nest "$inner" nest-src
+grep -q "STORED" "${workdir}/nest-src.log"     || fail "a changed source in the nested tree did not store a new object"
+if grep -q "fastcache-cc: HIT" "${workdir}/nest-src.log"; then
+    fail "a changed source in the nested tree was SERVED the enclosing tree's object"
+fi
+echo "   a changed source misses too"
+
 # --- 5: a moved header must not replay a depfile naming its old path ---------
 # The header's CONTENTS do not change, so the preprocessed text is byte-identical
 # (line markers are suppressed). The depfile is nothing but paths, and the one on
@@ -1147,7 +1246,7 @@ echo "   retired flags exit 2 with a diagnostic"
 "$launcher" -z >/dev/null || fail "-z returned non-zero"
 "$launcher" --zero-stats >/dev/null || fail "--zero-stats returned non-zero"
 
-echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth," \
+echo "compile-cache E2E OK: miss/hit, byte-identical, >1 MiB values, store ceiling, cross-depth, nested roots," \
      "moved-header convergence (both layouts keyed apart), an edit re-keying," \
      "authentication (refused without a credential, cached with one), and safe fallback"
 exit 0
