@@ -100,12 +100,13 @@ enum class DrainResult : std::uint8_t
 
 /// Wait until nothing is outstanding, or until the ceiling elapses.
 ///
-/// The one bounded drain in this tree. Every shutdown path that waits on
-/// detached work — a reactor loop, a connection coroutine, a peer sender, an
-/// admin request — borrows members held on the object being torn down, so it
-/// must not return while one of them is still running; and it must not wait
-/// forever either, because a stuck peer would then turn a stop into a hang and
-/// hand the ending to a supervisor that answers `SIGKILL` with no diagnostic.
+/// The one bounded drain in this tree: every shutdown path that waits on
+/// detached work goes through it. Such work — a reactor loop, a connection
+/// coroutine, a peer sender, an admin request — borrows members held on the
+/// object being torn down, so the teardown must not return while one of them is
+/// still running; and it must not wait forever either, because a stuck peer
+/// would then turn a stop into a hang and hand the ending to a supervisor that
+/// answers `SIGKILL` with no diagnostic.
 ///
 /// **The ceiling is measured, never counted.** Accumulating the *requested*
 /// poll — `waited += poll` — states a bound and enforces `poll_actual / poll`
