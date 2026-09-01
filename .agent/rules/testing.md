@@ -347,6 +347,76 @@ sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
 
+## The POSIX fixtures share one helper library, and a bound is read from a clock
+
+`scripts/lib/e2e-common.sh` holds `fail`, `free_port`, `port_answers`,
+`wait_until`, `wait_for_port`, `wait_for_log`, `stop_and_require_exit` and
+`http_get`. It was seven copies, and every argument the C++ side of this file
+makes about `ScriptedSocket` applies unchanged: a shared helper is a shared fake,
+a fake nobody exercises does not report its own bugs, and copies drift silently
+until whichever caller walks into the drift pays for it.
+
+The drift had already happened, in three directions, and each one is a fixture
+that could not report what it saw:
+
+- `check-compile-cache-daemon-start.sh`'s `wait_for_port` checked **no liveness
+  at all**, so a daemon that died at `bind()` was reported as `never answered on
+  port N` after the full bound had burned — the slow-machine-versus-wedged-process
+  confusion this file spends three sections on.
+- `fleet-dashboard-e2e.sh`'s `http_get` learnt that `read` returns non-zero on a
+  final chunk with no trailing newline, so a naive loop drops it — and the JSON
+  document that route serves is one line with no newline at all. The fix was never
+  carried back; in the other six copies it is latent by luck about which endpoints
+  end in a newline.
+- Two `free_port`s had no issued-port ledger.
+
+The library is therefore the **union** of the correct behaviours, not their
+intersection: preserving each caller's current behaviour would have preserved all
+three defects under the name of compatibility.
+
+**A bound is read from a clock, never counted in iterations.** Every copy said
+things like "100 x 0.2s = 20s" and none of those equalities held: `sleep` is an
+external command that forks and execs, and it overshoots on a busy machine, so the
+product is a *lower* bound that drifts most exactly when a fixture is timing out.
+`fleet-dashboard-e2e` had the pure form of it —
+
+    fail "timed out after $((WAIT_TICKS / 10))s waiting for $what to listen on ${port}"
+
+— a duration computed from the loop shape and **never observed**. Whatever the loop
+took, the operator was told `WAIT_TICKS / 10`. That message is the one this file
+requires to separate a slow machine from a wedged process, and it cannot, because
+the reading that would show a slow machine is derived from assuming the machine was
+fast. `SECONDS` bounds the loop and `SECONDS` is what gets reported; the sleep stays
+as pacing. One second of resolution is the price and it is ample against budgets of
+20s and 240s, because it is a measured second rather than an assumed one.
+
+**A bespoke condition is a predicate, never a bespoke loop.** `wait_until` is public
+for exactly that: `fleet-dashboard-e2e` had a hand-written poll for a worker to
+appear in `/fleet.json`, with its own bound, its own message and no liveness check,
+because neither `wait_for_port` nor `wait_for_log` covered it. That is how the next
+copy gets written.
+
+**`fail` signals the top-level shell unconditionally, and does not test `BASHPID`.**
+`exit` inside `( ... )` ends the subshell only; the obvious guard is to compare
+`BASHPID` with the top-level pid and signal only when they differ, and that guard is
+correct on bash 4 and **silently inert on 3.2**, where `BASHPID` is unset and the
+test reduces to comparing `$$` with itself. So there is no detection: the signal
+goes out always and a `trap 'exit 1' TERM` turns it back into an ordinary exit with
+the EXIT trap intact. This is not belt-and-braces reasoning — staging the `BASHPID`
+guard back in and running the self-test on a bash 5 runner leaves every behavioural
+case **green**, because on bash 5 the guard works. The bash-3.2 scan in
+`check-e2e-helpers.sh` is the only check in the tree that can see it.
+
+`ctest -R e2e-helpers-selftest` is the test, in the default set, POSIX-only. Its
+decision half — which kind of failure a wait suffered — is `_e2e_verdict`, pure and
+driven from staged records with both sides of every threshold pinned, for the reason
+`Get-WaitVerdict` is. Its acquisition half is driven against real processes that
+really die and real logs that really grow. Both halves were falsified: eleven staged
+defects, each shown red at the case that names it. Two of the first drafts' cases
+could **not** be made to fail and were rewritten — a forty-draw port test that a
+deleted ledger passed fifteen runs in sixteen, and a `( fail )` subshell case that
+`set -e` was quietly rescuing.
+
 ## An in-process fleet, and what a harness has to earn
 
 `tests/FleetHarness.hpp` runs a compile fleet in one process: N `SchedulerService`
@@ -687,3 +757,13 @@ Four things about the shape, and the last two are the ones that generalise.
   scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
   `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
   has been copied wrong before.
+- **[#451](https://github.com/LASTRADA-Software/fastcached/issues/451)** —
+  `scripts/dist-compile-e2e.sh` still carries its own `free_port`, `wait_for_port`,
+  `wait_for_log`, `http_get`, `fail` and `stop_and_require_exit`, and inlines the
+  node start recipe about ten times. Held back from #449 deliberately: #445 was in
+  the merge queue rewriting the same helpers, and taking a hand-merge risk in the
+  one file where a wrongly-merged wait is silent is the wrong trade at any conflict
+  probability. When it lands, `wait_for_registration` — #445's corrected `1 of 1
+  toolchain(s) registered` wait — **moves into** `lib/e2e-common.sh` rather than
+  being written an eighth time, and that file's `http_get` takes the shared one's
+  final-chunk fix rather than keeping its own version of the bug.

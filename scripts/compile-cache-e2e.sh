@@ -102,40 +102,24 @@ export XDG_STATE_HOME="${workdir}/state"
 export FASTCACHE_VERBOSE=1
 export FASTCACHE_PREFETCH_GROUP="e2e"
 
-fail() { echo "compile-cache E2E FAILED: $*" >&2; exit 1; }
-
-# Find a port nothing is listening on, exactly as `dist-compile-e2e` and
-# `cluster-e2e` do -- and for the reason they record: a fixed port is one more way
-# to collide with whatever else is running on this machine, and the failure reads
-# as "the cache is broken" when it means "something else was listening".
+# The shared helpers: `fail`, `free_port`, `wait_for_port` -- one copy for every
+# POSIX fixture (#449). This file's own `free_port` was a near-copy of
+# dist-compile-e2e.sh's WITHOUT the issued-port ledger, and it draws two ports
+# (the plain daemon and the authenticating one), which is exactly the shape the
+# ledger exists for: nothing is listening on a port issued a moment ago whose
+# server has not bound yet, so both draws could return it and the second daemon
+# would die of EADDRINUSE.
 #
-# This test is worse than most when that happens, because its readiness probe
-# cannot tell its own daemon from a stranger's: the probe connects, the daemon
-# this script started has already exited because the port was taken, and the run
-# proceeds against somebody else's cache. Both halves of that show up as a claim
-# about caching -- a first compile reported as a HIT, or a second one that was not
-# served -- with nothing anywhere naming the port.
-#
-# A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT,
-# and the daemon that follows would then be the one that cannot have it.
-#
-# The range stops below the kernel's ephemeral port range: a port can be an
-# outbound connection's local endpoint with nothing listening on it, so this probe
-# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
-# reasoning, and the CI failure that found it, are above `free_port` in
-# dist-compile-e2e.sh.
-free_port() {
-    local candidate
-    local floor=20000 ceiling=32000
-    for _ in $(seq 1 200); do
-        candidate=$(( floor + RANDOM % (ceiling - floor) ))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${candidate}") 2>/dev/null; then
-            echo "$candidate"
-            return 0
-        fi
-    done
-    fail "could not find a free port"
-}
+# The reasoning that used to live here -- why a connect probe and not a bind
+# probe, and why the range stops below the kernel's ephemeral range -- is above
+# `free_port` in `lib/e2e-common.sh`, in full. The part that is about THIS
+# fixture stays below, at the check that the daemon still listening is the one it
+# started: this test's readiness probe cannot tell its own daemon from a
+# stranger's, and both halves of that mistake show up as a claim about caching --
+# a first compile reported as a HIT, or a second one that was not served -- with
+# nothing anywhere naming the port.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "compile-cache E2E" "$workdir"
 
 [[ -n "$port" ]] || port="$(free_port)"
 
@@ -146,18 +130,7 @@ free_port() {
     > "${workdir}/daemon.log" 2>&1 &
 server_pid=$!
 
-# Wait for the listener rather than sleeping a fixed amount: a cold CI runner
-# can take noticeably longer than a warm developer machine.
-ready=""
-for _ in $(seq 1 100); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then ready=1; break; fi
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-        cat "${workdir}/daemon.log" >&2
-        fail "daemon exited before it started listening"
-    fi
-    sleep 0.2
-done
-[[ -n "$ready" ]] || { cat "${workdir}/daemon.log" >&2; fail "daemon never listened on port ${port}"; }
+wait_for_port 127.0.0.1 "$port" "$server_pid" "daemon" "${workdir}/daemon.log"
 
 # Something answered; make sure it is OURS. The loop above breaks the moment the
 # port is connectable, which a daemon somebody else left behind satisfies just as
@@ -1155,16 +1128,7 @@ EOF
 "$fastcached" --bind=127.0.0.1 --port="$authport" --requirepass=e2e-s3cret --log-level=info \
     > "${workdir}/auth-daemon.log" 2>&1 &
 auth_pid=$!
-authready=""
-for _ in $(seq 1 100); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/${authport}") 2>/dev/null; then authready=1; break; fi
-    if ! kill -0 "$auth_pid" 2>/dev/null; then
-        cat "${workdir}/auth-daemon.log" >&2
-        fail "authenticating daemon exited before it started listening"
-    fi
-    sleep 0.2
-done
-[[ -n "$authready" ]] || { cat "${workdir}/auth-daemon.log" >&2; fail "authenticating daemon never listened"; }
+wait_for_port 127.0.0.1 "$authport" "$auth_pid" "authenticating daemon" "${workdir}/auth-daemon.log"
 kill -0 "$auth_pid" 2>/dev/null || {
     cat "${workdir}/auth-daemon.log" >&2
     fail "something else is listening on port ${authport}: our authenticating daemon is gone"

@@ -108,42 +108,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "compile-cache daemon-start FAILED: $*" >&2; exit 1; }
-
-# Find a port nothing is listening on. Same technique and same reasoning as
-# dist-compile-e2e.sh's free_port(): a connect probe, racy in principle,
-# acceptable because this test is RUN_SERIAL and the range is wide.
+# The shared helpers: `fail`, `free_port` and `wait_for_port`, one copy for every
+# POSIX fixture (#449). The three this file had were near-copies of
+# dist-compile-e2e.sh's, and two of them had drifted:
 #
-# The range stops below the kernel's ephemeral port range: a port can be an
-# outbound connection's local endpoint with nothing listening on it, so this probe
-# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
-# reasoning, and the CI failure that found it, are above `free_port` in
-# dist-compile-e2e.sh.
-free_port() {
-    local port
-    local floor=20000 ceiling=32000
-    for _ in $(seq 1 200); do
-        port=$(( floor + RANDOM % (ceiling - floor) ))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-            echo "$port"
-            return 0
-        fi
-    done
-    fail "could not find a free port"
-}
-
-# Block until something answers on a port, bounded — never a fixed sleep, for
-# the same reason dist-compile-e2e.sh's wait_for_port isn't one: a cold CI
-# runner is slower than a warm developer machine to get a process from
-# spawned to listening.
-wait_for_port() {
-    local port="$1" what="$2"
-    for _ in $(seq 1 100); do
-        if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then return 0; fi
-        sleep 0.2
-    done
-    fail "${what} never answered on port ${port}"
-}
+#   * `free_port` had no issued-port ledger. Only one port is drawn here today,
+#     so it was latent rather than wrong -- and latent-because-of-the-caller is
+#     how the next caller inherits a bug.
+#   * `wait_for_port` checked NO liveness at all, so a daemon that died at
+#     `bind()` was reported as `never answered on port N` after the full bound
+#     had burned. A slow machine and a dead process are fixed in different
+#     places and that message cannot tell them apart, which is the thing
+#     `.agent/rules/testing.md` asks a bounded wait to do.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "compile-cache daemon-start" "$workdir"
 
 port="$(free_port)"
 addr="127.0.0.1:${port}"
@@ -211,7 +189,13 @@ cat "${workdir}/configure1.log"
 grep -q "Auto-started fastcached" "${workdir}/configure1.log" \
     || fail "first configure never reported starting a daemon"
 
-wait_for_port "$port" "fastcached"
+# The daemon is double-forked and detached by the configure, so this script never
+# held its pid -- but the configure has returned by now and the pidfile is how
+# anything here finds it. Read if it is there, `-` if it is not: a wait told `-`
+# says INCONCLUSIVE on expiry rather than implying it watched something.
+daemonPid="-"
+[[ -f "$daemonPidfile" ]] && daemonPid="$(cat "$daemonPidfile" 2>/dev/null || echo -)"
+wait_for_port 127.0.0.1 "$port" "$daemonPid" "fastcached" "${workdir}/configure1.log"
 
 [[ -f "$daemonPidfile" ]] || fail "no pidfile at ${daemonPidfile} after the daemon was reported started"
 firstPid="$(cat "$daemonPidfile")"

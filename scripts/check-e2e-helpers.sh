@@ -1,0 +1,710 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# The self-test for `scripts/lib/e2e-common.sh`.
+#
+# A shared helper is a shared fake. `src/tests/ScriptedSocket.hpp` is the
+# precedent: three private copies of one scripted socket, two of them carrying
+# the same defect, found a day apart -- because a fake nobody exercises does not
+# report its own bugs. Folding seven copies of `free_port`/`wait_for_port`/
+# `http_get`/`fail` into one file makes every fixture depend on this file being
+# right, and a helper library with no test that can go red is #449's own failure
+# mode one level up: something that passes for a reason unrelated to what it
+# guards.
+#
+# Two halves, and the split is the one `.agent/rules/testing.md` argues for after
+# `node-scratch-isolation-e2e` spent a CI leg learning it:
+#
+#   * The DECISION -- which kind of failure a wait suffered -- is `_e2e_verdict`,
+#     which is pure. It reads no clock, touches no process and opens no file, so
+#     every one of its branches is a one-line record here, including the ones that
+#     cannot be staged (a pid that is not this shell's child) and the ones whose
+#     bounds have to be pinned on BOTH sides rather than demonstrated once from
+#     the middle. That is where an `-and`/`-or` mistake actually lives.
+#   * ACQUISITION -- the poll loop, the liveness check, the log-growth accounting
+#     -- is driven for real, with real processes that really die and real logs
+#     that really grow, but with one-second budgets rather than a fixture's.
+#
+# Registered as `e2e-helpers-selftest` and deliberately NOT labelled `smoke`: it
+# starts no daemon, needs no compiler, and finishes in a few seconds, so it
+# belongs in the default `ctest` set where a change to the helpers is caught by
+# whoever made it.
+#
+# Usage:
+#   check-e2e-helpers.sh              run every case
+#   check-e2e-helpers.sh --case NAME  run one case in this process (used above)
+set -uo pipefail
+
+source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+library="${source_dir}/scripts/lib/e2e-common.sh"
+
+# ---------------------------------------------------------------------------
+# The cases
+# ---------------------------------------------------------------------------
+#
+# Each runs in its own bash process, because most of them end in `fail`, and
+# `fail` ends the process -- that being the property under test.
+
+run_case() {
+    # The fixtures all run under `set -euo pipefail`, so the helpers are
+    # exercised under it here too. A helper that only behaves when errexit is off
+    # is a helper no caller has.
+    set -e
+    local name="$1"
+    # NOT `local`: the EXIT trap below runs after this function has returned, so
+    # a scratch path scoped to the function is an unbound variable by the time
+    # cleanup reads it -- which under `set -u` turns every passing case into a
+    # failure at the very last moment, after its assertions have all held.
+    scratch="$(mktemp -d)"
+    # shellcheck source=lib/e2e-common.sh
+    . "$library"
+    cleanup() { echo "cleanup ran"; rm -rf "$scratch"; }
+    trap cleanup EXIT
+    e2e_begin "selftest" "$scratch"
+    e2e_wait_seconds 1
+
+    case "$name" in
+
+    # --- `fail` stops the RUN, not the shell that raised it -----------------
+    #
+    # The defect this pins shipped here: a `fail` called from a `( ... )` group
+    # ended the subshell only, the script carried on, and it then reported two
+    # further failures about the artefacts the first one explains -- so a reader
+    # working upward from the last line starts on the wrong question.
+    #
+    # All three contexts, because the fix has to hold in each and the obvious
+    # guard (compare `BASHPID` with the top-level pid) does not: `BASHPID` is
+    # bash 4.0+ and macOS ships 3.2, where it is unset and the comparison
+    # silently always holds.
+    #
+    # WHERE THE SUBSHELL SITS MATTERS. The obvious spelling of this case --
+    # a bare `( fail ... )` followed by a line that must not run -- proves
+    # nothing, because `set -e` stops the script on the subshell's non-zero
+    # status whether or not `fail` signalled anybody. Deleting the signal
+    # outright left that version GREEN.
+    #
+    # So the subshell's status is CONSUMED, by `||` and by an `if`, which is
+    # where errexit is switched off and where the real fixtures put it: the
+    # construct that found this defect was a control build in a `( ... )` whose
+    # result the script then examined. Only the signal can stop the run here.
+    fail-top)
+        fail "staged failure at the top level"
+        echo "BUG: the top-level shell continued"
+        ;;
+    fail-subshell)
+        ( fail "staged failure inside ( ... )"; echo "BUG: the subshell continued" ) \
+            || echo "BUG: the top-level shell continued past the subshell"
+        echo "BUG: the top-level shell reached the end"
+        ;;
+    fail-cmdsub)
+        if captured="$( echo ignored; fail "staged failure inside \$( ... )" )"; then
+            echo "BUG: the command substitution succeeded with '${captured}'"
+        else
+            echo "BUG: the top-level shell continued past the command substitution"
+        fi
+        ;;
+    fail-hook)
+        dump() { echo "the on-fail hook ran"; }
+        e2e_on_fail dump
+        fail "staged failure with a hook"
+        ;;
+
+    # --- `free_port` ---------------------------------------------------------
+    #
+    # The ledger, which two of the seven copies did not have. Nothing is
+    # listening on a port issued a moment ago whose server has not bound yet, so
+    # without it a fixture that draws every port it needs before binding any of
+    # them can hand the same number out twice -- and the collision surfaces as a
+    # process dying of EADDRINUSE, which reads as an unrelated flake.
+    #
+    # The range, and that every draw is recorded.
+    ports)
+        drawn=""
+        n=0
+        while [ "$n" -lt 40 ]; do
+            p="$(free_port)"
+            [ "$p" -ge 20000 ] || fail "drew ${p}, below the floor of 20000"
+            [ "$p" -lt 32000 ] || fail "drew ${p}, at or above the ceiling of 32000"
+            case " ${drawn} " in
+                *" ${p} "*) fail "drew ${p} twice; the issued-port ledger is not working" ;;
+            esac
+            drawn="${drawn} ${p}"
+            n=$(( n + 1 ))
+        done
+        # The ledger is a FILE and not a variable for a reason -- every call site
+        # is a command substitution and a subshell's assignment is gone the moment
+        # it exits -- so assert the file, not just the absence of repeats.
+        count="$(grep -c . "${scratch}/.issued-ports")"
+        [ "$count" = "40" ] || fail "the ledger holds ${count} ports, not 40"
+        echo "40 distinct ports, all in range, all recorded"
+        ;;
+
+    # And that the ledger is what CONFINES the draw to ports not yet issued.
+    #
+    # The forty-draw case above cannot show this and was written believing it
+    # could: with the ledger deleted it still passed. Forty draws from twelve
+    # thousand numbers repeat about one run in sixteen, so it fails fifteen times
+    # out of sixteen to notice a property that is entirely broken -- which is not
+    # a weak test, it is a test of something else that happens to be in the room.
+    #
+    # Seeding `RANDOM` to force the collision does not work either: bash reseeds
+    # the generator in subshells, and every call site of `free_port` is a command
+    # substitution, so two draws from one seed are two different streams.
+    #
+    # So the ledger is PRE-LOADED instead, with every port in the range but the
+    # top thousand. A draw that consults it can only come back from that
+    # thousand; a draw that does not has eleven chances in twelve of coming back
+    # from below it, and five draws make that 4 in 10^6. Nothing is listening on
+    # any of them -- which is the whole point, and exactly the situation the
+    # ledger exists for: a port issued a moment ago, whose server has not bound
+    # yet, probes free.
+    ports-ledger)
+        seq 20000 30999 > "${scratch}/.issued-ports"
+        n=0
+        while [ "$n" -lt 5 ]; do
+            p="$(free_port)"
+            [ "$p" -ge 31000 ] \
+                || fail "drew ${p}, which the ledger already held; the ledger is not consulted"
+            n=$(( n + 1 ))
+        done
+        echo "the ledger confined five draws to the ports it had not issued"
+        ;;
+
+    # `port_answers` is the bool half: a closed port is an ordinary answer for
+    # some callers rather than a fault, and they need something that does not end
+    # the run. A port this process just drew and never bound is closed by
+    # construction.
+    port-answers-closed)
+        p="$(free_port)"
+        if port_answers 127.0.0.1 "$p"; then
+            fail "port_answers said something is listening on the unbound port ${p}"
+        fi
+        echo "port_answers is false for an unbound port"
+        ;;
+
+    # --- the wait loop -------------------------------------------------------
+    #
+    # Driven through `wait_until` rather than through `wait_for_port`,
+    # because the loop is where the liveness check, the cost accounting and the
+    # log-growth reading live; `wait_for_port` and `wait_for_log` are two-line
+    # wrappers that differ only in the predicate. The real-socket cases below
+    # cover the wrappers.
+    wait-success)
+        marker="${scratch}/ready"
+        ( sleep 0.6; : > "$marker" ) >/dev/null 2>&1 &
+        writer=$!
+        ready() { [ -e "$marker" ]; }
+        wait_until ready "the staged marker" "-" "-" 5
+        wait "$writer" 2>/dev/null || true
+        echo "the wait returned when the predicate became true"
+        ;;
+
+    # A process that DIED is a third case beside "slow" and "stuck", and it is
+    # reported the moment it is noticed rather than after the budget -- calling
+    # it a timeout sends the reader to the budget, which is not the subject. The
+    # driver asserts the elapsed time is nowhere near the ten seconds allowed.
+    wait-death-is-prompt)
+        ( exit 3 ) &
+        corpse=$!
+        sleep 0.4
+        never() { return 1; }
+        wait_until never "a process that is already gone" "$corpse" "-" 10
+        echo "BUG: the wait returned"
+        ;;
+
+    # Alive, and it logged nothing at all for the whole budget: it reached the
+    # point of being started and no further.
+    wait-timeout-silent)
+        log="${scratch}/silent.log"
+        : > "$log"
+        # Redirected, and short. A background process started here inherits this
+        # shell's stdout, which is the pipe the driver reads the case's output
+        # through -- so an orphan holding it open makes the driver's command
+        # substitution block until the orphan exits, whatever the case did.
+        sleep 5 >/dev/null 2>&1 &
+        sleeper=$!
+        never() { return 1; }
+        wait_until never "a silent process" "$sleeper" "$log" 2
+        echo "BUG: the wait returned"
+        ;;
+
+    # Alive, and still logging when the budget ran out. The distinction from the
+    # case above is the whole reason a total cannot answer this: growth spread
+    # over the whole wait and growth that stopped in the first tick are the same
+    # `logGrew=yes` and opposite findings, so the reading that decides is the
+    # STALL AGE.
+    wait-timeout-progressing)
+        log="${scratch}/busy.log"
+        : > "$log"
+        ( n=0; while [ "$n" -lt 25 ]; do echo "line ${n}" >> "$log"; sleep 0.2; n=$(( n + 1 )); done ) >/dev/null 2>&1 &
+        chatty=$!
+        never() { return 1; }
+        wait_until never "a chatty process" "$chatty" "$log" 2
+        echo "BUG: the wait returned"
+        ;;
+
+    # Neither reading is available. Reported as its own outcome rather than as
+    # the nearest neighbour: skipped, absent, unstarted and failed are four
+    # states, and a wait that cannot tell them apart says so.
+    wait-timeout-no-pid)
+        log="${scratch}/nopid.log"
+        : > "$log"
+        never() { return 1; }
+        wait_until never "something nobody is watching" "-" "$log" 2
+        echo "BUG: the wait returned"
+        ;;
+    wait-timeout-no-log)
+        sleep 5 >/dev/null 2>&1 &
+        sleeper=$!
+        never() { return 1; }
+        wait_until never "something with no log" "$sleeper" "-" 2
+        echo "BUG: the wait returned"
+        ;;
+
+    # Neither reading, which is the shape `macos-package-e2e` uses: launchd owns
+    # the job, so there is no pid this shell may watch and no log it writes. Its
+    # own row here because that fixture cannot be run from this repository's
+    # development machines at all, so the only thing that can exercise the
+    # argument form it passes is this file. `wait_for_port` rather than
+    # `wait_until`, since it is the wrapper's five-`-`-and-a-bound spelling that
+    # is at issue.
+    wait-nothing-watched)
+        p="$(free_port)"
+        wait_for_port 127.0.0.1 "$p" "-" "the installed service" "-" 2
+        echo "BUG: the wait returned"
+        ;;
+
+    # A wait whose bound is a real duration. Driven from the DRIVER, which times
+    # the whole process: nothing inside the wait can measure the wait, because it
+    # ends in `fail`.
+    wait-clock-bound)
+        never() { return 1; }
+        wait_until never "a bound that must be real" "-" "-" 4
+        echo "BUG: the wait returned"
+        ;;
+
+    # `wait_for_log` over a real file, including the part `wait_for_port` alone
+    # cannot show: a bound port does not mean a process has finished announcing
+    # itself, so the marker has to be found after the fact rather than at the
+    # moment it is written.
+    wait-for-log)
+        log="${scratch}/late.log"
+        : > "$log"
+        ( sleep 0.4; echo "1 of 1 toolchain(s) registered" >> "$log" ) >/dev/null 2>&1 &
+        writer=$!
+        sleep 5 >/dev/null 2>&1 &
+        holder=$!
+        wait_for_log "1 of 1 toolchain(s) registered" "$holder" "the staged node" "$log" 5
+        wait "$writer" 2>/dev/null || true
+        kill "$holder" 2>/dev/null || true
+        echo "wait_for_log returned on the marker"
+        ;;
+
+    # --- the real-socket cases ----------------------------------------------
+    #
+    # `wait_for_port` and `http_get` against a listener that really binds, really
+    # answers and really closes. Perl rather than nc: `nc`'s listen flags differ
+    # between the BSD, GNU and OpenBSD builds, and one of those is on every
+    # platform CI runs but never the same one.
+    wait-for-port)
+        p="$(free_port)"
+        # stderr goes into the same file `wait_for_port` is told to dump, so a
+        # listener that cannot bind explains itself in the failure rather than
+        # arriving as an unexplained death. stdout is closed off for the reason
+        # the silent case gives.
+        _selftest_listener "$p" 1 "${scratch}/listener.log" \
+            >/dev/null 2>>"${scratch}/listener.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/listener.log" 15
+        kill "$listener" 2>/dev/null || true
+        echo "wait_for_port returned on a real listener"
+        ;;
+
+    # THE regression. `read` sets its variable and returns non-zero on a final
+    # chunk with no trailing newline, so a naive loop drops it -- and the fleet
+    # dashboard's JSON document is ONE line with no newline at all, so the whole
+    # body vanished. One of the seven copies of `http_get` learnt that; the other
+    # six never did, and are latent today only by luck about which endpoints
+    # happen to end in a newline. The staged response therefore ends WITHOUT one,
+    # and the assertion is on the last byte rather than on the body being
+    # non-empty -- which is what a version carrying the bug would still satisfy,
+    # because the headers arrive with their newlines intact.
+    http-last-chunk)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/http.log" \
+            >/dev/null 2>>"${scratch}/http.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/http.log" 15
+        body="$(http_get 127.0.0.1 "$p" /fleet.json)"
+        kill "$listener" 2>/dev/null || true
+        case "$body" in
+            *"200 OK"*) ;;
+            *) fail "the staged listener did not answer 200: '${body}'" ;;
+        esac
+        case "$body" in
+            *NO-TRAILING-NEWLINE*) echo "http_get kept the final chunk" ;;
+            *) fail "http_get dropped the final chunk; the body was '${body}'" ;;
+        esac
+        ;;
+
+    # A header the caller adds reaches the server. `http_get` takes them
+    # variadically so the dashboard's Authorization and If-None-Match do not each
+    # need their own parameter -- and the second one is why: the fleet page's
+    # parse loop once stopped at the first header it recognised, which stayed
+    # correct exactly until there were two.
+    http-headers)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/hdr.log" \
+            >/dev/null 2>>"${scratch}/hdr.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/hdr.log" 15
+        http_get 127.0.0.1 "$p" /echo "Authorization: Bearer staged" "If-None-Match: \"etag-staged\"" >/dev/null
+        kill "$listener" 2>/dev/null || true
+        wait "$listener" 2>/dev/null || true
+        grep -q 'Authorization: Bearer staged' "${scratch}/hdr.log" \
+            || { cat "${scratch}/hdr.log" >&2; fail "the Authorization header did not reach the server"; }
+        grep -q 'If-None-Match: "etag-staged"' "${scratch}/hdr.log" \
+            || { cat "${scratch}/hdr.log" >&2; fail "the second header did not reach the server"; }
+        echo "both caller headers reached the server"
+        ;;
+
+    # A refused connection is a RETURN, not a stop: a fixture asking whether a
+    # surface is up wants to decide for itself what that means.
+    http-refused)
+        p="$(free_port)"
+        if http_get 127.0.0.1 "$p" /healthz >/dev/null 2>&1; then
+            fail "http_get succeeded against the unbound port ${p}"
+        fi
+        echo "http_get returned non-zero for a refused connection"
+        ;;
+
+    *)
+        echo "unknown case: ${name}" >&2
+        exit 2
+        ;;
+    esac
+}
+
+# A listener that answers one request per connection with a body ending in NO
+# newline, and records the request headers it was sent.
+#
+# @param 1 port
+# @param 2 seconds to wait before binding -- so a caller can prove the wait
+#          POLLS rather than happening to be called after the bind
+# @param 3 file to record request lines in
+_selftest_listener() {
+    perl -e '
+        use strict; use warnings; use IO::Socket::INET;
+        my ($port, $delay, $logfile) = @ARGV;
+        sleep $delay if $delay;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => $port,
+            Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+        open(my $log, ">>", $logfile) or die $!;
+        $log->autoflush(1);
+        while (my $c = $srv->accept()) {
+            while (defined(my $l = <$c>)) { print $log $l; last if $l =~ /^\r?\n?$/; }
+            print $c "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                   . "Connection: close\r\n\r\n{\"tail\":\"NO-TRAILING-NEWLINE\"}";
+            close $c;
+        }
+    ' "$1" "$2" "$3"
+}
+
+# ---------------------------------------------------------------------------
+# The driver
+# ---------------------------------------------------------------------------
+
+if [ "${1:-}" = "--case" ]; then
+    run_case "$2"
+    exit 0
+fi
+
+failures=0
+ran=0
+skipped=0
+
+# What each case must exit with and what its combined output must and must not
+# say. A table rather than a function per case, so adding a branch to
+# `_e2e_verdict` is adding a row.
+#
+# Fields are `|`-separated: name, expected exit status, then patterns. A pattern
+# beginning with `!` must be ABSENT. Patterns are `grep -F` fixed strings, so a
+# regular expression that quietly matches more than it should cannot creep in.
+expect() {
+    local record="$1" out="$2" status="$3"
+    local name wanted rest pattern
+
+    name="${record%%|*}"; record="${record#*|}"
+    wanted="${record%%|*}"; rest="${record#*|}"
+
+    if [ "$status" != "$wanted" ]; then
+        echo "FAIL ${name}: exited ${status}, expected ${wanted}" >&2
+        printf '%s\n' "$out" | sed 's/^/     | /' >&2
+        return 1
+    fi
+
+    # Split on `|` by parameter expansion rather than by word splitting. An
+    # unquoted `$rest` under `IFS='|'` would also glob, so a pattern containing a
+    # `*` would quietly become whatever the working directory happens to
+    # contain -- and turning globbing off for the loop leaves `set -f` behind on
+    # every early `return`.
+    rest="${rest}|"
+    while [ -n "$rest" ]; do
+        pattern="${rest%%|*}"
+        rest="${rest#*|}"
+        [ -n "$pattern" ] || continue
+
+        # `grep -qF <<<` and never `printf ... | grep -q`. Under `pipefail`,
+        # `grep -q` exits at its first match, the producer dies of SIGPIPE, and
+        # the pipeline reports the PRODUCER's status -- so the pipeline fails
+        # precisely when the pattern is present. A false negative on the success
+        # path is the worst shape a check can have, and this repository has one
+        # on record (`nm "$b" | grep -q __tsan_init`).
+        local hit=0
+        grep -qF -- "${pattern#!}" <<< "$out" || hit=1
+
+        case "$pattern" in
+            '!'*)
+                if [ "$hit" -eq 0 ]; then
+                    echo "FAIL ${name}: output contains '${pattern#!}' and must not" >&2
+                    printf '%s\n' "$out" | sed 's/^/     | /' >&2
+                    return 1
+                fi
+                ;;
+            *)
+                if [ "$hit" -ne 0 ]; then
+                    echo "FAIL ${name}: output lacks '${pattern}'" >&2
+                    printf '%s\n' "$out" | sed 's/^/     | /' >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    return 0
+}
+
+# --- the pure verdict ------------------------------------------------------
+#
+# `_e2e_verdict` takes a record and returns lines. Every branch is one row here,
+# and each threshold is pinned on BOTH sides rather than demonstrated once from
+# the middle -- at the boundary and one second past it -- because that is where a
+# comparison mistake lives. Arguments are:
+#
+#     what  bound  elapsed  polls  alive  exit  logGrew  stall
+#
+# all durations in MEASURED seconds. With bound=20 the "recent" window is 20/4 =
+# 5s, so a 5s stall is progressing and a 6s one is stalled; and the overrun note
+# fires above bound + max(1, bound/10), so 22s is quiet and 23s is not.
+verdicts=(
+    "died|worker|20|20|98|no|3|no|-|the process DIED"
+    "died-status-unknown|worker|20|20|98|no|-|no|-|exit=-"
+    "no-process|worker|20|20|98|unknown|-|unknown|-|INCONCLUSIVE|No process was watched"
+    "no-log|worker|20|20|98|yes|-|unknown|-|INCONCLUSIVE|no log was watched"
+    "silent|worker|20|20|98|yes|-|no|-|logged NOTHING for the whole 20s"
+    "progressing-at-bound|worker|20|20|98|yes|-|yes|5|still making progress"
+    "stalled-one-second-past|worker|20|20|98|yes|-|yes|6|stopped making observable progress"
+    "progressing-fresh|worker|20|20|98|yes|-|yes|0|still making progress"
+    "stalled-cold|worker|20|20|98|yes|-|yes|20|stopped making observable progress"
+    # The measured elapsed is what gets printed, never the budget.
+    "reports-measured-not-nominal|worker|20|37|61|yes|-|no|-|waited 37s (measured, over 61 polls) of a 20s budget"
+    # And the overrun note, pinned on both sides of bound + max(1, bound/10).
+    "overrun-quiet-at-slack|worker|20|22|98|yes|-|no|-|!NOTE: the loop overran"
+    "overrun-named-past-slack|worker|20|23|98|yes|-|no|-|NOTE: the loop overran its own budget by 3s"
+)
+
+echo "== the verdict, against staged records"
+for row in "${verdicts[@]}"; do
+    old="$IFS"
+    IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vrest <<< "$row"
+    IFS="$old"
+    out="$( . "$library"
+            _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" 2>&1 )"
+    ran=$(( ran + 1 ))
+    expect "${vname}|0|${vrest}" "$out" 0 || failures=$(( failures + 1 ))
+done
+
+# A verdict that never says BLOCKED cannot report a hang, and a table of rows
+# that all pass says nothing about whether the rows differ. So assert the set of
+# findings is as large as the set of branches: nine rows collapsing to two
+# distinct findings would pass every row above.
+distinct="$(
+    for row in "${verdicts[@]}"; do
+        old="$IFS"
+        IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vrest <<< "$row"
+        IFS="$old"
+        ( . "$library"
+          _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" 2>&1 ) \
+            | grep 'FINDING:'
+    done | sort -u | grep -c .
+)"
+if [ "$distinct" -ne 6 ]; then
+    echo "FAIL verdict-branches: the records produced ${distinct} distinct findings, not 6" >&2
+    failures=$(( failures + 1 ))
+fi
+ran=$(( ran + 1 ))
+
+# --- the cases -------------------------------------------------------------
+
+cases=(
+    "fail-top|1|selftest FAILED: staged failure at the top level|cleanup ran|!BUG:"
+    "fail-subshell|1|selftest FAILED: staged failure inside ( ... )|cleanup ran|!BUG:"
+    "fail-cmdsub|1|selftest FAILED: staged failure inside \$( ... )|cleanup ran|!BUG:"
+    "fail-hook|1|the on-fail hook ran|selftest FAILED: staged failure with a hook"
+    "ports|0|40 distinct ports, all in range, all recorded"
+    "ports-ledger|0|the ledger confined five draws to the ports it had not issued"
+    "port-answers-closed|0|port_answers is false for an unbound port"
+    "wait-success|0|the wait returned when the predicate became true|polls) for the staged marker"
+    "wait-death-is-prompt|1|the process DIED|exit=3|of a 10s budget|!BUG:|!waited 9s|!waited 10s"
+    "wait-timeout-silent|1|logged NOTHING for the whole 2s|!BUG:"
+    "wait-timeout-progressing|1|still making progress|!BUG:"
+    "wait-timeout-no-pid|1|No process was watched|!BUG:"
+    "wait-timeout-no-log|1|no log was watched|!BUG:"
+    "wait-nothing-watched|1|No process was watched|to listen on 127.0.0.1:|!BUG:"
+    "wait-for-log|0|wait_for_log returned on the marker"
+)
+
+# Perl is what stages a real listener. Where it is absent those cases are
+# SKIPPED and said to be skipped, by name and with a count -- never folded into
+# the pass, which is the collapse this repository makes about once a session.
+socket_cases=(
+    "wait-for-port|0|wait_for_port returned on a real listener"
+    "http-last-chunk|0|http_get kept the final chunk"
+    "http-headers|0|both caller headers reached the server"
+    "http-refused|0|http_get returned non-zero for a refused connection"
+)
+
+echo "== the helpers, in real shells"
+for record in "${cases[@]}"; do
+    name="${record%%|*}"
+    out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
+    status=$?
+    ran=$(( ran + 1 ))
+    expect "$record" "$out" "$status" || failures=$(( failures + 1 ))
+done
+
+# --- the bound is a duration, not an iteration count -----------------------
+#
+# The one property in this file that has to be timed from OUTSIDE, and the
+# reason it needs its own block rather than a row in the table above: a wait
+# that expires ends the process, so nothing inside it can report how long it
+# took, and every verdict row is a staged record that never ran a loop at all.
+# Between them they cover what the wait SAYS and say nothing about how long it
+# waited -- which is exactly the gap the defect lives in. Replacing the clock
+# with `elapsed=$(( elapsed + 1 ))` leaves all forty other checks green.
+#
+# A four-second bound, required to have taken at least three seconds of wall
+# clock. Under an iteration count it is four polls of 0.2s and comes back in
+# under a second. The slack is one second because `SECONDS` truncates at both
+# ends; the gap being measured is three seconds wide, so no truncation reaches
+# across it.
+echo "== the bound is a duration, not an iteration count"
+clock_started="$SECONDS"
+out="$( bash "${BASH_SOURCE[0]}" --case wait-clock-bound 2>&1 )"
+status=$?
+clock_took=$(( SECONDS - clock_started ))
+ran=$(( ran + 1 ))
+if [ "$status" != "1" ]; then
+    echo "FAIL wait-clock-bound: exited ${status}, expected 1" >&2
+    failures=$(( failures + 1 ))
+elif [ "$clock_took" -lt 3 ]; then
+    echo "FAIL wait-clock-bound: a 4s bound came back after ${clock_took}s of wall clock;" >&2
+    echo "     the loop is counting iterations rather than reading a clock" >&2
+    printf '%s\n' "$out" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+else
+    # And the number it PRINTS is the measured one. A loop could be bounded
+    # correctly and still report the budget, which is the half with teeth --
+    # a timeout message stating a duration nobody measured is a fixture lying
+    # to the person diagnosing it.
+    reported="$(printf '%s\n' "$out" | sed -n 's/^waited \([0-9][0-9]*\)s (measured.*/\1/p')"
+    if [ -z "$reported" ] || [ "$reported" -lt 3 ]; then
+        echo "FAIL wait-clock-bound: it waited ${clock_took}s and reported '${reported:-nothing}'" >&2
+        printf '%s\n' "$out" | sed 's/^/     | /' >&2
+        failures=$(( failures + 1 ))
+    fi
+fi
+
+if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then
+    echo "== the helpers, against a real listener"
+    for record in "${socket_cases[@]}"; do
+        name="${record%%|*}"
+        out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
+        status=$?
+        ran=$(( ran + 1 ))
+        expect "$record" "$out" "$status" || failures=$(( failures + 1 ))
+    done
+else
+    for record in "${socket_cases[@]}"; do
+        echo "SKIPPED ${record%%|*}: perl with IO::Socket::INET is not available to stage a listener" >&2
+        skipped=$(( skipped + 1 ))
+    done
+fi
+
+# --- bash 3.2 --------------------------------------------------------------
+#
+# macOS ships a 2007 `/bin/bash` and these fixtures run on every platform CI
+# builds, so a construct newer than that is a fixture that does not start there.
+# Scanned rather than remembered: the constraint was already written down in
+# `coverage.sh`'s comments, where nobody writing a new script would find it.
+#
+# `BASHPID` is in the table because it is the trap that looks like the fix. A
+# `[ "${BASHPID:-$$}" = "$top_pid" ]` guard is CORRECT on bash 4 and silently
+# inert on 3.2, where BASHPID is unset and the test reduces to comparing `$$`
+# with itself -- so the subshell defect it was written to close is closed on
+# Linux and open on macOS. `fail` avoids the question entirely.
+#
+# And this row is LOAD-BEARING rather than belt-and-braces, which is only visible
+# from having tried it: staging that guard back into `fail` and running this file
+# on a bash 5 runner leaves `fail-subshell` GREEN, because on bash 5 the guard
+# works. The behavioural case cannot see a 3.2-only defect from a 4-or-later
+# shell, and every machine this is developed and tested on is a 4-or-later shell.
+# The scan is the only check here that can.
+echo "== bash 3.2 constructs"
+banned=(
+    "mapfile:reads into an array; bash 4.0+"
+    "readarray:the same builtin under its other name; bash 4.0+"
+    "declare -A:associative arrays; bash 4.0+"
+    "local -n:name references; bash 4.3+"
+    "BASHPID:bash 4.0+, and unset on macOS -- a guard using it is silently inert there"
+    "[[ -v :bash 4.2+"
+    "^^}:case modification; bash 4.0+"
+    ",,}:case modification; bash 4.0+"
+)
+for entry in "${banned[@]}"; do
+    token="${entry%%:*}"
+    why="${entry#*:}"
+    # Comment lines are excluded, because the header explains WHY several of
+    # these are banned and a scan that fails on its own rationale is a scan
+    # nobody can write the rationale for. Indented comments too: the reason for
+    # `BASHPID` is inside `fail`.
+    hits="$(grep -n -F -- "$token" "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+    ran=$(( ran + 1 ))
+    if [ -n "$hits" ]; then
+        echo "FAIL bash32: ${library} uses '${token}' (${why})" >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        failures=$(( failures + 1 ))
+    fi
+done
+
+# And the library must not be executable or carry a `#!`: it is sourced, and a
+# copy that looks runnable invites someone to run it, which does nothing and
+# says nothing.
+ran=$(( ran + 1 ))
+first_line="$(head -1 "$library")"
+case "$first_line" in
+    '#!'*)
+        echo "FAIL shebang: ${library} is sourced, not executed, and must carry no '#!' line" >&2
+        failures=$(( failures + 1 ))
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+
+echo
+echo "e2e-helpers-selftest: ${ran} checks ran, ${failures} failed, ${skipped} skipped"
+if [ "$skipped" -gt 0 ]; then
+    echo "  (a skip is not a pass: the ${skipped} skipped checks were not run at all)"
+fi
+[ "$failures" -eq 0 ] || exit 1
+exit 0

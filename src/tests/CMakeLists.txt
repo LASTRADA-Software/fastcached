@@ -256,6 +256,44 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The shared e2e helper library. Fails when `scripts/lib/e2e-common.sh` stops
+# drawing ports the way it says, stops distinguishing a dead process from a slow
+# one, stops keeping an HTTP body's last chunk, or stops ending the run from
+# inside a subshell.
+#
+# It exists because that file is a shared fake in the sense
+# `src/tests/ScriptedSocket.hpp` records: seven fixtures now depend on it, so a
+# defect in it is a defect in all of them at once, and #449 is precisely the
+# ticket about a fixture passing for a reason unrelated to what it guards. A
+# helper library with no test that can go red would be that failure one level up.
+#
+# Not labelled "smoke": it starts no daemon, needs no compiler and binds nothing
+# but the loopback listener it stages for itself, so it belongs in the default
+# `ctest` set where whoever edits the helpers is the one who sees it break.
+#
+# `if(NOT WIN32)` for the reason `local-gate-selftest` and `ci-scope` carry the
+# same guard -- the library serves POSIX fixtures and is POSIX itself. Measured
+# rather than assumed, and worth recording: on msys2 bash a `/dev/tcp` connect to
+# an unbound loopback port can SUCCEED, so the socket cases there report a wait
+# of 0s against a listener that binds a second later. The same cases read 1s on
+# Linux. A green run on Windows would be the wrong kind of green.
+if(NOT WIN32)
+    add_test(
+        NAME "e2e-helpers-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
+    )
+    # It stages several deliberate timeouts of a couple of seconds each and one
+    # four-second wait that must really take four seconds -- the check that the
+    # bound comes from a clock rather than from an iteration count. Well inside
+    # 120s, and bounded so a helper that stops being bounded reports here rather
+    # than as a suite timeout naming nothing.
+    set_tests_properties("e2e-helpers-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # Target-file guard hygiene. Fails when a `$<TARGET_FILE:>` names an executable
 # the app table can gate off, without any enclosing condition asking whether
 # that target exists.

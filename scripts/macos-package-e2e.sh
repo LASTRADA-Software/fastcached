@@ -102,19 +102,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The shared helpers: `fail` and `wait_for_port`, one copy for every POSIX
+# fixture (#449).
+#
+# WHAT CHANGED FOR THIS FIXTURE, deliberately: the local `wait_for_port` took no
+# arguments at all -- it closed over the global `$port` -- and RETURNED 1, with
+# both call sites writing `|| fail "nothing listening ..."`. The shared one
+# fails the run itself and names the port, the bound, the measured elapsed and
+# whether anything was watched. The `|| fail` goes, being the only use either
+# site made of the return value: the step still fails at the same point with the
+# same status 1. A caller that wanted a closed port to be an ordinary answer
+# would use `port_answers`, and neither of these does.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "macOS package E2E" "$workdir"
+
 # On failure, dump what the postinstall scripts recorded before giving up. A
 # .pkg postinstall must exit 0 whatever happens, so its diagnostics are the only
 # evidence of a step that declined to run -- and without them a failure here
 # looks like "the service is just missing".
-fail() {
-    echo "macOS package E2E FAILED: $*" >&2
+dump_install_logs() {
     if [[ -r /var/log/fastcached-install.log ]]; then
         echo "--- /var/log/fastcached-install.log ---" >&2
         tail -40 /var/log/fastcached-install.log >&2
     fi
     sudo grep -i fastcached /var/log/install.log 2>/dev/null | tail -20 >&2 || true
-    exit 1
+    return 0
 }
+e2e_on_fail dump_install_logs
 
 # --- 1. inspect the payload before touching the machine --------------------
 echo "== inspecting the payload"
@@ -253,14 +267,6 @@ done
 # --- 4. the selected launchd job must be registered and serving -------------
 echo "== checking the launchd registration"
 
-wait_for_port() {
-    for _ in $(seq 1 150); do
-        (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && return 0
-        sleep 0.1
-    done
-    return 1
-}
-
 serves() {
     reply="$(printf 'set k 0 0 5\r\nhello\r\nget k\r\nquit\r\n' | nc -w 5 127.0.0.1 "$port" || true)"
     [[ "$reply" == *"STORED"* && "$reply" == *"hello"* ]] || fail "service did not serve: $reply"
@@ -331,7 +337,10 @@ if [[ "$scope" == "daemon" ]]; then
     owner="$(ps -o user= -p "$(sudo launchctl print "system/${LABEL}" | awk -F'= ' '/^\tpid = /{print $2; exit}')" | tr -d ' ')"
     [[ "$owner" == "_fastcached" ]] || fail "daemon runs as '${owner}', expected _fastcached"
 
-    wait_for_port || fail "nothing listening on 127.0.0.1:${port}"
+    # `-` for the pid: launchd owns these jobs and this script has no handle on
+    # them, which the verdict reports as its own outcome rather than implying it
+    # watched something. 15s, the bound this fixture has always used.
+    wait_for_port 127.0.0.1 "$port" "-" "the installed service" "-" 15
     serves
     echo "   system daemon running as _fastcached and serving on ${port}"
 else
@@ -345,7 +354,8 @@ else
     # made a real agent look absent — and made the uninstall assertion below
     # pass without ever testing anything.
     if agent_domain="$(registered_agent_domain)"; then
-        wait_for_port || fail "nothing listening on 127.0.0.1:${port}"
+        # `-` for the pid, as above: launchd owns the job.
+        wait_for_port 127.0.0.1 "$port" "-" "the registered agent" "-" 15
         serves
         echo "   agent registered in ${agent_domain} and serving on ${port}"
     else

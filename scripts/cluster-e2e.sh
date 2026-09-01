@@ -117,66 +117,24 @@ dump_logs() {
     done
 }
 
-fail() { dump_logs; echo "cluster E2E FAILED: $*" >&2; exit 1; }
+# The shared helpers: `fail`, `free_port` and `wait_for_port`, one copy for every
+# POSIX fixture (#449). The reasoning that used to be repeated here -- why a
+# connect probe rather than a bind probe, why the issued-port ledger is a FILE,
+# and why the range stops below the kernel's ephemeral range -- is above
+# `free_port` in `lib/e2e-common.sh`, in full rather than in each fixture's own
+# abbreviation of it.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "cluster E2E" "$workdir"
+
+# Every failure dumps every node's log first. A consensus defect that reproduces
+# intermittently is diagnosable from the logs or it is not diagnosable at all,
+# and cleanup takes them away -- so this has to run before the run ends rather
+# than at the call site that noticed.
+e2e_on_fail dump_logs
 
 export XDG_STATE_HOME="${workdir}/state"
 
 # --- helpers ----------------------------------------------------------------
-
-# Find a port nothing is listening on.
-#
-# A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT
-# on some systems, and the caller is about to hand it to a *different* process
-# anyway, so the only question this can honestly answer is "is anything answering
-# here right now".
-#
-# Ports already handed out THIS RUN are remembered and skipped. Without that, the
-# only question asked is "is anything listening", and nothing is listening on a
-# port issued a moment ago whose server has not bound yet -- so two calls could
-# return the same number and the second process to start died with
-# `bind(...) failed: 98`. This fixture draws every port it needs before binding
-# any of them, which is exactly the window that makes it reachable: rare enough
-# to read as an unrelated flake, and it did.
-#
-# The ledger is a FILE rather than a variable because every call site is a command
-# substitution, and a subshell's assignment is gone the moment it exits -- which
-# is how a first attempt at this fixed nothing at all. It lives under `workdir`,
-# so the existing cleanup takes it away.
-#
-# The range stops below the kernel's ephemeral port range: a port can be an
-# outbound connection's local endpoint with nothing listening on it, so this probe
-# says "free" and the `bind()` that follows still fails with EADDRINUSE. The full
-# reasoning, and the CI failure that found it, are above `free_port` in
-# dist-compile-e2e.sh.
-free_port() {
-    local port ledger="${workdir}/.issued-ports"
-    local floor=20000 ceiling=32000
-    for _ in $(seq 1 200); do
-        port=$(( floor + RANDOM % (ceiling - floor) ))
-        if grep -qx "$port" "$ledger" 2>/dev/null; then
-            continue
-        fi
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-            echo "$port" >> "$ledger"
-            echo "$port"
-            return 0
-        fi
-    done
-    fail "could not find a free port"
-}
-
-# Block until something answers on a port, or the process behind it dies.
-wait_for_port() {
-    local port="$1" pid="$2" what="$3"
-    for _ in $(seq 1 100); do
-        if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then return 0; fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            fail "${what} exited before it started listening"
-        fi
-        sleep 0.2
-    done
-    fail "${what} never listened on port ${port}"
-}
 
 # Ask one node a cluster question. Echoes its output; never fails the script.
 #
@@ -232,7 +190,7 @@ start_node() {
         --log-level=info \
         > "$log" 2>&1 &
     pids+=("$!")
-    wait_for_port "${scheduler_ports[$index]}" "$!" "${id}"
+    wait_for_port 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${id}" "$log"
 }
 
 for index in 0 1 2; do
@@ -597,7 +555,7 @@ scheduler_ports+=("$(free_port)")
     > "${workdir}/n4.log" 2>&1 &
 pids+=("$!")
 node_logs[3]="${workdir}/n4.log"
-wait_for_port "${scheduler_ports[3]}" "$!" "n4"
+wait_for_port 127.0.0.1 "${scheduler_ports[3]}" "$!" "n4" "${workdir}/n4.log"
 
 # It is running and it leads nothing, which is the first half of the property: a
 # node waiting to be admitted must not have formed a cluster of its own. Asked of
