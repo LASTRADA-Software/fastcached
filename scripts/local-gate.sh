@@ -152,8 +152,13 @@ cached_entry() {
     awk -v name="$2" 'index($0, name ":") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$1"
 }
 
-# Whether a compiler-cache launcher fronts the compiler in a GENERATED build, as
-# one of three words: `none`, `unknown`, or `fronted <n>`.
+# How many compile edges of a GENERATED build are fronted by a compiler-cache
+# launcher: a count, or the word `unknown` when there is no build to read.
+#
+# A count and not a yes/no, because the number is what makes the refusal
+# actionable, and not a `fronted <n>` string either -- that would be a wire format
+# between two functions in one file, glued on by the producer and taken apart by
+# the consumer, with only the producing end self-tested.
 #
 # This is the guard, and it is separate from the configure decision above because
 # it answers a different question. Passing `-DUSE_COMPILER_CACHE=OFF` is not the
@@ -173,17 +178,22 @@ cached_entry() {
 # project's idiom for this exact question: `scripts/launcher-replay-e2e.sh` checks
 # the same string from the other side, to prove a launcher IS in use.
 #
-# `unknown` is its own answer and not folded into `none`, because a missing
-# `build.ninja` is a state where the question cannot be answered rather than one
-# where the answer is good, and a gate that cannot check must not report.
+# `unknown` is its own answer and not folded into a count of zero, because a
+# missing `build.ninja` is a state where the question cannot be answered rather
+# than one where the answer is good, and a gate that cannot check must not report.
+# Zero is a reading; `unknown` is the absence of one.
+#
+# The whole file is scanned rather than stopped at the first match, and that costs
+# nothing worth saving: measured at 22.4ms against a 19.7ms bare `awk` spawn on a
+# 1.3MB `build.ninja`, so ~2.7ms is the scan. Stopping early cannot help the only
+# path a passing gate takes anyway -- answering zero means reading to EOF.
 # @param 1 Path to a generated build.ninja.
 launcher_verdict() {
     if [[ ! -f "$1" ]]; then
         echo "unknown"
         return 0
     fi
-    awk 'index($0, "LAUNCHER = ") { n++ }
-         END { if (n) print "fronted " n; else print "none" }' "$1"
+    awk 'index($0, "LAUNCHER = ") { n++ } END { print n+0 }' "$1"
 }
 
 # Why this preset has to be configured, or empty when it does not.
@@ -191,17 +201,17 @@ launcher_verdict() {
 # Split out because it is exactly what `--self-test` can check without a toolchain,
 # and because getting it wrong is silent in the direction that matters: a gate that
 # skips the re-configure keeps the wrong analyser and reports clean.
-# @param 1 Path to the build directory's CMakeCache.txt.
+# @param 1 Path to the build directory.
 # @param 2 `tidy` or `no-tidy`, from the table above.
 # @param 3 Absolute path of the pinned analyser.
 configure_reason() {
-    local cache="$1" analyser="$2" wanted="$3"
+    local dir="$1" analyser="$2" wanted="$3"
     local reasons=""
 
     # `cmake --build --preset` on a directory that does not exist fails with
     # "<path> is not a directory", which names neither the preset nor the fix and is
     # what a FRESH CHECKOUT gets from the one script everybody is told to run.
-    if [[ ! -f "$cache" ]]; then
+    if [[ ! -f "$dir/CMakeCache.txt" ]]; then
         echo "no build directory yet"
         return 0
     fi
@@ -213,7 +223,7 @@ configure_reason() {
     # it, because re-running the gate is what skipped the configure.
     if [[ "$analyser" == "tidy" ]]; then
         local have
-        have="$(cached_entry "$cache" CLANG_TIDY_EXE)"
+        have="$(cached_entry "$dir/CMakeCache.txt" CLANG_TIDY_EXE)"
         if [[ "$have" != "$wanted" ]]; then
             reasons="cached clang-tidy is ${have:-absent}, not $wanted"
         fi
@@ -224,22 +234,46 @@ configure_reason() {
     # fronted of the two. An absent entry is a directory configured before this
     # check existed, and `USE_COMPILER_CACHE` defaults to ON, so absent is reported
     # rather than tolerated -- the same reading `CLANG_TIDY_EXE-NOTFOUND` gets above.
+    #
+    # `${reasons:+...}` rather than an if/else, so the sentence is written once: two
+    # arms differing only by a separator are two places that have to stay identical,
+    # and a third pinned entry would be a third pair.
     local caching
-    caching="$(cached_entry "$cache" USE_COMPILER_CACHE)"
+    caching="$(cached_entry "$dir/CMakeCache.txt" USE_COMPILER_CACHE)"
     if [[ "$caching" != "OFF" ]]; then
-        if [[ -n "$reasons" ]]; then
-            reasons="$reasons; compiler caching is ${caching:-absent}, not OFF"
-        else
-            reasons="compiler caching is ${caching:-absent}, not OFF"
-        fi
+        reasons="${reasons:+$reasons; }compiler caching is ${caching:-absent}, not OFF"
     fi
 
-    # Both clauses can hold at once, and a run that re-configures for two reasons
-    # should say both: reporting only the first would leave a reader believing the
-    # other was already right.
-    if [[ -n "$reasons" ]]; then
-        echo "$reasons"
-    fi
+    # Whatever the refusal will read is also a reason to configure, or the gate
+    # cannot repair the state it refuses -- and CMake makes that state reachable:
+    # `-D` values are entered into `CMakeCache.txt` and the file is written even
+    # when the configure then FAILS, while the previously generated `build.ninja`
+    # stays exactly as it was. So a first gate run can leave a directory whose cache
+    # reads `OFF` with the right analyser, beside a launcher-fronted build. Judging
+    # only the cache, every later run would find nothing to configure, refuse on the
+    # stale build, and say "something set CMAKE_CXX_COMPILER_LAUNCHER externally" --
+    # which would be false, and which re-running could never fix, because
+    # re-running is what skips the configure. That is the precise shape the analyser
+    # clause above exists to remove, and it must not be reopened one file over.
+    #
+    # Through `launcher_verdict`, so the decision and the refusal read the same
+    # observable rather than two that can disagree. What survives a configure that
+    # actually RAN is the only state the refusal's message is true about.
+    local fronted
+    fronted="$(launcher_verdict "$dir/build.ninja")"
+    case "$fronted" in
+        0) ;;
+        unknown) reasons="${reasons:+$reasons; }there is no build.ninja to check" ;;
+        *)       reasons="${reasons:+$reasons; }the generated build is launcher-fronted (compile edges: $fronted)" ;;
+    esac
+
+    # Several clauses can hold at once, and a run that re-configures for more than
+    # one reason should say all of them: reporting only the first would leave a
+    # reader believing the others were already right.
+    #
+    # Unguarded: every caller takes this through `$( )`, which strips the trailing
+    # newline, so an empty `echo` and printing nothing are the same value.
+    echo "$reasons"
 }
 
 if [[ "$self_test" -eq 1 ]]; then
@@ -255,32 +289,64 @@ if [[ "$self_test" -eq 1 ]]; then
         fi
     }
 
-    # Every fixture below states BOTH pinned entries, because a cache file is only
-    # a useful stand-in for a build directory if it is complete: a fixture missing
+    # A fixture is a build DIRECTORY, not a lone cache file, because the decision
+    # under test reads two files out of one directory and the cheaper stand-in
+    # could not express "the cache is fine and the generated build is missing".
+    #
+    # @param 1 Directory name under $scratch.
+    # @param 2 CMakeCache.txt content.
+    # @param 3 `ninja` for a clean generated build, `fronted` for a
+    #          launcher-fronted one, `none` for a cache with no build beside it.
+    fixture() {
+        mkdir -p "$scratch/$1"
+        printf '%b' "$2" > "$scratch/$1/CMakeCache.txt"
+        case "$3" in
+            ninja)
+                printf 'build x.o: CXX_COMPILER__foo x.cpp\n  DEP_FILE = x.o.d\n' \
+                    > "$scratch/$1/build.ninja" ;;
+            fronted)
+                printf 'build x.o: CXX_COMPILER__foo x.cpp\n  LAUNCHER = /usr/bin/cmake -E env /usr/bin/fastcache-cc \n' \
+                    > "$scratch/$1/build.ninja" ;;
+        esac
+    }
+
+    # Every fixture states BOTH pinned entries, because a cache is only a useful
+    # stand-in for a build directory if it is complete: one missing
     # `USE_COMPILER_CACHE` would make the caching clause fire in the cases written
     # to isolate the analyser one, and the two would stop being separable.
-    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n' > "$scratch/right"
-    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=OFF\n' > "$scratch/wrong"
-    printf 'CLANG_TIDY_EXE:FILEPATH=CLANG_TIDY_EXE-NOTFOUND\nUSE_COMPILER_CACHE:BOOL=OFF\n' > "$scratch/notfound"
-    printf 'CMAKE_BUILD_TYPE:STRING=Debug\nUSE_COMPILER_CACHE:BOOL=OFF\n' > "$scratch/absent"
+    fixture right     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'      ninja
+    fixture wrong     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=OFF\n'      ninja
+    fixture notfound  'CLANG_TIDY_EXE:FILEPATH=CLANG_TIDY_EXE-NOTFOUND\nUSE_COMPILER_CACHE:BOOL=OFF\n'     ninja
+    fixture absent    'CMAKE_BUILD_TYPE:STRING=Debug\nUSE_COMPILER_CACHE:BOOL=OFF\n'                       ninja
 
     # The compiler-cache side. `caching-on` is what every gate directory on a
     # developer's machine looks like today, since the option defaults to ON;
     # `caching-unset` is one configured before the gate asked at all.
-    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=ON\n' > "$scratch/caching-on"
-    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\n' > "$scratch/caching-unset"
-    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=ON\n' > "$scratch/both-wrong"
+    fixture caching-on     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=ON\n'  ninja
+    fixture caching-unset  'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\n'                              ninja
+    fixture both-wrong     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=ON\n'  ninja
+
+    # Everything the gate pins is right, and the generated build is either missing
+    # or stale and launcher-fronted. Both are what a FAILED configure leaves behind:
+    # CMake writes the cache with the `-D` values and then does not regenerate.
+    fixture no-ninja      'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'  none
+    fixture stale-fronted 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'  fronted
 
     expect "reads the cached analyser" \
-        "/usr/bin/clang-tidy-20" "$(cached_entry "$scratch/wrong" CLANG_TIDY_EXE)"
+        "/usr/bin/clang-tidy-20" "$(cached_entry "$scratch/wrong/CMakeCache.txt" CLANG_TIDY_EXE)"
     expect "reads nothing when the entry is absent" \
-        "" "$(cached_entry "$scratch/absent" CLANG_TIDY_EXE)"
+        "" "$(cached_entry "$scratch/absent/CMakeCache.txt" CLANG_TIDY_EXE)"
     expect "reads the NOTFOUND sentinel as a value rather than as absence" \
-        "CLANG_TIDY_EXE-NOTFOUND" "$(cached_entry "$scratch/notfound" CLANG_TIDY_EXE)"
+        "CLANG_TIDY_EXE-NOTFOUND" "$(cached_entry "$scratch/notfound/CMakeCache.txt" CLANG_TIDY_EXE)"
     expect "reads the compiler-cache entry through the same reader" \
-        "ON" "$(cached_entry "$scratch/caching-on" USE_COMPILER_CACHE)"
+        "ON" "$(cached_entry "$scratch/caching-on/CMakeCache.txt" USE_COMPILER_CACHE)"
     expect "reads nothing when the compiler-cache entry is absent" \
-        "" "$(cached_entry "$scratch/caching-unset" USE_COMPILER_CACHE)"
+        "" "$(cached_entry "$scratch/caching-unset/CMakeCache.txt" USE_COMPILER_CACHE)"
+    # An entry name is matched at the start of the line and up to its colon, so a
+    # CMake `-ADVANCED` sibling is a different entry rather than a prefix match.
+    printf 'USE_COMPILER_CACHE-ADVANCED:INTERNAL=1\nUSE_COMPILER_CACHE:BOOL=OFF\n' > "$scratch/advanced"
+    expect "an -ADVANCED sibling is not mistaken for the entry" \
+        "OFF" "$(cached_entry "$scratch/advanced" USE_COMPILER_CACHE)"
 
     expect "a missing build directory is configured" \
         "no build directory yet" \
@@ -323,22 +389,39 @@ if [[ "$self_test" -eq 1 ]]; then
         "cached clang-tidy is /usr/bin/clang-tidy-20, not /usr/bin/clang-tidy-22; compiler caching is ON, not OFF" \
         "$(configure_reason "$scratch/both-wrong" tidy /usr/bin/clang-tidy-22)"
 
+    # A directory the refusal cannot READ must be re-configured rather than left to
+    # be refused forever. Everything this fixture pins is already correct, so
+    # without the clause it would get no configure, then fail `unknown` on a
+    # `build.ninja` nothing was ever going to generate -- and re-running the gate
+    # could not repair it, which is the exact shape the analyser clause removed.
+    expect "a cache with no generated build beside it is re-configured" \
+        "there is no build.ninja to check" \
+        "$(configure_reason "$scratch/no-ninja" tidy /usr/bin/clang-tidy-22)"
+    expect "a correct cache beside a launcher-fronted build is re-configured" \
+        "the generated build is launcher-fronted (compile edges: 1)" \
+        "$(configure_reason "$scratch/stale-fronted" tidy /usr/bin/clang-tidy-22)"
+    expect "a no-tidy preset is re-configured over a stale fronted build too" \
+        "the generated build is launcher-fronted (compile edges: 1)" \
+        "$(configure_reason "$scratch/stale-fronted" no-tidy /usr/bin/clang-tidy-22)"
+
     # The refusal. `-DUSE_COMPILER_CACHE=OFF` does not settle this on its own --
     # `CompileCache.cmake` returns early over an externally-set launcher -- so what
     # the gate refuses on is the generated build, and these are the three answers it
-    # can get. The `fronted` fixture is a real `LAUNCHER = ` line, verbatim from a
+    # can get. The fronted fixture carries a real `LAUNCHER = ` line, verbatim from a
     # gate directory, rather than the bare word: what is being tested is that the
-    # gate recognises what CMake actually emits.
-    printf 'build x.o: CXX_COMPILER__foo x.cpp\n  LAUNCHER = /usr/bin/cmake -E env FASTCACHE_ADDR=127.0.0.1:6674 /usr/bin/fastcache-cc \n  DEP_FILE = x.o.d\n' \
+    # gate recognises what CMake actually emits, including the leading indent.
+    printf 'build x.o: CXX_COMPILER__foo x.cpp\n  LAUNCHER = /usr/bin/cmake -E env FASTCACHE_ADDR=127.0.0.1:6674 /usr/bin/fastcache-cc \n  DEP_FILE = x.o.d\nbuild y.o: CXX_COMPILER__foo y.cpp\n  LAUNCHER = /usr/bin/cmake -E env /usr/bin/fastcache-cc \n' \
         > "$scratch/ninja-fronted"
-    printf 'build x.o: CXX_COMPILER__foo x.cpp\n  DEP_FILE = x.o.d\n' > "$scratch/ninja-clean"
 
-    expect "a launcher-fronted build is seen, and counted" \
-        "fronted 1" "$(launcher_verdict "$scratch/ninja-fronted")"
-    expect "a build with no launcher edge reports none" \
-        "none" "$(launcher_verdict "$scratch/ninja-clean")"
-    expect "a build.ninja that is not there is unknown, never none" \
-        "unknown" "$(launcher_verdict "$scratch/ninja-missing")"
+    # Two edges rather than one, because a count is what the refusal reports and a
+    # verdict that answered 1 for every fronted build would pass a single-edge test
+    # while telling an operator nothing.
+    expect "a launcher-fronted build is counted, not merely noticed" \
+        "2" "$(launcher_verdict "$scratch/ninja-fronted")"
+    expect "a build with no launcher edge reads zero" \
+        "0" "$(launcher_verdict "$scratch/right/build.ninja")"
+    expect "a build.ninja that is not there is unknown, never zero" \
+        "unknown" "$(launcher_verdict "$scratch/no-ninja/build.ninja")"
 
     # The table drives both of the above, so a row that stopped parsing would make
     # every check here vacuous while every one of them passed.
@@ -404,7 +487,12 @@ run_preset() {
     # to CMakePresets.json's single `binaryDir` of
     # `${sourceDir}/out/build/${presetName}`. A preset that moved its build
     # directory would configure once too often, which is the harmless direction.
-    local cache="out/build/${preset}/CMakeCache.txt"
+    #
+    # Once, and the two files derived from it: a second literal spelling of the same
+    # directory could name a file the gate never opened, and one of the two places
+    # it appeared was a failure message telling a developer where to look.
+    local build_dir="out/build/${preset}"
+    local ninja="${build_dir}/build.ninja"
 
     # The analyser is passed as a cache entry rather than through the preset,
     # because `find_program` short-circuits on a cache entry that is already set --
@@ -425,16 +513,25 @@ run_preset() {
     fi
 
     local reason
-    reason="$(configure_reason "$cache" "$analyser" "$tidy_path")"
+    reason="$(configure_reason "$build_dir" "$analyser" "$tidy_path")"
     if [[ -n "$reason" ]]; then
         echo "== $preset: configure ($reason)"
-        # Turning the launcher off rewrites every compile command, so ninja
-        # rebuilds the whole configuration once. Said HERE, at the moment it is
-        # decided, because a developer watching both presets rebuild from scratch
-        # with no explanation will reasonably file it as breakage. An explained
-        # cost is a cost; an unexplained one is a bug report.
-        case "$reason" in
-            *"compiler caching is"*)
+        # Turning the launcher off rewrites every compile command, so ninja rebuilds
+        # the whole configuration once. Said HERE, at the moment it is decided,
+        # because a developer watching both presets rebuild from scratch with no
+        # explanation will reasonably file it as breakage. An explained cost is a
+        # cost; an unexplained one is a bug report.
+        #
+        # Decided from what the CURRENT build actually HAS, not from the reason
+        # text. The whole point of this check is that the flag is the intent and the
+        # generated build is the fact, and the two disagree here in a case that is
+        # ordinary rather than exotic: on a machine with no launcher installed at
+        # all, `USE_COMPILER_CACHE` reads ON while `build.ninja` carries no launcher
+        # edge, and the configure rewrites no compile command. Warning about a
+        # from-scratch rebuild there would be a warning about nothing.
+        case "$(launcher_verdict "$ninja")" in
+            unknown|0) ;;
+            *)
                 echo "== $preset: dropping the compiler-cache launcher changes every compile"
                 echo "==   command, so this configuration rebuilds from scratch ONCE. Expected."
                 ;;
@@ -450,16 +547,16 @@ run_preset() {
     # the fact out of the generated build, and they are not the same -- see
     # launcher_verdict.
     local verdict
-    verdict="$(launcher_verdict "out/build/${preset}/build.ninja")"
+    verdict="$(launcher_verdict "$ninja")"
     case "$verdict" in
-        none)
+        0)
             echo "== $preset: no compiler-cache launcher in the generated build"
             ;;
         unknown)
-            fail "$preset: out/build/${preset}/build.ninja is not there after configuring, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report"
+            fail "$preset: $ninja is not there after configuring, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report"
             ;;
         *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (${verdict#fronted } compile edges), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (compile edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
             ;;
     esac
 

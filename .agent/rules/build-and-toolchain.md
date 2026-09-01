@@ -164,10 +164,20 @@ determinism rests on.
     directory-scope variable and never as a cache entry, so that guard could not fire -- inside
     the fix for a ticket about guards that cannot fire. It was caught by checking the two real
     caches rather than by reasoning about the CMake documentation.
-  - **Two questions, two observables.** Whether to re-**configure** is the `USE_COMPILER_CACHE`
-    cache entry -- pure, and absent reads as ON, since the option defaults that way. Whether to
-    **refuse** is the generated `build.ninja`. A missing `build.ninja` is `unknown` and is
-    refused, never folded into `none`: a gate that cannot check must not report.
+  - **Whatever the refusal reads is also a reason to configure, or the gate cannot repair the
+    state it refuses.** CMake enters `-D` values into `CMakeCache.txt` and writes that file
+    even when the configure then FAILS, leaving the old `build.ninja` untouched -- so a first
+    run can leave a cache reading `OFF` with the right analyser beside a launcher-fronted
+    build. Judged from the cache alone, every later run finds nothing to configure, refuses on
+    the stale build, and blames an external `CMAKE_CXX_COMPILER_LAUNCHER` that nobody set --
+    and re-running can never fix it, because re-running is what skips the configure. That is
+    the analyser bug above, reopened one file over. So `configure_reason` reads the generated
+    build too, through the same `launcher_verdict` the refusal uses: one observable, not two
+    that can disagree, and the refusal's message is then true because the only state that
+    reaches it is one that survived a configure which actually ran.
+  - A missing `build.ninja` is `unknown` and is never folded into a count of zero: zero is a
+    reading, `unknown` is the absence of one, and a gate that cannot check must not report.
+    `USE_COMPILER_CACHE` absent reads as ON, since that is the option's default.
   - The one-time cost is stated by the run that incurs it. Dropping the launcher rewrites every
     compile command, so ninja rebuilds the configuration from scratch once; a developer
     watching that with no explanation files it as breakage. An explained cost is a cost.

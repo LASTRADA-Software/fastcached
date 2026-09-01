@@ -556,12 +556,14 @@ endif()
 # through a compiler-cache launcher.
 #
 # The gate itself cannot be a test -- it builds two whole configurations -- but the
-# parts that can be WRONG are decisions over a file, and those are pure.
-# `--self-test` drives them against synthetic inputs: CMake caches on the wrong
-# analyser, one whose `find_program` never found any (`CLANG_TIDY_EXE-NOTFOUND`),
-# one with no entry at all, one already correct, and ones with compiler caching on,
-# off and unset; then `build.ninja` files that are launcher-fronted, clean, and
-# missing entirely.
+# parts that can be WRONG are decisions over a build directory, and those are pure.
+# `--self-test` drives them against synthetic ones: caches on the wrong analyser,
+# one whose `find_program` never found any (`CLANG_TIDY_EXE-NOTFOUND`), one with no
+# entry at all, one already correct, ones with compiler caching on, off and unset,
+# and -- beside a cache the gate is entirely happy with -- a generated build that is
+# launcher-fronted, and none at all. Those last two are what a FAILED configure
+# leaves behind, and they are the cases where the gate has to be able to repair the
+# state it refuses rather than refuse it forever.
 #
 # The failure it exists for reads exactly like success, in both halves.
 # `find_program` never revisits a filled cache entry and the gate only configured
