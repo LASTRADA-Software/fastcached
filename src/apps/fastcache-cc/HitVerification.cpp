@@ -114,7 +114,7 @@ HitComparison CompareObjectFiles(std::filesystem::path const& served, std::files
     // about whether the cache is right, and failing a build over a full disk would
     // make this feature the thing operators turn off.
     if (!servedBytes.has_value() || !freshBytes.has_value())
-        return { .verdict = HitVerdict::Inconclusive };
+        return { .verdict = HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} };
 
     auto comparison = CompareObjectImages(*servedBytes, *freshBytes);
     return { .verdict = VerdictOf(comparison.outcome),

@@ -723,11 +723,11 @@ void ReplayStreams(std::string_view out, std::string_view err)
                                                    unsigned rate)
 {
     if (!Cc::ShouldVerifyHit(key, rate))
-        return { .verdict = Cc::HitVerdict::NotChecked };
+        return { .verdict = Cc::HitVerdict::NotChecked, .comparison = std::nullopt, .detail = {} };
 
     auto const served = FastCache::PathFromNarrowText(cmd.objPath);
     if (!served.has_value())
-        return { .verdict = Cc::HitVerdict::Inconclusive };
+        return { .verdict = Cc::HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} };
 
     // Beside the object rather than in the system temp directory: the build already
     // writes here, so it is writable and on the same filesystem, and a rename or a
@@ -737,7 +737,7 @@ void ReplayStreams(std::string_view out, std::string_view err)
     std::error_code ec;
     std::filesystem::copy_file(*served, aside, std::filesystem::copy_options::overwrite_existing, ec);
     if (ec)
-        return { .verdict = Cc::HitVerdict::Inconclusive };
+        return { .verdict = Cc::HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} };
 
     // The compiler's own streams are DISCARDED. It has already been served a hit, so
     // its diagnostics were replayed; printing them a second time would make a verified
@@ -751,7 +751,7 @@ void ReplayStreams(std::string_view out, std::string_view err)
         // failed verification never costs the build its object.
         std::filesystem::copy_file(aside, *served, std::filesystem::copy_options::overwrite_existing, ec);
         std::filesystem::remove(aside, ec);
-        return { .verdict = Cc::HitVerdict::Inconclusive };
+        return { .verdict = Cc::HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} };
     }
 
     auto comparison = Cc::CompareObjectFiles(aside, *served);

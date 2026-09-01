@@ -311,7 +311,16 @@ namespace
     {
         /// The differing offsets, in order.
         std::vector<std::size_t> offsets;
-        /// True when the budget cut the scan short, so `offsets` is a PREFIX.
+        /// True when the scan REACHED ITS BUDGET with differences still to find, so
+        /// `offsets` is a PREFIX.
+        ///
+        /// **"Reached its budget", never "stopped before the end of the file."** The
+        /// two coincide on the failing case and differ on every passing one, which is
+        /// why the second spelling passed the case written for it and was wrong
+        /// everywhere else: the scan stops one byte past the LAST difference, which is
+        /// almost never end-of-file, so `at < left.size()` called every ordinary
+        /// comparison truncated and silently disabled the classification this flag
+        /// exists to protect.
         ///
         /// Carried rather than inferred from `offsets.size() == DescribeBudget`,
         /// because two conclusions below are only sound over a COMPLETE list: that a
@@ -491,7 +500,7 @@ namespace
 ObjectComparisonResult CompareObjectImages(std::span<std::byte const> served, std::span<std::byte const> fresh)
 {
     if (served.size() == fresh.size() && (served.empty() || std::memcmp(served.data(), fresh.data(), served.size()) == 0))
-        return { .outcome = ObjectComparison::Identical };
+        return { .outcome = ObjectComparison::Identical, .detail = {} };
 
     // The FRESH image decides which layout applies, and only the fresh one: it is
     // this toolchain's own output, so a format this cannot lay out is this code's

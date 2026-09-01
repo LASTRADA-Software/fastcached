@@ -65,6 +65,12 @@ enum class ObjectComparison : std::uint8_t
 /// this is returned by value and its inputs are spans over buffers the caller is
 /// free to drop, which is the use-after-free `.agent/rules/wire-and-protocol.md`
 /// records having happened twice already.
+/// Every field is named at every designated-initializer site, including the ones a
+/// member's own default initializer would supply. That looks like redundancy and is
+/// not: clang's `-Wmissing-designated-field-initializers` is an ERROR in this tree's
+/// pedantic presets, while MSVC accepts the short form -- so trimming them builds
+/// clean on Windows and fails the Linux gate. A cleanup pass removed them here for
+/// exactly that reason and the gate put them back.
 struct ObjectComparisonResult
 {
     ObjectComparison outcome { ObjectComparison::Different };
