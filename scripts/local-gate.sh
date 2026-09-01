@@ -309,6 +309,12 @@ if [[ "$self_test" -eq 1 ]]; then
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     self_test_failures=0
+    # Skipped is its own outcome, and it has to be VISIBLE or it reads as tested.
+    # `ctest` shows a passing test's output to nobody, so a skip announced only on
+    # stderr is a case that silently did not run -- which is the exact collapse this
+    # file spends its length refusing. It rides the final PASSED line instead,
+    # beside the interpreter, for the reason the interpreter is named there.
+    self_test_skipped=""
 
     # @param 1 What is being checked. @param 2 Expected. @param 3 Actual.
     expect() {
@@ -470,7 +476,7 @@ if [[ "$self_test" -eq 1 ]]; then
     fixture denied 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n' fronted
     chmod 000 "$scratch/denied/build.ninja" 2>/dev/null
     if [[ -r "$scratch/denied/build.ninja" ]]; then
-        echo "SELF-TEST SKIPPED: unreadable build.ninja (this user can read a 0000 file)" >&2
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }unreadable build.ninja (this user reads a 0000 file)"
     else
         expect "a build.ninja that cannot be READ is its own answer, not a count" \
             "unreadable" "$(launcher_verdict "$scratch/denied/build.ninja")"
@@ -497,7 +503,7 @@ if [[ "$self_test" -eq 1 ]]; then
     # bash" is the shape of claim this whole file exists to stop making. A runner
     # with a newer bash first on PATH proves the checks and not the constraint, and
     # the log is the only place that difference is visible.
-    echo "LOCAL GATE SELF-TEST PASSED (bash ${BASH_VERSION})"
+    echo "LOCAL GATE SELF-TEST PASSED (bash ${BASH_VERSION})${self_test_skipped:+ -- SKIPPED: $self_test_skipped}"
     exit 0
 fi
 
