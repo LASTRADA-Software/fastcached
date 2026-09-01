@@ -7,11 +7,11 @@
     #include <catch2/catch_test_macros.hpp>
 
     #include <sys/epoll.h>
+    #include <sys/eventfd.h>
 
     #include <cstdint>
     #include <memory>
 
-    #include <sys/eventfd.h>
     #include <unistd.h>
 
 using namespace FastCache;

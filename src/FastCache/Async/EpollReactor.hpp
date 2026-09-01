@@ -161,7 +161,7 @@ class EpollReactor: public IReactor
     ///
     /// Safe even if Attach was never called.
     /// @param handler The handler to remove. Must still be alive.
-    void Detach(EpollFdHandler* handler) noexcept;
+    void Detach(EpollFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.

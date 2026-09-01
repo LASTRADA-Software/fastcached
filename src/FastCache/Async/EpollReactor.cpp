@@ -115,7 +115,7 @@ bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write
     return ::epoll_ctl(_epollFd, EPOLL_CTL_MOD, handler->fd, &ev) == 0;
 }
 
-void EpollReactor::Detach(EpollFdHandler* handler) noexcept
+void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 {
     if (!handler)
         return;

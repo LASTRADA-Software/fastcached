@@ -96,7 +96,7 @@ class KqueueReactor: public IReactor
     ///
     /// Must be called BEFORE the owner is freed; every path does.
     /// @param handler The handler to remove. Must still be alive.
-    void Detach(KqueueFdHandler* handler) noexcept;
+    void Detach(KqueueFdHandler* handler) const noexcept;
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.

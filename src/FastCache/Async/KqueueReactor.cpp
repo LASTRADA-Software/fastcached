@@ -174,7 +174,7 @@ bool KqueueReactor::UpdateInterest(KqueueFdHandler* handler, bool read, bool wri
     });
 }
 
-void KqueueReactor::Detach(KqueueFdHandler* handler) noexcept
+void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
 {
     if (!handler)
         return;
