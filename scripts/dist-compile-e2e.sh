@@ -539,7 +539,15 @@ if [[ "$mode" == "membership" ]]; then
     # `ifconfig` prints three layouts across macOS and two vintages of net-tools.
     # Each row prints candidates one per line, is allowed to fail, and the first
     # usable answer wins.
-    probe_ip_addr() { ip -4 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1; }
+    #
+    # `up` is part of the `ip` filter, and it is not tidiness: an address on an
+    # administratively-down interface is still enumerated, and binding it succeeds
+    # while the local route is gone -- so the fixture's own `wait_for_port` would
+    # never connect and the run would FAIL where its contract says SKIP. A laptop on
+    # Wi-Fi with a configured wired NIC unplugged is the ordinary way to meet that.
+    # `ifconfig` with no arguments and `hostname -I` already report only up
+    # interfaces, so the three rows agree on that much.
+    probe_ip_addr() { ip -4 -o addr show scope global up 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1; }
     probe_ifconfig() { ifconfig 2>/dev/null | awk '$1 == "inet" { print $2 }' | sed 's/^addr://'; }
     probe_hostname() { hostname -I 2>/dev/null; }
 
@@ -569,7 +577,7 @@ if [[ "$mode" == "membership" ]]; then
         # result for a property it did not test -- this ticket's own failure mode
         # wearing a different hat.
         echo "dist-compile membership E2E SKIPPED: this host reports no non-loopback IPv4 address"
-        echo "  probed: 'ip -4 -o addr show scope global', 'ifconfig', 'hostname -I'"
+        echo "  probed: 'ip -4 -o addr show scope global up', 'ifconfig', 'hostname -I'"
         echo "  Without one, every connection to this machine's own worker arrives from 127.0.0.0/8,"
         echo "  which ClusterMembership::Classify admits before it ever consults the member list. There"
         echo "  is no arrangement of loopback addresses that reaches that list (127.0.0.2 included), so"
@@ -663,7 +671,13 @@ if [[ "$mode" == "membership" ]]; then
         # cannot say which happened.
         wait_for_port "$port" "$pid" "${tag} worker" "${workdir}/${tag}.log" "$lan_address"
         wait_for_log "compile node ready" "$pid" "${tag} worker" "${workdir}/${tag}.log"
-        wait_for_log "registered" "$pid" "${tag} worker" "${workdir}/${tag}.log"
+        # The ACCEPTED count, not the word `registered`. The summary line is logged
+        # after every heartbeat round whatever the outcome -- `0 of 1 toolchain(s)
+        # registered` contains it too -- and here that is not a detail: whether the
+        # scheduler admits this worker's own non-loopback address is part of what
+        # the mode tests, so a wait satisfied by a REFUSED round would report the
+        # failure two steps later as a dispatch fault.
+        wait_for_log "1 of 1 toolchain(s) registered" "$pid" "${tag} worker" "${workdir}/${tag}.log"
         wait_for_port "$admin" "$pid" "${tag} worker admin endpoint" "${workdir}/${tag}.log"
     }
 
@@ -710,6 +724,10 @@ if [[ "$mode" == "membership" ]]; then
         || fail "the admitting worker served a compile and its jobs counter did not move"
     admit_refused="$(worker_counter "$admit_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
+    # Absent is not zero, and here it would read as one: an empty string compares
+    # unequal to "0" and the failure would name a count nobody exported.
+    [[ -n "$admit_refused" ]] \
+        || fail "the admitting worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
     [[ "$admit_refused" == "0" ]] \
         || fail "the admitting worker refused ${admit_refused} caller(s) as not-a-member"
     echo "   dispatched and served: ${admit_completed} job(s), 0 refused"
@@ -741,12 +759,22 @@ if [[ "$mode" == "membership" ]]; then
     # compile has to add is a FURTHER refusal -- measured as a delta from this
     # reading rather than against zero, which is why the reading is taken after
     # every process is up and before the compile runs.
-    refuse_before="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
-        || fail "the refusing worker's admin endpoint refused a /metrics request"
+    # Polled rather than read once, and bounded like every other wait here.
+    # `wait_for_port` returns when the kernel completes the handshake, which the
+    # accept loop's `Classify` and `Refuse` follow -- so a single read can lose that
+    # race and fail with a confident wrong sentence about loopback when the truth is
+    # a few milliseconds.
+    refuse_before=""
+    for _ in $(seq 1 50); do
+        refuse_before="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
+            || fail "the refusing worker's admin endpoint refused a /metrics request"
+        if [[ -n "$refuse_before" && "$refuse_before" -ge 1 ]]; then break; fi
+        sleep 0.2
+    done
     [[ -n "$refuse_before" ]] \
         || fail "the refusing worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
     [[ "$refuse_before" -ge 1 ]] \
-        || fail "the refusing worker did not refuse this fixture's own liveness probe from ${lan_address}, so that probe reached it as a loopback caller and this leg would prove nothing"
+        || fail "waited 10s and the refusing worker never refused this fixture's own liveness probe from ${lan_address}: that probe reached it as an admitted caller, so this leg would prove nothing"
 
     write_source "${proj}/refused.cpp" "memberrefused"
     "$compiler" -std=c++17 -O1 -c "${proj}/refused.cpp" -o "${proj}/build/refused-ref.o" \
@@ -787,6 +815,8 @@ if [[ "$mode" == "membership" ]]; then
         }
     refuse_completed="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_completed_total)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
+    [[ -n "$refuse_completed" ]] \
+        || fail "the refusing worker exports no fastcache_worker_jobs_completed_total series"
     [[ "$refuse_completed" == "0" ]] \
         || fail "a worker that refused the caller still completed ${refuse_completed} job(s)"
     echo "   refused as not-a-member (counter ${refuse_before} -> ${refuse_after}), and the build compiled locally"
