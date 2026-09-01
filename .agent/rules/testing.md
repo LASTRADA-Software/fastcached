@@ -447,6 +447,13 @@ here"*, which is not the same question as *"can I bind here"* — and the gap be
 the two is exactly where a smoke test fails for a reason that has nothing to do
 with what it tests.
 
+**A body of assertions with a prerequisite the host may lack becomes its own ctest
+test**, not another case in an existing one. A script exits once, so a case inside a
+suite can do no more than print a line and let the run go green, and skipped and
+passed are then the same result. `dist-compile-membership-e2e` is that shape — one
+script, two registrations, `--case membership` — and the reasoning is under *A
+fixture whose client is always local cannot test who is admitted*, below.
+
 ## A shared failure message describes one caller, and lies to the others
 
 `cluster-e2e`'s `find_leader` ended with:
@@ -610,6 +617,69 @@ Three ways it refuses to pass vacuously, because each is how such a check report
 success for work it did not do: an app table it could not read, a scan that found
 no reference at all, and a file whose `if` nesting it could not follow to the end.
 All three are named failures.
+
+## A fixture whose client is always local cannot test who is admitted
+
+`scripts/dist-compile-e2e.sh` had twelve cases, three real processes each, and every
+leg of every one of them was loopback. `ClusterMembership::Classify` admits loopback
+**before** it consults a member list — deliberately, because that is what makes an
+unconfigured node useful on its own machine — so the branch underneath was reached by
+nothing:
+
+```cpp
+if (IsLoopbackHost(peerAddress))
+    return Membership::Member;                            // every case in the suite
+...
+return any_of(_hosts, SameHost) ? Member : Outsider;      // nothing at all
+```
+
+That is how [#235](https://github.com/LASTRADA-Software/fastcached/issues/235)
+survived. A worker that admitted **only** its own machine — and therefore refused
+every dispatched compile the documented setup sent it — passed the whole distributed
+suite, because the suite only ever asked it to admit its own machine. The fixture
+proved dispatch works and could not have noticed that dispatch works for nobody else.
+
+**The cheap fix does not work, and it looks exactly like it does.** A second loopback
+address is the obvious move and was the ticket's own first suggestion:
+`IsLoopbackHost` matches `127.` rather than `127.0.0.1`, and says so in its own
+comment, so a client on `127.0.0.2` takes the same early return. The fixture would
+change, the addresses in the log would differ, and the test would go on proving what
+it proved before — which is the shape of the defect, applied to its own repair.
+
+**What reaches the branch is the host's own non-loopback address**, and it needs no
+second machine: bind the worker there, let the scheduler grant that endpoint, and the
+connection the worker accepts arrives from outside `127/8`.
+
+Four things about the shape, and the last two are the ones that generalise.
+
+- **Assert both directions; only the pair proves anything.** Listed in
+  `--fleet-member` → dispatched and served. Absent → refused `not-a-member`, the build
+  compiles locally, and `fastcache_worker_jobs_refused_not_a_member_total` **moves** —
+  the assertion #235 needed and did not have. The admitted leg alone passes over
+  loopback too, since loopback is admitted above the list, so it cannot show the
+  address ever reached the list; the refusing leg is what shows it, because a loopback
+  peer would have been admitted there as well. Measured, with the address forced back
+  to `127.0.0.1`: the admitting leg stays **green** and the refusing leg goes red. That
+  asymmetry is the finding — one of the two legs cannot tell the difference, which is
+  why a suite made of legs like it reported nothing for twelve cases.
+- **The scheduler admits the client in both legs.** #235's shape is a lease that is
+  granted and then a worker that refuses it, which is invisible from the side anybody
+  watches — no scheduler counter moves. A refusal arriving from the scheduler instead
+  is a different test passing under the same name, so the client-side assertion matches
+  `refused the job: rejected (not-a-member)` rather than the error code alone.
+- **The baseline is not zero, and pretending it is hides the instrument.** The
+  fixture's own `wait_for_port` dials the compile port from that same address, so the
+  refusing leg has already refused one caller before its compile runs. That reading is
+  taken *after* startup and the compile is asserted as a **delta** from it — and its
+  being at least one is itself an assertion, because a zero there would mean the probe
+  arrived as a loopback caller and the leg proves nothing.
+- **A machine with no non-loopback address reports SKIPPED, loudly.** This is the only
+  body of assertions in that file with a prerequisite a host may lack, which is why it
+  is its own ctest test (`ctest -R dist-compile-membership-e2e`) rather than a
+  thirteenth case: a script exits once, so a case inside the suite could do no more
+  than print a line and let the run go green. A quiet fall back to loopback would be a
+  pass reported for a case that never ran — this ticket's own failure mode, wearing the
+  hat of its fix.
 
 ## Open work
 

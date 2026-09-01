@@ -1074,13 +1074,19 @@ else()
                 -Launcher "$<TARGET_FILE:fastcache-cc>"
         )
     else()
+        # The three binaries and the compiler, named once. Both POSIX entries below
+        # pass exactly this and differ only in `--case`, which is the whole point of
+        # there being two of them.
+        set(_fc_dist_e2e_args
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --node "$<TARGET_FILE:fastcache-compile-node>"
+            --launcher "$<TARGET_FILE:fastcache-cc>"
+            --compiler "${CMAKE_CXX_COMPILER}"
+        )
         add_test(
             NAME "dist-compile-e2e"
             COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
-                --fastcached "$<TARGET_FILE:fastcached>"
-                --node "$<TARGET_FILE:fastcache-compile-node>"
-                --launcher "$<TARGET_FILE:fastcache-cc>"
-                --compiler "${CMAKE_CXX_COMPILER}"
+                ${_fc_dist_e2e_args} --case suite
         )
     endif()
     # Spawns three daemons and several workers and drives real compiles, so it
@@ -1091,6 +1097,53 @@ else()
         RUN_SERIAL TRUE
         TIMEOUT 900
     )
+
+    # The one body of assertions in that fixture that is NOT loopback: it binds a
+    # worker on this host's own non-loopback address, so the peer address the
+    # worker classifies falls outside the 127.0.0.0/8 that
+    # `ClusterMembership::Classify` admits before ever reading a member list. That
+    # is why the suite could not have noticed #235, and the full argument -- both
+    # legs, why the pair is needed, and why a host without such an address must
+    # report SKIPPED -- is in `.agent/rules/testing.md` and in the script's own
+    # block. Its own test rather than a thirteenth case, because a script exits
+    # once and a case inside the suite could only print a line and let the run go
+    # green.
+    #
+    # POSIX-only for now, the way `cluster-e2e` records for itself: the property is
+    # platform-independent and the fixture is not, and `dist-compile-e2e.ps1`
+    # carries no such mode, so a Windows entry would be a translation rather than
+    # new coverage.
+    if(NOT WIN32)
+        add_test(
+            NAME "dist-compile-membership-e2e"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+                ${_fc_dist_e2e_args} --case membership
+        )
+        # RUN_SERIAL for CPU rather than for ports: `free_port` and its ledger
+        # already make concurrent binding safe, but each worker advertises the whole
+        # machine, and `AvailableSlots` withdraws slots for the cores something else
+        # is using -- so a parallel ctest job makes this fail as "not dispatched".
+        #
+        # TIMEOUT 600 against a ~7 s warm run, which is deliberate and is not slack.
+        # The script bounds every one of its own waits (20 s each, ten of them
+        # across five processes, plus one 10 s counter poll) and every bound names
+        # what it was waiting for. A ctest timeout below the sum of those fires
+        # BEFORE the fixture can say which participant never came up, and this
+        # repository has already paid for that once -- `dist-compile-e2e ***Timeout
+        # 900.10 sec`, in three jobs, naming nothing. It is a backstop for a stall
+        # the script cannot see, so it sits above the script's own ceiling.
+        set_tests_properties("dist-compile-membership-e2e" PROPERTIES
+            LABELS "smoke"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 600
+        )
+    else()
+        # Said out loud, the way `cluster-e2e` and `fleet-dashboard-e2e` say it. A
+        # platform guard with no `else()` is a test that does not exist on that
+        # platform with nothing in the configure log to say so.
+        message(STATUS "dist-compile-membership-e2e: POSIX-only — skipping")
+    endif()
 
     # The Windows fixture's object comparison, against synthetic COFF input.
     #
