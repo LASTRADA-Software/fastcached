@@ -859,11 +859,61 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     auto bound = std::format("{}:{}", endpoint.host, listener->BoundPort());
     logger.Logf(LogLevel::Info, "{} listening on {}", row.name, bound);
 
-    // `new` rather than `make_unique` because the constructor is private: the two ways
-    // to reach it are this factory, which has already proved the listener is bound,
-    // and nothing else.
+    // `new` rather than `make_unique` because the constructor is private: the ways to
+    // reach it are this factory and `StartAdopted`, each of which has already proved
+    // its listener is bound, and nothing else.
     return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
         io, std::move(listener), responder, row.name, std::move(bound), logger } };
+}
+
+std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartAdopted(NodeIoLoop& io,
+                                                                                       NodeSurface surface,
+                                                                                       int descriptor,
+                                                                                       std::string_view advertisedHost,
+                                                                                       IFrameResponder& responder,
+                                                                                       ILogger& logger)
+{
+    auto const& row = RowFor(surface);
+
+    // No `SoleEndpointOf`, and its absence is the point rather than an omission: the
+    // unit bound and listened before this process existed, so there is no address here
+    // to resolve and re-binding an already-listening socket fails. `Adopt` performs no
+    // bind, no listen and no `SO_REUSEADDR` for that reason.
+    //
+    // Ownership of `descriptor` passes into this call and is not ours again on any
+    // path -- the listener closes it in its destructor, including when the adoption
+    // itself failed -- so there is deliberately no `::close` anywhere below.
+#if defined(_WIN32)
+    // Unreachable rather than unsupported, and answered rather than not compiled.
+    // Socket activation here is systemd's protocol: `AdoptInheritedDescriptors` is
+    // `#if !defined(_WIN32)` and hands back nothing on Windows, so no caller can
+    // arrive with a descriptor. What this branch buys is that the signature is the
+    // same on every platform -- no `#ifdef` in the header, no call site that has to
+    // know -- and that if a Windows activation mechanism is ever wired up it meets a
+    // sentence instead of a link error. `IocpListener` has no `Adopt` yet (#465).
+    (void) io;
+    (void) descriptor;
+    (void) advertisedHost;
+    (void) responder;
+    (void) logger;
+    (void) row;
+    return std::unexpected { std::string { "socket activation is not available on this platform" } };
+#else
+    auto listener = PlatformListener::Adopt(io.Reactor(), descriptor);
+    if (!listener || !listener->IsBound())
+        return std::unexpected { std::format("cannot serve the socket-activated descriptor ({})",
+                                             listener ? listener->BindError() : std::string_view { "null listener" }) };
+
+    // Asked of the SOCKET. The port is the unit's choice and this process is never
+    // told it, so `BoundPort()` is the only thing that knows -- and it is what makes
+    // an activated node's log line and its `BoundEndpoint()` say something true
+    // rather than echo a `--listen-node` that configured nothing.
+    auto bound = FormatHostPort(advertisedHost, listener->BoundPort());
+    logger.Logf(LogLevel::Info, "{} serving a socket-activated listener, advertised as {}", row.name, bound);
+
+    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
+        io, std::move(listener), responder, row.name, std::move(bound), logger } };
+#endif
 }
 
 } // namespace FastCache::Node

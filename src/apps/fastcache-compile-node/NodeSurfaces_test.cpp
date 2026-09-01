@@ -380,11 +380,29 @@ TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][
     // actually need is one nothing printed. The general rule is in
     // distributed-compilation.md.
     //
-    // **Both halves stay asserted while activation is unwired**, which is the point
-    // of keeping this case rather than deleting it with the row it used to name: the
-    // note currently records that this surface does not serve an inherited
-    // descriptor yet, and the last stitch of #290 stage 3 has to change the note and
-    // this case together.
-    CHECK(RowFor(NodeSurface::Node).note.contains("--advertise"));
-    CHECK(RowFor(NodeSurface::Node).note.contains(".socket"));
+    // **This case was built as a forcing function and did not force**, which is
+    // worth recording where the next person will meet it. While activation was
+    // unwired the note said the surface did NOT serve an inherited descriptor, and
+    // the comment here claimed both halves were asserted -- but the two `contains`
+    // below match `--advertise` and `.socket`, which the note carries in either
+    // state. The note could have flipped from "not served" to "served", or back,
+    // without a single assertion moving. A comment describing a guarantee the
+    // assertions do not make is the same defect as a refusal test that only asks
+    // `has_value()`, and it is the third time in this ticket that the obvious
+    // assertion turned out to be satisfied by the wrong thing.
+    //
+    // So the state is asserted, not merely the vocabulary. #464 gave the reactor
+    // listeners `Adopt`, this row's surface serves an activated descriptor now, and
+    // reverting either without saying so here fails.
+    auto const& note = RowFor(NodeSurface::Node).note;
+
+    // The vocabulary, which is what a worksheet needs: an operator reading this row
+    // must be told the unit owns the address and that --advertise is what clients
+    // are given.
+    CHECK(note.contains("--advertise"));
+    CHECK(note.contains(".socket"));
+
+    // And the STATE, which is what the vocabulary cannot carry.
+    CHECK(note.contains("is served on this surface"));
+    CHECK_FALSE(note.contains("NOT yet served"));
 }

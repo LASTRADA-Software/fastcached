@@ -23,6 +23,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#if !defined(_WIN32)
+    #include <sys/socket.h>
+
+    #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -525,7 +534,7 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     CapturingLogger logger;
     auto const [cfg, port] = BaseConfig();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "serving no 0xFC port"));
@@ -552,7 +561,7 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     REQUIRE_FALSE(cfg.serveScheduler);
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface != nullptr);
 
@@ -571,11 +580,138 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
 }
+
+#if !defined(_WIN32)
+
+/// A descriptor in the state a supervisor hands one over in: bound and listening,
+/// and deliberately NOT non-blocking and NOT close-on-exec, because systemd passes
+/// them without either and correcting them is part of what adoption is for.
+struct HandedOverListenFd
+{
+    /// In the default member initializer rather than the body, because
+    /// `cppcoreguidelines-prefer-member-initializer` is an error here and the body
+    /// still has to REQUIRE the result.
+    int fd { ::socket(AF_INET, SOCK_STREAM, 0) };
+    std::uint16_t port { 0 };
+
+    HandedOverListenFd()
+    {
+        REQUIRE(fd >= 0);
+        if (fd < 0)
+            return; // constrains the fd for the static analyzer on the ::bind path below
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0; // ephemeral, so this cannot collide with a live port
+        REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd, 8) == 0);
+        socklen_t len = sizeof(addr);
+        REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port = ::ntohs(addr.sin_port);
+    }
+
+    HandedOverListenFd(HandedOverListenFd const&) = delete;
+    HandedOverListenFd& operator=(HandedOverListenFd const&) = delete;
+    HandedOverListenFd(HandedOverListenFd&&) = delete;
+    HandedOverListenFd& operator=(HandedOverListenFd&&) = delete;
+
+    ~HandedOverListenFd()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+
+    /// Hand the descriptor to something that takes ownership of it.
+    /// @return The descriptor; this fixture no longer closes it.
+    [[nodiscard]] int Release() noexcept
+    {
+        auto const released = fd;
+        fd = -1;
+        return released;
+    }
+};
+
+TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node][node-surface]")
+{
+    // **The last stitch of #290 stage 3.** For as long as the surfaces were merged
+    // and the reactor listeners could not adopt, an activated worker was refused at
+    // startup: the merged 0xFC surface runs on the reactor and socket activation
+    // handed back a BLOCKING listener, so there was nothing that could join the two.
+    // #464 added `PlatformListener::Adopt` and this closes over it.
+    //
+    // The two facts asserted here are the ones no unit of either change can see on
+    // its own: that the node reaches `Adopt` at all rather than binding, and that the
+    // endpoint it then reports is the SUPERVISOR's port rather than anything read out
+    // of the configuration.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NamedResponder cache { "cache" };
+    HandedOverListenFd handed;
+    auto const supervisorPort = handed.port;
+
+    NodeConfig cfg;
+    // Emptied deliberately, and it is the load-bearing part of this case. Under
+    // activation the unit owns the address, so this flag configures nothing -- and a
+    // node that consulted the row would find it resolves to nothing and decline a
+    // handoff that has already happened, leaving the descriptor unserved.
+    cfg.nodeListen.clear();
+    // The only thing that can say where clients go, which is why activation makes it
+    // mandatory. The port here is deliberately NOT the supervisor's: a node that
+    // echoed this value back instead of asking the socket would pass a weaker version
+    // of this case, so the two must differ.
+    cfg.advertise = "worker-01.internal:1";
+
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+
+    // The host from --advertise, the port from the SOCKET. Asked of the descriptor
+    // because the unit never tells this process which port it chose, so `BoundPort()`
+    // is the only thing that knows -- and the advertised `:1` above proves the answer
+    // was not simply copied out of the configuration.
+    CHECK((*surface)->BoundEndpoint() == std::format("worker-01.internal:{}", supervisorPort));
+    CHECK(Logged(logger, "socket-activated"));
+
+    // And neither sentence from the ordinary path, both of which would mean the row
+    // had been consulted after all.
+    CHECK_FALSE(Logged(logger, "--listen-node is empty"));
+    CHECK_FALSE(Logged(logger, "listening on"));
+}
+
+TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node][node-surface]")
+{
+    // The same answer a failed bind gets, and for the same reason: an activated node
+    // that cannot serve its descriptor still has --scheduler, so it would register,
+    // advertise an address nothing answers, and be leased to clients that each fail
+    // to reach it and compile locally in silence. `Adopt` reports through
+    // `IsBound()`/`BindError()` rather than throwing, so this is a path a caller has
+    // to actively route into the refusal -- it does not arrive as an exception.
+    //
+    // A packaged Linux install enables the worker THROUGH the socket unit -- the
+    // `.service` deliberately carries no `[Install]` section -- so this is the
+    // ordinary deployment rather than an exotic one.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    NamedResponder cache { "cache" };
+
+    NodeConfig cfg;
+    cfg.nodeListen.clear();
+    cfg.advertise = "worker-01.internal:6676";
+
+    // Not a descriptor. `Adopt` answers this without touching it, which is also why
+    // there is nothing here to close: ownership passes on every path, including the
+    // ones that fail.
+    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, logger);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("socket-activated"));
+}
+
+#endif
 
 TEST_CASE("A node port that cannot be bound is fatal however it was configured", "[node][node-surface]")
 {
@@ -629,8 +765,8 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE(holder);
         REQUIRE(holder->IsBound());
 
-        auto refused =
-            StartNodeSurfaceOrExplain(io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, logger);
+        auto refused = StartNodeSurfaceOrExplain(
+            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, logger);
         REQUIRE_FALSE(refused.has_value());
 
         // The flag, so an operator knows what to edit.

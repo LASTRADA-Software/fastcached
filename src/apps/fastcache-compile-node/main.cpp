@@ -177,56 +177,63 @@ void InstallNodeStopHandlers()
     std::signal(SIGTERM, &HandleNodeStopSignal);
 }
 
-/// Adopt a socket-activated listener, when a supervisor handed one over.
+/// The descriptor a supervisor handed this worker, when there was one.
 ///
-/// Separated from `main` so the whole handoff -- how many descriptors arrived,
-/// and whether the configuration can still describe this worker afterwards -- is
-/// one decision with one answer, rather than three checks interleaved with
-/// everything else a startup does.
+/// Separated from `main` so the whole handoff -- how many descriptors arrived, and
+/// whether the configuration can still describe this worker afterwards -- is one
+/// decision with one answer, rather than three checks interleaved with everything
+/// else a startup does.
+///
+/// **A descriptor rather than a listener**, since #290 stage 3. The merged `0xFC`
+/// surface runs on the reactor, and the listener that serves it is built by
+/// `FrameEndpoint::StartAdopted` from this descriptor; building one here would own
+/// it, and handing an owned descriptor on is a double close rather than a handover.
+///
+/// Nothing here closes what it returns. On the two refusal paths the process exits
+/// immediately, and on the success path ownership passes to the listener -- which
+/// takes it even when the adoption itself fails.
 /// @param cfg What the operator asked for.
-/// @param logger Where the adoption is announced.
-/// @return The adopted listener, null when nothing was handed over, or why the
+/// @param logger Where the handoff is announced.
+/// @return The descriptor, `std::nullopt` when nothing was handed over, or why the
 ///         handoff cannot be served.
-[[nodiscard]] std::expected<std::unique_ptr<IListener>, std::string> AdoptActivatedListener(NodeConfig const& cfg,
-                                                                                            ILogger& logger)
+[[nodiscard]] std::expected<std::optional<int>, std::string> ActivatedDescriptor(NodeConfig const& cfg, ILogger& logger)
 {
     // When a supervisor already bound the port and handed the descriptor over,
     // binding it again would fail with "address already in use" -- against
-    // ourselves. Falling through to Bind() when nothing was handed over is what
-    // lets one binary serve both a `.socket` unit and a plain `--port`, with no
-    // flag distinguishing them: the environment says which, and it says so
-    // unambiguously.
-    auto inherited = AdoptInheritedListeners(AcceptPollInterval, RequestIoTimeout);
+    // ourselves. Falling through to the ordinary bind when nothing was handed over
+    // is what lets one binary serve both a `.socket` unit and a plain
+    // `--listen-node`, with no flag distinguishing them: the environment says which,
+    // and it says so unambiguously.
+    auto const inherited = AdoptInheritedDescriptors();
     if (inherited.empty())
-        return std::unique_ptr<IListener> {};
+        return std::optional<int> {};
 
-    // Only the first would be used. This worker answers one protocol on one port,
-    // so a unit listing several sockets is a misconfiguration -- reported rather
-    // than half-honoured, since silently ignoring the rest would leave an operator
-    // with a port that accepts nothing and no clue why.
+    // Only the first would be used. This worker answers one protocol on one port, so
+    // a unit listing several sockets is a misconfiguration -- reported rather than
+    // half-honoured, since silently ignoring the rest would leave an operator with a
+    // port that accepts nothing and no clue why.
     if (inherited.size() > 1)
         return std::unexpected { std::format("socket activation handed over {} listeners; this worker serves exactly one",
                                              inherited.size()) };
 
-    // Socket activation makes --advertise mandatory, because the fallback becomes
-    // a guess the process cannot make. `--bind` and `--port` were not used -- the
-    // socket unit chose the port and this process is never told which -- so the
-    // default would register `0.0.0.0:6676` from config values that describe
-    // nothing, and 0.0.0.0 is not an address a remote client can dial anyway.
+    // Socket activation makes --advertise mandatory, because the fallback becomes a
+    // guess the process cannot make. `--listen-node` was not used -- the socket unit
+    // chose the address and this process is never told which -- so the fallback would
+    // register a value from configuration that describes nothing, and the wildcard is
+    // not an address a remote client can dial anyway.
     //
     // The consequence of guessing is the worst-shaped failure this system has: the
-    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases
-    // that endpoint to clients, and every one of them fails to connect and
-    // compiles locally. Nothing reports an error, and the fleet looks healthy from
-    // both ends. Refusing at startup, where it can be explained, is the whole
-    // difference.
+    // registration SUCCEEDS, the worker heartbeats happily, the scheduler leases that
+    // endpoint to clients, and every one of them fails to connect and compiles
+    // locally. Nothing reports an error, and the fleet looks healthy from both ends.
+    // Refusing at startup, where it can be explained, is the whole difference.
     if (cfg.advertise.empty())
         return std::unexpected { std::string {
             "--advertise is required under socket activation: the socket unit owns the port, so this worker "
             "cannot know what address clients should use" } };
 
-    logger.Logf(LogLevel::Info, "adopted a socket-activated listener; --bind and --port are not used");
-    return std::move(inherited.front());
+    logger.Logf(LogLevel::Info, "a supervisor handed over a listening socket; --listen-node is not used");
+    return std::optional { inherited.front() };
 }
 
 /// What `main` returns when the operator's configuration is wrong.
@@ -515,13 +522,13 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // multi-second pause -- and it means the startup log reads in the order things
     // actually happened, so an operator watching a worker come up sees what it did
     // with the socket before the long quiet part.
-    auto activatedOrError = AdoptActivatedListener(cfg, logger);
+    auto const activatedOrError = ActivatedDescriptor(cfg, logger);
     if (!activatedOrError.has_value())
     {
         logger.Logf(LogLevel::Error, "{}", activatedOrError.error());
         return ExitUsage;
     }
-    auto activated = std::move(*activatedOrError);
+    auto const activated = *activatedOrError;
 
     auto const runner = Cc::MakeProcessRunner();
 
@@ -535,26 +542,19 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // fact with one author. See `AdvertisedEndpoint`.
     auto const advertise = Node::AdvertisedEndpoint(cfg);
 
-    // **The last stitch of #290 stage 3, and it refuses rather than half-works.**
-    // Socket activation adopts an already-bound descriptor, and the surface it used to
-    // feed -- the dedicated compile port -- no longer exists. The merged `0xFC` surface
-    // runs on the reactor, and `AdoptInheritedListeners` hands back a BLOCKING listener,
-    // so there is no way to serve the inherited descriptor here yet: the reactor
-    // listeners expose only `Bind(reactor, host, port)` and gain an adopting factory in
-    // a change of their own.
+    // The descriptor travels to `StartNodeSurfaceOrExplain` below and is served
+    // there. It used to be refused here, for the two months between the surfaces
+    // merging and the reactor listeners learning to adopt: `AdoptInheritedListeners`
+    // handed back a BLOCKING listener, the merged surface runs on the reactor, and
+    // there was nothing that could join the two. #464 added `PlatformListener::Adopt`
+    // and this is the last stitch of #290 stage 3 closing over it.
     //
-    // Refused, loudly, rather than adopted and left unserved. A packaged Linux install
-    // enables the worker THROUGH the socket unit -- the `.service` has no `[Install]`
-    // section -- so a node that took the descriptor and then answered nothing on it
-    // would be the silent shape this whole ticket exists to remove, on the deployment
-    // path most people use.
-    if (activated != nullptr)
-    {
-        logger.Logf(LogLevel::Error,
-                    "socket activation is not yet served on the merged 0xFC surface; start this worker without the "
-                    ".socket unit until the reactor listeners can adopt an inherited descriptor");
-        return ExitUsage;
-    }
+    // The interim was a refusal rather than an adoption left unserved, and that shape
+    // is worth keeping in mind for the next such gap: a packaged Linux install enables
+    // the worker THROUGH the socket unit -- the `.service` deliberately has no
+    // `[Install]` section -- so a node that took the descriptor and then answered
+    // nothing on it would have been the silent failure this whole ticket exists to
+    // remove, on the deployment path most people use.
 
     // Surveyed HERE rather than before the port is bound, and the order is the one
     // socket activation already argues for a few lines up: do the cheap, fallible
@@ -708,7 +708,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
-                                       activated != nullptr ? Node::SocketActivation::Yes : Node::SocketActivation::No,
+                                       activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
                                        logger);
     if (!validator.has_value())
@@ -886,6 +886,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                                         cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
                                         schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
                                         &compileResponder,
+                                        activated,
                                         logger);
     if (!nodeSurfaceOrRefusal.has_value())
     {

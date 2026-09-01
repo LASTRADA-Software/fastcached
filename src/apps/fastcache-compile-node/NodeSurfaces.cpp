@@ -154,10 +154,10 @@ namespace
                 resolved.defaultHost = NodeListenDefaultHost(cfg);
                 return ResolveFromSpec(resolved, cfg);
             },
-            .note = "a systemd .socket unit is NOT yet served on this surface: the unit owns the address and "
-                    "--advertise is what names where clients go, but an inherited descriptor cannot be adopted "
-                    "onto the reactor yet, so an activated worker is refused at startup rather than left "
-                    "listening on nothing. one 0xFC port for the cache verbs, this node's own compile verbs, and -- with "
+            .note = "a systemd .socket unit is served on this surface: the unit owns the address, so this "
+                    "flag configures nothing there and --advertise is what names where clients go -- it is "
+                    "required under activation and refused at startup when absent. one 0xFC port for the cache "
+                    "verbs, this node's own compile verbs, and -- with "
                     "--serve-scheduler -- the scheduler verbs. A bare "
                     "port binds loopback on a worker and the wildcard on a scheduler, because peers are "
                     "elsewhere by definition -- and the cache verbs answer this machine alone whichever it is, "

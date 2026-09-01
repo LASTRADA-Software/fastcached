@@ -4,20 +4,36 @@
 #include "NodeIoLoop.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
+
 #include <format>
+#include <optional>
 #include <utility>
 
 namespace FastCache::Node
 {
 
-std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io, NodeConfig const& cfg, ILogger& logger)
+std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
+                                                        NodeConfig const& cfg,
+                                                        std::optional<int> inherited,
+                                                        ILogger& logger)
 {
-    // The surface, not an address. Where a bare port lands is the row's answer --
-    // loopback on a worker, the wildcard on a node that schedules -- so the address
-    // bound here, the one an install-time refusal judges and the one
+    // Two factories over one constructor, and which one runs is decided by whether a
+    // supervisor handed a descriptor over -- never by a flag. The environment says
+    // it, and it says so unambiguously; a flag would be a second author of a fact the
+    // process can already observe.
+    //
+    // On the ordinary path: the surface, not an address. Where a bare port lands is
+    // the row's answer -- loopback on a worker, the wildcard on a node that schedules
+    // -- so the address bound here, the one an install-time refusal judges and the one
     // `--print-surfaces` prints are one computation rather than three that agree
-    // today.
-    auto started = FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, logger);
+    // today. Under activation there is no such computation to do: the unit bound the
+    // port, and `--advertise` -- mandatory there, and refused at startup when absent
+    // -- is the only thing that can say where clients should go.
+    auto started = inherited.has_value()
+                       ? FrameEndpoint::StartAdopted(
+                             io, NodeSurface::Node, *inherited, HostOfEndpoint(AdvertisedEndpoint(cfg)), _responder, logger)
+                       : FrameEndpoint::Start(io, NodeSurface::Node, cfg, _responder, logger);
     if (!started.has_value())
         return std::unexpected { started.error() };
 
@@ -30,6 +46,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
                                                                                         IFrameResponder* cache,
                                                                                         IFrameResponder* scheduler,
                                                                                         IFrameResponder* compile,
+                                                                                        std::optional<int> inherited,
                                                                                         ILogger& logger)
 {
     // **Whether** this surface is served is the row's answer -- the same one
@@ -47,7 +64,12 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         logger.Logf(LogLevel::Info, "no cache tier, no scheduler and no worker; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
-    if (RowFor(NodeSurface::Node).Resolve(cfg).empty())
+    // Asked BEFORE the row, because under activation the row answers about a flag
+    // that configured nothing. An operator who enables the `.socket` unit and leaves
+    // `--listen-node` empty has not asked for a closed port -- the unit is the port --
+    // so reading the row first would decline a handoff that had already happened and
+    // leave the descriptor unserved.
+    if (!inherited.has_value() && RowFor(NodeSurface::Node).Resolve(cfg).empty())
     {
         // **The row is the authority on WHETHER, and it cannot say WHY.** That is the
         // division this function's header states, and there is now exactly one way for
@@ -65,7 +87,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     }
 
     auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
-    auto bound = surface->Bind(io, cfg, logger);
+    auto bound = surface->Bind(io, cfg, inherited, logger);
     if (bound.has_value())
         return surface;
 

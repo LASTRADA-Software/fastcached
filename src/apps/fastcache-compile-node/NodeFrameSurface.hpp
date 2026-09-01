@@ -8,6 +8,7 @@
 
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace FastCache::Node
@@ -51,12 +52,20 @@ class NodeFrameSurface
     NodeFrameSurface(NodeFrameSurface&&) = delete;
     NodeFrameSurface& operator=(NodeFrameSurface&&) = delete;
 
-    /// Bind the listener and start serving it.
+    /// Bind the listener, or adopt one a supervisor handed over, and start serving.
     /// @param io The loop this surface accepts and answers on.
-    /// @param cfg What the operator asked for; the surface row resolves the address.
+    /// @param cfg What the operator asked for; the surface row resolves the address,
+    ///        except under socket activation, where the unit chose it and `cfg` can
+    ///        only supply the `--advertise` host clients are told to dial.
+    /// @param inherited A descriptor a supervisor already bound and listened, or
+    ///        `std::nullopt` for the ordinary path. Ownership passes to the listener
+    ///        built from it, including when that fails.
     /// @param logger Where to announce the bound address.
     /// @return Nothing, or why it could not be served.
-    [[nodiscard]] std::expected<void, std::string> Bind(NodeIoLoop& io, NodeConfig const& cfg, ILogger& logger);
+    [[nodiscard]] std::expected<void, std::string> Bind(NodeIoLoop& io,
+                                                        NodeConfig const& cfg,
+                                                        std::optional<int> inherited,
+                                                        ILogger& logger);
 
     /// The address this node's `0xFC` listener bound.
     /// @return The endpoint, or an empty string before `Bind` succeeded.
@@ -138,6 +147,7 @@ class NodeFrameSurface
     IFrameResponder* cache,
     IFrameResponder* scheduler,
     IFrameResponder* compile,
+    std::optional<int> inherited,
     ILogger& logger);
 
 } // namespace FastCache::Node
