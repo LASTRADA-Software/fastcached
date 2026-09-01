@@ -20,23 +20,6 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// How often a stop says what it is still waiting for.
-    ///
-    /// A stop that says nothing for the whole timeout is indistinguishable from one
-    /// that has hung, which is the reading this whole change exists to prevent -- so
-    /// the interval is short enough that an operator watching `systemctl stop` sees
-    /// the count fall rather than a pause.
-    constexpr std::chrono::seconds DrainReportInterval { 2 };
-
-    /// What this process exits with when it abandons compiles to stop.
-    ///
-    /// Distinct from every ordinary failure, so a supervisor's log tells "stopped
-    /// with compiles still running" from a crash. 75 is `EX_TEMPFAIL` from
-    /// `sysexits.h` -- not a standard this project otherwise uses, but the closest
-    /// thing to a shared vocabulary for "this was not clean, and retrying is
-    /// reasonable", and unambiguous beside a compiler's own exit codes.
-    constexpr int DrainAbandonedExitCode = 75;
-
     /// Largest request a worker will buffer; declared in the header because
     /// `WorkerProtocol` is handed the same figure. See `WorkerMaxRequestBytes`.
     constexpr std::size_t MaxRequestBytes = WorkerMaxRequestBytes;
@@ -93,72 +76,6 @@ namespace
         .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
     };
 
-    /// Take `want` bytes from `counter` without exceeding `budget`.
-    /// @param counter The shared in-flight total.
-    /// @param want How many bytes this job declared.
-    /// @param budget The ceiling.
-    /// @return Whether the reservation was made.
-    [[nodiscard]] bool TryReserve(std::atomic<std::size_t>& counter, std::size_t want, std::size_t budget) noexcept
-    {
-        // Compared by SUBTRACTION, not as `current + want <= budget`: that sum wraps
-        // on a `want` near the top of the range and passes a check it should fail --
-        // admitting an unbounded reservation through the one function whose whole job
-        // is to refuse them. Neither caller can reach it today, because both clamp
-        // against this same budget first, but a reservation helper that admits on
-        // overflow is one careless call away from being the hole it exists to close.
-        if (want > budget)
-            return false;
-        auto current = counter.load(std::memory_order_acquire);
-        while (current <= budget - want)
-            if (counter.compare_exchange_weak(current, current + want, std::memory_order_acq_rel, std::memory_order_acquire))
-                return true;
-        return false;
-    }
-
-    /// Gives a reservation back however its scope ends.
-    class ReservedBytes
-    {
-      public:
-        /// @param counter The shared in-flight total; must outlive this.
-        /// @param bytes How many were reserved.
-        ReservedBytes(std::atomic<std::size_t>& counter, std::size_t bytes) noexcept:
-            _counter { &counter },
-            _bytes { bytes }
-        {
-        }
-        ~ReservedBytes()
-        {
-            _counter->fetch_sub(_bytes, std::memory_order_acq_rel);
-        }
-        ReservedBytes(ReservedBytes const&) = delete;
-        ReservedBytes& operator=(ReservedBytes const&) = delete;
-        ReservedBytes(ReservedBytes&&) = delete;
-        ReservedBytes& operator=(ReservedBytes&&) = delete;
-
-        /// Raise this reservation to `total`, or leave it exactly as it was.
-        ///
-        /// Growing an existing reservation rather than taking a second one, because a
-        /// job holds ONE amount and gives back what it holds: two live reservations
-        /// per job is two things a path out of `Serve` has to remember, and the one it
-        /// forgets is a budget that never returns to zero.
-        /// @param total What this job should hold from now on.
-        /// @param budget The ceiling.
-        /// @return Whether the reservation now stands at `total`.
-        [[nodiscard]] bool TryRaiseTo(std::size_t total, std::size_t budget) noexcept
-        {
-            if (total <= _bytes)
-                return true;
-            if (!TryReserve(*_counter, total - _bytes, budget))
-                return false;
-            _bytes = total;
-            return true;
-        }
-
-      private:
-        std::atomic<std::size_t>* _counter;
-        std::size_t _bytes;
-    };
-
     /// Write every byte, or report failure.
     [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
     {
@@ -180,11 +97,10 @@ WorkerServer::WorkerServer(IListener& listener,
     _listener { listener },
     _jobs { jobs },
     _protocol { protocol },
-    _slots { slots },
     _membership { membership },
     _metrics { metrics },
     _logger { logger },
-    _drainTimeout { drainTimeout }
+    _capacity { slots, MaxInFlightBytes, drainTimeout, logger }
 {
 }
 
@@ -197,55 +113,7 @@ WorkerServer::~WorkerServer()
 
     // Every job holds a slot until it ends, so zero means nothing is still running
     // on the executor with a pointer into this object.
-    auto const idle = [this] {
-        return _inFlight.load(std::memory_order_acquire) == 0;
-    };
-
-    auto const started = std::chrono::steady_clock::now();
-    auto guard = std::unique_lock { _drainMutex };
-    while (true)
-    {
-        // Woken on a cadence rather than once, because a stop that says nothing for
-        // the whole bound is indistinguishable from one that has hung -- which is the
-        // reading this exists to prevent. Under the lock throughout, so the count a
-        // line reports and the count the decision was made on are the same one.
-        (void) _drained.wait_for(guard, DrainReportInterval, idle);
-
-        switch (NextDrainAction(
-            _inFlight.load(std::memory_order_acquire), std::chrono::steady_clock::now() - started, _drainTimeout))
-        {
-            case DrainAction::Finished:
-                return;
-
-            case DrainAction::Report:
-                _logger.Logf(LogLevel::Info,
-                             "worker: waiting for {} compile(s) to finish before stopping",
-                             _inFlight.load(std::memory_order_acquire));
-                break;
-
-            case DrainAction::Abandon:
-                _logger.Logf(LogLevel::Error,
-                             "worker: giving up after {}s with {} compile(s) still running; ending now rather than "
-                             "waiting for the supervisor to kill this process without saying why (#239)",
-                             _drainTimeout.count(),
-                             _inFlight.load(std::memory_order_acquire));
-
-                // NOT a return. A running compile holds a pointer into this object --
-                // the counter, the protocol, the metrics sink, the logger, the byte
-                // budget -- so unwinding out of here would free all of them underneath
-                // it, trading a stop that waits for a crash on the way out. Ending the
-                // process is the one exit that abandons those jobs without touching
-                // what they are still using, and each one's client resolves its own
-                // lease on every path out of a compile (#212).
-                //
-                // `_Exit`, not `exit`: static destructors would run the same teardown
-                // this is avoiding.
-                std::_Exit(DrainAbandonedExitCode);
-
-            case DrainAction::Last:
-                break;
-        }
-    }
+    _capacity.Drain();
 }
 
 DrainAction NextDrainAction(std::size_t outstanding,
@@ -261,18 +129,18 @@ DrainAction NextDrainAction(std::size_t outstanding,
 
 void WorkerServer::Shutdown() noexcept
 {
-    _shuttingDown.store(true, std::memory_order_release);
+    _capacity.BeginShutdown();
     _listener.Close();
 }
 
 std::size_t WorkerServer::InFlight() const noexcept
 {
-    return _inFlight.load(std::memory_order_acquire);
+    return _capacity.InFlight();
 }
 
 Task<void> WorkerServer::Run()
 {
-    while (!_shuttingDown.load(std::memory_order_acquire))
+    while (!_capacity.IsShuttingDown())
     {
         auto accepted = co_await _listener.Accept();
         if (!accepted.has_value())
@@ -291,7 +159,7 @@ Task<void> WorkerServer::Run()
         // A connection accepted just as shutdown began is dropped rather than
         // admitted. The loop condition is checked before `Accept()` parks, so
         // without this the last admission can land after the drain started.
-        if (_shuttingDown.load(std::memory_order_acquire))
+        if (_capacity.IsShuttingDown())
         {
             socket->Close();
             co_return;
@@ -323,10 +191,8 @@ Task<void> WorkerServer::Run()
         // first. Refused, never queued: queueing hides the overload from the
         // scheduler that is trying to route around it, and the client has a local
         // compile waiting either way.
-        auto const before = _inFlight.fetch_add(1, std::memory_order_acq_rel);
-        if (before >= _slots)
+        if (!_capacity.TryTakeSlot())
         {
-            _inFlight.fetch_sub(1, std::memory_order_acq_rel);
             (void) co_await WriteAll(socket.get(), Cc::Refuse(_metrics, NoCapacity));
             socket->Close();
             continue;
@@ -360,14 +226,11 @@ Task<void> WorkerServer::Run()
 
 void WorkerServer::ReleaseSlot() noexcept
 {
-    // Under the lock, notify included. The destructor can only wake by taking this
-    // same mutex, so it cannot run ahead and free the members while this thread is
-    // still inside them -- which is the whole reason this is a condition variable
-    // rather than `_inFlight.wait()`, and the reason it is one function rather than
-    // the two call sites each spelling it out.
-    auto const guard = std::scoped_lock { _drainMutex };
-    _inFlight.fetch_sub(1, std::memory_order_acq_rel);
-    _drained.notify_all();
+    // Kept as a function of its own rather than the two call sites each reaching
+    // through to the capacity: what it guarantees -- that the drain cannot wake and
+    // free these members while this thread is still inside them -- is a property of
+    // one place doing it, and `CompileCapacity::ReleaseSlot` carries the reasoning.
+    _capacity.ReleaseSlot();
 }
 
 DetachedTask WorkerServer::ServeDetached(std::unique_ptr<ISocket> socket)
@@ -418,7 +281,8 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
             // over-budget request costs no allocation at all. The slot cap alone
             // does not bound memory: `slots` jobs each declaring the per-request
             // maximum is still `slots` times it.
-            if (!TryReserve(_bytesInFlight, decoded->payloadLength, MaxInFlightBytes))
+            auto reserved = _capacity.TryTakeBytes(decoded->payloadLength);
+            if (!reserved.has_value())
             {
                 // Its own code, not NoCapacity: this says "come back shortly", while
                 // NoCapacity says "the fleet is full". An operator sent to buy
@@ -428,8 +292,6 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 socket->Close();
                 co_return;
             }
-            ReservedBytes reserved { _bytesInFlight, decoded->payloadLength };
-
             auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
             if (payload.has_value())
             {
@@ -470,7 +332,7 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // ceiling would accept, and allocate, precisely the frames skipped
                 // here -- unbudgeted, which is this whole defect again. One number,
                 // one place, and the skip below stays sound.
-                if (footprint <= MaxInFlightBytes && !reserved.TryRaiseTo(footprint, MaxInFlightBytes))
+                if (footprint <= _capacity.ByteBudget() && !reserved->TryRaiseTo(footprint))
                 {
                     // A REPLY, not a close, and the same code the frame-length
                     // refusal uses: the frame declared its own length and has been

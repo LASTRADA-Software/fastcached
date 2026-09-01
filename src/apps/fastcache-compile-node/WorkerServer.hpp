@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CompileCapacity.hpp"
+
 #include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -226,35 +228,22 @@ class WorkerServer
     IListener& _listener;
     IExecutor& _jobs;
     Cc::WorkerProtocol& _protocol;
-    std::size_t _slots;
     Distributed::IMembershipOracle const& _membership;
     IMetricsSink& _metrics;
     ILogger& _logger;
-    std::atomic<bool> _shuttingDown { false };
 
-    /// Payload bytes the jobs running right now are reading, against a budget.
+    /// The slot cap, the in-flight byte budget and the drain, in one place.
     ///
-    /// The slot cap bounds CPU; this bounds memory, and they are not the same
-    /// question -- `slots` jobs each declaring the per-request maximum is `slots`
-    /// times it. Serving one at a time used to answer both at once.
-    std::atomic<std::size_t> _bytesInFlight { 0 };
-
-    /// Atomic for the cap check, which is on the accept path and takes no lock.
-    std::atomic<std::size_t> _inFlight { 0 };
-
-    /// Guards the drain, and it has to be a lock rather than `_inFlight.wait()`.
+    /// Held rather than spelled out here, because #290 gives all three a second
+    /// user: when the compile verbs move onto the merged `0xFC` surface a responder
+    /// answers them, and it must spend the SAME capacity this accept loop does --
+    /// otherwise a worker answers to two caps depending on which door a client came
+    /// through, and the figure it advertises to the fleet describes neither.
     ///
-    /// An atomic wait can return on observing the store alone, without the paired
-    /// notify -- so the destructor could see zero, run to completion and free this
-    /// object while the job that released the last slot was still inside
-    /// `notify_all` on a member of it. Waking through a mutex the notifier holds
-    /// means the notifier is provably past its critical section first.
-    std::mutex _drainMutex;
-    std::condition_variable _drained;
-
-    /// How long a stop waits before it abandons what is still running. Zero waits
-    /// forever, which is what this did before the bound existed.
-    std::chrono::seconds _drainTimeout { 30 };
+    /// The reasoning that used to sit on the individual members lives on
+    /// `CompileCapacity` now, including why the two counters are not one question
+    /// and why the drain waits on a condition variable rather than `atomic::wait`.
+    CompileCapacity _capacity;
 };
 
 } // namespace FastCache::Node
