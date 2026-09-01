@@ -45,7 +45,7 @@
 # surface is momentarily full, the peer retries past it, and summed into a credential
 # series it makes that series unreadable. That is a considered position. But it was
 # spelled as a bare `EncodeErrorReply`, which is also how "forgot" is spelled, so no
-# scan could tell four considered decisions from five accumulated defects.
+# scan could tell a considered decision from an accumulated defect.
 #
 # So `RefuseWithoutCounter` states the decision and carries its reason, and
 # `RefuseUntriaged` states the ABSENCE of one and carries the issue that will make it.
@@ -295,8 +295,15 @@ foreach(relative IN LISTS sources)
                 list(APPEND untriagedFiles "${relative}")
             endforeach()
 
-            if(line MATCHES "\\.issue[ \t]*=[ \t]*([A-Za-z_][A-Za-z0-9_]*|[0-9]+)")
-                list(APPEND fileIssueTokens_${relative} "${CMAKE_MATCH_1}")
+            # `::` is part of the name. A constant declared in a `Detail` namespace is
+            # spelled `Detail::CacheSurfaceTriage` at the call site, and a pattern that
+            # stopped at the colons captured `Detail`, resolved nothing, and reported a
+            # file that names its issue perfectly well as naming none. The qualifier is
+            # dropped for the lookup because the declaration carries the bare name.
+            if(line MATCHES "\\.issue[ \t]*=[ \t]*([A-Za-z_][A-Za-z0-9_:]*|[0-9]+)")
+                set(issueToken "${CMAKE_MATCH_1}")
+                string(REGEX REPLACE "^.*::" "" issueToken "${issueToken}")
+                list(APPEND fileIssueTokens_${relative} "${issueToken}")
             endif()
         endif()
 

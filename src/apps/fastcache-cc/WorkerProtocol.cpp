@@ -4,9 +4,8 @@
 #include "Dispatch.hpp"
 #include "WorkerProtocol.hpp"
 
-#include <FastCache/Protocol/SurfaceRefusal.hpp>
-
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>

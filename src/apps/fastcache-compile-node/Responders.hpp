@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <ranges>
 
@@ -23,6 +24,20 @@ namespace FastCache::Node
 
 namespace Detail
 {
+    /// The issue that will decide which of the CACHE surface's refusals are events.
+    ///
+    /// Both of this surface's refusal arms carried a written rationale and neither was
+    /// a decision: one argued the framing arms are "visible to the peer", when #491's
+    /// scenario is a peer that IS the attacker; the other called the byte budget a
+    /// transient, when #491 records that `MaxInFlightBytes()` folds to the largest
+    /// owner -- this cache -- so it is the byte-budget refusal a real node reaches.
+    ///
+    /// Written as decided, they also left the backlog, and #491's completion measure
+    /// would then have read `CacheProxy`'s sites -- a different surface -- letting it
+    /// close while the two arms in its own title stayed undecided. An instrument
+    /// measuring the wrong set and reporting success is the defect #492 exists to fix.
+    constexpr std::uint32_t CacheSurfaceTriage = 491;
+
     /// What the SCHEDULER surface answers each endpoint-decided refusal with.
     ///
     /// `Cc::SurfaceRefusal` rows and `Cc::Refuse`, not an `Increment` beside an
@@ -409,37 +424,37 @@ class CacheResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::RefusalReply
     ///
-    /// Nothing to count: this surface requires no credential, so it can never
-    /// produce the one refusal that carries a counter. The size and opcode arms are
-    /// framing errors and are already visible as such to the peer.
+    /// **Undecided, not decided.** The position this used to state -- that the size
+    /// and opcode arms are "already visible as such to the peer" -- answers a question
+    /// nobody asked: #491's scenario is a client hammering a cache-tier node with
+    /// oversized declarations while an operator watches a flat graph, so **the peer is
+    /// the attacker** and visibility to it is not the property anyone needs. That is
+    /// one of the arms #491 was filed to rule on, so it says so rather than claiming
+    /// the ruling.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
-        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::ErrorCodeFor(decision),
-                                          .rationale =
-                                              "this surface requires no credential, so it can never produce the one "
-                                              "refusal that carries a counter; the size and opcode arms are framing "
-                                              "errors and are already visible as such to the peer" },
-                                        detail);
+        return Cc::RefuseUntriaged({ .code = CompileCacheWire::ErrorCodeFor(decision), .issue = Detail::CacheSurfaceTriage },
+                                   detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
     ///
-    /// Nothing to count here either, and for two different reasons. The credential
-    /// arms are unreachable: this surface requires none, so `AUTH` never routes to it
-    /// and `CheckCredential` answers `NoPolicy` unconditionally. The byte budget is
-    /// reachable and is a transient the peer retries past, not a signal -- the same
-    /// position `RefusalReply` above takes on the framing arms.
+    /// **Undecided, and the byte budget is why.** Calling it "a transient the peer
+    /// retries past" is the OPPOSITE of what #491 records: `MaxInFlightBytes()` folds
+    /// to the largest owner, in practice this cache, so the byte-budget refusal a real
+    /// node actually reaches is THIS one. #491 names it as the uncounted arm that
+    /// fires, which is #326's scenario one surface over.
+    ///
+    /// The credential arms genuinely are unreachable here -- this surface requires no
+    /// credential, so `AUTH` never routes to it -- but they share the one answer, and
+    /// an arm that cannot fire is not a reason to call the arm that does decided.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal),
-                                          .rationale =
-                                              "the credential arms are unreachable on a surface that requires none, and "
-                                              "the byte budget is a transient the peer retries past" },
-                                        detail);
+        return Cc::RefuseUntriaged({ .code = ErrorCodeFor(refusal), .issue = Detail::CacheSurfaceTriage }, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout

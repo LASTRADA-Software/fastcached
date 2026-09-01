@@ -741,7 +741,17 @@ outright rather than drawing with a gap.
   count, which is their own older position. The catch is which refusal a real node
   reaches: `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's, in
   practice the cache's, so the byte-budget refusal that fires on a node with a tier is
-  a cache `STORE` — the uncounted one. #326's scenario, one surface over.
+  a cache `STORE` — the uncounted one. #326's scenario, one surface over. Since #492
+  its ten sites are `RefuseUntriaged` and the check prints them, so closing it is the
+  printed count for #491 reaching zero. **Two of those ten nearly escaped it**: they
+  carried written rationales from #447 and were first marked `RefuseWithoutCounter`,
+  which reads as decided — one of them asserting the byte budget is "a transient the
+  peer retries past", the *opposite* of the mechanism above. Marked decided they would
+  have left the backlog, and #491's measure would then have counted `CacheProxy`'s
+  eight sites — a different surface — letting it close at 8/8 while the two arms in its
+  own title stayed undecided. **A rationale is not a decision because it is
+  well-written**; it is a decision when nobody is still arguing about it, and an open
+  issue naming the site is that argument.
 - **[#494](https://github.com/LASTRADA-Software/fastcached/issues/494)** — the fleet
   scheduler's and the daemon's own `0xFC` surfaces answer eight refusals that count
   nothing; `SchedulerProtocol.cpp` references no metrics sink at all, on the surface

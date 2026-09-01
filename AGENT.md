@@ -627,8 +627,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   primitive's shared home — out of `fastcache-cc`'s private header so coverage is a
   property of the TYPE. Header-only, so `_fc_cc_core` gains no row.
 - And "deliberately uncounted" must not be spelled like "forgot": both were a bare
-  `EncodeErrorReply`, so no scan could tell five considered decisions from five
-  defects. THREE spellings, three claims — `Refuse` (a rise means something),
+  `EncodeErrorReply`, so no scan could tell a considered decision from a defect --
+  and two of #490's five written rationales turned out to be neither, asserting
+  positions #491 exists to settle, one of them the opposite of what #491 argues. THREE spellings, three claims — `Refuse` (a rise means something),
   `RefuseWithoutCounter` (a rise would mean nothing, and why), `RefuseUntriaged`
   (nobody has decided, and which issue will). The third is safe only because the check
   TALLIES it and prints the total per issue on every run: a placeholder reason would
