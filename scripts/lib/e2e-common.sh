@@ -172,14 +172,32 @@ fail() {
 
 # ---------------------------------------------------------------------------
 
-# Find a port nothing is listening on, and remember it.
+# Is anything answering on host:port right now? Returns 0 or 1; never fails the
+# run.
+#
+# The ONE place that knows how to ask. `free_port` draws through it and
+# `wait_for_port` polls through it, so there is a single definition of what "a
+# port is open" means here rather than the three near-identical `(exec 3<>...)`
+# spellings this file replaced -- and a fixture that wants the answer as a bool,
+# because a closed port is an expected outcome there rather than a fault, calls
+# the same thing the waits do.
 #
 # A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT
-# on some systems, and the caller is about to hand it to a *different* process
-# anyway, so the only question this can honestly answer is "is anything answering
-# here right now". Racy in principle; these tests are RUN_SERIAL and the range is
-# wide, and the alternative -- fixed ports -- races with every other smoke test in
-# the suite rather than only with itself.
+# on some systems, and a caller drawing a port is about to hand it to a
+# *different* process anyway, so the only question this can honestly answer is
+# "is anything answering here right now".
+#
+# @param 1 host
+# @param 2 port
+port_answers() {
+    (exec 3<>"/dev/tcp/${1}/${2}") 2>/dev/null
+}
+
+# Find a port nothing is listening on, and remember it.
+#
+# Racy in principle, since `port_answers` above cannot reserve anything; these
+# tests are RUN_SERIAL and the range is wide, and the alternative -- fixed ports
+# -- races with every other smoke test in the suite rather than only with itself.
 #
 # Ports already handed out THIS RUN are remembered and skipped. Without that, the
 # only question asked is "is anything listening", and nothing is listening on a
@@ -219,22 +237,13 @@ free_port() {
         if grep -qx "$port" "$ledger" 2>/dev/null; then
             continue
         fi
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        if ! port_answers 127.0.0.1 "$port"; then
             echo "$port" >> "$ledger"
             echo "$port"
             return 0
         fi
     done
     fail "could not find a free port in ${floor}-${ceiling}"
-}
-
-# Is anything answering on host:port right now? Returns 0 or 1; never fails the
-# run. The bool a caller wants when a closed port is an expected outcome rather
-# than a fault.
-# @param 1 host
-# @param 2 port
-port_answers() {
-    (exec 3<>"/dev/tcp/${1}/${2}") 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -496,7 +505,7 @@ _e2e_expire() {
 wait_for_port() {
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
     local seconds="${6:-$_e2e_wait_seconds}"
-    _e2e_port_ready() { (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; }
+    _e2e_port_ready() { port_answers "$host" "$port"; }
     wait_until _e2e_port_ready "${what} to listen on ${host}:${port}" \
         "$pid" "$logfile" "$seconds"
 }
