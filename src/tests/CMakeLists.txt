@@ -398,18 +398,17 @@ set_tests_properties("worker-refusals-counted" PROPERTIES
 #
 # A glob is only worth more than the list it replaced if it actually bites on a file
 # that was never named, and a guard nobody has seen fire is not a guard. This drives
-# the real check against six synthetic source trees and asserts each verdict
+# the real check against seven synthetic source trees and asserts each verdict
 # separately -- clean, a new `.cpp`, a new `.hpp`, an untriaged site that must PASS
-# while being counted, an untriaged site naming no issue, and a tree whose spellings
-# have been renamed away, which must be reported as a broken scan rather than as a
-# clean tree.
+# while being counted, an untriaged site naming no issue, a FOURTH refusal spelling
+# added to the allowed header, and a tree whose spellings have been renamed away.
 #
 # It asserts each direction rather than inverting the whole test with `WILL_FAIL`: a
 # check that stopped refusing and a check that started refusing everything are
 # opposite defects and a bare inversion reports them identically. Same argument as
 # `node-scratch-isolation-e2e-selftest`.
 #
-# In the default set: it writes a handful of small files and runs `cmake -P` six
+# In the default set: it writes a handful of small files and runs `cmake -P` seven
 # times.
 add_test(
     NAME "worker-refusals-selftest"

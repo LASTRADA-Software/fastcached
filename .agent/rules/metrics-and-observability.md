@@ -561,17 +561,35 @@ looks exactly like a port nobody is talking to.
   honesty, which is what makes it safe to have. Spelling an undecided site
   `RefuseWithoutCounter` with a placeholder reason is WORSE than the bare encoder: it
   carries the appearance of a decision and a dead link to prove it.
-- **The `why` is a forcing function, not a dead field.** Nothing sends it and nothing
+- **The reason is a forcing function, not a dead field.** Nothing sends it and nothing
   reads it at run time; what it does is make the author answer "would a rise here mean
   something happened" before the call compiles. `StartupPolicyRejection` carries a
-  per-row reason for the same purpose, and the option table carries `why` text nothing
-  transmits.
-- **And the check is SEEN to fire.** `worker-refusals-selftest` drives it against six
+  per-row reason for the same purpose. Measured, so the cost argument does not have to
+  be taken on trust: at `-O2` a caller with the reason and one without emit
+  **byte-identical** bodies and the literal is not emitted at all.
+- **It is `rationale` and not `why`.** `CompileCacheWire::RefusedVerb::why` is the text
+  a CLIENT is SENT; this one is never sent. The two meet in one expression in
+  `CacheProxy.cpp` and `SchedulerProtocol.cpp`, and one word carrying two opposite
+  contracts is how a reader comes to transmit the wrong one.
+- **The SET of spellings is DERIVED from the header, never restated in the check.**
+  This is the rule the first attempt got wrong, and the direction matters: a restated
+  list notices a spelling going AWAY — a rename leaves the check hunting something
+  nobody calls — and is blind to one ARRIVING. Add `RefuseDeferred` to the allowed
+  header and every call site reaching it passes the scan, joins no backlog and asserts
+  no claim at all, which is this rule's own failure re-entering through the instrument
+  that closed it. `check-script-check-signals.cmake`'s idiom — *the set is read from
+  the file, never restated here* — turned on the checker itself.
+- **And the check is SEEN to fire.** `worker-refusals-selftest` drives it against seven
   synthetic source trees and asserts each verdict separately — a guard nobody has
   watched refuse is not a guard, and a glob is only worth more than the list it
   replaced if it bites on a file that was never named. Per case rather than
   `WILL_FAIL`, because a check that stopped refusing and one that refuses everything
   are opposite defects a bare inversion reports identically.
+- **A default-set check is scanned for cheaply or it is a tax on every run.** Globbing
+  `src/` and splitting every file cost 2.9 s on every platform to find matches in ten
+  of 413 files. A whole-file `string(FIND)` for the three substrings before the
+  line-by-line pass takes it to 208 ms, and is exact rather than heuristic because each
+  needle is a strict prefix of the regex it guards.
 - **Assert that no OTHER counter moved.** A test checking only the wire code passes
   with every refusal wired to one shared counter — and it passed, on the first run of
   the very test written to prove the two `MalformedFrame` refusals are separate: the

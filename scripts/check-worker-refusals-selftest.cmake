@@ -216,7 +216,41 @@ if(NOT objected)
          "issue-unnamed: an untriaged refusal naming no issue was folded into the backlog total instead of being reported as a tally that cannot conclude")
 endif()
 
-# 6. A tree where the spellings have gone. Zero findings must be reported as a scan
+# 6. A FOURTH spelling in the allowed header. This is the direction a restated list
+#    cannot see, and the one that would re-open this ticket: `RefuseDeferred` passes
+#    the scan, joins no backlog and asserts no claim, so every call site reaching it
+#    is a refusal nobody is checking. The check derives the set from the header, so it
+#    must object to a spelling it does not know.
+set(tree "${root}/spelling-added")
+file(REMOVE_RECURSE "${tree}")
+file(MAKE_DIRECTORY "${tree}/src/FastCache/Protocol")
+configure_file("${FASTCACHED_SOURCE_DIR}/${wireHeader}" "${tree}/${wireHeader}" COPYONLY)
+file(READ "${FASTCACHED_SOURCE_DIR}/${refusalHeader}" refusalContent)
+string(APPEND refusalContent [==[
+
+namespace FastCache::Cc
+{
+[[nodiscard]] inline std::vector<std::byte> RefuseDeferred(UncountedRefusal const& refusal,
+                                                           std::string_view detail = {})
+{
+    return CompileCacheWire::EncodeErrorReply(refusal.code, detail);
+}
+} // namespace FastCache::Cc
+]==])
+file(WRITE "${tree}/${refusalHeader}" "${refusalContent}")
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures
+         "spelling-added: a FOURTH refusal spelling in the allowed header did not fail the check -- every call site reaching it would pass the scan, join no backlog and assert nothing")
+else()
+    string(FIND "${output}" "RefuseDeferred" position)
+    if(position EQUAL -1)
+        list(APPEND failures
+             "spelling-added: the check objected but did not name the unknown spelling, so a person reading the failure cannot tell which one arrived")
+    endif()
+endif()
+
+# 7. A tree where the spellings have gone. Zero findings must be reported as a scan
 #    that stopped working, never as a clean tree -- the direction this project keeps
 #    getting wrong, and the one a passing check hides.
 set(tree "${root}/scan-broken")
@@ -249,4 +283,4 @@ if(failures)
     message(FATAL_ERROR "worker refusals selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "worker refusals selftest: 6 synthetic tree(s), every verdict as expected")
+message(STATUS "worker refusals selftest: 7 synthetic tree(s), every verdict as expected")

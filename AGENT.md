@@ -627,14 +627,25 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   primitive's shared home — out of `fastcache-cc`'s private header so coverage is a
   property of the TYPE. Header-only, so `_fc_cc_core` gains no row.
 - And "deliberately uncounted" must not be spelled like "forgot": both were a bare
-  `EncodeErrorReply`, so no scan could tell four considered decisions from five
+  `EncodeErrorReply`, so no scan could tell five considered decisions from five
   defects. THREE spellings, three claims — `Refuse` (a rise means something),
   `RefuseWithoutCounter` (a rise would mean nothing, and why), `RefuseUntriaged`
   (nobody has decided, and which issue will). The third is safe only because the check
-  TALLIES it and prints the total per issue on every run: a placeholder `why` would
+  TALLIES it and prints the total per issue on every run: a placeholder reason would
   spell *forgot* in the vocabulary of *decided*, which is worse than the bare encoder.
-  The `why` is a forcing function, not a dead field. `worker-refusals-selftest` drives
-  six synthetic trees, because a guard nobody has watched refuse is not a guard.
+  The reason is a forcing function, not a dead field — and it is `rationale`, never
+  `why`, which on `RefusedVerb` is text a CLIENT is SENT; the two meet in one
+  expression and one word cannot carry both contracts.
+- The SET of spellings is derived from that header, never restated in the check. A
+  restated list catches one going away and is blind to one ARRIVING — add a fourth and
+  every call site reaching it passes the scan, joins no backlog and asserts nothing,
+  which is #492's own defect one level up. `worker-refusals-selftest` drives seven
+  synthetic trees, including that one, because a guard nobody has watched refuse is
+  not a guard.
+- The scan filters whole-file before splitting: 403 of 413 files contain none of the
+  three substrings, and scanning them all cost a default-set entry 2.9 s on every
+  platform to find matches in ten files. 208 ms after. Exact rather than approximate —
+  each needle is a strict prefix of the regex that would have matched it.
 - Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
   makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
   (`SchedulerService::Register`) and never repaired by a renderer — and the

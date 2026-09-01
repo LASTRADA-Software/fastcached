@@ -100,9 +100,20 @@ if(NOT allowedFileCount EQUAL allowedReasonCount)
     message(FATAL_ERROR "worker refusals: ${allowedFileCount} allowed file(s) but ${allowedReasonCount} reason(s)")
 endif()
 
-# The three spellings, checked to exist. A rename that emptied this check would
-# otherwise leave it reporting a clean tree it is no longer looking at.
-set(spellings "Refuse" "RefuseWithoutCounter" "RefuseUntriaged")
+# The three spellings this check knows, and what they are FOR.
+#
+# This list is an assertion, never the source of truth. The set actually offered to a
+# surface is DERIVED below, by reading every refusal function `SurfaceRefusal.hpp`
+# defines, and a derived set that differs from this one is a failure either way round.
+#
+# The direction that matters is a spelling being ADDED. A restated list catches one
+# disappearing -- a rename leaves the check scanning for something nobody calls -- and
+# is blind to a fourth arriving: add `RefuseDeferred` to the allowed header and every
+# call site reaching it passes the scan, joins no backlog and asserts no claim at all.
+# That is this ticket's own defect one level up, so the set is read from the header
+# rather than remembered here, which is `check-script-check-signals.cmake`'s idiom
+# turned on the checker itself.
+set(knownSpellings "Refuse" "RefuseUntriaged" "RefuseWithoutCounter")
 
 foreach(relative IN LISTS allowedFiles)
     if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")
@@ -150,31 +161,20 @@ endif()
 # automatically, and a new NON-test file does not. That is the direction that fails
 # closed -- the whole point of replacing the list this check used to carry.
 set(excludePatterns
-    "(^|/)src/tests/"
-    "_test\\.cpp$"
-    "TestSupport\\.hpp$"
-    "TestUtils\\.hpp$"
-    "(^|/)test_main\\.cpp$")
-set(excludeReasons
-    "shared test fixtures: a fake server encodes error replies to script one"
-    "unit tests construct the exact bytes a client would see"
-    "test-only helpers, same reason"
-    "test-only helpers, same reason"
-    "Catch2 entry points")
-
-list(LENGTH excludePatterns excludePatternCount)
-list(LENGTH excludeReasons excludeReasonCount)
-if(NOT excludePatternCount EQUAL excludeReasonCount)
-    message(FATAL_ERROR
-            "worker refusals: ${excludePatternCount} exclusion pattern(s) but ${excludeReasonCount} reason(s)")
-endif()
+    "(^|/)src/tests/"        # shared fixtures: a fake server encodes error replies to script one
+    "_test\\.cpp$"           # unit tests construct the exact bytes a client would see
+    "TestSupport\\.hpp$"     # test-only helpers, same reason
+    "TestUtils\\.hpp$"       # test-only helpers, same reason
+    "(^|/)test_main\\.cpp$") # Catch2 entry points
 
 # ---------------------------------------------------------------------------
-# Pass 1: every call to the raw encoder, and every untriaged refusal.
+# The scan: every call to the raw encoder, every untriaged refusal, and every
+# refusal spelling the primitive actually offers.
 set(violations "")
-set(allowedHits 0)
+set(encoderSeen FALSE)
 set(untriaged "")
 set(issueTokens "")
+set(definedSpellings "")
 set(scannedCount 0)
 
 foreach(relative IN LISTS sources)
@@ -195,6 +195,24 @@ foreach(relative IN LISTS sources)
         set(allowed TRUE)
     endif()
 
+    file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" content)
+
+    # Nothing below can fire in a file containing none of these three substrings, and
+    # 403 of the 413 files scanned contain none. Measured: splitting and regexing all
+    # of them cost 2.9 s of a DEFAULT-set ctest entry, on every platform, to find
+    # matches in ten files. Whole-file `FIND` first takes that to ~0.3 s.
+    #
+    # Exact, not approximate: each needle is a strict prefix of the regex that would
+    # have matched it, so no hit can be lost. The `constexpr std::uint32_t` scan is
+    # exempt because its results are only ever read back keyed on the SAME file, and a
+    # file with no `.issue` has nothing to read them.
+    string(FIND "${content}" "EncodeErrorReply" foundEncoder)
+    string(FIND "${content}" "RefuseUntriaged" foundUntriaged)
+    string(FIND "${content}" ".issue" foundIssue)
+    if(foundEncoder EQUAL -1 AND foundUntriaged EQUAL -1 AND foundIssue EQUAL -1)
+        continue()
+    endif()
+
     fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${relative}" lines)
 
     set(lineNumber 0)
@@ -208,9 +226,20 @@ foreach(relative IN LISTS sources)
 
         if(line MATCHES "EncodeErrorReply[ \t]*\\(")
             if(allowed)
-                math(EXPR allowedHits "${allowedHits} + 1")
+                if("${relative}" STREQUAL "${refusalHeader}")
+                    set(encoderSeen TRUE)
+                endif()
             else()
                 list(APPEND violations "${relative}:${lineNumber}")
+            endif()
+        endif()
+
+        # Which refusal spellings exist, READ rather than remembered. A fourth one
+        # added to this header would otherwise be a spelling that passes the scan,
+        # joins no backlog and asserts nothing -- this ticket's defect one level up.
+        if("${relative}" STREQUAL "${refusalHeader}")
+            if(line MATCHES "std::vector<std::byte>[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\\(")
+                list(APPEND definedSpellings "${CMAKE_MATCH_1}")
             endif()
         endif()
 
@@ -224,6 +253,11 @@ foreach(relative IN LISTS sources)
 
         # An issue number named once and used many times. Resolved so the tally can
         # be reported per issue, which is what gives each of them a completion test.
+        #
+        # Keyed on the FILE as well as the name: two files may legitimately name
+        # different issues, and a global key would silently resolve one file's backlog
+        # against another's number -- a misattributed row, which is the failure this
+        # check exists to prevent, arriving through its own reporting.
         if(line MATCHES "constexpr[ \t]+std::uint32_t[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*([0-9]+)[ \t]*;")
             set(issueConstant_${relative}_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
         endif()
@@ -237,43 +271,58 @@ endforeach()
 # one each, so zero means a renamed function, a moved file or a changed spelling.
 # Reported as its own failure rather than folded into success, which is the direction
 # this project keeps getting wrong.
-if(allowedHits EQUAL 0)
+if(NOT encoderSeen)
     message("")
     message("  No `EncodeErrorReply` call was found in ${refusalHeader}.")
     message("")
-    message("The three refusal spellings are each built on one, so zero means this scan")
-    message("is no longer looking at what it thinks it is -- a renamed function, a moved")
-    message("file, a changed spelling. It is not evidence that every refusal is routed.")
+    message("Every refusal spelling is built on one, so none means this scan is no longer")
+    message("looking at what it thinks it is -- a renamed function, a moved file, a")
+    message("changed spelling. It is not evidence that every refusal is routed.")
     message(FATAL_ERROR "worker refusals: the scan matched nothing and cannot conclude")
 endif()
 
-fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${refusalHeader}" refusalLines)
-set(missingSpellings "")
-foreach(spelling IN LISTS spellings)
-    set(found FALSE)
-    foreach(line IN LISTS refusalLines)
-        if(line MATCHES "^[ \t]*(//|///|\\*)")
-            continue()
-        endif()
-        if(line MATCHES "${spelling}[ \t]*\\(")
-            set(found TRUE)
-            break()
-        endif()
-    endforeach()
-    if(NOT found)
-        list(APPEND missingSpellings "${spelling}")
-    endif()
-endforeach()
+# The set of spellings a surface can reach, DERIVED above, against the set this check
+# knows how to reason about.
+#
+# Both directions are failures and they are different failures. One MISSING is a
+# rename this check has not followed, which leaves it scanning for something nobody
+# calls. One EXTRA is worse and is the direction a restated list cannot see: a fourth
+# spelling in the allowed header is a way to answer a refusal that passes the scan,
+# adds nothing to the backlog and asserts no claim at all -- exactly the silence this
+# ticket removed, re-entering through the instrument that removed it.
+list(REMOVE_DUPLICATES definedSpellings)
+list(SORT definedSpellings)
+set(expectedSpellings ${knownSpellings})
+list(SORT expectedSpellings)
 
-if(missingSpellings)
-    string(REPLACE ";" ", " missing "${missingSpellings}")
+if(NOT "${definedSpellings}" STREQUAL "${expectedSpellings}")
+    set(extraSpellings ${definedSpellings})
+    list(REMOVE_ITEM extraSpellings ${knownSpellings})
+    set(missingSpellings ${expectedSpellings})
+    if(definedSpellings)
+        list(REMOVE_ITEM missingSpellings ${definedSpellings})
+    endif()
+
     message("")
-    message("  ${refusalHeader} defines no `${missing}`.")
+    if(extraSpellings)
+        string(REPLACE ";" ", " extra "${extraSpellings}")
+        message("  ${refusalHeader} defines a refusal spelling this check does not know: ${extra}")
+    endif()
+    if(missingSpellings)
+        string(REPLACE ";" ", " missing "${missingSpellings}")
+        message("  ${refusalHeader} defines no `${missing}`.")
+    endif()
     message("")
-    message("This check tallies `RefuseUntriaged` and requires the other two to exist. A")
-    message("spelling that is gone makes both the rule and the backlog count meaningless,")
-    message("so it is reported rather than passed over.")
-    message(FATAL_ERROR "worker refusals: a refusal spelling is missing and the tally cannot conclude")
+    message("The spellings are READ from that header, never restated here, because a")
+    message("restated list can only notice one going AWAY. A new one is the direction that")
+    message("matters: every call site reaching it would pass this scan, join no backlog and")
+    message("state no claim -- which is the silence #492 removed, coming back through the")
+    message("check that removed it.")
+    message("")
+    message("A fourth spelling is a real decision and may well be right. Make it here, in")
+    message("`knownSpellings`, and say in the rulebook what claim it asserts -- and if it")
+    message("can leave a refusal uncounted, tally it the way `RefuseUntriaged` is tallied.")
+    message(FATAL_ERROR "worker refusals: the refusal spellings are not the ones this check reasons about")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -292,9 +341,9 @@ if(violations)
     message("Answer through one of the three spellings in ${refusalHeader}, and say")
     message("which fact you are asserting:")
     message("")
-    message("    Cc::Refuse(metrics, row, detail)               a rise here means something")
-    message("    Cc::RefuseWithoutCounter({ .why = \"...\" })     a rise would mean nothing, because")
-    message("    Cc::RefuseUntriaged({ .issue = N })            nobody has decided yet; N will")
+    message("    Cc::Refuse(metrics, row, detail)                 a rise here means something")
+    message("    Cc::RefuseWithoutCounter({ .rationale = \"..\" })   a rise would mean nothing, because")
+    message("    Cc::RefuseUntriaged({ .issue = N })               nobody has decided yet; N will")
     message("")
     message("The third is a legitimate answer and is counted, not hidden: this check")
     message("reports the outstanding total on every run.")
@@ -350,14 +399,17 @@ foreach(token IN LISTS issueTokens)
     list(APPEND issueList "${number}")
 endforeach()
 
-set(reported "")
 message(STATUS "worker refusals: ${scannedCount} file(s) scanned, every refusal routed")
 message(STATUS "worker refusals: ${untriagedCount} refusal site(s) awaiting triage")
-foreach(number IN LISTS issueList)
-    if("${number}" IN_LIST reported)
-        continue()
-    endif()
-    list(APPEND reported "${number}")
+
+# One line per issue, then the sites themselves. The total says how much is
+# undecided; the split says who decides it, and gives each issue a completion test
+# that is measured rather than asserted. The sites are printed because the scan is
+# already holding them -- a reader given "8 awaiting #491" and no file to open has to
+# go and find what this loop just walked past.
+set(distinctIssues ${issueList})
+list(REMOVE_DUPLICATES distinctIssues)
+foreach(number IN LISTS distinctIssues)
     set(perIssue 0)
     foreach(other IN LISTS issueList)
         if("${other}" STREQUAL "${number}")
@@ -369,4 +421,7 @@ foreach(number IN LISTS issueList)
     else()
         message(STATUS "worker refusals:   ${perIssue} awaiting #${number}")
     endif()
+endforeach()
+foreach(site IN LISTS untriaged)
+    message(STATUS "worker refusals:     ${site}")
 endforeach()
