@@ -25,6 +25,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <system_error>
@@ -1207,6 +1208,24 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     auto const stamp = ComputeToolchainStamp(banner, resolved, roots);
     auto const cachePath = CacheFilePath(resolved);
 
+    // Handed back rather than left for the caller to derive a second time (#259).
+    // Every field is the one this function just used, so a caller recording what the
+    // digest rests on records exactly that, and does it without a spawn.
+    //
+    // Built here, ABOVE the cache-hit return, because a hit is precisely the case the
+    // caller was paying for: the entry it returns says nothing about the roots, so the
+    // caller's second probe ran on every warm start forever.
+    //
+    // Disengaged when the probe could not be spawned, which is the guard moved out of
+    // the caller and into the type -- see `ToolchainIdentity::evidence`. Copied rather
+    // than moved out of `roots`: the walk below still needs them, and one vector of
+    // root paths against the spawn this removes is not a trade worth reasoning about.
+    auto evidence = [&]() -> std::optional<ToolchainEvidence> {
+        if (!discovered.answered)
+            return std::nullopt;
+        return ToolchainEvidence { .compiler = resolved, .banner = std::string { banner }, .roots = roots, .stamp = stamp };
+    }();
+
     // A probe that never ran touches the cache in NEITHER direction, and both halves
     // are needed (issue #225).
     //
@@ -1230,7 +1249,9 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     {
         auto const [cachedStamp, cachedFingerprint] = ReadCache(cachePath);
         if (!cachedStamp.empty() && cachedStamp == stamp)
-            return ToolchainIdentity { .fingerprint = cachedFingerprint, .defect = probeDefect };
+            return ToolchainIdentity { .fingerprint = cachedFingerprint,
+                                       .defect = probeDefect,
+                                       .evidence = std::move(evidence) };
     }
 
     // The expensive part, reached only on a miss or a forced refresh.
@@ -1256,7 +1277,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
             return probeDefect;
         return complete ? IdentityDefect::None : IdentityDefect::PartialTree;
     }();
-    return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect };
+    return ToolchainIdentity { .fingerprint = fingerprint, .defect = defect, .evidence = std::move(evidence) };
 }
 
 } // namespace FastCache::Cc
