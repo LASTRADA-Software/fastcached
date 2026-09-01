@@ -217,6 +217,12 @@ endforeach()
 # mount, not of this check. CI runs on a native filesystem, so the first row is the
 # one that describes it there.
 list(JOIN byteOrderNames "|" byteOrderAlternation)
+
+# The same table spelled for a human, derived rather than restated. The success
+# line at the bottom of this file listed FOUR names while the table already held
+# six -- "a second copy is not a cross-check, it is a second thing to be wrong",
+# arriving inside a check written to enforce a rule.
+list(JOIN byteOrderNames "/" byteOrderDisplay)
 set(byteOrderQualified "(^|[^A-Za-z0-9_:])::[ ]*(${byteOrderAlternation})[ ]*\\(")
 set(byteOrderBare "(^|[^A-Za-z0-9_:.>])(${byteOrderAlternation})[ ]*\\(")
 
@@ -303,7 +309,7 @@ if(scanFileCount EQUAL 0)
 elseif(bareUses EQUAL 0)
     string(APPEND vacuous
         "  ${scanFileCount} file(s) were scanned and not one unqualified call to any of "
-        "htonl/htons/ntohl/ntohs/htonll/ntohll was found.\n"
+        "${byteOrderDisplay} was found.\n"
         "  Either this project has stopped converting byte order -- in which case delete this\n"
         "  check -- or the scan roots no longer reach the code that does, and this check has\n"
         "  been passing by looking at the wrong files.\n")
@@ -345,4 +351,4 @@ endif()
 
 list(LENGTH scanFiles scanFileCount)
 message("byte-order qualifier: ${scanFileCount} source file(s) scanned, ${bareUses} unqualified "
-        "call(s) to htonl/htons/ntohl/ntohs found, 0 globally qualified")
+        "call(s) to ${byteOrderDisplay} found, 0 globally qualified")
