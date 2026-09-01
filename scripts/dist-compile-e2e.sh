@@ -571,7 +571,7 @@ worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || ec
 # that endpoint, and the connection the worker accepts arrives from an address
 # outside 127/8 -- with no second machine, no container and no alias involved.
 #
-# ## Two legs, and only the pair proves anything
+# ## Three legs, and the first two prove nothing apart
 #
 #   admitted   the address IS in the worker's `--fleet-member`: the compile is
 #              dispatched and that worker's job counter moves.
@@ -579,12 +579,20 @@ worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || ec
 #              `not-a-member`, the launcher compiles locally, and
 #              `fastcache_worker_jobs_refused_not_a_member_total` moves. That
 #              counter is the assertion #235 needed and did not have.
+#   served     the SAME address, the SAME listener, the other verb: it fetches from
+#              the admitting worker's own cache tier and is SERVED, because that
+#              address is this machine. #290's rule, which the merge is what put at
+#              risk -- see leg 3, which carries the argument in full.
 #
 # The admitted leg on its own would pass over loopback too -- loopback is admitted
 # by the branch ABOVE the list -- so it cannot show that the peer address ever
 # reached the list. The refused leg is what shows it: a loopback peer would have
 # been admitted there as well, and the leg would fail. Neither is worth running
 # without the other, which is why they are one mode rather than two.
+#
+# Leg 3 is the odd one and is deliberately not symmetric with them: membership is a
+# list an operator writes, locality is a fact about the host, and after #290 both are
+# decided on one socket. It runs against leg 1's worker for that reason.
 #
 # In BOTH legs the scheduler admits the client. #235's shape is a lease that is
 # granted and then a worker that refuses it, so no scheduler counter moves and the
@@ -722,6 +730,10 @@ if [[ "$mode" == "membership" ]]; then
     # an empty pid and carry on.
     started_pid=""
 
+    # And the port that worker bound, for the same reason. Leg 3 dials the listener
+    # leg 1 compiled on, so it has to be able to name it.
+    started_port=""
+
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch (`--listen-node`) port
     start_membership_scheduler() {
@@ -758,17 +770,25 @@ if [[ "$mode" == "membership" ]]; then
     # fingerprint pinned there is no walk here, and a worker that has not logged
     # `compile node ready` within the bound has not started.
     #
+    # The cache tier is a PARAMETER rather than a constant in the body, because the
+    # two legs want opposite answers to it and a flag repeated with a different value
+    # would leave which one wins to the option table's overwrite order -- a fixture
+    # asserting a property it never states. Leg 1's worker holds a tier, so leg 3 can
+    # ask it for an object over the same socket; leg 2's holds none, because a refusal
+    # is all that leg reads and a tier there is a second thing to go wrong.
+    #
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch port to register with
     # @param 3 admin port
-    # @param 4.. the membership flags under test, if any
+    # @param 4 the cache-tier flag: `--cache-memory=<n>`, or `$no_local_cache` for none
+    # @param 5.. the membership flags under test, if any
     start_membership_worker() {
-        local tag="$1" dispatch="$2" admin="$3" port="" pid=""
-        shift 3
+        local tag="$1" dispatch="$2" admin="$3" tier="$4" port="" pid=""
+        shift 4
         # As above: the compile port is the worker's own business, since the client
         # is told where to dial by the lease rather than by this fixture.
         port="$(free_port)"
-        "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" \
+        "$node" "$stated_drain" "$tier" --cluster-key-file="$cluster_key" \
             --scheduler="${lan_address}:${dispatch}" \
             --listen-node="${lan_address}:${port}" --advertise="${lan_address}:${port}" \
             --admin-listen="$admin" \
@@ -776,6 +796,7 @@ if [[ "$mode" == "membership" ]]; then
             ${@+"$@"} > "${workdir}/${tag}.log" 2>&1 &
         pid=$!
         started_pid="$pid"
+        started_port="$port"
         pids+=("$pid")
         # Bind and registration are waited for separately, because a stall in one is
         # a different fault from a stall in the other and a fixture that folds them
@@ -793,8 +814,10 @@ if [[ "$mode" == "membership" ]]; then
 
     start_membership_scheduler "mem-admit-scheduler" "$admit_dispatch_port"
     start_membership_worker "mem-admit-worker" "$admit_dispatch_port" "$admit_admin_port" \
+        --cache-memory=64m \
         --fleet-member="$lan_address"
     admit_worker_pid="$started_pid"
+    admit_worker_port="$started_port"
 
     # The policy the worker actually adopted, from its own ready line. Asserted
     # because the two legs differ in exactly one flag, and a leg that silently
@@ -827,10 +850,10 @@ if [[ "$mode" == "membership" ]]; then
     # ONE body, because "it served a job and refused nobody" is a statement about a
     # moment rather than about two scrapes a round trip apart.
     #
-    # This is also where the pair earns its keep from the other side: the fixture's
-    # own `wait_for_port` dialled this worker from $lan_address, and here that is
-    # ADMITTED -- the flat zero below is that probe passing the member list, against
-    # leg 2 where the identical probe is refused.
+    # The zero is read rather than assumed, and it is the assertion that this
+    # worker served the dispatched compile without refusing anything on the way --
+    # a leg that dispatched AND refused would be describing two different callers
+    # and would not be the clean control leg 2 is measured against.
     admit_completed="$(wait_for_counter "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
         "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log")"
     admit_metrics="$(http_get "$admit_admin_port" /metrics)" \
@@ -844,6 +867,92 @@ if [[ "$mode" == "membership" ]]; then
         || fail "the admitting worker refused ${admit_refused} caller(s) as not-a-member"
     echo "   dispatched and served: ${admit_completed} job(s), 0 refused"
 
+    # --- leg 3: the same peer, the same listener, and its CACHE verb is SERVED ----
+    #
+    # #290's acceptance criterion at deployment scale, and it is the half that can be
+    # reached from one host. The ticket states the property as a FETCH refused while a
+    # compile from the same peer succeeds; the refusing direction cannot be built here,
+    # because `CachedLocalityOracle::IsThisMachine` answers true for every address this
+    # machine answers on and $lan_address is one of them by construction. That contrast
+    # is a unit case (`NodeFrameSurface_test`, "(#290) one peer on one listener"), which
+    # injects the oracle and can therefore have a peer that is genuinely somebody else.
+    #
+    # What is left is the OTHER direction, and it is the one a bind change breaks in
+    # silence. Until stage 3 the cache tier and the compiler sat behind two listeners,
+    # and "who may do this" was answered by which socket a frame arrived on. They now
+    # share one, and what replaced the socket is that locality is a property of the
+    # VERB: this worker must serve its tier to $lan_address -- which IS this machine --
+    # while deciding the compile by membership instead. A merge that gated the cache on
+    # `IsLoopbackHost` alone would satisfy every other assertion in this file and fail
+    # only here. Nothing else would notice: objects would stay correct, the fleet would
+    # keep dispatching, and the tier would simply stop answering the address an
+    # operator bound it to.
+    #
+    # The SAME worker as leg 1, deliberately, rather than a fourth process. The claim
+    # is about one listener answering two verbs two ways, so a second worker would be a
+    # second socket and would give up the property being asserted.
+    echo "== membership leg 3: ${lan_address} fetching from the listener that just compiled for it"
+
+    write_source "${proj}/tiered.cpp" "membertiered"
+    "$compiler" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered-ref.o" \
+        || fail "the leg 3 reference compile failed"
+
+    # Pointed at the WORKER's node port, at $lan_address, with no scheduler: this is a
+    # cache exchange and nothing else, so a dispatch cannot stand in for a hit.
+    (
+        export FASTCACHE_ADDR="${lan_address}:${admit_worker_port}"
+        unset FASTCACHE_SCHEDULER
+        run_launcher "${workdir}/mem-tier-store.log" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered.o"
+    ) || {
+        cat "${workdir}/mem-tier-store.log" >&2
+        echo "--- worker log ---" >&2
+        cat "${workdir}/mem-admit-worker.log" >&2
+        fail "a compile storing into the worker's tier at ${lan_address} failed"
+    }
+
+    rm -f "${proj}/build/tiered.o"
+    (
+        export FASTCACHE_ADDR="${lan_address}:${admit_worker_port}"
+        unset FASTCACHE_SCHEDULER
+        run_launcher "${workdir}/mem-tier-hit.log" -std=c++17 -O1 -c "${proj}/tiered.cpp" -o "${proj}/build/tiered.o"
+    ) || {
+        cat "${workdir}/mem-tier-hit.log" >&2
+        fail "a second compile against the worker's tier at ${lan_address} failed"
+    }
+
+    # The POSITIVE, asserted on its own. A refusal counter that stayed at zero says
+    # only that nothing was refused, and "no refusals" is not "it was served" -- the
+    # launcher steps over a refused FETCH and compiles, so a tier that answered nobody
+    # would leave both the build green and that counter flat.
+    grep -q "fastcache-cc: HIT" "${workdir}/mem-tier-hit.log" \
+        || {
+            cat "${workdir}/mem-tier-hit.log" >&2
+            echo "--- worker log ---" >&2
+            cat "${workdir}/mem-admit-worker.log" >&2
+            fail "the worker's tier did not serve ${lan_address} an object it holds"
+        }
+    cmp -s "${proj}/build/tiered-ref.o" "${proj}/build/tiered.o" \
+        || fail "the object served from the worker's tier to ${lan_address} is wrong"
+
+    # And the worker's own side of the same exchange. The hit is what says the tier
+    # answered; the flat refusal counter is what says WHICH rule let it through, and
+    # after the merge those two refusals share a wire code -- a caller that is not on
+    # this machine and a caller with no claim on its CPU both answer `not-a-member` --
+    # so the counters are the only place they are told apart.
+    tier_hits="$(wait_for_counter "$admit_admin_port" fastcache_node_cache_hits_total 1 \
+        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log")"
+    tier_metrics="$(http_get "$admit_admin_port" /metrics)" \
+        || fail "the admitting worker's admin endpoint refused a /metrics request"
+    tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
+    # Absent is not zero. A worker with no tier exports no such series, and an empty
+    # string would compare unequal to "0" and fail naming a count nobody published --
+    # which is also the check that catches leg 1 losing its `--cache-memory`.
+    [[ -n "$tier_refused" ]] \
+        || fail "the admitting worker exports no fastcache_node_cache_requests_refused_not_local_total series"
+    [[ "$tier_refused" == "0" ]] \
+        || fail "the worker refused ${tier_refused} cache request(s) from ${lan_address} as not-local"
+    echo "   its tier served ${lan_address} ${tier_hits} hit(s), refusing 0 as not-local"
+
     # --- leg 2: the same address, not a member, and the worker says so -----------
     #
     # The worker is started with NO membership flags at all, which is the default
@@ -855,24 +964,45 @@ if [[ "$mode" == "membership" ]]; then
     refuse_admin_port="$(free_port)"
 
     start_membership_scheduler "mem-refuse-scheduler" "$refuse_dispatch_port"
-    start_membership_worker "mem-refuse-worker" "$refuse_dispatch_port" "$refuse_admin_port"
+    start_membership_worker "mem-refuse-worker" "$refuse_dispatch_port" "$refuse_admin_port" \
+        "$no_local_cache"
     refuse_worker_pid="$started_pid"
 
     grep -q "this machine only" "${workdir}/mem-refuse-worker.log" \
         || { cat "${workdir}/mem-refuse-worker.log" >&2; fail "the refusing worker did not report a loopback-only policy"; }
 
-    # The reading BEFORE the compile, and it is not expected to be zero.
+    # The reading BEFORE the compile, and it is ZERO -- which it did not used to be,
+    # and the reason is a behaviour change #290 stage 3 made deliberately.
     #
-    # `wait_for_port` dials the compile port from this same non-loopback address to
-    # decide the worker is up, and that probe is a caller like any other: leg 1
-    # admits it -- which is what the flat zero up there says -- and this leg refuses
-    # it. So the branch under test is already observable here, the floor of 1 is an
-    # assertion rather than a formality, and what the compile has to add is a
-    # FURTHER refusal, measured as a delta from this reading.
-    refuse_before="$(wait_for_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total 1 \
-        "$refuse_worker_pid" \
-        "the refusing worker (it never refused this fixture's own probe from ${lan_address}, so that probe reached it as an admitted caller and this leg would prove nothing)" \
-        "${workdir}/mem-refuse-worker.log")"
+    # This wait used to poll for >= 1, and the thing it was waiting for was this
+    # fixture's own `wait_for_port`: the dedicated compile listener refused a
+    # non-member at ACCEPT -- `WorkerServer`'s accept loop classified
+    # `socket->PeerAddress()` before a byte was read -- so a bare connect-and-close
+    # from $lan_address was itself a counted refusal.
+    #
+    # Stage 3 retired that listener. The compile verbs now arrive on the merged 0xFC
+    # surface, where the peer gate is asked per FRAME rather than per accept, at the
+    # first point the verb is known. That is not an oversight and could not be undone
+    # without breaking the merge: membership is the policy of the compile VERBS, not
+    # of the socket, and the same socket serves cache verbs that answer locality
+    # instead -- an accept-time membership gate would decide both. A connection that
+    # sends nothing is therefore refused by nothing, and the probe no longer counts.
+    #
+    # What that costs this leg is a corroborating reading, not the leg itself. The
+    # compile below still arrives from $lan_address, and loopback would still be
+    # admitted by the branch above the member list, so the 0 -> 1 delta discriminates
+    # exactly as the old 1 -> 2 did. The baseline is ASSERTED to be zero rather than
+    # merely recorded: a worker already refusing this address for some other reason
+    # would otherwise be indistinguishable from one refusing the compile.
+    refuse_metrics_before="$(http_get "$refuse_admin_port" /metrics)" \
+        || fail "the refusing worker's admin endpoint refused a /metrics request"
+    refuse_before="$(metric_value "$refuse_metrics_before" fastcache_worker_jobs_refused_not_a_member_total)"
+    # Absent is not zero: an unexported series would read as an empty string here and
+    # make the delta below compare against nothing.
+    [[ -n "$refuse_before" ]] \
+        || fail "the refusing worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
+    [[ "$refuse_before" == "0" ]] \
+        || fail "the refusing worker had already refused ${refuse_before} caller(s) before the compile"
 
     write_source "${proj}/refused.cpp" "memberrefused"
 
