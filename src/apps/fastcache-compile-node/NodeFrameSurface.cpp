@@ -86,7 +86,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         return std::unique_ptr<NodeFrameSurface> {};
     }
 
-    auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile, metrics);
+    auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
     auto bound = surface->Bind(io, cfg, inherited, metrics, logger);
     if (bound.has_value())
         return surface;

@@ -1517,22 +1517,40 @@ a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
 ### What a refused connection looks like
 
-Every refusal the `0xFC` listener answers moves exactly one counter, and the ones
-below are the whole of what a probe of that port looks like from outside the
-machine. They are separate series rather than one `refused_total` because an
-operator does a different thing about each; where two of them share a wire code,
-that is said explicitly.
+These are what a probe of that port looks like from outside the machine. They are
+separate series rather than one `refused_total` because an operator does a
+different thing about each; where two of them share a wire code, that is said
+explicitly.
 
-| Series | Says |
-|---|---|
-| `fastcache_worker_frames_refused_payload_too_large_total` | A header declared more payload than the surface will buffer, so nothing was read. **The cheapest probe there is** — it needs 24 bytes where the envelope series needs a whole frame sent and read — which is why it has its own counter rather than leaning on them. |
-| `fastcache_worker_jobs_refused_endpoint_busy_total` | A request would not fit in the bytes already in flight. A slot was free and the memory was not, so more machines would not have helped. |
-| `fastcache_node_frame_connections_refused_at_capacity_total` | The listener already holds every *connection* it will, so a new one was turned away before it sent anything. |
-| `fastcache_scheduler_credentials_rejected_total` | Somebody presented a scheduler token and it was **wrong**. |
-| `fastcache_scheduler_credentials_malformed_total` | An `AUTH` frame that would not decode at all — a client built against another release. |
-| `fastcache_scheduler_requests_refused_unauthenticated_total` | A verb was reached *without* a credential ever having been presented. |
-| `fastcache_node_frame_requests_refused_unserved_verb_total` | A verb family this node runs no component for — a `LEASE` at a plain worker, a `FETCH` at a node with no tier. Rises for an unknown opcode too, which makes it the series a port scan shows up on. |
-| `fastcache_worker_frames_refused_malformed_credential_total` | An `AUTH` payload the *compile* surface could not decode. Flat at zero by construction — `AUTH` is the scheduler's — so a rise means what may compile here has changed. |
+**Read the "counted for" column before alerting.** The listener routes each
+refusal to the component that owns the verb, and the three components do not all
+count the same things — a deliberate split, not an oversight, but one that decides
+what an alert can see. The frame ceiling and the byte budget move a counter for
+**compile** verbs; on a cache `STORE` or a scheduler `REGISTER` they are answered
+correctly and counted nowhere. That is a known gap rather than a claim about those
+surfaces being quiet, and it matters most on a node holding a cache tier: the
+listener's in-flight ceiling is the largest of the components present, which is
+usually the cache's, so the byte-budget refusal that fires in practice is a cache
+`STORE`.
+
+| Series | Says | Counted for |
+|---|---|---|
+| `fastcache_worker_frames_refused_payload_too_large_total` | A header declared more payload than the surface will buffer, so nothing was read. **The cheapest probe there is** — it needs 24 bytes where the envelope series needs a whole frame sent and read — which is why it has its own counter rather than leaning on them. | compile verbs |
+| `fastcache_worker_jobs_refused_endpoint_busy_total` | A request would not fit in the bytes already in flight. A slot was free and the memory was not, so more machines would not have helped. | compile verbs |
+| `fastcache_node_frame_connections_refused_at_capacity_total` | The listener already holds every *connection* it will, so a new one was turned away before it sent anything. | every verb — it is decided before one is named |
+| `fastcache_scheduler_credentials_rejected_total` | Somebody presented a scheduler token and it was **wrong**. | `AUTH` |
+| `fastcache_scheduler_credentials_malformed_total` | An `AUTH` frame that would not decode at all — a client built against another release. | `AUTH` |
+| `fastcache_scheduler_requests_refused_unauthenticated_total` | A verb was reached *without* a credential ever having been presented. | scheduler verbs |
+| `fastcache_worker_frames_refused_malformed_credential_total` | An `AUTH` payload the *compile* surface could not decode. Flat at zero by construction — `AUTH` is the scheduler's — so a rise means what may compile here has changed. | compile verbs |
+| `fastcache_worker_frames_refused_rejected_credential_total` | An `AUTH` payload the *compile* surface decoded and could not verify. Flat at zero by the same construction. | compile verbs |
+
+One refusal has **no** counter, deliberately: a verb this node runs no component
+for — a `LEASE` at a plain worker, a `FETCH` at a node with no cache tier — is
+answered `unimplemented-verb` and counted nowhere. It is not an event but the
+answer ordinary traffic gets: a worker with no scheduler refuses every `AUTH` a
+`FASTCACHE_TOKEN` launcher sends, once per exchange for a whole build. A counter
+there would be dominated by a healthy build, which is the same problem as one that
+never moves.
 
 Two pairs must never be summed, and both pairs share a wire code, so a dashboard
 grouping by the code an operator sees in a client log gets them wrong:

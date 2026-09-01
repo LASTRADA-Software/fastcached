@@ -366,6 +366,16 @@ namespace CompileRefusal
         .code = CompileCacheWire::ErrorCode::MalformedFrame,
         .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedCredential,
     };
+    /// An `AUTH` payload that decoded and did not verify.
+    ///
+    /// Its own counter rather than `Unauthenticated` below, for the reason
+    /// `MalformedCredential` above has one: three refusals answer `unauthenticated` or
+    /// `malformed-frame` across this worker and an operator acts on each differently.
+    /// Unreachable here today, which is exactly where the split is easiest to forget.
+    inline constexpr Cc::SurfaceRefusal RejectedCredential {
+        .code = CompileCacheWire::ErrorCode::Unauthenticated,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedRejectedCredential,
+    };
     /// A compile verb reached before a credential. Zero on every shipped shape.
     inline constexpr Cc::SurfaceRefusal Unauthenticated {
         .code = CompileCacheWire::ErrorCode::Unauthenticated,

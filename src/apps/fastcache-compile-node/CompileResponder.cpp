@@ -107,7 +107,7 @@ namespace
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusalTable { {
         { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy },
         { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential },
-        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::Unauthenticated },
+        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::RejectedCredential },
     } };
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusalTable, &EndpointRefusalRow::refusal),

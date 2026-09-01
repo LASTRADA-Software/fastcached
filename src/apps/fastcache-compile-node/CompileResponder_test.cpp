@@ -459,7 +459,7 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder compile { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
-    MergedResponder merged { nullptr, nullptr, &compile, fix.metrics };
+    MergedResponder merged { nullptr, nullptr, &compile };
 
     CHECK(merged.OwnerOf(static_cast<std::uint8_t>(Wire::Op::Compile)) == &compile);
 
@@ -864,7 +864,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // Far below what this compile will take, standing in for the five seconds every
     // dispatched TU used to be given.
     ShortWindowResponder tooShort { worker.responder, std::chrono::milliseconds { 100 } };
-    MergedResponder merged { nullptr, nullptr, &tooShort, fix.metrics };
+    MergedResponder merged { nullptr, nullptr, &tooShort };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -941,7 +941,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder, fix.metrics };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     // The SIZE, asserted rather than waited out: ten minutes of held compile would be a
     // suite nobody runs. Paired with the mechanism above, the two cover both.
@@ -1005,7 +1005,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder, fix.metrics };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1101,7 +1101,7 @@ TEST_CASE("The merged listener counts the frame it refuses without reading", "[n
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder, fix.metrics };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);

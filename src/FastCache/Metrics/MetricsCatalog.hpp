@@ -261,6 +261,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "family is routed to the scheduler, so a compile surface is never asked "
               "for a credential.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerFramesRefusedRejectedCredential,
+      .prometheusName = "fastcache_worker_frames_refused_rejected_credential_total",
+      .help = "AUTH payloads on a compile surface that decoded and did not verify. "
+              "Never sum with frames_refused_unauthenticated: they share a wire code "
+              "and nothing else -- that one never presented a credential, this one "
+              "presented the wrong one. Flat at zero BY CONSTRUCTION: the Session verb "
+              "family is routed to the scheduler.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
       .prometheusName = "fastcache_worker_frames_refused_unauthenticated_total",
       .help = "Frames refused for reaching a compile verb before a credential. Flat at "
@@ -414,13 +422,6 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "worker_jobs_refused_endpoint_busy: they share a wire code and nothing "
               "else -- that one says one request was too big right now, this says the "
               "surface has no room for another conversation.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb,
-      .prometheusName = "fastcache_node_frame_requests_refused_unserved_verb_total",
-      .help = "Frames naming a verb family this node runs no component for -- a LEASE "
-              "at a plain worker, a FETCH at a node with no cache tier. The fix is to "
-              "give the node that component. Rises for an unknown opcode too, which "
-              "makes it the series a port scan shows up on.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",

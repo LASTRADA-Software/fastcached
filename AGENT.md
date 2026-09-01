@@ -614,7 +614,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   names no verb, so it is the ENDPOINT's own row rather than a default arm on the
   router — which is also what keeps the two `EndpointBusy` refusals from ever summing.
   And `SchedulerRequestsRefusedUnauthenticated` fires only pre-payload, so a WRONG
-  token counted nothing: three outcomes, three rows.
+  token counted nothing: three outcomes, three rows. But not every refusal is an EVENT
+  — a verb this node runs no component for is what a HEALTHY build gets, once per
+  exchange, so counting it buries the scan it would be read for.
 - Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
   makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
   (`SchedulerService::Register`) and never repaired by a renderer — and the

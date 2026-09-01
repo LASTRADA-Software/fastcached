@@ -37,22 +37,36 @@ namespace Detail
     /// `case` would only imply it. `EnumTable` takes its extent from
     /// `EndpointRefusal::Last`, so a fourth enumerator leaves an empty row here rather
     /// than silently borrowing a neighbour's.
-    inline constexpr EnumTable<EndpointRefusal, std::optional<Cc::SurfaceRefusal>> SchedulerEndpointRefusals { {
-        std::nullopt,
-        Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
-                             .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed },
-        Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
-                             .counter = IMetricsSink::Counter::SchedulerCredentialsRejected },
+    struct SchedulerEndpointRefusal
+    {
+        EndpointRefusal refusal;                  ///< Which endpoint decision this describes.
+        std::optional<Cc::SurfaceRefusal> answer; ///< The row, or nothing where this surface counts none.
+    };
+
+    inline constexpr EnumTable<EndpointRefusal, SchedulerEndpointRefusal> SchedulerEndpointRefusals { {
+        { .refusal = EndpointRefusal::InFlightBudget, .answer = std::nullopt },
+        { .refusal = EndpointRefusal::CredentialMalformed,
+          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed } },
+        { .refusal = EndpointRefusal::CredentialRejected,
+          .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected } },
     } };
+
+    // Positional rows alone would not have caught this: appending an enumerator leaves
+    // a value-initialised row here, whose `answer` is `nullopt` -- so a guard that
+    // short-circuits on the absent case passes VACUOUSLY and the new refusal ships
+    // uncounted, which is this ticket's own defect re-entering through its fix. The row
+    // carries its enumerator so the position is checked whatever the answer is.
+    static_assert(RowsInEnumeratorOrder(SchedulerEndpointRefusals, &SchedulerEndpointRefusal::refusal),
+                  "SchedulerEndpointRefusals must hold one row per EndpointRefusal, in enumerator order");
 
     // A row states the code a second time, and a second statement of one fact is a
     // second thing to be wrong. Checked rather than trusted, against the one place
     // that property lives.
-    static_assert(std::ranges::all_of(std::views::iota(std::size_t { 0 }, SchedulerEndpointRefusals.size()),
-                                      [](std::size_t index) {
-                                          auto const& row = SchedulerEndpointRefusals[index];
-                                          return !row.has_value()
-                                                 || row->code == ErrorCodeFor(static_cast<EndpointRefusal>(index));
+    static_assert(std::ranges::all_of(SchedulerEndpointRefusals,
+                                      [](SchedulerEndpointRefusal const& row) {
+                                          return !row.answer.has_value() || row.answer->code == ErrorCodeFor(row.refusal);
                                       }),
                   "a scheduler refusal row must answer the code `ErrorCodeFor` names for its refusal");
 } // namespace Detail
@@ -177,7 +191,7 @@ class SchedulerResponder final: public IFrameResponder
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)];
+        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)].answer;
         if (!row.has_value())
             return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
         return Cc::Refuse(_metrics, *row, detail);
@@ -510,18 +524,10 @@ class MergedResponder final: public IFrameResponder
     ///        not schedule. Also owns the credential, so `AUTH` goes here.
     /// @param compile Answers the compile verbs, or nullptr when this node runs no
     ///        worker. All three must outlive this.
-    /// @param metrics Where a verb no component here serves is counted. The router's
-    ///        own, because that refusal belongs to no owner by definition -- and it is
-    ///        reachable by the cheapest probe there is, so answering it uncounted is
-    ///        the whole of #447 on the one path routing cannot close.
-    MergedResponder(IFrameResponder* cache,
-                    IFrameResponder* scheduler,
-                    IFrameResponder* compile,
-                    IMetricsSink& metrics) noexcept:
+    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
         _cache { cache },
         _scheduler { scheduler },
-        _compile { compile },
-        _metrics { metrics }
+        _compile { compile }
     {
     }
 
@@ -536,8 +542,9 @@ class MergedResponder final: public IFrameResponder
     /// hops onto an executor before it compiles and back onto the reactor before it
     /// answers: a compile blocks for seconds, and neither running it on this reactor
     /// (#213) nor returning its reply off that reactor is visible at any call site.
-    /// `WorkerServer` still serves its own dedicated port; this is an additional door
-    /// onto the same worker, the same policy and the same slot accounting.
+    /// The worker's dedicated port is gone (#290 stage 3), so this is not an additional
+    /// door onto the worker -- it is the only one, and the same policy and slot
+    /// accounting reach it here.
     ///
     /// @param opRaw The third header byte, as received.
     /// @return The owner, or nullptr.
@@ -735,24 +742,29 @@ class MergedResponder final: public IFrameResponder
     /// every other refusal here: nothing is misconfigured on the CLIENT's side, and the
     /// node has to be told to hold a tier or to schedule before this verb exists.
     ///
-    /// **And it is counted**, through the one row every route to it shares. Four
-    /// methods reach this -- `Answer`, `RefusePeer`, `RefusalReply` and
-    /// `EndpointRefusalReply` -- and each used to encode its own reply, so a node being
-    /// scanned for the verbs it answers refused every probe correctly and left
-    /// `/metrics` flat (#447). It is the router's own counter rather than an owner's
-    /// because there is, by definition, no owner to route it to; the same argument
-    /// `FrameServer` makes about the refusal it decides before a header exists.
+    /// **Deliberately not counted, and that is the hard half of #447 rather than an
+    /// omission.** Every other refusal here is an event; this one is an ANSWER that
+    /// ordinary, healthy traffic produces continuously. A node runs its components
+    /// independently, so a worker with no scheduler refuses every `AUTH` a
+    /// `FASTCACHE_TOKEN` launcher sends -- which is per exchange, for a whole build --
+    /// and a node with no cache tier refuses every local `FETCH` the same way. Counted,
+    /// the series would be dominated by a normal build and a port scan would be
+    /// invisible inside it, which is the failure this ticket is about arrived at from
+    /// the opposite direction: a signal nothing can be read out of is no better than a
+    /// counter that never moves.
+    ///
+    /// Splitting it into "the ordinary absences" and "the rest" is a real counter and
+    /// out of this ticket's scope; #447's own residue is recorded rather than guessed
+    /// at. What DID change is that all four routes here -- `Answer`, `RefusePeer`,
+    /// `RefusalReply` and `EndpointRefusalReply` -- give one sentence: a peer asking
+    /// for a verb served nowhere is told that, rather than being told its frame was
+    /// too large and sent to shrink one that was never going to be answered.
     /// @return The encoded refusal.
-    [[nodiscard]] std::vector<std::byte> UnservedReply() const
+    [[nodiscard]] static std::vector<std::byte> UnservedReply()
     {
-        return Cc::Refuse(_metrics, UnservedVerb, "this node serves no component for that verb family");
+        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::UnimplementedVerb,
+                                                  "this node serves no component for that verb family");
     }
-
-    /// The row pairing that refusal's wire code with its counter.
-    static constexpr Cc::SurfaceRefusal UnservedVerb {
-        .code = CompileCacheWire::UnimplementedVerb,
-        .counter = IMetricsSink::Counter::NodeFrameRequestsRefusedUnservedVerb,
-    };
 
     /// The largest value the present owners report for one ceiling.
     ///
@@ -773,7 +785,6 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _cache;
     IFrameResponder* _scheduler;
     IFrameResponder* _compile;
-    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Node

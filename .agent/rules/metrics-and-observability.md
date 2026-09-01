@@ -563,6 +563,17 @@ looks exactly like a port nobody is talking to.
   *impossible* for the byte-budget and at-capacity refusals to share a counter,
   although they share `EndpointBusy` on the wire and say opposite things to an
   operator. The types keep them apart rather than a comment asking somebody to.
+- **Not every refusal is an EVENT, and one that ordinary traffic produces must not be
+  counted.** The merged listener answers `UnimplementedVerb` to a verb this node runs
+  no component for — and that is what a *healthy* deployment gets: a worker with no
+  scheduler refuses every `AUTH` a `FASTCACHE_TOKEN` launcher sends, once per exchange
+  for a whole build, and a node with no cache tier refuses every local `FETCH` the same
+  way. Counted, the series is a build's traffic and a port scan is invisible inside it
+  — which is this rule's own failure reached from the opposite side: a signal nothing
+  can be read out of is no better than a counter that never moves. The test is not "is
+  this a refusal" but "would a rise mean something happened". Splitting such an answer
+  into its ordinary and its alarming halves is a real design question and never a
+  by-the-way row.
 - **A refusal counter can be a SECURITY signal, and the one that was missing is.**
   `SchedulerRequestsRefusedUnauthenticated` fires only at the pre-payload gate — a
   peer reaching a verb having never authenticated, which is a misconfigured member.

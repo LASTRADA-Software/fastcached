@@ -39,14 +39,8 @@ class NodeFrameSurface
     ///        nullptr when this node does not schedule.
     /// @param compile Answers the compile verbs, or nullptr when this node runs no
     ///        worker. All three must outlive this.
-    /// @param metrics Where the router counts a verb no component here serves, and
-    ///        where the endpoint counts the connection it has no room for. Both are
-    ///        refusals that belong to no owning component.
-    NodeFrameSurface(IFrameResponder* cache,
-                     IFrameResponder* scheduler,
-                     IFrameResponder* compile,
-                     IMetricsSink& metrics) noexcept:
-        _responder { cache, scheduler, compile, metrics }
+    NodeFrameSurface(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
+        _responder { cache, scheduler, compile }
     {
     }
 
