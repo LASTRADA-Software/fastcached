@@ -115,12 +115,30 @@ bool EpollReactor::UpdateInterest(EpollFdHandler* handler, bool read, bool write
     return ::epoll_ctl(_epollFd, EPOLL_CTL_MOD, handler->fd, &ev) == 0;
 }
 
-void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
+void EpollReactor::Detach(EpollFdHandler* handler) noexcept
 {
-    if (!handler || handler->fd < 0 || _epollFd < 0)
+    if (!handler)
         return;
-    epoll_event ev {};
-    ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, handler->fd, &ev);
+
+    if (handler->fd >= 0 && _epollFd >= 0)
+    {
+        epoll_event ev {};
+        ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, handler->fd, &ev);
+    }
+
+    // Withdraw this handler from the batch Run() is walking. EPOLL_CTL_DEL above
+    // stops future reports and does nothing about entries epoll_wait has already
+    // written, which is the whole of #475. The handler is still alive here, so
+    // the comparison is against a live pointer and needs no generation counter.
+    //
+    // The whole array is scanned, including entries already dispatched: nulling
+    // one of those is a no-op, and it keeps this free of an off-by-one against
+    // the loop's cursor.
+    for (int i = 0; i < _batch.count; ++i)
+    {
+        if (_batch.events[i].data.ptr == handler)
+            _batch.events[i].data.ptr = nullptr;
+    }
 }
 
 void EpollReactor::Submit(std::coroutine_handle<> handle)
@@ -225,12 +243,22 @@ void EpollReactor::Run()
             return;
         }
 
+        // Published so `Detach` can withdraw an entry from this array. A callback
+        // below can free the object another entry's handler lives in, and
+        // EPOLL_CTL_DEL does not retract what epoll_wait already wrote here --
+        // #475, reproduced under ASan. Cleared before leaving the batch so a
+        // Detach outside the loop scans nothing.
+        _batch = DequeuedBatch { .events = events, .count = n };
+
         for (int i = 0; i < n; ++i)
         {
             auto const& ev = events[i];
             if (ev.data.ptr == nullptr)
             {
-                // Wake event — drain the eventfd counter and move on.
+                // Either the wake event, or an entry `Detach` withdrew after this
+                // batch was dequeued. Draining the eventfd is harmless in the
+                // second case: it is level-triggered and re-reports if it still
+                // has a count.
                 std::uint64_t buf {};
                 std::ignore = ::read(_wakeFd, &buf, sizeof(buf));
                 continue;
@@ -242,9 +270,17 @@ void EpollReactor::Run()
             // level-triggered fd is re-reported forever and the loop spins, and a
             // second callback must not run because the first may have resumed a
             // coroutine that freed the object `handler` lives in.
+            //
+            // That covers ONE handler reported twice in this batch. It does NOT
+            // cover handler i freeing the owner of handler j -- for years this
+            // comment read as though it did, which is how #475 stayed invisible.
+            // What covers that is `Detach` nulling the entry above, not anything
+            // here.
             if (auto* const callback = SelectEpollCallback(*handler, ev.events); callback != nullptr)
                 callback(handler);
         }
+
+        _batch = DequeuedBatch {};
 
         DrainPendingSubmits();
         FireExpiredTimers();
