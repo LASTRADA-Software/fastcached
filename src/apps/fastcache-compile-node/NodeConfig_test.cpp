@@ -1242,7 +1242,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
             // binds loopback on a node that does not schedule. Same silent failure,
             // different cause -- and a row still expecting "wildcard" would have gone
             // on passing while naming a refusal that no longer fires.
-            { .what = "no --advertise at all", .advertise = "", .reason = "binds loopback" },
+            { .what = "no --advertise at all", .advertise = "", .reason = "--listen-node=0.0.0.0:6674" },
             // Spelled out rather than defaulted: the endpoint is judged, never the
             // question of which flag produced it.
             { .what = "the wildcard spelled out", .advertise = "0.0.0.0:6676", .reason = "the wildcard resolves to" },

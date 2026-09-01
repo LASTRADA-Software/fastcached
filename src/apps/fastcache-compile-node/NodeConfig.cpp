@@ -1628,7 +1628,9 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "names an address only this machine can reach: it defaults to the --listen-node surface, which "
                      "binds loopback on a node that does not schedule, so a peer dialling it reaches ITSELF. This "
                      "worker would register, heartbeat, be leased out and never be reached, with no error at either "
-                     "end. Name --advertise with an address peers can dial." },
+                     "end. Name BOTH: --listen-node=0.0.0.0:6674 so this worker accepts from the network, and "
+                     "--advertise=<this host>:6674 so peers are told where to find it. Naming --advertise alone "
+                     "leaves the surface on loopback and the worker still unreachable, and nothing refuses that." },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "
