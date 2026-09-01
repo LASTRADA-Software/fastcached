@@ -54,7 +54,7 @@ flowchart TB
     end
 
     subgraph work["Any worker"]
-        comp["compile port<br/>:6676"]
+        comp["0xFC port<br/>--listen-node :6674"]
     end
 
     shared["fastcached<br/>the shared cache :6674"]
@@ -367,7 +367,7 @@ client's own cache connection.
 |---|---|---|---|---|
 | `fastcache-cc` | a cache — `fastcached` or a node's `--listen-node` | `FASTCACHE_ADDR`, default `127.0.0.1:6674` | once per operation | `FETCH`, `STORE` |
 | `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, conventionally `:6675` | on a cache miss, when dispatch is configured | `LEASE` |
-| `fastcache-cc` | the worker named in the grant | whatever that worker advertises; `--port`, default `6676` | once per dispatched compile, held for its duration | `COMPILE` — also answered on `--listen-node`, by the same worker |
+| `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to its `--listen-node` surface | once per dispatched compile, held for its duration | `COMPILE` |
 | `fastcache-cc` | the leader's scheduler | `:6675` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | `--scheduler`, `:6675` | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
@@ -376,8 +376,9 @@ client's own cache connection.
 | an operator | the leader's scheduler | `:6675` | on demand | `CLUSTER-STATUS`, `-SET`, `-FORGET`, `-ADMIT` |
 | a browser or scraper | a node's `--admin-listen`, or `fastcached`'s `--metrics` (default `:9259`) | as configured | on demand | HTTP: `/fleet`, `/fleet.json`, `/metrics`, `/healthz` |
 
-Two of those numbers are real defaults and one is not. A node's `0xFC` port listens
-on `6674` and a worker's compile port on `6676` unless you say otherwise; **`6675` is
+One of those numbers is a real default and one is not. A node's `0xFC` port listens
+on `6674` unless you say otherwise — and since the surfaces merged that is the only
+port a worker opens for the protocol, compiles included; **`6675` is
 only a convention this documentation follows** — a scheduler does not exist until you
 ask for one with `--serve-scheduler`, and when you do it is answered on
 `--listen-node`, beside the cache and compile verbs, rather than on a port of its own. Neither does a consensus or
@@ -532,9 +533,8 @@ exchange and the key.
 
 ## Who a node admits
 
-**Two** of a node's three surfaces — the scheduler and the compile port — ask
-membership of a caller, and the answer comes from two independent lists. A host on
-**either** is admitted:
+The scheduler verbs and the compile verbs ask membership of a caller, and the answer
+comes from two independent lists. A host on **either** is admitted:
 
 | List | Set by | Answers |
 |---|---|---|
@@ -641,7 +641,6 @@ each, then exits without opening anything:
 ```console
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
-compile           0.0.0.0:6676  TCP
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
@@ -678,7 +677,7 @@ serves.
     | Machine | Inbound | From |
     |---|---|---|
     | The scheduler | `6675/tcp` | every worker, and every client that dispatches |
-    | Each worker | `6676/tcp` | every client that dispatches |
+    | Each worker | its `--listen-node` port, `6674/tcp` by default | every client that dispatches |
     | The shared cache | `6674/tcp` | every node, and every client |
 
     Clients need no inbound rule at all. Workers need none for the scheduler.

@@ -315,12 +315,15 @@ port **9259**; it only listens when `--metrics` is given.
 
 ### Distributed compilation
 
-Two further ports, both **off unless you ask for them**:
+One further port, **off unless you ask for it**:
 
 | Port | What | Default |
 |------|------|---------|
 | **6675** | The fleet scheduler | off; enable with `fastcache-compile-node --serve-scheduler`, which answers on that node's `--listen-node` rather than on a port of its own. Not served by `fastcached` |
-| **6676** | A compile worker's own port | the worker's `--port` |
+
+A worker needs no port of its own. Dispatched compiles arrive on the **same
+`--listen-node` surface** that carries the node's cache verbs, so a worker opens one
+`0xFC` port in total.
 
 A compile node also serves a **cache tier of its own**, on the same `--listen-node`
 port, which defaults to `6674` on loopback — the same address as the daemon's,
@@ -336,15 +339,17 @@ For who dials whom on each of these — and what a machine needs to accept rathe
 than merely bind — see
 [Cluster communication](../operations/cluster-communication.md#what-to-open-on-a-firewall).
 
-The dispatch endpoint is separate from the cache **on purpose**. The cache may
-reasonably be reachable across a build LAN; the surface that causes a compiler to
-*run* on another machine should be something you switch on and firewall
-deliberately. A dispatch request arriving on a cache-only listener is refused
-with a typed error rather than served.
+**One port does not mean one policy.** Cache and compile share the listener and are
+still governed separately: the cache verbs answer this machine alone whatever the
+socket is bound to, while a dispatched compile additionally needs a lease the
+scheduler signed for this worker's advertised endpoint. Which caller is admitted to
+which verb is a property of the verb, never of the port it arrived on — so widening
+`--listen-node` to reach workers does not widen who may read the node's cache.
 
-6676 is not an IANA request and is not a client-side default: the scheduler hands
-a client the worker's endpoint explicitly, so it is only ever what an operator
-configured.
+The endpoint a worker advertises is not an IANA request and is not a client-side
+default: the scheduler hands a client that endpoint explicitly, so it is only ever
+what an operator configured — and it must be an address other machines can dial,
+which the node refuses at startup if it is not.
 
 See [Distributed compilation](distributed-compilation.md).
 

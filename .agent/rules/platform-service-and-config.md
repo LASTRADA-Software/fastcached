@@ -255,6 +255,28 @@ readable and silently ignored. Every rule below has already been one of them.
   did exactly that and had to be rewritten to pair each input with text only the
   answering rule produces. **Assert the message, not merely the refusal.**
 
+  **And "was it refused" is satisfied by ANY row, so it is not evidence that the row
+  you mean still exists.** That is what makes the rule above sharper than it looks:
+  the presence check and the message check fail in different circumstances, and the
+  presence check is the one that cannot fail. Measured while adding a second
+  `StartupPolicyRejection` row for an advertised endpoint no remote client can reach
+  ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)): with the new
+  row disabled, `REQUIRE(refusal.has_value())` **still passed**, because an unrelated
+  row fires for the same configuration, and only the per-row phrase went red. A test
+  written the obvious way would have gone on passing while the rule it was named after
+  had ceased to exist -- and it would have done so from the day it was written, not
+  after some later edit. So a table's test pairs every input with text **only the
+  answering row produces**, and asserting the refusal alone is worth nothing here.
+
+  **Which is also why two conditions never share one message.** A widened predicate
+  covering both passes every row of such a table individually -- each input is still
+  refused, each still matches the shared phrase -- so nothing catches the merge. The
+  operator pays for it twice over: two different mistakes with two different remedies
+  arrive as one sentence describing neither, and the person who typed nothing at all
+  reads about a value they never wrote. Two rows, and a case asserting the two
+  messages **differ**, or the split is only a comment. `--advertise` naming the
+  wildcard and `--advertise` defaulting to loopback are that pair.
+
   What stayed out needs stating carefully, because the easy reason is the wrong one.
   `--bind`, `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are
   addresses on the same command line, and it is tempting to say they are excluded

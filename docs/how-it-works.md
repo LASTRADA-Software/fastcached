@@ -446,7 +446,7 @@ outcome is called the **leader**.
 6. **Prints one ready line**:
 
    ```
-   compile node ready on 0.0.0.0:6676, advertising worker-01.internal:6676,
+   compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674,
    14 slot(s) as a workstation node, 2 toolchain(s)
    ```
 
