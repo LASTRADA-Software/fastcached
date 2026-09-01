@@ -787,16 +787,18 @@ struct MergedWorker
     /// wins that race is a timing question and nothing about it is compiler-specific.
     ~MergedWorker()
     {
-        // **Released BEFORE the drain, so this path can never destroy evidence.**
+        // **Released BEFORE the drain, so `Abandon` is unreachable from a test.**
         //
-        // Without it the net is a shredder. A case whose `DrainedWithin` assertion fires
-        // unwinds into here; the job still is not draining -- that is WHY it fired --
-        // so `Drain` reaches `Abandon` and calls `std::_Exit`, which flushes nothing.
-        // ctest captures stdout through a pipe, so it is block-buffered, and the red
-        // assertion written to make the failure legible would still be sitting in that
-        // buffer when the process died. The diagnostic would be swallowed by exactly the
-        // thing it was added to diagnose, and the next person would see two banner lines
-        // again.
+        // A case whose `DrainedWithin` assertion fires unwinds into here with the job
+        // still not draining -- that is WHY it fired -- so without this, `Drain` reaches
+        // `Abandon` and calls `std::_Exit`.
+        //
+        // What that costs was measured, and it is narrower than it sounds. **The failed
+        // assertion's own text is written either way**; what `_Exit` takes is the Catch2
+        // SUMMARY and the exit code -- 75 with no `test cases: 1 | 1 failed` line,
+        // against 1 with one. So a reader loses the line naming which case failed, and
+        // CI reports something that reads as a crashed binary rather than as a failed
+        // test. That is worth this call; it is not the assertion being swallowed.
         //
         // Releasing first means the job always completes, the drain always finishes, and
         // `Abandon` is unreachable from a test -- which is what makes the sentence above
