@@ -658,8 +658,10 @@ Four things about the shape, and the last two are the ones that generalise.
   the assertion #235 needed and did not have. The admitted leg alone passes over
   loopback too, since loopback is admitted above the list, so it cannot show the
   address ever reached the list; the refusing leg is what shows it, because a loopback
-  peer would have been admitted there as well. Both legs were confirmed red with the
-  address forced back to `127.0.0.1`.
+  peer would have been admitted there as well. Measured, with the address forced back
+  to `127.0.0.1`: the admitting leg stays **green** and the refusing leg goes red. That
+  asymmetry is the finding — one of the two legs cannot tell the difference, which is
+  why a suite made of legs like it reported nothing for twelve cases.
 - **The scheduler admits the client in both legs.** #235's shape is a lease that is
   granted and then a worker that refuses it, which is invisible from the side anybody
   watches — no scheduler counter moves. A refusal arriving from the scheduler instead
