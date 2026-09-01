@@ -273,6 +273,23 @@ determinism rests on.
     dimensions move it: distinct LOCATIONS matter most (1024 touched once each is
     reliable where one touched 1024 times is not), repetition helps but needs orders
     of magnitude more, so the canary uses both with margin in each.
+  - **And a figure is a quantity with an UNCERTAINTY.** This is the sibling of *a
+    performance figure is a quantity under conditions*
+    ([`compile-cache.md`](compile-cache.md)), and it was missing from it: a count
+    with no interval attached reads like a measurement and is a hope.
+    **Zero is where this is easiest to forget, because zero reads as the absence of
+    doubt rather than as a value with an interval around it.** Zero silent runs in
+    5000 is not a rate of zero -- the rule of three bounds it at ~0.06% at 95%, so a
+    300-run zero-tolerance gate built on that figure expects 0.18 events and would
+    fire about **one run in six**: red one time in six to prevent a canary that was
+    silent one time in five hundred, which is #473's own failure mode one layer up
+    and harder to argue with for looking principled. The converse omission is how
+    two honest measurements nearly became one number -- 4/100 silent on one machine
+    is P = 7.8e-5 against another's 0.220%, and 5.5e-3 against that machine's harder
+    0.700%, so the samples disagree about the MACHINES rather than about the rate
+    and both rows stand. Attach the interval, and say what it is an interval on --
+    "P is small" without naming the hypothesis it is small under is the same
+    omission wearing a number.
   - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
     on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
     pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
