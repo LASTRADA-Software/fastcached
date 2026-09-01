@@ -128,9 +128,7 @@ int main()
     auto total = 0;
     for (auto i = 0; i < Cells; ++i)
         total += shared[i];
-    std::printf("tsan-canary: %d increments observed (expected %d if no race)\n",
-                total,
-                2 * Cells * Repeats);
+    std::printf("tsan-canary: %d increments observed (expected %d if no race)\n", total, 2 * Cells * Repeats);
 
     // Exit 0 ALWAYS. Whether this program failed is ThreadSanitizer's verdict to
     // deliver, through its own exit code, not this program's opinion of its own
