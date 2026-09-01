@@ -316,6 +316,23 @@ set_tests_properties("worker-refusals-counted" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Every `*Explicit` bit a CLI flag sets must be consulted by the config merge.
+# A flag with no `MergeField` row parses, validates and appears in --help, and is
+# then silently discarded the moment the operator also has a config file. That has
+# happened four times and each was found by a human reading a diff (#130).
+add_test(
+    NAME "config-merge-covers-flags"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-config-merge-covers-flags.cmake"
+)
+set_tests_properties("config-merge-covers-flags" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The compile worker's shipped reference configuration against its option table.
 # Fails when a setting the file can carry has no commented block for an operator
 # to find, or when the file documents a key the table no longer has -- which is
