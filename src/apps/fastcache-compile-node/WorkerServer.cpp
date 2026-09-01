@@ -332,7 +332,7 @@ Task<void> WorkerServer::Serve(std::unique_ptr<ISocket> socket)
                 // ceiling would accept, and allocate, precisely the frames skipped
                 // here -- unbudgeted, which is this whole defect again. One number,
                 // one place, and the skip below stays sound.
-                if (footprint <= _capacity.ByteBudget() && !reserved->TryRaiseTo(footprint))
+                if (_capacity.IsChargeable(footprint) && !reserved->TryRaiseTo(footprint))
                 {
                     // A REPLY, not a close, and the same code the frame-length
                     // refusal uses: the frame declared its own length and has been

@@ -149,6 +149,33 @@ class CompileCapacity
         return _byteBudget;
     }
 
+    /// Whether @p footprint is a price this budget may be asked to pay at all.
+    ///
+    /// **A predicate rather than a comparison, because its inversion has a name.** A
+    /// request costing more than the WHOLE budget can never be afforded, however idle
+    /// this worker is -- so charging it would answer `EndpointBusy`, which means "come
+    /// back shortly", to a frame that will never fit. The client then retries forever
+    /// against a ceiling it cannot see. Left uncharged, it reaches the decoder, which
+    /// refuses it by name as `payload-too-large` and without allocating a byte.
+    ///
+    /// The hand-off is sound only while the decoder's ceiling is no larger than this
+    /// budget, which is why `WorkerMaxRequestBytes` is one exported constant rather
+    /// than a literal per side.
+    ///
+    /// Both doors into this worker ask it -- the accept loop and the merged surface's
+    /// responder -- and that is the whole reason it is here rather than spelled at each.
+    /// What they do with the answer still differs, and legitimately: the accept loop
+    /// reserves the frame length first and RAISES to the footprint, because it has not
+    /// read the payload yet; the responder is handed a complete frame and charges once.
+    /// Those are different computations over one rule, so the rule moves and the
+    /// arithmetic does not.
+    /// @param footprint What the request declares it will cost.
+    /// @return False when no state of this budget could ever afford it.
+    [[nodiscard]] bool IsChargeable(std::size_t footprint) const noexcept
+    {
+        return footprint <= _byteBudget;
+    }
+
     /// Wait for the running compiles to finish, reporting and then abandoning.
     ///
     /// Bounded, and it ENDS rather than returning to a caller that would free

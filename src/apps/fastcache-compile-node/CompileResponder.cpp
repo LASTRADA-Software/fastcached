@@ -153,7 +153,7 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
     // owed exactly once and an assignment would be a second object's claim landing on
     // the first one's storage.
     auto const footprint = Cc::DeclaredRequestFootprint(frame);
-    auto const chargeable = footprint <= _capacity.ByteBudget();
+    auto const chargeable = _capacity.IsChargeable(footprint);
     auto const reserved =
         chargeable ? _capacity.TryTakeBytes(footprint) : std::optional<CompileCapacity::Bytes> { std::nullopt };
     if (chargeable && !reserved.has_value())

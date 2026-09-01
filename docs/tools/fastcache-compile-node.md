@@ -718,9 +718,19 @@ given is refused for at most that long and then works.
 
 The compile column reads the same on both of its ports, and that is deliberate: the
 node port answers `COMPILE` through the *same* membership check the dedicated port
-applies, so the second door admits nobody the first would refuse. A caller with no
-claim on this machine is refused before a byte of its preprocessed source is read,
-on either port.
+applies. A caller with no claim on this machine is refused before a byte of its
+preprocessed source is read, on either port.
+
+**The two ports are not otherwise interchangeable, and one difference is a startup
+rule rather than a runtime one.** Whether this node verifies the lease a client
+presents is decided once, at startup, from whether a machine that is not this one
+could reach the compile verbs *at all* — and that question now has two answers to
+combine, because `--listen-node` binds the wildcard on any node running
+`--serve-scheduler`. A node that reaches either port from the network needs
+`--cluster-key-file`, and is refused at startup without it. Before the surfaces
+merged this was judged from `--bind` alone, which would have let
+`--bind 127.0.0.1 --serve-scheduler --fleet-open` serve unauthenticated compiles on
+a port facing the network.
 
 Refusals are counted, because this withdrew access somebody may have been relying
 on:
