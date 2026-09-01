@@ -874,6 +874,18 @@ and what they may assume.
   block that obeys it in `fastcache-cc/CMakeLists.txt` while two blocks one directory away did not, which is a
   rule that needs a check rather than a better comment: `ctest -R target-file-guards`, in the default set,
   reading the optional targets from `src/apps/CMakeLists.txt` rather than restating them.
+- A fixture whose client is always LOCAL cannot test who is admitted. `Classify` returns
+  `Member` for the whole of `127.0.0.0/8` before it reads the member list, so twelve
+  loopback end-to-end cases passed a worker that admitted only its own machine and refused
+  every dispatched compile (#235). A second loopback address does not reach that list —
+  the check is `127.`, not `127.0.0.1` — and changing to one looks exactly like a fix. The
+  host's OWN non-loopback address does, with no second machine. Assert BOTH directions:
+  listed and dispatched, unlisted and refused with the refusal COUNTER moving, the
+  scheduler admitting the client in both so the refusal is the worker's. The fixture's own
+  liveness probe is a caller too, so the refusing leg's baseline is one rather than zero
+  and the compile is a delta from it. A host with no such address reports SKIPPED, loudly
+  and as its own ctest test — a quiet fall back to loopback is a pass for a case that
+  never ran, which is the defect itself.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
 - Tests allocate their ports per run rather than fixing them — from **below** the

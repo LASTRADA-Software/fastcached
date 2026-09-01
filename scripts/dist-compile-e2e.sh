@@ -514,6 +514,15 @@ worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || ec
 # fleet looks healthy from the only side anybody watches; a refusal coming from the
 # scheduler instead would be a different test passing under the same name.
 #
+# ## What binding on that address does and does not expose
+#
+# Both workers are started with the cluster key, so every grant is signed and
+# checked. Leg 1's worker admits exactly one host -- the address the machine
+# already answers on -- and leg 2's admits none but its own loopback, so for the
+# few seconds these ports are open the set of callers either would serve is
+# {this machine}. A peer address is the kernel's, not a claim in a frame, so
+# nothing on the network can present that address without being this machine.
+#
 # ## Why this is a mode and not a thirteenth case
 #
 # It is the only assertion here with a prerequisite the machine may not have, and a
@@ -627,6 +636,12 @@ if [[ "$mode" == "membership" ]]; then
     # asserts that agreement, once, and this mode is not about it -- and it skips an
     # include-tree walk per worker, which is the expensive part of starting one.
     #
+    # That also takes away the one stall these waits could not diagnose. A walk logs
+    # nothing while it runs, so a slow one and a wedge produce identical logs and
+    # need the CPU classifier `node-scratch-isolation-e2e` carries; with the
+    # fingerprint pinned there is no walk here, and a worker that has not logged
+    # `compile node ready` within the bound has not started.
+    #
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch port to register with
     # @param 3 compile port
@@ -717,12 +732,21 @@ if [[ "$mode" == "membership" ]]; then
     grep -q "this machine only" "${workdir}/mem-refuse-worker.log" \
         || { cat "${workdir}/mem-refuse-worker.log" >&2; fail "the refusing worker did not report a loopback-only policy"; }
 
+    # The reading BEFORE the compile, and it is not expected to be zero.
+    #
+    # `wait_for_port` dials the compile port from this same non-loopback address to
+    # decide the worker is up, and that probe is a caller like any other: leg 1
+    # admits it (which is why the assertion there is a flat zero) and this leg
+    # refuses it. So the branch under test is already observable here, and what the
+    # compile has to add is a FURTHER refusal -- measured as a delta from this
+    # reading rather than against zero, which is why the reading is taken after
+    # every process is up and before the compile runs.
     refuse_before="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
     [[ -n "$refuse_before" ]] \
         || fail "the refusing worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
-    [[ "$refuse_before" == "0" ]] \
-        || fail "the refusing worker had already refused ${refuse_before} caller(s) before this leg ran"
+    [[ "$refuse_before" -ge 1 ]] \
+        || fail "the refusing worker did not refuse this fixture's own liveness probe from ${lan_address}, so that probe reached it as a loopback caller and this leg would prove nothing"
 
     write_source "${proj}/refused.cpp" "memberrefused"
     "$compiler" -std=c++17 -O1 -c "${proj}/refused.cpp" -o "${proj}/build/refused-ref.o" \
@@ -733,13 +757,20 @@ if [[ "$mode" == "membership" ]]; then
         || { cat "${workdir}/mem-refused.log" >&2; fail "a build refused by a worker did not survive"; }
 
     # The client's half: a typed refusal naming the reason, and a local compile.
-    grep -q "not dispatched (rejected (not-a-member)" "${workdir}/mem-refused.log" \
+    # `refused the job:` is part of the match rather than `rejected (not-a-member)`
+    # alone, because that phrase is what says the refusal came from the WORKER the
+    # lease named -- a scheduler declining the lease would be a different failure
+    # reported in a different sentence, and this leg would then be asserting the
+    # gate it deliberately arranged NOT to test.
+    grep -q "refused the job: rejected (not-a-member)" "${workdir}/mem-refused.log" \
         || {
             cat "${workdir}/mem-refused.log" >&2
             echo "--- worker log ---" >&2
             cat "${workdir}/mem-refuse-worker.log" >&2
-            fail "a compile from an unlisted address was not refused as not-a-member"
+            fail "a compile from an unlisted address was not refused as not-a-member by the worker"
         }
+    grep -q "; compiling locally" "${workdir}/mem-refused.log" \
+        || { cat "${workdir}/mem-refused.log" >&2; fail "a refused compile did not fall back to a local one"; }
     cmp -s "${proj}/build/refused-ref.o" "${proj}/build/refused.o" \
         || fail "the object built after a membership refusal is wrong"
 
@@ -749,10 +780,10 @@ if [[ "$mode" == "membership" ]]; then
     # would have named it.
     refuse_after="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
-    [[ -n "$refuse_after" && "$refuse_after" -ge 1 ]] \
+    [[ -n "$refuse_after" && "$refuse_after" -gt "$refuse_before" ]] \
         || {
             cat "${workdir}/mem-refuse-worker.log" >&2
-            fail "the worker refused a caller and fastcache_worker_jobs_refused_not_a_member_total did not move"
+            fail "the worker refused the compile and fastcache_worker_jobs_refused_not_a_member_total did not move past ${refuse_before}"
         }
     refuse_completed="$(worker_counter "$refuse_admin_port" fastcache_worker_jobs_completed_total)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
