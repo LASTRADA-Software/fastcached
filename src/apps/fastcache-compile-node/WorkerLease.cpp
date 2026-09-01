@@ -42,8 +42,9 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
         // an operator who did not intend it has exactly one chance to find out.
         logger.Logf(LogLevel::Warn,
                     "compiling WITHOUT verifying lease signatures: no --cluster-key-file is configured, so a "
-                    "grant cannot be checked. Nothing off this machine can dial the compile port -- the startup "
-                    "rules refuse every configuration where something could -- but no lease is being enforced");
+                    "grant cannot be checked. The startup rules refuse every configuration in which a machine "
+                    "that is not this one could reach the compile verbs -- on --bind and on --listen-node, "
+                    "which answers them too -- but no lease is being enforced");
         return Cc::UncheckedLeaseValidator();
     }
 

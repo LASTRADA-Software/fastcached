@@ -11,6 +11,7 @@
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -161,8 +162,32 @@ class CompileResponder final: public IFrameResponder
     /// merged port with oversized COMPILE declarations moves the same counter it moves
     /// on the dedicated one. An operator reads the two side by side and must not have to
     /// know which door a refusal came through to find it.
+    ///
+    /// Every arm goes through `Cc::Refuse`, including the two this surface cannot
+    /// produce: `ctest -R worker-refusals-counted` covers this file now, and it covers
+    /// it by there being no `EncodeErrorReply` here to leave a refusal uncounted.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t opRaw) const override;
+
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// **However long a compiler runs, which is the whole of #223 arriving on the
+    /// server side.** The endpoint's own window is five seconds -- right for a cache
+    /// round trip, and a guarantee that every translation unit worth distributing is
+    /// compiled and then thrown away, because `ServeConnection` is not parked on the
+    /// socket while this answers: the sweep closes it silently, the compile finishes,
+    /// hops home, and its write fails. Short TUs would keep succeeding, so a smoke
+    /// test passes.
+    ///
+    /// `Wire::DefaultCompileLeaseTimeout` rather than a number of this surface's own,
+    /// and it is the same argument #249 made for the two ends of the client's side:
+    /// past it the scheduler has reclaimed the lease and may have re-granted the key,
+    /// so an object produced after it is one nobody can use. Serving longer than the
+    /// grant lives is doing work the fleet has already given away.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return CompileCacheWire::DefaultCompileLeaseTimeout;
+    }
 
     /// @copydoc IFrameResponder::MaxRequestBytes
     ///

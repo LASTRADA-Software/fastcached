@@ -549,6 +549,23 @@ class HoldableResponder final: public IFrameResponder
         return 64ULL * 1024ULL;
     }
 
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _requestTimeout;
+    }
+
+    /// How long this fake claims its answers may take.
+    ///
+    /// Settable because the endpoint now asks, and because a surface whose answer
+    /// outlives the endpoint's header window is exactly what the deadline cases are
+    /// about: a compile takes minutes, and five seconds used to close the socket
+    /// underneath it without waking anything.
+    /// @param window The window to report.
+    void PlaceRequestTimeout(std::chrono::milliseconds window) noexcept
+    {
+        _requestTimeout = window;
+    }
+
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return _concurrent;
@@ -673,6 +690,7 @@ class HoldableResponder final: public IFrameResponder
     mutable std::atomic<int> _refusedOp { -1 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
+    std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     std::size_t _concurrent { 8 };
     std::size_t _budget { 0 };
 };
@@ -725,12 +743,12 @@ TEST_CASE("A peer the surface refuses never gets its payload read", "[node][fram
     auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
 
     // Says WHICH failure it is when it fails. A refusal decided from the header
-    // requires no work at all, so a run that takes anything near `RequestTimeout`
+    // requires no work at all, so a run that takes anything near the deadline
     // was blocked reading a payload -- whereas a slow machine still answers, just
     // later. Reporting the number is what lets a reader tell those apart instead of
     // guessing at a bare "no reply".
-    INFO("waited " << waited.count() << "ms for a refusal that costs no work; RequestTimeout is "
-                   << FrameServer::RequestTimeout.count() << "ms. An empty reply at roughly that figure is the "
+    INFO("waited " << waited.count() << "ms for a refusal that costs no work; this surface's deadline is "
+                   << FrameServer::HeaderTimeout.count() << "ms. An empty reply at roughly that figure is the "
                    << "server blocked in ReadExactly for a payload it should never have asked for; an empty reply "
                    << "well under it is something else, and a late but PRESENT reply is only a slow machine.");
     REQUIRE_FALSE(reply.empty());
@@ -779,8 +797,8 @@ TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][
     auto const reply = Exchange(port, frame);
     auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
 
-    INFO("waited " << waited.count() << "ms for a refusal that costs no work; RequestTimeout is "
-                   << FrameServer::RequestTimeout.count() << "ms. An EMPTY reply near that figure is the server "
+    INFO("waited " << waited.count() << "ms for a refusal that costs no work; this surface's deadline is "
+                   << FrameServer::HeaderTimeout.count() << "ms. An EMPTY reply near that figure is the server "
                    << "blocked in ReadExactly for a payload it should never have asked for; an empty reply well "
                    << "under it is something else, and a late but PRESENT reply is only a slow machine.");
     REQUIRE_FALSE(reply.empty());

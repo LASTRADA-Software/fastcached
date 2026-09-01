@@ -1372,6 +1372,23 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 
     SyncRun(server.Run());
 
+    // **Both doors closed and every compile drained HERE, while the node's reactor is
+    // still turning.** Not tidiness and not a duplicate of the destructor: a compile
+    // admitted through the merged `0xFC` surface finishes on `compilePool` and then
+    // hops back onto `nodeIo`'s reactor to hand back its reply. That reactor stops when
+    // the last ADOPTED loop ends, and a connection task parked off-reactor is not one
+    // of them -- so tearing the surface down first can stop the reactor with a compile
+    // still out, losing the hop home, the slot and the byte reservation, and leaving
+    // this worker to wait out its whole drain timeout and `_Exit` reporting compiles
+    // still running that had already finished.
+    //
+    // Destruction order cannot express this: the surface points at the responder and
+    // the responder at this worker's capacity, so those three must be destroyed
+    // surface-first, which is the opposite of what the drain needs. Separating the stop
+    // from the destruction is what lets both be right, and it is why `StopAndWait`
+    // exists as something callable rather than only as a destructor body.
+    server.StopAndWait();
+
     // Unwired BEFORE the sampler goes, and that ordering is the whole reason this
     // line exists: locals are destroyed in reverse declaration order, so the
     // scheduler tier -- declared before the sampler because the sampler reads its

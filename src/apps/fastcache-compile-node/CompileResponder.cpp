@@ -48,6 +48,42 @@ namespace
       private:
         CompileCapacity* _capacity;
     };
+
+    /// Which counter each pre-payload refusal moves on this surface.
+    ///
+    /// A `switch` rather than an `EnumTable`, and the reason is the enum rather than a
+    /// preference: `PrePayloadDecision` states no `Last`. It is a wire enum that both
+    /// binaries compile in, `ErrorCodeFor` answers it with a switch for the same
+    /// reason, and adding a count to a shared header to satisfy a local idiom would be
+    /// a wire change bought for nothing. The compiler still enumerates it -- no
+    /// `default`, so a fifth outcome is a build failure here exactly as it is there.
+    ///
+    /// Two of the four cannot happen. `UnknownOpcode` is refused by the router before
+    /// a verb reaches this responder, and `Unauthenticated` needs `AuthRequired` to
+    /// have said yes, which this surface never does. They get counters anyway, because
+    /// a refusal answered while nothing rises is indistinguishable on `/metrics` from
+    /// a port nobody is talking to -- and if either ever fires, what changed is who may
+    /// compile here.
+    ///
+    /// `Serve` is not a refusal and the interface says so, but a total function has to
+    /// answer it. It follows `ErrorCodeFor`'s own choice rather than inventing a
+    /// second one.
+    /// @param decision What `DecidePrePayload` returned.
+    /// @return The row pairing the wire code with its counter.
+    [[nodiscard]] constexpr Cc::SurfaceRefusal RefusalFor(Wire::PrePayloadDecision decision) noexcept
+    {
+        switch (decision)
+        {
+            case Wire::PrePayloadDecision::PayloadTooLarge:
+                return CompileRefusal::PayloadTooLarge;
+            case Wire::PrePayloadDecision::UnknownOpcode:
+                return CompileRefusal::UnknownOpcode;
+            case Wire::PrePayloadDecision::Unauthenticated:
+            case Wire::PrePayloadDecision::Serve:
+                break;
+        }
+        return CompileRefusal::Unauthenticated;
+    }
 } // namespace
 
 std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_view peer, std::uint8_t /*opRaw*/) const
@@ -61,18 +97,9 @@ std::optional<std::vector<std::byte>> CompileResponder::RefusePeer(std::string_v
 
 std::vector<std::byte> CompileResponder::RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t /*opRaw*/) const
 {
-    // Only the oversize arm carries a counter on this surface. The other two cannot be
-    // reached: `UnknownOpcode` is answered by the router before a verb gets here, and
-    // `Unauthenticated` needs `AuthRequired` to have said yes, which this surface never
-    // does. They are still answered, because `DecidePrePayload` is total over every
-    // byte value and a surface that could not encode one of its outcomes would be a
-    // hole rather than a simplification.
-    if (decision == Wire::PrePayloadDecision::PayloadTooLarge)
-        return Cc::Refuse(_metrics, CompileRefusal::PayloadTooLarge);
-
     // No detail. What a message could add is which verb the caller failed to reach, and
     // a caller that got this far learns nothing useful from being told.
-    return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), {});
+    return Cc::Refuse(_metrics, RefusalFor(decision));
 }
 
 Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)
@@ -96,7 +123,7 @@ Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const>
     // after `~WorkerServer` began waiting would be a job the drain has already stopped
     // counting on, started against members it is about to free.
     if (_capacity.IsShuttingDown())
-        co_return Cc::Refuse(_metrics, CompileRefusal::NoCapacity, "this worker is stopping");
+        co_return Cc::Refuse(_metrics, CompileRefusal::Stopping, "this worker is stopping");
 
     // The cap is enforced here as well as advertised, and a job over it is REFUSED
     // rather than queued: refusing costs the client one local compile, while queueing

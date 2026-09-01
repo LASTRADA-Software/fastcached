@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
+#include "FrameEndpoint.hpp"
+#include "NodeConfig.hpp"
+#include "NodeIoLoop.hpp"
+#include "NodeSurfaces.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Async/ResumeOn.hpp>
@@ -9,15 +13,23 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingConnector.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -363,10 +375,19 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
     constexpr std::string_view Compressed = "a few dozen bytes, and no more";
     constexpr std::uint32_t Declared = 8ULL * 1024ULL * 1024ULL;
 
+    // A FRACTION of the budget is held, not all of it, and the difference is whether
+    // this case tests anything. Holding the whole budget makes every non-zero charge
+    // fail, so a responder charging the hundred-byte FRAME LENGTH -- which is the bug
+    // -- would be refused too and the case would pass while proving nothing. With
+    // 1 MiB of 8 held, the frame length fits comfortably and only the declared
+    // 8 MiB expansion does not, so the two charges give opposite answers.
+    constexpr std::size_t Budget = 8ULL * 1024ULL * 1024ULL;
+    constexpr std::size_t Held = 1ULL * 1024ULL * 1024ULL;
+
     Fixture fix;
     ThreadPoolExecutor reactor { 1 };
     ThreadPoolExecutor jobs { 1 };
-    CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/Declared, std::chrono::seconds { 5 }, fix.logger };
+    CompileCapacity capacity { /*slots=*/2, Budget, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder responder { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
 
     auto const enveloped = Wire::EncodeCodecEnvelope(NoSuchCodec, Declared, Wire::AsBytes(Compressed));
@@ -377,13 +398,14 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
                                                                   .acceptedCodecs = { Wire::IdentityCodec },
                                                                   .sourceName = "a.cpp" });
 
-    // One of these fits the budget exactly and the second cannot, so the second is told
-    // to come back rather than being told the fleet is full: an operator sent to buy
-    // machines over a transient byte budget is being sent to fix something that was
-    // never wrong. The first is held by taking its reservation directly, which is what
-    // a compile in flight looks like to the budget.
-    auto const held = capacity.TryTakeBytes(Declared);
+    // A compile already in flight, spelled as the reservation one would be holding.
+    auto const held = capacity.TryTakeBytes(Held);
     REQUIRE(held.has_value());
+
+    // The two charges disagree, which is what makes the assertion below meaningful:
+    // the frame is small enough to fit in what is left, and what it DECLARES is not.
+    REQUIRE(frame.size() < Budget - Held);
+    REQUIRE(Cc::DeclaredRequestFootprint(frame) > Budget - Held);
 
     auto const answered = AnswerFrom(responder, reactor, frame);
     CHECK(ErrorOf(answered.reply) == Wire::ErrorCode::EndpointBusy);
@@ -448,4 +470,415 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
     // And the ceilings fold over the compile responder as over any other owner.
     CHECK(merged.MaxRequestBytes() == WorkerMaxRequestBytes);
     CHECK(merged.MaxInFlightBytes() == capacity.ByteBudget());
+}
+
+// ---------------------------------------------------------------------------
+// Against the REAL endpoint.
+//
+// Everything above substitutes two `ThreadPoolExecutor`s for a reactor, which is what
+// makes the thread assertions expressible -- and that substitution cannot see two
+// defects that live in `FrameEndpoint` itself: its request deadline, which closes a
+// socket out from under an answer, and its stop rule, which can stop the reactor while
+// an answer is still out on the pool. Both were found in review after the in-process
+// cases were green, so the cases below exist precisely because those are not enough.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A runner that blocks until released, so a case can look at a compile mid-flight.
+///
+/// Bounded, because an unbounded wait turns a regression into a suite that HANGS
+/// rather than one that fails -- and a hang reports a defect as a timeout naming
+/// nothing.
+class HoldingRunner final: public Cc::IProcessRunner
+{
+  public:
+    Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureSplit(argv);
+    }
+
+    Cc::CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        {
+            auto const guard = std::scoped_lock { _mutex };
+            ++_started;
+        }
+        _changed.notify_all();
+        {
+            auto guard = std::unique_lock { _mutex };
+            (void) _changed.wait_for(guard, std::chrono::seconds { 10 }, [this] { return _released; });
+        }
+        Cc::Test::WriteStubObject(argv);
+        return Cc::CompileRun { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// @param many How many compiles to wait for.
+    /// @return Whether that many started before the bound elapsed.
+    [[nodiscard]] bool WaitForStarted(std::size_t many)
+    {
+        auto guard = std::unique_lock { _mutex };
+        return _changed.wait_for(guard, std::chrono::seconds { 10 }, [this, many] { return _started >= many; });
+    }
+
+    void Release()
+    {
+        {
+            auto const guard = std::scoped_lock { _mutex };
+            _released = true;
+        }
+        _changed.notify_all();
+    }
+
+  private:
+    std::mutex _mutex;
+    std::condition_variable _changed;
+    std::size_t _started { 0 };
+    bool _released { false };
+};
+
+/// Another responder's answers, behind a deadline this one chooses.
+///
+/// A decorator rather than a second fake, so what the endpoint drives is the REAL
+/// `CompileResponder` -- its admission, its hops, its accounting -- with only the
+/// number under test replaced. A hand-written stand-in would prove the endpoint
+/// honours some responder's window and say nothing about this one's.
+class ShortWindowResponder final: public IFrameResponder
+{
+  public:
+    /// @param inner What actually answers; must outlive this.
+    /// @param window The deadline to report instead of the inner one's.
+    ShortWindowResponder(IFrameResponder& inner, std::chrono::milliseconds window) noexcept:
+        _inner { inner },
+        _window { window }
+    {
+    }
+
+    [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
+    {
+        co_return co_await _inner.Answer(frame, std::move(peer));
+    }
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer, std::uint8_t opRaw) const override
+    {
+        return _inner.RefusePeer(peer, opRaw);
+    }
+    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
+    {
+        return _inner.AuthRequired(opRaw);
+    }
+    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    {
+        return _inner.CheckCredential(payload);
+    }
+    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision, std::uint8_t opRaw) const override
+    {
+        return _inner.RefusalReply(decision, opRaw);
+    }
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _window;
+    }
+    [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
+    {
+        return _inner.MaxRequestBytes();
+    }
+    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
+    {
+        return _inner.MaxOpenConnections();
+    }
+    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
+    {
+        return _inner.MaxInFlightBytes();
+    }
+
+  private:
+    IFrameResponder& _inner;
+    std::chrono::milliseconds _window;
+};
+
+/// A listener that never yields a connection.
+///
+/// These cases drive the MERGED surface. The worker is present because it owns the
+/// capacity and the stop, not because its own accept loop is under test, and `Run()`
+/// is never called on it.
+class IdleListener final: public IListener
+{
+  public:
+    AcceptAwaitable Accept() override
+    {
+        return AcceptAwaitable { AcceptResult { std::unexpect,
+                                                NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+    }
+    void Close() noexcept override {}
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+};
+
+/// A free loopback port, taken and released.
+///
+/// Per run rather than fixed: `catch_discover_tests` gives every case its own process
+/// and the suite runs in parallel, so a chosen number is a failure that appears only
+/// under `ctest -j`.
+/// @return The port.
+[[nodiscard]] std::uint16_t FreePort()
+{
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    // Asked of the SOCKET: `Bind` returns a listener in an errored state rather than
+    // nothing, so a null check passes on a bind that failed and the port comes back 0.
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+    return port;
+}
+
+/// Send one frame to a loopback port and read exactly one framed reply.
+///
+/// Reads what the protocol declares rather than to EOF: this endpoint keeps the
+/// connection, so reading to EOF would wait for the sweeper -- and on a surface whose
+/// deadline is now ten minutes, that is a suite that never finishes.
+/// @param port Where the endpoint listens.
+/// @param frame The request.
+/// @return The reply, or empty when the peer closed without answering.
+[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::vector<std::byte> frame)
+{
+    BlockingConnector connector;
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, std::chrono::seconds { 5 }));
+    REQUIRE(socket.has_value());
+
+    auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
+        auto const written = co_await peer->Write(std::span<std::byte const> { request });
+        if (!written.has_value())
+            co_return std::vector<std::byte> {};
+
+        std::vector<std::byte> received;
+        auto want = Wire::ReplyHeaderSize;
+        while (received.size() < want)
+        {
+            std::array<std::byte, 4096> chunk {};
+            auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+            if (!read.has_value() || *read == 0)
+                co_return std::vector<std::byte> {};
+            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+
+            if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
+                if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
+                    want = Wire::ReplyHeaderSize + header->payloadLength;
+        }
+        co_return received;
+    }((*socket).get(), std::move(frame)));
+
+    (*socket)->Close();
+    return reply;
+}
+
+/// A config naming @p port for the node surface.
+/// @param port The loopback port to bind.
+/// @return The config.
+[[nodiscard]] NodeConfig ConfigForPort(std::uint16_t port)
+{
+    NodeConfig cfg;
+    cfg.nodeListen = std::format("127.0.0.1:{}", port);
+    return cfg;
+}
+
+/// The worker, the responder and the router a merged-surface case drives.
+///
+/// Held together because their declaration ORDER is load-bearing and silently so: the
+/// router points at the responder and the responder holds the worker's capacity, so
+/// the three are destroyed router-first. Spelled out in each case, that ordering is a
+/// thing three cases would each have to get right.
+struct MergedWorker
+{
+    IdleListener listener;
+    HoldingRunner runner;
+    Cc::CompileJobRunner jobs;
+    Cc::WorkerProtocol protocol;
+    ThreadPoolExecutor pool { 2 };
+    WorkerServer server;
+    CompileResponder responder;
+
+    /// @param fix Supplies the scratch directory, metrics, logger and membership.
+    /// @param io The loop the responder returns its answers on.
+    MergedWorker(Fixture& fix, NodeIoLoop& io):
+        jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
+        protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics },
+        server { listener, protocol, 2, fix.membership, fix.metrics, fix.logger, pool },
+        responder { protocol, server.Capacity(), fix.membership, pool, io.Reactor(), fix.metrics, fix.logger }
+    {
+    }
+
+    MergedWorker(MergedWorker const&) = delete;
+    MergedWorker& operator=(MergedWorker const&) = delete;
+    MergedWorker(MergedWorker&&) = delete;
+    MergedWorker& operator=(MergedWorker&&) = delete;
+
+    /// Stops and drains, so no case leaves a compile running into its own teardown.
+    ~MergedWorker()
+    {
+        server.StopAndWait();
+    }
+};
+
+} // namespace
+
+TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][compile-responder]")
+{
+    // **The blocker, and this half is about the MECHANISM.** `FrameServer` armed one
+    // five-second window across the whole request, answer included -- right for a cache
+    // round trip and fatal for a compile, which runs for minutes. The failure is silent
+    // in the worst way: `ServeConnection` is not parked on the socket while a responder
+    // answers, so the sweep closes it without waking anything. The compile runs to
+    // completion, hops home, and its write fails. Every translation unit worth
+    // distributing would be compiled, paid for and thrown away, while short ones
+    // succeeded -- so a smoke test passes.
+    //
+    // Proved in two halves rather than by holding a ten-minute compile:
+    //
+    //   * HERE, that the endpoint arms the window the RESPONDER names -- by making that
+    //     window short and watching the answer be lost, which is the bug's own shape
+    //     reproduced deliberately and in under a second.
+    //   * In the case below, that `CompileResponder` names a window a compile fits in.
+    //
+    // Neither half means anything alone: the first would pass against a hard-coded
+    // number, the second against an endpoint that ignored it.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io };
+
+    // Far below what this compile will take, standing in for the five seconds every
+    // dispatched TU used to be given.
+    ShortWindowResponder tooShort { worker.responder, std::chrono::milliseconds { 100 } };
+    MergedResponder merged { nullptr, nullptr, &tooShort };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+
+    // Held past the deadline AND past a sweep, then let go.
+    //
+    // Both halves are needed and the second is what a first attempt got wrong: an
+    // expired deadline does nothing until the sweeper looks, and it looks every
+    // `SweepInterval`. A 400ms hold exceeded the 100ms window by four times over, was
+    // never swept, and the case failed -- reporting the fix as broken when what was
+    // wrong was the fixture's arithmetic. Derived from the cadence rather than guessed
+    // at a number, so it cannot silently stop covering the sweep if that cadence moves.
+    std::this_thread::sleep_for(FrameServer::SweepInterval * 2);
+    worker.runner.Release();
+
+    CHECK(pending.get().empty());
+
+    // And the worker paid in full: the compiler ran, the object was produced, the
+    // client got nothing, and NOTHING WAS REFUSED -- which is exactly what makes this
+    // silent rather than merely wrong. An operator watching the refusal series sees a
+    // flat graph while every distributed TU is discarded.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedStopping) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 0);
+}
+
+TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][compile-responder]")
+{
+    // **The direct proof, and it is worth the seconds it costs.** Same arrangement with
+    // `CompileResponder`'s OWN window instead of the short stand-in, and the compile is
+    // held past `HeaderTimeout` -- the single five-second window that used to cover the
+    // answer as well as the header, and that would therefore have swept this connection
+    // and thrown the finished object away.
+    //
+    // An earlier version held 400ms and asserted only that the responder's NUMBER was
+    // large. That is a two-step argument -- the endpoint reads the number, the number is
+    // big -- and it would have passed against a build where the endpoint quietly kept
+    // its own window for the answer. Holding past the old ceiling collapses both steps
+    // into one observation.
+    //
+    // **Do not shorten this sleep.** Below `HeaderTimeout` the case stops discriminating
+    // and becomes a slower copy of the one above.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    // The SIZE, asserted rather than waited out: ten minutes of held compile would be a
+    // suite nobody runs. Paired with the mechanism above, the two cover both.
+    REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile))
+            == Wire::DefaultCompileLeaseTimeout);
+    REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile)) > FrameServer::HeaderTimeout);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+
+    // Past the old ceiling, and then past a sweep -- an expired deadline does nothing
+    // until the sweeper looks. Derived from the two constants rather than written as a
+    // number, so it cannot silently stop covering either if one of them moves.
+    std::this_thread::sleep_for(FrameServer::HeaderTimeout + FrameServer::SweepInterval * 2);
+    worker.runner.Release();
+
+    auto const reply = pending.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(StatusOf(reply) == Wire::Status::Ok);
+}
+
+TEST_CASE("A compile in flight is drained before anything can stop the reactor", "[node][compile-responder]")
+{
+    // **The second defect the in-process cases could not see.** `NodeIoLoop` stops its
+    // reactor when the last ADOPTED loop ends -- the accept loop and the sweeper -- and
+    // a connection task parked off-reactor is not one of them. So tearing the surface
+    // down while a compile is still out on the pool stops the reactor underneath the hop
+    // home: the coroutine is never resumed, its slot and byte reservation are never
+    // released, and the worker then waits out its whole drain timeout and `_Exit`s
+    // reporting compiles still running that had in fact already finished. The bounded
+    // stop (#239) would blame the thing it broke.
+    //
+    // `WorkerBody` closes both doors and drains before any of that, which is what
+    // `StopAndWait` exists as a callable thing for -- destruction order cannot express
+    // it, because the router, the responder and the worker must be destroyed in exactly
+    // the opposite order.
+    //
+    // Asserted three ways: the reply alone would not distinguish a drain that merely
+    // won a race.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+
+    // The compile is on the pool and its slot is held, so the drain below has something
+    // real to wait for rather than passing vacuously.
+    REQUIRE(worker.server.Capacity().InFlight() == 1);
+
+    worker.runner.Release();
+    worker.server.StopAndWait();
+
+    // 1. The drain waited for the hop HOME, not merely for the compiler to exit.
+    CHECK(worker.server.Capacity().InFlight() == 0);
+
+    // 2. And it returned while the reactor was still turning -- the ordering itself
+    //    rather than a proxy for it. A drain finishing after the loops had ended would
+    //    be one whose compile had nowhere to come home to.
+    CHECK(io.LoopsRunning() > 0);
+
+    // 3. The client got its object. Under the defect this is empty: the answer is
+    //    posted to a reactor nobody drains and never leaves the process.
+    auto const reply = pending.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(StatusOf(reply) == Wire::Status::Ok);
 }

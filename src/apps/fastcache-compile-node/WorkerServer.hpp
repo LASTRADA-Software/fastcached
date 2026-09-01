@@ -118,6 +118,28 @@ namespace CompileRefusal
         .code = CompileCacheWire::ErrorCode::PayloadTooLarge,
         .counter = IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge,
     };
+    /// This worker has begun stopping and admits nothing more.
+    ///
+    /// **Not `NoCapacity`, and the split is the whole reason a row is a row.** An
+    /// operator acts on the two oppositely: `NoCapacity` says the fleet is too small,
+    /// this says a node is draining and a retry lands elsewhere. Summed, a rolling
+    /// restart reads as permanent under-capacity. The client sees one code either way,
+    /// because it does the same thing with both -- which is exactly why the counter is
+    /// the half that has to differ.
+    inline constexpr Cc::SurfaceRefusal Stopping {
+        .code = CompileCacheWire::ErrorCode::NoCapacity,
+        .counter = IMetricsSink::Counter::WorkerJobsRefusedStopping,
+    };
+    /// A pre-payload decision naming a verb this build has no row for.
+    inline constexpr Cc::SurfaceRefusal UnknownOpcode {
+        .code = CompileCacheWire::ErrorCode::UnknownOpcode,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnknownOpcode,
+    };
+    /// A compile verb reached before a credential. Zero on every shipped shape.
+    inline constexpr Cc::SurfaceRefusal Unauthenticated {
+        .code = CompileCacheWire::ErrorCode::Unauthenticated,
+        .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
+    };
 } // namespace CompileRefusal
 
 /// Refuse a caller with no claim on this machine's CPU, or admit it.
@@ -263,6 +285,34 @@ class WorkerServer
 
     /// Compiles running right now, for the heartbeat.
     [[nodiscard]] std::size_t InFlight() const noexcept;
+
+    /// Close every door into this worker, then wait for what is running.
+    ///
+    /// The destructor's body, callable early -- and calling it early is not a
+    /// convenience, it is an ORDERING that the merged surface made load-bearing
+    /// (#290).
+    ///
+    /// A compile admitted through the merged `0xFC` listener finishes on the pool and
+    /// then hops back onto the node's reactor to return its reply. That reactor is
+    /// stopped by `NodeIoLoop` when the last ADOPTED loop ends -- the accept loop and
+    /// the sweeper -- and a connection task parked off-reactor is not one of them. So
+    /// if the surface is torn down first, the reactor can stop while a compile is still
+    /// out on the pool: the hop home is posted to a port nobody drains, the coroutine
+    /// is never resumed, its slot and its byte reservation are never released, and this
+    /// class then waits the whole drain timeout and `_Exit`s reporting compiles still
+    /// running that had in fact already finished. The bounded stop would blame the
+    /// thing it broke.
+    ///
+    /// Destruction order cannot fix that on its own: the surface holds a pointer to the
+    /// responder and the responder holds this worker's capacity, so the three must be
+    /// destroyed surface-first -- which is the opposite of the order the drain needs.
+    /// Separating the stop from the destruction is what lets both be right. `WorkerBody`
+    /// calls this while every loop is still turning; the destructor calls it again and
+    /// finds nothing left to wait for.
+    ///
+    /// Idempotent. `BeginShutdown` is a latch and a drain with no outstanding compiles
+    /// returns `Finished` at once.
+    void StopAndWait();
 
     /// The slot cap, byte budget and drain this worker answers to.
     ///

@@ -107,6 +107,16 @@ class SchedulerResponder final: public IFrameResponder
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
     }
 
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// A round trip. `SchedulerProtocol::Answer` never suspends -- it answers from its
+    /// own tables -- so what this covers is a peer sending a payload it already has in
+    /// hand, and the endpoint's own header window is the right size for that.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return FrameServer::HeaderTimeout;
+    }
+
     /// Kilobytes, not megabytes.
     ///
     /// Membership is checked *inside* the service — after the frame is read — so an
@@ -292,6 +302,18 @@ class CacheResponder final: public IFrameResponder
                                                       std::uint8_t /*opRaw*/) const override
     {
         return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
+    }
+
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// A round trip, and it is one even though answering may dial an upstream: that
+    /// dial has a ceiling of its own well inside this, and a cache exchange that has
+    /// not finished in five seconds has already lost to compiling locally -- which is
+    /// what the launcher does the moment this surface stops being worth a second
+    /// command.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return FrameServer::HeaderTimeout;
     }
 
     /// Megabytes, because a STORE carries a whole object file.
@@ -486,6 +508,24 @@ class MergedResponder final: public IFrameResponder
         if (owner == nullptr)
             return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), {});
         return owner->RefusalReply(decision, opRaw);
+    }
+
+    /// @copydoc IFrameResponder::RequestTimeout
+    ///
+    /// **Routed to the owner, and deliberately NOT the largest.** The three ceilings
+    /// below fold with `Largest` because #284 made the payload cap a property of the
+    /// verb, so a generous session cap cannot make a scheduler verb generous. There is
+    /// no such column for time: a surface-wide maximum would hand every cache and
+    /// scheduler verb the compile window, which is the slow-loris property given away
+    /// to buy nothing.
+    ///
+    /// A verb nobody owns takes the endpoint's own header window. It is unreachable --
+    /// `RefusePeer` has already refused it -- and the short answer is the safe one for
+    /// a question asked about a peer this surface will not serve.
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner == nullptr ? FrameServer::HeaderTimeout : owner->RequestTimeout(opRaw);
     }
 
     /// @copydoc IFrameResponder::MaxRequestBytes

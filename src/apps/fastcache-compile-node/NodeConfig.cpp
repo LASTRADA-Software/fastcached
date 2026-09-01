@@ -1333,7 +1333,23 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return host.empty() || host == "0.0.0.0" || host == "::";
 }
 
-/// Whether a machine that is not this one could dial this node's COMPILE port.
+/// Whether a machine that is not this one could reach this node's COMPILE verbs.
+///
+/// **TWO ports answer them, and asking about one is how an open surface passes a
+/// startup table.** `--bind` was the whole answer until #290's second half gave the
+/// compile verbs a second door on the merged `0xFC` listener -- whose bare-port host
+/// is the WILDCARD on any node passing `--serve-scheduler`. So
+/// `--bind 127.0.0.1 --serve-scheduler --fleet-open` with no `--cluster-key-file`
+/// looked local, passed, and served unauthenticated compiles on a wildcard-bound port
+/// with every `worker_jobs_refused_lease_*` counter reading zero.
+///
+/// The node surface is asked of its own ROW rather than re-deriving the host here,
+/// which is the rule the dashboard credential rule below already follows: that row's
+/// default host depends on the configuration, it may resolve to nothing at all, and a
+/// second author of the resolution is one that judges an address the surface no longer
+/// binds. The row also answers "not served" for a node with neither a cache tier nor a
+/// scheduler -- correctly, because such a node opens no `0xFC` port and its compiles
+/// arrive only on `--bind`.
 ///
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
 /// `getaddrinfo` as nullptr under AI_PASSIVE, the same third case `AdvertisesWildcard`
@@ -1341,10 +1357,15 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 /// behaviour this relies on rather than an accident. Why it is asked at all is on the
 /// rule that asks it.
 /// @param cfg The parsed configuration.
-/// @return Whether the compile port answers anywhere but this machine.
+/// @return Whether either door onto the compile verbs answers anywhere but this
+///         machine.
 [[nodiscard]] bool CompilePortFacesTheNetwork(NodeConfig const& cfg)
 {
-    return !IsLoopbackHost(cfg.bindAddress);
+    if (!IsLoopbackHost(cfg.bindAddress))
+        return true;
+
+    auto const nodePort = RowFor(NodeSurface::Node).Resolve(cfg);
+    return std::ranges::any_of(nodePort, [](SurfaceEndpoint const& endpoint) { return !IsLoopbackHost(endpoint.host); });
 }
 
 std::string AdmissionSummary(NodeConfig const& cfg)

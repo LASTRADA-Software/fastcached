@@ -78,9 +78,19 @@ WorkerServer::WorkerServer(IListener& listener,
 
 WorkerServer::~WorkerServer()
 {
+    // Normally a second call that finds nothing to do: `WorkerBody` stops and drains
+    // explicitly, while the reactor a merged-surface compile has to hop home onto is
+    // still turning. See `StopAndWait`. This is what covers every other way out.
+    StopAndWait();
+}
+
+void WorkerServer::StopAndWait()
+{
     // Close the door before counting who is still inside. Draining without this
     // races the accept loop: it can admit one more job just as the count reaches
-    // zero, and the wait then returns while that job is starting.
+    // zero, and the wait then returns while that job is starting. `BeginShutdown`
+    // closes the OTHER door in the same call -- `CompileResponder` asks it -- which
+    // is what makes one drain cover both.
     Shutdown();
 
     // Every job holds a slot until it ends, so zero means nothing is still running

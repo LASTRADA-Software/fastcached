@@ -210,6 +210,20 @@ class IMetricsSink
         WorkerJobsRefusedNotAMember,
         WorkerJobsRefusedEndpointBusy,
 
+        /// Jobs refused because this worker had begun stopping.
+        ///
+        /// Its own series and not `no_slot`, because an operator acts on the two
+        /// oppositely: `no_slot` says buy machines or lower the fan-out, this says
+        /// wait -- the node is draining and a client that retries will find another
+        /// worker or this one restarted. Summed together, a rolling restart reads as
+        /// a fleet that is permanently too small.
+        ///
+        /// Only the merged `0xFC` surface can produce it. The dedicated compile port
+        /// closes its listener to stop, so a client meets a closed port rather than a
+        /// refusal; the merged listener carries three verb families and goes on
+        /// serving the other two, so this one has to be refused in words.
+        WorkerJobsRefusedStopping,
+
         /// Frames refused before a job existed at all.
         ///
         /// A family of their own rather than more `WorkerJobsRefused*`, because they
@@ -257,6 +271,17 @@ class IMetricsSink
         /// node refuse every one correctly, and concludes it is not being probed
         /// (#326).
         WorkerFramesRefusedPayloadTooLarge,
+
+        /// Frames refused for reaching a compile verb before a credential.
+        ///
+        /// Zero on every configuration this build ships, and that is the point rather
+        /// than a reason to leave it out: a compile carries its own per-job credential
+        /// -- the lease the scheduler signed -- so `CompileResponder::AuthRequired`
+        /// answers false and the pre-payload gate never reaches this. A rise means
+        /// that answer changed, which is a change to who may compile here, and a
+        /// counter is how an operator would find out. A tally's zero is the truth
+        /// about events that did not happen.
+        WorkerFramesRefusedUnauthenticated,
 
         /// Jobs refused while opening the request's codec envelope, one counter per
         /// reason — the same split, and for the same argument, that `EnvelopeError`

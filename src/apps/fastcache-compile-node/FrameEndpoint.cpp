@@ -321,10 +321,17 @@ namespace
         // half a header is swept rather than holding a frame until the process dies.
         // `Rearm` below moves it forward once per request -- not once per read; see
         // its note for what the window then covers.
-        auto const deadlineFor = [state] {
-            return state->io.Reactor().Clock().Now() + FrameServer::RequestTimeout;
+        //
+        // TWO windows, and which one is armed depends on whether a verb has been
+        // named. Until it has, this peer has told the surface nothing, so it gets the
+        // short one whatever the surface goes on to serve -- that is where the
+        // slow-loris property lives. Once the header decodes, the owner of the verb
+        // says how long ITS answer may take, because a cache exchange is a round trip
+        // and a dispatched compile is however long a compiler runs (#223, #290).
+        auto const deadlineFor = [state](std::chrono::milliseconds window) {
+            return state->io.Reactor().Clock().Now() + window;
         };
-        state->Track(socket.get(), deadlineFor());
+        state->Track(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
 
         // The firewall: this is a DetachedTask, whose unhandled_exception terminates
         // the process, so one client's answer must not take the node with it.
@@ -358,7 +365,7 @@ namespace
                 // Whatever a pipelined peer has already sent is kept.
                 reader.ReleaseSpareCapacity();
 
-                state->Rearm(socket.get(), deadlineFor());
+                state->Rearm(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
 
                 auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
                 if (!header.has_value())
@@ -368,6 +375,17 @@ namespace
                 if (!decoded.has_value())
                     break; // A foreign magic: no declared length, so nowhere to
                            // resynchronize to. Closing is the only thing left.
+
+                // The verb is named, so the window becomes the one its owner asks for
+                // -- covering the payload read and the answer. Re-armed HERE rather
+                // than at the top, because the value depends on a header that had not
+                // been read yet: a surface generous to compiles must not hand that
+                // generosity to a peer which has sent nothing.
+                //
+                // The refusal branches below are all fast, and re-arming ahead of them
+                // costs nothing: a peer being refused reads its reply and hangs up
+                // well inside any window either side would choose.
+                state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
 
                 if (decoded->payloadLength > cap)
                 {

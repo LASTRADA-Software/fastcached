@@ -23,13 +23,19 @@
 # **`Wire::EncodeErrorReply` appears exactly once across the surfaces, inside
 # `Refuse`.**
 #
-# Two files are covered, because a worker has two 0xFC surfaces and an operator reads
-# their counters side by side: `WorkerProtocol.cpp` answers the verbs, and
-# `WorkerServer.cpp` answers before a verb is reached -- admission, capacity, the
-# in-flight budget, and the frame-level payload ceiling. That last one is the CHEAPEST
-# probe there is, needing only a header where the envelope refusals need a whole frame
-# read, so it is the likeliest thing to be pointed at a node and it counted nothing at
-# all ([#326](https://github.com/LASTRADA-Software/fastcached/issues/326)).
+# Three files are covered, because a worker has three 0xFC surfaces and an operator
+# reads their counters side by side: `WorkerProtocol.cpp` answers the verbs,
+# `WorkerServer.cpp` answers before a verb is reached on the dedicated compile port --
+# admission, capacity, the in-flight budget, and the frame-level payload ceiling -- and
+# `CompileResponder.cpp` answers the same questions for compiles arriving on the merged
+# `0xFC` listener ([#290](https://github.com/LASTRADA-Software/fastcached/issues/290)).
+# That last surface is why this list is a list rather than a pair: it was added with
+# uncounted refusals in it, and the scan said nothing because it was not looking.
+#
+# The frame-level payload ceiling is the CHEAPEST probe there is, needing only a header
+# where the envelope refusals need a whole frame read, so it is the likeliest thing to
+# be pointed at a node and it counted nothing at all
+# ([#326](https://github.com/LASTRADA-Software/fastcached/issues/326)).
 #
 # It is exact because the three refusals that ALREADY counted -- the lease refusal,
 # the envelope error and the job refusal -- were routed through `Refuse` too, carrying
@@ -62,7 +68,8 @@ endif()
 # worker must not hold two notions of what a refusal is.
 set(surfaces
     "src/apps/fastcache-cc/WorkerProtocol.cpp"
-    "src/apps/fastcache-compile-node/WorkerServer.cpp")
+    "src/apps/fastcache-compile-node/WorkerServer.cpp"
+    "src/apps/fastcache-compile-node/CompileResponder.cpp")
 
 foreach(relative IN LISTS surfaces)
     if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")

@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -84,6 +85,18 @@ class NamedResponder final: public IFrameResponder
         return _maxRequest;
     }
 
+    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _requestTimeout;
+    }
+
+    /// How long this fake claims its answers may take.
+    /// @param window The window to report.
+    void PlaceRequestTimeout(std::chrono::milliseconds window) noexcept
+    {
+        _requestTimeout = window;
+    }
+
     [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
     {
         return _maxOpen;
@@ -136,6 +149,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxRequest { 1024 };
     std::size_t _maxOpen { 8 };
     std::size_t _maxInFlight { 4096 };
+    std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like
     // a mutator, which is the thing `RefusePeer`'s own signature refuses to do.
