@@ -376,17 +376,6 @@ namespace
                     break; // A foreign magic: no declared length, so nowhere to
                            // resynchronize to. Closing is the only thing left.
 
-                // The verb is named, so the window becomes the one its owner asks for
-                // -- covering the payload read and the answer. Re-armed HERE rather
-                // than at the top, because the value depends on a header that had not
-                // been read yet: a surface generous to compiles must not hand that
-                // generosity to a peer which has sent nothing.
-                //
-                // The refusal branches below are all fast, and re-arming ahead of them
-                // costs nothing: a peer being refused reads its reply and hangs up
-                // well inside any window either side would choose.
-                state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
-
                 if (decoded->payloadLength > cap)
                 {
                     // Refused with a reply naming BOTH numbers, because "too large"
@@ -508,6 +497,26 @@ namespace
                         break;
                     continue;
                 }
+
+                // **The verb's own window, armed at the point this surface decides to
+                // SERVE and not one line earlier.** It covers the payload read and the
+                // answer, which are the two things a compile makes long.
+                //
+                // Every branch above is a refusal, and every one of them ends in
+                // `reader.Skip(decoded->payloadLength)` -- a read of whatever the peer
+                // declared, from a peer that may dribble it. Armed after the header
+                // decoded, as it first was, a stranger who merely NAMES `Op::Compile`
+                // in a seven-byte header would be handed the compile window before
+                // `RefusePeer` had been asked whether they are a member at all: a
+                // hundred-and-twentyfold longer hold, pre-admission, on a surface whose
+                // whole purpose here was to be harder to exhaust. The comment that used
+                // to sit up there reasoned the refusals were "all fast" -- true of the
+                // `WriteAll`, false of the skip that follows it.
+                //
+                // So `HeaderTimeout` governs everything up to this line, which is the
+                // rule stated positively: a peer gets the generous window by being
+                // SERVED, never by asking.
+                state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
 
                 BudgetedBytes const bytes { state, decoded->payloadLength };
                 auto const payload = co_await reader.ReadExactly(decoded->payloadLength);

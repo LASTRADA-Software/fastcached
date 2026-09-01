@@ -763,6 +763,92 @@ TEST_CASE("A peer the surface refuses never gets its payload read", "[node][fram
     CHECK(responder.PeerRefusals() == 1);
 }
 
+TEST_CASE("A peer refused before admission never gets the served window", "[node][frame]")
+{
+    // **The window a verb asks for is earned by being SERVED, never by being named.**
+    //
+    // `RequestTimeout` is per verb so a compile can run for minutes (#223, #290). Armed
+    // where it first was -- immediately after the header decoded -- a stranger who
+    // merely writes `Op::Compile` into a seven-byte header would have had the compile
+    // window armed on their connection *before* `RefusePeer` was asked whether they are
+    // a member at all. Every refusal branch ends in `reader.Skip(declaredLength)`, a
+    // read from a peer that may dribble, so that is a hundred-and-twentyfold longer
+    // pre-admission hold on a surface whose whole purpose here was to be harder to
+    // exhaust. The comment that used to sit above the re-arm reasoned the refusals were
+    // "all fast": true of the `WriteAll`, false of the skip after it.
+    //
+    // **The instrument is a SHORT window, and that is deliberate.** What is under test
+    // is *which* deadline governs a refused peer, and the dangerous value -- ten minutes
+    // -- cannot be waited out. A short one answers the same question in the opposite
+    // direction and in two seconds: if the responder's window were in force here, this
+    // connection would be swept almost at once; under `HeaderTimeout` it is not swept at
+    // all within the observation. A functional test cannot see any of this, because the
+    // refusal itself is correct either way and only the deadline differs.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.RefuseEveryPeer(true);
+    responder.PlaceRequestTimeout(std::chrono::milliseconds { 200 });
+    // A budget the declaration fits inside, so the peer gate is unambiguously what
+    // refuses: this case is about the deadline, not about which gate fired.
+    responder.Limit(8, 64ULL * 1024ULL);
+
+    auto const port = FreePort();
+    auto endpoint =
+        FrameEndpoint::Start(fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    BlockingConnector connector;
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, 5s));
+    REQUIRE(socket.has_value());
+    auto* const peer = (*socket).get();
+
+    // Declared, never sent -- so the server answers the refusal and then sits in
+    // `Skip`, which is the state whose deadline this case is about.
+    constexpr std::uint32_t Declared = 32ULL * 1024ULL;
+    std::array<std::byte, Wire::RequestHeaderSize> frame {};
+    WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
+    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+        co_return written.has_value();
+    }(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
+
+    // The refusal arrives first. Asserted so the observation below cannot pass because
+    // the connection was closed for some entirely different reason.
+    auto const refusal = SyncRun(ReadOneReply(peer));
+    REQUIRE_FALSE(refusal.empty());
+    REQUIRE(ErrorOf(refusal) == Wire::ErrorCode::NotAMember);
+
+    // Now: is this connection still held? A read returns only when the server closes,
+    // so "still pending" IS "still open". Bounded, and released by hand afterwards on
+    // BOTH paths -- an unbounded wait here would turn a regression into a suite that
+    // hangs rather than one that fails.
+    // `ReadAtLeast` rather than a raw `Read`: `SyncRun` drives a `Task`, and the file's
+    // existing helper is already the free-function-with-pointers shape the coroutine
+    // lint rules require. It returns false exactly when the peer closed first.
+    auto lingering = std::async(std::launch::async, [peer] {
+        std::vector<std::byte> received;
+        return !SyncRun(ReadAtLeast(peer, &received, 1));
+    });
+
+    // Two sweeps: past any deadline the responder asked for, and comfortably inside
+    // `HeaderTimeout`. Derived from the constants rather than written as a number, so it
+    // cannot silently stop covering the sweep if the cadence moves.
+    auto const stillOpen = lingering.wait_for(FrameServer::SweepInterval * 2) == std::future_status::timeout;
+
+    // Closed by us either way, which is what lets the reader thread finish and the
+    // future be joined without the case ever hanging.
+    (*socket)->Close();
+    (void) lingering.get();
+
+    INFO("the responder asked for 200ms and HeaderTimeout is "
+         << FrameServer::HeaderTimeout.count() << "ms; observed for " << (FrameServer::SweepInterval * 2).count()
+         << "ms. A closed connection here is the responder's window governing a peer this surface had not yet "
+            "admitted, which is the pre-admission hold this case exists to refuse.");
+    CHECK(stillOpen);
+}
+
 TEST_CASE("An unauthenticated peer never gets its payload read either", "[node][frame]")
 {
     // #289, and the same instrument as the peer gate above for the same reason: "the
