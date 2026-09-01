@@ -631,8 +631,13 @@ if [[ "$mode" == "membership" ]]; then
     # while the local route is gone -- so the fixture's own `wait_for_port` would
     # never connect and the run would FAIL where its contract says SKIP. A laptop on
     # Wi-Fi with a configured wired NIC unplugged is the ordinary way to meet that.
-    # `ifconfig` with no arguments and `hostname -I` already report only up
-    # interfaces, so the three rows agree on that much.
+    #
+    # The other two rows cannot all be filtered the same way, and saying they can
+    # would be a comment describing something the code does not do: `hostname -I`
+    # reports only up interfaces, but macOS's `ifconfig` with no arguments lists
+    # every interface rather than only the up ones. That residual is why a chosen
+    # address that will not carry a connection is a named FAIL naming the address --
+    # `${tag} never listened on <addr>:<port>` -- rather than anything silent.
     probe_ip_addr() { ip -4 -o addr show scope global up 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1; }
     probe_ifconfig() { ifconfig 2>/dev/null | awk '$1 == "inet" { print $2 }' | sed 's/^addr://'; }
     probe_hostname() { hostname -I 2>/dev/null; }
