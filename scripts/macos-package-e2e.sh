@@ -337,9 +337,12 @@ if [[ "$scope" == "daemon" ]]; then
     owner="$(ps -o user= -p "$(sudo launchctl print "system/${LABEL}" | awk -F'= ' '/^\tpid = /{print $2; exit}')" | tr -d ' ')"
     [[ "$owner" == "_fastcached" ]] || fail "daemon runs as '${owner}', expected _fastcached"
 
-    # `-` for the pid: launchd owns these jobs and this script has no handle on
-    # them, which the verdict reports as its own outcome rather than implying it
-    # watched something. 15s, the bound this fixture has always used.
+    # `-` for the pid, and it is REQUIRED rather than merely tidy. This daemon
+    # runs as `_fastcached`, so `kill -0` from the test user answers EPERM --
+    # which a shell cannot tell from ESRCH -- and the wait would report a
+    # perfectly healthy daemon as having DIED on its first poll. The pid is
+    # right there in the `owner` line above; passing it is the tempting change
+    # that breaks this. 15s, the bound this fixture has always used.
     wait_for_port 127.0.0.1 "$port" "-" "the installed service" "-" 15
     serves
     echo "   system daemon running as _fastcached and serving on ${port}"
@@ -354,7 +357,9 @@ else
     # made a real agent look absent — and made the uninstall assertion below
     # pass without ever testing anything.
     if agent_domain="$(registered_agent_domain)"; then
-        # `-` for the pid, as above: launchd owns the job.
+        # `-` for the pid, as above. This branch's agent does run as the test
+        # user, but the script never learns its pid -- `registered_agent_domain`
+        # answers with a domain, not a process -- so there is nothing to pass.
         wait_for_port 127.0.0.1 "$port" "-" "the registered agent" "-" 15
         serves
         echo "   agent registered in ${agent_domain} and serving on ${port}"

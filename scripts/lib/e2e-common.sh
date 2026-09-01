@@ -395,9 +395,28 @@ _e2e_verdict() {
 # second, which is the price: it is ample for budgets of 20s and 240s, and it is
 # a MEASURED second rather than an assumed one. `sleep` stays, as pacing.
 #
+# A PID PASSED HERE MUST BE ONE THIS USER CAN SIGNAL. Liveness is `kill -0`, and
+# `kill -0` answers non-zero for a process that is alive but owned by somebody
+# else -- EPERM and ESRCH are the same reading from a shell. This loop treats
+# non-zero as DIED, so a pid running under a service account would be reported
+# as having died, on the first poll, with an exit status of `-` and its log
+# dumped: a confident wrong answer of exactly the kind the verdict exists to
+# avoid, and one no bound or budget would soften.
+#
+# Measured rather than reasoned: `kill -0 1` as an ordinary user answers
+# `Operation not permitted` and returns non-zero, and pid 1 is not dead.
+#
+# So the rule is "a pid this shell may signal, or `-`", and `-` is not a lesser
+# answer -- the verdict reports it as its own outcome, which is honest, where a
+# borrowed pid is simply wrong. `macos-package-e2e` is the live case: its
+# LaunchDaemon runs as `_fastcached`, so it passes `-`, while
+# `macos-service-e2e`'s agent runs as the test user and is `kill -0`-ed by the
+# fixture itself three lines earlier, so it passes the pid.
+#
 # @param 1 a function name; returns 0 when the wait is over
 # @param 2 what is being waited for, for the messages
-# @param 3 pid to watch, or "-" for none
+# @param 3 pid to watch, or "-" for none. Must be signallable by this user; see
+#          above -- a pid owned by another account reads as DEAD.
 # @param 4 log to watch and dump, or "-" for none
 # @param 5 bound in seconds
 wait_until() {
@@ -496,9 +515,11 @@ _e2e_expire() {
 #
 # @param 1 host
 # @param 2 port
-# @param 3 pid to watch, or "-" if the process is not this shell's to watch
-#          (a launchd job, say). "-" is an honest reading and the verdict says so;
-#          a pid that is available and not passed is a diagnosis thrown away.
+# @param 3 pid to watch, or "-" if there is no pid this user may signal -- a
+#          launchd job under a service account, say. "-" is an honest reading and
+#          the verdict says so; a pid that is available, signallable and not
+#          passed is a diagnosis thrown away, and a pid that is NOT signallable
+#          is worse than none. See `wait_until` above.
 # @param 4 what it is, for the messages
 # @param 5 log to dump on expiry, or "-"
 # @param 6 optional bound in seconds; defaults to `e2e_wait_seconds`
