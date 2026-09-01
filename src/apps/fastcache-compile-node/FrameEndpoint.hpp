@@ -259,6 +259,45 @@ class IFrameResponder
     /// A refusal here is a reply on a kept connection, so a peer that arrives during
     /// a busy moment is told to come back rather than made to reconnect.
     [[nodiscard]] virtual std::size_t MaxInFlightBytes() const noexcept = 0;
+
+    /// Whether this verb's owner accounts for the request's bytes itself.
+    ///
+    /// The budget above is charged when the header declares its length and released
+    /// when `Answer` returns, which is right for a verb whose answer is a round trip
+    /// and wrong for one whose answer is a COMPILE. A compile runs for seconds to
+    /// minutes, and `CompileResponder` charges the same frame against
+    /// `CompileCapacity` -- the accounting the worker advertises and the dedicated
+    /// port already uses. Held in both, one buffer is counted in two pools for the
+    /// whole compile, and the endpoint's pool is shared per LISTENER: compiles
+    /// filling it refuse a 64 KiB `REGISTER` with `EndpointBusy`, which carries no
+    /// redirect and is not followed by the worker half, so a peer expires out of the
+    /// registry and every lease answers `NoWorker` -- a fleet outage caused by this
+    /// node's own compile load (#448).
+    ///
+    /// So a verb that answers `true` is charged by the endpoint only while its
+    /// payload is READ -- which nothing else can account for, since the owner has no
+    /// frame yet -- and by its owner from there on. One buffer, one pool, and the
+    /// figure both doors charge is the one the worker advertises.
+    ///
+    /// **The handoff is tight by construction, and rests on two invariants stated
+    /// here because neither is visible at the release site.** `Task` is lazy
+    /// (`Async/Task.hpp`: `initial_suspend` is `suspend_always`, with symmetric
+    /// transfer at the final one), so `co_await Answer(...)` runs the body on the
+    /// awaiting thread with no return to the loop; and the node's framed surfaces
+    /// share exactly one reactor thread (`NodeIoLoop`). Between the release and the
+    /// owner's charge there is therefore no suspension point and no other thread
+    /// serving this pool, so nothing can observe the lowered figure. Were either
+    /// invariant broken, `DeclaredRequestFootprint` floors at the payload length, so
+    /// the owner always charges at least what was released -- the error would be
+    /// bounded by one frame per reactor thread and would err towards over-admission.
+    ///
+    /// Pure virtual for the reason the ceilings above are: a surface that says
+    /// nothing would answer `false` by inheritance and silently double-charge, which
+    /// is precisely the defect this column exists to close.
+    ///
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return True when the owner of @p opRaw charges the request's bytes itself.
+    [[nodiscard]] virtual bool HoldsOwnByteBudget(std::uint8_t opRaw) const noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.
@@ -457,6 +496,14 @@ class FrameEndpoint
     {
         return _boundEndpoint;
     }
+
+    /// @return How many declared payload bytes are in flight. For tests.
+    ///
+    /// Forwarded from `FrameServer` rather than exposing the server itself: the one
+    /// thing a case needs to read from outside is this figure, and the handoff in
+    /// `IFrameResponder::HoldsOwnByteBudget` is an ORDERING that nothing else can
+    /// observe (#448).
+    [[nodiscard]] std::size_t InFlightBytes() const noexcept;
 
   private:
     FrameEndpoint(NodeIoLoop& io,

@@ -223,6 +223,23 @@ class CompileResponder final: public IFrameResponder
         return _capacity.ByteBudget();
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// **Yes, and this surface is why the column exists.** `Answer` charges
+    /// `DeclaredRequestFootprint` against `CompileCapacity` -- the same accounting
+    /// the dedicated port uses and the same figure the worker advertises -- and it
+    /// holds that for the compile. The endpoint holding its own reservation over the
+    /// same frame counted one buffer twice for minutes, in a pool shared with the
+    /// scheduler verbs on this listener (#448).
+    ///
+    /// Verb-blind on purpose. `MergedResponder` routes by verb FAMILY, so every verb
+    /// reaching here is a compile verb, and answering per-verb would be a second
+    /// place for the family table to be restated and disagree with itself.
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return true;
+    }
+
   private:
     Cc::WorkerProtocol& _protocol;
     CompileCapacity& _capacity;

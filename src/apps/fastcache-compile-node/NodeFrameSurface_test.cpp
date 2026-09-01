@@ -107,6 +107,23 @@ class NamedResponder final: public IFrameResponder
         return _maxInFlight;
     }
 
+    /// @copydoc IFrameResponder::HoldsOwnByteBudget
+    ///
+    /// Settable per fake, because what `MergedResponder` must do with this is ROUTE
+    /// it: the three ceilings above fold with `Largest`, and folding this one either
+    /// way is a defect (#448).
+    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _ownBudget;
+    }
+
+    /// Claim, or stop claiming, that this fake accounts for its own request bytes.
+    /// @param own What `HoldsOwnByteBudget` should answer.
+    void ClaimOwnByteBudget(bool own) noexcept
+    {
+        _ownBudget = own;
+    }
+
     /// Require a credential for every verb this fake is asked about.
     /// @param required What `AuthRequired` should answer.
     void RequireAuth(bool required) noexcept
@@ -149,6 +166,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxRequest { 1024 };
     std::size_t _maxOpen { 8 };
     std::size_t _maxInFlight { 4096 };
+    bool _ownBudget { false };
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like
