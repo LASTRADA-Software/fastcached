@@ -207,13 +207,15 @@ struct InheritedListenFd
             return; // constrains the fd for the static analyzer on the ::bind path below
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        // Unqualified, for the reason LoopbackPair records above: htonl/htons/ntohs
+        // are macros on macOS, and a `::` ahead of a macro expansion does not parse.
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0; // ephemeral, so the test cannot collide with a live port
         REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
         REQUIRE(::listen(fd, 8) == 0);
         socklen_t len = sizeof(addr);
         REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
-        port = ::ntohs(addr.sin_port);
+        port = ntohs(addr.sin_port);
     }
 
     /// Hand the descriptor to something that takes ownership of it.
@@ -260,8 +262,8 @@ std::string ExchangeOverLoopback(std::uint16_t port, std::string_view greeting, 
 
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
-    addr.sin_port = ::htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
     {
         ::close(fd);
