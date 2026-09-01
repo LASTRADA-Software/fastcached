@@ -306,7 +306,15 @@ if(FASTCACHED_BUILD_TESTS)
         target_link_libraries(fastcache-cc-tests PRIVATE ws2_32)
     endif()
     include(Catch)
-    catch_discover_tests(fastcache-cc-tests)
+    # SKIP_RETURN_CODE, because a Catch2 case that SKIPs exits 4 and ctest scores a
+    # non-zero exit as a FAILURE. Without this, "this host has no MSVC driver" and
+    # "the verifier is broken" are the same red line -- skipped and failed collapsed
+    # into one state, which is the reading `.agent/rules/metrics-and-observability.md`
+    # spends a paragraph on and the exact failure #493 is about.
+    #
+    # Measured on this tree: `fastcache-cc-tests '[msvc]'` exits 4 having reported
+    # `1 skipped`, and ctest reported it as `(Failed)`.
+    catch_discover_tests(fastcache-cc-tests PROPERTIES SKIP_RETURN_CODE 4)
 
     # ---------------------------------------------------------------------
     # The end-to-end compile-cache test (`compile-cache-e2e`) used to be

@@ -34,15 +34,20 @@ namespace
 
 /// An MSVC-family driver on this host that can actually COMPILE, if there is one.
 ///
-/// **Presence is not the question, and neither is a successful spawn.** A probe that
-/// asked whether the driver could be started reported `cl.exe` present on Linux and
-/// this case then FAILED where it should have skipped: on POSIX a missing binary is
-/// not a failure to spawn at all -- `fork` succeeds and the child exits 127 after
-/// `exec` fails -- so `NotSpawned` never appears. The same probe is wrong on Windows
-/// for a second reason the `dist-compile-e2e.ps1` fixture already records: a
-/// clang-cl that cannot find an MSVC SDK is on PATH and can build nothing.
+/// **Presence is not usability**, which is the fourth time this distinction has
+/// decided something in this file's history. A probe that asks whether the driver
+/// can be STARTED answers a different question: `dist-compile-e2e.ps1` records the
+/// case that makes it concrete -- a clang-cl that cannot find an MSVC SDK is on
+/// PATH, spawns perfectly, and can build nothing. So can a driver whose toolset was
+/// uninstalled from under it.
 ///
-/// So the question asked is the only one that answers both: **did an object appear?**
+/// The only question that survives both is **did an object appear?**
+///
+/// (`NotSpawned` is a sound guard for its own question and is used correctly
+/// elsewhere -- `ProcessRunner` spawns through `posix_spawnp`, which reports an exec
+/// failure back to the parent rather than leaking it as a 127 exit, so a genuinely
+/// missing binary does report `NotSpawned` on POSIX. It is simply not an answer
+/// about whether the tool WORKS.)
 ///
 /// The translation unit is header-free on purpose, which is what makes this runnable
 /// without a developer command prompt -- a bare `cl.exe` with no `INCLUDE` compiles
