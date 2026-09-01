@@ -180,8 +180,8 @@ terminal, and each has already been a bug:
   port alive after the worker exits.
 - **Under socket activation `--advertise` is required, because the fallback
   becomes a guess the process cannot make.** The socket unit owns the port and
-  never tells the service which one, so `{--bind}:{--port}` describes nothing —
-  and `0.0.0.0` is not an address a remote client can dial regardless. The failure
+  never tells the service which one, so `--listen-node` describes nothing — and
+  `0.0.0.0` is not an address a remote client can dial regardless. The failure
   is the worst shape this system has: registration *succeeds*, the worker
   heartbeats happily, the scheduler leases that endpoint out, and every client
   fails to connect and compiles locally, with no error anywhere and a fleet that
@@ -352,7 +352,7 @@ Consequences that are each load-bearing:
     which flag it reads like.
   - **Admitting peers and advertising an address are two halves of one decision.**
     Peers are admitted so that they can *dial* this worker, and `--advertise` falls
-    back to `{--bind}:{--port}` whose bind is the wildcard — which the scheduler
+    back to `--listen-node`, which is the wildcard on a scheduler — which the scheduler
     hands to clients verbatim, so a client on another machine dials `0.0.0.0` and
     reaches itself. `NodeServiceRejection` had always refused that for an *install*;
     letting a worker carry a membership flag at all is what made it reachable from a
@@ -707,9 +707,9 @@ Consequences that are each load-bearing:
   "is a key configured".** Keying the refusal on the key alone breaks every
   single-machine install to prevent nothing — a process on this host already has
   this host's compiler, so a lease check there escalates nobody. "Could reach it"
-  has **two halves and either one closes it**: the socket (a loopback `--bind`
-  answers no other machine whatever the policy says — which is what keeps this
-  repository's own `--fleet-open` e2e fleets working) and the policy
+  has **two halves and either one closes it**: the socket (a loopback
+  `--listen-node` answers no other machine whatever the policy says — which is what
+  keeps this repository's own `--fleet-open` e2e fleets working) and the policy
   (`--fleet-open`, a non-loopback `--fleet-member`, or consensus). **Consensus
   counts**, because a clustered node's admitted set GROWS at runtime: the agreed
   member list is published into the same oracle the compile port consults, so such a
@@ -728,15 +728,32 @@ Consequences that are each load-bearing:
   scheduler to look for a fault that is local.
 - **A fixture that carries the key and never dispatches proves only that a keyed node
   STARTS.** `cluster-e2e` and `fleet-dashboard-e2e` were given `--cluster-key-file`
-  because they leave `--bind` at the wildcard, and neither compiles anything — so for
-  a while the only end-to-end evidence for the lease check was construction. Meanwhile
+  because they left `--bind` at the wildcard, and neither compiles anything — so for
+  a while the only end-to-end evidence for the lease check was construction. (Both
+  bind loopback since #290 stage 3, which merged the compile port into
+  `--listen-node`; they keep the key, and their own comments now say the bind is the
+  half that closes them rather than the half that opens them.) Meanwhile
   the fixtures that *do* dispatch bind loopback, slipped under the startup rule, and
   ran `UncheckedLeaseValidator` for every one of their hundreds of compiles. Both
   halves have to meet in one fixture, which is why `dist-compile-e2e` carries the key
   on every node: an in-process test mints and verifies inside one process and cannot
   show that the endpoint a worker ADVERTISED is the endpoint the scheduler signed.
 - **A flag that describes nothing under socket activation cannot answer whether a
-  port faces the network.** `--bind` is the obvious answer to "is this port local",
+  port faces the network.**
+
+  > **The flags this entry names no longer exist.** #290 stage 3 retired the dedicated
+  > compile port and deleted `--bind` and `--port` with it; the node opens one 0xFC
+  > surface and `--listen-node` configures it, so `CompilePortFacesTheNetwork` reads
+  > that row and nothing else. The entry is left as it was written, deliberately: what
+  > it records is not a fact about a flag but a shape — a premise that is true on the
+  > path it was written for and false on another path that reads it — and the sibling
+  > it warns about at the end is now the *only* flag, which makes the hole wider rather
+  > than smaller. Rewritten in today's spelling it would read as a rule about
+  > `--listen-node` and lose the two things that make it worth keeping: that this was
+  > #282 recurring inside the fix for #282, and that review found it and CI did not.
+  > Read `--bind` below as "the flag that then configured the compile port".
+
+  `--bind` is the obvious answer to "is this port local",
   and it is wrong for a reason nothing in this tree stated until now. Under
   activation the unit owns the address -- the shipped
   `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
@@ -1172,9 +1189,10 @@ Six more about what the tier IS and who gets to see it:
 
   Three columns carry what the openers cannot: **protocol** (discovery is UDP and the
   other five are TCP, so a worksheet without it yields five correct firewall rules and
-  one wrong one), **`defaultHost`** (the host a bare port falls *back* to -- empty for
-  the compile port, whose host is `--bind`, a flag of its own), and a free-form
-  **note** for what a column cannot say.
+  one wrong one), **`defaultHost`** (the host a bare port falls *back* to -- loopback
+  for the node surface on a worker and the wildcard once `--serve-scheduler` is given,
+  since peers are elsewhere by definition), and a free-form **note** for what a column
+  cannot say.
 
   There is deliberately **no `presence` column**: `resolve` already answers it, and a
   column restating it was wrong for raft, whose address an operator can name while

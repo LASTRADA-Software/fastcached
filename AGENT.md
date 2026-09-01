@@ -207,11 +207,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A lease has three transitions and expiry is the third: the **client** resolves it,
   on every path out of the compile, over a fresh connection. Expiry is the safety net
   for a client that died.
-- `--bind` answers "does this port face the network" only when this process bound
-  the port. Under socket activation the unit owns the address and the flag still
-  holds a value that describes nothing — a stale `--bind=127.0.0.1` passed the
+- A listen flag answers "does this port face the network" only when this process
+  bound the port. Under socket activation the unit owns the address and the flag
+  still holds a value that describes nothing — a stale loopback value passed the
   startup table and served an unauthenticated compile port. The config table's rule
-  is insufficient there, not wrong, so both it and the runtime guard stay.
+  is insufficient there, not wrong, so both it and the runtime guard stay. Recorded
+  against `--bind`, which #290 stage 3 deleted; `--listen-node` inherits the hole and
+  is now the only flag, so it is wider.
 - Whether a worker **checks** a lease is a startup decision, never a per-request
   fallback — skipped per request, the port is open and every refusal counter reads
   zero. The question is "can a machine that is not this one reach the compile

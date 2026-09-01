@@ -644,25 +644,25 @@ when nobody sets `FASTCACHE_ADDR`, and the one `cmake/portable/CompileCache.cmak
 passes. So the whole thing works with no configuration: start a node, build, and
 the launcher finds it.
 
-**It is one port for every verb family this node answers.** The cache verbs are
-answered here always; the scheduler verbs are answered here too once you pass
-`--serve-scheduler`; and **`COMPILE` is answered here as well**, by the same worker,
-against the same slot count and the same member list as the dedicated compile port
-below. That flag also moves where a bare port binds — loopback without it, the
-wildcard with it — because a scheduler no peer can dial does nothing. There is no
-second listen flag to set, and no way for them to end up on addresses that disagree.
+**It is one port for every verb family this node answers, and it is the only one.**
+The cache verbs are answered here always; the scheduler verbs are answered here too
+once you pass `--serve-scheduler`; and **`COMPILE` is answered here as well**, by the
+same worker, against the same slot count and the same member list. That flag also
+moves where a bare port binds — loopback without it, the wildcard with it — because a
+scheduler no peer can dial does nothing. There is no second listen flag to set, and
+no way for two to end up on addresses that disagree.
 
-The compile verbs now arrive on `--listen-node` beside the cache verbs, and are still
-what a worker advertises, so nothing about how a client reaches you has moved. What
-changed is that the node port is now a second way in to the same worker rather than
-a port that answered `COMPILE` with "unimplemented".
+A worker used to open a dedicated compile port beside this one, configured by flags
+of its own. It does not any more: `--listen-node` is what a worker advertises and
+what a dispatched compile arrives on, so there is one address to open in a firewall,
+one address in a lease, and one address to get wrong.
 
 That port is also `fastcached`'s, and what happens when both want it depends on
 whether **you typed the address**:
 
 | `--listen-node` | Port already held |
 |---|---|
-| defaulted | Warned, and the node starts **with no local tier** and no `COMPILE` on that port. Your builds reach the daemon on that port instead, and dispatch still reaches the compile port, so nothing breaks — it just does less than a node with a tier would. |
+| defaulted | Warned, and the node starts **with no 0xFC port at all** — no local tier and no `COMPILE`. Your builds reach the daemon on that port instead, so local caching still works; but this node no longer has a second port for dispatched compiles to arrive on, so it can serve none. It still registers with its `--scheduler` and advertises that address, which means clients are leased an endpoint nothing is listening on. Do not run a node and a `fastcached` on one machine: the node answers every verb the daemon does. |
 | named by you | Fatal. The node refuses to start and says so. |
 
 The asymmetry is the point: a node sharing a machine with `fastcached` should not
@@ -713,15 +713,25 @@ interfaces, so a local client dialling the node at its routable address is still
 local; the set is re-read every 30 seconds, so an address the machine has just been
 given is refused for at most that long and then works.
 
-The compile column reads the same on both of its ports, and that is deliberate: the
-node port answers `COMPILE` through the *same* membership check the dedicated port
-applies. A caller with no claim on this machine is refused before a byte of its
-preprocessed source is read, on either port.
+The compile column is on ONE port, which is what #290 stage 3 finished: the
+dedicated compile listener is gone, `COMPILE` arrives on `--listen-node` beside the
+cache and scheduler verbs, and it is answered through the same membership check the
+dedicated port applied. A caller with no claim on this machine is refused before a
+byte of its preprocessed source is read.
 
-**The two ports are not otherwise interchangeable, and one difference is a startup
-rule rather than a runtime one.** Whether this node verifies the lease a client
-presents is decided once, at startup, from whether a machine that is not this one
-could reach the compile verbs *at all*. `--listen-node` binds the wildcard on any
+A non-member now reaches that refusal a step later than it used to. The dedicated
+listener classified the peer at **accept**, from the kernel's address, before any
+byte was read; the merged surface asks per FRAME, at the first point the verb is
+known — and it has to, because membership is the policy of the compile verbs while
+the same socket answers cache verbs on locality, so a gate at accept would decide
+both and make the listener the policy again. The widening is that a non-member holds
+a connection until it sends a header, bounded by the header timeout and by the
+surface's maximum open connections. That is the exposure the cache verbs have
+carried on this listener since #416.
+
+**Whether this node verifies the lease a client presents is decided once, at
+startup**, from whether a machine that is not this one could reach the compile verbs
+*at all*. `--listen-node` binds the wildcard on any
 node running `--serve-scheduler`, so such a node needs `--cluster-key-file` and is
 refused at startup without it. For one release the question had TWO answers to
 combine, and asking either alone let an open surface pass: `--bind 127.0.0.1

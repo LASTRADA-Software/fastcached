@@ -71,12 +71,19 @@ pids=()
 
 # The cluster's pre-shared key, which every node here shares.
 #
-# Not decoration and not a workaround for the startup rule: these nodes leave
-# `--listen-node` at the wildcard and say `--fleet-open`, so another machine genuinely
-# could dial their compile ports, and a node in that shape has to be able to check
-# the lease a client presents it (#282). Giving them the key is what a real fleet in
-# this shape does, and it means these fixtures exercise the SIGNING scheduler and
-# the VERIFYING worker rather than the unchecked pair.
+# Not decoration: these nodes say `--fleet-open`, so their compile verbs admit every
+# caller that can reach the port, and a node in that shape has to be able to check the
+# lease a client presents it (#282). Giving them the key is what a real fleet in this
+# shape does, and it means these fixtures exercise the SIGNING scheduler and the
+# VERIFYING worker rather than the unchecked pair.
+#
+# The binds are loopback, which is the OTHER half of #282's rule and is why the key is
+# a choice here rather than a requirement: either a loopback bind or a loopback-only
+# policy closes the port on its own, and these nodes have the first and deliberately
+# not the second. This paragraph used to say they left the bind at the wildcard, which
+# was true of the flag it named (`--bind`, defaulting to 0.0.0.0) and became false when
+# #290 stage 3 replaced it with `--listen-node=127.0.0.1:<port>` -- a mechanical flag
+# rename carried a claim about behaviour with it.
 #
 # Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
 # with the key's value, and a per-run secret would make a failure look like a flake.

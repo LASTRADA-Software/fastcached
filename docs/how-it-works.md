@@ -417,8 +417,9 @@ outcome is called the **leader**.
    a client. A node that ends up with nothing to serve refuses to start and says
    where it looked.
 
-2. **Binds its surfaces** — the compile port, and whichever of the cache tier,
-   scheduler and consensus port are configured.
+2. **Binds its surfaces** — the 0xFC port (`--listen-node`), which carries the
+   compile verbs, the cache tier and the scheduler verbs together, plus the admin
+   and consensus ports when they are configured.
 
 3. **Starts consensus, if `--node-id` was given**, and says so. The parenthesis is
    the part to read — it tells you whether this node brought a cluster with it:

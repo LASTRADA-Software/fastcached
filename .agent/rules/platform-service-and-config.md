@@ -142,8 +142,8 @@ readable and silently ignored. Every rule below has already been one of them.
   in `NodeServiceRejection` describes a registration that would **succeed** and then
   produce a service which cannot do its job -- silent from both ends, since the
   operator is told it was installed and nothing later says otherwise. `--advertise`
-  is the one worth naming: left empty it bakes in `{--bind}:{--port}`, and `--bind`
-  defaults to `0.0.0.0`, which is not an address a client can dial. Such a worker
+  is the one worth naming: left empty it bakes in whatever `--listen-node` resolves
+  to, which on a scheduler is `0.0.0.0` -- not an address a client can dial. Such a worker
   registers, heartbeats happily, is leased out by the scheduler, and is never
   reached. `--scheduler` gets the same treatment because it would start and exit at
   every boot.
@@ -278,8 +278,8 @@ readable and silently ignored. Every rule below has already been one of them.
   wildcard and `--advertise` defaulting to loopback are that pair.
 
   What stayed out needs stating carefully, because the easy reason is the wrong one.
-  `--bind`, `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are
-  addresses on the same command line, and it is tempting to say they are excluded
+  `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are addresses on
+  the same command line, and it is tempting to say they are excluded
   because they fail at `bind()` or `connect()` -- but that is about **reachability**,
   and their *grammar* is every bit as much a pure function of the command line as a
   listen flag's. The honest split is narrower: this table covers the surfaces this
@@ -562,8 +562,7 @@ readable and silently ignored. Every rule below has already been one of them.
 
 - **Which flags carry text OTHER MACHINES will read is a column of the table.**
   `ParseUtf8Text` rather than `ParseText`, and the rows in it are the ones whose
-  value leaves the machine: `--advertise` and `--bind` become the endpoint clients
-  dial, `--node-id` and `--raft-peer` a member's identity and the address its peers
+  value leaves the machine: `--advertise` becomes the endpoint clients dial, `--node-id` and `--raft-peer` a member's identity and the address its peers
   open a socket to, `--cluster-id` rides every discovery beacon, and
   `--cluster-admit`/`--cluster-set` commit their operand through consensus — where
   an entry is applied *after* it is committed, with nobody left to refuse it, so the
@@ -647,5 +646,5 @@ readable and silently ignored. Every rule below has already been one of them.
   `--advertise` is the costly one: nothing parses it, so `--advertise=nope` installs,
   registers, heartbeats, is leased out and is never reached, which is word for word
   the failure the emptiness rule beside it was written to prevent. Deciding it needs
-  a grammar per flag (`--bind` is a host alone; `--upstream` may be empty;
-  `--fleet-member` is a list) and words other than "the surface it configures".
+  a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
+  `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".

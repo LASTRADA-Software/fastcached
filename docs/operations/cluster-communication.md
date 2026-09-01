@@ -384,11 +384,10 @@ ask for one with `--serve-scheduler`, and when you do it is answered on
 `--listen-node`, beside the cache and compile verbs, rather than on a port of its own. Neither does a consensus or
 discovery port: those have no conventional number at all.
 
-The node port answers `COMPILE` as well, against the same slot count and the same
-member list as the compile port. It is a second door onto one worker rather than a
-second worker, so the number this machine advertises to the fleet still describes
-all of it — and a worker advertises its compile port, so this changes nothing about
-where a client goes. See
+The node port answers `COMPILE` as well, and it is the only port that does — the
+dedicated compile listener was retired once this one could carry the verbs. So the
+number this machine advertises to the fleet describes all of it, and it is the same
+number a client is handed in a lease and the same number you open in a firewall. See
 [Install](../getting-started/install.md#distributed-compilation) for the
 port summary, and
 [the compile-cache protocol](../protocols/compile-cache.md) for the verbs.
@@ -653,9 +652,11 @@ notes:
 The node opens its ports from the same table that prints, so the list and the sockets
 cannot disagree — which is the point of generating a worksheet rather than
 transcribing one. It also prints a `notes:` block, which is where the two facts a
-column cannot carry live: that a systemd `.socket` unit overrides `--bind`/`--port`
-entirely, and that `--discovery`'s address is where beacons are *sent* while its
-sockets bind the wildcard. [The node's own page](../tools/fastcache-compile-node.md#every-port-it-opens)
+column cannot carry live: that a systemd `.socket` unit is not yet served on the
+node surface — an inherited descriptor cannot be adopted onto the reactor yet, so an
+activated worker is refused at startup rather than left listening on nothing — and
+that `--discovery`'s address is where beacons are *sent* while its sockets bind the
+wildcard. [The node's own page](../tools/fastcache-compile-node.md#every-port-it-opens)
 carries the full six-surface table.
 
 The three shapes below are the *deployments*, in the order fleets tend to grow into
