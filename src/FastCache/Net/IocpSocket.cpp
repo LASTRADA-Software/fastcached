@@ -141,6 +141,19 @@ struct IocpSocket::Impl
         /// leaks instead of being freed under the kernel's feet. That trade is the
         /// point: a bounded leak on an abnormal shutdown path in exchange for
         /// removing a use-after-free from the normal one.
+        ///
+        /// Cost, measured rather than asserted, because "it is only an atomic" is
+        /// how a hot path gets slow (`GetAdaptersAddresses` at 238x `getifaddrs`
+        /// is this repository's standing reminder). One copy at submit and one
+        /// move-out plus release at dispatch, against a real submit + completion
+        /// round trip:
+        ///
+        ///   refcount pair                     ~8 ns
+        ///   WSARecv + dequeued completion  ~4500 ns   (loopback, 1 byte, warm)
+        ///
+        /// So ~0.18% of one submitted operation, on this machine at /O2. A ratio
+        /// rather than a bare nanosecond figure, since the number alone does not
+        /// say whether it matters.
         std::shared_ptr<Impl> inFlight {};
     };
 
