@@ -625,7 +625,17 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
 }
 
 KqueueListener::KqueueListener() noexcept = default;
-KqueueListener::~KqueueListener() = default;
+
+KqueueListener::~KqueueListener()
+{
+    // The listener owns its descriptor and, while interest is armed, is the
+    // `udata` the kernel hands back for it. Leaving both to a `= default`
+    // destructor leaked the fd AND left the kqueue pointing at freed memory, so
+    // a connection arriving after the listener went away resumed through a
+    // dangling handler. `Close()` is idempotent, so an explicit close first --
+    // which is what every current owner does -- costs nothing here.
+    KqueueListener::Close();
+}
 
 std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
                                                      std::string_view bindAddress,
@@ -649,6 +659,43 @@ std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
 
     auto const fd = static_cast<int>(bound->socket);
     PrepareOwnedFd(fd);
+    listener->_impl->handler.fd = fd;
+    return listener;
+}
+
+std::unique_ptr<KqueueListener> KqueueListener::Adopt(KqueueReactor& reactor, int fd)
+{
+    std::unique_ptr<KqueueListener> listener { new KqueueListener {} };
+    listener->_impl = std::make_unique<Impl>(reactor);
+
+    if (fd < 0)
+    {
+        listener->_impl->bindError = "adopt: not a descriptor";
+        return listener;
+    }
+
+    // No bind, no listen, no SO_REUSEADDR -- the supervisor did all three, and
+    // repeating any of them on an already-listening socket fails. What is left
+    // is what `Bind` applies to its own listening socket through
+    // `PrepareOwnedFd`, which is the same two properties for the same reasons.
+    //
+    // `PrepareOwnedFd` itself is deliberately not called: it ignores the
+    // non-blocking result, and on a listening descriptor that is the failure this
+    // whole factory exists to prevent -- a blocking accept parks the reactor
+    // thread that carries every other connection. Fatal rather than best-effort,
+    // so the descriptor is closed and the listener says why instead of coming up
+    // as a latent stall.
+    if (!Detail::SetNonBlocking(static_cast<Detail::NativeSocket>(fd)))
+    {
+        listener->_impl->bindError = "adopt: cannot switch the inherited descriptor to non-blocking";
+        ::close(fd);
+        return listener;
+    }
+    Detail::ArmCloseOnExec(static_cast<Detail::NativeSocket>(fd));
+
+    // Unlike epoll there is nothing to attach: `KqueueListener::Bind` registers
+    // no interest either, and `Accept()` arms EVFILT_READ lazily when it has to
+    // park. So the adopted descriptor is ready the moment it is stored.
     listener->_impl->handler.fd = fd;
     return listener;
 }
