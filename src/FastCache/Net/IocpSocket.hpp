@@ -93,7 +93,10 @@ class IocpSocket final: public ISocket
     struct Impl;
 
   private:
-    std::unique_ptr<Impl> _impl;
+    /// Shared, not unique: an in-flight overlapped operation holds a strong
+    /// reference of its own, so the completion block outlives this object when it
+    /// is destroyed mid-operation. See `Impl::Op::inFlight` and #465.
+    std::shared_ptr<Impl> _impl;
     std::uintptr_t _native;
     std::string _peerAddress;
     bool _closed { false };
@@ -131,7 +134,10 @@ class IocpListener final: public IListener
   private:
     IocpListener() noexcept;
 
-    std::unique_ptr<Impl> _impl;
+    /// Shared, not unique: an in-flight overlapped operation holds a strong
+    /// reference of its own, so the completion block outlives this object when it
+    /// is destroyed mid-operation. See `Impl::Op::inFlight` and #465.
+    std::shared_ptr<Impl> _impl;
 };
 
 } // namespace FastCache

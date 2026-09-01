@@ -11,6 +11,7 @@
     #include <coroutine>
     #include <cstdint>
     #include <mutex>
+    #include <thread>
     #include <vector>
 
     #include <windows.h>
@@ -83,6 +84,33 @@ class IocpReactor: public IReactor
         return _iocp;
     }
 
+    /// Whether the calling thread is the one inside `Run()`.
+    ///
+    /// The one-worker-thread property above has always been true and was, until
+    /// the completion-lifetime fix, only documented. `IocpSocket` and
+    /// `IocpListener` now clear a pending awaitable in their destructors, and
+    /// that is safe **only** because the destructor and the completion dispatch
+    /// cannot run concurrently -- so the property became load-bearing and needs
+    /// something better than a paragraph. Their destructors assert on this.
+    ///
+    /// False before `Run()` has been entered and after it returns, which is the
+    /// honest answer: with nothing dequeuing, there is no worker thread to be on.
+    /// Callers that legitimately tear down outside a running reactor check
+    /// `Running()` first rather than treating false as a violation.
+    /// @return True when this thread is the reactor's worker thread.
+    [[nodiscard]] bool IsOnWorkerThread() const noexcept
+    {
+        return _running.load(std::memory_order_acquire)
+               && _workerThread.load(std::memory_order_relaxed) == std::this_thread::get_id();
+    }
+
+    /// Whether a thread is currently inside `Run()`.
+    /// @return True between entry to and return from `Run()`.
+    [[nodiscard]] bool Running() const noexcept
+    {
+        return _running.load(std::memory_order_acquire);
+    }
+
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.
     struct TimerEntry
@@ -98,6 +126,12 @@ class IocpReactor: public IReactor
     IClock& _clock;
     void* _iocp { nullptr };
     std::atomic<bool> _stopped { false };
+    /// Identity of the thread inside `Run()`, and whether one is there at all.
+    /// Two variables because a default-constructed `thread::id` is a valid value
+    /// to compare against and would make "nobody is running" indistinguishable
+    /// from "some thread whose id happens to compare equal".
+    std::atomic<std::thread::id> _workerThread {};
+    std::atomic<bool> _running { false };
     std::uint64_t _nextSequence { 0 };
     std::mutex _timerMutex;
     std::vector<TimerEntry> _timers;

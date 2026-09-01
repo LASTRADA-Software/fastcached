@@ -11,6 +11,7 @@
     #include <winsock2.h>
 
     #include <array>
+    #include <cassert>
     #include <cstddef>
     #include <cstdint>
     #include <expected>
@@ -66,6 +67,34 @@ namespace
         };
     }
 
+    /// Assert that a destructor clearing a pending awaitable cannot race the
+    /// completion dispatch that would read it.
+    ///
+    /// `IocpSocket` and `IocpListener` null `awaitable` on teardown so a
+    /// completion arriving afterwards does not resume a coroutine frame that is
+    /// gone. That is a plain unsynchronised store, and it is safe for exactly one
+    /// reason: dispatch runs on the reactor's single worker thread, so teardown on
+    /// that thread cannot overlap it. `IocpReactor` has always documented one
+    /// worker thread; #465 is what made the property load-bearing rather than
+    /// descriptive, and a documented property that something now depends on needs
+    /// a check rather than a citation.
+    ///
+    /// Tearing down while no thread is inside `Run()` is equally fine and common
+    /// -- tests build a socket and drop it without ever running the reactor, and
+    /// shutdown destroys listeners after `Run()` has returned. With nothing
+    /// dequeuing there is no race to lose, so that case passes.
+    ///
+    /// Debug-only, by `assert`: a destructor cannot throw, and this is a contract
+    /// violation by the caller rather than a runtime condition to report. The same
+    /// shape `RaftPeerTransport::Stop` uses for its own thread rule.
+    /// @param reactor The reactor whose worker thread the object belongs to.
+    void AssertTeardownIsSerialisedWithDispatch([[maybe_unused]] IocpReactor const& reactor) noexcept
+    {
+        assert((!reactor.Running() || reactor.IsOnWorkerThread())
+               && "an IOCP socket/listener must be destroyed on its reactor's worker thread, or with that "
+                  "reactor stopped -- otherwise clearing a pending awaitable races the completion dispatch");
+    }
+
 } // namespace
 
 struct IocpSocket::Impl
@@ -82,12 +111,37 @@ struct IocpSocket::Impl
         IoAwaitable* awaitable { nullptr };
         bool isWrite { false };
         // Vectored-write backing storage that must outlive the overlapped
-        // completion: WSASend consumes the WSABUF array asynchronously, and
-        // the payload bytes are referenced (not copied) until the completion
-        // is dequeued. Both are released by the next Read/Write/WriteVectored
-        // that reuses this op, or at socket teardown.
+        // completion: WSASend consumes the WSABUF array asynchronously, and the
+        // payload bytes are referenced (not copied) until the completion is
+        // dequeued.
+        //
+        // Released by `Dispatch`, which is the first moment the kernel is
+        // provably done with them. This used to say "or at socket teardown",
+        // which was a second, separate defect (#465): destroying a socket with a
+        // write in flight freed bytes WSASend was still reading, and the failure
+        // mode is corruption on the wire rather than a crash. `inFlight` below is
+        // what makes the block survive to be released here.
         std::vector<WSABUF> writeBufs {};
         std::shared_ptr<void const> writeKeepAlive {};
+
+        /// A strong reference to the enclosing `Impl`, taken when the overlapped
+        /// operation is submitted and released by `Dispatch`.
+        ///
+        /// This is what makes a socket safe to destroy with I/O in flight. The
+        /// kernel holds `&completion` -- and WRITES to it, since `Internal` and
+        /// `InternalHigh` are updated at completion -- so closing the handle does
+        /// not retract anything: it makes the operation complete with
+        /// `ERROR_OPERATION_ABORTED`, and the completion is still dequeued
+        /// afterwards. Freeing this block before that happens is a use-after-free
+        /// on the read side and a write to freed memory on the kernel's side.
+        ///
+        /// Deliberately a reference cycle while an operation is outstanding
+        /// (`Impl` -> `Op` -> `Impl`), broken by `Dispatch`. If a completion can
+        /// never be dequeued -- a reactor destroyed without draining -- this block
+        /// leaks instead of being freed under the kernel's feet. That trade is the
+        /// point: a bounded leak on an abnormal shutdown path in exchange for
+        /// removing a use-after-free from the normal one.
+        std::shared_ptr<Impl> inFlight {};
     };
 
     Op readOp;
@@ -96,8 +150,22 @@ struct IocpSocket::Impl
     static void Dispatch(IocpCompletion* base, DWORD bytes, DWORD err)
     {
         auto* op = reinterpret_cast<Op*>(base);
+
+        // Released only when this function returns, so every member touched below
+        // -- and the OVERLAPPED the kernel just wrote into -- is still alive even
+        // if the owning IocpSocket was destroyed while this was in flight.
+        auto const keepAlive = std::move(op->inFlight);
+
         auto* awaitable = op->awaitable;
         op->awaitable = nullptr;
+
+        // The write's backing storage is referenced by the kernel, not copied, so
+        // the completion arriving is the first moment it is safe to let go -- see
+        // the comment on `writeBufs`. Before `Complete`, because resuming the
+        // waiter can issue the next write straight into this same op.
+        op->writeBufs.clear();
+        op->writeKeepAlive.reset();
+
         if (!awaitable)
             return;
         if (err == 0)
@@ -121,7 +189,7 @@ IocpSocket::IocpSocket(IocpReactor& reactor,
                        std::uintptr_t native,
                        std::string peerAddress,
                        IocpAttachment attachment) noexcept:
-    _impl { std::make_unique<Impl>(reactor, static_cast<SOCKET>(native)) },
+    _impl { std::make_shared<Impl>(reactor, static_cast<SOCKET>(native)) },
     _native { native },
     _peerAddress { std::move(peerAddress) }
 {
@@ -140,6 +208,23 @@ IocpSocket::IocpSocket(IocpReactor& reactor,
 
 IocpSocket::~IocpSocket()
 {
+    if (_impl)
+    {
+        AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
+
+        // The awaitable lives in the AWAITING coroutine's frame, which is
+        // normally being destroyed alongside this socket. `inFlight` keeps the
+        // completion block alive, but nothing makes that pointer valid again --
+        // resuming it would be a second use-after-free, in the caller rather
+        // than here. Clearing it is safe only because the assertion above holds:
+        // a completion cannot be dequeued while this destructor runs.
+        _impl->readOp.awaitable = nullptr;
+        _impl->writeOp.awaitable = nullptr;
+    }
+
+    // Closing is the cancellation: it makes any outstanding operation complete
+    // with ERROR_OPERATION_ABORTED. The completion still arrives afterwards, and
+    // `Op::inFlight` is what it arrives into.
     IocpSocket::Close();
 }
 
@@ -185,6 +270,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
     wsaBuf.len = static_cast<ULONG>(buffer.size());
     DWORD bytesReceived = 0;
     DWORD flags = 0;
+    op.inFlight = _impl; // the kernel now holds &op.completion; see Op::inFlight
     auto const rc = WSARecv(
         _impl->native, &wsaBuf, 1, &bytesReceived, &flags, reinterpret_cast<LPWSAOVERLAPPED>(&op.completion), nullptr);
     auto const lastErr = (rc == 0) ? 0 : WSAGetLastError();
@@ -194,6 +280,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
         a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
         return a;
     }
+    op.inFlight.reset(); // failed synchronously, so no completion will arrive
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
@@ -216,6 +303,7 @@ IoAwaitable IocpSocket::WaitReadable()
     wsaBuf.len = 0;
     DWORD bytesReceived = 0;
     DWORD flags = 0;
+    op.inFlight = _impl; // the kernel now holds &op.completion; see Op::inFlight
     auto const rc = WSARecv(
         _impl->native, &wsaBuf, 1, &bytesReceived, &flags, reinterpret_cast<LPWSAOVERLAPPED>(&op.completion), nullptr);
     auto const lastErr = (rc == 0) ? 0 : WSAGetLastError();
@@ -225,6 +313,7 @@ IoAwaitable IocpSocket::WaitReadable()
         a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
         return a;
     }
+    op.inFlight.reset(); // failed synchronously, so no completion will arrive
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
@@ -242,6 +331,7 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
     wsaBuf.buf = const_cast<CHAR*>(reinterpret_cast<CHAR const*>(buffer.data()));
     wsaBuf.len = static_cast<ULONG>(buffer.size());
     DWORD bytesSent = 0;
+    op.inFlight = _impl; // the kernel now holds &op.completion; see Op::inFlight
     auto const rc = WSASend(_impl->native,
                             &wsaBuf,
                             1,
@@ -256,6 +346,7 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
         a.SetSuspendCallback(&SocketAwaitableSuspended, &op);
         return a;
     }
+    op.inFlight.reset(); // failed synchronously, so no completion will arrive
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
 }
 
@@ -294,6 +385,7 @@ IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const
     }
 
     DWORD bytesSent = 0;
+    op.inFlight = _impl; // the kernel now holds &op.completion; see Op::inFlight
     auto const rc = WSASend(_impl->native,
                             op.writeBufs.data(),
                             static_cast<DWORD>(op.writeBufs.size()),
@@ -310,6 +402,7 @@ IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const
     }
     op.writeBufs.clear();
     op.writeKeepAlive.reset();
+    op.inFlight.reset(); // failed synchronously, so no completion will arrive
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
 }
 
@@ -345,6 +438,13 @@ struct IocpListener::Impl
         /// static Dispatch can extract the peer address from `addrBuf` without
         /// reaching back into the listener Impl.
         LPFN_GETACCEPTEXSOCKADDRS getAcceptExSockaddrsFn { nullptr };
+
+        /// Strong reference to the enclosing `Impl` while an AcceptEx is
+        /// outstanding, released by `Dispatch`. Identical in purpose and in
+        /// consequence to `IocpSocket::Impl::Op::inFlight`, which carries the
+        /// full reasoning: `addrBuf` here is a second buffer the kernel writes
+        /// into, on top of the OVERLAPPED itself.
+        std::shared_ptr<Impl> inFlight {};
     };
 
     AcceptOp current;
@@ -352,6 +452,13 @@ struct IocpListener::Impl
     static void Dispatch(IocpCompletion* base, DWORD /*bytes*/, DWORD err)
     {
         auto* op = reinterpret_cast<AcceptOp*>(base);
+
+        // Released only when this function returns, so the OVERLAPPED the kernel
+        // just wrote into -- and `addrBuf`, which AcceptEx also wrote into -- are
+        // still alive even if the owning IocpListener was destroyed while this
+        // accept was outstanding.
+        auto const keepAlive = std::move(op->inFlight);
+
         auto* awaitable = op->awaitable;
         op->awaitable = nullptr;
 
@@ -412,13 +519,27 @@ struct IocpListener::Impl
 };
 
 IocpListener::IocpListener() noexcept = default;
-IocpListener::~IocpListener() = default;
+IocpListener::~IocpListener()
+{
+    if (!_impl)
+        return;
+
+    AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
+
+    // See ~IocpSocket: the awaitable is in the awaiting coroutine's frame, which
+    // `AcceptOp::inFlight` does not and cannot keep alive.
+    _impl->current.awaitable = nullptr;
+
+    // `Impl::~Impl` closes `listenSock` and any half-built `acceptSock`, which is
+    // what aborts an outstanding AcceptEx. The completion arrives afterwards and
+    // lands on the block `inFlight` is holding, not on freed memory.
+}
 
 std::unique_ptr<IocpListener> IocpListener::Bind(
     IocpReactor& reactor, std::string_view bindAddress, std::uint16_t port, int backlog, IAddressResolver& resolver)
 {
     std::unique_ptr<IocpListener> listener { new IocpListener {} };
-    listener->_impl = std::make_unique<Impl>(reactor);
+    listener->_impl = std::make_shared<Impl>(reactor);
 
     // Shared resolve + create + bind + listen (IPv4/IPv6 literal or hostname).
     auto bound = Detail::BindAndListen(resolver, bindAddress, port, backlog, /*extraTypeFlags*/ 0);
@@ -539,6 +660,7 @@ AcceptAwaitable IocpListener::Accept()
         return AcceptAwaitable { std::unexpected(MakeWsaError(WSAGetLastError(), "socket(accept)")) };
 
     DWORD bytesReceived = 0;
+    op.inFlight = _impl; // the kernel now holds &op.completion and &op.addrBuf
     auto const ok = _impl->acceptExFn(_impl->listenSock,
                                       op.acceptSock,
                                       op.addrBuf.data(),
@@ -555,6 +677,7 @@ AcceptAwaitable IocpListener::Accept()
         return a;
     }
 
+    op.inFlight.reset(); // failed synchronously, so no completion will arrive
     ::closesocket(op.acceptSock);
     op.acceptSock = INVALID_SOCKET;
     return AcceptAwaitable { std::unexpected(MakeWsaError(lastErr, "AcceptEx")) };
