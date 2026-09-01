@@ -72,7 +72,7 @@ pids=()
 # The cluster's pre-shared key, which every node here shares.
 #
 # Not decoration and not a workaround for the startup rule: these nodes leave
-# `--bind` at the wildcard and say `--fleet-open`, so another machine genuinely
+# `--listen-node` at the wildcard and say `--fleet-open`, so another machine genuinely
 # could dial their compile ports, and a node in that shape has to be able to check
 # the lease a client presents it (#282). Giving them the key is what a real fleet in
 # this shape does, and it means these fixtures exercise the SIGNING scheduler and
@@ -185,7 +185,6 @@ start_node() {
         --cache-memory=0 \
         --scheduler="127.0.0.1:${scheduler_ports[$index]}" \
         --toolchain="/bin/sh" \
-        --port="$(free_port)" \
         --advertise="127.0.0.1:1" \
         --log-level=info \
         > "$log" 2>&1 &
@@ -549,7 +548,6 @@ scheduler_ports+=("$(free_port)")
     --cache-memory=0 \
     --scheduler="127.0.0.1:${scheduler_ports[3]}" \
     --toolchain="/bin/sh" \
-    --port="$(free_port)" \
     --advertise="127.0.0.1:1" \
     --log-level=info \
     > "${workdir}/n4.log" 2>&1 &

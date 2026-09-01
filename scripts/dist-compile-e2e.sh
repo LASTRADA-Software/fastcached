@@ -734,8 +734,7 @@ if [[ "$mode" == "membership" ]]; then
             --serve-scheduler --listen-node="${lan_address}:${dispatch}" \
             --fleet-member="$lan_address" \
             --scheduler="${lan_address}:${dispatch}" \
-            --bind="$lan_address" --port="$own_port" \
-            --advertise="${lan_address}:${own_port}" \
+            --advertise="${lan_address}:${dispatch}" \
             --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
             > "${workdir}/${tag}.log" 2>&1 &
         pid=$!
@@ -771,7 +770,7 @@ if [[ "$mode" == "membership" ]]; then
         port="$(free_port)"
         "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" \
             --scheduler="${lan_address}:${dispatch}" \
-            --bind="$lan_address" --port="$port" --advertise="${lan_address}:${port}" \
+            --listen-node="${lan_address}:${port}" --advertise="${lan_address}:${port}" \
             --admin-listen="$admin" \
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
             ${@+"$@"} > "${workdir}/${tag}.log" 2>&1 &
@@ -935,7 +934,8 @@ fi
 # time -- and nothing in the cache daemon can establish which node that is. So
 # the scheduler moved to where leadership lives, which is the compile node.
 #
-# `--bind` is deliberately not used: it is mutually exclusive with --listen.
+# One 0xFC surface since #290 stage 3: --listen-node is the bind, and compiles
+# arrive on it beside the cache and scheduler verbs.
 cache_port="$(free_port)"
 
 "$fastcached" --listen="127.0.0.1:${cache_port}" \
@@ -965,8 +965,7 @@ sched_worker_port="$(free_port)"
 
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${dispatch_port}" \
-    --bind=127.0.0.1 --port="$sched_worker_port" \
-    --advertise="127.0.0.1:${sched_worker_port}" \
+    --advertise="127.0.0.1:${dispatch_port}" \
     --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
     > "${workdir}/scheduler.log" 2>&1 &
 scheduler_pid=$!
@@ -980,7 +979,7 @@ wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --bind=127.0.0.1 --port="$worker_port" --advertise="127.0.0.1:${worker_port}" \
+    --listen-node="127.0.0.1:${worker_port}" --advertise="127.0.0.1:${worker_port}" \
     --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug \
     > "${workdir}/worker.log" 2>&1 &
@@ -1132,8 +1131,7 @@ wait_for_port "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}
 
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${iso_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${iso_dispatch_port}" \
-    --bind=127.0.0.1 --port="$iso_sched_worker_port" \
-    --advertise="127.0.0.1:${iso_sched_worker_port}" \
+    --advertise="127.0.0.1:${iso_dispatch_port}" \
     --toolchain="also-not-the-compiler-this-client-uses=${compiler}" \
     --slots=1 --log-level=debug > "${workdir}/iso-scheduler.log" 2>&1 &
 iso_scheduler_pid=$!
@@ -1142,7 +1140,7 @@ wait_for_port "$iso_dispatch_port" "$iso_scheduler_pid" "isolation scheduler" "$
 
 iso_worker_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${iso_dispatch_port}" \
-    --bind=127.0.0.1 --port="$iso_worker_port" --advertise="127.0.0.1:${iso_worker_port}" \
+    --listen-node="127.0.0.1:${iso_worker_port}" --advertise="127.0.0.1:${iso_worker_port}" \
     --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug \
     > "${workdir}/iso-worker.log" 2>&1 &
 iso_worker_pid=$!
@@ -1240,8 +1238,7 @@ wait_for_port "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/
 # the whole point of the case is that it has one.
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${cap_dispatch_port}" --fleet-open \
     --scheduler="127.0.0.1:${cap_dispatch_port}" \
-    --bind=127.0.0.1 --port="$cap_sched_worker_port" \
-    --advertise="127.0.0.1:${cap_sched_worker_port}" \
+    --advertise="127.0.0.1:${cap_dispatch_port}" \
     --toolchain="not-the-compiler-under-test=${compiler}" \
     --slots=1 --log-level=debug > "${workdir}/cap-scheduler.log" 2>&1 &
 cap_scheduler_pid=$!
@@ -1250,7 +1247,7 @@ wait_for_port "$cap_dispatch_port" "$cap_scheduler_pid" "capacity scheduler" "${
 
 cap_worker_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${cap_dispatch_port}" \
-    --bind=127.0.0.1 --port="$cap_worker_port" --advertise="127.0.0.1:${cap_worker_port}" \
+    --listen-node="127.0.0.1:${cap_worker_port}" --advertise="127.0.0.1:${cap_worker_port}" \
     --toolchain="${compiler}" --slots=1 --log-level=debug \
     > "${workdir}/cap-worker.log" 2>&1 &
 cap_worker_pid=$!
@@ -1355,7 +1352,7 @@ echo "== case 8: a worker exits on SIGTERM"
 # accept a local fallback would have deleted the #236 assertion it exists for.
 stop_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --bind=127.0.0.1 --port="$stop_port" --advertise="127.0.0.1:${stop_port}" \
+    --listen-node="127.0.0.1:${stop_port}" --advertise="127.0.0.1:${stop_port}" \
     --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info \
     > "${workdir}/stop-worker.log" 2>&1 &
 stop_worker_pid=$!
@@ -1391,7 +1388,7 @@ tier_upstream_pid=$!
 pids+=("$tier_upstream_pid")
 wait_for_port "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
 
-"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$cache_node_worker"     --advertise="127.0.0.1:${cache_node_worker}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
+"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --advertise="127.0.0.1:${cache_node_port}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
 tier_node_pid=$!
 pids+=("$tier_node_pid")
 wait_for_port "$cache_node_port" "$tier_node_pid" "cache node" "${workdir}/tier-node.log"
@@ -1442,7 +1439,7 @@ echo "== case 10: a worker sizes itself from its node class"
 
 sizing_port="$(free_port)"
 "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --bind=127.0.0.1 --port="$sizing_port" --advertise="127.0.0.1:${sizing_port}" \
+    --listen-node="127.0.0.1:${sizing_port}" --advertise="127.0.0.1:${sizing_port}" \
     --toolchain="self-sizing=${compiler}" \
     --node-class=dedicated --reserve-cores=0 --log-level=debug \
     > "${workdir}/sizing.log" 2>&1 &
@@ -1494,7 +1491,7 @@ blackhole_worker_port="$(free_port)"
 # `--scheduler` is required whenever a worker surface is configured -- a worker
 # nothing knows about serves nobody, and the node refuses to start rather than
 # looking healthy. It points at the scheduler this run already has.
-"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --bind=127.0.0.1 --port="$blackhole_worker_port"     --advertise="127.0.0.1:${blackhole_worker_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
+"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --advertise="127.0.0.1:${blackhole_node_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
 blackhole_node_pid=$!
 pids+=("$blackhole_node_pid")
 wait_for_port "$blackhole_node_port" "$blackhole_node_pid" "black-hole node" "${workdir}/blackhole-node.log"

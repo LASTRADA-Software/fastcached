@@ -89,6 +89,25 @@ budget or reduce what runs beside it.
 
 Three separate errors, and only the first is about this fixture.
 
+- **When a test binary dies mid-run the DENOMINATOR moves, and the ratio still looks
+  healthy.** `AGENT.md` says a count cannot carry a verdict -- "25 of 26 green is
+  arithmetic that is true and useless" -- and this is its sharper form: a crash does
+  not report as a crash, it reports as a *smaller suite that mostly passed*. Measured
+  while deleting a flag in #290 stage 3: removing a row from a `std::array<Row, 4>`
+  left the fourth value-initialized to null pointers, the segfault took the rest of
+  the run with it, and the summary read `171 cases | 170 passed | 1 failed` for a
+  binary holding **276**. Every instinct trained on ratios says that is fine.
+
+  The only signal was that 171 was not 276, which is a number you have to already
+  know -- so do not rely on noticing it. **Compare the case count against the previous
+  run whenever a change deletes anything**, and treat a drop as a crash until proven
+  otherwise. A shrinking suite and a passing suite look identical in the one line most
+  people read.
+
+  It is also the project's own table rule arriving in a test file: an extent written
+  as a literal outlived its rows. `std::to_array` derives it and the shape becomes
+  unrepresentable, which is why the production tables use it.
+
 - **A cumulative figure cannot answer a question about now.** `cpuDuringWait` was
   the total over the whole wait and was read as a claim about the process's state
   **at the deadline**. 3.4s spread evenly over 300 seconds and 3.4s burned in the
