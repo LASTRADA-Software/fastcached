@@ -322,6 +322,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   refusing cache still dispatches, because the two live on different machines. The
   reason is still recorded, the MISS trace is skipped so it is not overwritten, and
   the `STORE` is skipped so a dead cache is asked no more often than before.
+- A bounded wait MEASURES its ceiling: `waited += poll` counts the sleep it ASKED for,
+  and a sleep costs what the host's timer granularity says — so a stated 5 s enforced
+  15 s and 7.5 s at two sites, silently, with every test green. One `DrainWithin`
+  (`Core/BoundedDrain.hpp`), whose `DrainBound` carries the ceiling and the cadence and
+  whose blocking and clock are ONE injected seam — a test whose sleeps cost what they
+  requested cannot tell the two implementations apart on any platform. Both copies cited
+  the correct implementation in a comment and had reimplemented it; a comment naming what
+  it duplicates vouches for the duplicate's bugs.
 - An unbounded drain does not avoid an ending, it hands the choice to the supervisor,
   which answers `SIGKILL` with no diagnostic. `~WorkerServer` bounds it, says what it
   abandons and ends the process itself — returning would free members a running job is

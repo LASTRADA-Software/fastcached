@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 
 #include <cassert>
 #include <chrono>
@@ -455,18 +456,14 @@ void RaftPeerTransport::Stop() noexcept
            && "RaftPeerTransport::Stop must not be called from the reactor's own thread");
 
     // Bounded, because a stuck peer must not turn a stop into a hang -- which is
-    // exactly what this transport used to do. Same ceiling and cadence as
-    // `RaftPeerServer::Shutdown`, for the same reason.
-    constexpr auto Ceiling = std::chrono::seconds { 5 };
-    constexpr auto Poll = std::chrono::milliseconds { 10 };
-    auto waited = std::chrono::milliseconds { 0 };
-    while (_sendersRunning.load(std::memory_order_acquire) != 0 && waited < Ceiling)
-    {
-        std::this_thread::sleep_for(Poll);
-        waited += Poll;
-    }
+    // exactly what this transport used to do. Through `DrainWithin`, the one
+    // bounded drain here: this loop had been a copy that named
+    // `RaftPeerServer::Shutdown`'s ceiling and then accumulated the requested poll
+    // rather than measuring it, enforcing 7.5 s on a host whose 10 ms sleep costs
+    // 15 (#452).
+    auto const outcome = DrainWithin([this] { return _sendersRunning.load(std::memory_order_acquire) != 0; });
 
-    if (auto const stuck = _sendersRunning.load(std::memory_order_acquire); stuck != 0)
+    if (auto const stuck = _sendersRunning.load(std::memory_order_acquire); outcome == DrainResult::Ceiling && stuck != 0)
     {
         // Released rather than destroyed. The reactor may still hold these
         // handles, so destroying the frames is undefined behaviour while leaking
@@ -475,7 +472,7 @@ void RaftPeerTransport::Stop() noexcept
         _logger.Log(LogLevel::Error,
                     std::format("raft: {} peer sender(s) did not finish within {} ms; leaking their frames",
                                 stuck,
-                                Ceiling.count() * 1000));
+                                DrainBound {}.ceiling.count()));
         auto const guard = std::unique_lock { _peersMutex };
         for (auto& [id, peer]: _peers)
             std::ignore = peer->sender.Release();

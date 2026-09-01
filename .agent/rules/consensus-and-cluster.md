@@ -627,6 +627,17 @@ Every rule below has already been a bug.
     `OnInstallSnapshot`, and a rule stated in only one of them is a rule the cluster
     does not have.
 
+- **A shutdown drain here is `Core/BoundedDrain.hpp`'s `DrainWithin`, never a loop.**
+  `RaftPeerServer::Shutdown` and `RaftPeerTransport::Stop` both wait for detached
+  coroutines that borrow members of the object being torn down, and both are bounded
+  so a stuck peer cannot turn a stop into a hang. `RaftPeerServer`'s wait was correct
+  and was then copied by `RaftPeerTransport` and by the node's `FrameServer`, both of
+  which accumulated the poll they *requested* instead of measuring what it cost, and
+  so enforced 7.5 s and 15 s against a stated 5 (#452). Both copies named
+  `RaftPeerServer::Shutdown` in a comment while reimplementing it. The ceiling and the
+  cadence are `DrainBound`'s defaults, so neither site states one; the reasoning is in
+  [`.agent/rules/distributed-compilation.md`](distributed-compilation.md).
+
 ## Open work
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a

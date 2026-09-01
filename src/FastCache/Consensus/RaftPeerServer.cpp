@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <chrono>
@@ -230,11 +231,14 @@ void RaftPeerServer::Shutdown() noexcept
     // after the server is destroyed. Bounded rather than unconditional: a stuck
     // peer must not turn a stop into a hang, which is how a service ends up
     // killed by its supervisor instead of stopping.
-    using namespace std::chrono_literals;
-    constexpr auto MaxDrainTime = 5s;
-    auto const start = std::chrono::steady_clock::now();
-    while (_active.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() - start < MaxDrainTime)
-        std::this_thread::sleep_for(10ms);
+    //
+    // This wait was correct, and was then copied twice by loops that cited it and
+    // counted their polls instead of measuring them. So it is now the shared
+    // `DrainWithin`, and the ceiling and the cadence live there with it (#452).
+    if (DrainWithin([this] { return _active.load(std::memory_order_acquire) > 0; }) == DrainResult::Ceiling)
+        _logger.Logf(LogLevel::Error,
+                     "raft: {} peer connection(s) did not finish within the stop ceiling",
+                     _active.load(std::memory_order_acquire));
 }
 
 } // namespace FastCache::Consensus

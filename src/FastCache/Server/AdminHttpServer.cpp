@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/TlsWrap.hpp>
@@ -397,12 +398,12 @@ void AdminHttpServer::Shutdown() noexcept
     // handler that suspends on a slow write could touch freed members after
     // the server object is destroyed. Bounded by the per-request socket I/O
     // timeout, plus a generous spin-cap so a stuck handler cannot block
-    // forever.
-    using namespace std::chrono_literals;
-    constexpr auto MaxDrainTime = 5s;
-    auto const start = std::chrono::steady_clock::now();
-    while (_inFlight.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() - start < MaxDrainTime)
-        std::this_thread::sleep_for(10ms);
+    // forever -- through the one shared `DrainWithin`, which measures that ceiling
+    // rather than counting polls towards it (#452).
+    if (DrainWithin([this] { return _inFlight.load(std::memory_order_acquire) > 0; }) == DrainResult::Ceiling)
+        _logger.Logf(LogLevel::Error,
+                     "admin: {} request(s) did not finish within the stop ceiling",
+                     _inFlight.load(std::memory_order_acquire));
 }
 
 } // namespace FastCache
