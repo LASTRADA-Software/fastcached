@@ -641,12 +641,11 @@ each, then exits without opening anything:
 ```console
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
-compile           0.0.0.0:6676    TCP
-cache             127.0.0.1:6674  TCP
-scheduler         0.0.0.0:6675    TCP
-admin             -               not served; set --admin-listen
-raft              0.0.0.0:6680    TCP
-discovery beacon  0.0.0.0:6681    UDP
+compile           0.0.0.0:6676  TCP
+node              0.0.0.0:6675  TCP
+admin             -             not served; set --admin-listen
+raft              0.0.0.0:6680  TCP
+discovery beacon  0.0.0.0:6681  UDP
 
 notes:
   …
