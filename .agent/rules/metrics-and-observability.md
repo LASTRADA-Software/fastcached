@@ -668,3 +668,21 @@ outright rather than drawing with a gap.
   every compile. Deliberately a *measurement* ticket: a TTL buys latency and pays
   in staleness on the one page that exists to be current, and the charts already
   avoid the cost with a validator rather than a lifetime.
+
+- **[#491](https://github.com/LASTRADA-Software/fastcached/issues/491)** — the merged
+  listener's frame ceiling and byte budget are counted for **compile** verbs and
+  answered uncounted for cache and scheduler ones. #447 routed every refusal to the
+  surface that owns it and deliberately did not change what the other two surfaces
+  count, which is their own older position. The catch is which refusal a real node
+  reaches: `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's, in
+  practice the cache's, so the byte-budget refusal that fires on a node with a tier is
+  a cache `STORE` — the uncounted one. #326's scenario, one surface over.
+- **[#492](https://github.com/LASTRADA-Software/fastcached/issues/492)** —
+  `worker-refusals-counted` scans a hand-kept list of `.cpp` files. Its own header
+  records that list growing by hand once already, and #447 grew it a second time and
+  still could not cover `Responders.hpp`, where the two new credential counters live,
+  because it is a header. An over-broad scan fails CLOSED — a wrongly-included file
+  reports, a wrongly-excluded one is silent — so globbing with named exclusions beats
+  enumeration even though both are lists. Retiring the class rather than patching it
+  needs `Cc::SurfaceRefusal` out of `fastcache-cc`'s private header and into a shared
+  home, so the scan can target the type instead of somebody's memory.

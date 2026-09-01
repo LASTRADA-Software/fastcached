@@ -1527,11 +1527,12 @@ refusal to the component that owns the verb, and the three components do not all
 count the same things — a deliberate split, not an oversight, but one that decides
 what an alert can see. The frame ceiling and the byte budget move a counter for
 **compile** verbs; on a cache `STORE` or a scheduler `REGISTER` they are answered
-correctly and counted nowhere. That is a known gap rather than a claim about those
-surfaces being quiet, and it matters most on a node holding a cache tier: the
-listener's in-flight ceiling is the largest of the components present, which is
-usually the cache's, so the byte-budget refusal that fires in practice is a cache
-`STORE`.
+correctly and counted nowhere
+([#491](https://github.com/LASTRADA-Software/fastcached/issues/491)). That is a
+known gap rather than a claim about those surfaces being quiet, and it matters most
+on a node holding a cache tier: the listener's in-flight ceiling is the largest of
+the components present, which is usually the cache's, so the byte-budget refusal
+that fires in practice is a cache `STORE`.
 
 | Series | Says | Counted for |
 |---|---|---|
