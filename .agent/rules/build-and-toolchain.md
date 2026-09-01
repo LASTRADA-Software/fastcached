@@ -125,6 +125,98 @@ determinism rests on.
     directory on the wrong analyser, one that never found any, one with no entry, one already
     correct -- because the gate itself builds two whole configurations and cannot be a test,
     while the part that can be silently wrong is pure.
+- **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
+  `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
+  so both its configurations were fronted by whichever launcher happened to be installed, at
+  whatever version, with no check and no mention. Measured: 148 `LAUNCHER = ` lines in
+  `clang-debug` and 618 in `gcc-release`, all pointing at an installed `fastcache-cc` hundreds
+  of commits behind master and subject to [#368](https://github.com/LASTRADA-Software/fastcached/issues/368)
+  ([#471](https://github.com/LASTRADA-Software/fastcached/issues/471)).
+
+  **The rule was already standing, in a file sitting beside the one that ignored it.**
+  `scripts/launcher-replay-e2e.sh` names "the standing `-DUSE_COMPILER_CACHE=OFF` rule" in its
+  own header and records what it is for: in #319 a cache-backed build of a test binary
+  segfaulted where the same commit built cache-off passed, and nothing in CI could have
+  reported it. `CMakePresets.json` carries the same value on `clang-coverage` for an
+  independent reason. The project had decided this twice and written it down twice, and the
+  gate was the only reference build in the tree that dissented. **Stating a rule in the file
+  that obeys it is how the file that does not obey it never learns about it** -- the same
+  mechanism as `tsan-gate.sh` documenting that macOS has no `timeout(1)` while `cluster-e2e.sh`
+  called it anyway. A rule with one instance is a comment; a rule with two needs a check.
+  - **Pinning the other two tools is the argument for REMOVING this one, not for versioning
+    it.** `clang-format` and `clang-tidy` are pinned because their version changes the verdict
+    and there is a canonical version to pin *to*. A compiler cache has neither: no canonical
+    version, and it is supposed to be verdict-**neutral**. When it is not, it substitutes an
+    object the tree did not produce. The tempting symmetry -- require the launcher to be the
+    build of the current tree -- is unsound twice over. `git describe` on a dirty tree yields
+    `X.Y.Z-N-gsha-dirty`, and two different working trees produce that same string, so it is
+    not an identity; and the only launcher that could ever match is one built from the tree
+    under gate, which routes the gate's objects through the very change being gated. That is
+    worse than an unknown-vintage launcher, which is at least independent of the diff.
+  - **Passing the flag is not the same fact as no launcher being in effect.**
+    `cmake/portable/CompileCache.cmake` returns early when `CMAKE_CXX_COMPILER_LAUNCHER` was
+    set externally -- a preset, a toolchain file, an older `-D` -- and leaves it untouched. So
+    the gate reads the **generated build**: `LAUNCHER = ` in `build.ninja`, which is already
+    this project's idiom for the question, since `launcher-replay-e2e.sh` checks the same
+    string from the other side to prove a launcher *is* in use. The first design read
+    `CMAKE_CXX_COMPILER_LAUNCHER` back out of `CMakeCache.txt` and would have reported "no
+    launcher" against both live gate directories: `CompileCache.cmake` sets it as an ordinary
+    directory-scope variable and never as a cache entry, so that guard could not fire -- inside
+    the fix for a ticket about guards that cannot fire. It was caught by checking the two real
+    caches rather than by reasoning about the CMake documentation.
+  - **Whatever the refusal reads is also a reason to configure, or the gate cannot repair the
+    state it refuses.** CMake enters `-D` values into `CMakeCache.txt` and writes that file
+    even when the configure then FAILS, leaving the old `build.ninja` untouched -- so a first
+    run can leave a cache reading `OFF` with the right analyser beside a launcher-fronted
+    build. Judged from the cache alone, every later run finds nothing to configure, refuses on
+    the stale build, and blames an external `CMAKE_CXX_COMPILER_LAUNCHER` that nobody set --
+    and re-running can never fix it, because re-running is what skips the configure. That is
+    the analyser bug above, reopened one file over. So `configure_reason` reads the generated
+    build too, through the same `launcher_verdict` the refusal uses: one observable, not two
+    that can disagree, and the refusal's message is then true because the only state that
+    reaches it is one that survived a configure which actually ran.
+  - A missing `build.ninja` is `unknown`, one that cannot be READ is `unreadable`, and neither
+    is ever folded into a count of zero: zero is a reading, the other two are the absence of
+    one and the failure to take one. `awk` on a file it cannot open exits **without running
+    its `END` block**, so it prints nothing -- and an empty answer reaching the caller's
+    default arm renders a failed reading as the worst positive one, refusing a build nobody
+    could read while blaming a launcher nobody set. A `[[ -f ]]` that passes for a file whose
+    permissions deny it is exactly where the fourth state hides. `USE_COMPILER_CACHE` absent
+    reads as ON, since that is the option's default.
+  - The match is **not** anchored to ninja's two-space indent, deliberately: anchoring fails
+    OPEN if that spelling ever changes, because a count of zero reads as a clean build. Loose
+    can only over-count, which for a gate is the safe direction -- and since
+    `CMAKE_<LANG>_LINKER_LAUNCHER` emits the same binding, the number is reported as
+    launcher-fronted **edges** rather than as compile edges.
+  - **The gate does not own its build directories, and says so.** Every preset has one
+    `binaryDir`, `out/build/${presetName}`, and these are the trees this project tells
+    developers and agents to build in; `-D` writes a cache entry and `option()` never
+    overrides one, so a gate run turns the compiler cache off there *permanently*. That is
+    accepted as a STATED cost -- the run prints what it did, that it is permanent, and how to
+    undo it -- and gate-owned directories are
+    [#487](https://github.com/LASTRADA-Software/fastcached/issues/487). A silent change to how
+    a tree builds is the defect this whole entry is about, so the fix for it must not commit a
+    quieter version of it one directory over.
+  - The one-time cost is stated by the run that incurs it. Dropping the launcher rewrites every
+    compile command, so ninja rebuilds the configuration from scratch once; a developer
+    watching that with no explanation files it as breakage. An explained cost is a cost.
+  - **What it costs, measured rather than asserted** -- and as a table of conditions, because a
+    single number here is the wrong quantity in whichever direction it is quoted. One
+    `gcc-release` configuration, 630 object edges, from scratch, 32 jobs, WSL2 on a 9p mount:
+
+    | leg | wall clock |
+    |---|---|
+    | launcher on, nothing stored yet (629 fronted edges) | 224 s |
+    | **launcher off** (0 fronted edges) | **230 s** |
+    | launcher on, everything replayed | 94 s |
+
+    So a **full** rebuild of one configuration costs ~136 s more, about 2.4x -- and a MISSING
+    cache costs the same as no cache, which is why the first row must not be quoted as the
+    price of this change. Neither may the third: the gate is incremental, so a from-scratch
+    build happens once when this lands, and thereafter only when something invalidates
+    everything anyway. Note also that the warm row is exactly the exposure -- 629 objects
+    replayed from an earlier build is the state in which "the objects need not match this tree"
+    is a live claim rather than a theoretical one.
 - **When `clang-debug` cannot be built, get the sanitizer from GCC instead.** That
   preset is the only one that runs ASan, and on a host where it cannot configure at
   all the tempting conclusion is that no sanitizer coverage is available locally. It

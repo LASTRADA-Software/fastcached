@@ -550,22 +550,32 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
-# The local gate pins its analyser. Fails when `scripts/local-gate.sh` would run
-# clang-tidy at a version nobody chose, or would accept a build directory that
-# already caches one.
+# The local gate pins its analyser and refuses a compiler cache. Fails when
+# `scripts/local-gate.sh` would run clang-tidy at a version nobody chose, would
+# accept a build directory that already caches one, or would build its objects
+# through a compiler-cache launcher.
 #
 # The gate itself cannot be a test -- it builds two whole configurations -- but the
-# part that can be WRONG is a decision over a CMake cache file, and that part is
-# pure. `--self-test` drives it against synthetic caches: a directory on the wrong
-# analyser, one whose `find_program` never found any (`CLANG_TIDY_EXE-NOTFOUND`),
-# one with no entry at all, and one already correct.
+# parts that can be WRONG are decisions over a build directory, and those are pure.
+# `--self-test` drives them against synthetic ones: caches on the wrong analyser,
+# one whose `find_program` never found any (`CLANG_TIDY_EXE-NOTFOUND`), one with no
+# entry at all, one already correct, ones with compiler caching on, off and unset,
+# and -- beside a cache the gate is entirely happy with -- a generated build that is
+# launcher-fronted, and none at all. Those last two are what a FAILED configure
+# leaves behind, and they are the cases where the gate has to be able to repair the
+# state it refuses rather than refuse it forever.
 #
-# The failure it exists for reads exactly like success. `find_program` never
-# revisits a filled cache entry and the gate only configured when `CMakeCache.txt`
-# was ABSENT, so a build directory kept whichever clang-tidy it first found forever
-# and re-running the gate could not fix it -- re-running the gate is what skipped
-# the configure. The same shape as the stale `FASTCACHE_CC-NOTFOUND` that kept
-# build trees on sccache silently.
+# The failure it exists for reads exactly like success, in both halves.
+# `find_program` never revisits a filled cache entry and the gate only configured
+# when `CMakeCache.txt` was ABSENT, so a build directory kept whichever clang-tidy
+# it first found forever and re-running the gate could not fix it -- re-running the
+# gate is what skipped the configure. The same shape as the stale
+# `FASTCACHE_CC-NOTFOUND` that kept build trees on sccache silently. And
+# `USE_COMPILER_CACHE` defaults to ON, so a gate that never mentioned it built both
+# configurations through whatever launcher was installed -- 148 and 618
+# launcher-fronted edges when it was measured (#471), against the standing
+# `-DUSE_COMPILER_CACHE=OFF` rule that `scripts/launcher-replay-e2e.sh` already
+# names and #319 already paid for.
 #
 # Not labelled "smoke": it starts no daemon, opens no socket, and needs neither
 # cmake nor clang-tidy. `if(NOT WIN32)` for the reason `ci-scope` carries the same
