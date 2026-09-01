@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -701,6 +702,33 @@ inline constexpr std::size_t MaxAuthPayload = 4096;
 /// that can be made to allocate 256 MiB per frame by anything that authenticated
 /// once is a scheduler that stops scheduling.
 inline constexpr std::size_t MaxControlPayload = 64 * 1024;
+
+/// How long a scheduler's lease lives, and therefore how long a client waits.
+///
+/// **One number, and it has to be, because the two ends bound the same thing from
+/// opposite sides.** Above the lease timeout a client waits on a lease the scheduler
+/// has already reclaimed and may have re-granted for the same key; below it, a
+/// compile the fleet is still holding capacity for is thrown away. Neither end can
+/// pick its own value without describing a fleet the other end is not running
+/// ([#249](https://github.com/LASTRADA-Software/fastcached/issues/249)).
+///
+/// It lives HERE for the reason `MaxAuthPayload` and `MaxControlPayload` do: this
+/// header is the only thing both ends can include. `fastcache-cc` does not link
+/// `FastCache`, so `LeaseTable`'s own header is not reachable from the launcher --
+/// which is what left these as two literals coupled by a doc comment. The comment
+/// was right that they could not be `static_assert`ed against each other; it was
+/// wrong that nothing could be done, because the VALUE could move to where both
+/// sides already look.
+///
+/// No `static_assert` pairs them, deliberately: both now DERIVE from this, so there
+/// is nothing left to disagree. An assertion that two aliases of one constant are
+/// equal is the guard that fires only when nothing is wrong.
+///
+/// Sized for "longer than any single translation unit anybody compiles". The cost of
+/// too short is duplicated work; the cost of too long is one key not being
+/// distributed while a dead worker goes unnoticed -- which is a real cost, stated on
+/// `DefaultDispatchTotal` and split properly only by #245's liveness signal.
+inline constexpr std::chrono::milliseconds DefaultCompileLeaseTimeout { 600'000 };
 
 /// Every opcode this build understands.
 ///
