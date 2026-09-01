@@ -4,6 +4,7 @@
 
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -774,19 +775,19 @@ void FrameServer::Shutdown() noexcept
     // early would let `~FrameServer` free what they are still using -- and would
     // leave the port bound after the endpoint claims to have stopped.
     //
-    // Bounded, because a stuck connection must not turn a stop into a hang: the
-    // ceiling and cadence `RaftPeerServer::Shutdown` already uses, for the reason it
-    // records.
-    constexpr auto Ceiling = std::chrono::seconds { 5 };
-    constexpr auto Poll = std::chrono::milliseconds { 5 };
-    auto waited = std::chrono::milliseconds { 0 };
-    while ((_state->loopsAlive.load(std::memory_order_acquire) != 0 || _state->OpenCount() != 0) && waited < Ceiling)
-    {
-        std::this_thread::sleep_for(Poll);
-        waited += Poll;
-    }
+    // Bounded, because a stuck connection must not turn a stop into a hang.
+    // `DrainWithin` is the one bounded drain in this tree, and this is one of the
+    // two sites it came from: the loop that stood here cited the ceiling and
+    // cadence `RaftPeerServer::Shutdown` uses and then reimplemented both --
+    // accumulating the requested poll instead of measuring it, so the 5 s it named
+    // was 15 s on a host whose timer granularity is 15 ms, and the cadence it
+    // claimed to share was 5 ms rather than 10 (#452).
+    auto const outcome = DrainWithin([&state = *_state] {
+        return state.loopsAlive.load(std::memory_order_acquire) != 0 || state.OpenCount() != 0;
+    });
 
-    if (auto const stuck = _state->loopsAlive.load(std::memory_order_acquire) + _state->OpenCount(); stuck != 0)
+    if (auto const stuck = _state->loopsAlive.load(std::memory_order_acquire) + _state->OpenCount();
+        outcome == DrainResult::Ceiling && stuck != 0)
         _state->logger.Logf(
             LogLevel::Error, "{}: {} loop(s)/connection(s) did not finish within the stop ceiling", _state->what, stuck);
 }
