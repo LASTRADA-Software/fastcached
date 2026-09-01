@@ -198,10 +198,11 @@ determinism rests on.
     only thing that distinguishes "gated" from "gated on paper".
   - **So a sanitizer job proves the tree only once something proves the sanitizer.**
     `scripts/tsan-gate.sh` will not report clean until it has answered two separate
-    questions, because they fail separately: `__tsan_init` in the **test binaries**
-    says *this artefact* was instrumented, and `src/tests/TsanCanary.cpp` -- a
-    deliberate data race, built by the same `add_compile_options` as everything else
-    -- says the runtime still detects and reports. A `TSAN_OPTIONS`, a suppressions
+    questions, because they fail separately: an **undefined** `__tsan_init` reference
+    in each artefact's **own object files** says *this artefact* was instrumented,
+    and `src/tests/TsanCanary.cpp` -- a deliberate data race, built by the same
+    `add_compile_options` as everything else -- says the runtime still detects and
+    reports. A `TSAN_OPTIONS`, a suppressions
     pattern or a stripped runtime can break the second while the first still holds.
     The canary is run **with the suppressions file active**, so a wildcard broad
     enough to swallow an obvious race fails the gate instead of silently disarming
@@ -210,6 +211,42 @@ determinism rests on.
     script's header and deliberately nowhere else. It said "five refusals" in three
     files, in three orders, having dropped the two hardest to reason about: a hard
     count restated beside the thing it counts is a fact with no owner.
+  - **`__tsan_init` in a BINARY is a property of the link, not of any translation
+    unit** -- so asking `nm --defined-only` of a binary cannot prove instrumentation,
+    and for three years that is what this gate did. The symbol is *defined by the
+    sanitizer runtime*, which the link pulls in whole whenever `-fsanitize=thread` is
+    on the link line. Measured, same source, two objects, two binaries: a canary
+    whose TU was compiled with **no sanitizer flag at all** produced a binary
+    carrying `__tsan_init` and passed the proof. Ask the **objects** instead, where
+    the reference is *undefined* and cannot be borrowed from a runtime the object is
+    not linked to. Same symbol; what changed is `--undefined-only` and what it is
+    asked of.
+    Three things that only appear once you look at where the proof is *used*:
+    **the canary was never the exposed artefact.** An uninstrumented canary fails
+    closed -- it exits 0, reports no race, and the gate refuses -- though it used to
+    do so while blaming `TSAN_OPTIONS`, the suppressions file and the runtime, all
+    three of which were fine. The **test binaries** had no backstop: `RunTarget`
+    checks the timeout, the tag filter and the assertion count, and not one of those
+    distinguishes an instrumented run from an uninstrumented one, so an
+    uninstrumented `FastCacheTest` ran, reported assertions, exited 0, and the gate
+    printed *all scoped targets clean*. A fix covering only the canary would have
+    closed the issue with its stated harm untouched.
+    **The obvious per-function symbols are the wrong ones.** `__tsan_func_entry`,
+    `__tsan_read` and `__tsan_write` are emitted per instrumented *function*, so an
+    object whose TU has no functions carries none -- six of `FastCacheTest`'s 135,
+    the platform-gated `Iocp*`, `Kqueue*` and `Tls*` files that compile to nothing
+    on Linux. They do carry `__tsan_init` and a `tsan.module_ctor`: instrumented,
+    with nothing to instrument. A rule built on the hooks needs an empty-TU
+    exemption; one built on `__tsan_init` needs none, and holds 185 of 185 objects
+    across the three targets. That is the empty-translation-unit state showing up in
+    an *instrument* -- naming it rather than collapsing it into pass or fail is the
+    four-states rule again.
+    **And the guard is exercised**: `ctest -R tsan-gate-selftest` drives every
+    verdict against staged object trees -- a suite binary with one uninstrumented
+    object first, since that is the half with no backstop -- through a stub `nm`, so
+    it needs no compiler and runs in the default set. A guard that has never been
+    seen to fire is what this whole file is about, and this one could not fire at
+    all.
   - **A filter that matches nothing is a suite that tested nothing**, and every
     other signal in that run reads clean. The gate names it, and separately refuses
     an exit of 0 that reported no assertions. This is the same shape as a sweep that
@@ -221,13 +258,21 @@ determinism rests on.
     status and the pipeline reports failure. So `nm "$bin" | grep -q __tsan_init`
     says "no such symbol" precisely *because* the symbol was there. Capture the
     output into a variable and match afterwards
-    (`syms="$(nm "$bin")"; [[ "$syms" == *__tsan_init* ]]`), or drop `-q`. This is
+    (`syms="$(nm "$obj")"; [[ "$syms" == *__tsan_init* ]]`), or drop `-q`. This is
     not specific to `nm`: **every "does this artefact contain X" idiom in this tree
     is exposed to it** -- symbol checks, `strings | grep -q`, `objdump | grep -q`,
     any long producer feeding an early-exiting matcher. It bit `scripts/tsan-gate.sh`
     itself, which is the script written to catch exactly this class of thing, and
     that is the first time here that the *checking mechanism* produced the false
     reading rather than the thing being checked.
+    **And it is worse than a false negative: it is RACY.** Measured while fixing
+    #472, in the census scripts written to count instrumented objects. Whether
+    `printf` finishes before `grep -q` closes the pipe is a scheduling accident, so
+    two runs over the same 135 objects returned **129 and 108**, and a listing built
+    the same way named **27** offenders against a true **6**. A deterministic wrong
+    answer is caught by the first person who checks it twice; a racy one is
+    attributed to the subject, which is how it survives. Two runs agreeing is
+    therefore not evidence that a pipeline of this shape is sound.
   - **An edit script asserts its anchor MATCHED, and a generator that produced
     nothing fails rather than reporting success.** The same family as the two above,
     reached from the authoring side rather than the checking side, and it happened
