@@ -1666,11 +1666,46 @@ jobs:
             echo "::error::a connection did not bring the worker up"
             systemctl status fastcache-compile-node --no-pager || true; exit 1; }
 
-          # It must have ADOPTED the socket rather than bound its own. Binding
-          # would have failed against the socket unit already holding the port,
-          # so a running service that did not adopt is a service listening
-          # somewhere nobody was told about.
-          grep -q 'adopted a socket-activated listener' /tmp/node-log.txt \
+          # It must have ADOPTED the socket rather than bound its own, and that is
+          # asserted on the STATE as well as on a log line.
+          #
+          # The paragraph here used to argue the grep was belt-and-braces, because a
+          # worker that failed to adopt would collide with the socket unit already
+          # holding the port and never come up. That was true while the activated
+          # surface was the dedicated compile port -- `--bind`/`--port`, the same port
+          # the unit holds. #290 stage 3 activates the NODE surface instead, whose
+          # default is 6674 while this unit holds 6676, and `fastcached` is stopped a
+          # step earlier so 6674 is free. A non-adopting worker therefore binds its
+          # own default, logs readiness, and passes every other assertion in this
+          # step. The reasoning survived the change that invalidated it, so the grep
+          # had quietly become the only check standing here.
+          #
+          # `ss` rather than a connect probe: a connect to 6676 succeeds either way,
+          # since the socket unit answers it whether or not the service adopted. What
+          # separates the two outcomes is whether anything is listening on the port
+          # the FALLBACK would take.
+          command -v ss >/dev/null \
+            || { echo "::error::ss is unavailable, so this step cannot tell an adopted socket from a bound one"; exit 1; }
+          # Captured and matched, never `ss ... | grep -q`. That pipeline is a false
+          # NEGATIVE under `pipefail`, and it fails on the success path: `grep -q`
+          # exits at the first match, `ss` dies of SIGPIPE, and `pipefail` reports
+          # the producer's status -- so the pipeline says "nothing listening"
+          # precisely when something IS. Same trap as `nm | grep -q __tsan_init` in
+          # build-and-toolchain.md, which is where this shape is written down.
+          #
+          # `if` rather than an `&&` chain for the second reason: under `set -e` the
+          # good case would make a chained form return non-zero and abort the step.
+          listening_6674="$(ss -lnt 'sport = :6674' 2>/dev/null || true)"
+          if [[ "$listening_6674" == *LISTEN* ]]; then
+            echo "::error::the worker bound its own --listen-node default instead of adopting the activated socket"
+            ss -lnt || true; exit 1
+          fi
+
+          # And the sentence, which is what says WHY it is not on 6674 -- the state
+          # check alone cannot separate "adopted" from "started no listener at all".
+          # Its wording changed with the flags: it named `--bind` and `--port` until
+          # stage 3 deleted them.
+          grep -q 'serving a socket-activated listener' /tmp/node-log.txt \
             || { echo "::error::the worker did not adopt the activated socket"; exit 1; }
 
           test "$(systemctl show -p User --value fastcache-compile-node)" = fastcache-node
@@ -2184,8 +2219,24 @@ jobs:
           $cacheDir = Join-Path $env:RUNNER_TEMP 'fastcache-node-cache'
           $toolchain = (Get-Command cl.exe).Source
 
+          # --listen-node is NAMED, and it has to be since #290 stage 3.
+          #
+          # A node opens exactly one 0xFC port, defaulting to 127.0.0.1:6674 -- and
+          # the step above leaves a `fastcached` serving on 6674 for the rest of the
+          # job, where the Linux packaging job stops its daemon before installing the
+          # worker. Left defaulted, the worker's only port is a port it cannot have,
+          # and a bind it cannot make is now a startup refusal rather than a warning:
+          # before stage 3 a worker losing that port kept a compile port of its own
+          # and carried on, so the collision was invisible here.
+          #
+          # 6676, matching --advertise, so the two agree -- a loopback bind under a
+          # loopback advertise is the coherent single-machine shape and passes the
+          # startup table. Whether this job should co-install a daemon and a worker
+          # on one machine at all is a real question (#229 says it should not), and
+          # not one this step is the place to settle.
           & $node --install-service `
               --scheduler=127.0.0.1:6675 `
+              --listen-node=127.0.0.1:6676 `
               --advertise=127.0.0.1:6676 `
               --cache-dir="$cacheDir" `
               --toolchain="$toolchain"
@@ -2214,10 +2265,51 @@ jobs:
             # it must not be introduced by the installer either. The heartbeat
             # retries in a background thread, so an unreachable scheduler does not
             # stop the service.
-            Start-Service FastCacheCompileNode
+            # A failed start used to report one word -- `Stopped` -- for every
+            # possible cause, which is a status rather than a reason and sent the
+            # last failure here to log archaeology for a two-line answer. Every
+            # branch below is diagnostic and best-effort: the throw is what fails
+            # the step, and a diagnostic that cannot run must not mask it.
+            Start-Service FastCacheCompileNode -ErrorAction SilentlyContinue
             for ($i = 0; $i -lt 30 -and (Get-Service FastCacheCompileNode).Status -ne 'Running'; $i++) { Start-Sleep 1 }
             if ((Get-Service FastCacheCompileNode).Status -ne 'Running') {
-              throw "worker did not start under its virtual account: $((Get-Service FastCacheCompileNode).Status)"
+              $status = (Get-Service FastCacheCompileNode).Status
+
+              # What was actually registered. A registration replays this command
+              # line at every start, so it is the first thing to read and the one
+              # thing a status word can never carry.
+              $registered = (Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'").PathName
+              Write-Host "registered PathName: $registered"
+
+              # The sharpest version: run what was registered, in the foreground,
+              # so the refusal TEXT appears instead of a status. `--daemon` is
+              # stripped because it means "run under the SCM" and would fail for a
+              # different reason than the one being diagnosed.
+              try {
+                # A token is a run of unquoted characters and quoted sections, not
+                # `"..."|\S+` -- that alternation takes \S+ first and splits
+                # `--cache-dir="C:\dir with space"` into three arguments.
+                $argv = ([regex]::Matches($registered, '(?:[^\s"]|"[^"]*")+') | ForEach-Object { $_.Value -replace '"','' })
+                $exe = $argv[0]
+                $rest = @($argv | Select-Object -Skip 1 | Where-Object { $_ -ne '--daemon' })
+                $out = Join-Path $env:RUNNER_TEMP 'node-foreground.log'
+                $proc = Start-Process -FilePath $exe -ArgumentList $rest -PassThru -NoNewWindow `
+                          -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+                if (-not $proc.WaitForExit(15000)) { $proc.Kill(); Write-Host 'foreground run did not exit; it started cleanly' }
+                Write-Host '--- foreground stdout ---'; Get-Content $out -ErrorAction SilentlyContinue
+                Write-Host '--- foreground stderr ---'; Get-Content "$out.err" -ErrorAction SilentlyContinue
+              } catch { Write-Host "foreground reproduction failed: $_" }
+
+              # And what the SCM itself recorded, which covers the causes that never
+              # reach the process at all -- a missing account, a denied logon right.
+              try {
+                Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddMinutes(-5) } `
+                  -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Message -match 'FastCacheCompileNode' } |
+                  Select-Object -First 10 TimeCreated, Id, Message | Format-List
+              } catch { Write-Host "event log read failed: $_" }
+
+              throw "worker did not start under its virtual account: $status"
             }
             Stop-Service FastCacheCompileNode -Force
           }
