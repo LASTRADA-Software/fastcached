@@ -1060,11 +1060,21 @@ quickly.
   ambient dependency. A cache with a hidden clock is untestable by construction.
 
 **And prefer not needing the cache.** Computing a value once and returning what you
-already have beats caching it: `CachedToolchainFingerprint` derives the resolved
-path, the include roots and the stamp, returns none of them, and its caller
-re-derives all three at an extra driver spawn per toolchain per survey
-([#259](https://github.com/LASTRADA-Software/fastcached/issues/259)). That is not a
-caching problem and a cache would be the wrong fix for it.
+already have beats caching it: `CachedToolchainFingerprint` derived the resolved
+path, the include roots and the stamp, returned none of them, and its caller
+re-derived all three at an extra driver spawn per toolchain per survey — on warm
+starts too, because a cache HIT said nothing about the roots it covered. That was
+not a caching problem and a cache would have been the wrong fix for it; the fix was
+`ToolchainIdentity` handing back the `ToolchainEvidence` it had already folded
+([#259](https://github.com/LASTRADA-Software/fastcached/issues/259)). A wider return
+value is also the STRONGER answer, not merely the cheaper one: two derivations a few
+milliseconds apart can disagree, and the caller was recording evidence a compiler
+upgrade in between would have made describe a different include tree than the digest
+covers. **Evidence a caller may not have is a disengaged `optional`, never an empty
+field** — empty roots and an empty stamp are both ordinary answers, so neither can
+carry "there was no probe", and that is the guard from
+[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)
+moved out of the call site and into the type.
 
 ## C++ Coding Guidelines
 

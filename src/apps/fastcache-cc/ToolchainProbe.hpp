@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -587,6 +588,41 @@ static_assert(RowsInEnumeratorOrder(IdentityDefectTable, &IdentityDefectRow::def
     return IdentityDefectTable[static_cast<std::size_t>(defect)];
 }
 
+/// What a fingerprint was computed FROM, handed back rather than left to be re-derived.
+///
+/// The digest is a hash of exactly these, so anything that wants to notice the
+/// toolchain moving underneath it needs them and nothing else. They were previously
+/// recomputed by the caller, which cost one extra driver spawn per toolchain per
+/// survey -- on every node in the fleet, on every start, warm ones included, since
+/// the second derivation ran whether or not the first hit the cache (#259).
+///
+/// It is also the stronger guarantee, not merely the cheaper one. Two derivations a
+/// few milliseconds apart can disagree: a package manager replacing a compiler
+/// between them leaves a witness describing an include tree the digest does not
+/// cover, and such a toolchain then never reports itself stale. Returning what was
+/// actually folded makes "the same" a property of the code rather than of the
+/// machine holding still.
+struct ToolchainEvidence
+{
+    /// The compiler as it was STAT'd -- resolved on the search path, not as typed.
+    ///
+    /// A bare `cc` or `cl` cannot be stat'd from an arbitrary working directory, so
+    /// this is the spelling `ComputeToolchainStamp` was given and the one the cache
+    /// file is named after.
+    std::string compiler;
+
+    std::string banner;             ///< The version line folded into the digest and the stamp.
+    std::vector<std::string> roots; ///< The include search roots the digest covers, in probe order.
+
+    /// What those three hashed to, or empty when this toolchain cannot be stamped.
+    ///
+    /// Empty is a real answer -- an unstattable compiler, or a root whose name this
+    /// process cannot decode -- and means the toolchain is simply never found stale,
+    /// which is the same "refusing to stamp is refusing to cache" trade
+    /// `ComputeToolchainStamp` documents. It is never a change.
+    std::string stamp;
+};
+
 /// A toolchain fingerprint, and whether it says anything about WHICH compiler it is.
 struct ToolchainIdentity
 {
@@ -594,6 +630,23 @@ struct ToolchainIdentity
 
     /// Why this digest must not be served, or `None` when it may be.
     IdentityDefect defect { IdentityDefect::None };
+
+    /// What the digest was derived from, or nothing when there was nothing to derive.
+    ///
+    /// Disengaged in exactly two cases, and both mean the same thing: nothing was
+    /// measured. A probe that could not be SPAWNED is one (`IdentityDefect::UnrunProbe`,
+    /// which is `IncludeSearchRoots::answered` being false); an identity nobody probed
+    /// at all -- an operator's `<fingerprint>=<compiler>` pin, constructed directly --
+    /// is the other.
+    ///
+    /// Disengaged rather than an empty `roots`, for the reason `IncludeSearchRoots`
+    /// documents at length: several mechanisms legitimately find no roots, an empty
+    /// stamp is ordinary too, and neither field can carry "there was no probe". Making
+    /// it structural is what stops a caller building a record of evidence on a probe
+    /// that never ran -- a node would then watch a narrower set of roots than its own
+    /// fingerprint covers and stop noticing SDK-side changes, permanently and in
+    /// silence.
+    std::optional<ToolchainEvidence> evidence;
 
     /// Whether this identity may be registered, matched on, or dispatched with.
     ///
@@ -628,8 +681,11 @@ struct ToolchainIdentity
 /// @param spec The driver's table row.
 /// @param parallel Runs the walk's hashing slices when the cache misses.
 /// @param forceRefresh Skip the cached value and rewrite it.
-/// @return The fingerprint and whether it means anything; the digest is never
-///         empty (it degrades to a banner-only one).
+/// @return The fingerprint, whether it means anything, and what it was derived
+///         from; the digest is never empty (it degrades to a banner-only one).
+///         The evidence is derived on every call, cache hit included -- it is
+///         what the stamp comparison is made OF, so it cannot be cached behind
+///         that stamp, and it is therefore free to return.
 [[nodiscard]] ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
                                                            IToolchainHost& host,
                                                            std::string const& compiler,

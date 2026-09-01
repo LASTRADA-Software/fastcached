@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -155,6 +156,37 @@ class SpawnScript final: public Cc::IProcessRunner
         return *this;
     }
 
+    /// Have @p compiler's include probe name @p roots, the way a GNU driver does.
+    ///
+    /// Without this every fake compiler answers the include probe with its version
+    /// line, which parses to no root at all. That is an ordinary answer in production
+    /// and a useless one here: a case about what the survey RECORDED needs a toolchain
+    /// with something to record, or every field it checks holds vacuously.
+    ///
+    /// @param compiler The path whose search list this is.
+    /// @param roots What it should list, in order.
+    /// @return This runner, for chaining.
+    SpawnScript& IncludeRoots(std::string compiler, std::vector<std::string> const& roots)
+    {
+        std::string verbose = "#include <...> search starts here:\n";
+        for (auto const& root: roots)
+            verbose += " " + root + "\n";
+        verbose += "End of search list.\n";
+        _includeRoots.emplace_back(std::move(compiler), std::move(verbose));
+        return *this;
+    }
+
+    /// @return How many times the INCLUDE probe was spawned.
+    ///
+    /// The number issue #259 is about: the survey asked a driver where its headers
+    /// are, and then asked a second time to write down the answer it had just been
+    /// given. Keyed on `-E` for the reason `Unprobeable` is -- that flag belongs to
+    /// the include probe and to nothing else the survey runs.
+    [[nodiscard]] int IncludeProbes() const noexcept
+    {
+        return _includeProbes.load();
+    }
+
     Cc::CompileRun RunCaptureCombined(std::span<std::string const> argv) override
     {
         if (!argv.empty() && std::ranges::contains(_unspawnable, argv.front()))
@@ -167,6 +199,21 @@ class SpawnScript final: public Cc::IProcessRunner
         // and to nothing else the survey runs.
         if (!argv.empty() && std::ranges::contains(_unprobeable, argv.front()) && std::ranges::contains(argv, "-E"))
             return Cc::CompileRun { .exitCode = Cc::NotSpawned, .out = {}, .err = {} };
+
+        // Counted and answered before the banner fallback below, on the same `-E` key
+        // the branch above uses. Atomic because `FingerprintAll` calls one runner from
+        // several threads whenever a case presents more than one toolchain, and a fake
+        // that only happens to be safe for the cases written so far is a fake that
+        // reports a data race the day a fifth one is added.
+        if (!argv.empty() && std::ranges::contains(argv, "-E"))
+        {
+            _includeProbes.fetch_add(1);
+            for (auto const& [compiler, verbose]: _includeRoots)
+                if (compiler == argv.front())
+                    // On stderr, which is where a GNU-family driver prints its search
+                    // list and the only stream `DiscoverIncludePaths` reads it from.
+                    return Cc::CompileRun { .exitCode = 0, .out = {}, .err = verbose };
+        }
 
         // The banner names the compiler, so two distinct compilers get two distinct
         // identities. A constant banner would make every fake compiler fingerprint
@@ -192,6 +239,8 @@ class SpawnScript final: public Cc::IProcessRunner
     std::vector<std::string> _unprobeable;
     std::vector<std::string> _speechless;
     std::vector<std::pair<std::string, std::string>> _banners;
+    std::vector<std::pair<std::string, std::string>> _includeRoots;
+    std::atomic<int> _includeProbes { 0 };
 };
 
 /// A `cl.exe` in the layout every Visual Studio since 2017 installs.
@@ -793,6 +842,62 @@ TEST_CASE("NodeToolchains: two names for one toolchain are served once, and said
 
     // And the count an operator reads is the count of what is served.
     CHECK(Logged(logger, "discovered 1 toolchain(s)"));
+}
+
+TEST_CASE("NodeToolchains: the witness is the identity's own evidence and is probed once", "[node][toolchains]")
+{
+    // Issue #259. The survey records what a fingerprint rests on so that noticing the
+    // toolchain move later costs no walk (#238) -- and it used to DERIVE all of that a
+    // second time, beside the call that had just computed it: a search-path
+    // resolution, a driver spawn and a stat of every root, per toolchain, per survey,
+    // on every node in the fleet. The spawn ran on warm starts too, since a cache HIT
+    // returns a digest and used to say nothing about the roots it covers.
+    //
+    // A real directory, because the stamp reaches the filesystem with no seam in front
+    // of it and an unstattable stand-in would leave `Watchable()` false -- which is
+    // exactly the state a witness that recorded nothing would also be in.
+    FastCache::Testing::ScratchDirectory tree { "fc-node-witness" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("clang", "#!/bin/sh\n");
+    auto const compiler = (tree / "clang").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate(compiler) } };
+    SpawnScript runner;
+    runner.IncludeRoots(compiler, { root });
+    ScopedStateDir const state;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    // Asked through a runner of its own, so the spawn it costs is not the one under
+    // count -- and asked rather than written out, because what a banner probe makes of
+    // a driver's first line is that function's business and not this case's.
+    SpawnScript reference;
+    auto const expectedBanner = Cc::CompilerBanner(reference, compiler);
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
+    REQUIRE(resolved.has_value());
+    auto const& served = Unwrap(resolved);
+    REQUIRE(served.size() == 1);
+    auto const& witness = served.begin()->second.witness;
+
+    // ONE. Two is the defect, and it is the whole of what this case exists to fail on.
+    CHECK(runner.IncludeProbes() == 1);
+
+    // And what was recorded is this toolchain's, not an empty stand-in that a single
+    // probe would also produce if the evidence never travelled back. Each field is the
+    // one the digest folded: the resolved spelling rather than the typed one, the
+    // roots the driver listed, and a stamp over both.
+    CHECK(witness.compiler == host.ResolveOnSearchPath(compiler).value_or(compiler));
+    CHECK(witness.banner == expectedBanner);
+    CHECK(witness.roots == std::vector<std::string> { root });
+    CHECK(witness.Watchable());
+    CHECK(witness.stamp == Cc::ComputeToolchainStamp(witness.banner, witness.compiler, witness.roots));
+
+    // The recheck the witness exists for still answers "unchanged" over it, which is
+    // the property a witness built on the wrong evidence would quietly lose.
+    CHECK(StaleToolchains(served).empty());
 }
 
 TEST_CASE("NodeToolchains: two distinct compilers stay two", "[node][toolchains]")

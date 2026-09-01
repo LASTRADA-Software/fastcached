@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cc;
@@ -1484,6 +1485,139 @@ TEST_CASE("A driver that answered with no roots is still cached", "[toolchain-pr
 
     CHECK(identity.defect == IdentityDefect::NoEvidence);
     CHECK(StoredFingerprint(state) == identity.fingerprint);
+}
+
+// --- the evidence a fingerprint rests on ---------------------------------------
+
+TEST_CASE("A fingerprint carries the evidence it was derived from", "[toolchain-probe]")
+{
+    // Issue #259. The identity used to be the digest and nothing else, so a caller
+    // that needs to record WHAT the digest rests on -- the node, so that noticing the
+    // toolchain move later costs no walk -- derived the resolved path, the roots and
+    // the stamp a SECOND time beside the call. That cost one extra driver spawn per
+    // toolchain per survey, forever, on every machine in the fleet.
+    //
+    // What is asserted is not "some evidence came back" but that it is the SAME VALUE
+    // that second derivation produced, field for field. It has to be: the digest is a
+    // hash of exactly these, so anything else here would be a caller recording
+    // evidence for a fingerprint that does not describe it -- a toolchain watching
+    // roots its own identity does not cover, which is silent from both ends.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-evidence" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+    auto const root = (std::filesystem::path { tree.Path().string() } / "inc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-evidence-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+
+    // A real version line, so the identity is `Usable` and this case is about the
+    // evidence rather than about a defect.
+    constexpr std::string_view banner = "clang version 20.1.8";
+
+    CountingRunner runner { VerboseNaming(root) };
+    ScriptedToolchainHost host;
+
+    // Exactly what the caller used to compute beside the call: the same three
+    // functions, the same seams, the same arguments. Derived through a runner of its
+    // own so the spawn it costs stays out of the count below -- that spawn is what
+    // this change removes, and it would otherwise be paid again by the assertion that
+    // it is gone.
+    CountingRunner reference { VerboseNaming(root) };
+    auto const expectedCompiler = host.ResolveOnSearchPath(compiler).value_or(compiler);
+    auto const expectedRoots = DiscoverIncludePaths(reference, host, compiler, DriverOf(Flavor::Clang)).roots;
+    auto const expectedStamp = ComputeToolchainStamp(banner, expectedCompiler, expectedRoots);
+
+    // Both non-empty, or every comparison below would hold vacuously. Empty roots and
+    // an empty stamp are ordinary answers in production and are asserted separately;
+    // here they would only mean the fixture never described a toolchain.
+    REQUIRE(expectedRoots == std::vector<std::string> { root });
+    REQUIRE_FALSE(expectedStamp.empty());
+
+    SECTION("on the call that walks the tree")
+    {
+        auto const identity = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+        REQUIRE(identity.Usable());
+        REQUIRE(identity.evidence.has_value());
+        auto const& evidence = FastCache::Testing::Unwrap(identity.evidence);
+
+        CHECK(evidence.compiler == expectedCompiler);
+        CHECK(evidence.banner == banner);
+        CHECK(evidence.roots == expectedRoots);
+        CHECK(evidence.stamp == expectedStamp);
+    }
+
+    SECTION("and on the cache hit that skips it")
+    {
+        // The half that decides whether this is worth anything. A warm start is a
+        // HIT, and a hit returns a digest the cache file holds while saying nothing
+        // about the roots -- so the caller's second probe ran on every start of every
+        // node forever. The walk was cached; the spawn was not.
+        auto const cold = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+
+        // Content edited with the directory clock untouched, which is the documented
+        // blind spot of an mtime stamp -- and here it is the instrument. A call that
+        // RE-WALKED would now digest different bytes, so an unchanged fingerprint is
+        // what proves the second call is a hit rather than a repeat of the first.
+        tree.Write("inc/a.hpp", "edited in place");
+        auto const hit = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+        REQUIRE(hit.fingerprint == cold.fingerprint);
+
+        REQUIRE(hit.evidence.has_value());
+        auto const& evidence = FastCache::Testing::Unwrap(hit.evidence);
+        CHECK(evidence.compiler == expectedCompiler);
+        CHECK(evidence.banner == banner);
+        CHECK(evidence.roots == expectedRoots);
+        CHECK(evidence.stamp == expectedStamp);
+
+        // One spawn per call and no more. Discovery cannot be cached behind the stamp
+        // -- it is what the stamp is computed FROM -- so two calls are two spawns; the
+        // point is that saying what the digest covers needs no THIRD one.
+        CHECK(runner.Calls() == 2);
+    }
+}
+
+TEST_CASE("An identity nothing measured carries no evidence", "[toolchain-probe]")
+{
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-evidence-unrun" };
+    tree.Write("inc/a.hpp", "content");
+    tree.Write("cc", "#!/bin/sh\n");
+    auto const compiler = (tree / "cc").string();
+
+    FastCache::Testing::ScratchDirectory state { "fc-tcp-evidence-unrun-state" };
+    FastCache::Testing::ScopedEnv const env { StateVariable, state.Path().string() };
+    ScriptedToolchainHost host;
+
+    constexpr std::string_view banner = "clang version 20.1.8";
+
+    SECTION("a probe that could not be spawned")
+    {
+        // The guard that used to live at the caller, moved into the type. A record of
+        // evidence built on a probe that never RAN would name an empty root set while
+        // the digest beside it claims to cover the toolchain's -- so that toolchain
+        // would stop noticing an SDK-side change permanently, and in silence from both
+        // ends. Disengaged is what makes writing one down impossible rather than
+        // merely discouraged.
+        SequencedRunner runner { { NeverSpawned() } };
+        auto const identity = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+
+        CHECK(identity.defect == IdentityDefect::UnrunProbe);
+        CHECK_FALSE(identity.evidence.has_value());
+    }
+
+    SECTION("a probe that ran and listed nothing")
+    {
+        // The other side, and the reason this cannot be asked as an empty `roots`.
+        // Several mechanisms legitimately find no root at all, and every one of them
+        // is served on a banner-only fingerprint -- so an answer of nothing is still
+        // an answer, and still evidence a node may watch.
+        CountingRunner runner { "" };
+        auto const identity = CachedFingerprintSerially(runner, host, compiler, banner, DriverOf(Flavor::Clang));
+
+        REQUIRE(identity.Usable());
+        REQUIRE(identity.evidence.has_value());
+        CHECK(FastCache::Testing::Unwrap(identity.evidence).roots.empty());
+    }
 }
 
 TEST_CASE("A header that could not be read leaves the walk incomplete and uncached", "[toolchain-probe]")

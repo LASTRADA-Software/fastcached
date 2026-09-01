@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <thread>
@@ -204,8 +205,15 @@ namespace
                     // to read one out of. Empty travels as "did not say" (#194), which
                     // is the honest answer -- and is why the fingerprint column stays
                     // beside the label rather than being replaced by it.
-                    fingerprints[index].identity =
-                        Cc::ToolchainIdentity { .fingerprint = entry.fingerprint, .defect = Cc::IdentityDefect::None };
+                    //
+                    // And no evidence, stated rather than left to the default: an
+                    // override is never probed, so there is nothing this process
+                    // measured and nothing it may later claim to be watching. It is
+                    // the same "nothing was measured" the unrun probe reports, which
+                    // is why one disengaged `optional` carries both.
+                    fingerprints[index].identity = Cc::ToolchainIdentity { .fingerprint = entry.fingerprint,
+                                                                           .defect = Cc::IdentityDefect::None,
+                                                                           .evidence = std::nullopt };
                     continue;
                 }
 
@@ -239,47 +247,33 @@ namespace
                 logger.Logf(LogLevel::Info, "computed the toolchain fingerprint for {}", entry.compiler);
 
                 // The evidence this identity rests on, kept so that noticing it has
-                // moved costs no spawn at all (#238). It is the same banner, the same
-                // resolved path and the same roots `CachedToolchainFingerprint` just
-                // folded, so the stamp recorded here is by construction the one it
-                // wrote to its own cache file.
+                // moved costs no spawn at all (#238) -- and TAKEN from the identity
+                // rather than derived again beside it (#259). It is the banner, the
+                // resolved path, the roots and the stamp `CachedToolchainFingerprint`
+                // itself folded, so "the stamp recorded here is the one it wrote to
+                // its own cache file" is now true by construction rather than by the
+                // machine holding still between two derivations.
                 //
-                // The roots are asked for a SECOND time, and that is the price of
-                // this being computed outside the function that already had them.
-                // One extra driver spawn per toolchain, on a start that is already
-                // walking the include tree, buys zero spawns on every heartbeat for
-                // the life of the process -- which is the cost that actually matters,
-                // and the one #188 is separately trying to remove from the launcher.
+                // What that removes is one driver spawn per toolchain per survey, plus
+                // a search-path resolution and a stat of every root. The spawn ran on
+                // warm starts too: a cache HIT returns a digest and used to say nothing
+                // about the roots, so the second probe was unavoidable there as well.
                 //
-                // Resolved on the search path for the reason `ComputeToolchainStamp`
-                // documents: a bare `cc` or `cl` cannot be stat'd from an arbitrary
-                // working directory, so stamping the typed spelling would quietly
-                // yield no stamp for exactly the toolchains a package manager
-                // upgrades.
-                auto const resolved = host.ResolveOnSearchPath(entry.compiler).value_or(entry.compiler);
-                auto discovered = Cc::DiscoverIncludePaths(runner, host, entry.compiler, spec);
-
-                // A probe that did not RUN leaves no witness, rather than one over an
-                // empty root set. The identity above was computed from whatever the
-                // FIRST probe found, so a second probe that failed would leave this
-                // node watching a narrower set of roots than its own fingerprint
-                // covers -- and it would then stop noticing an SDK-side change for
-                // that toolchain, permanently and in silence. Not watching a
-                // toolchain is visible in the next survey; watching the wrong
-                // evidence is not.
+                // Absent evidence is a probe that did not RUN, and it leaves no witness
+                // rather than one over an empty root set -- see
+                // `Cc::ToolchainIdentity::evidence` for why that cannot be asked as an
+                // empty `roots`. Such an identity is `UnrunProbe` and is refused below
+                // anyway; the guard stays because the two facts are decided in
+                // different places and only one of them may be relaxed.
                 //
-                // Asked as `answered` rather than as an empty `roots`, for the reason
-                // `IncludeSearchRoots` documents: several mechanisms legitimately find
-                // no roots at all, and only a driver that could not be spawned means
-                // the answer is missing.
-                if (discovered.answered)
-                {
-                    auto stamp = Cc::ComputeToolchainStamp(banner, resolved, discovered.roots);
-                    fingerprints[index].witness = ToolchainWitness { .compiler = resolved,
-                                                                     .banner = banner,
-                                                                     .roots = std::move(discovered.roots),
-                                                                     .stamp = std::move(stamp) };
-                }
+                // Copied rather than moved out: the identity is read again below, and
+                // an `optional` hollowed out by a move would still answer `has_value()`
+                // -- which is exactly the "there was a probe" fact this depends on.
+                if (auto const& evidence = fingerprints[index].identity.evidence; evidence.has_value())
+                    fingerprints[index].witness = ToolchainWitness { .compiler = evidence->compiler,
+                                                                     .banner = evidence->banner,
+                                                                     .roots = evidence->roots,
+                                                                     .stamp = evidence->stamp };
 
                 // Derived from the banner that was just computed, rather than by
                 // asking the compiler a second time: the digest is a hash OF this
