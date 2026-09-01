@@ -11,6 +11,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -228,7 +229,8 @@ TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verif
     // described is a number somebody has to come back and ask about -- and the second
     // half, that the fresh object was used, is what tells a reader whether the build
     // they are holding is trustworthy.
-    auto const line = DescribeVerdict({ .verdict = HitVerdict::Mismatched }, "objkey-v3:abcdef");
+    auto const line =
+        DescribeVerdict({ .verdict = HitVerdict::Mismatched, .comparison = std::nullopt, .detail = {} }, "objkey-v3:abcdef");
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("WRONG OBJECT"));
     CHECK(line.contains("freshly compiled"));
@@ -236,12 +238,16 @@ TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verif
     // Nothing to say about the two ordinary outcomes -- a line per hit would make the
     // one that matters unreadable. Including when the comparison overlooked a clock,
     // which on Windows is EVERY hit.
-    CHECK(DescribeVerdict({ .verdict = HitVerdict::NotChecked }, "k").empty());
-    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched }, "k").empty());
-    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched, .detail = "the compiler's timestamp" }, "k").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::NotChecked, .comparison = std::nullopt, .detail = {} }, "k").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched, .comparison = std::nullopt, .detail = {} }, "k").empty());
+    CHECK(DescribeVerdict(
+              { .verdict = HitVerdict::Matched, .comparison = std::nullopt, .detail = "the compiler's timestamp" }, "k")
+              .empty());
 
     // And the inconclusive one is described too, because it is not a pass.
-    CHECK_FALSE(DescribeVerdict({ .verdict = HitVerdict::Inconclusive }, "objkey-v3:abcdef").empty());
+    CHECK_FALSE(DescribeVerdict({ .verdict = HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} },
+                                "objkey-v3:abcdef")
+                    .empty());
 }
 
 TEST_CASE("What differed is carried into the line, not left to be asked about", "[launcher][verify]")
@@ -249,8 +255,9 @@ TEST_CASE("What differed is carried into the line, not left to be asked about", 
     // `.debug$S` and `.text$mn` mean a foreign build path and stale code, and those
     // are acted on differently -- so a mismatch naming neither makes an operator come
     // back and ask a question the comparison had already answered.
-    auto const line =
-        DescribeVerdict({ .verdict = HitVerdict::Mismatched, .detail = "3 differing byte(s), in .text$mn" }, "k");
+    auto const line = DescribeVerdict(
+        { .verdict = HitVerdict::Mismatched, .comparison = std::nullopt, .detail = "3 differing byte(s), in .text$mn" },
+        "k");
     CHECK(line.contains(".text$mn"));
     CHECK(line.contains("WRONG OBJECT"));
 }
@@ -260,7 +267,8 @@ TEST_CASE("A toolchain that cannot be compared is not reported as a wrong object
     // The state that must never read as a finding. An operator who takes "cannot
     // verify" for "your cache is broken" switches verification off, and the class it
     // guards goes invisible again -- which is #493 restated one level up.
-    auto const line = DescribeVerdict({ .verdict = HitVerdict::Unsupported, .detail = "some format" }, "objkey-v3:abcdef");
+    auto const line = DescribeVerdict(
+        { .verdict = HitVerdict::Unsupported, .comparison = std::nullopt, .detail = "some format" }, "objkey-v3:abcdef");
     CHECK_FALSE(line.empty());
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("cannot verify"));

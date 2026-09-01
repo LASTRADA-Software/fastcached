@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cc;
@@ -302,9 +303,14 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     // describes what a compiler emits. Running the verifier on made-up bytes would
     // prove the parser self-consistent and nothing about MSVC -- which is the whole
     // way #493 survived review, as a byte comparison that was never run on Windows.
-    auto const driver = FindMsvcDriver();
-    if (!driver.has_value())
+    auto const found = FindMsvcDriver();
+    if (!found.has_value())
         SKIP("no MSVC-family driver on PATH");
+    // `Unwrap` rather than `*found`, and the reason is not style: clang-tidy cannot
+    // see that Catch2's `SKIP` does not return, so a bare dereference is
+    // `bugprone-unchecked-optional-access` and fails the pedantic build.
+    REQUIRE(found.has_value());
+    auto const& driver = Testing::Unwrap(found);
 
     Testing::ScratchDirectory const scratch { "object-equivalence-msvc" };
     auto const& dir = scratch.Path();
@@ -320,7 +326,7 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
 
     auto const object = dir / "tu.obj";
     auto const runner = MakeProcessRunner();
-    std::vector<std::string> const argv { *driver, "/nologo", "/c", "/Fo" + object.string(), source.string() };
+    std::vector<std::string> const argv { driver, "/nologo", "/c", "/Fo" + object.string(), source.string() };
 
     REQUIRE(runner->RunCaptureCombined(argv).exitCode == 0);
     auto const first = ReadFileBytes(object).value_or(std::vector<std::byte> {});
@@ -372,14 +378,14 @@ TEST_CASE("A real compiler's two objects verify clean, and a corrupted one does 
     // compiles land -- a case that fails on a correct implementation, occasionally.
     auto const elsewhere = dir / "other" / "tu.obj";
     std::filesystem::create_directories(elsewhere.parent_path());
-    std::vector<std::string> const argvElsewhere { *driver, "/nologo", "/c", "/Fo" + elsewhere.string(), source.string() };
+    std::vector<std::string> const argvElsewhere { driver, "/nologo", "/c", "/Fo" + elsewhere.string(), source.string() };
     REQUIRE(runner->RunCaptureCombined(argvElsewhere).exitCode == 0);
     auto const foreign = ReadFileBytes(elsewhere).value_or(std::vector<std::byte> {});
     REQUIRE_FALSE(foreign.empty());
 
     auto const crossPath = CompareObjectImages(foreign, second);
     INFO("cross-path verdict detail: " << crossPath.detail);
-    if (*driver == "cl.exe")
+    if (driver == "cl.exe")
     {
         // #489's case: `cl` writes the object's absolute path into `.debug$S` and the
         // source's hash into `.chks64`, so two output paths are two different images.
