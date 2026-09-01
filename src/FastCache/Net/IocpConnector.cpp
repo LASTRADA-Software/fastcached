@@ -31,6 +31,25 @@ namespace
     /// enclosing op -- the same layout contract `IocpSocket::Impl::Op` relies on.
     /// It lives in the dialling coroutine's frame, so its address is stable for
     /// exactly as long as the port can reach it.
+    ///
+    /// **That last sentence is the invariant, and it is why this type carries no
+    /// `inFlight` reference the way `IocpSocket::Impl::Op` and
+    /// `IocpListener::Impl::AcceptOp` do. Do not "make it consistent" with them.**
+    ///
+    /// The op outlives the operation because the OWNER IS SUSPENDED ON IT: the
+    /// coroutine cannot leave the frame holding this struct without the
+    /// completion having arrived, since `co_await ConnectPark { &op }` is resumed
+    /// only by `OnConnectComplete`. Even the timeout path below cancels and then
+    /// keeps waiting, precisely because `CancelIoEx` makes the completion arrive
+    /// rather than retracting it.
+    ///
+    /// The socket and the listener cannot use this shape: they are owned by
+    /// whoever holds their `unique_ptr`, and a destructor is not a coroutine and
+    /// cannot suspend until a completion lands. That asymmetry is the whole of
+    /// #465 -- removing this comment and adding a reference count here would be
+    /// harmless, but removing the *waiting* on the belief that a reference count
+    /// replaces it would reintroduce the defect in the one place that never had
+    /// it.
     struct ConnectOp
     {
         IocpCompletion completion {};
