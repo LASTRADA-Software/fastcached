@@ -444,6 +444,27 @@ named_endpoint() {
 # ever answered as leader at all.
 wait_for_formation() {
     local index endpoint answer named led followers live everLed=0
+
+    # What the DECLINES said, which is the evidence this wait used to throw away.
+    #
+    # A node that is not leading answers `ask --scheduler=<endpoint>` -- it names
+    # who it believes leads. Across a whole failing wait that is the difference
+    # between three distinguishable states, and until #457's first CI run this
+    # function reported only two of them:
+    #
+    #   nothing named, ever      nobody knew who led; a genuine non-formation
+    #   one endpoint, named early a leader was stably known and never affirmed,
+    #                             which is a finding about the PRODUCT rather than
+    #                             about this fixture's budget
+    #   one endpoint, named late  the election really did happen near the deadline,
+    #                             and the budget is what was short
+    #
+    # The third state is the one a bare "never formed" hides, and it is the one
+    # that decides whether raising a number is a fix or a cover-up. `at` is seconds
+    # from the start of THIS wait, so the reader gets it without arithmetic.
+    local firstNamed="" firstNamedAt="" lastNamed="" namedRuns=0
+    local started="$SECONDS"
+
     local deadline=$(( SECONDS + FormationSeconds ))
     while [[ "$SECONDS" -lt "$deadline" ]]; do
         led=""
@@ -475,6 +496,19 @@ wait_for_formation() {
             esac
         done
 
+        # Recorded before the exit test, so a wait that succeeds on its first pass
+        # has still observed what it saw -- and recorded on CHANGE rather than every
+        # pass, so `namedRuns` counts how often the answer moved rather than how
+        # often it was asked.
+        if [[ -n "$named" && "$named" != "$lastNamed" ]]; then
+            if [[ -z "$firstNamed" ]]; then
+                firstNamed="$named"
+                firstNamedAt=$(( SECONDS - started ))
+            fi
+            namedRuns=$(( namedRuns + 1 ))
+            lastNamed="$named"
+        fi
+
         if [[ -n "$led" && "$followers" -eq $(( live - 1 )) && "$named" == "$led" ]]; then
             leader_endpoint="$led"
             return 0
@@ -482,16 +516,34 @@ wait_for_formation() {
         sleep 0.2
     done
 
-    # Two different faults, and telling them apart is most of the value: nothing
-    # ever led at all, or something led and the rest never came to name it.
-    # Three faults now, not two, and the new one comes first because it makes the
-    # other two unanswerable: if the probes did not finish, this fixture never
-    # observed the cluster and cannot say what it did. Reporting "never elected"
-    # from a run that never asked is the confident wrong sentence #388 already cost
-    # half an hour to.
+    # What the declines named, as its own sentence, because it is the evidence that
+    # separates the remaining possibilities and it is cheap to state.
+    local naming
+    if [[ -z "$firstNamed" ]]; then
+        naming="no node ever named a leader, so none was known to any of them"
+    elif [[ "$namedRuns" -eq 1 ]]; then
+        naming="every decline named ${firstNamed}, from ${firstNamedAt}s in and unchanged for the rest of the wait -- so a leader WAS known throughout and never answered as one"
+    else
+        naming="the named leader moved ${namedRuns} times, first ${firstNamed} at ${firstNamedAt}s, last ${lastNamed} -- the cluster was still re-electing"
+    fi
+
+    # Faults, in the order that makes each one answerable.
+    #
+    # The probe accounting comes first: if the probes did not finish, this fixture
+    # never observed the cluster and cannot say what it did, so reporting "never
+    # elected" from a run that never asked is the confident wrong sentence #388
+    # already cost half an hour to.
+    #
+    # Then the naming evidence, and it is not decoration. #457's first CI run on
+    # macOS produced 570 probes, 0 affirmed, 0 timed out -- and the dumped node logs
+    # showed the cluster HAD formed: n2 led term 2 and had committed its own member
+    # record naming its scheduler port, with both others following it. So both
+    # halves of the old sentence were false at once, and neither this fixture nor a
+    # reader could tell. What it could not say, and now can, is whether that leader
+    # was known early and silent or known only at the end.
     [[ "$everLed" -eq 1 ]] ||
-        fail "no node ever answered a cluster question in ${FormationSeconds}s; either the cluster never elected a leader, or this run never managed to ask -- $(probe_summary)"
-    fail "the cluster elected but never formed in ${FormationSeconds}s: one leader and every other node naming it never held at once ($(probe_summary))"
+        fail "no node ever answered as leader in ${FormationSeconds}s: ${naming} ($(probe_summary))"
+    fail "the cluster elected but never formed in ${FormationSeconds}s: one leader and every other node naming it never held at once. ${naming} ($(probe_summary))"
 }
 
 wait_for_formation
