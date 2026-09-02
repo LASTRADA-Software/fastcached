@@ -55,6 +55,18 @@ namespace
             return false;
         if (!pathCmp.starts_with(rootCmp))
             return false;
+        // A root that ENDS in a separator is its own segment boundary, so demanding
+        // another one after it asks for a byte that cannot be there. `/` and `C:\`
+        // are the whole of that class -- a bare root IS its trailing separator -- and
+        // before this they matched nothing at all: every path under them was judged
+        // to lie outside both roots, so the stored value kept the producing machine's
+        // absolute paths, silently, which is #229/#319 for any build rooted at the
+        // filesystem root (issue #547). An UNTRIMMED root (`/x/build/`) lands here
+        // too and now behaves; `RootReconciler` still trims those, so this is a
+        // second line rather than a substitute for the first.
+        if (rootCmp.back() == '/')
+            return true;
+
         // Exact match, or the next byte is a separator (segment boundary).
         return pathCmp.size() == rootCmp.size() || pathCmp[rootCmp.size()] == '/';
     }
@@ -169,7 +181,19 @@ namespace
     {
         char const sep = SeparatorOf(root);
         std::string out { root };
-        out.push_back(sep);
+
+        // The same fact as the segment test above, on the way back: a root that ends
+        // in a separator already carries the one this join would add. Appending
+        // regardless produced `//inc/a.hpp` on POSIX -- implementation-defined rather
+        // than merely ugly -- and `C:\\inc\a.hpp` on Windows, which parses as a
+        // UNC path naming a host that does not exist (issue #547).
+        //
+        // Either separator counts, not just the one `SeparatorOf` picked: a root
+        // mixing styles (`C:\src/`) reports `\` and ends with `/`, so testing only
+        // against the reported one would append a second separator to it.
+        if (!out.empty() && out.back() != '/' && out.back() != '\\')
+            out.push_back(sep);
+
         out += ToNative(tail, sep);
         return out;
     }
