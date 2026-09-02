@@ -1106,9 +1106,9 @@ jobs:
         # rather than assumed. No Windows leg was the longest job in any of the 13
         # code-touching pull-request runs sampled for the per-event table in
         # `.agent/rules/build-and-toolchain.md` — that is `Code coverage` or an
-        # escalated `clang-tidy` sweep — so this leg costs about nine
-        # runner-minutes and no wall clock at all, which is cheaper than giving up
-        # a Release configuration to buy it.
+        # escalated `clang-tidy` sweep — so this leg costs runner-minutes and no
+        # wall clock at all, which is cheaper than giving up a Release
+        # configuration to buy it.
         #
         # The per-leg figures live in that table and are deliberately not restated
         # here. The pre-`SCCACHE_GHA_ENABLED` numbers in the comment above were
@@ -1116,7 +1116,10 @@ jobs:
         # they described a two-leg matrix that no longer existed while reading
         # like current fact. Which job "finishes last" is likewise a property of
         # the EVENT, not of this workflow: it is `clang-tidy` on master and inside
-        # the queue, and `Code coverage` on a pull request.
+        # the queue, where every sweep is a full one, and on a pull request it is
+        # `Code coverage` in most runs and an escalated `clang-tidy` sweep in the
+        # rest — 9 and 4 of the 13 sampled. Not one of them is a Windows leg,
+        # which is the only part of it this comment depends on.
         #
         # It runs `ctest` like its siblings, because a Debug leg that only
         # compiles exercises none of the runtime it was added for. The

@@ -895,14 +895,16 @@ live on master indefinitely with every status check green (#315).
 - **The canary sets its own CRT report modes**, and that is load-bearing rather
   than defensive: an unhandled debug assertion pops a modal dialog, and on a
   runner that means the job hangs to its timeout instead of failing in a second.
-- **A third leg rather than replacing a Release one, and that was measured.**
-  Windows costs ~9 and ~7 minutes today; the 21.2 and 15.7 quoted in
-  `build.yml`'s own `windows:` comment predate `SCCACHE_GHA_ENABLED` and are stale
-  — that comment states them in the past tense, and a reader skimming it for a
-  current figure will take the wrong one. Neither leg is near the
-  critical path — `clang-tidy` runs ~20 minutes and finishes last — so the Debug
-  leg costs about eight runner-minutes and no wall clock. Giving up a Release
-  configuration to buy that would have traded coverage for capacity already there.
+- **A third leg rather than replacing a Release one, and that was measured.** No
+  Windows leg is the longest job in any sampled pull-request run, so this leg costs
+  runner-minutes and no wall clock, and giving up a Release configuration to buy
+  that would trade coverage for capacity already there. The per-leg figures are
+  *What CI costs* below and are not restated here — the last two written down in
+  this spot went stale twice over, once when `SCCACHE_GHA_ENABLED` landed and again
+  when the matrix grew a third leg, and both times they read as current fact. So
+  does "`clang-tidy` finishes last", which is true on master and inside the merge
+  queue and true on only 4 of 13 sampled pull requests — the ones whose change
+  escalated the sweep.
 - **Guarded to `MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"`, which means its
   absence elsewhere is normal.** That is worth knowing before debugging it: a
   platform-guarded registration is indistinguishable from a lost one when you look
@@ -924,7 +926,10 @@ once you say which. Measured 2026-09-02 over 37 completed, green `build.yml` run
 between 08:04Z and 16:07Z, on the three-leg Windows matrix, with
 `SCCACHE_GHA_ENABLED` in force; runner-minutes sum the non-skipped jobs, and job
 durations come from `repos/:owner/:repo/actions/runs/:id/jobs` rather than from
-impressions:
+impressions. Two of the bullets below quote **step** timings, and those come from
+a separate 10-run sample taken the same day — how far it overlaps these 37 runs
+was not recorded, so do not reconcile a step mean against a job range below to the
+tenth:
 
 | event | runs | runner-min, mean | longest job, mean | which job is longest |
 |---|--:|--:|--:|---|
@@ -943,9 +948,17 @@ of the bottom two rows**, which is the next bullet.
   unique product is a handful of cache entries.** A `merge_group` run and the
   `push` on master that follows it carry the *same* `head_sha` — 6 of 6 pairs
   checked on 2026-09-02 — so the master push recompiles, retests and repackages a
-  tree the queue has already proved green, at 102.1 runner-minutes mean. Measured
-  on the docs-only #530: **0.5** runner-minutes at pull-request time, which is the
-  scoping working, then **108.9 + 95.0** to land it.
+  tree the queue has already proved green. That is a whole bottom row of the table
+  above, per merge. Measured on the docs-only #530: **0.5** runner-minutes at
+  pull-request time, which is the scoping working, then **108.9 + 95.0** to land
+  it.
+
+  The condition on those six pairs is a queue **batch of one**, which is what this
+  repository has had. GitHub batches queue entries, and a batch of N dispatches N
+  `merge_group` events and lands as ONE push — so "twice" is the batch-size-one
+  reading of a ratio that is really `(N + 1) / N`, and the per-merge price falls as
+  batches grow. `build.yml`'s `changes` job already records the batching from the
+  other side.
 
   It is not pure waste, and the difference is measurable rather than argued.
   *Measured*: on the same `head_sha` the queue run had just compiled, each Windows
@@ -955,10 +968,11 @@ of the bottom two rows**, which is the next bullet.
   restores from its own ref and from the default branch, and writes only to its own
   ref, so the queue's `gh-readonly-queue/master/…` entries are unreachable by
   anything and the master push is what publishes those objects for every later pull
-  request and queue entry to restore. Deleting the push trigger would therefore
-  trade 102 runner-minutes per merge for a cache that goes cold at whatever rate
-  master changes — a real trade, not an obvious one, and nobody has priced the
-  second half of it.
+  request and queue entry to restore. Narrowing the push trigger to tags — NOT
+  deleting `on: push`, whose `tags:` row is the only way the `release` job is ever
+  reached — would therefore trade a bottom-row run per merge for a cache that goes
+  cold at whatever rate master changes: a real trade, not an obvious one, and
+  nobody has priced the second half of it.
 
 - **A ccache hit does not skip clang-tidy, so caching harder was never the fix.**
   That job reported **535 hits out of 592 cacheable calls (90.4%)** and its build
@@ -1122,9 +1136,10 @@ of the bottom two rows**, which is the next bullet.
   With `SCCACHE_GHA_ENABLED` the statistics read `ghac` rather than `Local disk`.
   Measured over 10 runs × 3 legs on 2026-09-02, every leg issues **668 or 669
   compile requests** and hits **537–663** of them, 80.4% to 99.3% — and the spread
-  is *how many translation units the change touched*, not which event it was: a
-  master push changing six files hits 99.1%, a pull request against a
-  widely-included header hits 80.4%. What is left is not cacheable at all:
+  is *how many translation units the change touched*, not which event it was: the
+  leg that missed 6 of 668 hit 99.1%, the one that missed 131 hit 80.4%, and both
+  shapes occur on pull requests and on master pushes alike. What is left is not
+  cacheable at all:
 
   | leg | `Build`, mean | `Test`, mean | whole job, mean (min–max) |
   |---|--:|--:|--:|
@@ -1161,25 +1176,33 @@ of the bottom two rows**, which is the next bullet.
   of the run**, not the ~17 this bullet used to claim. And `coverage` **is** the
   longest job in 9 of those 13 runs, at 10.3–17.0 minutes — so "coverage is not on
   the critical path", which this bullet also used to claim, was wrong. Dropping all
-  four from pull requests would take a run from **103.2 to 76.4 runner-minutes
-  (−26%)** and its longest job from **17.3 to 14.2 (−18%)**; in the four runs where
-  an escalated `clang-tidy` sweep is longest it would buy no wall clock whatever.
+  four from pull requests would take those **26.7 runner-minutes (−26%)** off a run
+  and bring its longest job to **14.2 (−18%)**; in the four runs where an escalated
+  `clang-tidy` sweep is longest it would buy no wall clock whatever.
 
   Neither guard objects, so neither can be leaned on as though it were the reason.
   `check-release-gate` asserts the *list* in `release.needs`, not that each job
-  runs, so a skipped job still gates. And the `default-master` ruleset's required
-  contexts are `Windows-cl-release`, `Windows-clangcl-release`,
-  `Linux-clang-release`, `Linux-gcc-release`, `macOS-clang-release`, `clang-tidy`,
-  the three sccache smokes, `Check C++ style` and `Require a type label` — `Code
-  coverage` and the three `Package (…)` contexts are not among them, so gating
-  their execution could not produce the never-arrives failure this file records
-  three ways. The refusal is on the merits, and the merits are `package-macos`.
+  runs, so a skipped job still gates. And **none of these four jobs was a required
+  context** when the `default-master` ruleset was read on 2026-09-02 — neither
+  `Code coverage` nor any `Package (…)` was among its contexts — so gating their
+  execution would not have produced the never-arrives failure this file records
+  three ways.
+
+  Read the ruleset again before acting on that, and do **not** substitute
+  `RequiredContexts` in `scripts/check-merge-queue-contexts.sh` for it. That table
+  agrees today, but it is a MIRROR of a server-side setting and its own header says
+  which direction it cannot see: *a context added to the ruleset and not added here
+  is not caught.* Absence from the mirror is therefore not evidence of absence from
+  the enforced list, and it is the enforced list that decides whether skipping a
+  job strands a queued pull request. The recipe is in that header
+  (`gh api …/rulesets`). The refusal is on the merits regardless, and the merits
+  are `package-macos`.
 
 - **`Code coverage` is four-fifths an uncached compile, and it cannot be cached.**
   Step timings over 10 code-touching pull-request runs on 2026-09-02: `Build`
   **11.05 min** (max 13.03); `Measure coverage` — the whole ~2000-case suite under
   instrumentation *plus* `llvm-profdata` and `llvm-cov` — **2.31 min** (max 2.37, a
-  60 ms spread); every other step under 20 seconds. So the natural guess, that only
+  60 ms spread); no other step averaging over 20 seconds. So the natural guess, that only
   the report-merging step is cheap to move, is correct and useless: that step is
   already cheap. The expense is a full instrumented build with no compiler cache in
   front of it, and `cmake/Coverage.cmake` refuses to configure with one because a
@@ -1188,12 +1211,14 @@ of the bottom two rows**, which is the next bullet.
   back on the `package-macos` merits above, rather than on anything a cache can do.
 
 - **A WSL build belongs under `~`, not under `/mnt/d`, and the cost of getting it
-  wrong is threefold.** DrvFs is a 9p bridge to the Windows filesystem, and a build
-  is almost entirely small-file I/O. Measured on this machine — same commit, clang
-  20, Debug, `USE_COMPILER_CACHE=OFF`, `-j8`, target `fastcached`, a warm configure
-  so only the compile is timed:
+  wrong is threefold.** `/mnt/*` is a bridge to the Windows filesystem — served
+  over **9p** on WSL2, which is what `df -T` reports; DrvFs is the WSL1 mechanism
+  and is what the older notes in this tree call it — and a build is almost entirely
+  small-file I/O. Measured on this machine — same commit, clang 20, Debug,
+  `USE_COMPILER_CACHE=OFF`, `-j8`, target `fastcached`, a warm configure so only
+  the compile is timed:
 
-  | | ext4 (`~`) | DrvFs (`/mnt/d`) | |
+  | | ext4 (`~`) | 9p (`/mnt/d`) | |
   |---|---|---|---|
   | build, wall | **19.6 s** | **60.5 s** | 3.1× |
   | build, user CPU | 125.2 s | 127.0 s | 1.01× |
@@ -1201,7 +1226,7 @@ of the bottom two rows**, which is the next bullet.
   | open+read every `*.hpp` | 0.11 s | 1.02 s | 9.3× |
 
   The user time is the number that settles it: the two builds did **the same
-  compute**, to within 1.5%. Everything DrvFs costs is spent waiting on the
+  compute**, to within 1.5%. Everything the bridge costs is spent waiting on the
   filesystem, which is also why the header walk — pure I/O, no compute — is the
   worst ratio of the four, and why `sccache-backend-caveat` times out on `/mnt/d`
   without anything being broken.
@@ -1229,24 +1254,32 @@ of the bottom two rows**, which is the next bullet.
 
   The middle two rows are what a build feels: **a warm `stat` costs about 0.3 µs on
   ext4 and about 0.8 ms on 9p**, because ext4 answers out of the dentry cache while
-  9p makes a round trip to the Windows host for every one. At 1250 stat/s, one
-  traversal of `src/` is seconds rather than milliseconds — the same order as the
-  independently measured **2.09 s** in *The local gate* above, and the reason 38
-  traversals cost 78.7 s there and are invisible on CI and on ext4. A shell loop
-  over the same two filesystems reports 6.7× and would justify nothing.
+  9p makes a round trip to the Windows host for every one. `src/` holds **677
+  entries** (648 files, 29 directories), so at 1250 stat/s a single traversal of it
+  costs about **0.5 s** of bare `stat` where ext4 charges 0.2 ms — which is the
+  same order as the **2.09 s** `GLOB_RECURSE` traversal independently measured in
+  *The local gate* above, and why the checks that walk the tree are invisible on CI
+  and on ext4 and blow their budget here. The remaining ~4× is the glob's own
+  round trips per entry — `readdir`, symlink resolution, the `stat` this row times
+  — and has NOT been measured, so do not read 0.5 s as a prediction of 2.09 s. A
+  shell loop over the same two filesystems reports 6.7× and would justify nothing.
 
   Two things this does *not* say, because both were reached for while measuring it.
   A warm `ninja -n` over the whole tree runs in **0.09 s on 9p** — ninja caches and
   the page cache is warm — so anyone probing with that measures nothing and
   concludes there is no penalty. And these are probes, not a build: the build
-  numbers are the table above, and a re-measurement of them is worth nothing while
-  another lane is compiling on the same machine, which is the usual state of this
-  repository.
+  numbers are the table above, and a re-measurement of *those* is worth nothing
+  while another lane is compiling on the same machine, which is the usual state of
+  this repository.
 
-  Finally, worth spelling right because it decides what a search finds: on WSL2
-  `/mnt/*` is served over **9p** — `df -T` says so — and DrvFs is the WSL1
-  mechanism. Older notes in this tree, this section's own table included, say
-  DrvFs; the effect is the same one and the name is not.
+  And a build measurement that gives each side its own `CPM_SOURCE_CACHE` makes
+  both sides re-clone Catch2, zstd and lz4 — thousands of small files, which is
+  precisely the access pattern the table above prices — so the configure dominates
+  the thing being timed and can fail outright. That is a per-worktree cost nobody
+  budgets, it is paid independently by every lane, and no per-job timing anywhere
+  shows it;
+  [#545](https://github.com/LASTRADA-Software/fastcached/issues/545) is where it is
+  being dealt with. Point a measurement at the machine's populated cache instead.
 
 ## Language and ABI pitfalls
 
