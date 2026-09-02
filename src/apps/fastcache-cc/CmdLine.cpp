@@ -352,7 +352,15 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 12> PathValues { {
+    constexpr std::array<PathValueFlag, 15> PathValues { {
+        // The prefix-map family first, being the longest spellings. All three are
+        // GNU-only: `cl` has no path-map switch at all, and clang-cl accepts
+        // `-ffile-prefix-map` while ignoring it for the records that matter --
+        // measured, an object built with it still differs cross-root by the same
+        // 23 bytes in `S_OBJNAME` and the embedded `-cc1` line.
+        { .spelling = "-fdebug-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
+        { .spelling = "-fmacro-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
+        { .spelling = "-ffile-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "/Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
@@ -730,6 +738,9 @@ namespace
             // Nothing captures it: the launcher never reads or writes the PDB, it
             // only has to keep the path out of the key and off a worker's line.
             case PathValueRole::DebugOutput:
+            // Nor this: the compiler applies the rewrite itself, and the launcher
+            // only has to relativize the root it names so the key stays portable.
+            case PathValueRole::PrefixMap:
                 break;
         }
         return nullptr;

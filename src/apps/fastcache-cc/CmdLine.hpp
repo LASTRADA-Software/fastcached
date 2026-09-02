@@ -207,6 +207,24 @@ enum class PathValueRole : std::uint8_t
     /// dispatch refuses outright -- with `/Z7`, and with no debug flag, this names a
     /// file nothing produces.
     DebugOutput,
+
+    /// A path rewrite the compiler applies to what it EMBEDS (`-fdebug-prefix-map`
+    /// and the two spellings beside it). Alone among these roles the value is not
+    /// a path but a `<path>=<replacement>` pair, and only the head of it is one.
+    ///
+    /// It is here because the flag carries the producing checkout's absolute root
+    /// by construction -- that is what it is for -- so an argument nothing
+    /// relativized would put that root into every key and cost exactly the
+    /// cross-checkout sharing the flag was added to preserve. Measured before the
+    /// row existed: `-fdebug-prefix-map=/home/ci/checkout-aaa=/fastcache/src` came
+    /// back from `RelativizeArgs` byte-for-byte.
+    ///
+    /// The replacement half is deliberately NOT rewritten. Two machines that map
+    /// to different replacements produce different objects, so they must produce
+    /// different keys; leaving that half literal is what makes the key enforce
+    /// #203's "the mapping must be identical on every machine sharing the cache"
+    /// rather than merely document it.
+    PrefixMap,
 };
 
 /// One spelling of a flag whose value is a filesystem path.

@@ -729,3 +729,99 @@ TEST_CASE("The target reaches the object key, so two code generators do not shar
     // And the same target still keys the same, or nothing would ever hit.
     CHECK(keyFor("x86_64-pc-linux-gnu") == keyFor("x86_64-pc-linux-gnu"));
 }
+
+TEST_CASE("A prefix-map flag's root is relativized, so two checkouts still share one key")
+{
+    // Issue #203, and the assertion is the whole shape the fix takes. The
+    // compiler embeds where it was built; `-fdebug-prefix-map` is how it is told
+    // not to. But the flag names the producing checkout's absolute root BY
+    // CONSTRUCTION -- that is what it is for -- so an argument nothing
+    // relativized would put that root into every key and cost exactly the
+    // cross-checkout sharing the flag was added to preserve.
+    //
+    // Measured before the row existed: `RelativizeArgs` returned
+    // `-fdebug-prefix-map=/home/ci/checkout-aaa=/fastcache/src` byte-for-byte.
+    // So the fix would have read as a fix, produced correct objects, and turned
+    // every cross-checkout hit into a miss -- silently, because a miss is what a
+    // cold cache looks like too.
+    auto keyFor = [](std::string_view root, std::string_view replacement) {
+        std::vector<std::string> args { "-g", "-c" };
+        if (!replacement.empty())
+            args.emplace_back(std::string { "-fdebug-prefix-map=" } + std::string { root } + "="
+                              + std::string { replacement });
+        args.emplace_back(std::string { root } + "/tu.cpp");
+        return ComputeKey(KeyInputs { .compilerId = "g++ (GCC) 15.2.0",
+                                      // Identical across both checkouts: line markers are suppressed, and
+                                      // this TU expands no `__FILE__`. A TU that DOES expand it carries the
+                                      // difference in this very field and keys apart on its own -- the
+                                      // preprocessor is what expands `__FILE__` and this is the raw
+                                      // preprocessed text, so there is no arrangement in which two
+                                      // checkouts share a key while their `__FILE__` strings differ.
+                                      .preprocessed = "namespace demo{int Add(int a,int b)noexcept{return a+b;}}",
+                                      .relativizedArgs = Relativize(args, root),
+                                      .dependencyPaths = {} });
+    };
+    constexpr std::string_view RootA = "/home/ci/checkout-aaa";
+    constexpr std::string_view RootB = "/home/ci/checkout-bbb";
+    constexpr std::string_view Shared = "/fastcache/src";
+
+    // The flag itself relativizes: the root becomes the canonical token and the
+    // replacement half survives verbatim.
+    auto const mapped =
+        Relativize({ std::string { "-fdebug-prefix-map=" } + std::string { RootA } + "=" + std::string { Shared } }, RootA);
+    REQUIRE(mapped.size() == 1);
+    // The token carries a trailing separator, which is `PathCanon::Canonicalize`
+    // answering for a bare root rather than anything this row does. It is
+    // harmless and it is asserted rather than trimmed: this text only ever
+    // reaches the KEY -- the compiler is handed the argument as the build system
+    // wrote it -- so what matters is that it is identical on every machine, and
+    // trimming it would be a second spelling of one root for no reader.
+    CHECK(mapped[0] == "-fdebug-prefix-map=<SRCROOT>/=/fastcache/src");
+
+    // Two checkouts mapping to the same replacement produce objects that are
+    // byte-identical (measured on g++ and clang++; see the rulebook), so they
+    // must produce one key. This is the assertion that is red without the row.
+    CHECK(keyFor(RootA, Shared) == keyFor(RootB, Shared));
+
+    // Two checkouts mapping to DIFFERENT replacements produce objects that are
+    // not, so they must not. Nothing rewrites the replacement half, which is what
+    // makes the key enforce "the mapping must be identical on every machine
+    // sharing the cache" rather than leaving it as advice.
+    CHECK(keyFor(RootA, Shared) != keyFor(RootB, "/somewhere/else"));
+
+    // And a build that passes no mapping is a different command line, not a
+    // default, so it shares with neither.
+    CHECK(keyFor(RootA, {}) != keyFor(RootA, Shared));
+
+    // What is deliberately NOT asserted, so nobody adds it later believing it was
+    // an omission: that two checkouts passing NO mapping key apart. They do not --
+    // that is #489, and it is measured, reproduced and knowingly left standing.
+    // Closing it means folding the compile location into the key, which costs
+    // cross-checkout sharing on every `cl` compile and on every unmapped POSIX
+    // one; the project chose the sharing and the mapping instead. The residue is
+    // COFF, where no mapping exists, and it is written down in
+    // `.agent/rules/compile-cache.md` rather than left to be rediscovered here.
+    CHECK(keyFor(RootA, {}) == keyFor(RootB, {}));
+}
+
+TEST_CASE("A prefix-map value with no replacement is relativized rather than refused")
+{
+    // `-fdebug-prefix-map=/abs` is malformed and the driver will say so. The
+    // launcher must not be the one reporting it: it relativizes what it can and
+    // lets the compile fail with the compiler's own diagnostic, which is the
+    // message an operator can act on.
+    auto const out = Relativize({ std::string { "-fdebug-prefix-map=/home/ci/checkout-aaa" } }, "/home/ci/checkout-aaa");
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == "-fdebug-prefix-map=<SRCROOT>/");
+
+    // The split follows the driver rather than being convenient: GNU splits at
+    // the LAST separator, so `<from>` may carry one and `<to>` may not. Here that
+    // makes the driver's own `<from>` `/home/ci/checkout-aaa=/a`, which is not
+    // under the root -- `IsSegmentPrefix` needs a separator after it, not an `=` --
+    // so the argument comes back unchanged. That is the same answer the compiler
+    // gives, which is the point of splitting where it splits.
+    auto const withEquals =
+        Relativize({ std::string { "-fdebug-prefix-map=/home/ci/checkout-aaa=/a=b" } }, "/home/ci/checkout-aaa");
+    REQUIRE(withEquals.size() == 1);
+    CHECK(withEquals[0] == "-fdebug-prefix-map=/home/ci/checkout-aaa=/a=b");
+}
