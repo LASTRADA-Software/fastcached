@@ -239,7 +239,8 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
         // the layout behind the byte.
         //
         // `"not-a-value"` is the node's own fixture string, kept verbatim: its
-        // leading `n` is not generation 1, and the four bytes an object length would
+        // leading `n` is no generation this build implements, and the four bytes an
+        // object length would
         // occupy read as ~1.87 billion, which the frame cannot supply.
         constexpr std::string_view opaque = "not-a-value";
         auto const bytes = AsBytes(opaque);
@@ -283,12 +284,6 @@ TEST_CASE("Canonicalizing a stored value twice is not a second rewrite")
 namespace
 {
 
-/// One case of the conformance corpus: what a producer captured, the roots it
-/// captured it under, and the roots a consumer localizes it back into.
-///
-/// The roots are `string_view`s rather than a `PathCanon::Layout`, so the whole
-/// corpus is a `constexpr` table and adding a case is adding a row. Layouts are
-/// built from them at the point of use.
 /// What a row claims one side of the transformation does to its text.
 ///
 /// **A row that exercises nothing is byte-identical, inside a digest, to one that
@@ -538,16 +533,14 @@ struct StoredValueGeneration
 
 /// Every generation of the stored-value contract this build knows about.
 ///
-/// Generation 1 is the first, so there is nothing retired yet. That is not a
-/// standing property: it holds only until somebody bumps the byte, and the rows
-/// below are where the retired ones then live.
+/// The live one is last; everything above it is retired and stays. A retired row is
+/// not decoration: the live digest must reproduce none of them, so putting an old
+/// version byte back is caught whatever golden was pasted with it -- which a lone
+/// golden value could not do.
 /// @return The table, newest last.
 constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
-    // producer side and doubled its separator on the consumer side. The row stays so
-    // that putting the old byte back reproduces a retired digest and fails, whatever
-    // the golden says -- which is the whole reason the table is keyed on the version
-    // rather than being a lone golden value.
+    // producer side and doubled its separator on the consumer side.
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
     StoredValueGeneration { .digest = "2de61702e93b6c84e24c6d54c7c6db072d5ac0d5591826c871ec8f2aa37ca669", .version = 2 },
 };

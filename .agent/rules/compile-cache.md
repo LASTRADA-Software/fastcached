@@ -1272,11 +1272,14 @@ were open to breaking it, and neither needed anybody's install to be stale.
     the golden are one edit two hunks apart, and moving both leaves the suite green,
     which is `Test::RetiredGeneration`'s argument arriving at the same place from the
     key side. Retired rows stay, and the live digest must reproduce none of them.
-  - **Measured, because a guard nobody has watched refuse is not a guard**: a
-    plausible "collapse the double separator" edit to `JoinLocalized` — which changes
-    what every consumer replays — passes **2007 of 2008** cases, the pin being the one
-    that refused it. The first cut of the corpus did not catch it either, because it
-    exercised bare roots only as a PRODUCER; a rewrite and its inverse are one spec,
+  - **Measured, because a guard nobody has watched refuse is not a guard**: an edit to
+    `JoinLocalized` — which changes what every consumer replays — is refused by
+    **exactly one** case in the whole suite, the pin. Stated that way on purpose: the
+    figure was written twice as *2006 of 2007* and *2007 of 2008*, one restatement per
+    citation, and both went stale the next time anybody added a test. The count of
+    cases that refuse it is the fact; the suite total is the condition it was measured
+    under, and it moves. The first cut of the corpus refused it nowhere at all, because
+    it exercised bare roots only as a PRODUCER; a rewrite and its inverse are one spec,
     so both ends of every shape reach the digest. That miss generalises past this
     file and is [#547](https://github.com/LASTRADA-Software/fastcached/issues/547):
     **a corpus that varies one side of a transformation and fixes the other cannot
@@ -1322,9 +1325,11 @@ were open to breaking it, and neither needed anybody's install to be stale.
       rewrite, and the empty region exists to prove the framing survives with no text.
       A guard that has to be waived twice is a guard on its way to becoming
       decoration.
-    - It also **says which row broke**. Reverting the producer fix fails the digest
-      once and the effect assertion twice, naming both rows that went inert; the
-      digest alone can only report that something moved.
+    - It also **says which row broke**. Measured: reverting the producer fix fails the
+      digest once and the effect assertion four times — both sides of both bare-root
+      rows, since with nothing canonicalized there is no token for the consumer to
+      localize either — and each failure names its row. The digest alone can only
+      report that something moved.
   - **Vary BOTH sides of a transformation, or the corpus cannot see the side it
     fixed.** The bare-root miss was producer-varied and consumer-fixed, and the
     mutation written specifically to prove the guard bites passed all 2007 cases
@@ -1385,11 +1390,15 @@ were open to breaking it, and neither needed anybody's install to be stale.
     of the expected value is not evidence of a particular alternative**, and a
     classifier built on it will be confidently wrong about everything that is merely
     unfamiliar.
-  - **No tag moved for this.** Nothing observable about generation 1 changed, and
-    `CompileValueVersion` has never moved, so the population of values stored
-    verbatim by this route is empty **by construction**. That is a condition, not a
-    standing property: it stops being true the first time somebody bumps the byte,
-    which is exactly when the refusal above starts doing work.
+  - **No tag moved for this.** Nothing observable about generation 1 changed, so the
+    population of values stored verbatim by this route is empty **by construction**.
+    The reason is the FRAMING, not the generation byte: this route needs a bump that
+    moves the layout, and no bump has. Saying instead that "`CompileValueVersion` has
+    never moved" was a weaker claim wearing the same words, and it expired at
+    [#547](https://github.com/LASTRADA-Software/fastcached/issues/547) — generation 2
+    exists, generation-1 values are in the field, and the `ForeignGeneration` refusal
+    above is doing work today while this residual is still empty. Two conditions that
+    happened to hold together are not one condition.
 - **The launcher says which of the two it met.** `DecodeFailureReason` gives a
   foreign generation its own `--show-stats` row, because a mixed fleet is a rolling
   upgrade that ends by itself while a malformed value is a defect somebody has to
@@ -1567,15 +1576,6 @@ worth acting on is worth one clause saying which of the two it is.
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
   arguments even though their dependency sets now agree.
-- **[#547](https://github.com/LASTRADA-Software/fastcached/issues/547)** —
-  `JoinLocalized` appends a separator unconditionally, so a bare CONSUMER root
-  localizes `<SRCROOT>/inc/a.hpp` to `//inc/a.hpp` on POSIX and `C:\inc.hpp` on
-  Windows — a leading `//` is implementation-defined on one host and reads as UNC on
-  the other. The conformance corpus pins the CURRENT behaviour deliberately, so the
-  fix is forced to bump `CompileValueVersion` and drag `manifest-v*` with it: this is
-  the generation machinery's first real customer rather than a path tidy-up. The
-  ticket also asks for an audit of which other root shapes are varied on one side of
-  the transformation only, since that is the generalisable half.
 - **[#548](https://github.com/LASTRADA-Software/fastcached/issues/548)** — the
   retired-generation idiom has two homes with different key types:
   `apps/fastcache-cc/KeyDigestTestSupport.hpp` keyed on a schema-tag string, and

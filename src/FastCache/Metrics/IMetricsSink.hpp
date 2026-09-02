@@ -525,10 +525,13 @@ class IMetricsSink
         ///
         /// **Its baseline is zero and that is what makes it readable.** A fleet is
         /// permanently mid-upgrade ([#173]), so it might look like ordinary traffic --
-        /// but `CompileValueVersion` has never moved, so nothing produces one today
-        /// and any rise is a real event with a date on it. That is the opposite of the
-        /// `AUTH` refusal this tier deliberately leaves uncounted, which a healthy
-        /// launcher emits once per exchange for a whole build.
+        /// but a CONVERGED fleet produces none, so the series is zero, then a burst
+        /// while a rollout spans a `CompileValueVersion` bump, then zero again, and any
+        /// rise is a real event with a date on it. Not "the byte has never moved": it
+        /// moved to 2 at #547, which is when this series started doing work rather than
+        /// when it stopped meaning anything. That is the opposite of the `AUTH` refusal
+        /// this tier deliberately leaves uncounted, which a healthy launcher emits once
+        /// per exchange for a whole build.
         ///
         /// It is also what makes #483's decision auditable. Refusing a foreign
         /// generation buys correctness by giving up hits, and without this series
