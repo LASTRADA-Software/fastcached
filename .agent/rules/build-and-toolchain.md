@@ -1097,6 +1097,24 @@ of the bottom two rows**, which is the next bullet.
   CI job build it", because if yes its flag belongs in whatever line generates a
   database.
 
+  **A file the sweep DID reach can still be uncovered, and that half is now the
+  script's** (#466). A translation unit whose file is guarded out to nothing has a
+  compile command, so it never meets the drop rule above — it is planned, analysed,
+  reported clean, and the clean report is the defect: `TlsSocket_test.cpp` carried a
+  syntax error while the database listed it, clang-tidy passed it, both compilers
+  built it and ctest ran a binary holding none of its cases. Five signals agreed
+  about nothing. So the sweep preprocesses each unit once more and reports
+  **contributed / produced no code in this configuration / could not be
+  preprocessed**, per FILE, since a file has several commands and they need not
+  agree. There are now **two** lists to reconcile against the diff, not one, and the
+  headline counts files rather than commands. An empty unit is a guard working and
+  is never a fault — the leg where that guard is ACTIVE is what covers the file, so
+  the reconciliation is against the matrix, not against this run.
+
+  What the script still cannot answer is whether any CI leg compiles it with the
+  guard active. That is a different instrument over the matrix, and it is the half
+  with teeth: this one reports, and a green job's log is not read.
+
 - **The sanitizer test run moved to `clang-asan-ubsan`; it did not go.** The
   `clang-debug` preset is the only configuration in the workflow with ASan and
   UBSan on, so that job's `ctest` is the project's entire sanitizer coverage in CI.
