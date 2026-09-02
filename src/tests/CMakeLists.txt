@@ -1758,3 +1758,61 @@ else()
         TIMEOUT 300
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# fetch-transfer-bound: the dependency-fetch bound is watched refusing a stall.
+#
+# Three configures wedged in one evening on fresh worktrees -- 40, 40 and 53
+# minutes -- each parked in `read()` on a socket that had delivered nothing,
+# because git and CMake both wait forever on a transfer that stops delivering
+# (#526). `cmake/FetchTransferBound.cmake` bounds both, and this is what shows
+# the bound firing: a guard nobody has watched refuse is not a guard, and the
+# same fix applied by hand on the night of the wedges was never once exercised,
+# because the retry it sat behind happened to succeed.
+#
+# Registered here rather than beside a binary because it names two executables
+# -- git and cmake -- and neither is a target of this project.
+#
+# Python and not the usual .sh/.ps1 pair, which is the exception this file
+# otherwise does not make: the fixture needs a LISTENING SOCKET that accepts a
+# connection and answers nothing, plus process-tree control to kill a wedged
+# git without draining pipes its grandchildren hold (#239). POSIX shell can
+# express neither, so a shell version would be a PowerShell implementation with
+# a stub beside it rather than two implementations of one rule.
+#
+# It contacts nothing outside 127.0.0.1 and needs no daemon, no compiler and no
+# network, so it stays in the default set. The port comes from `bind(0)`: the
+# per-run allocation rule exists because a fixture CHOOSING a port cannot see
+# one already held as an outbound connection's local endpoint, and letting the
+# kernel choose sidesteps that question rather than answering it.
+find_program(FASTCACHED_PYTHON3 NAMES python3 python DOC "Python 3 interpreter")
+if(NOT FASTCACHED_PYTHON3)
+    # A WARNING and not a STATUS. The outcome here is that a guard standing
+    # behind a rule which has already cost three lanes forty minutes each is
+    # ABSENT from this build tree, and absent is not the same as passing.
+    message(WARNING
+        "fetch-transfer-bound: no python3 found, so the dependency-fetch transfer "
+        "bound (#526) is NOT guarded in this build tree")
+else()
+    add_test(
+        NAME "fetch-transfer-bound"
+        COMMAND "${FASTCACHED_PYTHON3}"
+            "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
+            --source-dir "${CMAKE_SOURCE_DIR}"
+            --git "${GIT_EXECUTABLE}"
+            --cmake "${CMAKE_COMMAND}"
+    )
+    # The script is a real program with a real exit code, so it needs no
+    # FAIL_REGULAR_EXPRESSION -- that property exists for `cmake -P` checks,
+    # which cannot fail their own test because message(FATAL_ERROR) exits 0 on
+    # CMake 3.28. 77 is this file's script-driven convention for "a prerequisite
+    # is missing", which here means git or cmake could not be run at all.
+    #
+    # TIMEOUT well above what the script's own bounds permit (two ~6s controls
+    # and two legs bounded at the compressed window plus slack): the ctest
+    # timeout is the outer supervisor, not the measurement.
+    set_tests_properties("fetch-transfer-bound" PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+endif()
