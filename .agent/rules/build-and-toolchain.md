@@ -246,6 +246,56 @@ determinism rests on.
     directory on the wrong analyser, one that never found any, one with no entry, one already
     correct -- because the gate itself builds two whole configurations and cannot be a test,
     while the part that can be silently wrong is pure.
+- **A gate that stops at the first red leg must SAY what it skipped, or stopping early
+  becomes a lie.** `local-gate.sh` fails fast, which is correct -- forcing a full second
+  configuration after a known failure makes the gate something people stop running, and
+  the script's own header already names that hazard. What was wrong is that the refusal
+  was the *whole* report: `GATE FAILED: clang-debug tests` and nothing else, so the
+  reader supplied "and the rest passed" from optimism. It had not been asked
+  ([#501](https://github.com/LASTRADA-Software/fastcached/issues/501)).
+
+  Measured in #493: gate runs 1, 3, 4, 5 and 7 all failed inside `clang-debug` and
+  **none of them reached `gcc-release`**, while a GCC-only
+  `-Werror=maybe-uninitialized` -- raised by GCC 14 at `-O3` inlining a ternary into
+  `<optional>`'s own `operator!=`, and emitted by clang at no optimisation level and by
+  MSVC not at all -- sat in the tree through every one of them. That is almost
+  word-for-word the case the script's header gives as the reason `gcc-release` exists.
+  It surfaced only because a developer treated an unrun leg as *unrun* rather than as
+  covered.
+
+  So **every** run now ends with a per-leg verdict -- `passed`, `FAILED`, or `NOT RUN`
+  with the words "has reported NOTHING" -- on the green path too, because a summary
+  that appears only on failure is one nobody has read when it matters. Three
+  consequences worth keeping:
+  - **The renderer is pure**, taking `preset=state` pairs as arguments. The defect was
+    a REPORTING defect, and a report that can only be exercised by building two whole
+    configurations is the same defect one level up. `ctest -R local-gate-selftest`
+    drives every verdict in milliseconds, including the inequality the acceptance
+    actually turns on: `FAILED` and `NOT RUN` for one preset must never coincide.
+
+    **This is the same move `node-scratch-isolation-e2e` needed, and it is now the
+    standing answer for an instrument whose own defect is invisible.** That fixture's
+    verdict logic could only be reached by running the expensive thing it wrapped;
+    splitting the DECISION out as a pure function over a record and leaving
+    acquisition alone took it from 53 seconds and a `RUN_SERIAL` to 0.3 seconds and
+    neither, and made every branch cheap enough to mutate one at a time
+    (`.agent/rules/testing.md`). At least four instruments here have had that shape.
+    When a gate, fixture or classifier cannot be tested without paying for what it
+    measures, split the decision from the acquisition rather than accepting that the
+    instrument is untestable.
+  - **An unrecognised state renders as unrecognised.** A fourth state arriving at the
+    default arm as `passed` would recreate the bug exactly, one level down. Skipped,
+    absent, unstarted and failed are four states here as everywhere.
+  - **The states are derived from the preset table**, and the green line no longer
+    spells "(clang-debug + gcc-release)" as a literal -- a third row would have been
+    silently missing from the gate's own statement of what it had just done.
+
+  Reading a red log is the same trap once more: ninja prints `FAILED:` and puts the
+  error text several lines BELOW it, so a wrapper filtering on `error|warning:` alone
+  surfaced an unrelated zstd warning and none of the actual failure. **A filter that
+  reports nothing and a run that found nothing render identically.** Read the raw log
+  the message names, or filter on `FAILED:` as well.
+
 - **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
   `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
   so both its configurations were fronted by whichever launcher happened to be installed, at
