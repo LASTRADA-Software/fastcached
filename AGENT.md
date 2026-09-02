@@ -630,6 +630,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   `MalformedValue` themselves, so no caller picks; it is not a persistence failure; and
   `CacheMalformedValues` keeps it visible, because removing a wrong signal without adding
   a right one is the other way to get this wrong.
+- One `Corrupt`, two events, and WHERE decides: `Open` reads two meta slots, the free
+  list and two reserved keys, and `Replay()` is a no-op — so damage in that reach refuses
+  the process to start (fatal in both binaries) and damage anywhere else is found per key
+  while it serves. Making `Open` touch more of the store converts the second into the
+  first, which is a decision rather than an optimisation.
 - A format is convertible exactly as long as its reader is in `RecordFormats()`.
   Bumping the version without adding a row is the decision to discard every store.
 - "No marker" is an INFERENCE. Validate every record before writing any of them:

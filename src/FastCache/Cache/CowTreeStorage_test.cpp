@@ -13,11 +13,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -35,6 +37,7 @@
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/IPageStore.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
+#include <CowTree/Meta.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
@@ -1179,6 +1182,245 @@ TEST_CASE("Open on a path holding random non-CowTree bytes returns Corrupt or Io
     // first; we accept either Corrupt or IoError, both are sane.
     auto const code = storage.error().code;
     REQUIRE((code == FastCache::StorageErrorCode::Corrupt || code == FastCache::StorageErrorCode::IoError));
+}
+
+// ============================================================================
+// What `Corrupt` costs an operator (issue #484)
+//
+// The rules are careful that a store of another VINTAGE never reports
+// `Corrupt`, because `Corrupt` is what makes somebody delete a healthy cache.
+// The missing half was what an operator does when the bytes really are damaged,
+// and the answer turns entirely on WHERE the damage landed: the same code means
+// "this process will not start" in one place and "this process lost some keys"
+// in another. `docs/operations/corrupt-store.md` states both, and these two
+// cases are what stop that page from being prose about behaviour nothing
+// asserts.
+// ============================================================================
+
+namespace
+{
+
+/// A page size small enough that a few hundred small records occupy many pages,
+/// so a per-page damage sweep has more than one leaf to land on. The daemon
+/// runs a 16 KiB page, and at that size the same store would be a handful of
+/// pages and the sweep would prove much less.
+constexpr std::size_t DamagePageSize = CowTree::MinPageSize;
+
+/// How many records the damage sweep writes. Enough that the tree is several
+/// levels of several pages, so damage to one leaf leaves other leaves readable.
+constexpr int DamageRecords = 400;
+
+/// Key `i` of the damage sweep's store.
+/// @param i Record index.
+/// @return A fixed-width key, so every record is the same size.
+[[nodiscard]] std::string DamageKey(int i)
+{
+    return std::format("damage-key-{:04}", i);
+}
+
+/// Read a whole file into memory.
+///
+/// Only the meta-slot case needs this. Data pages are damaged through
+/// `IPageStore::Write`, which is simpler and cannot reach a meta slot by
+/// construction — but a meta slot has no such route, because `WriteMeta`
+/// recomputes the CRC and so cannot express damage at all.
+/// @param path The file to read.
+/// @return Its bytes.
+[[nodiscard]] std::vector<std::byte> ReadWholeFile(std::filesystem::path const& path)
+{
+    std::ifstream f { path, std::ios::binary | std::ios::ate };
+    REQUIRE(f.good());
+    auto const size = static_cast<std::size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<std::byte> bytes(size);
+    f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+    REQUIRE(f.good());
+    return bytes;
+}
+
+/// Replace a file's contents wholesale.
+/// @param path  The file to write.
+/// @param bytes What it should hold afterwards.
+void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const> bytes)
+{
+    std::ofstream f { path, std::ios::binary | std::ios::trunc };
+    REQUIRE(f.good());
+    f.write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(f.good());
+}
+
+/// Open the store file at `path` with the sweep's page size.
+///
+/// Returns the `expected` rather than asserting on it, unlike `WithOpenStorage`
+/// above: whether this store opens at all is the thing under test.
+/// @param path The store file.
+/// @return The opened store, or why it would not open.
+[[nodiscard]] std::expected<std::unique_ptr<FastCache::CowTreeStorage>, FastCache::StorageError> OpenDamaged(
+    std::filesystem::path const& path)
+{
+    return FastCache::CowTreeStorage::Open({ .path = path, .pageSize = DamagePageSize });
+}
+
+/// Overwrite data page `id` of `store` with `page`.
+/// @param store The page store.
+/// @param id    The 1-based data page to replace.
+/// @param page  Its new contents.
+void WritePage(CowTree::IPageStore& store, std::uint64_t id, std::span<std::byte const> page)
+{
+    REQUIRE(store.Write(CowTree::PageId { id }, CowTree::BytesView { page.data(), page.size() }).has_value());
+}
+
+} // namespace
+
+TEST_CASE("Damage to both meta pages refuses the store at Open, and refuses it as damage", "[cowstorage][open][corrupt]")
+{
+    TempFile tmp;
+    {
+        auto storage = OpenDamaged(tmp.path);
+        REQUIRE(storage.has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    // Only the two meta slots. Everything beneath them is left exactly as the
+    // store wrote it, so this is "the store can no longer say what it is" and
+    // not a file that happens to be full of garbage -- which is the case the
+    // test above already covers, and which is allowed to answer `IoError`.
+    auto bytes = ReadWholeFile(tmp.path);
+    REQUIRE(bytes.size() > 2 * DamagePageSize);
+    std::ranges::fill(std::span<std::byte> { bytes }.first(2 * DamagePageSize), std::byte { 0xFF });
+    WriteWholeFile(tmp.path, bytes);
+
+    auto const opened = OpenDamaged(tmp.path);
+    // The process does not start. Both `fastcached` and `fastcache-compile-node`
+    // treat a store that will not open as fatal, which is why the operator page
+    // calls damage here an outage rather than a degradation.
+    //
+    // `Corrupt` exactly, because the two neighbouring codes mean the store is
+    // FINE and must not be reachable from real damage: `UnsupportedFormatVersion`
+    // is a vintage to convert, `MalformedValue` is a client that sent a value
+    // this build cannot parse. Asserting those separately would be a tautology
+    // once the code is known to be `Corrupt`; the cases that hold the line from
+    // the other side are the vintage tests below.
+    REQUIRE_FALSE(opened.has_value());
+    REQUIRE(opened.error().code == FastCache::StorageErrorCode::Corrupt);
+}
+
+TEST_CASE("Damage below the meta pages still opens, and costs keys rather than the process", "[cowstorage][open][corrupt]")
+{
+    // `Open` reads the two meta slots and looks up two reserved keys -- the
+    // in-flight-conversion marker and the format marker -- and `Replay()` is
+    // deliberately a no-op, so nothing scans the store. Damage anywhere else is
+    // therefore not found until something reads the page it landed on, and a
+    // node logging `Corrupt` while serving is not the same event as one that
+    // will not start.
+    //
+    // Damage goes in through `IPageStore::Write`, which addresses DATA pages --
+    // the meta slots have accessors of their own and are not reachable from
+    // here at all. So "below the meta pages" is a property of how the fixture
+    // reaches the store, rather than an assumption about byte offsets that
+    // would restate `FilePageStore`'s layout back at it.
+    //
+    // What this fixture does NOT cover, stated so the next reader does not
+    // assume it does: `CowTree::Open` reads only the two meta slots, and the
+    // free-list walk that `FilePageStore::RecoverExistingFile` does at startup
+    // has no `InMemoryPageStore` equivalent. A damaged free-list page IS a
+    // startup refusal on a real store -- the operator page says so -- and
+    // nothing here exercises it.
+    CowTree::InMemoryPageStore store { DamagePageSize };
+    FastCache::CowTreeStorage::Options const opts;
+    {
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, DamageRecords))
+            REQUIRE((*storage)->Set(DamageKey(i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    auto const pageCount = store.PageCount();
+    REQUIRE(pageCount > 1);
+
+    // Which page holds which record is not something a test may assume, so the
+    // sweep looks for the case rather than computing where it is: damage each
+    // data page in turn until one leaves the store open and only partly
+    // readable. Pages that carry the marker's own root-to-leaf path refuse at
+    // `Open` instead, and are skipped -- that outcome is the case above.
+    //
+    // The three ways it can fail are different bugs, so the sweep counts them
+    // apart rather than reporting one bare `false`: every page refusing at `Open`
+    // means damage below the metas has become a refusal to start, a page that
+    // opens with nothing corrupt means the damage was not detected at all, and
+    // one that opens with nothing readable means the loss is total rather than
+    // partial.
+    bool partialLoss = false;
+    auto probed = 0;
+    auto refusedAtOpen = 0;
+    auto openedWithNothingCorrupt = 0;
+    auto openedWithNothingReadable = 0;
+    for (auto const id: std::views::iota(std::uint64_t { 1 }, static_cast<std::uint64_t>(pageCount) + 1))
+    {
+        auto const view = store.Read(CowTree::PageId { id });
+        if (!view.has_value())
+            continue;
+        ++probed;
+        std::vector<std::byte> const pristine { view->begin(), view->end() };
+
+        auto damaged = pristine;
+        damaged[damaged.size() / 2] ^= std::byte { 0xFF };
+        WritePage(store, id, damaged);
+
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        if (!storage.has_value())
+        {
+            // A refusal here is skipped rather than asserted on -- but not
+            // silently. `StoredFormatVersion` answers `PreMarkerFormatVersion`
+            // whenever the marker lookup MISSES over a non-empty tree, and that
+            // becomes `UnsupportedFormatVersion`: damage would then tell an
+            // operator their store is a healthy vintage to convert, which is the
+            // "delete a healthy cache" failure running backwards. Today every
+            // damaged page fails its CRC so the lookup errors instead of missing,
+            // and this is what keeps that true.
+            CAPTURE(id);
+            REQUIRE(storage.error().code == FastCache::StorageErrorCode::Corrupt);
+            ++refusedAtOpen;
+        }
+        else
+        {
+            FastCache::ManualClock clock;
+            auto corrupt = 0;
+            auto readable = 0;
+            for (auto const i: std::views::iota(0, DamageRecords))
+            {
+                // BOTH halves, and the second is the one that gets forgotten. A
+                // count of corrupt keys alone would pass against a store that had
+                // lost everything -- which is precisely the outcome the operator
+                // page tells somebody they are not necessarily in, and the reason
+                // it says to copy the file before deleting it.
+                if (corrupt > 0 && readable > 0)
+                    break;
+                auto const got = (*storage)->Get(DamageKey(i), clock.Now());
+                if (!got.has_value())
+                {
+                    if (got.error().code == FastCache::StorageErrorCode::Corrupt)
+                        ++corrupt;
+                }
+                else if (got->found)
+                    ++readable;
+            }
+            partialLoss = corrupt > 0 && readable > 0;
+            if (corrupt == 0)
+                ++openedWithNothingCorrupt;
+            else if (readable == 0)
+                ++openedWithNothingReadable;
+        }
+
+        // Put the page back whatever happened, so the next probe damages one
+        // page rather than accumulating every earlier one.
+        WritePage(store, id, pristine);
+        if (partialLoss)
+            break;
+    }
+    INFO("probed " << probed << " pages: " << refusedAtOpen << " refused at Open, " << openedWithNothingCorrupt
+                   << " opened with no key corrupt, " << openedWithNothingReadable << " opened with no key readable");
+    REQUIRE(partialLoss);
 }
 
 // ============================================================================
