@@ -561,6 +561,44 @@ class IMetricsSink
         /// SADD.
         CacheMalformedValues,
 
+        /// Connections the frame surface swept before the peer had named a verb.
+        ///
+        /// The pre-header window (`FrameServer::HeaderTimeout`, five seconds), armed
+        /// at accept and again before every header read. A peer counted here told the
+        /// surface nothing at all, which is why this is the ENDPOINT's row and not any
+        /// responder's: there is no verb to attribute it to, and a row that named one
+        /// could sum with a verb-attributed refusal that means something else.
+        ///
+        /// **Not an ordinary event**, though it looks like it might be. `RunOneExchange`
+        /// opens a connection, sends immediately, reads the reply and closes, so no
+        /// honest client of this surface idles across the window. A rise is a peer that
+        /// connected and did not speak -- a scanner, a health probe pointed at the
+        /// wrong port, or a client wedged before its first write.
+        ///
+        /// **Never summed with `FrameAnswerDeadlineSweeps`.** That one says a request
+        /// this surface accepted outran its own budget, which is a fleet problem; this
+        /// one says somebody knocked and said nothing, which is background noise on any
+        /// reachable port. Sharing a row would bury the first under the second.
+        FrameRequestDeadlineSweeps,
+
+        /// Connections the frame surface swept after the peer had named a verb.
+        ///
+        /// The verb's own window (`IFrameResponder::RequestTimeout`), armed once the
+        /// header decodes -- a round trip for a scheduler verb, and
+        /// `DefaultCompileLeaseTimeout` for a compile.
+        ///
+        /// **This is the rare, load-bearing one.** For a compile it means a translation
+        /// unit outran the lease it was granted under, so the object it would have
+        /// produced is one the scheduler may already have re-granted to somebody else.
+        /// Before this existed the connection was closed silently and the only trace was
+        /// a Debug log line carrying an undifferentiated total, so a site whose units are
+        /// genuinely longer than the grant could only INFER that from builds that got
+        /// slower.
+        ///
+        /// A rise is a question about the lease timeout, never about this worker's
+        /// speed. See the issue linked from `FrameServer::CloseOverdue`.
+        FrameAnswerDeadlineSweeps,
+
         Last,
     };
 

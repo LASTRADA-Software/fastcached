@@ -26,6 +26,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -1684,4 +1685,91 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     auto const reply = small.get();
     REQUIRE_FALSE(reply.empty());
     CHECK(ErrorOf(reply) != Wire::ErrorCode::EndpointBusy);
+}
+
+TEST_CASE("A peer swept before naming a verb and one swept owing an answer are counted apart", "[node][frame][sweep]")
+{
+    // **Issue #243, and the two arms ARE the case.** A swept connection used to be a
+    // bare `socket->Close()` whose only trace was a Debug log line carrying an
+    // undifferentiated total -- a signal that is present, correct, and emitted where
+    // nothing scrapes it, which is the shape of an absent counter rather than a wrong
+    // one.
+    //
+    // One counter would have been the defect one level up. The two sweeps are opposite
+    // findings: a peer that connected and never spoke is background noise on any
+    // reachable port, while a request this surface ACCEPTED and could not answer in
+    // time means, for a compile, a translation unit that outlived its lease grant --
+    // the rare, load-bearing signal the ticket is actually about. Summed, the second is
+    // buried under the first.
+    //
+    // Both peers are attached BEFORE the wait and both counters read after it, so the
+    // two arms share one endpoint, one sweeper and one window. Either arm alone proves
+    // nothing: a phase that was mislabelled at one of the three arming sites still
+    // raises A counter, and only requiring each arm to raise its OWN row catches that.
+    // Separate fixtures would additionally let the difference be explained by the
+    // harness rather than by the peer -- the failure `#247` had to be rebuilt to avoid.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+
+    // The answer window, shortened so this arm costs a sweep interval rather than the
+    // lease timeout. The responder owns this number in production too -- it is what
+    // gives a cache round trip a round trip and a compile however long a compiler runs
+    // -- so shortening it exercises the real mechanism rather than a test seam. The
+    // header window is a constant of the surface and is not shortened, which is why
+    // this case costs `FrameServer::HeaderTimeout`.
+    responder.PlaceRequestTimeout(50ms);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const requestsBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
+    auto const answersBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+
+    BlockingConnector connector;
+
+    // ARM ONE: connects and says nothing. It never names a verb, so it is swept on the
+    // header window and belongs to the endpoint's own row.
+    auto silent = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(silent.has_value());
+
+    // ARM TWO: names a verb the responder then never answers. Swept owing an answer.
+    auto owed = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(owed.has_value());
+    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
+        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
+        co_return written.has_value();
+    }((*owed).get(), Wire::EncodeFetch("k"))));
+
+    // ONE wait for both, bounded and reporting what it waited for. The bound is
+    // generous against `HeaderTimeout` plus a sweep interval, because what this case
+    // asserts is which counter moved and never how fast.
+    auto const deadline = std::chrono::steady_clock::now() + 60s;
+    auto requests = requestsBefore;
+    auto answers = answersBefore;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        requests = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
+        answers = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+        if (requests > requestsBefore && answers > answersBefore)
+            break;
+        std::this_thread::sleep_for(100ms);
+    }
+
+    INFO("request-deadline sweeps: " << requests << " (was " << requestsBefore << ")");
+    INFO("answer-deadline sweeps: " << answers << " (was " << answersBefore << ")");
+
+    // Each arm raised its OWN row, exactly once. Asserted as equality rather than as
+    // "rose", because a conflated implementation that raised both rows for both peers
+    // would satisfy a `>` on each.
+    CHECK(requests == requestsBefore + 1);
+    CHECK(answers == answersBefore + 1);
+
+    (*silent)->Close();
+    (*owed)->Close();
+    responder.Hold(false);
 }

@@ -90,6 +90,57 @@ namespace
 /// In one struct behind a pointer rather than as members of `FrameServer`, so the
 /// free-function connection tasks can name it without `FrameServer`'s privates
 /// being public -- the same reason `EpollSocket::Impl` is spelled this way.
+/// Which of a connection's two windows a tracked deadline belongs to.
+///
+/// A connection is swept for one of two reasons and they are opposite findings, so
+/// the tracker records which rather than leaving a sweep to guess
+/// ([#243](https://github.com/LASTRADA-Software/fastcached/issues/243)).
+enum class SweepPhase : std::uint8_t
+{
+    /// Waiting for the peer to name a verb: `FrameServer::HeaderTimeout`.
+    AwaitingRequest,
+    /// Waiting to answer a verb the peer named: `IFrameResponder::RequestTimeout`.
+    AwaitingAnswer,
+};
+
+/// What one sweep closed, split by why.
+///
+/// Two numbers rather than a total, because a total is the thing this ticket exists
+/// to replace: the sweep already returned one and logged it at Debug, which is a
+/// signal that is correct, present, and emitted where nothing scrapes it.
+struct SweepTally
+{
+    std::size_t awaitingRequest { 0 }; ///< Swept before naming a verb.
+    std::size_t awaitingAnswer { 0 };  ///< Swept while an answer was owed.
+
+    /// @return How many connections were closed in total.
+    [[nodiscard]] std::size_t Total() const noexcept
+    {
+        return awaitingRequest + awaitingAnswer;
+    }
+};
+
+/// One connection this surface is serving, and when it must be done by.
+struct TrackedConnection
+{
+    ISocket* socket { nullptr };
+    TimePoint deadline {};
+    SweepPhase phase { SweepPhase::AwaitingRequest };
+
+    /// Whether a sweep has already closed and counted this one.
+    ///
+    /// **A close does not deregister the entry, and the gap is not always short.**
+    /// `Untrack` runs when the connection's coroutine unwinds, and closing only
+    /// resumes it if it is parked on THIS socket -- a coroutine awaiting a responder
+    /// that has not answered stays parked, so the entry remains overdue and the next
+    /// sweep finds it again. Without this flag it is closed and COUNTED once per
+    /// sweep interval for as long as the responder holds, which turns the counter
+    /// into a measure of how long something was stuck rather than of how many
+    /// connections were swept. Caught by the two-arm case, which read 5 against an
+    /// expected 1.
+    bool swept { false };
+};
+
 struct FrameServer::State
 {
     NodeIoLoop& io;
@@ -101,14 +152,23 @@ struct FrameServer::State
 
     std::atomic<bool> shuttingDown { false };
 
-    /// Sockets being served, each with the instant it must finish by.
+    /// Sockets being served, each with the instant it must finish by AND which
+    /// window that instant belongs to.
+    ///
+    /// **The phase is not bookkeeping.** Without it a sweep cannot say whether it
+    /// closed a peer that never named a verb or a request this surface accepted and
+    /// then failed to answer in time, and those are opposite findings: the first is
+    /// background noise on any reachable port, the second is a translation unit that
+    /// outlived its lease grant. One counter for both would bury the rare one under
+    /// the ordinary one -- the same burial the metrics rules warn about for a refusal
+    /// a healthy build gets once per exchange.
     ///
     /// Every mutation happens on the reactor thread; the mutex is here because
     /// `Shutdown()` may be called from another one and needs to read the set to
     /// know whether to wait. Raw pointers, because the owning `unique_ptr` lives in
     /// the connection task's frame and the registration is removed before it ends.
     mutable std::mutex mutex;
-    std::vector<std::pair<ISocket*, TimePoint>> open;
+    std::vector<TrackedConnection> open;
 
     std::atomic<std::size_t> openConnections { 0 };
     std::atomic<std::size_t> inFlightBytes { 0 };
@@ -136,10 +196,13 @@ struct FrameServer::State
     }
 
     /// Register a socket with the deadline it must finish by.
-    void Track(ISocket* socket, TimePoint deadline)
+    /// @param socket The socket to track.
+    /// @param deadline When it must have finished.
+    /// @param phase Which window `deadline` belongs to.
+    void Track(ISocket* socket, TimePoint deadline, SweepPhase phase)
     {
         std::scoped_lock const guard { mutex };
-        open.emplace_back(socket, deadline);
+        open.push_back(TrackedConnection { .socket = socket, .deadline = deadline, .phase = phase });
     }
 
     /// Move a tracked socket's deadline forward.
@@ -154,39 +217,81 @@ struct FrameServer::State
     /// stops talking is still swept.
     /// @param socket The tracked socket.
     /// @param deadline Its new deadline.
-    void Rearm(ISocket* socket, TimePoint deadline)
+    /// @param phase Which window the new deadline belongs to. Moved with the
+    ///        deadline and never separately: a phase that outlived its own window
+    ///        would attribute the next sweep to the previous request's state.
+    void Rearm(ISocket* socket, TimePoint deadline, SweepPhase phase)
     {
         std::scoped_lock const guard { mutex };
         for (auto& entry: open)
-            if (entry.first == socket)
-                entry.second = deadline;
+            if (entry.socket == socket)
+            {
+                entry.deadline = deadline;
+                entry.phase = phase;
+                // Deliberately NOT cleared. A connection this sweeper has already
+                // closed is finished whatever its coroutine does next, and clearing
+                // the flag would let a request that started before the close be
+                // counted a second time when the next deadline passes.
+            }
     }
 
     /// Deregister a socket. Must happen before its owner destroys it.
     void Untrack(ISocket* socket)
     {
         std::scoped_lock const guard { mutex };
-        std::erase_if(open, [socket](auto const& entry) { return entry.first == socket; });
+        std::erase_if(open, [socket](auto const& entry) { return entry.socket == socket; });
     }
 
-    /// Close every socket past its deadline. Reactor thread only.
+    /// Close every socket past its deadline, and COUNT each by why.
+    ///
+    /// **A close is all this can do, and the counter is what makes it legible.**
+    /// A named refusal reply would be better and is not available here: this socket's
+    /// write side belongs to `ServeConnection`, which is parked in a read or awaiting
+    /// a responder that is about to write. A sweeper that wrote would interleave two
+    /// writers on one socket and splice a refusal into somebody's answer -- the
+    /// crossed-reply hazard reached from the output side. Closing is also what
+    /// UNBLOCKS the parked coroutine, so here the diagnosis and the remedy are one
+    /// act. Replacing the close is
+    /// [#523](https://github.com/LASTRADA-Software/fastcached/issues/523), which has
+    /// to supply its own way to end that read.
+    ///
+    /// Until then the counters are the whole instrument, which is why they are two
+    /// and not one: see `SweepPhase`.
     /// @param now The reactor's current time.
-    /// @return How many were closed.
-    std::size_t CloseOverdue(TimePoint now)
+    /// @return How many were closed in each phase.
+    SweepTally CloseOverdue(TimePoint now)
     {
-        std::vector<ISocket*> overdue;
+        std::vector<TrackedConnection> overdue;
         {
             std::scoped_lock const guard { mutex };
-            for (auto const& [socket, deadline]: open)
-                if (deadline <= now)
-                    overdue.push_back(socket);
+            for (auto& entry: open)
+                if (entry.deadline <= now && !entry.swept)
+                {
+                    // Marked HERE, under the same lock that found it, so a second
+                    // sweeper turn cannot collect the same entry before this one has
+                    // closed it.
+                    entry.swept = true;
+                    overdue.push_back(entry);
+                }
         }
+
+        SweepTally tally;
         // Closed outside the lock: `Close` completes a parked read by resuming its
         // coroutine inline, and that coroutine calls `Untrack`, which takes this
         // same mutex.
-        for (auto* socket: overdue)
-            socket->Close();
-        return overdue.size();
+        for (auto const& entry: overdue)
+        {
+            // Counted BEFORE the close, for the reason `SocketDeadlineTarget` records
+            // for the launcher's deadline: the close resumes a coroutine inline, so a
+            // tally written afterwards is written after that coroutine has already
+            // observed the socket shut.
+            auto& seen = entry.phase == SweepPhase::AwaitingRequest ? tally.awaitingRequest : tally.awaitingAnswer;
+            seen += 1;
+            metrics.Increment(entry.phase == SweepPhase::AwaitingRequest ? IMetricsSink::Counter::FrameRequestDeadlineSweeps
+                                                                         : IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            entry.socket->Close();
+        }
+        return tally;
     }
 
     /// Close the listener and every open connection. Reactor thread only.
@@ -197,8 +302,8 @@ struct FrameServer::State
         std::vector<ISocket*> sockets;
         {
             std::scoped_lock const guard { mutex };
-            for (auto const& [socket, deadline]: open)
-                sockets.push_back(socket);
+            for (auto const& entry: open)
+                sockets.push_back(entry.socket);
         }
         for (auto* socket: sockets)
             socket->Close();
@@ -379,7 +484,7 @@ namespace
         auto const deadlineFor = [state](std::chrono::milliseconds window) {
             return state->io.Reactor().Clock().Now() + window;
         };
-        state->Track(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
+        state->Track(socket.get(), deadlineFor(FrameServer::HeaderTimeout), SweepPhase::AwaitingRequest);
 
         // The firewall: this is a DetachedTask, whose unhandled_exception terminates
         // the process, so one client's answer must not take the node with it.
@@ -413,7 +518,7 @@ namespace
                 // Whatever a pipelined peer has already sent is kept.
                 reader.ReleaseSpareCapacity();
 
-                state->Rearm(socket.get(), deadlineFor(FrameServer::HeaderTimeout));
+                state->Rearm(socket.get(), deadlineFor(FrameServer::HeaderTimeout), SweepPhase::AwaitingRequest);
 
                 auto const header = co_await reader.ReadExactly(Wire::RequestHeaderSize);
                 if (!header.has_value())
@@ -587,7 +692,8 @@ namespace
                 // So `HeaderTimeout` governs everything up to this line, which is the
                 // rule stated positively: a peer gets the generous window by being
                 // SERVED, never by asking.
-                state->Rearm(socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)));
+                state->Rearm(
+                    socket.get(), deadlineFor(state->responder.RequestTimeout(decoded->opRaw)), SweepPhase::AwaitingAnswer);
 
                 BudgetedBytes bytes { state, decoded->payloadLength };
                 auto const payload = co_await reader.ReadExactly(decoded->payloadLength);
@@ -682,7 +788,12 @@ namespace
         // slot, and so counted by nothing. This is the one place where being polite
         // has to stay cheap.
         auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
-        state->Track(socket.get(), deadline);
+        // `AwaitingRequest`, and it is the honest phase rather than the convenient
+        // one: this peer was refused at accept, so it has named no verb and never
+        // will. A sweep here means the refusal write did not drain, which belongs
+        // beside the other pre-verb sweeps and must not be read as a request this
+        // surface accepted and failed to answer.
+        state->Track(socket.get(), deadline, SweepPhase::AwaitingRequest);
         try
         {
             // **The one refusal on this endpoint that belongs to the endpoint.**
@@ -725,9 +836,18 @@ namespace
             co_await SleepFor(state->io.Reactor(), FrameServer::SweepInterval);
             if (state->shuttingDown.load(std::memory_order_acquire))
                 break;
-            if (auto const closed = state->CloseOverdue(state->io.Reactor().Clock().Now()); closed != 0)
-                state->logger.Logf(
-                    LogLevel::Debug, "{}: closed {} connection(s) past the request deadline", state->what, closed);
+            // Logged with the split, not the total. The two numbers answer different
+            // questions -- one is scanners, the other is a request this node accepted
+            // and could not answer in time -- and a line carrying only their sum
+            // cannot be read for either. The counters carry the same split for anyone
+            // scraping rather than reading logs.
+            if (auto const swept = state->CloseOverdue(state->io.Reactor().Clock().Now()); swept.Total() != 0)
+                state->logger.Logf(LogLevel::Debug,
+                                   "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed",
+                                   state->what,
+                                   swept.Total(),
+                                   swept.awaitingRequest,
+                                   swept.awaitingAnswer);
         }
         state->loopsAlive.fetch_sub(1, std::memory_order_acq_rel);
         state->io.NoteLoopFinished();
