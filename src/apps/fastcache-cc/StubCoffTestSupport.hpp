@@ -68,6 +68,13 @@ inline constexpr std::size_t StubSymbolCount = 2;
 /// @param value What to store.
 inline void PutLe(std::vector<std::byte>& bytes, std::size_t at, std::size_t width, std::uint64_t value)
 {
+    // The bound is checked rather than assumed, and it is what keeps GCC quiet: at
+    // -O3 it inlines `vector::operator[]` far enough to see a possibly-null data
+    // pointer and reports `-Werror=null-dereference`, which clang and MSVC do not.
+    // The check is a real precondition too -- a builder writing past its own image
+    // is a defect in the builder -- so this is the source fix rather than a silencer.
+    if (at + width > bytes.size())
+        return;
     for (auto const index: std::views::iota(std::size_t { 0 }, width))
         bytes[at + index] = static_cast<std::byte>((value >> (8U * index)) & 0xFFU);
 }
