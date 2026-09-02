@@ -1055,13 +1055,23 @@ that does not happen.
 
   So the sweep's own failure opens or updates one issue — and the shape of that is
   the whole point. It keys on `steps.sweep.conclusion`, never on the job's
-  `failure()`: over the same sample a notifier on any failing master-push job would
-  have fired **18 times**, almost all of it infrastructure (the apt 403 of #550,
-  macOS runner flakes, a sanitizer timeout), while `clang-tidy`'s sweep failed
-  **once**. The test a new alarm has to pass here is whether a firing means something
-  happened — the same test that withdrew a counter in #447 — and 1-in-24 passes it
-  where 18-in-24 would not. One issue reopened by comment, keyed on a label rather
-  than a title so a reworded title cannot start a second thread.
+  `failure()`. **Over those same 18 failed master-push runs** — one window, one
+  denominator — a notifier on any failing job fires **18 times**, almost all of it
+  infrastructure (the apt 403 of #550, macOS runner flakes, a sanitizer timeout),
+  and `clang-tidy` was the failing job in exactly **one** of them. That is the whole
+  comparison; a rate over "push runs" would need a third window and is not what
+  decides it. The test a new alarm has to pass here is whether a firing means
+  something happened, which is the test that withdrew a counter in #447.
+
+  One issue, reopened by comment. Keyed on the **title**, read out of a `--label`
+  listing rather than a `--search`: search goes through GitHub's issue index, which
+  lags creation, so two master pushes failing inside that window would each find
+  nothing and each open one. The labels are `CONTRIBUTING.md`'s own — a private
+  `ci/…` key would be a label every documented filter is blind to — and
+  `status/needs-triage` is applied by the step rather than left to
+  `issue-triage.yml`, which never sees this issue: an issue opened with
+  `GITHUB_TOKEN` triggers no workflow, so the repository's one reader-attachment
+  mechanism does not fire and the report would land outside every triage query.
 
   It is a STEP inside the tidy job rather than a job of its own, and that is forced:
   `check-release-gate` asserts every job in the file appears in `release.needs`, and

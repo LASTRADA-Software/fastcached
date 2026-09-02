@@ -358,12 +358,15 @@ jobs:
   # tidy is to tidy fewer translation units.
   #
   # So this job no longer builds at all. It configures — which is all a compile
-  # database needs — and hands the database to `scripts/tidy-sweep.sh`, which on
-  # a pull request sweeps the changed translation units plus every one that
-  # transitively includes a changed header, and on any push — master, `fix-ci` or
-  # a tag — sweeps everything. Nightly is deliberately not a third trigger: every
-  # push to master already sweeps in full, and a `schedule:` on this workflow
-  # would run all twenty jobs to re-answer a question the merge just answered.
+  # database needs — and hands the database to `scripts/tidy-sweep.sh`, which
+  # sweeps the changed translation units plus every one that transitively
+  # includes a changed header. A PUSH — master, `fix-ci` or a tag — is the one
+  # event that sweeps everything, and since #554 it is the ONLY one: a pull
+  # request and a merge-queue entry both diff-scope, each against its own base.
+  # Which base, and why the union still covers master, is at the `Sweep` step.
+  # Nightly is deliberately not a third trigger: every push to master already
+  # sweeps in full, and a `schedule:` on this workflow would run all twenty jobs
+  # to re-answer a question the merge just answered.
   clang-tidy:
     name: "clang-tidy"
     runs-on: ubuntu-24.04
@@ -466,9 +469,17 @@ jobs:
       #
       # `tidy-sweep.sh` reads BASE only through `git rev-parse --verify` and
       # `git diff BASE...HEAD`, both of which take a raw SHA, and `fetch-depth: 0`
-      # above puts it in the clone. A BASE it cannot resolve makes it sweep
-      # EVERYTHING — `ci-scope.sh`'s own principle, already inside the script — so
-      # every way of being wrong here is towards more checking, never less.
+      # above puts it in the clone. A BASE it cannot RESOLVE makes it sweep
+      # EVERYTHING — `ci-scope.sh`'s own principle, already inside the script.
+      #
+      # That covers the absent and the malformed, and it is deliberately not the
+      # stronger claim, because the script has a second exit: a base that resolves
+      # but whose diff holds no source prints `no source changed` and exits 0,
+      # having analysed nothing. That is CORRECT for what reaches it here — a
+      # docs-only entry has nothing to tidy, exactly as its own pull-request run
+      # found — but it is the one direction that does not escalate, so a future
+      # change to how BASE is derived has to be judged against it rather than
+      # against the resolve check.
       #
       # This does NOT contradict the `changes` job's refusal to scope a queue
       # entry, which stands. That job decides whether a JOB RUNS AT ALL, where a
@@ -508,7 +519,7 @@ jobs:
       #
       # One issue, reopened by comment rather than replaced — a fresh issue per
       # push is the same noise problem in another medium. Found by its TITLE, which
-      # is the env var three lines above, so the search and the create cannot drift
+      # is the env var three lines above, so the lookup and the create cannot drift
       # apart without one edit changing both. Not by a label of its own:
       # `CONTRIBUTING.md` enumerates the label prefixes this repository uses and
       # there is no room in it for a private one, so a `ci/…` key would be a label
@@ -536,13 +547,22 @@ jobs:
           almost always the analyser drifting rather than any one change. Nothing
           is blocked by this, and the next pull request whose change escalates to a
           full sweep will fail for a reason that has nothing to do with it."
-          # The server-side search is a filter, not the match: `in:title` is
-          # word-based and would also return a near-miss. `$ENV.TITLE` rather than
-          # the title spliced into the jq program, so no quoting in a title anyone
-          # rewords later can turn the lookup into a syntax error and every later
-          # failure into a second issue.
-          existing="$(gh issue list --state open --search "\"${TITLE}\" in:title" \
-                      --limit 20 --json number,title \
+          # NOT `--search`, and that is the whole reason this reads by label and
+          # matches by title rather than searching for the title. `--search` goes
+          # through GitHub's issue search INDEX, which lags creation by seconds to
+          # minutes — so two master pushes failing inside that window would each
+          # find nothing and each open an issue, which is the noise this step
+          # exists to avoid. A plain `--label` listing is the directly-consistent
+          # REST endpoint: the second push sees what the first just opened.
+          #
+          # The labels narrow it (7 open issues carry both today) and the exact
+          # title decides it, because `--label` cannot be exact about which issue
+          # this is. `$ENV.TITLE` rather than the title spliced into the jq
+          # program, so no quoting in a title anyone rewords later can turn the
+          # lookup into a syntax error and every later failure into a second issue.
+          existing="$(gh issue list --state open \
+                      --label type/bug --label area/build \
+                      --limit 200 --json number,title \
                       --jq '[.[] | select(.title == $ENV.TITLE) | .number] | first // empty')"
           if [[ -n "$existing" ]]; then
             echo "updating existing report #${existing}"
