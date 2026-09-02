@@ -190,7 +190,7 @@ namespace
         // were spelled out in this function and nowhere else -- so when a compile node
         // became a second server for this wire it had none of them (#319). Sharing
         // only the rewrite would have left the ORDER here to be remembered twice.
-        auto const canonical =
+        auto canonical =
             CanonicalStoredValue(fields->value, BytesToString(fields->srcRoot), BytesToString(fields->buildTree));
         switch (canonical.outcome)
         {
@@ -209,18 +209,31 @@ namespace
                 // is what `CanonicalStoredValue` exists to prevent (#483). Neither
                 // server has a choice about this one.
                 //
-                // The code is still `MalformedValue` and that is WRONG in the way
+                // The MESSAGE names both generations, and it is the whole of the
+                // operator's diagnostic here: a rolling upgrade otherwise presents as
+                // stores that fail for no stated reason, and this reply is the only
+                // place a client of the DAEMON can see that the fleet is merely mixed.
+                //
+                // The CODE is still `MalformedValue`, and that is wrong in the way
                 // `.agent/rules/storage.md` records for `Corrupt` against
-                // `UnsupportedFormatVersion`: during a rolling upgrade it tells an
-                // operator their cache is damaged when the fleet is merely mixed, and
-                // the obvious remedy for a damaged cache is to wipe it. Its own wire
-                // code and counter row are #544, which depends on this change rather
-                // than being part of it.
-                co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
+                // `UnsupportedFormatVersion` -- the obvious remedy for a cache
+                // reported damaged is to wipe it. Its own wire code and counter row
+                // are #544, which depends on this change rather than being part of
+                // it, and which is what turns these two arms into a table.
+                co_return co_await ReplyError(socket,
+                                              Wire::ErrorCode::MalformedValue,
+                                              std::format("stored value is generation {}; this build implements {}",
+                                                          canonical.generation,
+                                                          CompileValueVersion))
+                    ? Next::Continue
+                    : Next::Abort;
         }
         auto const keyStr = BytesToString(fields->key);
         auto const groupStr = BytesToString(fields->prefetchGroup);
-        auto const stored = engine->Set(keyStr, canonical.bytes, /*flags=*/0, /*exptime=*/0);
+        // Moved, not copied: `CacheEngine::Set` takes the value BY VALUE and
+        // `canonical` is dead after this call, so passing it by name spent a full
+        // object-blob memcpy plus an allocation on every STORE.
+        auto const stored = engine->Set(keyStr, std::move(canonical.bytes), /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 

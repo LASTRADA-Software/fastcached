@@ -86,6 +86,20 @@ struct CompileValue
 /// answers is what makes somebody delete a healthy cache.
 [[nodiscard]] std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byte const> bytes);
 
+/// Whether @p error is `DecodeCompileValue`'s way of saying "this value was written
+/// under a generation this build does not implement".
+///
+/// One predicate rather than an `== ProtocolErrorCode::UnsupportedFeature` at each
+/// reader, because there are three of them — `CanonicalStoredValue`, the launcher's
+/// `--show-stats` reason, and the tests — and a rule spelled three times is a rule
+/// two of them can drift from. It is also the seam a future refusal reaches through:
+/// if the decoder ever grows a second kind of version refusal, this is the one place
+/// that has to learn about it.
+///
+/// @param error What `DecodeCompileValue` refused with.
+/// @return True for a foreign generation; false for damaged or mis-framed bytes.
+[[nodiscard]] bool IsForeignGeneration(ProtocolError const& error) noexcept;
+
 /// What `CanonicalStoredValue` found in the bytes a STORE carried, and therefore
 /// what the server holding them is allowed to do with them.
 ///
@@ -124,6 +138,14 @@ enum class CanonicalizationOutcome : std::uint8_t
     /// That misclassification is deliberate and one-directional: the cost is a
     /// refused store of something no client on this wire sends, and the alternative
     /// is guessing a foreign generation's framing well enough to rule it out.
+    ///
+    /// **What protects a caller is switching on this, not the empty `bytes`.** The
+    /// carried bytes being empty stops a server storing *nothing*; it does not stop
+    /// one storing the ORIGINAL, and the node's verbatim fallback was never the
+    /// canonical bytes but the STORE's own payload — so `outcome == Canonicalized ?
+    /// canonical.bytes : payload` compiles, reads naturally, and reinstates the whole
+    /// defect. There is no type that can refuse that; the switch with no `default:`
+    /// is what makes the third state impossible to leave out.
     ForeignGeneration,
 };
 

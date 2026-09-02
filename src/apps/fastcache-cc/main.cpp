@@ -370,12 +370,15 @@ void Note(std::string_view reason)
 /// involved varies per compile, so it goes in a `Note` beside the call rather than
 /// into a tally that would then hold a row per invocation.
 ///
+/// The classification is `IsForeignGeneration`, never a comparison against an error
+/// code spelled out here: the decoder owns which refusal means what, and a launcher
+/// restating it is the second place for that rule to drift.
+///
 /// @param error What `DecodeCompileValue` refused with.
 /// @return The reason to record.
 [[nodiscard]] std::string_view DecodeFailureReason(ProtocolError const& error) noexcept
 {
-    return error.code == ProtocolErrorCode::UnsupportedFeature ? "fetch decoded another generation's value"
-                                                               : "fetch decoded malformed";
+    return IsForeignGeneration(error) ? "fetch decoded another generation's value" : "fetch decoded malformed";
 }
 
 /// Say, under `FASTCACHE_VERBOSE`, that a stored value would not decode.

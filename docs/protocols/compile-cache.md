@@ -417,9 +417,16 @@ of a stored blob, describes the *value format*. They are separate because a
 stored blob outlives any connection: the wire version is agreed per request,
 while the blob's version is discovered when it is decoded, however long after it
 was written. The launcher's cache key additionally carries an `objkey-v6` schema
-tag, so a future change to the value format or the canonicalization spec re-keys
-the cache — stale entries then miss and are rewritten, rather than being served
-under rules they were not written by.
+tag; bumping it re-keys the cache, so stale entries miss and are rewritten rather
+than being served under rules they were not written by.
+
+Those two tags move **independently**, and it matters which one is load-bearing
+here. Nothing couples a `CompileValueVersion` bump to an `objkey-v*` bump — the
+lock-step this project does enforce is `manifest-v*` behind `objkey-v*`, a
+different pair — so a canonicalization change need not re-key anything, and two
+generations can therefore meet over one key. Re-keying is an optimisation that
+makes them meet less often; the refusal below is the protection that does not
+depend on anybody having remembered to bump a second tag.
 
 `CompileValueVersion` names the **canonicalization spec**, not only the byte
 layout. Canonical text travels nowhere but inside a stored value, and every server

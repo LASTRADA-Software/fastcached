@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -10,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -268,110 +270,106 @@ struct ConformanceCase
 /// running binary, so this digest is the same on Windows, Linux and macOS -- and a
 /// change that broke that would make a Windows and a POSIX server disagree about a
 /// value they both hold, which is the whole failure this vector exists to catch.
-/// @return The corpus, in the order it is digested.
-[[nodiscard]] std::span<ConformanceCase const> ConformanceCorpus()
-{
-    static constexpr std::array corpus {
-        ConformanceCase { .name = "posix showIncludes under both roots",
-                          .producerSourceRoot = "/home/dev/proj",
-                          .producerBuildTree = "/home/dev/proj/build",
-                          .consumerSourceRoot = "/srv/ci/checkout",
-                          .consumerBuildTree = "/srv/ci/checkout/out",
-                          .text = "Note: including file: /home/dev/proj/inc/a.hpp\n"
-                                  "Note: including file:  /home/dev/proj/build/gen/cfg.hpp\n"
-                                  "Note: including file: /usr/include/stdio.h\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "windows showIncludes, mixed case, CRLF",
-                          .producerSourceRoot = "C:\\src\\Proj",
-                          .producerBuildTree = "C:\\src\\Proj\\out",
-                          .consumerSourceRoot = "D:\\work\\proj",
-                          .consumerBuildTree = "D:\\work\\proj\\build",
-                          .text = "Note: including file: c:\\SRC\\proj\\inc\\A.hpp\r\n"
-                                  "Note: including file: C:\\src\\Proj\\out\\gen\\cfg.hpp\r\n"
-                                  "Note: including file: C:\\Program Files\\MSVC\\include\\vector\r\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "showIncludes final line with no newline",
-                          .producerSourceRoot = "/home/dev/proj",
-                          .producerBuildTree = "/home/dev/proj/build",
-                          .consumerSourceRoot = "/srv/ci/checkout",
-                          .consumerBuildTree = "/srv/ci/checkout/out",
-                          .text = "Note: including file: /home/dev/proj/z.h",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "showIncludes already carrying tokens is left alone",
-                          .producerSourceRoot = "/home/dev/proj",
-                          .producerBuildTree = "/home/dev/proj/build",
-                          .consumerSourceRoot = "/srv/ci/checkout",
-                          .consumerBuildTree = "/srv/ci/checkout/out",
-                          .text = "Note: including file: <SRCROOT>/inc/a.hpp\n"
-                                  "Note: including file: <BUILDTREE>/gen/cfg.hpp\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "msvc diagnostics, line and column",
-                          .producerSourceRoot = "C:\\src\\proj",
-                          .producerBuildTree = "C:\\src\\proj\\out",
-                          .consumerSourceRoot = "E:\\ci\\proj",
-                          .consumerBuildTree = "E:\\ci\\proj\\out",
-                          .text = "C:\\src\\proj\\a.cpp(17): warning C4100: unreferenced\r\n"
-                                  "C:\\src\\proj\\a.cpp(17,9): note: see reference\r\n"
-                                  "cl : Command line warning D9002\r\n",
-                          .grammar = Grammar::MsvcDiagnostics },
-        ConformanceCase { .name = "gcc depfile, target, continuations and escaped space",
-                          .producerSourceRoot = "/home/dev/proj",
-                          .producerBuildTree = "/home/dev/proj/build",
-                          .consumerSourceRoot = "/srv/ci/checkout",
-                          .consumerBuildTree = "/srv/ci/checkout/out",
-                          .text = "/home/dev/proj/build/a.o: /home/dev/proj/a.cpp \\\n"
-                                  "  /home/dev/proj/inc/a\\ b.hpp \\\n"
-                                  "  /usr/include/stdio.h\n"
-                                  "\n"
-                                  "/home/dev/proj/inc/a\\ b.hpp:\n",
-                          .grammar = Grammar::GccDepfile },
-        ConformanceCase { .name = "depfile under a drive-relative root",
-                          .producerSourceRoot = "C:src\\proj",
-                          .producerBuildTree = "C:src\\proj\\out",
-                          .consumerSourceRoot = "D:\\work\\proj",
-                          .consumerBuildTree = "D:\\work\\proj\\out",
-                          .text = "C:src\\proj\\out\\a.obj: C:src\\proj\\a.cpp\n",
-                          .grammar = Grammar::GccDepfile },
-        ConformanceCase { .name = "showIncludes under a UNC root",
-                          .producerSourceRoot = "\\\\build01\\share\\proj",
-                          .producerBuildTree = "\\\\build01\\share\\proj\\out",
-                          .consumerSourceRoot = "C:\\local\\proj",
-                          .consumerBuildTree = "C:\\local\\proj\\out",
-                          .text = "Note: including file: \\\\build01\\share\\proj\\inc\\a.hpp\r\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "a bare root produces, and a bare root consumes",
-                          // A bare root IS its own trailing separator, so it is the
-                          // one shape where the join has a second separator to think
-                          // about. It reaches the digest on BOTH sides deliberately:
-                          // producing was covered and consuming was not, and a
-                          // plausible "collapse the double separator" edit to
-                          // `JoinLocalized` therefore passed the entire suite while
-                          // changing what every consumer replays. That is the drift
-                          // this vector exists to see, and a corpus that only
-                          // produces cannot see it.
-                          .producerSourceRoot = "/",
-                          .producerBuildTree = "/build",
-                          .consumerSourceRoot = "/",
-                          .consumerBuildTree = "/out",
-                          .text = "Note: including file: /inc/a.hpp\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "a bare drive root consumes",
-                          .producerSourceRoot = "C:\\src\\proj",
-                          .producerBuildTree = "C:\\src\\proj\\out",
-                          .consumerSourceRoot = "D:\\",
-                          .consumerBuildTree = "D:\\out",
-                          .text = "Note: including file: C:\\src\\proj\\inc\\a.hpp\r\n",
-                          .grammar = Grammar::ShowIncludes },
-        ConformanceCase { .name = "empty region",
-                          .producerSourceRoot = "/home/dev/proj",
-                          .producerBuildTree = "/home/dev/proj/build",
-                          .consumerSourceRoot = "/srv/ci/checkout",
-                          .consumerBuildTree = "/srv/ci/checkout/out",
-                          .text = "",
-                          .grammar = Grammar::MsvcDiagnostics },
-    };
-    return corpus;
-}
+/// The corpus, in the order it is digested.
+constexpr std::array ConformanceCorpus {
+    ConformanceCase { .name = "posix showIncludes under both roots",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "Note: including file: /home/dev/proj/inc/a.hpp\n"
+                              "Note: including file:  /home/dev/proj/build/gen/cfg.hpp\n"
+                              "Note: including file: /usr/include/stdio.h\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "windows showIncludes, mixed case, CRLF",
+                      .producerSourceRoot = "C:\\src\\Proj",
+                      .producerBuildTree = "C:\\src\\Proj\\out",
+                      .consumerSourceRoot = "D:\\work\\proj",
+                      .consumerBuildTree = "D:\\work\\proj\\build",
+                      .text = "Note: including file: c:\\SRC\\proj\\inc\\A.hpp\r\n"
+                              "Note: including file: C:\\src\\Proj\\out\\gen\\cfg.hpp\r\n"
+                              "Note: including file: C:\\Program Files\\MSVC\\include\\vector\r\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "showIncludes final line with no newline",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "Note: including file: /home/dev/proj/z.h",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "showIncludes already carrying tokens is left alone",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "Note: including file: <SRCROOT>/inc/a.hpp\n"
+                              "Note: including file: <BUILDTREE>/gen/cfg.hpp\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "msvc diagnostics, line and column",
+                      .producerSourceRoot = "C:\\src\\proj",
+                      .producerBuildTree = "C:\\src\\proj\\out",
+                      .consumerSourceRoot = "E:\\ci\\proj",
+                      .consumerBuildTree = "E:\\ci\\proj\\out",
+                      .text = "C:\\src\\proj\\a.cpp(17): warning C4100: unreferenced\r\n"
+                              "C:\\src\\proj\\a.cpp(17,9): note: see reference\r\n"
+                              "cl : Command line warning D9002\r\n",
+                      .grammar = Grammar::MsvcDiagnostics },
+    ConformanceCase { .name = "gcc depfile, target, continuations and escaped space",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "/home/dev/proj/build/a.o: /home/dev/proj/a.cpp \\\n"
+                              "  /home/dev/proj/inc/a\\ b.hpp \\\n"
+                              "  /usr/include/stdio.h\n"
+                              "\n"
+                              "/home/dev/proj/inc/a\\ b.hpp:\n",
+                      .grammar = Grammar::GccDepfile },
+    ConformanceCase { .name = "depfile under a drive-relative root",
+                      .producerSourceRoot = "C:src\\proj",
+                      .producerBuildTree = "C:src\\proj\\out",
+                      .consumerSourceRoot = "D:\\work\\proj",
+                      .consumerBuildTree = "D:\\work\\proj\\out",
+                      .text = "C:src\\proj\\out\\a.obj: C:src\\proj\\a.cpp\n",
+                      .grammar = Grammar::GccDepfile },
+    ConformanceCase { .name = "showIncludes under a UNC root",
+                      .producerSourceRoot = "\\\\build01\\share\\proj",
+                      .producerBuildTree = "\\\\build01\\share\\proj\\out",
+                      .consumerSourceRoot = "C:\\local\\proj",
+                      .consumerBuildTree = "C:\\local\\proj\\out",
+                      .text = "Note: including file: \\\\build01\\share\\proj\\inc\\a.hpp\r\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "a bare root produces, and a bare root consumes",
+                      // A bare root IS its own trailing separator, so it is the
+                      // one shape where the join has a second separator to think
+                      // about. It reaches the digest on BOTH sides deliberately:
+                      // producing was covered and consuming was not, and a
+                      // plausible "collapse the double separator" edit to
+                      // `JoinLocalized` therefore passed the entire suite while
+                      // changing what every consumer replays. That is the drift
+                      // this vector exists to see, and a corpus that only
+                      // produces cannot see it.
+                      .producerSourceRoot = "/",
+                      .producerBuildTree = "/build",
+                      .consumerSourceRoot = "/",
+                      .consumerBuildTree = "/out",
+                      .text = "Note: including file: /inc/a.hpp\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "a bare drive root consumes",
+                      .producerSourceRoot = "C:\\src\\proj",
+                      .producerBuildTree = "C:\\src\\proj\\out",
+                      .consumerSourceRoot = "D:\\",
+                      .consumerBuildTree = "D:\\out",
+                      .text = "Note: including file: C:\\src\\proj\\inc\\a.hpp\r\n",
+                      .grammar = Grammar::ShowIncludes },
+    ConformanceCase { .name = "empty region",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "",
+                      .grammar = Grammar::MsvcDiagnostics },
+};
 
 /// One generation of the stored-value contract: the `CompileValueVersion` it was
 /// written under, and the digest the corpus above produces under it.
@@ -398,39 +396,37 @@ struct StoredValueGeneration
 /// standing property: it holds only until somebody bumps the byte, and the rows
 /// below are where the retired ones then live.
 /// @return The table, newest last.
-[[nodiscard]] std::span<StoredValueGeneration const> StoredValueGenerations()
-{
-    static constexpr std::array table {
-        StoredValueGeneration { .digest = "5221af95b6325970c6aea725033b93630795824462105c2ffbbe2b226b6ac787", .version = 1 },
-    };
-    return table;
-}
+constexpr std::array StoredValueGenerations {
+    StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
+};
 
 /// Digest the whole stored-value contract over the conformance corpus.
 ///
-/// Each field is length-prefixed before it is hashed, for the reason this tree
-/// records at the compiler identity: concatenating `("ab", "c")` and `("a", "bc")`
-/// digests them alike, so a change that moved a byte from one field to its
-/// neighbour would not be seen.
+/// Each field is length-prefixed through `WireFields`, which is this tree's one
+/// definition of that framing — and it needs framing for the reason recorded at the
+/// compiler identity: concatenated, `("ab", "c")` and `("a", "bc")` digest alike, so
+/// a change that moved a byte from one field to its neighbour would not be seen.
+///
+/// A row's `name` is deliberately NOT hashed. It is a label for a human reading a
+/// failure, so hashing it would make renaming one — a purely editorial change — fail
+/// this test with a message telling the author to bump `CompileValueVersion`, which
+/// is the one action this design exists to make hard.
+///
 /// @return The hex digest.
 [[nodiscard]] std::string ConformanceDigest()
 {
     std::vector<std::byte> material;
 
     auto const append = [&material](std::span<std::byte const> field) {
-        std::array<std::byte, sizeof(std::uint32_t)> prefix {};
-        WriteBigEndian<std::uint32_t>(prefix, static_cast<std::uint32_t>(field.size()));
-        material.insert(material.end(), prefix.begin(), prefix.end());
-        material.insert(material.end(), field.begin(), field.end());
+        auto const framed = WireFields::Encode({ field });
+        material.insert(material.end(), framed.begin(), framed.end());
     };
     auto const appendText = [&append](std::string_view text) {
-        append(std::span { reinterpret_cast<std::byte const*>(text.data()), text.size() });
+        append(AsBytes(text));
     };
 
-    for (auto const& row: ConformanceCorpus())
+    for (auto const& row: ConformanceCorpus)
     {
-        appendText(row.name);
-
         // A real object blob, because the contract includes leaving it untouched.
         CompileValue produced;
         produced.objectBlob = { std::byte { 0x7F }, std::byte { 0x45 }, std::byte { 0x4C }, std::byte { 0x46 } };
@@ -464,7 +460,7 @@ struct StoredValueGeneration
 
 TEST_CASE("The canonicalization spec is pinned to the generation byte that names it")
 {
-    auto const rows = StoredValueGenerations();
+    auto const& rows = StoredValueGenerations;
     // An emptied table would pass every check below vacuously, and read exactly like
     // one that found nothing wrong.
     REQUIRE_FALSE(rows.empty());
@@ -475,18 +471,26 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
-                                       << " and StoredValueGenerations() has no row for it -- a bump adds a row");
+                                       << " and StoredValueGenerations has no row for it -- a bump adds a row");
         REQUIRE(current != rows.end());
     }
 
+    // The message names BOTH ways of arriving here, because they call for opposite
+    // actions and only one of them is the interesting one. Editing the CORPUS moves
+    // the digest without moving any behaviour, and the answer there is to repin this
+    // generation's row. Editing the canonicalization or the framing moves what two
+    // servers do with one value, and the answer there is a new generation. A message
+    // naming only the second teaches whoever meets the first to bump the byte for
+    // nothing, which retires every entry in the fleet to buy exactly that.
     INFO("the stored-value contract produced "
-         << live << " but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << current->digest
-         << ".\nCanonicalization and framing are versioned BY this byte: two servers on one wire at different "
-            "builds must not both call themselves generation "
+         << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << current->digest
+         << ".\nIf you added, removed or edited a ConformanceCorpus row and changed no behaviour, repin generation "
+         << static_cast<unsigned>(CompileValueVersion) << " to " << live
+         << ".\nIf you changed how a path span is found, rewritten, localized or framed, that is a new "
+            "canonicalization spec: two servers on one wire at different builds must not both call themselves "
+            "generation "
          << static_cast<unsigned>(CompileValueVersion)
-         << " while rewriting a value differently. If the change is deliberate, bump CompileValueVersion and add "
-            "a row carrying "
-         << live << ".");
+         << " while rewriting a value differently. Bump CompileValueVersion and add a row carrying " << live << ".");
     CHECK(live == current->digest);
 
     // A version and its digest move together, so no two generations may carry
@@ -499,5 +503,63 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
         INFO("the live contract reproduces retired generation " << static_cast<unsigned>(row.version)
                                                                 << " -- its bump was reverted");
         CHECK(live != row.digest);
+    }
+}
+
+namespace
+{
+
+/// Every grammar tag this build's decoder accepts, asked OF the decoder.
+///
+/// Derived rather than restated, and that is the whole point: a hand-kept list of
+/// grammars would be exact about the ones it knows and silent about the one just
+/// added, which is the shape of failure the corpus check below exists to prevent.
+/// So each of the 256 possible tag bytes is offered to `DecodeCompileValue` in an
+/// otherwise-valid frame, and the ones it takes are the answer.
+///
+/// @return The accepted tags, ascending.
+[[nodiscard]] std::vector<std::uint8_t> AcceptedGrammarTags()
+{
+    std::vector<std::uint8_t> accepted;
+    for (auto const tag: std::views::iota(0, 256))
+    {
+        // One empty region carrying this tag, built by the encoder so the frame is
+        // valid in every respect except possibly the tag.
+        CompileValue probe;
+        probe.textRegions.push_back(
+            TextRegion { .grammar = static_cast<Grammar>(static_cast<std::uint8_t>(tag)), .bytes = {} });
+        if (DecodeCompileValue(EncodeCompileValue(probe)).has_value())
+            accepted.push_back(static_cast<std::uint8_t>(tag));
+    }
+    return accepted;
+}
+
+} // namespace
+
+TEST_CASE("The conformance corpus covers every grammar the decoder accepts")
+{
+    // A new `PathCanon::Grammar` IS a canonicalization-spec change, and one of the
+    // nastier kinds: an older build meets the new tag, `IsKnownGrammar` refuses it,
+    // the decoder calls that a malformed frame, and a server whose policy for
+    // malformed bytes is "store it verbatim" then stores the producer's absolute
+    // paths -- #483's own defect, arriving through a door the generation byte cannot
+    // see. The digest only moves for behaviour the corpus exercises, so a grammar no
+    // row covers is a spec change that ships under the same generation.
+    //
+    // `-Wswitch` on `IsKnownGrammar` already forces a DECODE decision for a new
+    // enumerator. Nothing forced a CORPUS row, and this is that.
+    auto const accepted = AcceptedGrammarTags();
+    // Two empty sets agree perfectly: if the probe stopped producing decodable
+    // frames this would pass while checking nothing.
+    REQUIRE_FALSE(accepted.empty());
+
+    for (auto const tag: accepted)
+    {
+        INFO("grammar tag " << static_cast<unsigned>(tag)
+                            << " decodes, but no ConformanceCorpus row exercises it -- so a change to how that "
+                               "grammar finds or rewrites path spans would not move the digest, and would ship "
+                               "under the current CompileValueVersion");
+        CHECK(std::ranges::any_of(
+            ConformanceCorpus, [tag](ConformanceCase const& row) { return static_cast<std::uint8_t>(row.grammar) == tag; }));
     }
 }

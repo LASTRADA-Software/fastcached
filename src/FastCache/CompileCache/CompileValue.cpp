@@ -6,6 +6,7 @@
 
 #include <array>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <utility>
 
@@ -120,27 +121,61 @@ namespace
         std::size_t _pos { 0 };
     };
 
+    /// One typed refusal from this decoder.
+    /// @param code    Which kind of refusal this is.
+    /// @param context What was wrong with the bytes, for a log.
+    /// @return The refusal.
+    [[nodiscard]] std::unexpected<ProtocolError> Refuse(ProtocolErrorCode code, std::string context)
+    {
+        return std::unexpected(ProtocolError { .code = code, .context = std::move(context) });
+    }
+
+    /// The refusal for bytes that are damaged or mis-framed.
+    /// @param context What was wrong.
+    /// @return The refusal.
     [[nodiscard]] std::unexpected<ProtocolError> Malformed(std::string context)
     {
-        return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = std::move(context) });
+        return Refuse(ProtocolErrorCode::MalformedFrame, std::move(context));
     }
 
     /// The refusal for a value whose leading byte names a generation this build does
     /// not implement -- deliberately NOT `Malformed`, because the bytes are not
     /// damaged and a caller that cannot tell those two apart applies one policy to
-    /// both. `CanonicalStoredValue` reads this code back; nothing else has to.
+    /// both. `IsForeignGeneration` is how a caller reads it back.
     /// @param generation The leading byte that was read.
     /// @return The typed refusal, naming both generations.
-    [[nodiscard]] std::unexpected<ProtocolError> ForeignGeneration(std::uint8_t generation)
+    [[nodiscard]] std::unexpected<ProtocolError> ForeignGenerationRefusal(std::uint8_t generation)
     {
-        return std::unexpected(ProtocolError {
-            .code = ProtocolErrorCode::UnsupportedFeature,
-            .context =
-                std::format("compile-value generation {}; this build writes and reads {}", generation, CompileValueVersion),
-        });
+        return Refuse(
+            ProtocolErrorCode::UnsupportedFeature,
+            std::format("compile-value generation {}; this build writes and reads {}", generation, CompileValueVersion));
+    }
+
+    /// Where the generation sits in an encoded value: its leading byte.
+    ///
+    /// Written down once, as a named question, because two places ask it -- the
+    /// decode below, walking the frame in order, and `CanonicalStoredValue`, which
+    /// needs the number for a refusal that names it. The alternative was a
+    /// `front()` at the second site, a hundred lines from the code that guarantees
+    /// the position, which is how a field added ahead of the generation would move
+    /// one reader and not the other.
+    ///
+    /// @param bytes An encoded value, possibly empty.
+    /// @return The declared generation, or none when there is no leading byte to
+    ///         declare one -- which is not the same as declaring generation zero.
+    [[nodiscard]] std::optional<std::uint8_t> DeclaredGeneration(std::span<std::byte const> bytes) noexcept
+    {
+        if (bytes.empty())
+            return std::nullopt;
+        return static_cast<std::uint8_t>(bytes.front());
     }
 
 } // namespace
+
+bool IsForeignGeneration(ProtocolError const& error) noexcept
+{
+    return error.code == ProtocolErrorCode::UnsupportedFeature;
+}
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
@@ -168,7 +203,7 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     if (!cursor.ReadU8(version))
         return Malformed("empty compile-value frame");
     if (version != CompileValueVersion)
-        return ForeignGeneration(version);
+        return ForeignGenerationRefusal(version);
 
     CompileValue value;
 
@@ -222,19 +257,19 @@ StoredValueCanonicalization CanonicalStoredValue(std::span<std::byte const> valu
     auto decoded = DecodeCompileValue(value);
     if (!decoded.has_value())
     {
-        // The one place the two absent cases are told apart. `DecodeCompileValue`
-        // answers `UnsupportedFeature` for a leading byte naming another generation
-        // and `MalformedFrame` for everything else, so the split is read back from
-        // the code rather than restated by a second version test here -- two
-        // spellings of one rule are two places for it to drift.
-        if (decoded.error().code != ProtocolErrorCode::UnsupportedFeature)
+        // The one place the two absent cases are told apart, and it asks the shared
+        // predicate rather than comparing the code itself -- two spellings of one
+        // rule are two places for it to drift, which is the argument this file makes
+        // about the canonicalization recipe one paragraph up.
+        if (!IsForeignGeneration(decoded.error()))
             return { .bytes = {}, .outcome = CanonicalizationOutcome::NotACompileValue, .generation = 0 };
 
-        // Safe by construction: `UnsupportedFeature` is only ever produced after the
-        // leading byte has been read, so `value` is non-empty here.
         return { .bytes = {},
                  .outcome = CanonicalizationOutcome::ForeignGeneration,
-                 .generation = static_cast<std::uint8_t>(value.front()) };
+                 // Cannot be absent: that refusal is only produced after the leading
+                 // byte was read. `value_or` rather than a dereference so the
+                 // impossible case is a zero rather than undefined behaviour.
+                 .generation = DeclaredGeneration(value).value_or(0) };
     }
 
     PathCanon::Layout const producer { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
