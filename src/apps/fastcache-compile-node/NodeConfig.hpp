@@ -753,6 +753,30 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
+/// Whether a reload changed something this worker had TOLD the fleet.
+///
+/// The band #403 made reloadable is not local wiring: `--toolchain` and
+/// `--no-toolchain-discovery` decide the fingerprints this node registers, so adopting
+/// one without telling the scheduler leaves it dispatching against a set this worker no
+/// longer serves. This is what separates "re-derive and re-register" from "apply and
+/// carry on", and `--log-level` -- the third reloadable row -- is squarely the latter.
+///
+/// **Asked rather than assumed**, because the re-survey is the expensive thing this
+/// process does: a driver spawned per compiler and a walk of every include tree, over
+/// 300 s cold (#354). Re-running it because somebody raised the log level mid-incident
+/// would be the worst possible moment to spend that.
+///
+/// It compares the two fields directly rather than walking `NodeOptions()` for
+/// `Reloadable::Yes` rows, and that is safe only because the table says so: every other
+/// registration-bearing flag is `Reloadable::No`, so no reload can move it. A
+/// `static_assert` beside the table pins the reloadable set, so a fourth row cannot be
+/// marked without its author being sent here to decide whether the fleet has to hear
+/// about it.
+/// @param previous The configuration that was in force.
+/// @param candidate The configuration just adopted.
+/// @return Whether what this worker advertises has changed.
+[[nodiscard]] bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate);
+
 /// What a bare `--listen-raft` binds.
 ///
 /// The wildcard, like a scheduling node's `--listen-node` and unlike a worker's:

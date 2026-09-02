@@ -505,6 +505,21 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "There is still no default COMPILER -- a default is how a\n"
                            "job ends up running against something nobody chose.",
             .yamlKey = "toolchain",
+            // Reloadable since #403, and the band's cheap half: nothing new had to be
+            // built for it. The heartbeat thread ALREADY replaces this node's served
+            // set mid-life when a compiler is patched underneath it (#238), and
+            // `RefreshToolchains` already reads the set from the configuration -- so a
+            // reload publishes a snapshot and that path does the rest, in the order it
+            // already establishes: the compile port first, the registration second, so
+            // a job naming a dropped fingerprint is refused `UnknownFingerprint` rather
+            // than served with a compiler nobody keyed against.
+            //
+            // What a reload must additionally do is FORCE that re-derivation. The
+            // existing trigger is a witness stamp moving on disk, and editing a file
+            // moves none -- so a change here would otherwise sit unapplied until the
+            // next unconditional sweep, which is a reload an operator watched do
+            // nothing.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::toolchains>(),
             .clear = ClearList<&NodeConfig::toolchains>(),
         },
@@ -518,6 +533,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "INSTALLED as a service, which is the registration that\n"
                            "would otherwise fail at every boot with nobody watching.",
             .yamlKey = "no_toolchain_discovery",
+            // Reloadable for the reason `--toolchain` is, and through the same path.
+            // It only ever decides anything when NO `--toolchain` is named: an
+            // operator-named set is `ToolchainSource::OperatorNamed` and discovery is
+            // not consulted at all. So the reachable change is "stop searching this
+            // machine and serve nothing" or its reverse, and both are states the
+            // re-survey already knows how to reach.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::toolchainDiscovery>(),
         },
         {
@@ -1153,7 +1175,32 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             options, [](OptionSpec<NodeConfig> const& spec) { return spec.yamlKey.empty() == (spec.same == nullptr); }),
         "a row with a yamlKey needs a FieldEq comparator, and a row without one must not have it");
 
+    // **The reloadable set is pinned, because marking a row is a decision about the
+    // FLEET and not only about this process.** Two of the three feed what this worker
+    // registers, so a reload of them has to re-derive and re-register
+    // (`AdvertisedClaimsDiffer`, which the heartbeat thread acts on); the third,
+    // `--log-level`, is purely local. A fourth row marked `Reloadable::Yes` is one or
+    // the other and nothing here could guess which -- so this fails the build and
+    // sends its author to make that call, rather than letting a registration-bearing
+    // flag become live and silently never reach the scheduler.
+    static_assert(
+        std::ranges::count_if(options, [](OptionSpec<NodeConfig> const& spec) { return spec.reloadable == Reloadable::Yes; })
+            == 3,
+        "a new Reloadable::Yes row must be classified in AdvertisedClaimsDiffer first");
+    static_assert(std::ranges::all_of(options,
+                                      [](OptionSpec<NodeConfig> const& spec) {
+                                          return spec.reloadable != Reloadable::Yes || spec.primary == "--log-level"
+                                                 || spec.primary == "--toolchain"
+                                                 || spec.primary == "--no-toolchain-discovery";
+                                      }),
+                  "a new Reloadable::Yes row must be classified in AdvertisedClaimsDiffer first");
+
     return options;
+}
+
+bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate)
+{
+    return previous.toolchains != candidate.toolchains || previous.toolchainDiscovery != candidate.toolchainDiscovery;
 }
 
 std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate)

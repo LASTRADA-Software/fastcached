@@ -363,6 +363,49 @@ enum class RecheckDepth : std::uint8_t
     Unconditional,
 };
 
+/// Whether a configuration reload moved what this worker advertises.
+///
+/// An enum rather than a `bool` at this seam: the call site reads
+/// `RecheckDepthFor(claims, beat)`, and a bare `true` there says nothing about which
+/// of the two inputs it is.
+enum class ClaimsReloaded : std::uint8_t
+{
+    No,
+    Yes,
+};
+
+/// How hard the next heartbeat should look at this machine's toolchains.
+///
+/// **A pure function over the two facts, because `main.cpp` is in no test target.**
+/// This rule was an expression inside the heartbeat loop, where the only way to check
+/// it was to read it -- and it is exactly the kind of rule that is wrong in one
+/// direction silently: a reload that failed to force the survey is a configuration an
+/// operator saved, saw accepted, and which then did nothing for up to `sweepEveryBeats`
+/// heartbeats. Split out, both directions are one assertion each (#403, and the same
+/// lesson as #354's readings record).
+///
+/// The periodic sweep fires on beat 0 as well as every `sweepEveryBeats` after it,
+/// which is the modulo's own behaviour and is right: the first beat after the initial
+/// survey is when a machine that came up serving less than it has should be looked at.
+/// @param claims Whether a reload changed what this worker would advertise.
+/// @param beat Which heartbeat this is, counting from one at the first.
+/// @param sweepEveryBeats How often the unconditional sweep comes round; never zero.
+/// @return The depth to pass `RefreshToolchains`.
+[[nodiscard]] constexpr RecheckDepth RecheckDepthFor(ClaimsReloaded claims,
+                                                     std::uint64_t beat,
+                                                     std::uint64_t sweepEveryBeats) noexcept
+{
+    // Guarded rather than trusted: a zero would be a division by zero on the
+    // heartbeat thread, and the caller's constant is the kind of thing a later edit
+    // makes configurable. Zero means "never sweep", which leaves the witnesses and a
+    // reload as the two remaining triggers.
+    if (claims == ClaimsReloaded::Yes)
+        return RecheckDepth::Unconditional;
+    if (sweepEveryBeats == 0)
+        return RecheckDepth::WhenEvidenceMoved;
+    return beat % sweepEveryBeats == 0 ? RecheckDepth::Unconditional : RecheckDepth::WhenEvidenceMoved;
+}
+
 /// Re-derive what this node serves, if the machine changed underneath it.
 ///
 /// The whole of #238's decision, in one place a test can drive. A node fingerprints

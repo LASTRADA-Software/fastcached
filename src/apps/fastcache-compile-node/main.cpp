@@ -534,15 +534,23 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 /// in force.
 /// @param reloader The pipeline, or null when this worker has no configuration file.
 /// @param logger Where the outcome is reported.
-void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
+/// @return Whether what this worker ADVERTISES changed, so the heartbeat thread has to
+///         re-derive its served set rather than wait for a witness to move on disk.
+[[nodiscard]] bool ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
 {
     if (reloader == nullptr)
     {
         // Not silence: an operator who sent SIGHUP believes this worker has a file to
         // re-read, and the useful answer is that it has none.
         logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
-        return;
+        return false;
     }
+
+    // Taken BEFORE the swap, because "did the advertised set change" cannot be asked
+    // afterwards: `Reload()` replaces the snapshot, and the previous one is then only
+    // reachable through a reference somebody kept. Each snapshot is immutable, so
+    // holding this one costs nothing and stays valid however the swap goes.
+    auto const before = reloader->Current();
 
     auto const outcome = reloader->Reload();
     if (!outcome.has_value())
@@ -551,12 +559,28 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         // changed something immutable -- because the operator's situation is the same:
         // they saved once, and NOTHING was applied.
         logger.Logf(LogLevel::Warn, "reload declined, configuration unchanged: {}", outcome.error().ToString());
-        return;
+        return false;
     }
 
     auto const current = reloader->Current();
     logger.SetMinLevel(current->logLevel);
-    logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
+
+    // Compared rather than assumed changed. A reload that touched only `--log-level`
+    // must not re-derive the toolchain set: that survey spawns a driver per compiler
+    // and walks every include tree, and a node whose operator raised the log level
+    // mid-incident is the worst moment to spend minutes on one.
+    auto const claimsMoved = Node::AdvertisedClaimsDiffer(*before, *current);
+    if (claimsMoved)
+        // Said here, at the moment the operator acted, rather than only when the
+        // heartbeat gets to it: the re-survey is the expensive part and an operator
+        // who saved a file deserves to know it was accepted before it completes.
+        logger.Logf(LogLevel::Info,
+                    "configuration reloaded; log level is now {}. What this worker serves has changed, so it will "
+                    "re-derive its toolchains and re-register on the next heartbeat",
+                    ToStringView(current->logLevel));
+    else
+        logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
+    return claimsMoved;
 }
 
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
@@ -579,7 +603,20 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     auto const runner = Cc::MakeProcessRunner();
 
     auto const toolchainHost = Cc::MakeToolchainHost();
-    auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
+    // Built UNCONDITIONALLY, and gated per call instead, since #403 made
+    // `--no-toolchain-discovery` reloadable. A discovery object constructed only when
+    // the flag was off at startup is one the flag can never be turned back on for --
+    // the running worker would hold a null it could not refill, so a reload that
+    // enabled discovery would silently keep serving nothing.
+    //
+    // It costs nothing to hold: `MakeToolchainDiscovery` stores two references and
+    // searches only when `Discover()` is called. `discoveryFor` is what decides,
+    // and it reads the configuration it is HANDED rather than the startup one, so
+    // the reloaded snapshot governs on the heartbeat thread.
+    auto const discovery = Cc::MakeToolchainDiscovery(*toolchainHost, *runner);
+    auto const discoveryFor = [&discovery](NodeConfig const& against) -> Cc::IToolchainDiscovery* {
+        return against.toolchainDiscovery ? discovery.get() : nullptr;
+    };
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to `MakeWorkerLeaseValidator` below and to the heartbeat's REGISTER, and a
@@ -629,7 +666,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // Its own clock rather than one of the tiers': it is what the hash phase's
     // progress rate reads elapsed time from.
     SteadyClock const toolchainClock;
-    auto discoveredOrNone = Node::DiscoverToolchainEntries(cfg, discovery.get(), *runner, logger);
+    auto discoveredOrNone = Node::DiscoverToolchainEntries(cfg, discoveryFor(cfg), *runner, logger);
     if (!discoveredOrNone.has_value())
         return ExitUsage;
     auto const discoveredToolchains = *std::move(discoveredOrNone);
@@ -1206,6 +1243,13 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // already logged which, and the exit code is what a supervisor reads.
     std::atomic<bool> surveyFoundNothing { false };
 
+    // Raised by a reload on the main loop, lowered by the heartbeat thread that acts
+    // on it. The re-derivation itself is `RefreshToolchains`, which is driven by
+    // WITNESSES -- a compiler's stamp moving on disk -- and an edited configuration
+    // file moves none of them. Without this the reload would be accepted, logged, and
+    // then do nothing until the next unconditional sweep (#403).
+    std::atomic<bool> advertisedClaimsChanged { false };
+
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         // The initial survey, and it runs HERE rather than at startup because it is
         // the expensive half: a full walk of every include tree, measured over 300 s
@@ -1276,11 +1320,29 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
             // never be looked at again, and a node left serving nothing could not
             // recover at all without a restart.
             ++beat;
-            auto const depth =
-                beat % SweepEveryBeats == 0 ? Node::RecheckDepth::Unconditional : Node::RecheckDepth::WhenEvidenceMoved;
+
+            // The configuration this beat acts on, which is the RELOADED one when a
+            // file exists. Held as a snapshot for the whole beat rather than read
+            // twice: `Current()` can be swapped underneath by a reload arriving
+            // mid-beat, and deciding the depth against one configuration and the
+            // survey against another is how a re-derivation gets skipped for a change
+            // it was raised by. Each snapshot is immutable, so holding it is free and
+            // a reload that lands mid-beat is answered by the next one.
+            auto const snapshot = reloader != nullptr ? reloader->Current() : nullptr;
+            auto const& liveCfg = snapshot ? *snapshot : cfg;
+
+            // Three ways to take the expensive path, and the third is #403's. A
+            // witness moved (the cheap check inside `RefreshToolchains`); the periodic
+            // sweep came round, which is the only way back from serving LESS than this
+            // machine has; or an operator edited the file, which moves no witness at
+            // all and would otherwise wait for that sweep.
+            auto const reloaded = advertisedClaimsChanged.exchange(false, std::memory_order_relaxed)
+                                      ? Node::ClaimsReloaded::Yes
+                                      : Node::ClaimsReloaded::No;
+            auto const depth = Node::RecheckDepthFor(reloaded, beat, SweepEveryBeats);
 
             if (auto refreshed = Node::RefreshToolchains(
-                    toolchains, cfg, discovery.get(), *runner, *toolchainHost, toolchainClock, logger, depth);
+                    toolchains, liveCfg, discoveryFor(liveCfg), *runner, *toolchainHost, toolchainClock, logger, depth);
                 refreshed.changed)
             {
                 toolchains = std::move(refreshed.served);
@@ -1376,8 +1438,12 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         // Taken here rather than in the handler, for the reason the handler's own note
         // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
         // costs one re-read rather than one per signal.
-        if (DaemonControls::Instance().TakeReloadRequest())
-            ApplyReloadRequest(reloader, logger);
+        // Set here and cleared by the heartbeat thread, which is the only reader.
+        // Relaxed on both sides deliberately: it orders nothing, it is a request that
+        // the next beat take the expensive path, and a beat that raced past it is
+        // answered by the following one.
+        if (DaemonControls::Instance().TakeReloadRequest() && ApplyReloadRequest(reloader, logger))
+            advertisedClaimsChanged.store(true, std::memory_order_relaxed);
         std::this_thread::sleep_for(StopPollInterval);
     }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
