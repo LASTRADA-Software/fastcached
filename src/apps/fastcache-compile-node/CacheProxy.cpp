@@ -70,21 +70,31 @@ namespace
         /// A `STORE` whose value names a canonicalization generation this build does
         /// not implement.
         ///
-        /// **Counted**, by this table's own test rather than by analogy. A rise is not
-        /// ordinary traffic: `CompileValueVersion` has never moved, so nothing
-        /// produces one today and the baseline is zero -- which is what separates this
-        /// from the `AUTH` arm below, where a healthy launcher emits one per exchange
-        /// for a whole build. The arm is reachable, and by the ordinary path rather
-        /// than a direct `Answer`: it is what a launcher at another generation
-        /// produces, which is the steady state of a fleet mid-upgrade
-        /// ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)). And
-        /// nothing else sees it -- `LocalCache::Store` counts writes that FAILED, and
-        /// this is a write never attempted.
+        /// **Counted**, and the ground matters because the obvious one does not hold.
+        /// "`CompileValueVersion` has never moved, so the baseline is zero" is true
+        /// today and expires exactly when this counter starts doing work — it argues
+        /// for the series from the absence of the thing it counts, and a future author
+        /// copying it would carry that mistake to the next arm.
         ///
-        /// What an operator does about a rise is what they do about the version row
-        /// above: find the machine that is out of step and finish or roll back the
-        /// upgrade. It also makes #483's own decision auditable, since refusing buys
-        /// correctness by giving up hits and the launcher reports only a miss.
+        /// The ground that survives a bump: **a converged fleet produces none.** That
+        /// is what separates it from the `AUTH` arm below, which a correctly
+        /// configured launcher emits once per exchange forever, so no scan can ever be
+        /// seen inside that series. This one is zero, then a burst while a rollout is
+        /// in flight — once per TU, which is a lot — then zero again. A series that
+        /// returns to zero is readable however tall the burst was, and the burst is
+        /// the event. Against the third test: nothing else sees it, since
+        /// `LocalCache::Store` counts writes that FAILED and this is a write never
+        /// attempted.
+        ///
+        /// Reachable by the ordinary path rather than a direct `Answer`: it is what a
+        /// launcher at another generation produces, and a fleet is permanently
+        /// mid-upgrade
+        /// ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)).
+        ///
+        /// What an operator does about it is what they do about the version row above
+        /// — find the machine that is out of step, finish or roll back — and it is the
+        /// only view of what #483's decision costs, since refusing buys correctness by
+        /// giving up hits and the launcher reports only a miss.
         constexpr Cc::SurfaceRefusal ForeignGeneration {
             .code = Wire::ErrorCode::MalformedValue,
             .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
@@ -267,20 +277,22 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             auto const canonical = CanonicalStoredValue(
                 fields->value, Wire::AsStringView(fields->srcRoot), Wire::AsStringView(fields->buildTree));
 
-            auto toStore = fields->value;
+            std::span<std::byte const> toStore {};
             switch (canonical.outcome)
             {
                 case CanonicalizationOutcome::Canonicalized:
                     toStore = canonical.bytes;
                     break;
                 case CanonicalizationOutcome::NotACompileValue:
+                    // The verbatim policy, at the case label that means it. It used
+                    // to be the initializer above, which is the same separation the
+                    // comment warns about in miniature: an arm reading `break;` says
+                    // "nothing to do" where this one decides something.
+                    toStore = fields->value;
                     break;
                 case CanonicalizationOutcome::ForeignGeneration:
-                    co_return Cc::Refuse(_metrics,
-                                         TierRefusal::ForeignGeneration,
-                                         std::format("stored value is generation {}; this build implements {}",
-                                                     canonical.generation,
-                                                     CompileValueVersion));
+                    co_return Cc::Refuse(
+                        _metrics, TierRefusal::ForeignGeneration, ForeignGenerationMessage(canonical.generation));
             }
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))

@@ -92,13 +92,31 @@ struct CompileValue
 /// One predicate rather than an `== ProtocolErrorCode::UnsupportedFeature` at each
 /// reader, because there are three of them — `CanonicalStoredValue`, the launcher's
 /// `--show-stats` reason, and the tests — and a rule spelled three times is a rule
-/// two of them can drift from. It is also the seam a future refusal reaches through:
-/// if the decoder ever grows a second kind of version refusal, this is the one place
-/// that has to learn about it.
+/// two of them can drift from.
 ///
-/// @param error What `DecodeCompileValue` refused with.
+/// **Only for an error `DecodeCompileValue` produced**, and that is a real
+/// precondition rather than a formality: `ProtocolErrorCode` is shared, and
+/// `UnsupportedFeature` already means a WIRE version elsewhere on this protocol, so
+/// handed any other producer's error this answers confidently and wrongly. Making
+/// that impossible rather than merely stated wants a decoder-local error type, which
+/// is a wider change than the one this arrived in.
+///
+/// @param error What `DecodeCompileValue` refused with — no other producer's.
 /// @return True for a foreign generation; false for damaged or mis-framed bytes.
 [[nodiscard]] bool IsForeignGeneration(ProtocolError const& error) noexcept;
+
+/// The sentence a server sends an operator about a value it cannot canonicalize.
+///
+/// One wording, beside the code that decides the fact, because there are three
+/// places that state it — the decoder's own `context`, and each of the two servers'
+/// refusal replies — and three spellings of one fact is what `IsForeignGeneration`
+/// was introduced to stop happening to the classification a level up. An operator
+/// meeting this on the daemon and on a node during one rolling upgrade should not
+/// have to work out whether the two are the same event.
+///
+/// @param generation The generation the producer wrote under.
+/// @return The sentence, naming that generation and this build's.
+[[nodiscard]] std::string ForeignGenerationMessage(std::uint8_t generation);
 
 /// What `CanonicalStoredValue` found in the bytes a STORE carried, and therefore
 /// what the server holding them is allowed to do with them.

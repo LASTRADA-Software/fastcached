@@ -1341,10 +1341,16 @@ were open to breaking it, and neither needed anybody's install to be stale.
     overturning the node cache tier's documented policy of storing an opaque value
     verbatim — a policy this layer does not own. `DecodeAfterGeneration` therefore
     runs on the rest of the frame too, and only a layout that holds together is
-    reported as a generation. The residual is stated rather than hidden: a generation
-    that moves the FRAMING as well reads as junk, nothing in this build could tell
-    those apart, and the shape that matters (#547 — framing kept, canonicalization
-    moved) is caught exactly. The general form is the one worth carrying: **absence
+    reported as a generation. The shape that matters (#547 — framing kept,
+    canonicalization moved) is then caught exactly. **The residual is not the harmless
+    direction, and saying so was this bullet's own first mistake**: a generation that
+    moves the FRAMING as well reads as junk, comes back `NotACompileValue`, and a
+    node's tier handles THAT by storing verbatim — so it re-enters through the door
+    this closes, for the class of bump most likely to cause it, since
+    `CompileValueVersion` names the framing too and nothing couples it to an
+    `objkey-v*` bump. Bounded rather than closed: the daemon refuses
+    `NotACompileValue`, so the forward cannot reach the shared cache, and a tier is
+    loopback-only. Bounds are not a fix, so it is tracked. The general form is the one worth carrying: **absence
     of the expected value is not evidence of a particular alternative**, and a
     classifier built on it will be confidently wrong about everything that is merely
     unfamiliar.

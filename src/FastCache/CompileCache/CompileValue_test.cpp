@@ -2,6 +2,7 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -11,17 +12,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <tests/Unwrap.hpp>
-
 using namespace FastCache;
-using FastCache::Testing::Unwrap;
 using PathCanon::Grammar;
 
 TEST_CASE("CompileValue encode/decode round-trips object blob and regions")
@@ -425,24 +422,6 @@ constexpr std::array StoredValueGenerations {
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
 };
 
-/// The generation table's row for @p version, if it has one.
-///
-/// Returns the ROW rather than an iterator into the table, because a
-/// `std::array` iterator is a raw pointer on libstdc++ and libc++ and a class type
-/// on MSVC's standard library -- so the `const auto *const` spelling the analyser
-/// asks for on one host does not compile on another. A value is the one shape
-/// every standard library agrees about.
-///
-/// @param version A `CompileValueVersion` value.
-/// @return The row, or none when the table has no generation of that number.
-[[nodiscard]] std::optional<StoredValueGeneration> GenerationRow(std::uint8_t version)
-{
-    for (auto const& row: StoredValueGenerations)
-        if (row.version == version)
-            return row;
-    return std::nullopt;
-}
-
 /// Digest the whole stored-value contract over the conformance corpus.
 ///
 /// Each field is length-prefixed through `WireFields`, which is this tree's one
@@ -510,14 +489,18 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 
     auto const live = ConformanceDigest();
 
-    auto const current = GenerationRow(CompileValueVersion);
+    // `FindOrNull` rather than an iterator: a `std::array` iterator is a raw pointer
+    // on libstdc++ and libc++ and a class type on MSVC's, so the spelling the
+    // analyser asks for on one host does not compile on another. That argument is
+    // the helper's own, which is why this calls it instead of restating it.
+    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::version);
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
                                        << " and StoredValueGenerations has no row for it -- a bump adds a row");
-        REQUIRE(current.has_value());
+        REQUIRE(pinnedRow != nullptr);
     }
-    auto const& pinned = Unwrap(current);
+    auto const& pinned = *pinnedRow;
 
     // The message names BOTH ways of arriving here, because they call for opposite
     // actions and only one of them is the interesting one. Editing the CORPUS moves

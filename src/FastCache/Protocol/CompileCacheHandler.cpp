@@ -220,11 +220,8 @@ namespace
                 // reported damaged is to wipe it. Its own wire code and counter row
                 // are #544, which depends on this change rather than being part of
                 // it, and which is what turns these two arms into a table.
-                co_return co_await ReplyError(socket,
-                                              Wire::ErrorCode::MalformedValue,
-                                              std::format("stored value is generation {}; this build implements {}",
-                                                          canonical.generation,
-                                                          CompileValueVersion))
+                co_return co_await ReplyError(
+                    socket, Wire::ErrorCode::MalformedValue, ForeignGenerationMessage(canonical.generation))
                     ? Next::Continue
                     : Next::Abort;
         }

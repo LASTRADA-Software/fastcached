@@ -146,19 +146,17 @@ namespace
     /// @return The typed refusal, naming both generations.
     [[nodiscard]] std::unexpected<ProtocolError> ForeignGenerationRefusal(std::uint8_t generation)
     {
-        return Refuse(
-            ProtocolErrorCode::UnsupportedFeature,
-            std::format("compile-value generation {}; this build writes and reads {}", generation, CompileValueVersion));
+        return Refuse(ProtocolErrorCode::UnsupportedFeature, ForeignGenerationMessage(generation));
     }
 
     /// Where the generation sits in an encoded value: its leading byte.
     ///
-    /// Written down once, as a named question, because two places ask it -- the
-    /// decode below, walking the frame in order, and `CanonicalStoredValue`, which
-    /// needs the number for a refusal that names it. The alternative was a
-    /// `front()` at the second site, a hundred lines from the code that guarantees
-    /// the position, which is how a field added ahead of the generation would move
-    /// one reader and not the other.
+    /// The named form of a position `DecodeCompileValue` also reads, through its
+    /// `Cursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
+    /// together -- a field added ahead of the generation changes both. It exists so
+    /// that `CanonicalStoredValue`, which needs the number for a refusal that names
+    /// it, asks a question with a name rather than writing `front()` a hundred lines
+    /// from the code that guarantees the answer.
     ///
     /// @param bytes An encoded value, possibly empty.
     /// @return The declared generation, or none when there is no leading byte to
@@ -175,6 +173,11 @@ namespace
 bool IsForeignGeneration(ProtocolError const& error) noexcept
 {
     return error.code == ProtocolErrorCode::UnsupportedFeature;
+}
+
+std::string ForeignGenerationMessage(std::uint8_t generation)
+{
+    return std::format("stored value is generation {}; this build implements {}", generation, CompileValueVersion);
 }
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
@@ -264,27 +267,36 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     if (!cursor.ReadU8(version))
         return Malformed("empty compile-value frame");
 
+    // The layout is parsed BEFORE the generation is judged, because a leading byte
+    // that is not ours is on its own no evidence of another generation. Reading it
+    // that way was a real defect rather than a conservative one: almost no opaque
+    // blob begins with 0x01, so every opaque value was called foreign and REFUSED --
+    // destroying the node cache tier's documented policy of storing an opaque value
+    // verbatim, which is a policy this layer has no business overturning. Two of that
+    // tier's tests said so.
+    //
+    // So a foreign generation is reported only for a frame that HOLDS TOGETHER behind
+    // the byte: positive evidence, rather than the absence of ours.
+    //
+    // The residual is real and its first description here was BACKWARDS. A future
+    // generation that moves the FRAMING as well parses as junk and comes back
+    // `NotACompileValue` -- and a node's tier handles that by storing the bytes
+    // VERBATIM, so the residual re-enters through the exact door this closes, for the
+    // class of bump most likely to cause it. `CompileValueVersion` names the framing
+    // too, and nothing couples it to an `objkey-v*` bump, so two such generations do
+    // meet over one key by design. Nothing in this build can separate an unknown
+    // layout from junk, so it is bounded rather than closed, and the bounds are worth
+    // naming because they are what makes it survivable: the daemon refuses
+    // `NotACompileValue` outright, so `RemoteUpstream::Store` cannot carry it to the
+    // SHARED cache, and a node's tier is loopback-only -- one machine's own build
+    // output, not the fleet's. Tracked rather than left in prose.
+    //
+    // The generation that keeps the framing and moves the canonicalization -- the
+    // shape #547 will have -- is caught exactly.
+    auto decoded = DecodeAfterGeneration(cursor);
     if (version == CompileValueVersion)
-        return DecodeAfterGeneration(cursor);
-
-    // A leading byte that is not ours is NOT on its own evidence of another
-    // generation, and reading it that way was a real defect rather than a
-    // conservative one: almost no opaque blob begins with 0x01, so every opaque value
-    // would have been called foreign and REFUSED -- destroying the node cache tier's
-    // documented policy of storing an opaque value verbatim, which is a policy this
-    // layer has no business overturning. Two of that tier's tests said so.
-    //
-    // So the rest of the layout is asked as well, and only a frame that holds
-    // together under it is reported as another generation. That is positive evidence
-    // rather than the absence of ours.
-    //
-    // The residual, stated because it is real: a future generation that changes the
-    // FRAMING as well as the canonicalization parses as junk here and is called
-    // malformed. Nothing in this build could tell those apart -- an unknown layout is
-    // unknown -- and the direction it fails in is the one the node already handles.
-    // A generation that keeps the framing and moves the canonicalization, which is
-    // what #547 will be, is caught exactly.
-    if (DecodeAfterGeneration(cursor).has_value())
+        return decoded;
+    if (decoded.has_value())
         return ForeignGenerationRefusal(version);
     return Malformed(std::format("leading byte {} is not this build's generation and the layout behind it does not "
                                  "hold, so these bytes are not a stored value",
