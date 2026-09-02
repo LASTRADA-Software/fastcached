@@ -107,8 +107,8 @@ namespace Detail
     /// @param raftEndpoint Where they will answer Raft traffic.
     /// @return The fields, borrowing from the arguments.
     [[nodiscard]] inline std::array<std::span<std::byte const>, 4> ProofFields(Challenge const& challenge,
-                                                                              std::string_view nodeId,
-                                                                              std::string_view raftEndpoint)
+                                                                               std::string_view nodeId,
+                                                                               std::string_view raftEndpoint)
     {
         return {
             WireFields::AsBytes(challenge.clusterId),
@@ -172,8 +172,7 @@ namespace Detail
                                          std::string_view raftEndpoint,
                                          Sha256::Digest const& presented)
 {
-    return VerifyFields(
-        key, SigningDomain::DiscoveryProof, Detail::ProofFields(challenge, nodeId, raftEndpoint), presented);
+    return VerifyFields(key, SigningDomain::DiscoveryProof, Detail::ProofFields(challenge, nodeId, raftEndpoint), presented);
 }
 
 /// Wrap an already-encoded payload in this protocol's frame header.

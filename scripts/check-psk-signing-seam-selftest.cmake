@@ -92,12 +92,28 @@ set(signingSeam
 
 # @param tree Which synthetic tree to run the check against.
 # @param outObjected Set TRUE when the check reported `CMake Error`.
-# @param outOutput Set to everything the check printed.
+# @param outOutput Set to everything the check printed, with every run of
+#        whitespace collapsed to one space.
 function(fastcached_run_check tree outObjected outOutput)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"
         OUTPUT_VARIABLE captured ERROR_VARIABLE capturedErrors RESULT_VARIABLE ignored)
     set(combined "${captured}${capturedErrors}")
+
+    # Collapsed before anything is matched against it, because `message()`
+    # WORD-WRAPS at a fixed width and every needle below is a phrase rather than a
+    # token. Measured, not guessed: the `nosources` refusal embeds the tree's own
+    # path, so at a scratch directory of one length it reads `found no source file
+    # it knows how to read` and at another `found no source\n  file it knows how to
+    # read` -- and `string(FIND)` then reports the phrase absent. That made this
+    # selftest fail on the tree it was passing on, decided by how long
+    # `CMAKE_CURRENT_BINARY_DIR` happens to be on the machine running it, which
+    # differs per preset, per checkout and per CI runner. A guard whose verdict
+    # depends on a path length is a guard that reports on something other than its
+    # subject. Single tokens are never broken by the wrapper, so this leaves the
+    # file-path needles alone and repairs every phrase at once.
+    string(REGEX REPLACE "[ \t\r\n]+" " " combined "${combined}")
+
     string(FIND "${combined}" "CMake Error" position)
     if(position EQUAL -1)
         set(${outObjected} FALSE PARENT_SCOPE)

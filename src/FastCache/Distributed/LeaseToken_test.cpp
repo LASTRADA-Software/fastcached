@@ -466,7 +466,8 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     auto const key = Key();
     auto const claims = Grant();
     auto const packedV1 = Detail::PackClaims(1, claims);
-    auto const tag = Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packedV1 } });
+    auto const tag =
+        Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packedV1 } });
     auto const envelope =
         WireFields::Encode({ std::span<std::byte const> { packedV1 }, std::span<std::byte const> { tag } });
 
