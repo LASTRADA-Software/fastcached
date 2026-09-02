@@ -54,6 +54,38 @@ determinism rests on.
   got them wrong while it was being written -- it reported its own remediation example
   printed from a `message()`, and a stray `]` in a comment merged lines under CMake's
   list grouping so it named line 217 for a call at line 307.
+- **Read a hygiene check by the COUNT of what it says it examined, never by whether it
+  passed.** `check-script-check-signals` was green while reading 3 of 21 registrations
+  — 14% of its subject — and no verdict could have shown it, because pass/fail was
+  green on both sides of the blindness. It was found by running every check against
+  master's tree and the branch's tree and diffing the counts each one reports; exactly
+  one differed. Two of the five bracket-vulnerable splitters could ONLY be caught this
+  way. A vacuous-pass refusal is orthogonal and not a substitute: it catches TOTAL
+  blinding and is structurally incapable of catching partial, since 3 is not 0. And
+  loud-versus-silent is a property of WHERE the bracket lands, not of the check — the
+  same check refused outright under one bracket position and passed at 14% under
+  another — so no check may be assumed safe because it once failed loudly. And know
+  what the method CANNOT see. A count detects a check examining a DIFFERENT NUMBER of
+  subjects; it is blind to one examining the same number of DIFFERENT subjects. So it
+  validates a change that alters HOW MUCH a check reads, and never one that alters WHAT
+  it matches — a dropped escape or a normalised tab leaves the line count identical and
+  the matched text different. The consolidation in
+  [#495](https://github.com/LASTRADA-Software/fastcached/issues/495) was nearly
+  validated this way, by the very method this bullet recommends. A tool that cannot
+  fail in the way a change fails is not validation, it is decoration.
+- **A count asserted in prose is a claim nothing verifies.** Two comments went stale in
+  one session, both because the thing they counted changed underneath them and nothing
+  was watching. "This is the fourth copy of this idiom" was counting the SPLITTER when
+  it was written and now reads as a claim about `fastcached_globs_to_regex`, of which
+  there are three. A note asserting `src/tests/CMakeLists.txt` holds 25
+  `$<TARGET_FILE:>` references survived a rebase that added a registration only because
+  that registration happened to use `${CMAKE_COMMAND}` — true by luck, not by
+  construction, and it would have gone false silently. Both were written by someone who
+  had just spent hours on exactly this failure mode. So prefer prose that states the
+  INVARIANT ("each root is walked once") over prose that states a census ("there are
+  three copies"), and where a number is genuinely load-bearing, put it where a CHECK
+  reads it rather than where only a human does — which is what `check-glob-traversals`
+  does for the count that matters.
 - **A hygiene script `ctest` runs is constrained to bash 3.2, because macOS ships
   bash 3.2.** Apple has not shipped bash 4 since the licence change, so `/bin/bash`
   on the macOS runner is from 2007. A script registered in the **default** ctest
