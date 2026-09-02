@@ -908,6 +908,48 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# The tidy sweep's scope computation. Registered here because the only thing
+# that ran it before was the `clang-tidy` job whose scope it computes (#588).
+#
+# That circularity is the point. The sweep decides WHICH translation units get
+# analysed, and the rulebook already records that a sweep is only as complete as
+# its database's targets -- so if the scope computation broke such that the job
+# did less work, the job would still pass, and its self-test, living inside it,
+# is not an independent check of that. Every comparable hygiene check here is in
+# the default set for this reason; this one was the odd one out.
+#
+# Needs no compile database, no clang-tidy, no daemon and no socket: it builds a
+# synthetic tree in a scratch directory and asks the include graph about it.
+#
+# `SKIP_RETURN_CODE 77` is load-bearing rather than copied from its neighbours.
+# `tidy-sweep.sh` requires bash 4.4 -- `wait -n` is 4.3, and expanding an empty
+# array under `set -u` stops erroring at 4.4 -- and macOS ships a 2007 bash 3.2.
+# Without this the script exits 2 there and a stock macOS runner goes RED for an
+# interpreter that is merely old; with it, ctest reports SKIPPED and says so.
+#
+# And the guard has to be here rather than at configure time, which is the
+# tempting repair and the wrong one: the floor is a property of whichever `bash`
+# the machine has at RUN time, and a macOS runner can carry 3.2 at /bin/bash and
+# 5.x from Homebrew. `if(NOT WIN32)` -- which `local-gate-selftest` above uses
+# for a genuinely platform-shaped reason -- cannot tell those apart, and dropping
+# the registration on macOS would put it back to a check that does not exist and
+# does not say so. Skipped, absent, unstarted and failed are four states.
+#
+# `if(NOT WIN32)` still applies for the reason its neighbours carry it: the
+# script is POSIX, and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "tidy-sweep-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
+    )
+    set_tests_properties("tidy-sweep-selftest" PROPERTIES
+        LABELS "hygiene"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The sccache-backend caveat. Fails when a file recommends pointing sccache at
 # fastcached -- which is what naming either of the two `SCCACHE_*` backend
 # variables is -- without saying, within 40 lines, what that costs under MSVC and
