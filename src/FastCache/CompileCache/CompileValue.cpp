@@ -195,6 +195,67 @@ std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
     return out;
 }
 
+namespace
+{
+    /// Everything after the generation byte, which is the whole of the layout.
+    ///
+    /// Split out because it is run TWICE, and the second run is what tells a stored
+    /// value of another generation from bytes that are not a stored value at all: the
+    /// generation byte alone cannot, since almost no opaque blob happens to begin with
+    /// this build's. `DecodeCompileValue` reads the leading byte and hands the rest
+    /// here either way.
+    ///
+    /// @param cursor Positioned immediately after the generation byte.
+    /// @return The decoded value, or why the layout did not hold.
+    [[nodiscard]] std::expected<CompileValue, ProtocolError> DecodeAfterGeneration(Cursor& cursor)
+    {
+        CompileValue value;
+
+        std::uint32_t objectLen {};
+        if (!cursor.ReadU32(objectLen))
+            return Malformed("truncated object length");
+        if (!cursor.ReadBytes(objectLen, value.objectBlob))
+            return Malformed("truncated object blob");
+
+        std::uint32_t regionCount {};
+        if (!cursor.ReadU32(regionCount))
+            return Malformed("truncated region count");
+
+        // The count is a claim about bytes this frame must already carry -- see
+        // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
+        // before anything is sized from it (issue #267).
+        if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
+            return Malformed("region count exceeds what the remaining bytes can supply");
+
+        // No `reserve(regionCount)`: a validated count is still an amplifier, and the
+        // realistic count here is one per grammar, so growing from the regions actually
+        // decoded costs nothing measurable beside the object blob copied just above.
+        for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
+        {
+            std::uint8_t grammarTag {};
+            if (!cursor.ReadU8(grammarTag))
+                return Malformed("truncated region grammar");
+            if (!IsKnownGrammar(grammarTag))
+                return Malformed("unknown region grammar tag");
+
+            std::uint32_t textLen {};
+            if (!cursor.ReadU32(textLen))
+                return Malformed("truncated region text length");
+
+            TextRegion region { .grammar = static_cast<PathCanon::Grammar>(grammarTag), .bytes = {} };
+            if (!cursor.ReadString(textLen, region.bytes))
+                return Malformed("truncated region text");
+            value.textRegions.push_back(std::move(region));
+        }
+
+        if (cursor.Remaining() != 0)
+            return Malformed("trailing bytes after compile-value frame");
+
+        return value;
+    }
+
+} // namespace
+
 std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byte const> bytes)
 {
     Cursor cursor { bytes };
@@ -202,52 +263,32 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     std::uint8_t version {};
     if (!cursor.ReadU8(version))
         return Malformed("empty compile-value frame");
-    if (version != CompileValueVersion)
+
+    if (version == CompileValueVersion)
+        return DecodeAfterGeneration(cursor);
+
+    // A leading byte that is not ours is NOT on its own evidence of another
+    // generation, and reading it that way was a real defect rather than a
+    // conservative one: almost no opaque blob begins with 0x01, so every opaque value
+    // would have been called foreign and REFUSED -- destroying the node cache tier's
+    // documented policy of storing an opaque value verbatim, which is a policy this
+    // layer has no business overturning. Two of that tier's tests said so.
+    //
+    // So the rest of the layout is asked as well, and only a frame that holds
+    // together under it is reported as another generation. That is positive evidence
+    // rather than the absence of ours.
+    //
+    // The residual, stated because it is real: a future generation that changes the
+    // FRAMING as well as the canonicalization parses as junk here and is called
+    // malformed. Nothing in this build could tell those apart -- an unknown layout is
+    // unknown -- and the direction it fails in is the one the node already handles.
+    // A generation that keeps the framing and moves the canonicalization, which is
+    // what #547 will be, is caught exactly.
+    if (DecodeAfterGeneration(cursor).has_value())
         return ForeignGenerationRefusal(version);
-
-    CompileValue value;
-
-    std::uint32_t objectLen {};
-    if (!cursor.ReadU32(objectLen))
-        return Malformed("truncated object length");
-    if (!cursor.ReadBytes(objectLen, value.objectBlob))
-        return Malformed("truncated object blob");
-
-    std::uint32_t regionCount {};
-    if (!cursor.ReadU32(regionCount))
-        return Malformed("truncated region count");
-
-    // The count is a claim about bytes this frame must already carry -- see
-    // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
-    // before anything is sized from it (issue #267).
-    if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
-        return Malformed("region count exceeds what the remaining bytes can supply");
-
-    // No `reserve(regionCount)`: a validated count is still an amplifier, and the
-    // realistic count here is one per grammar, so growing from the regions actually
-    // decoded costs nothing measurable beside the object blob copied just above.
-    for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
-    {
-        std::uint8_t grammarTag {};
-        if (!cursor.ReadU8(grammarTag))
-            return Malformed("truncated region grammar");
-        if (!IsKnownGrammar(grammarTag))
-            return Malformed("unknown region grammar tag");
-
-        std::uint32_t textLen {};
-        if (!cursor.ReadU32(textLen))
-            return Malformed("truncated region text length");
-
-        TextRegion region { .grammar = static_cast<PathCanon::Grammar>(grammarTag), .bytes = {} };
-        if (!cursor.ReadString(textLen, region.bytes))
-            return Malformed("truncated region text");
-        value.textRegions.push_back(std::move(region));
-    }
-
-    if (cursor.Remaining() != 0)
-        return Malformed("trailing bytes after compile-value frame");
-
-    return value;
+    return Malformed(std::format("leading byte {} is not this build's generation and the layout behind it does not "
+                                 "hold, so these bytes are not a stored value",
+                                 version));
 }
 
 StoredValueCanonicalization CanonicalStoredValue(std::span<std::byte const> value,

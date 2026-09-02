@@ -67,6 +67,29 @@ namespace
             .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload,
         };
 
+        /// A `STORE` whose value names a canonicalization generation this build does
+        /// not implement.
+        ///
+        /// **Counted**, by this table's own test rather than by analogy. A rise is not
+        /// ordinary traffic: `CompileValueVersion` has never moved, so nothing
+        /// produces one today and the baseline is zero -- which is what separates this
+        /// from the `AUTH` arm below, where a healthy launcher emits one per exchange
+        /// for a whole build. The arm is reachable, and by the ordinary path rather
+        /// than a direct `Answer`: it is what a launcher at another generation
+        /// produces, which is the steady state of a fleet mid-upgrade
+        /// ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)). And
+        /// nothing else sees it -- `LocalCache::Store` counts writes that FAILED, and
+        /// this is a write never attempted.
+        ///
+        /// What an operator does about a rise is what they do about the version row
+        /// above: find the machine that is out of step and finish or roll back the
+        /// upgrade. It also makes #483's own decision auditable, since refusing buys
+        /// correctness by giving up hits and the launcher reports only a miss.
+        constexpr Cc::SurfaceRefusal ForeignGeneration {
+            .code = Wire::ErrorCode::MalformedValue,
+            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
+        };
+
         /// A frame whose payload is not the length its header declared.
         ///
         /// **Uncounted, because it cannot fire through the listener.**
@@ -227,13 +250,38 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             // absolute paths and every consumer replayed them into its build system's
             // dependency graph (#319).
             //
-            // A value that does not decode is stored VERBATIM rather than refused,
-            // which is where this server's policy differs from the daemon's: an
-            // opaque value is not this tier's business to reject. `CanonicalStoredValue`
-            // answers `nullopt` and each server says what it wants to.
+            // Bytes that are not a stored value at all are stored VERBATIM rather
+            // than refused, which is where this server's policy differs from the
+            // daemon's: an opaque value is not this tier's business to reject.
+            //
+            // A value of another GENERATION is not in that category and this tier has
+            // no choice about it (#483). It used to be, because `CanonicalStoredValue`
+            // answered one `nullopt` for both -- so a launcher at generation N storing
+            // into a node at N+1 landed on the verbatim arm and put the producing
+            // checkout's absolute paths into the shared cache under a key every
+            // machine computes, which is #229/#319 reached by nothing worse than a
+            // rolling upgrade. The switch is what protects: `bytes` is empty for the
+            // foreign case, but the fallback here was never the canonical bytes, so
+            // `outcome == Canonicalized ? canonical.bytes : fields->value` would
+            // compile, read naturally, and reinstate the whole thing.
             auto const canonical = CanonicalStoredValue(
                 fields->value, Wire::AsStringView(fields->srcRoot), Wire::AsStringView(fields->buildTree));
-            auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
+
+            auto toStore = fields->value;
+            switch (canonical.outcome)
+            {
+                case CanonicalizationOutcome::Canonicalized:
+                    toStore = canonical.bytes;
+                    break;
+                case CanonicalizationOutcome::NotACompileValue:
+                    break;
+                case CanonicalizationOutcome::ForeignGeneration:
+                    co_return Cc::Refuse(_metrics,
+                                         TierRefusal::ForeignGeneration,
+                                         std::format("stored value is generation {}; this build implements {}",
+                                                     canonical.generation,
+                                                     CompileValueVersion));
+            }
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Cc::RefuseWithoutCounter(TierRefusal::StorageWriteFailed);

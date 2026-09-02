@@ -133,11 +133,20 @@ enum class CanonicalizationOutcome : std::uint8_t
     /// consumer that then replays the producer's paths into its dependency graph,
     /// which no edit in its own checkout can ever invalidate.
     ///
-    /// Read off the leading byte, so bytes that are not a stored value at all but
-    /// begin with an unrecognised tag land here rather than in `NotACompileValue`.
-    /// That misclassification is deliberate and one-directional: the cost is a
-    /// refused store of something no client on this wire sends, and the alternative
-    /// is guessing a foreign generation's framing well enough to rule it out.
+    /// **Positive evidence, not the absence of ours.** A leading byte that is not
+    /// this build's is on its own no evidence at all, and reading it that way was a
+    /// defect rather than a conservative choice: almost no opaque blob begins with
+    /// `0x01`, so every opaque value would land here and be REFUSED, overturning the
+    /// node cache tier's documented policy of storing an opaque value verbatim --
+    /// which this layer has no business deciding. Two of that tier's tests said so
+    /// out loud. So the rest of the layout is decoded as well, and only a frame that
+    /// holds together under it is reported as another generation.
+    ///
+    /// The residual, since it is real: a future generation that moves the FRAMING as
+    /// well as the canonicalization reads as junk here and comes back
+    /// `NotACompileValue`. Nothing in this build could separate those -- an unknown
+    /// layout is unknown -- and a generation that keeps the framing and moves the
+    /// canonicalization, which is the shape #547 will have, is caught exactly.
     ///
     /// **What protects a caller is switching on this, not the empty `bytes`.** The
     /// carried bytes being empty stops a server storing *nothing*; it does not stop

@@ -514,6 +514,28 @@ class IMetricsSink
         /// keyed on the code could not hold them.
         NodeCacheRequestsRefusedMalformedPayload,
 
+        /// A `STORE` refused because its value names a canonicalization generation
+        /// this build does not implement.
+        ///
+        /// The near-twin of `...RefusedUnsupportedVersion` one enumerator up, and
+        /// counted for the same reason: that one is a client at another WIRE version,
+        /// this is a value at another VALUE-FORMAT generation, and an operator does
+        /// the same thing about both -- find the machine that is out of step and
+        /// finish or roll back the upgrade.
+        ///
+        /// **Its baseline is zero and that is what makes it readable.** A fleet is
+        /// permanently mid-upgrade ([#173]), so it might look like ordinary traffic --
+        /// but `CompileValueVersion` has never moved, so nothing produces one today
+        /// and any rise is a real event with a date on it. That is the opposite of the
+        /// `AUTH` refusal this tier deliberately leaves uncounted, which a healthy
+        /// launcher emits once per exchange for a whole build.
+        ///
+        /// It is also what makes #483's decision auditable. Refusing a foreign
+        /// generation buys correctness by giving up hits, and without this series
+        /// nobody can see what that trade costs -- the refusal is invisible to the
+        /// launcher, which reports a miss and compiles locally.
+        NodeCacheRequestsRefusedForeignGeneration,
+
         /// Scheduler requests refused because the connection presented no accepted
         /// credential.
         ///

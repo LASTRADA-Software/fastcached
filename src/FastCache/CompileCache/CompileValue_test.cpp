@@ -209,6 +209,27 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
         CHECK(canonical.bytes.empty());
     }
 
+    SECTION("opaque bytes are not a foreign generation just for starting with one")
+    {
+        // The regression for the defect the NODE's tests caught, not this file's.
+        // Classifying on the leading byte alone made every opaque value foreign --
+        // almost none begins with this build's generation -- and the node's cache
+        // tier answers `NotACompileValue` by storing the bytes verbatim, a documented
+        // policy this layer does not own. So a foreign generation has to be PROVED by
+        // the layout behind the byte.
+        //
+        // `"not-a-value"` is the node's own fixture string, kept verbatim: its
+        // leading `n` is not generation 1, and the four bytes an object length would
+        // occupy read as ~1.87 billion, which the frame cannot supply.
+        constexpr std::string_view opaque = "not-a-value";
+        auto const bytes = AsBytes(opaque);
+        REQUIRE(static_cast<std::uint8_t>(bytes.front()) != CompileValueVersion);
+
+        auto const canonical = CanonicalStoredValue(bytes, "/home/dev/proj", "/home/dev/proj/build");
+        CHECK(canonical.outcome == CanonicalizationOutcome::NotACompileValue);
+        CHECK(canonical.generation == 0);
+    }
+
     SECTION("an empty value is not a foreign generation")
     {
         // There is no leading byte to have read, so this cannot be a generation

@@ -1334,10 +1334,20 @@ were open to breaking it, and neither needed anybody's install to be stale.
     for it to drift. It is `.agent/rules/storage.md`'s `UnsupportedFormatVersion`
     against `Corrupt`, one layer up and on the wire instead of on disk — and for the
     same reason, since the obvious remedy for a cache reported corrupt is to wipe it.
-  - **A blob whose leading byte is unrecognised is called foreign even when it is
-    not a stored value at all.** Deliberate and one-directional: the cost is a
-    refused store of something no client on this wire sends, and the alternative is
-    guessing a foreign generation's framing well enough to rule it out.
+  - **Another generation is proved, never inferred from the leading byte alone** —
+    and the first cut of this got it backwards, which the OTHER server's tests caught
+    rather than any reasoning here. Almost no opaque blob begins with `0x01`, so
+    "leading byte is not ours" called every opaque value foreign and refused it,
+    overturning the node cache tier's documented policy of storing an opaque value
+    verbatim — a policy this layer does not own. `DecodeAfterGeneration` therefore
+    runs on the rest of the frame too, and only a layout that holds together is
+    reported as a generation. The residual is stated rather than hidden: a generation
+    that moves the FRAMING as well reads as junk, nothing in this build could tell
+    those apart, and the shape that matters (#547 — framing kept, canonicalization
+    moved) is caught exactly. The general form is the one worth carrying: **absence
+    of the expected value is not evidence of a particular alternative**, and a
+    classifier built on it will be confidently wrong about everything that is merely
+    unfamiliar.
   - **No tag moved for this.** Nothing observable about generation 1 changed, and
     `CompileValueVersion` has never moved, so the population of values stored
     verbatim by this route is empty **by construction**. That is a condition, not a
