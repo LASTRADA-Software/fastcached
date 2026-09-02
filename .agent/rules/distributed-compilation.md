@@ -1917,6 +1917,18 @@ during which the node served *nothing*: not its cache tier, not `/healthz`, not
 `/metrics`. So `DiscoverToolchainEntries` stays on the startup path and
 `FingerprintToolchains` moves to the heartbeat thread's first round (#365).
 
+- **Anything that decides "has this changed since the survey" is seeded BEFORE the
+  survey, never after it.** The heartbeat notices a configuration reload by comparing
+  the snapshot it last acted on against the current one, and a baseline left null
+  until the first beat reads that beat as a reload — so every node with a
+  configuration file ran a second full survey immediately after its first: minutes of
+  include-tree walking on a cold machine, and a window in which one transient probe
+  failure drops toolchains the node had just successfully identified. Seeded before,
+  the first beat is comparable to every other one AND a reload that lands *during* the
+  survey is still seen, which a baseline taken afterwards would have swallowed. The
+  bullet above is about when the survey runs; this is about what the survey is measured
+  against, and getting the second wrong costs the whole benefit of the first (#403).
+
 - **Registration is not moved with it, and cannot be.** A `ServedToolchain` cannot
   exist without a real fingerprint, so `toolchains` is simply empty until the walk
   answers and `registrarsFor` builds nothing from it. That is the acceptance
