@@ -92,6 +92,32 @@ determinism rests on.
   three copies"), and where a number is genuinely load-bearing, put it where a CHECK
   reads it rather than where only a human does — which is what `check-glob-traversals`
   does for the count that matters.
+- **An instrument whose failure mode is an empty or unexpected value must not have a
+  predicate that sorts it into a named outcome.** Two instruments invented their
+  subject in one session, both by a negation quietly catching a value nobody
+  enumerated.
+  - A `gh ... --jq` query whose escaping the shell had mangled printed a parse error
+    and returned nothing; the surrounding `${res:-JOB NOT PRESENT}` turned that
+    nothing into a confident sentence, **identically for all four runs queried**. The
+    reading was the exact opposite of the truth — the job runs and passes. The tell
+    was that all four rows agreed *perfectly*, which is what a broken query looks like
+    and also what a real pattern looks like, so agreement is not corroboration when
+    the instrument can fail wholesale.
+  - `gh run view --json jobs` renders a **running** job's `conclusion` as the empty
+    string, not `null`, so `select(.conclusion != null and ...)` matched every
+    in-progress job and reported it as FAILED. That is *unfinished* classified as
+    *failed* — the four-states rule in
+    [`metrics-and-observability.md`](metrics-and-observability.md), violated by the
+    predicate rather than by the author. The tell was walked past: a required check
+    failing in a merge queue after passing on the PR, on a byte-identical tree, is not
+    a plausible event.
+
+  So: check the query's own exit status rather than only its output; **enumerate the
+  states and print counts**, so an unexpected value shows up as unexpected instead of
+  falling into whichever bucket a negation happens to catch; and never let a default
+  substitution convert "I could not see" into a statement about the subject. A query
+  that failed and a subject that is absent are different findings, and a `:-` default
+  spells them the same way.
 - **A hygiene script `ctest` runs is constrained to bash 3.2, because macOS ships
   bash 3.2.** Apple has not shipped bash 4 since the licence change, so `/bin/bash`
   on the macOS runner is from 2007. A script registered in the **default** ctest
