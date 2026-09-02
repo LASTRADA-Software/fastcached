@@ -54,7 +54,9 @@ configuration would bind, with its protocol, and exits without opening anything:
 
 ```console
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
-      --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
+      --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681 \
+      --scheduler 10.0.0.1:6675 --advertise 10.0.0.1:6674 \
+      --cluster-key-file /etc/fastcached/cluster.key
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
