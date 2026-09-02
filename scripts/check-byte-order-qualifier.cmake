@@ -169,6 +169,31 @@ function(fastcached_split_lines content linesOut)
     set(${linesOut} "${lines}" PARENT_SCOPE)
 endfunction()
 
+# Turn a list of shell globs into one anchored regex, so a root can be walked ONCE
+# and the results filtered in memory.
+#
+# `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN. On DrvFs one
+# traversal of `src/` costs 2.09 s, so a list of N patterns is N x that -- and the call
+# site reads as a single glob, which is what made the cost invisible (#502).
+#
+# This is the fourth copy of this idiom across the hygiene checks; consolidating them
+# into a shared module is #495, deliberately not pre-empted here.
+# @param globs The shell globs, each like `*.hpp` or `*.hpp.in`.
+# @param outVar Set to an anchored alternation regex.
+function(fastcached_globs_to_regex globs outVar)
+    set(parts "")
+    foreach(glob IN LISTS globs)
+        string(REPLACE "." "PLACEHOLDERDOT" one "${glob}")
+        string(REPLACE "*" ".*" one "${one}")
+        string(REPLACE "PLACEHOLDERDOT" "\\." one "${one}")
+        list(APPEND parts "${one}")
+    endforeach()
+    string(REPLACE ";" "|" joined "${parts}")
+    set(${outVar} "(${joined})$" PARENT_SCOPE)
+endfunction()
+
+fastcached_globs_to_regex("${FastCachedByteOrderScanGlobs}" scanRegex)
+
 # ---------------------------------------------------------------------------
 # Collect the files to judge.
 set(scanFiles "")
@@ -177,11 +202,10 @@ foreach(row IN LISTS FastCachedByteOrderScanRoots)
     fastcached_row_fields("${row}" scanRoot scanRootReason)
     set(rootPath "${FASTCACHED_SOURCE_DIR}/${scanRoot}")
     if(IS_DIRECTORY "${rootPath}")
-        set(rootGlobs "")
-        foreach(glob IN LISTS FastCachedByteOrderScanGlobs)
-            list(APPEND rootGlobs "${rootPath}/${glob}")
-        endforeach()
-        file(GLOB_RECURSE rootFiles LIST_DIRECTORIES false ${rootGlobs})
+        # ONE traversal per root, filtered afterwards. See fastcached_globs_to_regex.
+        file(GLOB_RECURSE rootAll LIST_DIRECTORIES false "${rootPath}/*")
+        set(rootFiles ${rootAll})
+        list(FILTER rootFiles INCLUDE REGEX "${scanRegex}")
         list(APPEND scanFiles ${rootFiles})
     else()
         # A renamed or mistyped root would otherwise take a whole surface out of

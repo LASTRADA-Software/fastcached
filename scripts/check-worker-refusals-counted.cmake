@@ -160,9 +160,13 @@ endfunction()
 #
 # Every C++ file under `src/`, headers included, because #447 put refusal rows in a
 # header and the old scan could not see them.
+# ONE traversal, filtered afterwards. Two patterns meant two traversals of `src/`, and
+# on DrvFs one costs 2.09 s (#502). No glob-to-regex helper here because the extensions
+# are stated once, right here, so the regex IS the source of truth rather than a second
+# statement of it.
 file(GLOB_RECURSE sources RELATIVE "${FASTCACHED_SOURCE_DIR}"
-     "${FASTCACHED_SOURCE_DIR}/src/*.cpp"
-     "${FASTCACHED_SOURCE_DIR}/src/*.hpp")
+     "${FASTCACHED_SOURCE_DIR}/src/*")
+list(FILTER sources INCLUDE REGEX "\\.(cpp|hpp)$")
 list(SORT sources)
 
 if(NOT sources)

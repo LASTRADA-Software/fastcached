@@ -12,6 +12,48 @@ determinism rests on.
 
 `scripts/local-gate.sh` is the gate. Run it before pushing.
 
+- **A hygiene check traverses each directory ONCE, not once per file pattern.**
+  `file(GLOB_RECURSE var a b c)` traverses once PER PATTERN and the call site reads as
+  one glob, so `check-sccache-backend-caveat` handed it ~19 patterns per root across
+  two calls and cost **78.7 s against a 60 s budget** -- the documented local gate could
+  not go green on a DrvFs checkout, a supported working environment (#502). Walk once
+  and `list(FILTER ... INCLUDE REGEX)` the result; **never raise the timeout**, because
+  a budget raised to accommodate a redundancy hides the redundancy.
+- **Read that figure with its conditions, or it misleads in both directions.** The cost
+  is per `stat` on a filesystem where each crosses a translation layer, so it is
+  invisible on CI and on ext4 and it varies with page-cache warmth:
+
+  | check | standalone | single gate | two lanes | budget |
+  |---|---|---|---|---|
+  | `sccache-backend-caveat` | 78.7 s | 60.0 s (timeout) | -- | 60 s |
+  | `byte-order-qualifier` | 19.6 s | 28.6 s | **60.9 s** | 60 s |
+  | `worker-refusals-counted` | 5.5 s | 9.7 s | -- | 60 s |
+  | `net-boundary` | 4.0 s | 8.6 s | -- | 60 s |
+
+  One traversal of `src/` is **2.09 s** (stable to 16 ms over five runs), and
+  38 x 2.09 = 79 s predicted 78.7 s measured -- the model is falsifiable, which is what
+  makes it worth trusting. **`byte-order-qualifier` has only ever exceeded its budget
+  while a SECOND lane's gate was running**, and this repository routinely has two and
+  three lanes gating at once. A reader who measures it single-gate gets 28.6 s and
+  concludes it is comfortable; the condition is the finding, not the number.
+- **The build tree was NOT the cause, and assuming it was would have shipped a fix that
+  changed nothing.** Deleting `out/` entirely takes `sccache-backend-caveat` from 100 s
+  to 79 s -- measured A/B, ratios 1.0-1.3x across all ten globbing checks -- so "no
+  check walks a build tree" would have been implemented, measured as done, and the gate
+  would still have been red. The ticket's own mechanism section said so before the
+  wrong scope was written over it: *`out/` is not a scan root; it is the source tree,
+  walked 126 times.* Globbing a build tree is a real and separate mistake, and one this
+  project has also made.
+- `ctest -R glob-traversals` enforces one pattern per call and refuses an unquoted
+  `${globs}` expansion -- ONE argument and as many traversals as the list is long,
+  which is what the original defect was and what an argument count alone would pass. It
+  is a **proxy** for traversals-per-root and its header says so: nineteen
+  single-pattern calls in a loop cost the same and pass it, so tidying an argument list
+  into a loop makes the guard greener while reintroducing the cost.
+  `glob-traversals-selftest` drives seven trees, two of which exist because the check
+  got them wrong while it was being written -- it reported its own remediation example
+  printed from a `message()`, and a stray `]` in a comment merged lines under CMake's
+  list grouping so it named line 217 for a call at line 307.
 - **A hygiene script `ctest` runs is constrained to bash 3.2, because macOS ships
   bash 3.2.** Apple has not shipped bash 4 since the licence change, so `/bin/bash`
   on the macOS runner is from 2007. A script registered in the **default** ctest

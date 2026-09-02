@@ -186,6 +186,63 @@ set_tests_properties("script-check-signals" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A hygiene check traverses each directory once, not once per file pattern.
+#
+# `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN, and the call site
+# reads as a single glob. `check-sccache-backend-caveat` handed it ~19 patterns per
+# root across two calls and took 78.7 s against a 60 s budget on a DrvFs checkout, so
+# the documented local gate could not go green for anyone working that way (#502).
+# One traversal of `src/` costs 2.09 s there and is effectively free on ext4, which is
+# why CI never saw it.
+#
+# The rule is `GLOB_RECURSE` receives exactly one pattern, and that pattern is not an
+# unquoted variable expansion -- the original defect was `${rootGlobs}`, ONE argument
+# and nineteen traversals, which an argument count alone would have passed.
+#
+# It is a PROXY for traversals-per-root and the check's header says so: nineteen
+# single-pattern calls in a loop cost the same and pass. A guard whose limits are
+# written down is worth having; one that reads as complete is not.
+#
+# In the default set with the other hygiene checks: it reads files and compares
+# strings.
+add_test(
+    NAME "glob-traversals"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-glob-traversals.cmake"
+)
+set_tests_properties("glob-traversals" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be seen to refuse, on each thing it claims and nothing else.
+#
+# Seven synthetic trees, one verdict each: one pattern passes, two are refused with the
+# count named, an unquoted list expansion is refused, the `RELATIVE` /
+# `LIST_DIRECTORIES` / `CONFIGURE_DEPENDS` keywords are not counted as patterns, a
+# `GLOB_RECURSE` inside a `message()` string is prose and not a call, a tree with none
+# at all reports a broken scan, and a call after a stray `]` in a comment is reported at
+# its REAL line -- CMake's list grouping merges lines, and this check once named line
+# 217 for a call at line 307.
+#
+# The last two cases exist because the check got them wrong while it was written, which
+# is the best reason a case can have.
+add_test(
+    NAME "glob-traversals-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/glob-traversals-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-glob-traversals-selftest.cmake"
+)
+set_tests_properties("glob-traversals-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # Every `catch_discover_tests` registration tells ctest that exit 4 means SKIPPED.
 #
 # A Catch2 case that calls `SKIP(...)` exits 4, and without `SKIP_RETURN_CODE` ctest
