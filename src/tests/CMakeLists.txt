@@ -1762,13 +1762,11 @@ endif()
 # ---------------------------------------------------------------------------
 # fetch-transfer-bound: the dependency-fetch bound is watched refusing a stall.
 #
-# Three configures wedged in one evening on fresh worktrees -- 40, 40 and 53
-# minutes -- each parked in `read()` on a socket that had delivered nothing,
-# because git and CMake both wait forever on a transfer that stops delivering
-# (#526). `cmake/FetchTransferBound.cmake` bounds both, and this is what shows
-# the bound firing: a guard nobody has watched refuse is not a guard, and the
-# same fix applied by hand on the night of the wedges was never once exercised,
-# because the retry it sat behind happened to succeed.
+# A dependency `git clone` that stops delivering never ends, because nothing
+# bounds it (#526). `cmake/FetchTransferBound.cmake` states the bound, the
+# measurements behind it and the reasoning for its numbers; this registration
+# deliberately restates none of that, because a figure others cite lives in one
+# place they point at.
 #
 # Registered here rather than beside a binary because it names two executables
 # -- git and cmake -- and neither is a target of this project.
@@ -1781,37 +1779,41 @@ endif()
 # a stub beside it rather than two implementations of one rule.
 #
 # It contacts nothing outside 127.0.0.1 and needs no daemon, no compiler and no
-# network, so it stays in the default set. The port comes from `bind(0)`: the
-# per-run allocation rule exists because a fixture CHOOSING a port cannot see
-# one already held as an outbound connection's local endpoint, and letting the
-# kernel choose sidesteps that question rather than answering it.
-find_program(FASTCACHED_PYTHON3 NAMES python3 python DOC "Python 3 interpreter")
-if(NOT FASTCACHED_PYTHON3)
+# network, so it is `hygiene` like the other checks that need none of those.
+# The port comes from `bind(0)`: the per-run allocation rule exists because a
+# fixture CHOOSING a port cannot see one already held as an outbound
+# connection's local endpoint, and letting the kernel choose sidesteps that
+# question rather than answering it.
+#
+# `find_package(Python3)` and not a `find_program`: it VALIDATES the interpreter
+# by running it, which is what screens out Windows' App Execution Alias -- a
+# zero-byte reparse point on PATH named `python3.exe` that a `find_program`
+# returns happily and that does not run Python. A third spelling of "find
+# python" would also disagree with `cmake/Coverage.cmake`'s about which
+# interpreter it means.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NOT Python3_Interpreter_FOUND)
     # A WARNING and not a STATUS. The outcome here is that a guard standing
     # behind a rule which has already cost three lanes forty minutes each is
     # ABSENT from this build tree, and absent is not the same as passing.
     message(WARNING
-        "fetch-transfer-bound: no python3 found, so the dependency-fetch transfer "
-        "bound (#526) is NOT guarded in this build tree")
+        "fetch-transfer-bound: no Python 3 interpreter found, so the dependency-fetch "
+        "transfer bound (#526) is NOT guarded in this build tree")
 else()
     add_test(
         NAME "fetch-transfer-bound"
-        COMMAND "${FASTCACHED_PYTHON3}"
+        COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
             --source-dir "${CMAKE_SOURCE_DIR}"
             --git "${GIT_EXECUTABLE}"
             --cmake "${CMAKE_COMMAND}"
     )
-    # The script is a real program with a real exit code, so it needs no
-    # FAIL_REGULAR_EXPRESSION -- that property exists for `cmake -P` checks,
-    # which cannot fail their own test because message(FATAL_ERROR) exits 0 on
-    # CMake 3.28. 77 is this file's script-driven convention for "a prerequisite
-    # is missing", which here means git or cmake could not be run at all.
-    #
-    # TIMEOUT well above what the script's own bounds permit (two ~6s controls
-    # and two legs bounded at the compressed window plus slack): the ctest
-    # timeout is the outer supervisor, not the measurement.
+    # 77 is this file's script-driven convention for "a prerequisite is
+    # missing", which here means git or cmake could not be run at all. TIMEOUT
+    # is the outer supervisor rather than the measurement: the script bounds
+    # every wait it makes, and this is what catches it failing to.
     set_tests_properties("fetch-transfer-bound" PROPERTIES
+        LABELS "hygiene"
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )

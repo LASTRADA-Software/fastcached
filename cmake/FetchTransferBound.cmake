@@ -69,7 +69,7 @@
 # ---------------------------------------------------------------------------
 # How it is applied
 #
-# Two transports fetch dependencies and both are bounded from this one table:
+# Two transports fetch DEPENDENCIES, and both take their numbers from here:
 #
 #   * git, for every `CPMAddPackage` that misses the cache. Bounded through
 #     `GIT_HTTP_LOW_SPEED_LIMIT` / `GIT_HTTP_LOW_SPEED_TIME`, which git reads
@@ -83,6 +83,29 @@
 #     configure, and unlike the clone case it leaves no `_deps` directory for
 #     anyone to inspect.
 #
+# What this file is NOT is the only place in the tree that states the policy,
+# and saying so would be an overclaim worth exactly nothing. `cmake/portable/
+# CompileCache.cmake` downloads the launcher and its release metadata, carries
+# its own `INACTIVITY_TIMEOUT` numbers, and runs BEFORE this module is even
+# included -- and it must, because it is required to stay stock-CMake-only and
+# may not include anything of ours. That duplicate is accepted with its reason
+# rather than written around; what closes it is that the guard asserts the
+# PROPERTY over the whole tree -- every `file(DOWNLOAD)` anywhere carries an
+# inactivity bound -- so a third download added by anyone is caught by the same
+# row rather than by somebody remembering these two line numbers.
+#
+# Two limits on the git half, stated because the rationale above would
+# otherwise read as if the mechanism were unconditional:
+#
+#   * `GIT_HTTP_LOW_SPEED_LIMIT`/`_TIME` are read by git 2.29 and later. On an
+#     older git the export is a silent no-op. The guard's bounded leg passes the
+#     same variables and requires the clone to END, so an old git turns that
+#     guard RED rather than leaving the bound quietly absent.
+#   * `http.*` binds the HTTP transport only. A dependency declared over ssh
+#     (`git@github.com:...`) would be unbounded; every dependency this project
+#     declares is https, and CPM's `GITHUB_REPOSITORY` cannot produce anything
+#     else.
+#
 # The environment variables override a value in the developer's own gitconfig,
 # which is deliberate -- this is a project policy about this project's fetches.
 # The escape hatch is the cache variables below, not an unbounded default.
@@ -91,6 +114,8 @@
 # accepts a connection and answers nothing, and watches both transports refuse
 # it -- and watches both of them NOT refuse it with the bound removed, because a
 # guard whose subject cannot be made to hang proves nothing about the guard.
+# That guard reads these numbers by INCLUDING this file, so nothing here needs
+# a printing mode of its own and nothing there restates a value.
 
 include_guard(GLOBAL)
 
@@ -101,16 +126,3 @@ set(FASTCACHED_FETCH_MIN_BYTES_PER_SECOND 1 CACHE STRING
 
 set(ENV{GIT_HTTP_LOW_SPEED_LIMIT} "${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND}")
 set(ENV{GIT_HTTP_LOW_SPEED_TIME} "${FASTCACHED_FETCH_SILENCE_SECONDS}")
-
-# Run directly (`cmake -P cmake/FetchTransferBound.cmake`) this prints what it
-# exported, one `NAME=VALUE` per line. That exists for the guard: reading the
-# numbers back out of the module that sets them is the difference between
-# asserting the mechanism works and asserting THIS TREE applies it, and a guard
-# that restated the values would be a second copy to go stale rather than a
-# cross-check.
-if(CMAKE_SCRIPT_MODE_FILE AND CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
-    message("FASTCACHED_FETCH_SILENCE_SECONDS=${FASTCACHED_FETCH_SILENCE_SECONDS}")
-    message("FASTCACHED_FETCH_MIN_BYTES_PER_SECOND=${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND}")
-    message("GIT_HTTP_LOW_SPEED_LIMIT=$ENV{GIT_HTTP_LOW_SPEED_LIMIT}")
-    message("GIT_HTTP_LOW_SPEED_TIME=$ENV{GIT_HTTP_LOW_SPEED_TIME}")
-endif()

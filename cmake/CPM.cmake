@@ -2,16 +2,23 @@
 # CPM.cmake bootstrap — downloads CPM.cmake on first use, caches it.
 # https://github.com/cpm-cmake/CPM.cmake
 
-# Bound every transfer below, and every `git clone` CPM performs after it, so a
-# stalled one ends instead of hanging forever (#526). Included FIRST because
-# the git half works by exporting environment variables that later subprocesses
-# inherit, and the `file(DOWNLOAD)` half reads a value it defines. This file is
-# the one place both are reached from: it is included before any CPMAddPackage,
-# so a dependency added later cannot be added unbounded.
+# Bound the download below, and every `git clone` CPM performs after it, so a
+# stalled one ends instead of hanging forever (#526). The measurements and the
+# reasoning for the numbers are in FetchTransferBound.cmake and nowhere else.
+#
+# Included FIRST, and that ordering is load-bearing twice over: the git half
+# works by exporting environment variables that later subprocesses inherit, and
+# the `file(DOWNLOAD)` half reads a variable it defines. This file is where
+# every DEPENDENCY fetch is reached from -- it is included before any
+# `CPMAddPackage`, so a dependency added later cannot be added unbounded.
+# `ctest -R fetch-transfer-bound` asserts that ordering rather than trusting
+# this sentence.
 include("${CMAKE_CURRENT_LIST_DIR}/FetchTransferBound.cmake")
 
 set(CPM_DOWNLOAD_VERSION 0.40.5)
 set(CPM_HASH_SUM "c46b876ae3b9f994b4f05a4c15553e0485636862064f1fcc9d8b4f832086bc5d")
+set(CPM_DOWNLOAD_URL
+    "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake")
 
 if(CPM_SOURCE_CACHE)
     set(CPM_DOWNLOAD_LOCATION "${CPM_SOURCE_CACHE}/cpm/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
@@ -36,23 +43,28 @@ get_filename_component(CPM_DOWNLOAD_LOCATION ${CPM_DOWNLOAD_LOCATION} ABSOLUTE)
 # carries the reason, so the failure names the transfer rather than the
 # consequence.
 file(DOWNLOAD
-    https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
+    "${CPM_DOWNLOAD_URL}"
     ${CPM_DOWNLOAD_LOCATION}
     EXPECTED_HASH SHA256=${CPM_HASH_SUM}
     INACTIVITY_TIMEOUT ${FASTCACHED_FETCH_SILENCE_SECONDS}
     STATUS cpmDownloadStatus
 )
+# The status carries the reason, and the message repeats it rather than
+# explaining it. This branch is reached by a DNS failure, a 404, an offline
+# machine and the inactivity bound alike, so a sentence declaring that the
+# bound fired would be wrong three times out of four -- the same shape as this
+# project's rule that skipped, absent and failed are separate states and a
+# reporter must not collapse them. The pointer says where to look if it WAS the
+# bound; the status says whether it was.
 list(GET cpmDownloadStatus 0 cpmDownloadCode)
 if(NOT cpmDownloadCode EQUAL 0)
-    list(GET cpmDownloadStatus 1 cpmDownloadMessage)
     message(FATAL_ERROR
-        "could not download the CPM.cmake bootstrap: ${cpmDownloadMessage}\n"
-        "  from: https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake\n"
+        "could not download the CPM.cmake bootstrap: ${cpmDownloadStatus}\n"
+        "  from: ${CPM_DOWNLOAD_URL}\n"
         "  into: ${CPM_DOWNLOAD_LOCATION}\n"
-        "A transfer that delivered under ${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND} byte(s)/second for "
-        "${FASTCACHED_FETCH_SILENCE_SECONDS}s is abandoned rather than waited on -- see "
-        "cmake/FetchTransferBound.cmake. Re-run the configure, or point CPM_SOURCE_CACHE at a "
-        "directory that already holds the bootstrap.")
+        "Re-run the configure, or point CPM_SOURCE_CACHE at a directory that already "
+        "holds the bootstrap. If the transfer stalled, cmake/FetchTransferBound.cmake "
+        "is what abandoned it and why.")
 endif()
 
 include(${CPM_DOWNLOAD_LOCATION})
