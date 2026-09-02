@@ -970,7 +970,8 @@ that does not happen.
   freezing the cache scope only a push writes. It has TWO unique products, not one.
 
 - **The `push` on master otherwise rebuilds a tree the merge queue has already
-  proved, and its other unique product is a handful of cache entries.** A `merge_group` run and the
+  proved, and its other unique product is a handful of cache entries.** A
+  `merge_group` run and the
   `push` on master that follows it carry the *same* `head_sha` — 6 of 6 pairs
   checked on 2026-09-02 — so the master push recompiles, retests and repackages a
   tree the queue has already proved green. That is a whole bottom row of the table
@@ -997,11 +998,13 @@ that does not happen.
   request and queue entry to restore. Narrowing the push trigger to tags — NOT
   deleting `on: push`, whose `tags:` row is the only way the `release` job is ever
   reached — would therefore trade a bottom-row run per merge for a cache that goes
-  cold at whatever rate master changes: a real trade, not an obvious one, and
-  nobody has priced the second half of it. **A third measurement, 2026-09-02**:
-  `refs/heads/master` holds **2521 cache entries totalling 7.9 GB**, and no other
-  ref can be written to it, which is the inference above confirmed from the
-  `actions/caches` listing rather than from the documentation.
+  cold at whatever rate master changes: a real trade, not an obvious one. **A third
+  measurement, 2026-09-02**: `refs/heads/master` holds **2521 cache entries
+  totalling 7.9 GB**, and no other ref can be written to it — the inference above
+  confirmed from the `actions/caches` listing rather than from the documentation. It
+  says how much would go cold and not how many minutes that costs, so the *size* of
+  the second half is still unpriced; what settles the trade today is the bullet
+  above it rather than this number.
 
 - **The merge queue diff-scopes the `clang-tidy` sweep; only the master `push`
   sweeps everything.** The step was `--all` for every event but a pull request, so
