@@ -134,26 +134,33 @@ foreach(relative IN LISTS allowedFiles)
 endforeach()
 
 # ---------------------------------------------------------------------------
-# Reading a file as LINES.
+# Reading a file as LINES, without ever building a CMake list.
 #
-# Read and split by hand rather than with `file(STRINGS)`, which returns a LIST: a
-# line containing a semicolon becomes two elements and every line number after it
-# drifts. C++ is made of semicolons, so this is not a corner case here.
-# Backslashes are escaped FIRST, and that ordering is the whole point. A source line
-# ending in `\` -- a macro continuation -- otherwise leaves a trailing escape in its
-# list element, `foreach(... IN LISTS ...)` reads it as escaping the separator, and the
-# line merges with the next one. Detection survives that (the text is still there) but
-# every reported line number after it is wrong, and the `file:line` is the only thing a
-# person has to act on. Inherited from when this ran over four named files; it now runs
-# over 413.
-function(fastcached_read_lines path outVar)
-    file(READ "${path}" content)
-    string(REPLACE "\\" "\\\\" content "${content}")
-    string(REPLACE ";" "\\;" content "${content}")
-    string(REPLACE "\r\n" "\n" content "${content}")
-    string(REPLACE "\n" ";" lines "${content}")
-    set(${outVar} "${lines}" PARENT_SCOPE)
-endfunction()
+# Every other hygiene check splits content into a `;`-joined list and iterates it.
+# That is where the hazards live: a `;` in the text becomes a separator, a trailing
+# `\` escapes the separator, and -- the one that cost this check -- an UNBALANCED
+# `[` or `]` makes CMake's list parser swallow every following element into one.
+#
+# Measured, because the tree stated a broader rule than the real one:
+#
+#     plain content              3 elements
+#     one unbalanced `[`         1 element   (everything merged)
+#     one unbalanced `]`         1 element   (everything merged)
+#     balanced `[[nodiscard]]`   3 elements  (harmless)
+#
+# Only UNBALANCED brackets group. That distinction is why this check cannot use the
+# neutralise-the-brackets fix the others use: it derives its refusal spellings from
+# declarations that read `[[nodiscard]] inline std::vector<std::byte> Refuse(`, so
+# replacing brackets took it from three spellings to ZERO. Escaping is not available
+# either -- `\[` is not a valid CMake escape sequence.
+#
+# So this walks the newlines directly and never makes a list. Immune by construction
+# rather than by neutralising the characters that happen to be dangerous today, and
+# the text is preserved EXACTLY, which is what a check that matches on `[[nodiscard]]`
+# and reports `file:line` needs.
+#
+# The cost is a substring per line rather than one split, and it is bounded by the
+# whole-file prefilter below: about ten of 413 files ever reach it.
 
 # ---------------------------------------------------------------------------
 # What is scanned.
@@ -247,11 +254,24 @@ foreach(relative IN LISTS sources)
         continue()
     endif()
 
-    fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${relative}" lines)
+    string(REPLACE "
+" "
+" scanRest "${content}")
 
     set(lineNumber 0)
-    foreach(line IN LISTS lines)
+    while(NOT scanRest STREQUAL "")
         math(EXPR lineNumber "${lineNumber} + 1")
+
+        string(FIND "${scanRest}" "
+" scanNewline)
+        if(scanNewline EQUAL -1)
+            set(line "${scanRest}")
+            set(scanRest "")
+        else()
+            string(SUBSTRING "${scanRest}" 0 ${scanNewline} line)
+            math(EXPR scanNewline "${scanNewline} + 1")
+            string(SUBSTRING "${scanRest}" ${scanNewline} -1 scanRest)
+        endif()
 
         # Prose, not a call.
         if(line MATCHES "^[ \t]*(//|///|\\*)")
@@ -321,7 +341,7 @@ foreach(relative IN LISTS sources)
         if(line MATCHES "constexpr[ \t]+std::uint32_t[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*([0-9]+)[ \t]*;")
             set(issueConstant_${relative}_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
         endif()
-    endforeach()
+    endwhile()
 endforeach()
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,17 @@ foreach(cmakeFile IN LISTS cmakeFiles)
     # Brackets are replaced rather than escaped because nothing here matches on
     # them: the patterns are `$<TARGET_FILE:x>` and `if`/`elseif`/`endif`, and a
     # space preserves every column and every line number.
+    #
+    # Two precisions that #495 measured and this comment originally lacked. Only an
+    # UNBALANCED bracket groups -- `[[nodiscard]]` is completely harmless -- so
+    # "CMake treats `[` and `]` as structure" is broader than the truth. And the
+    # replacement above is safe here by WHAT THIS CHECK MATCHES, not by construction:
+    # none of its patterns contains a bracket. Add one that does and this check
+    # breaks silently, the way `check-worker-refusals-counted` did when the same fix
+    # was applied to it -- its spellings read `[[nodiscard]] inline ... Refuse(`, and
+    # replacing brackets took it from three to zero. That check now reads its lines
+    # without building a CMake list at all, which is the fix to copy if a pattern
+    # here ever needs a bracket.
     file(READ "${cmakeFile}" content)
     string(REPLACE ";" "\\;" content "${content}")
     string(REPLACE "[" " " content "${content}")

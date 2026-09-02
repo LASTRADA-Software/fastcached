@@ -78,10 +78,29 @@ set(catchSkipCode 4)
 # line containing a semicolon becomes two elements and every line number after it
 # drifts. Backslashes are escaped first, or a line ending in one merges with the next
 # and every reported line number after it is wrong.
+#
+# A semicolon is only HALF of CMake's list grouping, and this check carried the other
+# half open until #495. `[` and `]` are structure too, so ONE unbalanced bracket -- in
+# a COMMENT, where nobody is thinking about CMake syntax -- merges every following line
+# into a single element.
+#
+# Measured here: a single `]` inserted into a comment near the top of
+# `src/tests/CMakeLists.txt` took this check from 5 registrations to 4, and it PASSED
+# both times. It counts registrations and asserts each can report skips, so a smaller
+# set still passes unanimously -- no verdict can show it, and no emptiness guard can
+# either, because 4 is not 0. The count is the only thing that moves.
+#
+# Brackets are REPLACED rather than escaped because nothing here matches on them, and a
+# space preserves every column and every line number. Escaping is kept for `;` and `\`
+# because this check reports `file:line` and its lines must survive verbatim -- that
+# difference is not incidental, and #495 records why this idiom exists in two
+# incompatible families that must not be merged into one.
 function(fastcached_read_lines path outVar)
     file(READ "${path}" content)
     string(REPLACE "\\" "\\\\" content "${content}")
     string(REPLACE ";" "\\;" content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
     string(REPLACE "\n" ";" lines "${content}")
     set(${outVar} "${lines}" PARENT_SCOPE)

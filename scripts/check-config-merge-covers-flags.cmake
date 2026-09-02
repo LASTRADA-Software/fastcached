@@ -53,9 +53,26 @@ endforeach()
 # Read and split by hand rather than with `file(STRINGS)`, which returns a LIST: a
 # line containing a semicolon becomes two elements and every line number after it
 # drifts. C++ is made of semicolons, so this is not a corner case here.
+#
+# A semicolon is only HALF of CMake's list grouping. `[` and `]` are structure too, so
+# ONE unbalanced bracket -- in a COMMENT, where nobody is thinking about CMake syntax --
+# merges every following line into a single element.
+#
+# Measured here: a single `]` inserted into a comment near the top of `CliParser.hpp`
+# made this check refuse outright. That is the LOUD half of the defect and it is the
+# lucky half; the same bug in `check-catch-skip-return-code` under-reported and passed.
+# Which of the two happens depends on WHERE the bracket lands, not on the check, so
+# neither may be assumed safe because it once failed loudly.
+#
+# Brackets are REPLACED rather than escaped because nothing here matches on them and a
+# space preserves every column and line number. The `;` escape stays, because this
+# check reports `file:line` and its lines must survive verbatim. #495 records why this
+# idiom exists in two incompatible families that must not be merged.
 function(fastcached_lines_of relative outVar)
     file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" content)
     string(REPLACE ";" "\\;" content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
     string(REPLACE "\n" ";" lines "${content}")
     set(${outVar} "${lines}" PARENT_SCOPE)
