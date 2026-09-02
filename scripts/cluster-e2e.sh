@@ -422,7 +422,7 @@ leader_endpoint=""
 # composition rather than by arithmetic.
 #
 # One variable rather than a bound threaded through every signature: `find_leader`
-# is also reached indirectly, through `submit_setting`, so a parameter would have
+# is also reached indirectly, through `ask_leader`, so a parameter would have
 # to be carried by functions that have no opinion about it and would be forgotten
 # by the next one added.
 enclosing_deadline=""
@@ -756,39 +756,26 @@ echo "cluster E2E: a follower redirects to an endpoint that answers"
 
 # --- 3. a setting reaches every member ---------------------------------------
 
-# Submit a setting to whoever leads NOW, rather than to whoever led when section 1
-# ran.
+# `ask_leader` (scripts/lib/e2e-common.sh) is what every leader-pinned MUTATING
+# command below goes through. It puts the command to whoever leads NOW and, if the
+# answer is not the one being asserted, re-derives the leader and asks again.
 #
-# `$leader_endpoint` was pinned there, and leadership may legitimately move before
-# this section finishes -- a slow enough runner blows any election timeout. Pinned,
-# BOTH halves of the old assertion were wrong: the submission went to a node that
-# answers "ask somebody else", and the poll below then waited out its full 20s to
-# report that a setting the leader accepted never appeared in its own state -- a
-# sentence about replication, produced by an election. That is the message issue
-# #117's second occurrence actually carried.
+# It used to be `submit_setting` here, hard-coded to `--cluster-set`. Generalising
+# it was #172: two OTHER call sites were one-shot against a pinned endpoint, and
+# under a moving leadership both fail the way this one used to.
 #
-# Retried on ANY answer that is not the one the caller is asserting, rather than on
-# a recognised "not the leader" refusal: that refusal has two spellings, one for
-# "somebody else leads" and one for "an election is in progress", and a fixture
-# that matched them would stop retrying the day either sentence is reworded --
-# silently, and back to failing the way this section used to.
-# @param 1 the `--cluster-set` argument to submit
-# @param 2 the substring an answer carries when the submission worked
-# @param 3 what to report when it never does
-submit_setting() {
-    local answer
-    answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
-    if [[ "$answer" != *"$2"* ]]; then
-        find_leader "whoever leads now, to re-offer a setting the previous leader did not take"
-        answer="$(cluster "$leader_endpoint" --cluster-set="$1")"
-    fi
-    [[ "$answer" == *"$2"* ]] || fail "$3 (asked ${leader_endpoint}): ${answer}"
-}
-
+# What that looked like here is worth keeping, because it names nothing that went
+# wrong: pinned, BOTH halves of the assertion were wrong at once. The submission
+# went to a node answering "ask somebody else", and the poll below then waited out
+# its full 20 s to report that a setting the leader accepted never appeared in its
+# own state -- a sentence about REPLICATION, produced by an ELECTION. That is the
+# message #117's second occurrence actually carried, and it is why a replication
+# timeout in this section is read as a leadership question first.
+#
 # The one submission this section makes, named once so the poll below re-offers
 # the same setting rather than a second one that drifted from it.
 set_upstream() {
-    submit_setting "upstream=cache.example:6674" "accepted" \
+    ask_leader "--cluster-set=upstream=cache.example:6674" "accepted" \
         "the leader refused a legitimate setting"
 }
 
@@ -810,7 +797,7 @@ settled=0
 replication_mark="$(probe_mark)"
 replication_deadline=$(( SECONDS + ReplicationSeconds ))
 # The nested `find_leader` calls below -- one direct, one reached through
-# `set_upstream` -> `submit_setting` -- each carry `FormationSeconds`, which is
+# `set_upstream` -> `ask_leader` -- each carry `FormationSeconds`, which is
 # twice this loop's whole budget. Capped here so the 30 s in the source is the
 # 30 s enforced.
 enclosing_deadline="$replication_deadline"
@@ -840,7 +827,7 @@ echo "cluster E2E: a setting replicates"
 # Against whoever leads NOW for the same reason: a follower refuses this with "ask
 # somebody else" and never names the typo, so an election here would fail it on a
 # point it does not test.
-submit_setting "upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
+ask_leader "--cluster-set=upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
 echo "cluster E2E: an unknown setting is refused by name"
 
 # --- 4. a machine joins the running cluster ----------------------------------
@@ -892,8 +879,8 @@ answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
 [[ "$answer" != *"known settings:"* ]] || fail "a joining node answered as a leader; it bootstrapped its own cluster"
 echo "cluster E2E: a joining node leads nothing"
 
-answer="$(cluster "$leader_endpoint" --cluster-admit="n4=127.0.0.1:${raft_ports[3]}")"
-[[ "$answer" == *"accepted"* ]] || fail "the leader refused to admit a member: ${answer}"
+ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[3]}" "accepted" \
+    "the leader refused to admit a member"
 
 # Admission is two steps and this waits for the second. The record commits first,
 # which is what teaches every node where n4 answers; only then does the leader
@@ -987,8 +974,13 @@ echo "cluster E2E: the admitted node counts itself a member: $(grep -o "counts [
 
 # --- 5. a member can be removed ----------------------------------------------
 
-answer="$(cluster "$leader_endpoint" --cluster-forget=n3)"
-[[ "$answer" == *"accepted"* ]] || fail "the leader refused to forget a member: ${answer}"
+# Identical in shape to the admit above, and never once observed failing -- because
+# the admit is in section 4 and this is in section 5, so under a moving leadership
+# the admit always failed first and this was never reached. Fixing only the one that
+# had been SEEN to fail would have moved the flake here rather than removed it, where
+# it would have read as a regression introduced by the fix (#172).
+ask_leader "--cluster-forget=n3" "accepted" \
+    "the leader refused to forget a member"
 echo "cluster E2E: a member can be removed"
 
 # --- 6. leadership survives losing the leader --------------------------------

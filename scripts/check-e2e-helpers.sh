@@ -502,6 +502,88 @@ run_case() {
         echo "http_get returned non-zero for a refused connection"
         ;;
 
+    # --- `ask_leader` asks whoever leads NOW ---------------------------------
+    #
+    # `$leader_endpoint` is pinned when a section derives it, and leadership can
+    # legitimately move before that section finishes. A command put to the node
+    # that led a moment ago then gets "ask somebody else", and the fixture
+    # reported that as the cluster refusing a legitimate command (#117, #172).
+    #
+    # Driven with a stubbed `cluster` because the real failure cannot be summoned:
+    # it needs an election to land inside one call. Stubbing the answer places the
+    # interleaving instead of waiting for it, which is the only way this fix can be
+    # shown to bite at all.
+    #
+    # `ask_leader` binds `cluster`, `find_leader` and `$leader_endpoint` late,
+    # which is exactly why it lives in the library and not in the fixture.
+    ask-leader-*)
+        leader_endpoint="127.0.0.1:1111"
+        calls="${scratch}/calls"
+        rederived="${scratch}/rederived"
+        : > "$calls"
+
+        find_leader() {
+            printf '%s\n' "re-derived: $1" >> "$rederived"
+            leader_endpoint="127.0.0.1:2222"
+        }
+
+        # Answers come from a queue, one per call, so a case states the sequence
+        # it is exercising rather than a predicate over the argument.
+        answers=()
+        cluster() {
+            local n
+            n="$(wc -l < "$calls" | tr -d ' ')"
+            printf 'x\n' >> "$calls"
+            printf '%s\n' "${answers[$n]}"
+        }
+
+        case "$name" in
+        ask-leader-first-answer)
+            answers=("accepted: done")
+            ask_leader "--cluster-set=k=v" "accepted" "should not be reported"
+            echo "took the first answer, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
+            # An `if`, not `[ ... ] && ...`: the good path is the file being ABSENT,
+            # and a bare test returning 1 under the `set -e` this harness deliberately
+            # keeps would fail the case for passing.
+            if [ -e "$rederived" ]; then echo "BUG: re-derived the leader when the first answer was fine"; fi
+            ;;
+
+        # THE CASE THIS TICKET EXISTS FOR. Without the retry this fails.
+        ask-leader-retries)
+            answers=("rejected (not-leader): this node does not lead the cluster" "accepted: done")
+            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
+            echo "recovered after a moved leadership, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
+            cat "$rederived"
+            ;;
+
+        # The SECOND spelling of the same refusal. A fixture that retried on a
+        # recognised "not the leader" wording would have to know both, and would
+        # stop retrying the day either is reworded. This one matches neither --
+        # it retries because the answer is not what the caller asserts.
+        ask-leader-election)
+            answers=("the cluster has no leader right now; try again shortly" "accepted: done")
+            ask_leader "--cluster-forget=n3" "accepted" "the leader refused to forget a member"
+            echo "recovered from an election in progress, asked $(wc -l < "$calls" | tr -d ' ') time(s)"
+            ;;
+
+        # A refusal can BE the assertion: the typo case asserts that an unknown
+        # setting is refused BY NAME, so the substring is the typo. Proof that the
+        # contract is "the answer carries this", never "the command succeeded".
+        ask-leader-refusal-is-the-assertion)
+            answers=("rejected: unknown setting 'upsteam'")
+            ask_leader "--cluster-set=upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
+            echo "a refusal naming the typo satisfied the assertion"
+            if [ -e "$rederived" ]; then echo "BUG: retried an answer that was already what the caller asserted"; fi
+            ;;
+
+        # Two chances and no more: it reports the caller's sentence and the answer.
+        ask-leader-never)
+            answers=("rejected (not-leader): nope" "rejected (not-leader): still nope")
+            ask_leader "--cluster-admit=n4=127.0.0.1:9" "accepted" "the leader refused to admit a member"
+            echo "BUG: reached the line after a failing ask_leader"
+            ;;
+        esac
+        ;;
     *)
         echo "unknown case: ${name}" >&2
         exit 2
@@ -693,6 +775,11 @@ cases=(
     "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
+    "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
+    "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
+    "ask-leader-election|0|recovered from an election in progress|asked 2 time(s)|!BUG:"
+    "ask-leader-refusal-is-the-assertion|0|a refusal naming the typo satisfied the assertion|!BUG:"
+    "ask-leader-never|1|the leader refused to admit a member|still nope|!BUG:"
 )
 
 # Perl is what stages a real listener. Where it is absent those cases are
