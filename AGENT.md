@@ -773,13 +773,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
   RED run is silent about every leg after the failure, so "GATE FAILED: clang-debug tests"
   does not mean the rest passed (#501). Two `-Werror` defects in one change hid behind
   five red runs that never reached `gcc-release`.
-- **A retry makes an instrument's own failures disappear without fixing them.** Six ways
-  the gate reported on something other than the tree under test turned up in one ticket —
-  `| tail` reporting the pipe's status, quoting collapsing through three parsers so the
-  run never happened, two gates in one build directory, a dirty tree, the log on `/tmp`
-  where a WSL idle-out erases it, and the wrapper edited WHILE bash was executing it. None
-  announces itself; each looks like a flake; a re-run clears all six. Presence is not
-  usability, and a finding fixed at the line rather than at the rule comes back.
+- **A retry makes an instrument's own failures disappear without fixing them.** Eight ways
+  the gate reported on something other than the tree under test have turned up across two
+  tickets — `| tail` reporting the pipe's status, quoting collapsing through three parsers
+  so the run never happened, two gates in one build directory, a dirty tree, the log on
+  `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
+  `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
+  DrvFs log redirect that failed while leaving the gate child ALIVE. None announces itself;
+  each looks like a flake; a re-run clears all eight. Presence is not usability, and a
+  finding fixed at the line rather than at the rule comes back.
+- **A claim about a tool is checked against the tool.** A pattern is broader than its author
+  reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
+  process is attributed by its ancestor chain and never by a cmdline match or a leaf `cwd`,
+  and a bound nobody has watched fire is untested rather than proven. The general form: "a
+  SIGTERM does not take 55 seconds to arrive" is true of `local-gate.sh` only because it
+  traps `EXIT` and not `TERM` — bash defers a TRAPPED signal, so the general claim and the
+  specific one point opposite ways and nothing warns you which you hold.
 - A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
