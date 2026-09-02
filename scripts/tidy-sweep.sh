@@ -315,6 +315,111 @@ AffectedTranslationUnits() {
 # prints a confident count. So it gets asserted, on a synthetic tree, with no
 # compile database and no clang-tidy needed. The CI job runs this before the
 # sweep for the same reason the sweep canaries its binary.
+# Did this translation unit contain any code FROM THE FILE ITSELF? (#466)
+#
+# PURE: reads preprocessed output on stdin, prints `produced` or `empty`, and
+# touches nothing else. That split is the whole point. The defect being fixed is
+# that a file compiling to an EMPTY translation unit reads as COVERED -- it has a
+# compile command, so it never reaches the "not a translation unit here" drop path,
+# and five independent signals reported success over nothing: the database listed
+# it, clang-tidy processed it and found nothing, gcc built it, clang built it, and
+# ctest ran a binary containing zero of its cases. It held a syntax error
+# throughout, and only CI's macOS leg could see it.
+#
+# `not compiled` and `compiled to nothing` look identical from outside and are not
+# the same claim. The second is worse, because it produces POSITIVE evidence.
+#
+# Because the classification is pure, `--self-test` drives every verdict from
+# synthesised linemarker text with no compiler, no database and no clang-tidy. Only
+# the preprocessor run in `UnitContribution` is impure, and that half decides
+# nothing.
+#
+# Suffix match on a "/" boundary rather than equality: a linemarker spells the path
+# the way the compile command did, which is usually absolute, while the plan
+# carries a repo-relative one. A bare `==` would answer `empty` for every unit in
+# the tree and look like a spectacular finding.
+#
+# @param 1 The path lines must be attributed to.
+ProducedCode() {
+    awk -v want="$1" '
+    function isTarget(p,   n) {
+        if (p == want) return 1
+        n = length(p) - length(want)
+        if (n > 0 && substr(p, n + 1) == want && substr(p, n, 1) == "/") return 1
+        return 0
+    }
+    /^# / { if (match($0, /"[^"]*"/)) cur = substr($0, RSTART + 1, RLENGTH - 2); next }
+    NF > 0 && isTarget(cur) { found = 1; exit }
+    END { print (found ? "produced" : "empty") }
+    '
+}
+
+# The compile command for one unit as a preprocess-only argv: the directory on the
+# first line, then one word per line.
+#
+# `-o` with its argument and `-c` are dropped and `-E` appended -- the same command
+# the build runs, asked to stop after preprocessing. Prints nothing when the file is
+# not in the database, which the caller reads as `unknown`: "we could not tell" must
+# never render as a verdict.
+#
+# @param 1 Directory holding compile_commands.json.
+# @param 2 Repo-relative path of the unit.
+PreprocessArgv() {
+    python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
+import json, shlex, sys
+sys.stdout.reconfigure(newline="\n")
+try:
+    entries = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+target = sys.argv[2].replace("\\", "/")
+for entry in entries:
+    path = entry.get("file", "").replace("\\", "/")
+    if path == target or path.endswith("/" + target):
+        argv = shlex.split(entry.get("command") or "") or list(entry.get("arguments", []))
+        out, skip = [], False
+        for a in argv:
+            if skip:
+                skip = False
+                continue
+            if a == "-o":
+                skip = True
+                continue
+            if a == "-c":
+                continue
+            out.append(a)
+        out.append("-E")
+        print(entry.get("directory", "."))
+        for a in out:
+            print(a)
+        break
+PYARGV
+}
+
+# `produced`, `empty` or `unknown` for one planned unit.
+#
+# `unknown` is a fourth state and is reported as one. A preprocessor that fails, or
+# a unit the database does not describe, has told us NOTHING about whether the file
+# contributes: folding that into `empty` invents a finding, folding it into
+# `produced` hides one.
+#
+# @param 1 Directory holding compile_commands.json.
+# @param 2 Repo-relative path of the unit.
+UnitContribution() {
+    local words directory out line
+    words="$(PreprocessArgv "$1" "$2" 2>/dev/null)" || { echo unknown; return; }
+    [[ -n "$words" ]] || { echo unknown; return; }
+    directory="$(printf '%s\n' "$words" | head -1)"
+    local -a argv=()
+    while IFS= read -r line; do
+        argv+=("$line")
+    done < <(printf '%s\n' "$words" | tail -n +2)
+    [[ "${#argv[@]}" -gt 0 ]] || { echo unknown; return; }
+    out="$(cd "$directory" 2>/dev/null && "${argv[@]}" 2>/dev/null | ProducedCode "$2")"
+    [[ -n "$out" ]] || { echo unknown; return; }
+    printf '%s\n' "$out"
+}
+
 SelfTest() {
     local status=0
     local scratch
@@ -400,6 +505,55 @@ SelfTest() {
     Expect "the synthetic include graph was actually built" \
            "yes" \
            "$( [[ "${#includers[@]}" -gt 0 ]] && echo yes || echo no )"
+
+    # Whether a unit produced any code OF ITS OWN (#466). Pure, so every verdict is
+    # reachable here from synthesised linemarker text -- no compiler, no database,
+    # no clang-tidy. `KqueueSocket_test.cpp` is the real instance: on Linux it
+    # preprocesses to 95,527 lines of which ZERO are its own.
+    #
+    # The first two are the whole distinction. A file that contributes nothing is
+    # not evidence about that file, and it looks identical from outside to one that
+    # was never compiled -- except that it produces POSITIVE evidence, which is
+    # worse.
+    Expect "a unit whose own lines survive the preprocessor produced code" \
+           "produced" \
+           "$(printf '# 1 "src/A.cpp"\nint a;\n' | ProducedCode src/A.cpp)"
+    Expect "a unit guarded out to nothing is empty" \
+           "empty" \
+           "$(printf '# 1 "src/A.cpp"\n# 1 "/usr/include/stdio.h"\nint fromHeader;\n' | ProducedCode src/A.cpp)"
+
+    # The failure that would look like a spectacular finding rather than a bug: a
+    # linemarker names the path as the COMPILE COMMAND spelled it, usually
+    # absolutely, while the plan carries a repo-relative one. Equality would answer
+    # `empty` for every unit in the tree.
+    Expect "an absolute linemarker still matches a repo-relative unit" \
+           "produced" \
+           "$(printf '# 1 "/build/src/A.cpp"\nint a;\n' | ProducedCode src/A.cpp)"
+    # And the boundary that stops the suffix match being too eager.
+    Expect "a path merely ENDING in the name is not the unit" \
+           "empty" \
+           "$(printf '# 1 "/build/other/NotA.cpp"\nint a;\n' | ProducedCode A.cpp)"
+
+    # Blank and whitespace-only lines are not code. A preprocessor emits runs of
+    # them where the guarded block was, so counting them would call every empty unit
+    # `produced` and silently restore the defect.
+    Expect "blank lines attributed to the file are not code" \
+           "empty" \
+           "$(printf '# 1 "src/A.cpp"\n\n   \n\n' | ProducedCode src/A.cpp)"
+    # Directives are not code either: an empty TU still carries its own `# 1` line.
+    Expect "the file's own linemarker alone is not code" \
+           "empty" \
+           "$(printf '# 1 "src/A.cpp"\n' | ProducedCode src/A.cpp)"
+    # Returning to the file after a header is the ordinary shape of a real unit.
+    Expect "code after returning from a header still counts" \
+           "produced" \
+           "$(printf '# 1 "src/A.cpp"\n# 1 "/usr/include/x.h"\nint h;\n# 2 "src/A.cpp"\nint a;\n' | ProducedCode src/A.cpp)"
+    # Nothing at all is not evidence that the file is empty, but it is what an empty
+    # stream says; `unknown` is decided by the caller, which can tell a failed
+    # preprocessor from a silent one.
+    Expect "an empty stream reads as empty, never as produced" \
+           "empty" \
+           "$(printf '' | ProducedCode src/A.cpp)"
 
     # The interpreter verdict (#588). Pinned on BOTH sides of the floor, because a
     # bound demonstrated once from the middle is where an off-by-one lives.
@@ -676,7 +830,17 @@ Canary
 # @param 2 The file to check.
 # @param 3 Slot prefix under $scratch.
 TidyOne() {
-    local database="$1" file="$2" slot="$3" out rc hits
+    local database="$1" file="$2" slot="$3" out rc hits contribution
+    # Asked BEFORE the analysis, and recorded whatever the analysis then says: a
+    # unit that contributes nothing is not evidence about its file even when
+    # clang-tidy reports cleanly on it -- that clean report is the defect (#466).
+    # Costs one preprocessor run, measured at 5-26% of what clang-tidy costs on the
+    # same unit, worst on the cheapest units because those are the empty ones.
+    contribution="$(UnitContribution "$database" "$file")"
+    case "$contribution" in
+        empty)   printf '%s\n' "$file" > "${slot}.empty" ;;
+        unknown) printf '%s\n' "$file" > "${slot}.unknown" ;;
+    esac
     out="$("$TIDY" -p "$database" --quiet "$file" 2>&1)"
     rc=$?
     if [[ "$rc" -ge 126 ]]; then
@@ -741,5 +905,37 @@ for report in "$scratch"/*.out; do
     status=1
 done
 
-[[ "$status" -eq 0 ]] && echo "TIDY SWEEP CLEAN (${index} translation unit(s), ${TIDY})"
+# The count that means something, and the two that qualify it (#466).
+#
+# `index` is units ANALYSED. Some of them contribute nothing of their own -- a file
+# whose body sits behind a platform or feature guard preprocesses to an empty
+# translation unit here, so clang-tidy read nothing of it and reported nothing
+# about it. Summing those into one number is what let a syntax error survive five
+# green signals.
+#
+# "produced no code in this configuration" and not "on this platform": of the
+# thirteen such units measured in a default Linux build, eleven are platform-gated
+# and two (`TlsContext_test.cpp`, `TlsSocket_test.cpp`) are gated on
+# `FC_TLS_ENABLED` and would contribute on this very platform with TLS on. Naming
+# the platform would tell a reader the file belongs to another OS when it belongs
+# to another build -- and this sentence must never read as a fault, because an
+# empty unit here is the guard working.
+shopt -s nullglob
+empties=("$scratch"/*.empty)
+unknowns=("$scratch"/*.unknown)
+if [[ "${#empties[@]}" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${#empties[@]} of ${index} unit(s) produced no code in this configuration,"
+    echo "            so this run says NOTHING about them (they are analysed, not covered):"
+    sort -u "${empties[@]}" | sed 's/^/              /'
+fi
+if [[ "${#unknowns[@]}" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${#unknowns[@]} unit(s) could not be preprocessed, so whether they"
+    echo "            contribute is UNKNOWN rather than either answer:"
+    sort -u "${unknowns[@]}" | sed 's/^/              /'
+fi
+
+if [[ "$status" -eq 0 ]]; then
+    covered=$((index - ${#empties[@]}))
+    echo "TIDY SWEEP CLEAN (${covered} of ${index} translation unit(s) contributed code, ${TIDY})"
+fi
 exit "$status"
