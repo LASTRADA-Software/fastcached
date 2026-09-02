@@ -1457,6 +1457,28 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         singleMachine.scheduler = "127.0.0.1:6675";
         CHECK_FALSE(StartupPolicyRejection(singleMachine).has_value());
 
+        // **And the same fleet written the way people actually write it.**
+        // `IsLoopbackHost` deliberately refuses to call `localhost` loopback, because
+        // it is asked who may read this node's cache tier and a name a resolver
+        // decides cannot answer that. Reused here unqualified, it would refuse a
+        // working one-machine install and tell the operator to bind the wildcard --
+        // the rule steering somebody into a wider surface than they had.
+        for (auto const* spelling: { "localhost:6675", "[::1]:6675", "127.0.0.5:6675" })
+        {
+            INFO("--scheduler=" << spelling);
+            NodeConfig sameBox = bare;
+            sameBox.scheduler = spelling;
+            CHECK_FALSE(StartupPolicyRejection(sameBox).has_value());
+        }
+
+        // A `--scheduler` that is not `host:port` is not this row's business: a bare
+        // port reaches `HostOfEndpoint` as a bare HOST, so it reads as "not loopback"
+        // and would be refused with a message about where the scheduler is when the
+        // fault is the value's shape.
+        NodeConfig malformed = bare;
+        malformed.scheduler = "6675";
+        CHECK_FALSE(StartupPolicyRejection(malformed).has_value());
+
         // And the worker that answered the refusal: both flags named, so nothing
         // about it is loopback any more.
         NodeConfig fixed = bare;
@@ -2429,16 +2451,21 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // or the reachability rows refuse the pair -- which would fail this case for a
     // reason it is not about. `Installable()` names a routable pair because that is
     // the ordinary fleet worker; pinning the bind to its default makes this the
-    // single-machine one, and ALL THREE halves move together.
+    // single-machine one.
     //
-    // The scheduler and the member list are the third half, and leaving them remote
-    // was wrong before this line ever ran (#463): a node advertising `127.0.0.1` to
-    // `cache.internal` registers an address that scheduler's clients cannot dial. It
-    // read as a single-machine fleet and was one only in the two fields this comment
-    // named, which is what the fourth reachability row now refuses.
+    // The SCHEDULER is the third half and leaving it remote was wrong before this
+    // line ever ran (#463): a node advertising `127.0.0.1` to `cache.internal`
+    // registers an address that scheduler's clients cannot dial. It read as a
+    // single-machine fleet and was one only in the two fields this comment named.
+    //
+    // The MEMBER LIST deliberately stays remote, which is what keeps this case about
+    // its own subject: `AdmitsRemotePeers` is what makes #282's lease rule apply at
+    // all, so an all-loopback list would leave the rule unable to fire and every
+    // assertion below true for a reason that is not the one claimed. It costs nothing
+    // here -- the bind is loopback, so `CompilePortFacesTheNetwork` is false and the
+    // rule permits it.
     cfg.advertise = "127.0.0.1:6674";
     cfg.scheduler = "127.0.0.1:6675";
-    cfg.fleetMembers = { "127.0.0.1:6676" };
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 

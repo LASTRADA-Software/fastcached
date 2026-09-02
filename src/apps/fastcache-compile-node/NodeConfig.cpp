@@ -1638,19 +1638,6 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return std::ranges::any_of(bound, [](SurfaceEndpoint const& endpoint) { return IsLoopbackHost(endpoint.host); });
 }
 
-/// Whether this node registers with a scheduler that is on another machine.
-///
-/// Syntactic, never resolved, for the reason `AdvertisesPastALoopbackBind` gives: this
-/// table is a set of pure functions of argv, and a lookup here would make the node's
-/// ability to start depend on a resolver being up.
-///
-/// "Not loopback" rather than "routable", which is the same asymmetry
-/// `AdvertisesWildcard` documents from the other side: a host that is down today can
-/// be the right one at the next boot, so only the shapes that are wrong on every
-/// machine and forever are judged. Loopback is one of exactly two things -- this
-/// machine, or a typo -- and the caller below only cares which of those it is.
-/// @param cfg The parsed configuration.
-/// @return Whether `--scheduler` names a host that is not this machine's loopback.
 /// Whether the operator named a membership policy at all.
 ///
 /// The gate all four reachability rows share, given the name `NodeConfig.hpp` already
@@ -1676,9 +1663,39 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return cfg.fleetOpen || !cfg.fleetMembers.empty();
 }
 
+/// Whether this node registers with a scheduler that cannot be on this machine.
+///
+/// Syntactic, never resolved, for the reason `AdvertisesPastALoopbackBind` gives: this
+/// table is a set of pure functions of argv, and a lookup here would make the node's
+/// ability to start depend on a resolver being up.
+///
+/// **`localhost` counts as this machine, and `IsLoopbackHost` deliberately does not
+/// say so.** That helper is asked security questions -- who may read this node's cache
+/// tier -- where a name a resolver decides must not be trusted. This is a USABILITY
+/// refusal about a name the operator typed, and RFC 6761 reserves `localhost` to
+/// resolve to loopback on every host there is, so nothing has to be looked up to know
+/// it. Left out, `--scheduler=localhost:6675 --fleet-open` -- a working one-machine
+/// install -- would be refused and told to bind the wildcard.
+///
+/// **A value that is not `host:port` is nobody's business here.** A bare port arrives
+/// at `HostOfEndpoint` as a bare HOST, so it would read as "not loopback" and be
+/// refused with a message about where the scheduler is when the fault is the value's
+/// shape. `--scheduler` is dialled through `ParseDialEndpoint`, which answers that
+/// properly; this row stays quiet for it.
+///
+/// What is left unrefused is a node naming its OWN routable name while binding
+/// loopback. Deciding that needs the machine's addresses, which this table may not
+/// consult -- and it is narrow: a node that schedules binds the wildcard by default,
+/// so it cannot reach this row at all, which leaves a worker registering with a
+/// scheduler on this box that it does not itself run. The refusal names the remedy.
+/// @param cfg The parsed configuration.
+/// @return Whether `--scheduler` names a host that is not this machine.
 [[nodiscard]] bool SchedulerIsRemote(NodeConfig const& cfg)
 {
-    return !cfg.scheduler.empty() && !IsLoopbackHost(HostOfEndpoint(cfg.scheduler));
+    auto const endpoint = SplitHostPort(cfg.scheduler);
+    if (!endpoint.has_value())
+        return false;
+    return !IsLoopbackHost(endpoint->first) && endpoint->first != "localhost";
 }
 
 /// Whether a worker registers an address only its own machine can reach, with a
