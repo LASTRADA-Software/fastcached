@@ -1727,6 +1727,52 @@ cross-check, it is a second thing to be wrong — and the only copied datum is t
 required-context list itself, whose provenance and the `gh api` call that reads
 the live one are in the script header.
 
+## A branch behind master is unverified, and only a build says otherwise
+
+A pull request's CI ran against the master it was branched from. Every green check
+on it is a statement about *that* tree, and it stays a statement about that tree
+however many times it is re-read. When master has moved, the only thing that
+restores the claim is building the branch on top of what master is now.
+
+Two ways of judging that risk without building are in use, and both are wrong.
+
+**The amount a branch is behind is not a measure of the risk.** It is a measure of
+elapsed time, and the defect is a semantic collision that either exists or does not.
+One commit can change a signature every branch calls; a hundred can be documentation.
+A branch that is two behind and a branch that is twenty behind are equally unverified,
+and ranking a queue by that number sorts it by nothing.
+
+**File overlap is evidence only in the direction that says there IS a hazard.**
+Two branches touching one file will conflict, or will merge into something neither
+author read -- worth knowing. But **the absence of overlap is evidence of nothing**,
+and reading it as safety is how this gets missed.
+[#520](https://github.com/LASTRADA-Software/fastcached/pull/520) and
+[#525](https://github.com/LASTRADA-Software/fastcached/pull/525) share no file at
+all: #520 changed `IConnector::Connect`'s third parameter from
+`std::chrono::milliseconds connectTimeout` to `DialOptions options`, across
+`IConnector` and every connector implementing it; #525 adds callers of `Connect` in
+`FrameEndpoint`, a file #520 never touches. Both pairwise CI runs were green, and
+both were green *correctly* -- each was built against a master without the other.
+
+Neither branch has ever gone red, and that is not a contradiction: it is the point.
+The break exists only in the combination, and the combination is the one tree nothing
+built. A red run cannot warn about a tree that was never compiled, so the absence of
+one here carries no information at all.
+
+A compiler finds this in seconds and no amount of reading finds it: the hazard is a
+name shared between two changes, not a line shared between two diffs, and a diff
+cannot show a name it does not mention. Which is also why cost is not the argument
+against doing it -- the N lane's worktree for
+[#292](https://github.com/LASTRADA-Software/fastcached/issues/292) was nine commits
+behind, and rebasing and rebuilding it took about two minutes and came back clean.
+That is what the check costs when it passes -- and passing is what it usually does,
+which is precisely why skipping it feels free.
+
+So the sequencing rule is that a branch is rebased and rebuilt before it merges, not
+inspected; `gh pr update-branch --rebase` is what converges a queue. And where two
+branches are in flight at once, the second one's green is provisional until it has
+been built on the first.
+
 ## Open work
 
 - **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one

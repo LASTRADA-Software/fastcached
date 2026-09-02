@@ -982,6 +982,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
   sits next to the implementation, so a report that counts it measures the tests
   testing themselves. A compiler cache and coverage cannot be combined — a
   replayed object's embedded mapping names the tree it was built in.
+- A branch BEHIND master is unverified, and only a build says otherwise: its green
+  checks are a true statement about the tree it was branched from, and stay one however
+  often they are re-read. Neither shortcut works. **How far behind is not a measure of
+  the risk** — it measures elapsed time, while the defect is a collision that either
+  exists or does not, so ranking a queue by it sorts by nothing. **File overlap is
+  evidence only in the direction that says there IS a hazard**; its ABSENCE is evidence
+  of nothing. #520 and #525 share no file — #520 changed `IConnector::Connect`'s third
+  parameter to `DialOptions` across every implementation, #525 adds callers in
+  `FrameEndpoint` — and both pairwise runs were green, correctly, each built against a
+  master without the other. NEITHER branch has ever gone red, which is the point rather
+  than a contradiction: the failing tree is the combination, and that is the one thing
+  nothing built. The hazard is a NAME shared between two changes, not a line shared
+  between two diffs, and a diff cannot show a name it does not mention. So a branch is
+  rebased and rebuilt before it merges, never inspected — the #292 worktree was nine
+  behind and the rebuild took about two minutes and was clean, which is what this costs
+  when it passes, and passing is why skipping it feels free.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
@@ -1100,6 +1116,24 @@ and what they may assume.
   AND the apps, and `src/FastCache/` must not include an app header. A harness earns
   its place only by a property shown RED when its rule is removed — and prove it with
   a case that stays GREEN under the same break, or the suite is measuring nothing.
+- A leader-pinned **mutating** command is put to whoever leads NOW, re-derived, never
+  to an endpoint an earlier section recorded — leadership moves, and the fixture then
+  reports "ask somebody else" as the cluster refusing something legitimate. The retry
+  keys on the answer the caller ASSERTS, never on a recognised refusal wording: that
+  refusal has TWO spellings, so a fixture matching them stops retrying the day either
+  is reworded. Which is also what lets one helper assert a REFUSAL — the typo'd
+  setting's substring is the typo. `submit_setting` WAS this rule, correct in both
+  halves, at line 778 of the same file — 117 lines above one call site that lacked it
+  and 212 above the other (#117, #172): a helper implementing a rule does not spread
+  it, only a call site using it does.
+- A first failure MASKS its identical siblings. `--cluster-forget` was never once
+  observed failing, not because it was sound but because the byte-identical
+  `--cluster-admit` one section earlier failed first and the run never reached it.
+  Fixing only the OBSERVED site relocates the flake rather than removing it, and the
+  relocated one then presents as a regression introduced by the fix — no failure
+  history, first seen in the run after the change. Which is the argument for the
+  audit: nothing about the sibling looked suspicious, and instinct would not have
+  found it (#172).
 
 ## Issues and pull requests
 
@@ -1235,6 +1269,17 @@ quickly.
   And a figure can be current, correctly measured and still **the wrong quantity** — quoting the warm cost as
   the price of MISSING a cache is circular, since the cache is what makes the warm case warm. Record a table
   of conditions, not a number; a spread states its own uncertainty and forces a citer to pick a row.
+  **The same rule governs a claim handed between PEOPLE, and a handoff IS a citation.** Worse than the
+  comment case: a reader who doubts a comment can re-measure, while a reader who is HANDED one usually
+  cannot — the measurement was made in another session, on another machine, in a run whose log has gone —
+  and a sentence looks identical whether it was measured, inferred, remembered or guessed. Four in one
+  session, all through a handoff: a mechanism reported and published as ESTABLISHED when the subject
+  contradicted it (#517); a `36/36` correspondence verified BY HAND and relayed as though a guard enforced
+  it; a pull request number that was an ISSUE number; and "thirty lines up", written in a comment quoting
+  BOTH line numbers without subtracting them — really 117 and 212 (#172), a correction that STRENGTHENS the
+  point, since a reader can arrive at either call site having never seen the helper at all. The remedy is on
+  the SENDING end because only it can be: **say what was MEASURED and what was INFERRED, separately, every
+  time.** The receiver cannot recover the distinction at any price; the sender states it for free.
 - **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs
   ~2.09 ms on Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart.
   A design that looks free on the platform you develop on can be the dominant cost
