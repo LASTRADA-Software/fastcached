@@ -205,6 +205,7 @@ add_test(
     NAME "catch-skip-return-code"
     COMMAND ${CMAKE_COMMAND}
         "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-return-code.cmake"
 )
 set_tests_properties("catch-skip-return-code" PROPERTIES

@@ -148,6 +148,59 @@ if(objected)
     list(APPEND failures "excluded: a bare registration inside a build tree was reported -- vendored third-party code is not ours to edit and must not fail this check")
 endif()
 
+# 7 and 8. The GIT path, which is the one CI takes and which none of the cases above
+#    reach -- a synthetic tree is not a git repository, so all six fall back to the
+#    directory walk. That gap is exactly how CI found `.cache/CPM/catch2/<hash>/...`
+#    after a local run had gone green: the mode under test was not the mode in use.
+#
+#    7 plants a vendored registration where CPM actually puts one and leaves it
+#    UNTRACKED; it must be ignored. 8 tracks a bare one; it must still be caught, so
+#    that "ignore what git does not track" cannot degrade into "ignore everything".
+find_program(FASTCACHED_GIT NAMES git)
+if(NOT FASTCACHED_GIT)
+    list(APPEND failures
+         "git-mode: no git executable, so the mode CI actually uses could not be exercised at all -- inconclusive, not a pass")
+else()
+    foreach(case "untracked" "tracked-bare")
+        set(tree "${root}/git-${case}")
+        file(REMOVE_RECURSE "${tree}")
+        file(MAKE_DIRECTORY "${tree}/src/thing")
+        file(WRITE "${tree}/src/thing/CMakeLists.txt"
+             "catch_discover_tests(thing-tests PROPERTIES SKIP_RETURN_CODE 4)
+")
+        file(MAKE_DIRECTORY "${tree}/.cache/CPM/catch2/deadbeef/tests")
+        file(WRITE "${tree}/.cache/CPM/catch2/deadbeef/tests/CMakeLists.txt"
+             "catch_discover_tests(SelfTest)
+")
+
+        execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
+        execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add "src/thing/CMakeLists.txt"
+                        RESULT_VARIABLE ignored)
+        if(case STREQUAL "tracked-bare")
+            # Force it in, since a real checkout would have it ignored.
+            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -f
+                            ".cache/CPM/catch2/deadbeef/tests/CMakeLists.txt"
+                            RESULT_VARIABLE ignored)
+        endif()
+
+        fastcached_run_check("${tree}" objected output)
+        if(case STREQUAL "untracked")
+            if(objected)
+                list(APPEND failures
+                     "git-untracked: a vendored registration git does not track was reported -- CPM resolves dependencies inside the source tree and nobody here can edit them")
+            endif()
+            string(FIND "${output}" "git ls-files" position)
+            if(position EQUAL -1)
+                list(APPEND failures
+                     "git-untracked: the check did not report scanning via git ls-files, so this case exercised the fallback and proves nothing about the mode CI uses")
+            endif()
+        elseif(NOT objected)
+            list(APPEND failures
+                 "git-tracked-bare: a TRACKED bare registration was not reported -- deriving the set from git must not degrade into ignoring everything")
+        endif()
+    endforeach()
+endif()
+
 if(failures)
     list(LENGTH failures failureCount)
     message("")
@@ -162,4 +215,4 @@ if(failures)
     message(FATAL_ERROR "catch skip selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "catch skip selftest: 6 synthetic tree(s), every verdict as expected")
+message(STATUS "catch skip selftest: 8 synthetic tree(s), every verdict as expected")

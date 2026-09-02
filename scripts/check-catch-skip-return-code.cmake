@@ -87,76 +87,80 @@ function(fastcached_read_lines path outVar)
     set(${outVar} "${lines}" PARENT_SCOPE)
 endfunction()
 
-# Every CMakeLists a first-party directory holds, so a registration in a directory
-# nobody thought of is still covered.
+# Which CMakeLists this REPOSITORY owns, asked of git rather than inferred from
+# directory names.
 #
-# The top level is listed ONE level deep and each surviving entry is recursed into
-# separately, rather than recursing once from the source root. Two reasons, and the
-# second is why this shape is worth the extra lines:
+# This is the third time the same defect bit this check, and the first two fixes were
+# both the wrong shape. The scan must not see vendored third-party code -- nobody here
+# can edit it, and Catch2 ships a bare `catch_discover_tests` of its own. The first
+# version globbed from the source root and reported `_deps/catch2-src`. The second
+# excluded a LIST of directory names -- `out`, `build`, `_deps` -- and CI then found
+# the same Catch2 tree at `.cache/CPM/catch2/<hash>/tests/...`, because CPM resolves
+# dependencies inside the source tree under a name that list did not have.
 #
-#   `GLOB_RECURSE` recurses from the base directory and treats only the last component
-#   as the pattern, so `<src>/src/*/CMakeLists.txt` does not mean "one level under
-#   src" -- it walks the whole tree. The first version of this check duly reported a
-#   registration inside `_deps/catch2-src`, which is vendored third-party code nobody
-#   here can edit.
+# A list of names to exclude is a hand-kept list, which is the exact thing this
+# check's own ticket exists to retire. So stop enumerating: `git ls-files` answers
+# "what does this repository contain" directly, and a dependency cache is untracked by
+# construction whatever it is called and wherever a package manager decides to put it.
+# It is also fast -- no stat of a build tree at all.
 #
-#   And walking the whole tree is SLOW where it matters. CMake's glob stats every
-#   entry, and on a DrvFs checkout with a build tree present that cost 55 s -- `user
-#   0.067s, sys 3.328s`, so pure I/O wait -- against a 60 s timeout on a check that
-#   runs in the default set. `find` over the same tree takes 2.3 s, which is why the
-#   filesystem is not the thing to blame. Skipping `out/` entirely is the fix; the
-#   same pathology, one directory over, is #502.
-#
-# Still derived rather than enumerated: a NEW first-party top-level directory is
-# picked up automatically, and only build and vendor trees are named.
-set(excludeNames
-    "out"        # build trees: generated copies of what is already scanned
-    "build"      # ditto, for anyone configuring outside out/
-    "_deps"      # vendored third-party sources, not ours to edit
-    ".git"       # not source
-    ".claude")   # sibling worktrees, if one is nested under this checkout
-
-set(listFiles "")
-if(EXISTS "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
-    list(APPEND listFiles "CMakeLists.txt")
+# The same idiom, and the same fallback, as `check-repository-hygiene.cmake`.
+if(NOT GIT_EXECUTABLE)
+    find_program(GIT_EXECUTABLE NAMES git)
 endif()
 
-file(GLOB topLevel RELATIVE "${FASTCACHED_SOURCE_DIR}" "${FASTCACHED_SOURCE_DIR}/*")
-foreach(entry IN LISTS topLevel)
-    if(NOT IS_DIRECTORY "${FASTCACHED_SOURCE_DIR}/${entry}")
-        continue()
-    endif()
-    if("${entry}" IN_LIST excludeNames)
-        continue()
-    endif()
-    file(GLOB_RECURSE found RELATIVE "${FASTCACHED_SOURCE_DIR}"
-         "${FASTCACHED_SOURCE_DIR}/${entry}/CMakeLists.txt")
-    list(APPEND listFiles ${found})
-endforeach()
+set(listFiles "")
+set(scanSource "")
 
-# A nested build directory inside a first-party tree would still be walked above, so
-# the results are filtered as well. Belt and braces on purpose: the walk decides the
-# COST, this decides the ANSWER, and getting the cost wrong must not change the answer.
-set(scanFiles "")
-foreach(candidate IN LISTS listFiles)
-    set(skip FALSE)
-    foreach(name IN LISTS excludeNames)
-        if(candidate MATCHES "(^|/)${name}/")
-            set(skip TRUE)
-            break()
+if(GIT_EXECUTABLE)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" rev-parse --is-inside-work-tree
+        OUTPUT_VARIABLE insideWorkTree
+        ERROR_VARIABLE gitError
+        RESULT_VARIABLE gitStatus
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files -- "*CMakeLists.txt"
+            OUTPUT_VARIABLE tracked
+            RESULT_VARIABLE lsStatus
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(lsStatus EQUAL 0 AND NOT tracked STREQUAL "")
+            string(REPLACE "\n" ";" listFiles "${tracked}")
+            set(scanSource "git ls-files")
+        endif()
+    endif()
+endif()
+
+# No git, or an export with no index. A source export contains no build tree and no
+# dependency cache BY CONSTRUCTION -- that is what makes the walk sound here and
+# unsound in a working checkout -- so the fallback is a plain recursive glob with the
+# build-tree names still excluded, and it says which mode produced the answer.
+if(NOT listFiles)
+    set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
+    file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
+         "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
+    foreach(candidate IN LISTS walked)
+        set(skip FALSE)
+        foreach(name IN LISTS excludeNames)
+            if(candidate MATCHES "(^|/)${name}/")
+                set(skip TRUE)
+                break()
+            endif()
+        endforeach()
+        if(NOT skip)
+            list(APPEND listFiles "${candidate}")
         endif()
     endforeach()
-    if(NOT skip)
-        list(APPEND scanFiles "${candidate}")
-    endif()
-endforeach()
-set(listFiles ${scanFiles})
+    set(scanSource "directory walk (no git index)")
+endif()
+
 list(REMOVE_DUPLICATES listFiles)
 list(SORT listFiles)
 
 if(NOT listFiles)
     message("")
-    message("  No CMakeLists.txt was found under any first-party directory.")
+    message("  No CMakeLists.txt was found in this repository at all.")
     message("")
     message("That is not a clean tree, it is a scan that stopped working -- a moved")
     message("source root, or a FASTCACHED_SOURCE_DIR pointing somewhere else.")
@@ -256,4 +260,4 @@ if(violations)
 endif()
 
 message(STATUS
-    "catch skip return code: ${registrationCount} Catch2 registration(s), all reporting skips as skips")
+    "catch skip return code: ${registrationCount} Catch2 registration(s) via ${scanSource}, all reporting skips as skips")
