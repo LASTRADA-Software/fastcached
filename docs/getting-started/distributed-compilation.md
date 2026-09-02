@@ -204,7 +204,8 @@ fastcache-compile-node \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6674
+    --advertise=scheduler.internal:6674 \
+    --cluster-key-file=/etc/fastcached/cluster.key
 ```
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
@@ -278,7 +279,8 @@ fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
     --listen-node=0.0.0.0:6674 \
     --advertise=worker-01.internal:6674 \
-    --fleet-open
+    --fleet-open \
+    --cluster-key-file=/etc/fastcached/cluster.key
 ```
 
 **`--listen-node` is not optional on a worker that serves a fleet.** It defaults to

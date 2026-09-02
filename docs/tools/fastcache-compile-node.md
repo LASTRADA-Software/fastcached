@@ -876,7 +876,9 @@ fastcache-compile-node \
     --raft-peer=n2=10.0.0.2:6680 \
     --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
+    --scheduler=10.0.0.1:6675 \
     --advertise=10.0.0.1:6674 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -986,7 +988,9 @@ fastcache-compile-node \
     --raft-peer=n4=10.0.0.4:6680 \
     --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
+    --scheduler=10.0.0.4:6675 \
     --advertise=10.0.0.4:6674 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1101,6 +1105,7 @@ fastcache-compile-node \
     --discovery=255.255.255.255:6681 \
     --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
+    --scheduler=10.0.0.1:6675 --advertise=10.0.0.1:6674 \
     --serve-scheduler --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
@@ -1745,6 +1750,7 @@ fastcache-compile-node --scheduler 127.0.0.1:6675 \
                        --advertise 10.0.0.1:6674 \
                        --serve-scheduler --listen-node 6675 --fleet-member 10.0.0.2 \
                        --admin-listen 6677 \
+                       --cluster-key-file /etc/fastcached/cluster.key \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
 curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
 ```
