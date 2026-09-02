@@ -142,7 +142,12 @@ if(FASTCACHED_BUILD_TESTS)
         # The repository root, so DocumentedCommandLines_test.cpp can read the
         # documentation pages it checks. The docs are not build inputs, so there is
         # no generated copy to point at and no reason to make one.
-        FASTCACHED_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+        #
+        # PROJECT_SOURCE_DIR rather than CMAKE_SOURCE_DIR: the two differ the moment
+        # this tree is consumed with add_subdirectory(), and the check would then
+        # iterate a `docs/` belonging to somebody else -- or, far more likely, throw
+        # a filesystem_error for a directory that is not there.
+        FASTCACHED_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     if(WIN32)
         target_link_libraries(fastcache-compile-node-tests PRIVATE ws2_32)
     endif()

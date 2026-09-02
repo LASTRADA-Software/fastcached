@@ -668,7 +668,8 @@ serves.
     Nothing. The client, the node and its tier all talk over loopback.
 
     ```sh
-    fastcache-compile-node --serve-scheduler --listen-node 6675 --scheduler 127.0.0.1:6675
+    fastcache-compile-node --serve-scheduler --listen-node 127.0.0.1:6675 \
+        --scheduler 127.0.0.1:6675 --fleet-open
     ```
 
 === "One scheduler, N workers"

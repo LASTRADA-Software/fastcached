@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <ranges>
 #include <regex>
 #include <span>
@@ -117,11 +118,14 @@ constexpr std::array<ExcludedPage, 0> ExcludedPages {};
 
 /// A verb that ends the process before the startup gate is ever consulted.
 ///
-/// `main.cpp` handles five of these and `return`s: `--print-surfaces` (:1563),
+/// `main.cpp` handles these and `return`s: `--help` / `--version` before the
+/// configuration is even assembled, then `--print-surfaces` (:1563),
 /// `--install-service` / `--uninstall-service` (:1596, judged by the stricter
-/// `NodeInstallRejection` instead), `--migrate-cache` (:1637) and the
-/// `cluster.action` verbs (:1653). A command line naming one of them is not a
-/// *start*, so asking whether it would start is asking the wrong question of it.
+/// `NodeInstallRejection` instead), `--migrate-cache` (:1637) and ALL FOUR
+/// `cluster.action` verbs (:1653) -- `--cluster-set` included, which is easy to
+/// leave out because it is the one of the four the admin prose demonstrates last.
+/// A command line naming one of them is not a *start*, so asking whether it would
+/// start is asking the wrong question of it.
 ///
 /// `--print-surfaces` is the sharp case and the reason this table exists. Its
 /// short-circuit is deliberate -- an operator reaches for it *because* a port is
@@ -154,8 +158,13 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--uninstall-service", .why = "removes a registration and exits" },
     NonStartVerb { .flag = "--migrate-cache", .why = "converts a store and exits" },
     NonStartVerb { .flag = "--cluster-status", .why = "a cluster admin verb: asks the leader and exits" },
+    NonStartVerb { .flag = "--cluster-set", .why = "a cluster admin verb: changes one replicated setting and exits" },
     NonStartVerb { .flag = "--cluster-admit", .why = "a cluster admin verb: proposes a member and exits" },
     NonStartVerb { .flag = "--cluster-forget", .why = "a cluster admin verb: proposes a removal and exits" },
+    // Answered before the configuration is even assembled, so these are further from
+    // a start than anything above them.
+    NonStartVerb { .flag = "--help", .why = "prints usage and exits, ahead of the config file being read" },
+    NonStartVerb { .flag = "--version", .why = "prints the version and exits, ahead of the config file being read" },
 };
 
 /// A command line the check deliberately does not judge.
@@ -219,15 +228,18 @@ struct FoundCommand
 /// parser and reported an unrecognised argument that no reader would ever hit.
 /// Only a `#` that begins a word counts, so a `#` inside a value is left alone --
 /// and this runs AFTER any `# ` root prompt is removed, or it would eat the command.
+/// Returns a VIEW: the result is always a prefix of @p command, and this runs for
+/// every line inside a fence rather than only for the invocations, so an owning
+/// return allocated 181 times per run to keep 25 commands. The view is into
+/// `pending`, which outlives every statement that reads it.
 /// @param command The command line, prompt already stripped.
 /// @return The command with any trailing comment removed.
-[[nodiscard]] std::string StripShellComment(std::string_view command)
+[[nodiscard]] std::string_view StripShellComment(std::string_view command)
 {
     for (auto const index: std::views::iota(std::size_t { 0 }, command.size()))
-        if (command[index] == '#'
-            && (index == 0 || std::isspace(static_cast<unsigned char>(command[index - 1])) != 0))
-            return std::string { command.substr(0, index) };
-    return std::string { command };
+        if (command[index] == '#' && (index == 0 || std::isspace(static_cast<unsigned char>(command[index - 1])) != 0))
+            return command.substr(0, index);
+    return command;
 }
 
 /// Trim ASCII whitespace from both ends.
@@ -325,7 +337,17 @@ struct FoundCommand
 
         // A fence ends whatever was accumulating: an unterminated continuation
         // inside a block is a documentation typo, not something to carry across.
-        if (line.starts_with("```"))
+        //
+        // **Trimmed, because a fence this project uses is frequently INDENTED.** A
+        // `=== "One machine"` content tab and a `!!! note` admonition both carry
+        // their fences four spaces in, and a `starts_with("```")` on the raw line
+        // never sees them -- so `inFence` stays false for the whole block and every
+        // command inside it is dropped in silence. That is the exact failure this
+        // file's header claims globbing inverted: the page was scanned, the example
+        // was not, and nothing said so. It was not hypothetical either --
+        // `operations/cluster-communication.md`'s "One machine" tab held a command
+        // line the node refuses to start on while this check reported green.
+        if (Trim(line).starts_with("```"))
         {
             inFence = !inFence;
             pending.clear();
@@ -350,10 +372,8 @@ struct FoundCommand
         for (auto const prompt: { std::string_view { "$ " }, std::string_view { "# " } })
             if (text.starts_with(prompt))
                 text.remove_prefix(prompt.size());
-        auto const stripped = StripShellComment(text);
-        if (auto const command = Trim(stripped); IsInvocation(command))
-            found.push_back(
-                FoundCommand { .page = page, .line = pendingLine, .command = std::string { command } });
+        if (auto const command = Trim(StripShellComment(text)); IsInvocation(command))
+            found.push_back(FoundCommand { .page = page, .line = pendingLine, .command = std::string { command } });
         pending.clear();
     }
     return found;
@@ -387,9 +407,8 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
     std::vector<std::string> excludedSeen;
     for (auto const& page: pages)
     {
-        auto const excluded = std::ranges::find_if(ExcludedPages, [&page](ExcludedPage const& row) {
-            return page.find(row.needle) != std::string::npos;
-        });
+        auto const excluded = std::ranges::find_if(
+            ExcludedPages, [&page](ExcludedPage const& row) { return page.find(row.needle) != std::string::npos; });
         if (excluded != ExcludedPages.end())
         {
             excludedSeen.emplace_back(excluded->needle);
@@ -440,11 +459,8 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
         if (!parsed.has_value())
         {
             ++failures;
-            FAIL_CHECK(std::format("{}:{}: does not parse: {}\n    {}",
-                                   found.page,
-                                   found.line,
-                                   parsed.error().ToString(),
-                                   found.command));
+            FAIL_CHECK(std::format(
+                "{}:{}: does not parse: {}\n    {}", found.page, found.line, parsed.error().ToString(), found.command));
             continue;
         }
 
@@ -463,9 +479,8 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
 
     // Counts first, so they are in scope for every assertion below rather than
     // trailing them where Catch2 would never print them.
-    INFO("scanned " << pages.size() << " page(s); found " << commands.size() << " command line(s); checked "
-                    << checked << "; templates " << templates << "; non-start verbs " << nonStart << "; failures "
-                    << failures);
+    INFO("scanned " << pages.size() << " page(s); found " << commands.size() << " command line(s); checked " << checked
+                    << "; templates " << templates << "; non-start verbs " << nonStart << "; failures " << failures);
 
     // A skip row that matches nothing has stopped describing anything, and would sit
     // there looking like coverage while hiding whatever moved into its place.

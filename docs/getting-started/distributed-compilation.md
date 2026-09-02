@@ -204,9 +204,16 @@ fastcache-compile-node \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6674 \
+    --advertise=scheduler.internal:6675 \
     --cluster-key-file=/etc/fastcached/cluster.key
 ```
+
+`--cluster-key-file` names one pre-shared key the whole fleet holds, and a node
+another machine can dial **will not start** without it — so provision it before you
+start anything, not after the first refusal. It is one file, made once per fleet and
+copied around; the recipe is
+[on the node's page](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them),
+and what it buys is under [Security](#security).
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
 than deprecated. The two jobs have opposite deployment shapes: a cache is shared
