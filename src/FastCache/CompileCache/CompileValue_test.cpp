@@ -11,13 +11,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
+using FastCache::Testing::Unwrap;
 using PathCanon::Grammar;
 
 TEST_CASE("CompileValue encode/decode round-trips object blob and regions")
@@ -282,10 +286,10 @@ constexpr std::array ConformanceCorpus {
                               "Note: including file: /usr/include/stdio.h\n",
                       .grammar = Grammar::ShowIncludes },
     ConformanceCase { .name = "windows showIncludes, mixed case, CRLF",
-                      .producerSourceRoot = "C:\\src\\Proj",
-                      .producerBuildTree = "C:\\src\\Proj\\out",
-                      .consumerSourceRoot = "D:\\work\\proj",
-                      .consumerBuildTree = "D:\\work\\proj\\build",
+                      .producerSourceRoot = R"(C:\src\Proj)",
+                      .producerBuildTree = R"(C:\src\Proj\out)",
+                      .consumerSourceRoot = R"(D:\work\proj)",
+                      .consumerBuildTree = R"(D:\work\proj\build)",
                       .text = "Note: including file: c:\\SRC\\proj\\inc\\A.hpp\r\n"
                               "Note: including file: C:\\src\\Proj\\out\\gen\\cfg.hpp\r\n"
                               "Note: including file: C:\\Program Files\\MSVC\\include\\vector\r\n",
@@ -306,10 +310,10 @@ constexpr std::array ConformanceCorpus {
                               "Note: including file: <BUILDTREE>/gen/cfg.hpp\n",
                       .grammar = Grammar::ShowIncludes },
     ConformanceCase { .name = "msvc diagnostics, line and column",
-                      .producerSourceRoot = "C:\\src\\proj",
-                      .producerBuildTree = "C:\\src\\proj\\out",
-                      .consumerSourceRoot = "E:\\ci\\proj",
-                      .consumerBuildTree = "E:\\ci\\proj\\out",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(E:\ci\proj)",
+                      .consumerBuildTree = R"(E:\ci\proj\out)",
                       .text = "C:\\src\\proj\\a.cpp(17): warning C4100: unreferenced\r\n"
                               "C:\\src\\proj\\a.cpp(17,9): note: see reference\r\n"
                               "cl : Command line warning D9002\r\n",
@@ -326,17 +330,17 @@ constexpr std::array ConformanceCorpus {
                               "/home/dev/proj/inc/a\\ b.hpp:\n",
                       .grammar = Grammar::GccDepfile },
     ConformanceCase { .name = "depfile under a drive-relative root",
-                      .producerSourceRoot = "C:src\\proj",
-                      .producerBuildTree = "C:src\\proj\\out",
-                      .consumerSourceRoot = "D:\\work\\proj",
-                      .consumerBuildTree = "D:\\work\\proj\\out",
+                      .producerSourceRoot = R"(C:src\proj)",
+                      .producerBuildTree = R"(C:src\proj\out)",
+                      .consumerSourceRoot = R"(D:\work\proj)",
+                      .consumerBuildTree = R"(D:\work\proj\out)",
                       .text = "C:src\\proj\\out\\a.obj: C:src\\proj\\a.cpp\n",
                       .grammar = Grammar::GccDepfile },
     ConformanceCase { .name = "showIncludes under a UNC root",
-                      .producerSourceRoot = "\\\\build01\\share\\proj",
-                      .producerBuildTree = "\\\\build01\\share\\proj\\out",
-                      .consumerSourceRoot = "C:\\local\\proj",
-                      .consumerBuildTree = "C:\\local\\proj\\out",
+                      .producerSourceRoot = R"(\\build01\share\proj)",
+                      .producerBuildTree = R"(\\build01\share\proj\out)",
+                      .consumerSourceRoot = R"(C:\local\proj)",
+                      .consumerBuildTree = R"(C:\local\proj\out)",
                       .text = "Note: including file: \\\\build01\\share\\proj\\inc\\a.hpp\r\n",
                       .grammar = Grammar::ShowIncludes },
     ConformanceCase { .name = "a bare root produces, and a bare root consumes",
@@ -356,10 +360,10 @@ constexpr std::array ConformanceCorpus {
                       .text = "Note: including file: /inc/a.hpp\n",
                       .grammar = Grammar::ShowIncludes },
     ConformanceCase { .name = "a bare drive root consumes",
-                      .producerSourceRoot = "C:\\src\\proj",
-                      .producerBuildTree = "C:\\src\\proj\\out",
-                      .consumerSourceRoot = "D:\\",
-                      .consumerBuildTree = "D:\\out",
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(D:\)",
+                      .consumerBuildTree = R"(D:\out)",
                       .text = "Note: including file: C:\\src\\proj\\inc\\a.hpp\r\n",
                       .grammar = Grammar::ShowIncludes },
     ConformanceCase { .name = "empty region",
@@ -399,6 +403,24 @@ struct StoredValueGeneration
 constexpr std::array StoredValueGenerations {
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
 };
+
+/// The generation table's row for @p version, if it has one.
+///
+/// Returns the ROW rather than an iterator into the table, because a
+/// `std::array` iterator is a raw pointer on libstdc++ and libc++ and a class type
+/// on MSVC's standard library -- so the `const auto *const` spelling the analyser
+/// asks for on one host does not compile on another. A value is the one shape
+/// every standard library agrees about.
+///
+/// @param version A `CompileValueVersion` value.
+/// @return The row, or none when the table has no generation of that number.
+[[nodiscard]] std::optional<StoredValueGeneration> GenerationRow(std::uint8_t version)
+{
+    for (auto const& row: StoredValueGenerations)
+        if (row.version == version)
+            return row;
+    return std::nullopt;
+}
 
 /// Digest the whole stored-value contract over the conformance corpus.
 ///
@@ -467,13 +489,14 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 
     auto const live = ConformanceDigest();
 
-    auto const current = std::ranges::find(rows, CompileValueVersion, &StoredValueGeneration::version);
+    auto const current = GenerationRow(CompileValueVersion);
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
                                        << " and StoredValueGenerations has no row for it -- a bump adds a row");
-        REQUIRE(current != rows.end());
+        REQUIRE(current.has_value());
     }
+    auto const& pinned = Unwrap(current);
 
     // The message names BOTH ways of arriving here, because they call for opposite
     // actions and only one of them is the interesting one. Editing the CORPUS moves
@@ -483,7 +506,7 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // naming only the second teaches whoever meets the first to bump the byte for
     // nothing, which retires every entry in the fleet to buy exactly that.
     INFO("the stored-value contract produced "
-         << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << current->digest
+         << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << pinned.digest
          << ".\nIf you added, removed or edited a ConformanceCorpus row and changed no behaviour, repin generation "
          << static_cast<unsigned>(CompileValueVersion) << " to " << live
          << ".\nIf you changed how a path span is found, rewritten, localized or framed, that is a new "
@@ -491,7 +514,7 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
             "generation "
          << static_cast<unsigned>(CompileValueVersion)
          << " while rewriting a value differently. Bump CompileValueVersion and add a row carrying " << live << ".");
-    CHECK(live == current->digest);
+    CHECK(live == pinned.digest);
 
     // A version and its digest move together, so no two generations may carry
     // either -- which is what catches a bump being put back afterwards, the golden
