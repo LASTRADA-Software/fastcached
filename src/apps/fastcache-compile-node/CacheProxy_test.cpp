@@ -16,7 +16,9 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -50,7 +52,7 @@ struct Fixture
     ManualClock clock;
     AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
-    CacheProxy proxy { cache };
+    CacheProxy proxy { cache, metrics };
 };
 
 [[nodiscard]] std::optional<Wire::Status> StatusOf(std::span<std::byte const> reply)
@@ -381,5 +383,241 @@ TEST_CASE("(#377) the cache's locality gate is one predicate, asked before the p
         CHECK_FALSE(responder.RefusePeer("10.0.0.7", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
         CHECK_FALSE(responder.RefusePeer("127.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
         CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 0);
+    }
+}
+
+namespace
+{
+/// Every counter's reading, so a case can say what did NOT move.
+///
+/// A refusal test that checks only the wire code passes with every arm wired to one
+/// shared counter -- and that is not hypothetical here: the very test written to prove
+/// the two `MalformedFrame` refusals are separate passed on its first run while the
+/// fixture was moving the neighbouring counter. So each case below asserts the whole
+/// vector, not the one row it is about.
+/// @param metrics The sink to read.
+/// @return One reading per enumerator, in enumerator order.
+[[nodiscard]] std::vector<std::uint64_t> AllCounters(AtomicMetricsSink const& metrics)
+{
+    std::vector<std::uint64_t> readings;
+    readings.reserve(static_cast<std::size_t>(IMetricsSink::Counter::Last));
+    for (auto const idx: std::views::iota(std::size_t { 0 }, static_cast<std::size_t>(IMetricsSink::Counter::Last)))
+        readings.push_back(metrics.Read(static_cast<IMetricsSink::Counter>(idx)));
+    return readings;
+}
+
+/// Which counters changed between @p before and @p after.
+/// @param before A reading from `AllCounters`.
+/// @param after A later reading from the same sink.
+/// @return The enumerator indices whose readings differ, ascending.
+[[nodiscard]] std::vector<std::size_t> Moved(std::vector<std::uint64_t> const& before,
+                                             std::vector<std::uint64_t> const& after)
+{
+    std::vector<std::size_t> moved;
+    for (auto const idx: std::views::iota(std::size_t { 0 }, before.size()))
+        if (before[idx] != after[idx])
+            moved.push_back(idx);
+    return moved;
+}
+
+/// The single-element answer `Moved` gives when exactly @p counter rose.
+/// @param counter The one enumerator expected to have moved.
+/// @return That enumerator's index, as a one-element vector.
+[[nodiscard]] std::vector<std::size_t> Only(IMetricsSink::Counter counter)
+{
+    return { static_cast<std::size_t>(counter) };
+}
+} // namespace
+
+TEST_CASE("(#491) the cache surface counts the frame ceiling and the byte budget", "[node][cache][metrics]")
+{
+    // #491. The merged listener routes each refusal to the component owning the verb,
+    // and for cache verbs the component answered correctly and moved nothing -- so an
+    // operator alerting on the compile surface's series watched a flat graph while a
+    // client hammered the port with 24-byte oversized declarations. That is #326's
+    // scenario one surface over, and these are the two arms it fires through.
+    Fixture fixture;
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder const responder { fixture.proxy, locality, fixture.metrics };
+    auto const fetch = static_cast<std::uint8_t>(Wire::Op::Fetch);
+
+    SECTION("the frame ceiling, which is the cheapest probe there is")
+    {
+        auto const before = AllCounters(fixture.metrics);
+        auto const reply = responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, fetch, "too big");
+
+        // The client is told exactly what it was told before: this changes what an
+        // operator can see, not what a launcher does.
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::PayloadTooLarge);
+        CHECK(Moved(before, AllCounters(fixture.metrics))
+              == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedPayloadTooLarge));
+    }
+
+    SECTION("the in-flight byte budget, which is the one a node with a tier reaches")
+    {
+        // `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's budget,
+        // which on any node holding a cache tier is this cache's -- so the endpoint's
+        // ceiling is this cache's ceiling, and a `STORE` is what runs into it.
+        auto const before = AllCounters(fixture.metrics);
+        auto const reply = responder.EndpointRefusalReply(EndpointRefusal::InFlightBudget, fetch, "full");
+
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::EndpointBusy);
+        CHECK(Moved(before, AllCounters(fixture.metrics))
+              == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy));
+    }
+
+    SECTION("and neither is summed into another surface's row for the same wire code")
+    {
+        // Three refusals answer `endpoint-busy` on this listener and two answer
+        // `payload-too-large`. A client does the same thing about each pair and an
+        // operator does not, which is the whole argument for a row being the refusal
+        // rather than the code -- so the separation is asserted rather than assumed.
+        (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, fetch, {});
+        (void) responder.EndpointRefusalReply(EndpointRefusal::InFlightBudget, fetch, {});
+
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 0);
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedEndpointBusy) == 0);
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity) == 0);
+    }
+}
+
+TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body", "[node][cache][metrics]")
+{
+    SECTION("a request at a version this build cannot decode")
+    {
+        // Worth its own series because the only other evidence is a cache that looks
+        // permanently cold: the launcher steps over a refused FETCH and compiles
+        // locally, so the build stays correct and merely stops being fast.
+        Fixture fix;
+        std::array<std::byte, Wire::RequestHeaderSize> frame {};
+        WireFrame::PutHeader(frame,
+                             Wire::Magic,
+                             static_cast<Wire::WireVersion>(Wire::CurrentVersion + 1),
+                             static_cast<std::uint8_t>(Wire::Op::Fetch),
+                             0);
+
+        auto const before = AllCounters(fix.metrics);
+        CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnsupportedVersion);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion));
+    }
+
+    SECTION("a FETCH or a STORE whose body will not decode reaches one row")
+    {
+        // One row for both verbs: they carry different fields and say the same thing
+        // about the peer, and an operator does one thing about it. Driven over the two
+        // verbs rather than written twice, because a second copy of this frame is a
+        // second place for the length below to be got wrong.
+        //
+        // The declared length MATCHES the bytes sent, deliberately. Shortened instead,
+        // this would be refused as TRUNCATED -- answering the same wire code and
+        // moving a different counter -- which is exactly how the compile surface's
+        // equivalent test passed under the bug it was written to catch.
+        for (auto const op: { Wire::Op::Fetch, Wire::Op::Store })
+        {
+            INFO("verb " << static_cast<unsigned>(op));
+            Fixture fix;
+            std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
+            WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(op), 2);
+            // A length prefix claiming far more field than the payload can hold.
+            frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
+            frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
+
+            auto const before = AllCounters(fix.metrics);
+            CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
+            CHECK(Moved(before, AllCounters(fix.metrics))
+                  == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload));
+        }
+    }
+
+    SECTION("and the AUTH refusal a token-configured launcher gets every exchange moves nothing")
+    {
+        // Deliberately uncounted, and the arm where a counter would be actively
+        // harmful: a `FASTCACHE_TOKEN` launcher sends AUTH once per exchange for a
+        // whole build, so the series would be dominated by healthy traffic and a port
+        // scan invisible inside it. The wire code still has to be exactly right --
+        // `unimplemented-verb` is the one refusal `Cc::CacheProtocol` steps over
+        // rather than treating as fatal.
+        Fixture fix;
+        auto const before = AllCounters(fix.metrics);
+        auto const reply =
+            SyncRun(fix.proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
+
+        CHECK(ErrorOf(reply) == Wire::UnimplementedVerb);
+        CHECK(Moved(before, AllCounters(fix.metrics)).empty());
+    }
+}
+
+TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rather than asserted", "[node][cache][metrics]")
+{
+    // Four arms here are uncounted BECAUSE nothing can reach them, which is a claim
+    // about routing rather than about policy -- and a claim about routing is exactly
+    // the kind that stops being true without anybody editing the sentence stating it.
+    // So it is measured over every byte value a peer can put in the third header byte,
+    // and that sweep is what makes this surface's answer defensible where
+    // `CompileCapacity`'s credential arms take the opposite line and mint counters
+    // that cannot rise.
+    Fixture fixture;
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, fixture.clock };
+    CacheResponder cache { fixture.proxy, locality, fixture.metrics };
+    MergedResponder const merged { &cache, nullptr, nullptr };
+
+    SECTION("no opcode routes an unknown verb to the cache, so its UnknownOpcode arm cannot fire")
+    {
+        // `FamilyOf` gives an opcode with no `OpTable` row the `Unset` family, which
+        // `MergedResponder` owns nowhere. "Reached this tier" and "has no row" are
+        // therefore mutually exclusive by the definition of `FamilyOf` rather than by
+        // a routing decision somebody could revisit.
+        //
+        // Both directions, because the one-directional half would pass for a router
+        // that sent NOTHING to the cache -- which is a broken node, not a proof.
+        auto served = 0;
+        for (auto const value: std::views::iota(0, 256))
+        {
+            auto const opRaw = static_cast<std::uint8_t>(value);
+            INFO("opcode " << value);
+            CHECK((merged.OwnerOf(opRaw) == &cache) == (Wire::FamilyOf(opRaw) == Wire::VerbFamily::Cache));
+            if (merged.OwnerOf(opRaw) == &cache)
+            {
+                CHECK(Wire::FindOp(opRaw) != nullptr);
+                ++served;
+            }
+        }
+        // FETCH and STORE. Named as a floor rather than an equality so adding a cache
+        // verb does not fail this, but a router that stopped serving any does.
+        CHECK(served >= 2);
+    }
+
+    SECTION("no opcode reaches the cache's Unauthenticated arm, because it requires no credential")
+    {
+        // `AuthRequired()` is false here by decision (#287, #290): a credential every
+        // local build can read is not a credential. `DecidePrePayload` yields
+        // `Unauthenticated` only for a surface that requires one, so this arm is
+        // closed by that answer rather than by the routing above.
+        for (auto const value: std::views::iota(0, 256))
+        {
+            auto const opRaw = static_cast<std::uint8_t>(value);
+            INFO("opcode " << value);
+            CHECK_FALSE(cache.AuthRequired(opRaw));
+            CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
+                                           .declaredLength = 0,
+                                           .sessionCap = cache.MaxRequestBytes(),
+                                           .authRequired = cache.AuthRequired(opRaw),
+                                           .credentialAccepted = false })
+                  != Wire::PrePayloadDecision::Unauthenticated);
+        }
+    }
+
+    SECTION("AUTH is the Session family, so no credential outcome is ever decided against the cache")
+    {
+        // The two `EndpointRefusal` credential arms are answered by whichever surface
+        // owns `Op::Auth`. With no scheduler configured that is NOBODY -- and the
+        // point of asserting the null is that a router which fell back to the cache
+        // would answer `&cache` here and reopen both arms in silence.
+        auto const auth = static_cast<std::uint8_t>(Wire::Op::Auth);
+        CHECK(Wire::FamilyOf(auth) == Wire::VerbFamily::Session);
+        CHECK(merged.OwnerOf(auth) == nullptr);
     }
 }

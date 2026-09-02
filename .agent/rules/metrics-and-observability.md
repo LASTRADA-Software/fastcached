@@ -613,6 +613,30 @@ looks exactly like a port nobody is talking to.
   the omission possible. It is also what made the list unfixable in halves — and #492
   is the exactness kept while the all-or-nothing goes away, since a site nobody has
   decided can now join as `RefuseUntriaged` instead of holding the whole file out.
+- **"It cannot fire" is a reason not to count, and its STRENGTH is what decides.**
+  #491 settled the cache surface's ten arms, and the interesting half was not the two
+  it counted but the six it did not. Two surfaces answer this question oppositely and
+  both are right: `CompileCapacity`'s credential rows are minted for arms `AUTH`
+  routing makes unreachable *today*, where a shape that reversed it is plausible and
+  the dead row buys a signal nobody would otherwise remember to add; the cache's
+  equivalents are not, because `AuthRequired() == false` there is a standing decision
+  (#287, #290) and its unknown-opcode arm is excluded by the DEFINITION of `FamilyOf`
+  rather than by a routing choice. A row that cannot rise is not free — the table's
+  whole value is that every row means something — so it is paid where it buys a future
+  signal and not where it cannot. **Write the divergence down in both places**: two
+  files taking opposite lines on one question, with the reasoning in neither, is an
+  inconsistency the next session "fixes" in whichever direction it reads first. And
+  prove it rather than asserting it — a claim about ROUTING stops being true without
+  anybody editing the sentence that states it, so the sweep is over all 256 opcode
+  values, in BOTH directions, since the one-directional half passes for a router that
+  sends nothing to the surface at all.
+- **The other two reasons not to count**, from the same pass: a rise that would be
+  ORDINARY TRAFFIC (the cache's `AUTH` refusal is what a `FASTCACHE_TOKEN` launcher
+  gets once per exchange for a whole build — `UnservedReply`'s argument, one surface
+  over), and an event ALREADY COUNTED somewhere better placed to see it (a failed
+  local write moves `NodeCacheStoreFailures` inside `LocalCache::Store`, where every
+  caller is visible and not only the ones that arrived over the wire; a second row
+  would count one write twice). Neither is "this refusal does not matter".
 - **The endpoint owns WHEN a refusal is answered; the surface owns WHAT, counter
   included.** A listener serving several components cannot know which counter a
   refusal belongs to — a cache `STORE` over the byte budget counted against the
@@ -734,24 +758,6 @@ outright rather than drawing with a gap.
   in staleness on the one page that exists to be current, and the charts already
   avoid the cost with a validator rather than a lifetime.
 
-- **[#491](https://github.com/LASTRADA-Software/fastcached/issues/491)** — the merged
-  listener's frame ceiling and byte budget are counted for **compile** verbs and
-  answered uncounted for cache and scheduler ones. #447 routed every refusal to the
-  surface that owns it and deliberately did not change what the other two surfaces
-  count, which is their own older position. The catch is which refusal a real node
-  reaches: `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's, in
-  practice the cache's, so the byte-budget refusal that fires on a node with a tier is
-  a cache `STORE` — the uncounted one. #326's scenario, one surface over. Since #492
-  its ten sites are `RefuseUntriaged` and the check prints them, so closing it is the
-  printed count for #491 reaching zero. **Two of those ten nearly escaped it**: they
-  carried written rationales from #447 and were first marked `RefuseWithoutCounter`,
-  which reads as decided — one of them asserting the byte budget is "a transient the
-  peer retries past", the *opposite* of the mechanism above. Marked decided they would
-  have left the backlog, and #491's measure would then have counted `CacheProxy`'s
-  eight sites — a different surface — letting it close at 8/8 while the two arms in its
-  own title stayed undecided. **A rationale is not a decision because it is
-  well-written**; it is a decision when nobody is still arguing about it, and an open
-  issue naming the site is that argument.
 - **[#494](https://github.com/LASTRADA-Software/fastcached/issues/494)** — the fleet
   scheduler's and the daemon's own `0xFC` surfaces answer eight refusals that count
   nothing; `SchedulerProtocol.cpp` references no metrics sink at all, on the surface

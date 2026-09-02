@@ -155,7 +155,7 @@ CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
     _cache { *_storage, *_upstream, clock, metrics },
-    _proxy { _cache },
+    _proxy { _cache, metrics },
     _responder { _proxy, locality, metrics }
 {
 }

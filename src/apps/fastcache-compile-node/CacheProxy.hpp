@@ -4,6 +4,7 @@
 #include "LocalCache.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -33,17 +34,28 @@ namespace FastCache::Node
 /// client that reached the wrong port learns which.
 ///
 /// `Auth` is the exception, and refusing it correctly is a **wire contract**: it
-/// is answered with `UnknownOpcode`, because that is the one refusal
-/// `Cc::CacheProtocol` reads as "this endpoint implements no credential" and
-/// proceeds past. Any other code makes the launcher treat the exchange as fatal
-/// and miss every subsequent compile in silence. See `RefusedVerbs` in the
+/// is answered `CompileCacheWire::UnimplementedVerb`, because that is the one
+/// refusal `Cc::CacheProtocol` reads as "this endpoint implements no credential"
+/// and proceeds past. Any other code makes the launcher treat the exchange as
+/// fatal and miss every subsequent compile in silence. See `RefusedVerbs` in the
 /// implementation for why that is a table row rather than a comment.
+///
+/// **The name, not the enumerator it aliases.** `UnimplementedVerb` is today
+/// `ErrorCode::UnknownOpcode`, and naming the alias here rather than the contract
+/// is how three surfaces came to spell one refusal separately and then disagree
+/// about it (#283, #340).
 class CacheProxy
 {
   public:
     /// @param cache The node's read-through tier; must outlive this.
-    explicit CacheProxy(LocalCache& cache) noexcept:
-        _cache { cache }
+    /// @param metrics Where this tier's refusals are counted; must outlive this.
+    ///        Injected rather than reached for, because a refusal answered while
+    ///        nothing rises is a probed port that looks unused (#326, #491) -- and
+    ///        because `Cc::Refuse` takes a sink, so there is no way to spell a counted
+    ///        refusal without one.
+    CacheProxy(LocalCache& cache, IMetricsSink& metrics) noexcept:
+        _cache { cache },
+        _metrics { metrics }
     {
     }
 
@@ -55,6 +67,7 @@ class CacheProxy
 
   private:
     LocalCache& _cache;
+    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Node

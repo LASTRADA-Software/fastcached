@@ -178,7 +178,7 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     ManualClock clock;
     AtomicMetricsSink metrics;
     Node::LocalCache cache { local, upstream, clock, metrics };
-    Node::CacheProxy proxy { cache };
+    Node::CacheProxy proxy { cache, metrics };
 
     auto const refusal = SyncRun(proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
     REQUIRE_FALSE(refusal.empty());

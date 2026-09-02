@@ -1553,20 +1553,26 @@ a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
 These are what a probe of that port looks like from outside the machine. They are
 separate series rather than one `refused_total` because an operator does a
-different thing about each; where two of them share a wire code, that is said
-explicitly.
+different thing about each; several of them share a wire code, and every such
+group is named below so a dashboard grouping by the code in a client log does not
+quietly merge two things you would act on differently.
 
 **Read the "counted for" column before alerting.** The listener routes each
-refusal to the component that owns the verb, and the three components do not all
-count the same things — a deliberate split, not an oversight, but one that decides
-what an alert can see. The frame ceiling and the byte budget move a counter for
-**compile** verbs; on a cache `STORE` or a scheduler `REGISTER` they are answered
-correctly and counted nowhere
-([#491](https://github.com/LASTRADA-Software/fastcached/issues/491)). That is a
-known gap rather than a claim about those surfaces being quiet, and it matters most
-on a node holding a cache tier: the listener's in-flight ceiling is the largest of
-the components present, which is usually the cache's, so the byte-budget refusal
-that fires in practice is a cache `STORE`.
+refusal to the component that owns the verb, and the components do not all count
+the same things — a deliberate split, not an oversight, but one that decides what
+an alert can see. The frame ceiling and the byte budget have a row *per surface*
+rather than one row each, because a cache `STORE` that overran its ceiling counted
+against the compile surface names the wrong subsystem, and naming the subsystem is
+what these series are read for.
+
+The **scheduler** surface is the one where they still move nothing
+([#494](https://github.com/LASTRADA-Software/fastcached/issues/494)). That is a
+known gap rather than a claim about that surface being quiet. The cache surface was
+the same until
+[#491](https://github.com/LASTRADA-Software/fastcached/issues/491), and it was the
+gap that mattered most: the listener's in-flight ceiling is the largest of the
+components present, which on any node holding a tier is the cache's, so the
+byte-budget refusal that fires in practice is a cache `STORE`.
 
 | Series | Says | Counted for |
 |---|---|---|
@@ -1578,34 +1584,96 @@ that fires in practice is a cache `STORE`.
 | `fastcache_scheduler_requests_refused_unauthenticated_total` | A verb was reached *without* a credential ever having been presented. | scheduler verbs |
 | `fastcache_worker_frames_refused_malformed_credential_total` | An `AUTH` payload the *compile* surface could not decode. Flat at zero by construction — `AUTH` is the scheduler's — so a rise means what may compile here has changed. | compile verbs |
 | `fastcache_worker_frames_refused_rejected_credential_total` | An `AUTH` payload the *compile* surface decoded and could not verify. Flat at zero by the same construction. | compile verbs |
+| `fastcache_node_cache_requests_refused_payload_too_large_total` | The cache surface's half of the frame ceiling. On a node holding a tier this is the one that actually fires, and it needs 24 bytes and no body to move. | cache verbs |
+| `fastcache_node_cache_requests_refused_endpoint_busy_total` | The cache surface's half of the byte budget: a `STORE` that would not fit in the bytes already in flight. The listener's ceiling folds to the largest component's, so on a node with a tier this is that ceiling. | cache verbs |
+| `fastcache_node_cache_requests_refused_unsupported_version_total` | A cache request at a wire version this build cannot decode — a client from another release. Worth alerting on because the launcher steps over it and compiles locally, so the only other symptom is a cache that looks permanently cold. | cache verbs |
+| `fastcache_node_cache_requests_refused_malformed_payload_total` | A `FETCH` or `STORE` body that would not decode, in a frame whose declared length arrived in full. Two ends that agree on the framing and disagree about what goes inside it. | cache verbs |
 
-One refusal has **no** counter, deliberately: a verb this node runs no component
-for — a `LEASE` at a plain worker, a `FETCH` at a node with no cache tier — is
-answered `unimplemented-verb` and counted nowhere. It is not an event but the
-answer ordinary traffic gets: a worker with no scheduler refuses every `AUTH` a
-`FASTCACHE_TOKEN` launcher sends, once per exchange for a whole build. A counter
-there would be dominated by a healthy build, which is the same problem as one that
-never moves.
+### Deciding whether a new refusal gets a counter
 
-Two pairs must never be summed, and both pairs share a wire code, so a dashboard
+The set above is not closed, so the rule that produced it is written out rather
+than left to be inferred from the rows. **The test is not "is this a refusal" but
+"would a rise here mean something happened".** A refusal gets a counter when a rise
+names something an operator would go and act on. It gets none when:
+
+- a rise would be **ordinary traffic** — a `FASTCACHE_TOKEN` launcher sends `AUTH`
+  once per exchange for a whole build, so a counter on the `unimplemented-verb`
+  answer would be dominated by healthy builds and a port scan invisible inside it;
+- the arm **cannot fire** — the router hands the cache only verbs whose family it
+  owns, so that surface's unknown-opcode arm is closed by the definition of the
+  family table rather than by a policy anybody chose;
+- the event is **already counted somewhere better placed to see it** — a failed
+  local write moves `fastcache_node_cache_store_failures_total` at the write, where
+  every caller is visible and not only the ones that arrived over the wire.
+
+A new arm nobody has applied the test to yet is **neither counted nor deliberately
+uncounted**, and saying so is the point: those are different facts, and a two-value
+choice forces a new arm to read as a decision somebody made. It is spelled
+`Cc::RefuseUntriaged` with the issue that will settle it,
+`ctest -R worker-refusals-counted` prints the outstanding total split by issue on
+every run, and it **fails the build** when a file refuses that way and names no
+issue the scan can resolve. So the state is reachable only by a deliberate act that
+records where the decision is tracked, and the printed count cannot be driven to
+zero by relabelling.
+
+A verb this node runs **no component for** — a `LEASE` at a plain worker, a `FETCH`
+at a node with no cache tier — is answered `unimplemented-verb` and counted nowhere,
+which is the first case above: it is what a healthy build gets, once per exchange.
+
+The cache surface's other six arms are uncounted deliberately, and each for its own
+reason rather than one shared sentence. They are listed so the decision can be
+disagreed with rather than rediscovered:
+
+| Refusal | Answers | Why nothing rises |
+|---|---|---|
+| An `AUTH` at the cache tier | `unimplemented-verb` | What a `FASTCACHE_TOKEN` launcher sends once per exchange for a whole build. A counter would be dominated by healthy traffic. |
+| A scheduler or compile verb at the cache tier | `dispatch-not-permitted` | The listener routes by verb family, so a frame reaching the tier already names a cache verb. Unreachable through the port. |
+| An opcode with no table row | `unknown-opcode` | Same routing, and stronger: an unrecognised opcode has no family, so it is answered at the door and never reaches this surface. |
+| A payload that is not its declared length | `malformed-frame` | The listener reads exactly the declared length, so the two figures are one figure. Kept as defence in depth for a direct call. |
+| A cache verb reached without a credential | `unauthenticated` | This surface requires none, by standing decision — so the pre-payload gate cannot produce this answer for it. |
+| An `AUTH` payload that will not decode or verify | `malformed-frame`, `unauthenticated` | `AUTH` belongs to the scheduler, which owns the credential. No credential outcome is ever decided against the cache. |
+
+**Why the cache and compile surfaces answer an unreachable arm differently.** The
+compile surface mints counters for credential arms it cannot currently reach
+(`..._malformed_credential_total` and `..._rejected_credential_total`, flat at zero
+by construction) and the cache surface does not, which looks inconsistent and is
+not. The compile surface's unreachability is a *routing* fact — `AUTH` belongs to
+the scheduler today, and a shape in which a compile surface checked a credential of
+its own is a plausible change — so the dead row buys a signal that would otherwise
+have to be remembered. The cache surface's is stronger in both of its arms: it
+requires no credential *by standing decision*
+([#287](https://github.com/LASTRADA-Software/fastcached/issues/287),
+[#290](https://github.com/LASTRADA-Software/fastcached/issues/290)), and its
+unknown-opcode arm is excluded by the definition of the verb-family lookup rather
+than by any routing choice. Minting a row that cannot rise costs something in a
+table whose whole value is that every row means something, so it is paid where it
+buys a future signal and not where it cannot. Both directions are asserted rather
+than argued: a test sweeps all 256 opcode values and pins that nothing routes an
+unknown verb to the cache and that no pre-payload decision there can be
+`unauthenticated`.
+
+Several groups must never be summed, and each shares a wire code, so a dashboard
 grouping by the code an operator sees in a client log gets them wrong:
 
-- **`endpoint-busy`** is answered by both byte-budget and connection-capacity
-  refusals. The first says *one request was too big right now* and is fixed by
-  looking at request sizes; the second says *this surface has no room for another
-  conversation* and is fixed by raising a connection ceiling.
+- **`endpoint-busy`** is answered by three refusals. Two are byte budgets — the
+  compile surface's and the cache's — and an operator reads them differently: one
+  says more machines would not have helped, the other says this node's own tier is
+  being handed objects faster than it can hold them. The third is connection
+  capacity, which says *this surface has no room for another conversation* and is
+  fixed by raising a connection ceiling rather than by looking at request sizes.
+- **`payload-too-large`** is answered by the frame ceiling on each surface. The
+  cache's is the one that fires on a node holding a tier, so a dashboard that
+  watches only the compile series there watches a graph that cannot move.
 - **`unauthenticated`** is answered both by a wrong token and by never having
   presented one. The first is a rotated key or somebody trying; the second is a
   fleet member misconfigured. Summed, "is my scheduler port being probed" stops
   being answerable — and the *rejection* half is the half that means somebody is
   trying.
-
-`malformed-frame` is the third such code, shared by a request body that would not
-decode and by an `AUTH` payload that would not; those are
-`fastcache_worker_frames_refused_malformed_payload_total` and
-`..._malformed_credential_total`, and an operator told only "a malformed frame
-arrived" cannot tell a client version skew from somebody malforming `AUTH` at the
-door.
+- **`malformed-frame`** is shared by a truncated compile frame, an undecodable
+  compile payload, an undecodable *cache* payload and two `AUTH` payloads. An
+  operator told only "a malformed frame arrived" cannot tell a client version skew
+  from somebody malforming `AUTH` at the door, nor a launcher that is out of step
+  with this node's cache from one that is out of step with its compile surface.
 
 All of them were once answered correctly on the wire while moving nothing, on the
 merged listener that is now the only `0xFC` port a node opens

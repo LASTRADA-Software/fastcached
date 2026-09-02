@@ -674,6 +674,56 @@ consumes it. Every way of poisoning nothing — a substitution that did not fire
 an output path this build does not use, a unit belonging to another target — now
 stops with a sentence about the injection rather than a verdict about the cache.
 
+## A canary reports on the guard AND on itself, and cannot say which
+
+The `static_assert` that every cache refusal policy states a counter *or* a
+rationale (#491) was watched refusing only on the **third** attempt. The first two
+runs both printed *the guard does not bite*, and the guard was correct both times.
+
+Once the canary ran the build as `cmake --build ... | tail -40` and read the
+**pipeline's** status, which is `tail`'s zero — so a build that *had* failed on the
+assertion was reported as one that succeeded. That is
+[`build-and-toolchain.md`](build-and-toolchain.md)'s `producer | grep -q` entry
+arriving through the other end of the same pipe, written by someone who had read
+that entry the same evening.
+
+Once the assertion **was not in the file at all**: a path-scoped `git checkout --`,
+undoing an unrelated botched edit, had discarded it along with the mistake it was
+aimed at. The canary correctly reported that a guard which does not exist does not
+fire.
+
+*Absent*, *present but toothless* and *the run could not tell* are three states.
+A canary that answers in two collapses them, and the sentence it produces blames
+the **subject** — which is the same shape as a fixture announcing a wrong object
+was linked when none was. What separated them here was neither care nor rereading:
+it was **asserting the object count**. Forty-eight units rebuilt, so "compiled
+nothing" was excluded and every surviving explanation was about the code.
+
+So a canary: asserts the poisoned edit actually **compiled** something; takes the
+status from the **process**, never from a pipe; and confirms the failure is the
+**intended** one by matching its text rather than by a non-zero exit — a build that
+fails for another reason proves nothing about the guard. Where it cannot establish
+those, it reports INCONCLUSIVE and names the reading it is missing.
+
+## A path-scoped revert is scoped to the FILE, not to the mistake
+
+`git checkout -- <path>` took two completed review fixes with it — a `static_assert`
+and a repaired documentation block — because they were uncommitted in the same file
+as the botched scripted rewrite it was aimed at. Nothing reported the loss: the
+revert succeeded, `git status` said *clean*, and *clean* was true.
+
+It surfaced only because a canary written for an unrelated purpose then failed. Had
+that canary passed for any other reason, the branch would have shipped without the
+guard.
+
+**Commit before running an experiment that edits the tree.** The red-proof scripts
+here already refuse to start against a dirty tree, and this is the same rule
+pointing at the recovery rather than at the setup. Where a revert cannot wait,
+restore the specific hunks rather than the path. And afterwards check what came
+**back**, not what went away: *validate the reverted tree* below is the same lesson,
+and it did not fire here because the loss was in the file being reverted rather than
+in the build describing it.
+
 ## Attribution by adjacency is a guess, and a guard built on one is a lottery
 
 The same fixture reported `115 hit(s), 106 miss(es)` on a build of identical
