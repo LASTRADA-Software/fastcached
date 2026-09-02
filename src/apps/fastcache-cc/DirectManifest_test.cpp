@@ -15,6 +15,7 @@
 #include <fstream>
 #include <ranges>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1469,6 +1470,12 @@ namespace
 /// only thing that matters -- and catastrophic when a header moved underneath it.
 struct TwoCheckouts
 {
+    /// The leaf names, spelled once. They appear in the writes and again in the
+    /// accessors, and two spellings of one filename is how a fixture comes to
+    /// write `dep.hpp` and hash `dep.hpp ` forever.
+    static constexpr std::string_view SourceName = "src/tu.cpp";
+    static constexpr std::string_view HeaderName = "src/dep.hpp";
+
     FastCache::Testing::ScratchDirectory root { "manifest-two-checkouts" };
 
     TwoCheckouts()
@@ -1477,22 +1484,25 @@ struct TwoCheckouts
         Make("checkout-new", "constexpr int Answer = 2;\n");
     }
 
-    /// @param name   Checkout directory name.
-    /// @param header Contents of the header, which is what differs between them.
     void Make(std::string_view name, std::string_view header) const
     {
-        auto const src = root.Path() / name / "src";
-        auto error = std::error_code {};
-        std::filesystem::create_directories(src, error);
-        // Byte-identical in both checkouts, deliberately.
-        Write(src / "tu.cpp", "#include \"dep.hpp\"\nint Value() { return Answer; }\n");
-        Write(src / "dep.hpp", header);
-    }
-
-    static void Write(std::filesystem::path const& at, std::string_view text)
-    {
-        std::ofstream out { at, std::ios::binary };
-        out << text;
+        auto const in = std::string { name } + "/";
+        // `ScratchDirectory::Write` rather than a private `ofstream`: it creates
+        // the parents and THROWS when the open or the close fails, which is the
+        // half that matters here. The first case below asserts that a hollow
+        // manifest validates in a checkout it was not built from -- an assertion
+        // about an ABSENCE -- so a fixture that silently wrote nothing would make
+        // it pass for the wrong reason, on two checkouts that do not differ
+        // because neither has a `dep.hpp` at all.
+        //
+        // Twenty older cases in this file still open `std::ofstream` by hand, so
+        // hand-rolling would have matched the local habit. That is not a reason
+        // to add a twenty-first.
+        // Identical in both checkouts, deliberately: that is the condition under
+        // which a hollow manifest validates, and it is what the original report
+        // stated before anyone was looking for it.
+        root.Write(in + std::string { SourceName }, "#include \"dep.hpp\"\nint Value() { return Answer; }\n");
+        root.Write(in + std::string { HeaderName }, header);
     }
 
     [[nodiscard]] FastCache::PathCanon::Layout LayoutOf(std::string_view name) const
@@ -1503,12 +1513,12 @@ struct TwoCheckouts
 
     [[nodiscard]] std::string Source(std::string_view name) const
     {
-        return (root.Path() / name / "src" / "tu.cpp").string();
+        return (root / (std::string { name } + "/" + std::string { SourceName })).string();
     }
 
     [[nodiscard]] std::string Header(std::string_view name) const
     {
-        return (root.Path() / name / "src" / "dep.hpp").string();
+        return (root / (std::string { name } + "/" + std::string { HeaderName })).string();
     }
 };
 
@@ -1535,12 +1545,15 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // constructible, and this is what it does.
     TwoCheckouts const checkouts;
 
+    auto const oldCheckout = checkouts.LayoutOf("checkout-old");
+    auto const newCheckout = checkouts.LayoutOf("checkout-new");
+
     auto const hollow = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
                                         .includePaths = {},
-                                        .workingDirectory = checkouts.LayoutOf("checkout-old").sourceRoot,
+                                        .workingDirectory = oldCheckout.sourceRoot,
                                         .toolchainStamp = std::string { Stamp },
                                         .objectKey = "object-from-the-old-checkout" },
-                                      checkouts.LayoutOf("checkout-old"));
+                                      oldCheckout);
     REQUIRE(hollow.has_value());
     // The TU and nothing else. `entries.size()` rather than a header count,
     // because the TU is always entry one.
@@ -1552,13 +1565,19 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // the relativized args, so both checkouts address this manifest by
     // construction -- that portability is the feature, and this is its cost when
     // the entry set is hollow.
-    CHECK(ValidateManifest(*hollow, checkouts.LayoutOf("checkout-new"), Stamp));
+    CHECK(ValidateManifest(*hollow, newCheckout, Stamp));
 
-    // `ManifestAssertsNothing` does NOT catch it: it asks whether the manifest is
-    // EMPTY, and this one names the TU. Asserted so the guard's edge is recorded
-    // rather than assumed -- a reader who believes it covers this case would stop
-    // looking exactly where the remaining exposure is.
-    CHECK_FALSE(ManifestAssertsNothing(*hollow));
+    // Not asserted, deliberately: `CHECK_FALSE(ManifestAssertsNothing(*hollow))`
+    // cannot fail while the line above passes, because `ValidateManifest` returns
+    // false whenever `ManifestAssertsNothing` is true. A signal that cannot be
+    // false in the failing case is not evidence, so it would read as a second
+    // check while testing nothing. The fact it was standing in for is that
+    // `ManifestAssertsNothing` asks only whether the manifest is EMPTY and this
+    // one names the TU -- which is a statement about the guard, and belongs in
+    // `.agent/rules/compile-cache.md` beside the other accepted costs rather than
+    // dressed up as an assertion here -- and it is now recorded there, under
+    // Accepted trade-offs, with the reason it is sound and the condition that
+    // would reopen it.
 }
 
 TEST_CASE("An honest manifest still records its header, and still fails in the other checkout")
@@ -1568,17 +1587,20 @@ TEST_CASE("An honest manifest still records its header, and still fails in the o
     // the property the hollow manifest lost -- FAILS where that header differs.
     TwoCheckouts const checkouts;
 
+    auto const oldCheckout = checkouts.LayoutOf("checkout-old");
+    auto const newCheckout = checkouts.LayoutOf("checkout-new");
+
     auto const sound = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
                                        .includePaths = { checkouts.Header("checkout-old") },
-                                       .workingDirectory = checkouts.LayoutOf("checkout-old").sourceRoot,
+                                       .workingDirectory = oldCheckout.sourceRoot,
                                        .toolchainStamp = std::string { Stamp },
                                        .objectKey = "object-key" },
-                                     checkouts.LayoutOf("checkout-old"));
+                                     oldCheckout);
     REQUIRE(sound.has_value());
     CHECK(sound->entries.size() == 2);
 
-    CHECK(ValidateManifest(*sound, checkouts.LayoutOf("checkout-old"), Stamp));
+    CHECK(ValidateManifest(*sound, oldCheckout, Stamp));
     // The header differs there, so this is the answer the hollow manifest could
     // not give.
-    CHECK_FALSE(ValidateManifest(*sound, checkouts.LayoutOf("checkout-new"), Stamp));
+    CHECK_FALSE(ValidateManifest(*sound, newCheckout, Stamp));
 }

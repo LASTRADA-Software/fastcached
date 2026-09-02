@@ -1248,6 +1248,26 @@ stops being one — the same confound that cost #493 a re-run.
 These are argued in place above and are **not** open work — do not "fix" one
 without reopening the argument:
 
+- **A manifest naming the TU and no header still validates, when a compile reports
+  no dependencies at all.** `NoProjectDeps` is `!includePaths.empty() && recorded
+  == 0`, so an EMPTY reported set skips it; `ManifestAssertsNothing` is
+  `entries.empty()`, and a TU-only manifest is not empty. So the hollow shape that
+  produced [#368](https://github.com/LASTRADA-Software/fastcached/issues/368) is
+  still constructible through that one door, and it validates in a checkout it was
+  not built from — `ctest -R fastcache-cc` covers exactly that, in
+  `DirectManifest_test.cpp`.
+  It is accepted because it is **sound as long as an empty reported set is
+  honest**, and both dishonest routes are closed: `UnreadablePaths` in `main.cpp`
+  refuses a manifest when a reported path is not readable as text (`47ee5e5`), and
+  `NoProjectDeps` refuses when paths were reported and all dropped (`4739f54`).
+  What remains is a TU that genuinely includes nothing, where a TU-only manifest is
+  the correct answer. The residue is that *"reported nothing"* and *"observed
+  nothing"* are two states an empty vector renders identically — so a THIRD way to
+  arrive at an empty list, added later at any caller, reopens #368 silently. That
+  is the thing to check before adding one, and it is why the test asserts the
+  current behaviour rather than a fix: it goes red if the guards are tightened,
+  which forces the edge to be reconsidered deliberately instead of drifting.
+
 - MurmurHash3 is not collision-resistant against an adversary. Accepted because
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust
