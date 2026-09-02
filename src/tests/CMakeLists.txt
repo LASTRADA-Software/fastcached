@@ -149,7 +149,27 @@ endif()
 # drifts between checks is a check that stops matching without saying so.
 # `script-check-canary` below is a deliberately failing script that must be seen
 # to fail, and `script-check-signals` refuses a registration that omits this.
-set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error")
+# It also covers `CMake Warning`, because a check that WARNS is a check nobody
+# reads. `check-net-boundary` emitted 629 warnings across 6291 lines on a clean
+# tree while passing, from a single invalid escape sequence -- and the diagnostic
+# naming that defect was buried inside the wall the defect produced (#517). The
+# guard lives in the SHARED spelling rather than on the check where it was noticed,
+# because a guard scoped to the file where a problem was found is how the next
+# instance goes unnoticed.
+#
+# What it catches and what it does not, because the next reader will assume it is
+# broader than it is: it catches a check that EMITS CMake warnings. It says nothing
+# about a check whose output is enormous for some other reason, and it does not make
+# an over-noisy check correct -- a check can be perfectly quiet and still print more
+# than anyone will read.
+#
+# Measured before it was added: all twenty checks and all four selftests were
+# already warning-clean once `check-net-boundary` was fixed, so this costs nothing
+# today and closes the door for every script check rather than for the one that
+# happened to be noticed.
+#
+# `script-check-warning-canary` below is the matching must-be-seen-to-warn half.
+set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 
 # The canary: a check that must be seen to fail. See scripts/script-check-canary.cmake
 # for why a property needs one. WILL_FAIL inverts the verdict, so this reports
@@ -162,6 +182,23 @@ add_test(
     COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/scripts/script-check-canary.cmake"
 )
 set_tests_properties("script-check-canary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    WILL_FAIL TRUE
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And the warning half of the same mechanism, which is silent forever on a clean
+# tree and would therefore rot unnoticed. See scripts/script-check-warning-canary.cmake.
+#
+# It warns and does NOT fail, deliberately: a script that also printed `CMake Error`
+# would trip the other branch of the alternation and stay green even if the warning
+# branch were deleted -- proving nothing while looking like proof.
+add_test(
+    NAME "script-check-warning-canary"
+    COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/scripts/script-check-warning-canary.cmake"
+)
+set_tests_properties("script-check-warning-canary" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     WILL_FAIL TRUE
     LABELS "hygiene"

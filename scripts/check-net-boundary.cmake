@@ -181,7 +181,35 @@ function(fastcached_fastcache_includes filePath includesOut)
 
         if(quoted)
             list(APPEND includes "!a quoted include, which this tree does not use: \"${target}\"")
-        elseif(target MATCHES "(^|/)\.\.(/|$)")
+        # A character class, not an escape, because `\.` is not a valid CMake escape
+        # sequence -- and the cost of that is a WARNING, not a wrong answer.
+        #
+        # Measured in situ before changing anything, by instrumenting the rule and
+        # asking it what it decided for every include in the tree:
+        #
+        #     FastCache/Net/../Core/Logger.hpp   offered, rule FIRED
+        #     FastCache/Net/Xy/Foo.hpp           offered, rule DECLINED
+        #
+        # So the rule was behaviourally correct in both directions and the fix below
+        # changes no verdict. That is worth stating because the obvious reading is the
+        # other one: an invalid escape LOOKS like it must degrade to `.` matching any
+        # character, and a two-character path segment would then be reported as walking
+        # out. Tested at top level, outside a function, the same pattern DOES match
+        # `Net/Xy/` -- so the reading is not unreasonable, it is just not what this code
+        # does. Ask the code, not a reconstruction of it.
+        #
+        # What the invalid escape actually costs is the diagnostic: it warns once per
+        # evaluation, and this function runs per include per file -- 629 warnings and
+        # 6291 lines of output on a clean tree, while the check passes. The warning
+        # naming the defect was buried inside the wall the defect produced, which is
+        # why it stood (#517).
+        #
+        # `[.]` sidesteps the escaping question rather than answering it. That also
+        # removes a real fragility: the pattern is correct HERE and stops being correct
+        # the moment it is passed through a variable, because the extra expansion drops
+        # the backslash. A spelling nobody can get wrong beats an escape that is right
+        # only in the context it was written in.
+        elseif(target MATCHES "(^|/)[.][.](/|$)")
             list(APPEND includes "!an include that walks out with '..': <${target}>")
         elseif(target MATCHES "^FastCache/")
             string(REGEX REPLACE "^FastCache/" "" relative "${target}")
