@@ -479,6 +479,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .description = "the scheduler's --listen-node endpoint. Required: a\n"
                            "worker nothing knows about serves nobody.",
             .yamlKey = "scheduler",
+            .same = FieldEq<&NodeConfig::scheduler>(),
         },
         {
             .primary = "--advertise",
@@ -491,6 +492,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "verbatim, so a worker that advertises an address only it\n"
                            "can reach is leased and then never answers.",
             .yamlKey = "advertise",
+            .same = FieldEq<&NodeConfig::advertise>(),
         },
         {
             .primary = "--toolchain",
@@ -503,6 +505,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "There is still no default COMPILER -- a default is how a\n"
                            "job ends up running against something nobody chose.",
             .yamlKey = "toolchain",
+            .same = FieldEq<&NodeConfig::toolchains>(),
             .clear = ClearList<&NodeConfig::toolchains>(),
         },
         {
@@ -515,6 +518,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "INSTALLED as a service, which is the registration that\n"
                            "would otherwise fail at every boot with nobody watching.",
             .yamlKey = "no_toolchain_discovery",
+            .same = FieldEq<&NodeConfig::toolchainDiscovery>(),
         },
         {
             .primary = "--slots",
@@ -529,6 +533,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "more would be fuller and slower than the scheduler\n"
                            "believes, at the same moment.",
             .yamlKey = "slots",
+            .same = FieldEq<&NodeConfig::slots>(),
         },
         {
             .primary = "--node-class",
@@ -541,6 +546,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "slot limit. The default is the safe answer rather than\n"
                            "the common one.",
             .yamlKey = "node_class",
+            .same = FieldEq<&NodeConfig::nodeClass>(),
         },
         {
             .primary = "--drain-timeout",
@@ -553,6 +559,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "decides instead and answers with SIGKILL and no\n"
                            "diagnostic.",
             .yamlKey = "drain_timeout_seconds",
+            .same = FieldEq<&NodeConfig::drainTimeoutSeconds>(),
         },
         {
             .primary = "--reserve-cores",
@@ -564,6 +571,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "same as omitting the flag. Ignored when --slots names\n"
                            "a number, which is the operator's answer already.",
             .yamlKey = "reserve_cores",
+            .same = FieldEq<&NodeConfig::reservedCores>(),
         },
         {
             .primary = "--node-id",
@@ -574,6 +582,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "consensus ON; without it this node leads alone,\n"
                            "which is right for one machine and is the default.",
             .yamlKey = "node_id",
+            .same = FieldEq<&NodeConfig::nodeId>(),
         },
         {
             .primary = "--listen-raft",
@@ -584,6 +593,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "port binds the WILDCARD: peers are on other machines\n"
                            "by definition, so loopback would silently not work.",
             .yamlKey = "listen_raft",
+            .same = FieldEq<&NodeConfig::raftListen>(),
         },
         {
             .primary = "--raft-peer",
@@ -596,6 +606,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "unreachable. This is the BOOTSTRAP set only:\n"
                            "membership is replicated once the cluster runs.",
             .yamlKey = "raft_peer",
+            .same = FieldEq<&NodeConfig::raftPeers>(),
             .clear = ClearList<&NodeConfig::raftPeers>(),
         },
         {
@@ -611,6 +622,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "cluster of itself, elects itself, and can never\n"
                            "afterwards be admitted to anybody else's.",
             .yamlKey = "raft_join",
+            .same = FieldEq<&NodeConfig::raftJoin>(),
         },
         {
             .primary = "--cluster-dir",
@@ -621,6 +633,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "that answered a vote and forgot it votes twice in\n"
                            "one term after a restart, which is two leaders.",
             .yamlKey = "cluster_dir",
+            .same = FieldEq<&NodeConfig::clusterDir>(),
         },
         { .primary = "--cluster-status",
           .arity = Arity::None,
@@ -662,6 +675,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "beacon and NOT a credential: what it buys is that two\n"
                            "unrelated fleets on one segment ignore each other.",
             .yamlKey = "cluster_id",
+            .same = FieldEq<&NodeConfig::clusterId>(),
         },
         {
             .primary = "--discovery",
@@ -673,6 +687,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "--cluster-key-file. Without it a cluster is exactly\n"
                            "the --raft-peer list an operator typed.",
             .yamlKey = "discovery",
+            .same = FieldEq<&NodeConfig::discoveryAddress>(),
         },
         {
             .primary = "--discovery-reply-port",
@@ -686,6 +701,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "handed a unicast. Pin it where a host firewall opens\n"
                            "named ports only -- one per node on the machine.",
             .yamlKey = "discovery_reply_port",
+            .same = FieldEq<&NodeConfig::discoveryReplyPort>(),
         },
         {
             .primary = "--cluster-key-file",
@@ -700,6 +716,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "one, a grant is unsigned and any client that can reach\n"
                            "a worker's compile port can spend it.",
             .yamlKey = "cluster_key_file",
+            .same = FieldEq<&NodeConfig::clusterKeyFile>(),
         },
         {
             .primary = "--scheduler-token-file",
@@ -713,6 +730,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "membership is the only gate, and that is a host list,\n"
                            "not a secret.",
             .yamlKey = "scheduler_token_file",
+            .same = FieldEq<&NodeConfig::schedulerTokenFile>(),
         },
         {
             .primary = "--admin-listen",
@@ -725,6 +743,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "default. /healthz is also the liveness probe this\n"
                            "worker otherwise has none of.",
             .yamlKey = "admin_listen",
+            .same = FieldEq<&NodeConfig::adminListen>(),
         },
         {
             .primary = "--dashboard",
@@ -735,6 +754,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "Answered in full only while this node LEADS; anyone else\n"
                            "names the leader rather than showing half a fleet.",
             .yamlKey = "dashboard",
+            .same = FieldEq<&NodeConfig::dashboard>(),
         },
         {
             .primary = "--dashboard-token-file",
@@ -747,6 +767,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "which every member of the fleet already holds. Required\n"
                            "when --admin-listen is not on loopback.",
             .yamlKey = "dashboard_token_file",
+            .same = FieldEq<&NodeConfig::dashboardTokenFile>(),
         },
         {
             .primary = "--tls-self-signed",
@@ -758,6 +779,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "fingerprint is logged for you to compare. Regenerated\n"
                            "every restart -- name --tls-cert for a stable identity.",
             .yamlKey = "tls_self_signed",
+            .same = FieldEq<&NodeConfig::tlsSelfSigned>(),
         },
         {
             .primary = "--tls-cert",
@@ -769,6 +791,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "key rather than by a flag, so there is no way to ask\n"
                            "for it without the material to do it.",
             .yamlKey = "tls_cert",
+            .same = FieldEq<&NodeConfig::tlsCertFile>(),
         },
         {
             .primary = "--tls-key",
@@ -777,6 +800,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::tlsKeyFile, ParsePathValue>(),
             .description = "private key for --tls-cert. Both or neither.",
             .yamlKey = "tls_key",
+            .same = FieldEq<&NodeConfig::tlsKeyFile>(),
         },
         {
             .primary = "--serve-scheduler",
@@ -791,6 +815,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "--listen-node binds: the wildcard here, because\n"
                            "peers have to reach it, and loopback without it.",
             .yamlKey = "serve_scheduler",
+            .same = FieldEq<&NodeConfig::serveScheduler>(),
         },
         {
             .primary = "--fleet-member",
@@ -804,6 +829,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "a peer dials from an ephemeral port, so an endpoint\n"
                            "is not something a connection can be compared to.",
             .yamlKey = "fleet_member",
+            .same = FieldEq<&NodeConfig::fleetMembers>(),
             .clear = ClearList<&NodeConfig::fleetMembers>(),
         },
         {
@@ -816,6 +842,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "'no policy' and 'admit everybody' must be the same\n"
                            "decision -- listing nobody refuses everybody.",
             .yamlKey = "fleet_open",
+            .same = FieldEq<&NodeConfig::fleetOpen>(),
         },
         {
             .primary = "--cache-memory",
@@ -829,6 +856,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "It exists so a local rebuild on a slow or bad\n"
                            "network never reaches the wire at all.",
             .yamlKey = "cache_memory",
+            .same = FieldEq<&NodeConfig::cacheMemoryBytes>(),
         },
         {
             .primary = "--cache-disk",
@@ -840,6 +868,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "anything with --cache-dir: without a path there is\n"
                            "no disk tier for a budget to bound.",
             .yamlKey = "cache_disk",
+            .same = FieldEq<&NodeConfig::cacheDiskBytes>(),
         },
         {
             .primary = "--cache-dir",
@@ -852,6 +881,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "enforced: the store is claimed exclusively, so a\n"
                            "second node sharing it refuses to start.",
             .yamlKey = "cache_dir",
+            .same = FieldEq<&NodeConfig::cacheDir>(),
         },
         {
             .primary = "--listen-node",
@@ -870,6 +900,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "new to the cache: those verbs answer this machine\n"
                            "alone whatever this is bound to.",
             .yamlKey = "listen_node",
+            .same = FieldEq<&NodeConfig::nodeListen>(),
         },
         {
             .primary = "--upstream",
@@ -880,6 +911,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "Empty is honest rather than broken: one developer's\n"
                            "machine has no shared cache.",
             .yamlKey = "upstream",
+            .same = FieldEq<&NodeConfig::upstream>(),
         },
         {
             .primary = "--requirepass",
@@ -888,6 +920,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::token, ParseText>(),
             .description = "credential presented to the scheduler",
             .yamlKey = "requirepass",
+            .same = FieldEq<&NodeConfig::token>(),
         },
         {
             .primary = "--log-level",
@@ -896,6 +929,15 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::logLevel, ParseNodeLogLevel>(),
             .description = "trace, debug, info, warn, error, fatal (default info)",
             .yamlKey = "log_level",
+            // The ONE reloadable row today, and it earns it: `ILogger::SetMinLevel`
+            // exists, so raising the level to diagnose something takes effect on a
+            // running worker without restarting it mid-build. `logTimestamps` next
+            // door is deliberately NOT marked -- `ConsoleLogger` takes its timestamp
+            // setting at construction and offers no setter, so marking it would
+            // publish a snapshot the logger does not honour, which is the exact
+            // disagreement the default guards against.
+            .reloadable = Reloadable::Yes,
+            .same = FieldEq<&NodeConfig::logLevel>(),
         },
         {
             // Beside `--log-level` because they are one concern, and two flags
@@ -925,6 +967,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "(default: on under macOS, where nothing else stamps a\n"
                            "service's output; off elsewhere)",
             .yamlKey = "log_timestamps",
+            .same = FieldEq<&NodeConfig::logTimestamps>(),
         },
         {
             // The negative spelling, for the reason the daemon's carries: the DEFAULT
@@ -960,6 +1003,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::pidfile, ParseText>(),
             .description = "write the pid here when daemonizing (POSIX)",
             .yamlKey = "pidfile",
+            .same = FieldEq<&NodeConfig::pidfile>(),
         },
         { .primary = "--install-service",
           .arity = Arity::None,
@@ -1089,7 +1133,68 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                                           });
                                       }),
                   "every notFromFile entry must name a real row that carries no yamlKey");
+
+    // A row a FILE can set must be comparable, and a row it cannot must not be.
+    //
+    // **Both directions, at compile time, because the correspondence was verified by
+    // hand once and nothing kept it in step.** That is exactly
+    // [#406](https://github.com/LASTRADA-Software/fastcached/issues/406)'s shape --
+    // a hand-checked list beside a table -- and reproducing it inside the change that
+    // gives its sibling a column would be the joke telling itself. Row 39 arrives
+    // without a comparator, and without this nothing says so: a reload would then
+    // read that field as unchanged forever, which is the silent-success failure this
+    // whole mechanism exists to prevent.
+    //
+    // The forward direction is the load-bearing one. The converse matters too: a
+    // comparator on a row no file can reach is dead code that reads as coverage, and
+    // the next person to audit this would count it.
+    static_assert(
+        std::ranges::all_of(
+            options, [](OptionSpec<NodeConfig> const& spec) { return spec.yamlKey.empty() == (spec.same == nullptr); }),
+        "a row with a yamlKey needs a FieldEq comparator, and a row without one must not have it");
+
     return options;
+}
+
+std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate)
+{
+    std::vector<std::string_view> changed;
+    for (auto const& spec: NodeOptions())
+    {
+        // A row with no comparator is not configuration state -- a one-shot verb, or
+        // an install-time flag. No file can set it, so no reload can change it. The
+        // static_assert beside the table is what keeps that true rather than assumed.
+        if (spec.same == nullptr || spec.reloadable == Reloadable::Yes)
+            continue;
+        if (!spec.same(previous, candidate))
+            changed.push_back(spec.primary);
+    }
+    return changed;
+}
+
+std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previous, NodeConfig const& candidate)
+{
+    auto const changed = UnreloadableChanges(previous, candidate);
+    if (changed.empty())
+        return {};
+
+    std::string names;
+    for (auto const& flag: changed)
+    {
+        if (!names.empty())
+            names += ", ";
+        names += flag;
+    }
+
+    return std::unexpected(ConfigError {
+        .code = ConfigErrorCode::ImmutableChanged,
+        .source = {},
+        .line = 0,
+        // The FIRST name, because the field is one string and something has to go in
+        // it; the whole list is in the context, which is what an operator reads.
+        .field = std::string { changed.front() },
+        .context = std::format("not reloadable, so nothing was applied: {}", names),
+    });
 }
 
 Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,

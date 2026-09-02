@@ -34,6 +34,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Config/YamlReader.hpp>
@@ -144,17 +145,43 @@ extern "C" void HandleNodeStopSignal(int /*signum*/)
     DaemonControls::Instance().RequestStop();
 }
 
-/// Ask for a graceful stop on the signals a supervisor actually sends.
+/// Record a reload request.
 ///
-/// SIGHUP is deliberately NOT handled: the daemon reloads its configuration on it,
-/// and this worker has nothing it could reload -- its toolchain table is what its
-/// registration advertised, so re-reading it would leave the scheduler dispatching
-/// against a set this worker no longer serves. Leaving SIGHUP at its default is
-/// therefore the honest behaviour rather than an omission.
+/// Same constraint as the stop handler: a signal handler sets a lock-free flag and
+/// does nothing else. The re-read, the immutability check and the logging all happen
+/// on the thread that notices the flag.
+extern "C" void HandleNodeReloadSignal(int /*signum*/)
+{
+    DaemonControls::Instance().RequestReload();
+}
+
+/// Ask for a graceful stop, and for a reload, on the signals a supervisor sends.
+///
+/// **SIGHUP used to be deliberately unhandled, and the argument for that is now the
+/// argument for the `reloadable` column.** It read: *this worker has nothing it could
+/// reload -- its toolchain table is what its registration advertised, so re-reading it
+/// would leave the scheduler dispatching against a set this worker no longer serves.*
+///
+/// The premise stopped being true when [#291](https://github.com/LASTRADA-Software/fastcached/issues/291)
+/// gave the node a configuration file. **The reasoning did not**, and it is exactly why
+/// reloadability is a column of `NodeOptions()` rather than a property of the reload
+/// path: those fields must refuse to change, for precisely the reason that paragraph
+/// gives. Restated rather than deleted, because a correct argument attached to a false
+/// premise is worth more than either half
+/// ([#292](https://github.com/LASTRADA-Software/fastcached/issues/292)).
+///
+/// So SIGHUP is handled, and what it can change is decided by the table: today only
+/// `--log-level`, which is the field an operator reaches for mid-incident and the one
+/// `ILogger` can actually be told about while running.
 void InstallNodeStopHandlers()
 {
     std::signal(SIGINT, &HandleNodeStopSignal);
     std::signal(SIGTERM, &HandleNodeStopSignal);
+#if !defined(_WIN32)
+    // POSIX only: Windows has no SIGHUP, and a service there is reconfigured through
+    // the SCM control handler rather than by a signal.
+    std::signal(SIGHUP, &HandleNodeReloadSignal);
+#endif
 }
 
 /// The descriptor a supervisor handed this worker, when there was one.
@@ -494,7 +521,45 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 /// @param cfg What this worker was told to be.
 /// @param logger Where it reports.
 /// @return Process exit code.
-[[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger)
+/// The node's reloader: `NodeConfig`, read through the option table, guarded by its
+/// `reloadable` column.
+using NodeReloader = ConfigReloaderOf<NodeConfig>;
+
+/// Act on one SIGHUP, and say what happened either way.
+///
+/// **Both outcomes are logged, and that is the whole point of the ticket.** A reload
+/// that silently ignored a changed field would leave the operator believing an edit
+/// took effect -- they edited a file, saw no error, and got nothing. So a refusal
+/// names every setting that may not change at runtime, and a success names what is now
+/// in force.
+/// @param reloader The pipeline, or null when this worker has no configuration file.
+/// @param logger Where the outcome is reported.
+void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
+{
+    if (reloader == nullptr)
+    {
+        // Not silence: an operator who sent SIGHUP believes this worker has a file to
+        // re-read, and the useful answer is that it has none.
+        logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
+        return;
+    }
+
+    auto const outcome = reloader->Reload();
+    if (!outcome.has_value())
+    {
+        // One line for both refusals -- a file that would not parse and a file that
+        // changed something immutable -- because the operator's situation is the same:
+        // they saved once, and NOTHING was applied.
+        logger.Logf(LogLevel::Warn, "reload declined, configuration unchanged: {}", outcome.error().ToString());
+        return;
+    }
+
+    auto const current = reloader->Current();
+    logger.SetMinLevel(current->logLevel);
+    logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
+}
+
+[[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
 {
     // Socket activation is resolved BEFORE the toolchains, and the order is
     // deliberate. Computing a fingerprint walks the whole include tree and takes
@@ -1307,7 +1372,14 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
     // That deletes the watcher rather than rehoming it: it existed only because a
     // parked `accept()` cannot be woken by a flag.
     while (!DaemonControls::Instance().StopRequested())
+    {
+        // Taken here rather than in the handler, for the reason the handler's own note
+        // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
+        // costs one re-read rather than one per signal.
+        if (DaemonControls::Instance().TakeReloadRequest())
+            ApplyReloadRequest(reloader, logger);
         std::this_thread::sleep_for(StopPollInterval);
+    }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
     compileCapacity.BeginShutdown();
 
@@ -1649,5 +1721,31 @@ int main(int argc, char** argv)
     if (!host)
         host = std::make_unique<ForegroundHost>();
 
-    return host->Run([&cfg, &logger] { return WorkerBody(cfg, logger); });
+    // Built only when there IS a file, and holding the SAME argv the startup parse
+    // used -- so a reload reproduces the startup order exactly: a fresh configuration,
+    // the file applied through the appliers argv reaches, then the command line second.
+    // "The command line wins" therefore stays a question of which loop ran last, never
+    // a per-field merge with per-field presence bits.
+    std::optional<NodeReloader> reloader;
+    if (!lookup.path.empty())
+        reloader.emplace(
+            cfg,
+            lookup.path,
+            [argvSpan](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+                // A FRESH configuration, never the live one. A file that fails halfway
+                // is then discarded whole rather than leaving the running worker
+                // holding part of a document nobody wrote.
+                NodeConfig candidate;
+                auto const loaded =
+                    ReadYamlSettings(path).and_then([&candidate, &path, argvSpan](std::vector<YamlSetting> const& settings) {
+                        return ApplyNodeConfiguration(settings, path, argvSpan.subspan(1), candidate);
+                    });
+                if (!loaded.has_value())
+                    return std::unexpected(loaded.error());
+                return candidate;
+            },
+            &ValidateNodeReloadable);
+
+    auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
+    return host->Run([&cfg, &logger, reloaderPtr] { return WorkerBody(cfg, logger, reloaderPtr); });
 }

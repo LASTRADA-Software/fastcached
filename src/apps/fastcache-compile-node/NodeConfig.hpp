@@ -12,10 +12,12 @@
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -688,6 +690,33 @@ struct NodeConfig
 /// is necessarily a documented one and adding a flag is adding a row.
 /// @return The table; stable for the life of the process.
 [[nodiscard]] std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept;
+
+/// Every setting a candidate configuration changes that cannot take effect live.
+///
+/// **EVERY one, never the first.** A reload that reports one unreloadable field and
+/// stops sends the operator round the same loop per field: they fix it, save, and are
+/// refused again for the next. The whole answer in one refusal is the difference
+/// between a diagnosis and a guessing game.
+///
+/// Driven by `NodeOptions()`'s own `reloadable` and `same` columns, so a row added
+/// tomorrow is covered without touching this — and a row that forgets its comparator
+/// does not compile, which is the guard beside the table.
+///
+/// @param previous What the worker is running with.
+/// @param candidate What the file now says.
+/// @return The `--flag` spellings that changed and may not, in table order. Empty
+///         means the candidate may be published.
+[[nodiscard]] std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate);
+
+/// The immutability rule `ConfigReloaderOf<NodeConfig>` runs, as a `ConfigError`.
+///
+/// A thin shape over `UnreloadableChanges` because the reloader speaks errors and the
+/// table speaks field names; the list is joined into one sentence naming all of them.
+/// @param previous What the worker is running with.
+/// @param candidate What the file now says.
+/// @return Nothing, or which settings may not change at runtime.
+[[nodiscard]] std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previous,
+                                                                      NodeConfig const& candidate);
 
 /// Describe this worker as a service to register.
 ///
