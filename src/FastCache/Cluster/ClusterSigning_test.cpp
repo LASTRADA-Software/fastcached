@@ -93,8 +93,7 @@ TEST_CASE("The signed message is the label, then the fields, all length-prefixed
 
     for (auto const& row: SigningDomainTable)
     {
-        auto const expected =
-            HmacSha256(key, WireFields::Encode({ WireFields::AsBytes(row.label), first, second }));
+        auto const expected = HmacSha256(key, WireFields::Encode({ WireFields::AsBytes(row.label), first, second }));
         CHECK(ConstantTimeEquals(SignFields(key, row.domain, { first, second }), expected));
     }
 }
@@ -137,8 +136,7 @@ TEST_CASE("A tag covers these fields, this key, and this arity", "[cluster][sign
     // A different arity. An appended EMPTY field is the cheapest way to ask whether
     // the encoding says how many fields there were: it adds no content, only a
     // length prefix, so a construction that merely concatenated would not notice.
-    auto const padded =
-        std::array<std::span<std::byte const>, 3> { Bytes("node-a"), Bytes("10.0.0.7:6675"), Bytes("") };
+    auto const padded = std::array<std::span<std::byte const>, 3> { Bytes("node-a"), Bytes("10.0.0.7:6675"), Bytes("") };
     CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, padded, honest));
 }
 

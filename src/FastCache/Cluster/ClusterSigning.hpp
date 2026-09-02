@@ -46,12 +46,17 @@
 ///
 /// - **Which fields go into the message, and in what order.** A signer states its
 ///   own claim list; nothing here knows what a claim is.
-/// - **Whether an empty key may sign or verify at all.** An empty HMAC key is a
+/// - **Whether a weak or empty key may sign at all.** An empty HMAC key is a
 ///   perfectly valid HMAC key, so two nodes that both failed to load a key file
-///   would otherwise authenticate each other's tags -- see
-///   `AuthenticateLeaseToken`, which refuses one outright. That is a policy about
-///   what a *deployment* means, not about what a MAC is, and the two protocols do
-///   not answer it the same way today.
+///   would happily authenticate each other's tags -- two machines agreeing on "no
+///   secret" and calling it authentication. Both wires already refuse that, at
+///   different layers and for different reasons: `ReadClusterKey` refuses a file
+///   holding fewer than `MinimumKeyBytes` before a `DiscoveryConfig` is built, and
+///   `AuthenticateLeaseToken` refuses an empty key at verify because a verifier
+///   that legitimately runs without one must decide so in the open rather than by
+///   omission. Neither belongs here: it is a policy about what a *deployment*
+///   means, and a MAC that refused its own key would give a caller no way to say
+///   what it decided.
 /// - **When the MAC is checked relative to everything else.** It is checked
 ///   before any other claim is reported on, or a named refusal becomes an oracle
 ///   -- and that is an ordering property of a verifier, which this cannot enforce
@@ -86,8 +91,8 @@ enum class SigningDomain : std::uint8_t
 /// omission this whole header exists to make impossible.
 struct SigningDomainDescriptor
 {
-    SigningDomain domain;    ///< The construction this row describes.
-    std::string_view label;  ///< The bytes folded in ahead of every field.
+    SigningDomain domain;   ///< The construction this row describes.
+    std::string_view label; ///< The bytes folded in ahead of every field.
 };
 
 /// One row per `SigningDomain`, in enumerator order.

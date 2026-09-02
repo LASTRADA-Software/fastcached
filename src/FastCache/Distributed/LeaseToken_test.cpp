@@ -533,8 +533,7 @@ TEST_CASE("Moving the lease onto the shared seam changed none of its bytes", "[d
     auto const packed = outer[0];
     auto const tag = outer[1];
 
-    auto const preSeam =
-        HmacSha256(key, WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v1" }), packed }));
+    auto const preSeam = HmacSha256(key, WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v1" }), packed }));
 
     REQUIRE(tag.size() == Sha256::DigestSize);
     Sha256::Digest presented {};

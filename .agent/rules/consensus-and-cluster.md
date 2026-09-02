@@ -114,6 +114,67 @@ Every rule below has already been a bug.
     cases were hand-typed as hex runs and both were wrong (49 bytes for 50, 120 for
     131), which reads exactly like an implementation failure. They are constructed
     programmatically now.
+- **One key, one signing construction, and the domain label is a required
+  parameter rather than a constant each signer remembers to fold in.** The
+  pre-shared key MACs a discovery proof and a lease token, and each used to build
+  its message inline out of `HmacSha256` and `WireFields::Encode` -- which are
+  primitives, not a construction. So what a message is *made of* was written
+  twice, and the requirement that every message carry a domain label was true of
+  exactly one of them: the lease carried `fastcache-lease-v1`, the proof carried
+  nothing. Nothing was reachable, and that is the point rather than the reprieve
+  it reads as -- **the safety was a property of the PAIR, not of either
+  construction.** A proof was a four-field encoding beginning with a cluster id
+  and a lease tag a two-field one beginning with a literal, so no byte string was
+  a valid message under both. That is a coincidence, and it survives exactly as
+  long as nobody adds a field to discovery or adds a third signer whose shape
+  collides with one of them. **Arity is not domain separation.**
+  `Cluster/ClusterSigning.hpp` is now the only thing in `src/` that calls the
+  primitive (#402), and five things about it are each what some plausible simpler
+  design gets wrong:
+  - **The domain is a `SigningDomain`, and it has no default.** There is no
+    argument to pass a bare label to and nothing to omit, so a signer is a row of
+    `SigningDomainTable` or it does not sign. The labels are `static_assert`ed
+    present and distinct: an empty one encodes as a zero-length field and
+    separates domains exactly as well as no label did, and a duplicated one is
+    that same hole reached by copying the row above and changing only the
+    enumerator, which is how a new signer actually gets written.
+  - **The label is a FIELD, not a prefix glued onto the first one.** It goes
+    through the same length-prefixed grammar as everything after it, so no choice
+    of first field can shift bytes across the boundary and spell a different
+    domain's label. It is the object key's rule and the proof's own, applied to
+    the one part of the message a caller does not supply.
+  - **`VerifyFields` is the only comparison exposed.** A verifier therefore
+    cannot reach for `==` on a digest and lose `ConstantTimeEquals` without
+    anybody noticing -- there is nothing else to reach for.
+  - **What it deliberately does NOT own**, because each is per protocol and
+    getting it wrong here would be getting it wrong everywhere: which fields a
+    message carries, whether a weak or empty key may sign (`ReadClusterKey`
+    refuses a short one at load and `AuthenticateLeaseToken` an empty one at
+    verify -- two layers, one policy, and neither belongs in a MAC), and WHEN the
+    MAC is checked relative to everything else. The last is an ordering property
+    of a verifier and no seam can hold it for one.
+  - **A guard, because the rule was already written down and enforced nowhere.**
+    A required parameter binds whoever goes *through* the seam and says nothing
+    about a fourth signer calling `HmacSha256` itself, which is an ordinary call
+    to a public function in `Core/` that no compiler will remark on. `ctest -R
+    psk-signing-seam` is what refuses that, and it fails when its own scan matches
+    nothing -- a table row vouching for a file that has stopped signing, or a
+    primitive renamed out from under the scan, would otherwise leave it passing
+    vacuously forever. `psk-signing-seam-selftest` drives all seven verdicts,
+    including the two that must PASS.
+- **Giving the proof a label changed the proof wire, and the datagram version did
+  not move.** Every tag differs from a pre-#402 build's; `CurrentVersion` stays at
+  1 because what changed is the MAC *input* and not the grammar, and bumping it
+  would misdescribe the format. It is also the better failure of the two: an older
+  node reaches the proof step and is logged failing to prove the key, where an
+  unsupported version is dropped by `ClassifyDatagram` and presents as peers seen
+  and never admitted -- the same silence this file already records
+  `--discovery-reply-port` being needed for. Loud beats silent; a cluster that
+  quietly will not form while every node looks healthy is the shape that costs a
+  day. The lease token's message is byte-for-byte what it was, and a test pins
+  that against the pre-seam construction written out as a literal rather than
+  against the code that produces it -- "the tests still pass" cannot show it,
+  because the tests moved with the code.
 - **A datagram double delivers a broadcast to the sender too, and loses only what
   it is told to.** `DatagramBus` mirrors what a real broadcast does, which is
   precisely the case `PeerDirectory` must ignore -- a double that spared the sender
