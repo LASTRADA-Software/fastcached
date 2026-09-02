@@ -359,7 +359,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     ManualClock clock;
     AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
-    CacheProxy proxy { cache };
+    CacheProxy proxy { cache, metrics };
 
     // This machine answers on 10.0.0.7, so 10.0.0.1 is somebody else. Injected because
     // the question is ambient: `ILocalityOracle` exists so a test can say which

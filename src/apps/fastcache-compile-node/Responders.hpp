@@ -5,6 +5,7 @@
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -16,6 +17,8 @@
 #include <cstdint>
 #include <optional>
 #include <ranges>
+#include <string_view>
+#include <vector>
 
 #include <WorkerProtocol.hpp>
 
@@ -24,19 +27,153 @@ namespace FastCache::Node
 
 namespace Detail
 {
-    /// The issue that will decide which of the CACHE surface's refusals are events.
+    /// What the CACHE surface does about one refusal it may be asked to answer.
     ///
-    /// Both of this surface's refusal arms carried a written rationale and neither was
-    /// a decision: one argued the framing arms are "visible to the peer", when #491's
-    /// scenario is a peer that IS the attacker; the other called the byte budget a
-    /// transient, when #491 records that `MaxInFlightBytes()` folds to the largest
-    /// owner -- this cache -- so it is the byte-budget refusal a real node reaches.
+    /// **Exactly one of the two is set**, checked per row rather than described: a
+    /// counter says a rise here is something an operator acts on, a rationale says a
+    /// rise would mean nothing and carries the argument for that. Those are the two
+    /// claims `Cc::Refuse` and `Cc::RefuseWithoutCounter` make, and pairing them here
+    /// is what keeps the answer beside the arm instead of inside a `switch` where a
+    /// missing case would only imply it.
     ///
-    /// Written as decided, they also left the backlog, and #491's completion measure
-    /// would then have read `CacheProxy`'s sites -- a different surface -- letting it
-    /// close while the two arms in its own title stayed undecided. An instrument
-    /// measuring the wrong set and reporting success is the defect #492 exists to fix.
-    constexpr std::uint32_t CacheSurfaceTriage = 491;
+    /// The wire code is deliberately NOT a column. It is a property of the refusal
+    /// rather than of this surface -- `ErrorCodeFor` owns it for both enumerations --
+    /// and a row restating it is a second statement of one fact, which is a second
+    /// thing to be wrong. The scheduler's table restates it and `static_assert`s the
+    /// agreement; not restating it is the same guarantee for no rows.
+    struct CacheRefusalPolicy
+    {
+        /// What rises, or nothing where this surface deliberately counts none.
+        std::optional<IMetricsSink::Counter> counter;
+
+        /// Why nothing rises. Empty exactly when `counter` is set.
+        ///
+        /// Never sent and never read at run time -- see `Cc::UncountedRefusal` for why
+        /// it exists at all. Spelled `rationale` and not `why` for the reason stated
+        /// there: `CompileCacheWire::RefusedVerb::why` is text a CLIENT is sent.
+        std::string_view rationale;
+    };
+
+    /// Whether @p policy states one claim rather than none or both.
+    /// @param policy The row to check.
+    /// @return True when exactly one of the counter and the rationale is present.
+    [[nodiscard]] constexpr bool StatesOneClaim(CacheRefusalPolicy const& policy) noexcept
+    {
+        return policy.counter.has_value() == policy.rationale.empty();
+    }
+
+    /// Answer a cache-surface refusal the way its row decided.
+    ///
+    /// One door for both of `CacheResponder`'s arms, so the counted and the uncounted
+    /// spellings are chosen from data rather than remembered at each call site.
+    /// @param metrics Where a counted refusal is recorded.
+    /// @param code What the client is told, from `ErrorCodeFor`.
+    /// @param policy This surface's decision about the arm.
+    /// @param detail Words for a person, or empty when there are none to add.
+    /// @return The encoded reply.
+    [[nodiscard]] inline std::vector<std::byte> AnswerCacheRefusal(IMetricsSink& metrics,
+                                                                   CompileCacheWire::ErrorCode code,
+                                                                   CacheRefusalPolicy const& policy,
+                                                                   std::string_view detail)
+    {
+        if (policy.counter.has_value())
+            return Cc::Refuse(metrics, { .code = code, .counter = *policy.counter }, detail);
+        return Cc::RefuseWithoutCounter({ .code = code, .rationale = policy.rationale }, detail);
+    }
+
+    /// One row of `CacheEndpointRefusals`.
+    struct CacheEndpointRefusal
+    {
+        EndpointRefusal refusal;     ///< Which endpoint decision this describes.
+        CacheRefusalPolicy policy;   ///< What this surface does about it.
+    };
+
+    /// What the CACHE surface does about each endpoint-decided refusal (#491).
+    ///
+    /// The byte budget is the arm #491 was filed about, and the one this surface
+    /// counts. `MergedResponder::MaxInFlightBytes()` folds to the LARGEST owner's
+    /// budget, which on any node holding a tier is this cache's, so the endpoint's
+    /// in-flight ceiling IS the cache's ceiling and the refusal that fires in practice
+    /// is a `STORE`. Answered correctly and counted nowhere, that is #326's scenario
+    /// one surface over: the port is hammered and the graph is flat.
+    ///
+    /// The earlier position -- that the budget is "a transient the peer retries past"
+    /// -- is sound for the SCHEDULER, whose ceiling is kilobytes and whose series is
+    /// about credentials. It is the opposite of what happens here, and inheriting it
+    /// is how a decision about one surface came to describe another.
+    inline constexpr EnumTable<EndpointRefusal, CacheEndpointRefusal> CacheEndpointRefusals { {
+        { .refusal = EndpointRefusal::InFlightBudget,
+          .policy = { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy, .rationale = {} } },
+        { .refusal = EndpointRefusal::CredentialMalformed,
+          .policy = { .counter = std::nullopt,
+                      .rationale = "AUTH is the Session family, which MergedResponder routes to the scheduler; no "
+                                   "credential outcome is ever decided against this surface" } },
+        { .refusal = EndpointRefusal::CredentialRejected,
+          .policy = { .counter = std::nullopt,
+                      .rationale = "AUTH is the Session family, which MergedResponder routes to the scheduler; no "
+                                   "credential outcome is ever decided against this surface" } },
+    } };
+
+    // Positional rows alone would not catch an appended enumerator: it leaves a
+    // value-initialised row whose policy states NEITHER claim, and a guard that
+    // short-circuits on the absent counter passes vacuously while the new refusal
+    // ships uncounted -- which is this issue's own defect re-entering through its fix.
+    static_assert(RowsInEnumeratorOrder(CacheEndpointRefusals, &CacheEndpointRefusal::refusal),
+                  "CacheEndpointRefusals must hold one row per EndpointRefusal, in enumerator order");
+
+    // And that each row asserts exactly one thing. A row with neither is the vacuous
+    // pass above; a row with both is an author who could not choose, answered here
+    // rather than at whichever call site read the fields in the luckier order.
+    static_assert(std::ranges::all_of(CacheEndpointRefusals,
+                                      [](CacheEndpointRefusal const& row) { return StatesOneClaim(row.policy); }),
+                  "every cache endpoint refusal must state either a counter or a rationale, and not both");
+
+    /// What the CACHE surface does about each pre-payload decision (#491).
+    ///
+    /// A total switch rather than an `EnumTable`, and the reason is the enum:
+    /// `PrePayloadDecision` is `CompileCacheWire`'s, which is header-only and
+    /// dependency-free because the launcher compiles it in, so it carries no `Last`
+    /// and an `EnumTable` cannot take its extent. `-Werror=switch` is the guard
+    /// instead, and it is the same one `CompileCacheWire::ErrorCodeFor` relies on for
+    /// this enumeration -- a fifth decision fails the build here rather than falling
+    /// through to a neighbour's answer.
+    ///
+    /// @param decision A decision other than `Serve`.
+    /// @return What this surface does about it.
+    [[nodiscard]] constexpr CacheRefusalPolicy CachePrePayloadPolicy(CompileCacheWire::PrePayloadDecision decision) noexcept
+    {
+        switch (decision)
+        {
+            case CompileCacheWire::PrePayloadDecision::PayloadTooLarge:
+                // **The arm #491 names.** Twenty-four bytes and no body is the cheapest
+                // probe there is, and the surface-wide frame ceiling on a node holding
+                // a tier is this cache's -- so an operator alerting on the compile
+                // surface's series watches a flat graph while the port is hammered.
+                //
+                // The position this replaces -- that the framing arms are "already
+                // visible as such to the peer" -- answers a question nobody asked:
+                // #491's scenario is a client sending oversized declarations on
+                // purpose, so the peer IS the attacker and its visibility is not the
+                // property anyone needs.
+                return { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedPayloadTooLarge, .rationale = {} };
+            case CompileCacheWire::PrePayloadDecision::UnknownOpcode:
+                return { .counter = std::nullopt,
+                         .rationale = "MergedResponder owns a verb only when FamilyOf names its family, and an opcode "
+                                      "with no OpTable row is Unset -- so an unknown one is answered UnservedReply at "
+                                      "the door and never reaches this surface" };
+            case CompileCacheWire::PrePayloadDecision::Unauthenticated:
+                return { .counter = std::nullopt,
+                         .rationale = "AuthRequired() is false here by decision (#287, #290), and DecidePrePayload "
+                                      "yields this only for a surface that requires a credential" };
+            case CompileCacheWire::PrePayloadDecision::Serve:
+                break;
+        }
+        // Unreachable by contract, as `ErrorCodeFor`'s own `Serve` arm is: the endpoint
+        // asks this only for a decision that refused. Closed rather than left to fall
+        // off the end, and closed UNCOUNTED, because inventing an event for a request
+        // that was served is the one wrong answer available here.
+        return { .counter = std::nullopt, .rationale = "Serve is not a refusal and the endpoint never asks about it" };
+    }
 
     /// What the SCHEDULER surface answers each endpoint-decided refusal with.
     ///
@@ -424,37 +561,35 @@ class CacheResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::RefusalReply
     ///
-    /// **Undecided, not decided.** The position this used to state -- that the size
-    /// and opcode arms are "already visible as such to the peer" -- answers a question
-    /// nobody asked: #491's scenario is a client hammering a cache-tier node with
-    /// oversized declarations while an operator watches a flat graph, so **the peer is
-    /// the attacker** and visibility to it is not the property anyone needs. That is
-    /// one of the arms #491 was filed to rule on, so it says so rather than claiming
-    /// the ruling.
+    /// **The frame ceiling is counted here and nowhere else** (#491). Which arm each
+    /// decision takes, and the argument for it, is
+    /// `Detail::CachePrePayloadPolicy` -- one place, beside the other arm's table,
+    /// rather than a `switch` in this method where "no counter" and "no case" would
+    /// read the same.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
-        return Cc::RefuseUntriaged({ .code = CompileCacheWire::ErrorCodeFor(decision), .issue = Detail::CacheSurfaceTriage },
-                                   detail);
+        return Detail::AnswerCacheRefusal(
+            _metrics, CompileCacheWire::ErrorCodeFor(decision), Detail::CachePrePayloadPolicy(decision), detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
     ///
-    /// **Undecided, and the byte budget is why.** Calling it "a transient the peer
-    /// retries past" is the OPPOSITE of what #491 records: `MaxInFlightBytes()` folds
-    /// to the largest owner, in practice this cache, so the byte-budget refusal a real
-    /// node actually reaches is THIS one. #491 names it as the uncounted arm that
-    /// fires, which is #326's scenario one surface over.
-    ///
-    /// The credential arms genuinely are unreachable here -- this surface requires no
-    /// credential, so `AUTH` never routes to it -- but they share the one answer, and
-    /// an arm that cannot fire is not a reason to call the arm that does decided.
+    /// **The byte budget is counted here** (#491), because it is the one a node with a
+    /// cache tier actually reaches: the endpoint's in-flight ceiling folds to the
+    /// largest owner's, which is this cache's, so a `STORE` is what runs into it.
+    /// `Detail::CacheEndpointRefusals` carries that and the two credential arms, which
+    /// `MergedResponder` routes to the scheduler and this surface therefore never
+    /// sees.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        return Cc::RefuseUntriaged({ .code = ErrorCodeFor(refusal), .issue = Detail::CacheSurfaceTriage }, detail);
+        return Detail::AnswerCacheRefusal(_metrics,
+                                          ErrorCodeFor(refusal),
+                                          Detail::CacheEndpointRefusals[static_cast<std::size_t>(refusal)].policy,
+                                          detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout

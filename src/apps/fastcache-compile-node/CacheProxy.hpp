@@ -4,6 +4,7 @@
 #include "LocalCache.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -42,8 +43,14 @@ class CacheProxy
 {
   public:
     /// @param cache The node's read-through tier; must outlive this.
-    explicit CacheProxy(LocalCache& cache) noexcept:
-        _cache { cache }
+    /// @param metrics Where this tier's refusals are counted; must outlive this.
+    ///        Injected rather than reached for, because a refusal answered while
+    ///        nothing rises is a probed port that looks unused (#326, #491) -- and
+    ///        because `Cc::Refuse` takes a sink, so there is no way to spell a counted
+    ///        refusal without one.
+    CacheProxy(LocalCache& cache, IMetricsSink& metrics) noexcept:
+        _cache { cache },
+        _metrics { metrics }
     {
     }
 
@@ -55,6 +62,7 @@ class CacheProxy
 
   private:
     LocalCache& _cache;
+    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Node
