@@ -27,14 +27,14 @@ namespace
     /// the same forcing function pointing the other way -- the author cannot write the
     /// call without answering "would a rise here mean something happened".
     ///
-    /// **The test, so a NEW arm can be classified without reading these eight.** A
-    /// refusal is counted when a rise in it names something an operator would go and
-    /// do something about; it is uncounted when a rise would be *ordinary traffic*,
-    /// when the arm cannot fire at all, or when the same event is already counted
-    /// somewhere better placed to see it. An arm nobody has applied the test to yet is
-    /// neither: it is `Cc::RefuseUntriaged` with the issue that will decide it, which
-    /// `worker-refusals-counted` tallies and prints on every run, and which fails the
-    /// build outright when no issue can be resolved for the file.
+    /// **The test, so a NEW arm can be classified without working backwards from the
+    /// arms below.** A refusal is counted when a rise in it names something an
+    /// operator would go and act on; it is uncounted when a rise would be *ordinary
+    /// traffic*, when the arm cannot fire at all, or when the same event is already
+    /// counted somewhere better placed to see it. An arm nobody has applied the test
+    /// to yet is neither: it is `Cc::RefuseUntriaged` carrying the issue that will
+    /// decide it, which `worker-refusals-counted` tallies and prints on every run,
+    /// and which fails the build outright when no issue can be resolved for the file.
     namespace TierRefusal
     {
         /// A request at a wire version this build cannot decode.
