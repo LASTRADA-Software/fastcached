@@ -18,6 +18,9 @@
 #include <string_view>
 #include <vector>
 
+using namespace FastCache;
+using namespace FastCache::Node;
+
 /// Every `fastcache-compile-node` command line the documentation shows must be one
 /// the binary would actually start on.
 ///
@@ -48,13 +51,26 @@
 /// about the whole configuration rather than the part that happened to be spelled
 /// out.
 ///
-/// ## What it cannot see
+/// ## What it cannot see, measured rather than assumed
 ///
-/// Anything past the startup policy: a flag whose *value* is wrong in a way only a
-/// running node discovers, a path that does not exist, a port already held. Those
-/// are properties of a machine rather than of a command line, and a check that
-/// tried to have opinions about them would fail on every developer's box for
-/// reasons the documentation cannot fix.
+/// **Refusals that are not in the table.** This runs `StartupPolicyRejection`, so a
+/// cross-flag rule enforced anywhere else is invisible to it. That is not
+/// hypothetical: run against the pre-fix documentation this check reports SIX of the
+/// seven defects, and misses `tools.md:1099` entirely, because `--scheduler is
+/// required` is refused in `main.cpp` rather than by the table
+/// ([#585](https://github.com/LASTRADA-Software/fastcached/issues/585)). Its
+/// install-time twin IS a table row, which is how the two came to disagree. So the
+/// check's coverage is exactly the table's, and it grows when the table does.
+///
+/// That is also why the six were verified by RUNNING them before this existed. A
+/// table check and a spawn answer different questions, and the one that found the
+/// seventh defect was the spawn.
+///
+/// **Anything past the startup policy**: a flag whose *value* is wrong in a way only
+/// a running node discovers, a path that does not exist, a port already held. Those
+/// are properties of a machine rather than of a command line, and a check that tried
+/// to have opinions about them would fail on every developer's box for reasons the
+/// documentation cannot fix.
 namespace
 {
 
@@ -186,6 +202,26 @@ struct FoundCommand
     return out;
 }
 
+/// Whether @p text is the node being INVOKED, rather than the node speaking.
+///
+/// `fastcache-compile-node: this node does not lead the cluster; ask ...` is an
+/// error message the binary prints, quoted in a fenced block so a reader
+/// recognises it. A `starts_with` on the program name alone matched it and
+/// reported the documentation as broken -- the check accusing its subject when
+/// the instrument was wrong, which is the failure this whole file exists to
+/// prevent one level down. The colon is what separates the two: a program name
+/// followed by anything but whitespace is not a command.
+/// @param text A trimmed line from a fenced block.
+/// @return True when it invokes the node.
+[[nodiscard]] bool IsInvocation(std::string_view text)
+{
+    constexpr std::string_view Program = "fastcache-compile-node";
+    if (!text.starts_with(Program))
+        return false;
+    auto const rest = text.substr(Program.size());
+    return rest.empty() || (std::isspace(static_cast<unsigned char>(rest.front())) != 0);
+}
+
 /// Every `fastcache-compile-node` invocation inside a fenced block of @p path.
 ///
 /// Backslash continuations are joined, and the reported line is the one the command
@@ -216,7 +252,7 @@ struct FoundCommand
         for (auto const prefix: { std::string_view { "$ " }, std::string_view { "# " } })
             if (trimmed.starts_with(prefix))
                 trimmed.remove_prefix(prefix.size());
-        if (trimmed.starts_with("fastcache-compile-node"))
+        if (IsInvocation(trimmed))
             found.push_back(FoundCommand { .page = std::string { page },
                                            .line = pendingLine,
                                            .command = std::string { trimmed } });
@@ -313,7 +349,7 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
                 failures.push_back(std::format("{}:{}: does not parse: {}\n    {}",
                                                found.page,
                                                found.line,
-                                               parsed.error().message,
+                                               parsed.error().ToString(),
                                                found.command));
                 continue;
             }
