@@ -943,19 +943,27 @@ re-measuring rather than citing forward:
 | `push` on master | 23 | 109.8 | 22.7 | 27.0 | `clang-tidy`, full sweep (23 of 23) |
 
 **Runner-minutes and wall clock are different questions and the answer differs by
-which you asked.** Landing one change costs **326.1 runner-minutes** — all three
-rows — but only the top two rows are on the path from "ready" to "merged", because
-the master `push` fires AFTER the merge. So the CI wall clock a contributor waits
-through is **24.1 + 31.7 = 55.8 minutes**, and the push's 109.8 runner-minutes buy
-**zero** merge latency. A lever that removes cheap parallel jobs buys minutes and
-no latency; one that shortens the longest job buys both. Say which you are
-selling.
+which you asked.** Landing one code change costs **326.1 runner-minutes** — the
+`pull_request` code-touching row plus `merge_group` plus `push`, named rather than
+counted off by position, since the docs-only row sits between them and a reader
+following "the top two rows" arrives at 24.1 + 1.1. Only the first two of those
+three are on the path from "ready" to "merged", because the master `push` fires
+AFTER the merge. So the CI wall clock a contributor waits through is
+**24.1 (`pull_request`) + 31.7 (`merge_group`) = 55.8 minutes**, and the push's
+109.8 runner-minutes buy **zero** merge latency. A lever that removes cheap
+parallel jobs buys minutes and no latency; one that shortens the longest job buys
+both. Say which you are selling.
 
 The other thing the older figures did not carry: **on a pull request the sweep is
-bimodal, not average.** Over 19 sampled pull-request sweeps, 11 were diff-scoped
-(0.0–8.4 min) and 8 escalated to a full sweep (21.8–25.5). The mean of 12.8
-describes none of them, and any prediction from it is a prediction about a run
-that does not happen.
+bimodal, not average.** Over 19 pull-request sweeps whose per-STEP timings were
+pulled — a subset of the 36 runs above, because the step sample was collected
+separately and is not the row's denominator — 11 were diff-scoped (0.0–8.4 min) and
+8 escalated to a full sweep (21.8–25.5). That 8-of-19 escalation rate and the row's
+`clang-tidy`-is-longest count of 18-of-36 are two different questions over two
+different samples and do not have to agree; neither is the other's check. The mean
+of 12.8 describes no run in either, and any prediction from it is a prediction about
+a run that does not happen — including the projection three bullets below, which
+makes it anyway and says so there.
 
 - **The `push` on master is LOAD-BEARING, and it is the only full `clang-tidy`
   sweep left.** It reads like the workflow's most obviously redundant run and was
@@ -1004,14 +1012,18 @@ that does not happen.
   the second half is still unpriced; what settles the trade today is the bullet
   above it rather than this number.
 
-- **The merge queue diff-scopes the `clang-tidy` sweep; only the master `push`
-  sweeps everything.** The step was `--all` for every event but a pull request, so
-  the workflow's critical path was the same full sweep three times per landed
-  change. Measured on the 99-run sample above: the `Sweep` step costs **22.50 min**
-  in the queue against **12.80** on a pull request, in a job whose entire fixed
-  overhead — checkout, apt, configure, the scope self-test — is **0.9 min**. So the
-  sweep *is* the job, and the queue was paying for the same 497 translation units
-  the push was about to walk again.
+- **A pull request and a merge-queue entry diff-scope the `clang-tidy` sweep;
+  every other event sweeps everything, which today means the master `push`.** The
+  step was `--all` for every event but a pull request, so the workflow's critical
+  path was the same full sweep three times per landed change. Measured on the 99-run
+  sample above: the `Sweep` step costs **22.50 min** in the queue against **12.80**
+  on a pull request, in a job whose remaining steps — checkout, apt, configure, the
+  scope self-test — come to about **a minute**. So the sweep *is* the job, and the
+  queue was paying for the same 497 translation units the push was about to walk
+  again. That last figure is a difference between a job mean and a step mean drawn
+  from two samples, which the header of this section says not to reconcile to the
+  tenth; it is quoted to an order of magnitude for that reason and nothing rests on
+  its precision.
 
   Applying the pull request's scoping to the queue takes it from 113.6 to **104.0**
   runner-minutes, its longest job from 23.5 to **15.0**, and its wall clock from
@@ -1019,18 +1031,51 @@ that does not happen.
   only lever anyone has found that moves that number by more than a couple of
   minutes. Per change, 326.1 → 316.5 runner-minutes.
 
+  **Those four numbers are the prediction this section forbids, made deliberately
+  and with its bias named.** They substitute the pull request's 12.80 sweep mean
+  into the queue, and that mean describes no run: the distribution is bimodal, so
+  the queue after this change is a mixture of ~1-minute entries and ~23-minute ones,
+  not a population of 15-minute ones. The bias has a direction, and it is
+  optimistic — a queue entry can batch several pull requests and escalates if *any*
+  member touches a `SweepEverythingWhen` path, so its escalation rate is at least the
+  pull request's 8-of-19 and 12.80 is an under-estimate for it. It is used because
+  nothing better exists before the change lands. **Re-measure after merging**; until
+  then read these as a direction with a floor, not as figures.
+
   **What it stops checking, and where that is still caught.** In the queue: findings
   in translation units the change cannot reach. Still caught by the master push's
   `--all`, and the union is complete — master@N proved fully clean, plus a scope
   that over-approximates everything a change can reach, covers master@N+1.
 
+  **Both halves of that are wiring, and wiring is asserted** (`ctest -R
+  tidy-sweep-scope`). Take the `--all` off the push and every run in this repository
+  stays green while the analysis is permanently narrower than this bullet claims:
+  no failing check, no slower job, no log line, just a confident count over fewer
+  translation units — the failure `tidy-sweep.sh` exists to prevent one level down,
+  reached one level up. Delete the report step and the full sweep still runs, still
+  fails and still reaches nobody. So the check reads the workflow for four things:
+  that `--all` is passed and passed on `push` (and by naming that event rather than
+  negating another, which is the shape that silently re-widens when a fifth trigger
+  is added), that a queue entry diffs against its own `base_sha`, that some step
+  reads the sweep STEP's conclusion for `refs/heads/master`, and that the job grants
+  the `issues: write` without which that reader is decorative. Each is driven red on
+  a synthetic workflow by `--self-test`, in both directions, because a guard nobody
+  has seen bite is a guard that has told you nothing.
+
   **The residual is narrower than it first reads, and the narrowing is the part that
   matters.** A clang-tidy finding depends on a translation unit's own sources and its
   include closure, both of which the scope covers; `SweepEverythingWhen` covers the
-  changes that alter how every unit is read. So no *code change* can plant a finding
-  outside its own scope. What is left is the analyser drifting under us — apt.llvm.org
-  publishing a new `clang-tidy-22` — which the diff-scoped PULL REQUEST sweep could
-  never have caught either, and which a deliberate version bump escalates anyway
+  changes that alter how every unit is read. So a *code change* plants a finding
+  outside its own scope only where the scope under-approximates, and `tidy-sweep.sh`
+  names its one such direction in its own header: an include spelling that resolves
+  to no first-party file is taken for a system header and dropped. That is a real
+  gap and it is not new — the diff-scoped pull-request sweep has always had it — but
+  it is why this reads "only where the include graph is complete" rather than "never".
+
+  What is left beyond that is the analyser drifting under us — apt.llvm.org publishing
+  a new `clang-tidy-22`. The diff-scoped PULL REQUEST sweep catches such drift only
+  where it lands inside the scope it already sweeps, which is a fraction of it and was
+  a fraction of it before this change too; a deliberate version bump escalates anyway,
   because `CLANG_TOOLS_VERSION` lives in `build.yml`, itself a `SweepEverythingWhen`
   row. Drift therefore surfaces at the master push, and failing that at the next
   pull request whose change escalates — 8 of 19 sampled, so hours rather than weeks.
@@ -1053,17 +1098,43 @@ that does not happen.
   back to 2026-06-10 sit at `run_attempt: 1`**, never once re-run. That last one is
   not proof nobody read them, and it is 18 for 18 of nobody acting.
 
-  So the sweep's own failure opens or updates one issue — and the shape of that is
-  the whole point. It keys on `steps.sweep.conclusion`, never on the job's
-  `failure()`. **Over those same 18 failed master-push runs** — one window, one
-  denominator — a notifier on any failing job fires **18 times**, almost all of it
-  infrastructure (the apt 403 of #550, macOS runner flakes, a sanitizer timeout),
-  and `clang-tidy` was the failing job in exactly **one** of them. That is the whole
-  comparison; a rate over "push runs" would need a third window and is not what
-  decides it. The test a new alarm has to pass here is whether a firing means
-  something happened, which is the test that withdrew a counter in #447.
+  **And the remedy does not get to skip that test.** An issue opened by
+  `github-actions[bot]` reaches a person only if somebody queries the label —
+  GitHub's default "Participating and @mentions" does not notify on a bot-opened
+  issue — so the reader this bullet installs is *asserted*, on the same evidence
+  standard the bullet just refused to accept: none. It is a strictly better place
+  for the signal than a run log nobody opens, because `status/needs-triage` is a
+  query this repository already runs, and it is not a measured improvement. If the
+  issue sits untouched, that is the same finding one level up and the answer is a
+  louder channel, not a second unmeasured one.
 
-  One issue, reopened by comment. Keyed on the **title**, read out of a `--label`
+  So the sweep's own failure opens or updates one issue — and the shape of that is
+  the whole point. It keys on `steps.sweep.conclusion` **in addition to** the
+  `failure()` status function, never on the job's result alone; `failure()` is not
+  redundant and removing it gives a step that never runs at all, because GitHub
+  skips every step after a failed one unless a status function says otherwise. **Over those same 18 failed master-push runs** — one window, one
+  denominator — a notifier on any failing job fires **18 times**, and `clang-tidy`
+  was the failing job in exactly **one** of them. The margin is wider than that one
+  suggests, and the direction is worth having exactly rather than roughly: in that
+  single run the failing STEP was `Test`, in the job's pre-split shape, so the
+  step-keyed condition that ships here would have fired **zero** times across the
+  whole window. 18 against 0, not 18 against 1. That is the whole comparison; a rate
+  over "push runs" would need a third window and is not what decides it, and what
+  those 18 failures were *about* was not classified run by run — the count is what
+  the argument rests on, not a characterisation of the causes. The test a new alarm
+  has to pass here is whether a firing means something happened, which is the test
+  that withdrew a counter in #447.
+
+  Zero firings is also the weaker half of the evidence and is not offered as more:
+  it says the alarm is quiet, not that it is sensitive. What makes it sensitive is
+  that the condition was watched firing on a forced failure (PR #561, run
+  `33677107395`) with a negative control keyed on a passing step skipped beside it.
+
+  One OPEN issue, updated by comment — the lookup is `--state open`, so a report
+  somebody closed is not found and the next failure opens a fresh one. That is
+  wanted (a closed report means it was dealt with) and is not what "reopen" would
+  promise, so the word is avoided: commenting on a closed issue does not reopen it.
+  Keyed on the **title**, read out of a `--label`
   listing rather than a `--search`: search goes through GitHub's issue index, which
   lags creation, so two master pushes failing inside that window would each find
   nothing and each open one. The labels are `CONTRIBUTING.md`'s own — a private
@@ -1307,10 +1378,16 @@ that does not happen.
   mostly a runner-minutes lever and barely a latency one, because `clang-tidy` is
   the longest pull-request job in 18 of 36 runs and remains so afterwards. What
   changed is where the interesting instance is: with the queue's sweep diff-scoped,
-  **`Code coverage` at 14.0 min is now the longest job in the merge queue**, which
-  is on the merge path in a way the pull-request copy never was. Anyone reopening
-  this should reopen it there. The `package-macos` merits are unchanged and still
-  decide it.
+  **`Code coverage` at 14.0 min is the job most often longest in the merge queue**,
+  which is on the merge path in a way the pull-request copy never was. Anyone
+  reopening this should reopen it there. The `package-macos` merits are unchanged
+  and still decide it.
+
+  Read 14.0 against the 15.0 projected two sections above as *the usual winner*
+  against *the mean of the maxima*, not as two answers to one question. A bimodal
+  sweep is longest in the minority of entries where it escalates and is a minute in
+  the rest, so the mean longest job can exceed the job that is usually longest, and
+  both numbers are projections carrying the bias named there.
 
 - **The merge queue's wall clock sits 8.2 min above its longest job, and that gap
   is runner acquisition, not the `changes` gate.** Worth knowing before anyone

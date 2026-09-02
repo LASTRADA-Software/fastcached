@@ -388,9 +388,15 @@ jobs:
       contents: read
       issues: write
     steps:
-      # fetch-depth: 0 is load-bearing here for a second reason beyond the one
-      # at the top of this file: the sweep diffs against the pull request's base
-      # branch, and a base ref it cannot resolve escalates it to a full sweep.
+      # fetch-depth: 0 is load-bearing here for a second reason beyond the one at
+      # the top of this file: the sweep diffs against a base it must be able to
+      # resolve, and a base it cannot resolve escalates it to a full sweep. Two
+      # bases since #554 — the pull request's base BRANCH, and a queue entry's
+      # `merge_group.base_sha`, a bare COMMIT. The second is what makes the depth
+      # matter rather than merely help: a shallow clone of
+      # `gh-readonly-queue/master/pr-N-<sha>` would not contain that commit, and
+      # the escalation would then hide the regression as a permanently full sweep
+      # in the queue — the cost this change exists to remove, restored silently.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -454,12 +460,25 @@ jobs:
       - name: "Self-test the sweep's scope computation"
         run: scripts/tidy-sweep.sh --self-test
 
-      # `--all` on the PUSH only; the queue diff-scopes like a pull request. Why
-      # that is sound, what it costs and what it buys are one bullet in *What CI
-      # costs* in `.agent/rules/build-and-toolchain.md` — pointed at rather than
-      # summarised, because the last two figures written down in this file went
-      # stale while reading as current fact. What is here is only what a reader
-      # AT THIS STEP cannot get from there.
+      # A pull request and a merge-queue entry diff-scope; everything else sweeps
+      # everything, which today is the `push` and nothing else. Why that is sound,
+      # what it costs and what it buys are one bullet in *What CI costs* in
+      # `.agent/rules/build-and-toolchain.md` — pointed at rather than summarised,
+      # because the last two figures written down in this file went stale while
+      # reading as current fact. What is here is only what a reader AT THIS STEP
+      # cannot get from there.
+      #
+      # The guard NAMES THE TWO DIFF-SCOPED EVENTS and excludes them, rather than
+      # naming `push` and including it, and the difference is which way an
+      # unforeseen trigger falls. `on:` is contemplated growing — the comment above
+      # this job says a nightly is *deliberately* not a third trigger — and under an
+      # `== 'push'` guard a `schedule:` or a `workflow_dispatch:` added later would
+      # diff-scope against `origin/master`. On master that diff is EMPTY, so the
+      # sweep prints `no source changed` and exits 0: a green check that analysed
+      # nothing, which is the verdict `tidy-sweep.sh`'s own header exists to make
+      # impossible. Spelled as an exclusion, a trigger nobody thought of gets the
+      # full sweep — slow, never wrong, and `ci-scope.sh`'s principle rather than
+      # its inverse. `ctest -R tidy-sweep-scope` refuses the inclusive spelling.
       #
       # BASE in a queue is the event's own `base_sha`, which is the head of the
       # entry AHEAD of this one, not master: the queue stacks, and the branch names
@@ -486,12 +505,18 @@ jobs:
       # wrong answer is a required context reporting green over code nothing
       # compiled, and its stated reason is that it will not reason about a batch
       # shape GitHub chooses. This decides how WIDE one analysis is, over a tree
-      # that is being fully built either way, and it does not have to reason about
-      # the batch shape because being wrong about it escalates.
+      # that is being fully built either way, and the only way of being wrong about
+      # the batch shape that this step can PRODUCE is a base it cannot resolve,
+      # which escalates. Not the general claim that being wrong escalates — the
+      # paragraph above says exactly where that stops holding.
       #
       # `github.base_ref` is empty on a push, where `--all` is passed anyway and
-      # BASE is never read. Defaulted rather than left as `origin/` so the two
-      # expressions on this step do not have to agree to be correct.
+      # BASE is never read. It is ALSO empty on a `merge_group`, where `--all` is
+      # not passed — so the `format(...)` fallback is what a missing or renamed
+      # `merge_group.base_sha` lands on there, and it lands on `origin/master`,
+      # which resolves and over-approximates. That is the whole reason the default
+      # is `master` rather than a bare `origin/`: the two expressions on this step
+      # do not have to agree to be correct.
       - name: "Sweep"
         id: sweep
         env:
@@ -500,7 +525,7 @@ jobs:
           BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || format('origin/{0}', github.base_ref || 'master') }}
         run: >-
           scripts/tidy-sweep.sh
-          ${{ github.event_name == 'push' && '--all' || '' }}
+          ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') && '--all' || '' }}
 
       # The step above is now the only full sweep, and a master push blocks nothing
       # and reaches nobody — measured three ways, recorded in the same rulebook
@@ -508,17 +533,25 @@ jobs:
       # onto that path means putting a reader on it.
       #
       # `steps.sweep.conclusion` rather than the job's `failure()`, and that is the
-      # difference between a signal and a thing people mute: on the sampled runs
-      # `failure()` alone fires 18 times, almost all of it infrastructure, and this
-      # fires once. `failure()` itself is NOT redundant and must not be removed —
-      # it is the status function that lets the step run at all after a failed one.
+      # difference between a signal and a thing people mute: over the sampled runs
+      # `failure()` alone fires 18 times and this fires none. The margin is in the
+      # rulebook bullet with the sample that produced it; what belongs here is that
+      # the discriminator is the STEP. `failure()` itself is NOT redundant and must
+      # not be removed — it is the status function that lets the step run at all
+      # after a failed one.
       #
       # `refs/heads/master` because `on: push` also carries `fix-ci`, which exists
       # for deliberately breaking CI, and the release tags, where `--all` running
       # green is not news.
       #
-      # One issue, reopened by comment rather than replaced — a fresh issue per
-      # push is the same noise problem in another medium. Found by its TITLE, which
+      # One OPEN issue, updated by comment rather than replaced — a fresh issue per
+      # push is the same noise problem in another medium. The lookup is
+      # `--state open`, so this is deliberately not "reopened": a report somebody
+      # closed is not found, and the next failure opens a fresh one. That is the
+      # wanted behaviour — a closed report means the finding was dealt with, and a
+      # later failure is later news — but it is the opposite of what the word
+      # "reopen" would promise, and commenting on a closed issue does not reopen it
+      # anyway. Found by its TITLE, which
       # both the lookup and the create read out of the step's own `TITLE` env var,
       # so they cannot drift apart without one edit changing both. Not by a label
       # of its own:
@@ -535,6 +568,10 @@ jobs:
         if: ${{ failure() && steps.sweep.conclusion == 'failure' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # Stated rather than inferred from the checkout's remote, which is how
+          # `issue-triage.yml` does it and is one `working-directory` away from
+          # resolving to nothing.
+          GH_REPO: ${{ github.repository }}
           TITLE: "clang-tidy: the full sweep on master is failing"
         run: |
           set -euo pipefail
