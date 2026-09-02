@@ -814,12 +814,19 @@ TEST_CASE("A prefix-map value with no replacement is relativized rather than ref
     REQUIRE(out.size() == 1);
     CHECK(out[0] == "-fdebug-prefix-map=<SRCROOT>/");
 
-    // The split follows the driver rather than being convenient: GNU splits at
-    // the LAST separator, so `<from>` may carry one and `<to>` may not. Here that
-    // makes the driver's own `<from>` `/home/ci/checkout-aaa=/a`, which is not
-    // under the root -- `IsSegmentPrefix` needs a separator after it, not an `=` --
-    // so the argument comes back unchanged. That is the same answer the compiler
-    // gives, which is the point of splitting where it splits.
+    // The split follows GCC, which cuts at the LAST separator, so `<from>` may
+    // carry one and `<to>` may not. Here that makes the isolated `<from>`
+    // `/home/ci/checkout-aaa=/a`, which is not under the root -- `IsSegmentPrefix`
+    // needs a separator after it, not an `=` -- so the argument comes back
+    // unchanged.
+    //
+    // Clang cuts at the FIRST separator instead (measured with a directory named
+    // `a=b`), so for a root that itself contains one the launcher isolates a
+    // different half than clang uses. What that costs is a MISS: the head lies
+    // under no root either way, the argument is unchanged, and two checkouts key
+    // apart. It is asserted here so the disagreement is recorded rather than
+    // rediscovered, and so nobody "fixes" the split to the other driver without
+    // seeing that both directions are wrong for one of them.
     auto const withEquals =
         Relativize({ std::string { "-fdebug-prefix-map=/home/ci/checkout-aaa=/a=b" } }, "/home/ci/checkout-aaa");
     REQUIRE(withEquals.size() == 1);

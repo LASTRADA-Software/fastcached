@@ -1192,9 +1192,44 @@ stops being one — the same confound that cost #493 a re-run.
   as working. **Relative does not imply checkout-independent**; the test asserts
   that property separately from the expected values, because a table can be edited
   to agree with wrong code.
-- **The build tree is mapped FIRST.** GCC and Clang take the first matching rule,
-  and this project's build tree lives *inside* the source tree
-  (`out/build/<preset>`), so source-first would swallow every build-tree path.
+- **The build tree is mapped LAST, and no object comparison can check that.** GCC
+  and Clang honour the **last** matching rule — measured off `DW_AT_comp_dir` on
+  gcc 14 and clang 20, not inferred, after this rulebook and the code both said
+  the opposite for three commits. Build-first leaves `comp_dir` as
+  `../../../out/build/<name>`; source-first gives `.`. Both are
+  checkout-independent, so two checkouts still produce byte-identical objects and
+  every e2e reads green either way. What the wrong order costs is narrower and
+  sharper: two machines whose build trees sit at the same depth under different
+  NAMES (`out/build/gcc-release` against `out/build/ci-release`) relativize to one
+  key — both flags tokenize to the same canonical text — while their objects
+  differ. That is the #203 symptom reappearing inside the fix for it, and the only
+  instrument that sees it is reading `comp_dir` directly.
+- **Only the DEBUG spelling is in the table.** `-fmacro-prefix-map` and
+  `-ffile-prefix-map` rewrite `__FILE__`, which lands in the preprocessed text the
+  key hashes — measured on both drivers with the source named absolutely, where
+  `-fdebug-prefix-map` leaves that text byte-identical and the other two do not.
+  A row for either would make the flag dropped from the preprocess line (every
+  role but `IncludeDir` is), so the key would hash text the real compile does not
+  produce, and a dispatched compile would bake the UNMAPPED `__FILE__` into an
+  object stored under the same key a locally mapped one uses. Unrecognised, they
+  reach the key verbatim and two checkouts miss — the safe direction, and the
+  behaviour that was already there.
+- **A root with a SPACE is not mapped, and that is a refusal.** The rules are
+  spliced into `CMAKE_<LANG>_FLAGS`, which is space-separated, so a rule naming
+  `/Users/john doe/proj` reaches the driver as two arguments and every compile
+  dies with `invalid argument '/Users/john' to '-fdebug-prefix-map'` — measured.
+  `check_compiler_flag` cannot catch it, because it probes a synthetic `/a=/b`.
+- **The two drivers disagree about where `<from>=<to>` splits, and neither answer
+  is right for both.** Measured with a directory named `a=b`: gcc cuts at the last
+  separator, clang at the first. The launcher follows gcc. Reachable only when a
+  mapped root itself contains a separator, and it costs a MISS rather than a
+  mis-serve — the head the launcher isolates lies under no root either way.
+- **A dispatched compile is not covered.** `RemoteCompileArgs` drops every
+  path-valued flag, so a worker never receives the mapping: a fleet-built object
+  carries the worker's scratch directory as its compilation directory, under the
+  same key a locally mapped one uses. Stated rather than claimed away, the way the
+  COFF residue is; forwarding the flag needs the client's root to travel with the
+  job.
 - **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
   hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
   module is included from a `project()` that lists CXX first — so the first run

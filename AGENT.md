@@ -184,8 +184,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   no debug flag at all** — `.debug$S`'s `S_OBJNAME` holds the absolute object path, so
   `/Z7` widens this and does not open it. `-fdebug-prefix-map` closes it on ELF and on
   NEITHER COFF driver; that residue is an accepted cost, not open work. Never
-  `-ffile-prefix-map`: `__FILE__` is self-protecting, since the preprocessor expands it
-  into the text the key hashes raw. And the flag names the producing root BY
+  `-ffile-prefix-map`, which rewrites `__FILE__` INTO the text the key hashes -- and for
+  that reason it and `-fmacro-prefix-map` get no table row either, or the key hashes text
+  the compile never produced. The build-tree rule is mapped LAST (both drivers honour the
+  LAST match, measured off `DW_AT_comp_dir`); a root with a SPACE is not mapped at all,
+  since the rules are spliced into a space-separated flags string; and a DISPATCHED
+  compile is not covered, because `RemoteCompileArgs` drops every path-valued flag. And the flag names the producing root BY
   CONSTRUCTION, so the key relativizes its head (`PathValueRole::PrefixMap`) and leaves
   the replacement literal — two machines mapping differently must MISS. Relative is not
   checkout-independent: `file(RELATIVE_PATH)` answers `../../mnt/d/.../checkout`

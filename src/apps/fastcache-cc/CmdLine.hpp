@@ -245,10 +245,12 @@ struct PathValueFlag
     /// whose value carries a tail (`-fprofile-prefix-map`, a `<path>:<something>`
     /// spelling) is a row.
     ///
-    /// The LAST occurrence is the split point, because that is where GNU splits
-    /// `-fdebug-prefix-map=old=new`: `old` may contain the separator and `new` may
-    /// not. Following the driver rather than being convenient is what makes the
-    /// launcher agree with the compiler about which part is a path.
+    /// The LAST occurrence is the split point, which follows GCC. There is no
+    /// answer that satisfies both drivers in the family: measured with a directory
+    /// named `a=b`, gcc cuts `-fdebug-prefix-map=<dir>/a=b=ZZZ` at the last
+    /// separator and clang at the first. Reachable only when a mapped root itself
+    /// contains one, and it costs a MISS rather than a mis-serve -- the head the
+    /// launcher isolates lies under no root, so the argument comes back verbatim.
     char valueTailSeparator { '\0' };
 };
 

@@ -352,21 +352,26 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 15> PathValues { {
-        // The prefix-map family first, being the longest spellings. All three are
-        // GNU-only: `cl` has no path-map switch at all, and clang-cl accepts
-        // `-ffile-prefix-map` while ignoring it for the records that matter --
-        // measured, an object built with it still differs cross-root by the same
-        // 23 bytes in `S_OBJNAME` and the embedded `-cc1` line.
+    constexpr std::array<PathValueFlag, 13> PathValues { {
+        // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
+        // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
+        // while ignoring it for the records that matter -- measured, an object
+        // built with it still differs cross-root by the same 23 bytes in
+        // `S_OBJNAME` and the embedded `-cc1` line.
+        //
+        // ONLY the debug spelling, and the omission of `-fmacro-prefix-map` and
+        // `-ffile-prefix-map` is deliberate rather than an oversight. Every row
+        // here is dropped from the preprocess line unless its role is
+        // `IncludeDir`, and that is safe exactly when the flag cannot change
+        // preprocessed text. Measured on gcc 14 and clang 20, source named
+        // absolutely, `-E -P`: `-fdebug-prefix-map` leaves the text byte-identical,
+        // while the other two rewrite `__FILE__` in it. A row for either would
+        // therefore hash text the real compile does not produce -- and worse, a
+        // dispatched compile would bake the UNMAPPED `__FILE__` into an object
+        // stored under the same key a locally-mapped one uses. Unrecognised, they
+        // reach the key verbatim and two checkouts simply miss, which is the safe
+        // direction and is the behaviour that was already there.
         { .spelling = "-fdebug-prefix-map",
-          .role = PathValueRole::PrefixMap,
-          .families = DriverFamily::Gnu,
-          .valueTailSeparator = '=' },
-        { .spelling = "-fmacro-prefix-map",
-          .role = PathValueRole::PrefixMap,
-          .families = DriverFamily::Gnu,
-          .valueTailSeparator = '=' },
-        { .spelling = "-ffile-prefix-map",
           .role = PathValueRole::PrefixMap,
           .families = DriverFamily::Gnu,
           .valueTailSeparator = '=' },
@@ -833,13 +838,22 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
         auto const prefix = arg.substr(0, arg.size() - value.size());
 
         // A row that says its value carries a tail is split HERE, so no consumer
-        // re-derives where the path ends. At the LAST separator, because that is
-        // where the driver splits it: for `-fdebug-prefix-map=old=new` the `old`
-        // half may contain one and the `new` half may not. A value with no
-        // separator at all is malformed and the driver will say so -- it is
-        // reported as a bare path rather than refused, because the diagnostic
-        // belongs to the compiler and relativizing a root it is about to reject
-        // changes nothing.
+        // re-derives where the path ends.
+        //
+        // At the LAST separator, which follows GCC. The two drivers in this row's
+        // family DISAGREE and there is no answer that satisfies both -- measured
+        // with a directory literally named `a=b`:
+        // `-fdebug-prefix-map=<dir>/a=b=ZZZ` remaps to `ZZZ` under gcc and to
+        // `b=ZZZ=b` under clang, so gcc cuts at the last separator and clang at
+        // the first. The disagreement is unreachable unless a mapped root
+        // CONTAINS a separator, and it costs a MISS rather than a mis-serve: the
+        // head the launcher isolates then lies under no root, so the argument
+        // comes back verbatim and the two checkouts key apart.
+        //
+        // A value with no separator at all is malformed and the driver will say
+        // so -- it is reported as a bare path rather than refused, because the
+        // diagnostic belongs to the compiler and relativizing a root it is about
+        // to reject changes nothing.
         if (row.valueTailSeparator != '\0')
             if (auto const at = value.rfind(row.valueTailSeparator); at != std::string_view::npos)
                 return PathValueMatch {

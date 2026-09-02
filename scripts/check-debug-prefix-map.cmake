@@ -57,9 +57,9 @@ endif()
 # inside the checkout.
 set(Layouts
     # This project's own layout, and the one every preset produces.
-    "/co/src/out/build/gcc-release|/co/src|/co/src/out/build/gcc-release=.,/co/src=../../.."
+    "/co/src/out/build/gcc-release|/co/src|/co/src=../../..,/co/src/out/build/gcc-release=."
     # One level down, the shape most projects use.
-    "/co/src/build|/co/src|/co/src/build=.,/co/src=.."
+    "/co/src/build|/co/src|/co/src=..,/co/src/build=."
     # Out of tree on another mount. `file(RELATIVE_PATH)` answers
     # `../../mnt/d/co/src` here — relative, and carrying the entire checkout path,
     # so the source rule must be DROPPED rather than emitted.
@@ -73,7 +73,14 @@ set(Layouts
     "/co/src|/co/src|/co/src=."
     # A build tree whose name STARTS with `..`-ish text must not be mistaken for a
     # relative chain by a sloppier predicate.
-    "/co/src/..build|/co/src|/co/src/..build=.,/co/src=.."
+    "/co/src/..build|/co/src|/co/src=..,/co/src/..build=."
+    # A SPACE in either root maps NOTHING. The rules are spliced into a
+    # space-separated `CMAKE_<LANG>_FLAGS`, so one rule would arrive at the driver
+    # as two arguments and every compile would die with `invalid argument
+    # '/co/john' to '-fdebug-prefix-map'` -- measured. An empty expectation, which
+    # is why the rules field may be empty.
+    "/co/john doe/src/build|/co/john doe/src|"
+    "/co/src/b uild|/co/src|"
 )
 
 set(problems 0)
@@ -81,8 +88,15 @@ foreach(row IN LISTS Layouts)
     string(REPLACE "|" ";" fields "${row}")
     list(GET fields 0 binaryDir)
     list(GET fields 1 sourceDir)
-    list(GET fields 2 expectedRules)
-    string(REPLACE "," ";" expectedRules "${expectedRules}")
+    # `list(GET fields 2)` cannot reach a trailing EMPTY field -- `string(REPLACE)`
+    # produces no element for it -- so an empty expectation is spelled by the row
+    # having only three fields, and read as such.
+    list(LENGTH fields fieldCount)
+    set(expectedRules "")
+    if(fieldCount GREATER 2)
+        list(GET fields 2 expectedRules)
+        string(REPLACE "," ";" expectedRules "${expectedRules}")
+    endif()
     list(LENGTH expectedRules expectedRuleCount)
     set(expectedMapped OFF)
     if(expectedRuleCount GREATER 1)

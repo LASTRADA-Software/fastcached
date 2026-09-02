@@ -504,16 +504,20 @@ have. Nothing fails; the paths are simply somebody else's.
 `cmake/portable/CompileCache.cmake` enables a launcher it also appends
 
 ```
--fdebug-prefix-map=<build tree>=.
 -fdebug-prefix-map=<source tree>=<relative path from the build tree>
+-fdebug-prefix-map=<build tree>=.
 ```
 
-which makes the objects byte-identical across checkouts — measured on both
-drivers. The build tree is mapped first because GCC and Clang take the first
-matching rule and the build tree usually lives inside the source tree. The second
-rule is emitted only when the relative path back is a pure `../` chain; for an
-out-of-tree build it would otherwise carry the checkout's own path, and the
-configure says so rather than mapping to something that only looks portable:
+which makes the objects byte-identical across checkouts and `DW_AT_comp_dir`
+exactly `.` — both measured, on both drivers. The build tree is mapped **last**
+because GCC and Clang honour the *last* matching rule, and the build tree usually
+lives inside the source tree; the other order leaves `comp_dir` naming the build
+directory, which is still checkout-independent and therefore invisible to an
+object comparison, while two build trees at one depth under different names then
+share a key. The source rule is emitted only when the relative path back is a
+pure `../` chain; for an out-of-tree build it would otherwise carry the
+checkout's own path, and the configure says so rather than mapping to something
+that only looks portable:
 
 ```
 -- [cache] The source root is NOT mapped: the build tree lies outside it, so the
@@ -526,6 +530,26 @@ leaves the **replacement** literal, so two machines mapping to *different*
 replacements miss rather than exchange objects that disagree. The mapping has to
 be the same everywhere a cache is shared, and that is enforced by the key rather
 than left to a convention.
+
+`-ffile-prefix-map` and `-fmacro-prefix-map` are deliberately **not** recognised,
+and passing either costs cross-checkout sharing for that translation unit. They
+rewrite `__FILE__`, which lands in the preprocessed text the key hashes, so the
+launcher cannot relativize them without hashing text the real compile does not
+produce — and a dispatched compile would then bake the *unmapped* `__FILE__` into
+an object stored under the same key. Unrecognised, they reach the key verbatim
+and two checkouts simply miss, which is the safe direction.
+
+A root containing a **space** is not mapped at all: these rules are spliced into
+`CMAKE_<LANG>_FLAGS`, which is space-separated, so one rule would arrive at the
+driver as two arguments and every compile would fail. The configure says so.
+
+**A dispatched compile is not covered.** The flag is a path-valued argument, and
+`RemoteCompileArgs` drops every one of those before a job is sent, so a worker
+never receives it — an object built on the fleet carries the worker's scratch
+directory as its compilation directory and the dispatching machine's paths in its
+`#line` markers, under the same key a locally built and correctly mapped object
+would use. Forwarding it needs the client's root to travel with the job, which is
+its own change.
 
 **On Windows there is no equivalent and the paths stay.** `cl` has no path-map
 switch, and `-ffile-prefix-map` does not reach the records that matter for

@@ -59,13 +59,19 @@
 # @param outRules         Set to the `<from>=<to>` rules, build tree first.
 # @param outSourceMapped  Set to ON/OFF: was the source root mapped at all.
 function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped)
-    # The build tree is mapped FIRST and this project's lives inside the source
-    # tree (`out/build/<preset>`). GCC and Clang take the first matching rule, so
-    # source-first would swallow every build-tree path and rewrite it to
-    # `./out/build/<preset>/...` -- still checkout-independent, but a different
-    # answer on a machine whose build tree is elsewhere, which is the one property
-    # this is for.
-    set(rules "${binaryDir}=.")
+    # A root with a SPACE in it is not mapped at all, and that is a refusal rather
+    # than a nicety. These rules are spliced into `CMAKE_<LANG>_FLAGS`, which is a
+    # space-separated string, so a rule naming `/Users/john doe/proj` reaches the
+    # driver as two arguments and every compile dies with
+    # `invalid argument '/Users/john' to '-fdebug-prefix-map'` -- measured. This
+    # file may never break a build, and `check_compiler_flag` cannot catch it
+    # because it probes a synthetic `/a=/b`. Quoting was the alternative and it is
+    # generator-dependent; declining is not.
+    if(binaryDir MATCHES " " OR sourceDir MATCHES " ")
+        set(${outRules} "" PARENT_SCOPE)
+        set(${outSourceMapped} OFF PARENT_SCOPE)
+        return()
+    endif()
 
     file(RELATIVE_PATH back "${binaryDir}" "${sourceDir}")
     # `file(RELATIVE_PATH)` answers with a TRAILING SEPARATOR (`../../../`), and
@@ -84,12 +90,31 @@ function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped
     # chain is exactly the case where it cannot: it says the build tree lies UNDER
     # the source tree. Anything else drops the rule rather than guessing; the
     # build-tree rule still lands, and that is the one carrying `DW_AT_comp_dir`.
-    if(back MATCHES "^\\.\\.(/\\.\\.)*$")
+    set(rules "")
+    if(back MATCHES "^\.\.(/\.\.)*$")
         list(APPEND rules "${sourceDir}=${back}")
         set(${outSourceMapped} ON PARENT_SCOPE)
     else()
         set(${outSourceMapped} OFF PARENT_SCOPE)
     endif()
+
+    # The build tree is mapped LAST, and that is the whole of the ordering: GCC and
+    # Clang honour the LAST matching rule, not the first. Measured directly off
+    # `DW_AT_comp_dir` on gcc 14 and clang 20, nested build tree `src/out/build/x`:
+    #
+    #   no rules      /abs/.../src/out/build/x
+    #   build first   ../../../out/build/x     <- the source rule wins
+    #   source first  .                        <- what is wanted
+    #
+    # This comment said the opposite for three commits, and no object comparison
+    # could catch it: `.` and `../../../out/build/x` are BOTH checkout-independent,
+    # so two checkouts still produced byte-identical objects and the e2e read
+    # green. What it costs is narrower and sharper -- two machines whose build
+    # trees sit at the same depth under different NAMES (`out/build/gcc-release`
+    # against `out/build/ci-release`) relativize to one key, because both flags
+    # tokenize to the same canonical text, while their objects differ. That is a
+    # mis-serve, and it is the #203 symptom reappearing inside the fix for it.
+    list(APPEND rules "${binaryDir}=.")
     set(${outRules} "${rules}" PARENT_SCOPE)
 endfunction()
 
