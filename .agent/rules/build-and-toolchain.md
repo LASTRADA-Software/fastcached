@@ -673,6 +673,18 @@ error one level up — a general claim standing in for a specific one.
   passed is the same defect as every entry above, and the same one
   `tsan-canary-rate.sh` exists to prevent.
 
+- **The tree you measured is not necessarily the tree in question.** A grep for a
+  constant found it at `main.cpp:135` with two uses, contradicting a report that it
+  had been deleted — except the primary checkout was parked on a branch merged days
+  earlier. Against `origin/master` the constant is gone. This is the worst-behaved
+  member of the family: the others produce a missing log or an absent answer, and this
+  one produces a **confident correction**, which propagates — it is about to be sent to
+  somebody who will act on it. The tell is not in the output, because the output looks
+  exactly like a finding. It is that **the answer was too convenient**: it made a
+  teammate wrong and the reader right, with no effort. Check what you grepped —
+  `git rev-parse HEAD` in the directory you searched — before reporting a contradiction
+  as a fact. It happened twice in one night, both times in the same direction.
+
 **The general form, and it is the one worth carrying away.** "A SIGTERM does not take
 55 seconds to arrive" was offered as evidence in an incident review. It is true of
 `local-gate.sh` — and *only* because that script traps `EXIT` and not `TERM`. bash

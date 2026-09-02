@@ -794,7 +794,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   and a bound nobody has watched fire is untested rather than proven. The general form: "a
   SIGTERM does not take 55 seconds to arrive" is true of `local-gate.sh` only because it
   traps `EXIT` and not `TERM` — bash defers a TRAPPED signal, so the general claim and the
-  specific one point opposite ways and nothing warns you which you hold.
+  specific one point opposite ways and nothing warns you which you hold. And **the tree
+  you measured is not necessarily the tree in question** — a grep in a checkout parked on
+  a merged branch produced a CONFIDENT CORRECTION, which propagates where a missing log
+  merely stalls. The tell is that the answer was too convenient.
 - A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
