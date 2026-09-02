@@ -32,7 +32,7 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
                                   IClock* clock,
                                   std::string host,
                                   std::uint16_t port,
-                                  std::chrono::milliseconds connectTimeout,
+                                  DialOptions options,
                                   DialStep dial,
                                   void* dialState)
 {
@@ -45,7 +45,7 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
                                              .systemCode = 0,
                                              .context = std::format("no host to dial for port {}", port) });
 
-    auto const deadline = BudgetDeadline(clock, connectTimeout);
+    auto const deadline = BudgetDeadline(clock, options.connectTimeout);
 
     auto resolved = co_await resolver->Resolve(host, port, reactor);
     if (!resolved.has_value())
@@ -68,11 +68,10 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
         // after the first had already consumed the whole allowance.
         if (clock != nullptr && clock->Now() >= deadline)
         {
-            failure =
-                NetError { .code = NetErrorCode::Timeout,
-                           .systemCode = 0,
-                           .context =
-                               std::format("connect to {}:{} timed out after {} ms", host, port, connectTimeout.count()) };
+            failure = NetError { .code = NetErrorCode::Timeout,
+                                 .systemCode = 0,
+                                 .context = std::format(
+                                     "connect to {}:{} timed out after {} ms", host, port, options.connectTimeout.count()) };
             break;
         }
 
@@ -104,7 +103,7 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
         }
         --remainingCandidates;
 
-        auto attempt = co_await dial(dialState, candidate, candidateDeadline);
+        auto attempt = co_await dial(dialState, candidate, candidateDeadline, options.keepAlive);
         if (attempt.has_value())
             co_return std::move(*attempt);
 

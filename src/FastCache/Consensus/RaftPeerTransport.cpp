@@ -144,7 +144,8 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // next one reads the new address here.
     auto const where = self->AddressOf(*peer);
 
-    auto dialed = co_await self->_connector.Connect(where.host, where.port, self->_options.dialTimeout);
+    auto dialed = co_await self->_connector.Connect(
+        where.host, where.port, DialOptions { .connectTimeout = self->_options.dialTimeout });
     if (!dialed.has_value())
     {
         // Debug, not Warn. A peer being down is the ordinary condition Raft is

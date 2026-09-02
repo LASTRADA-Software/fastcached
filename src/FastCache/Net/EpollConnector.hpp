@@ -36,9 +36,7 @@ class EpollConnector final: public IConnector
     EpollConnector(EpollReactor& reactor, IAsyncAddressResolver& resolver, IClock& clock) noexcept;
 
     /// @copydoc IConnector::Connect
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds connectTimeout) override;
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override;
 
   private:
     EpollReactor& _reactor;

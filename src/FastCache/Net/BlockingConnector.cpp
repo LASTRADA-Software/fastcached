@@ -213,7 +213,7 @@ namespace
     /// the whole flow. `deadline` is the TOTAL budget, so what this attempt gets
     /// is whatever is left of it -- that is what makes a two-candidate host cost
     /// one budget rather than two.
-    Task<SocketResult> BlockingDial(void* state, ResolvedEndpoint endpoint, TimePoint deadline)
+    Task<SocketResult> BlockingDial(void* state, ResolvedEndpoint endpoint, TimePoint deadline, KeepAlive keepAlive)
     {
         auto const& dial = *static_cast<BlockingDialState*>(state);
 
@@ -234,12 +234,19 @@ namespace
         // Armed BEFORE the socket is handed over, so there is no window in which
         // it is reachable and unbounded.
         Detail::SetIoTimeouts(*dialed, dial.ioTimeout, dial.ioTimeout);
+
+        // Same window, and separate from `ApplyHotSocketOptions` for the reason
+        // `ArmKeepAlive` states: that function is what every socket this process
+        // owns passes through, and this is asked for by ONE dial. Best-effort, so a
+        // socket that would not take it is still handed over.
+        if (keepAlive == KeepAlive::Yes)
+            std::ignore = Detail::ArmKeepAlive(*dialed, KeepAliveSettings {});
         co_return std::make_unique<BlockingSocket>(*dialed, std::format("{}:{}", *dial.host, dial.port));
     }
 
 } // namespace
 
-Task<SocketResult> BlockingConnector::Connect(std::string host, std::uint16_t port, std::chrono::milliseconds connectTimeout)
+Task<SocketResult> BlockingConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
 
@@ -249,7 +256,7 @@ Task<SocketResult> BlockingConnector::Connect(std::string host, std::uint16_t po
     // reactor is what tells the shared flow and the inline resolver never to
     // suspend. That is the property `SyncRun` rests on.
     co_return co_await Detail::RunConnectFlow(
-        &_resolver, /*reactor*/ nullptr, &_clock, std::move(host), port, connectTimeout, &BlockingDial, &state);
+        &_resolver, /*reactor*/ nullptr, &_clock, std::move(host), port, options, &BlockingDial, &state);
 }
 
 } // namespace FastCache

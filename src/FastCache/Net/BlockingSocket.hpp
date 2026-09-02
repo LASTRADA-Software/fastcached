@@ -3,6 +3,7 @@
 
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/KeepAlive.hpp>
 #include <FastCache/Net/NetError.hpp>
 
 #include <chrono>
@@ -141,6 +142,33 @@ namespace Detail
     /// passes through; there is no second place to remember. Best-effort.
     /// @param socket The socket handle to mark.
     void ArmCloseOnExec(NativeSocket socket) noexcept;
+
+    /// Arm TCP keepalive on a connected stream socket.
+    ///
+    /// **Deliberately NOT called from `ApplyHotSocketOptions`**, and that is the
+    /// whole design rather than an omission. That function is the one every socket
+    /// this process owns passes through -- accepted and dialled, on all four
+    /// backends -- which makes it the right home for something every socket wants
+    /// and the wrong home for this: arming keepalive there would silently change
+    /// when an idle memcached or Redis client connection is dropped, and when a
+    /// Raft peer link is torn down, fleet-wide, for a change nobody asked for. It
+    /// is reached from one place instead, the dial that asked for it
+    /// (`KeepAlive::Yes` in `DialOptions`), which is the same rule this tree
+    /// applies to SIGPIPE: per socket, never process-wide.
+    ///
+    /// Both the flag and the intervals, or neither. Bare `SO_KEEPALIVE` inherits
+    /// the system default -- two hours on Linux -- so a partial application is
+    /// worth nothing while looking like protection; see `KeepAliveSettings`.
+    ///
+    /// Best-effort, like its siblings here: a socket that would not take the
+    /// options keeps the platform default rather than failing the dial, because a
+    /// connection with no keepalive is what every connection had before this and
+    /// refusing to hand it over would turn a tuning failure into a build failure.
+    /// @param socket The connected stream-socket handle to arm.
+    /// @param settings Idle time, probe interval and probe count. `count` is
+    ///        ignored on Windows, where the OS fixes it; see `KeepAliveSettings`.
+    /// @return True when keepalive is in force with these intervals.
+    bool ArmKeepAlive(NativeSocket socket, KeepAliveSettings const& settings) noexcept;
 
     /// Build a `NetError` from a platform code and a description of the attempt.
     /// @param code A `WSAGetLastError()` / `errno` value.

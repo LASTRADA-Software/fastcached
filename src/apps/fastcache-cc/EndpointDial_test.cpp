@@ -30,9 +30,7 @@ namespace
 class RecordingConnector final: public IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds /*connectTimeout*/) override
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
     {
         _dials.emplace_back(std::move(host), port);
         co_return std::unexpected(
@@ -58,7 +56,7 @@ class RecordingConnector final: public IConnector
 /// parameter type.
 [[nodiscard]] std::unique_ptr<ISocket> Dial(RecordingConnector& connector, std::string_view hostPort)
 {
-    return SyncRun(Cc::DialEndpoint(&connector, hostPort, 100ms));
+    return SyncRun(Cc::DialEndpoint(&connector, hostPort, DialOptions { .connectTimeout = 100ms }));
 }
 
 } // namespace

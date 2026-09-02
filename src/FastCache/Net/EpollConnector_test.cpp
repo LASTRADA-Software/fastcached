@@ -79,7 +79,7 @@ FastCache::DetachedTask DriveExchange(FastCache::EpollReactor* loop,
     // arrives rather than racing it.
     auto pending = server->Accept();
 
-    *out = co_await dialer->Connect("127.0.0.1", port, 5s);
+    *out = co_await dialer->Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
     auto& dialResult = out->value();
     if (dialResult.has_value() && dialResult.value() != nullptr)
     {
@@ -219,7 +219,7 @@ TEST_CASE("A dial that must wait for readiness still ends on the reactor", "[net
         };
         drain(server, 96);
 
-        *out = co_await dialer->Connect("127.0.0.1", target, 20s);
+        *out = co_await dialer->Connect("127.0.0.1", target, FastCache::DialOptions { .connectTimeout = 20s });
         if (out->has_value())
         {
             auto& result = out->value();

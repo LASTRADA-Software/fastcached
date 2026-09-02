@@ -387,7 +387,8 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 {
     for (link.BeginRound();;)
     {
-        auto client = Cc::DialEndpointBlocking(connector, link.Target(), HeartbeatConnectTimeout);
+        auto client =
+            Cc::DialEndpointBlocking(connector, link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
         if (client == nullptr)
         {
             round.logger.Logf(LogLevel::Warn,

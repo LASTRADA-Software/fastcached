@@ -17,12 +17,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -81,10 +84,18 @@ class ScriptedPeer final: public ISocket
     ///        peer accepts and then says nothing -- the case a dial timeout cannot
     ///        catch and only an exchange budget can.
     /// @param log Where to record what happened; must outlive this peer.
-    ScriptedPeer(std::vector<std::byte> reply, PeerLog& log, bool dribble) noexcept:
+    ScriptedPeer(std::vector<std::byte> reply,
+                 PeerLog& log,
+                 bool dribble,
+                 bool die,
+                 ManualClock* clock,
+                 std::chrono::milliseconds advanceOnRead) noexcept:
         _reply { std::move(reply) },
         _log { &log },
-        _dribble { dribble }
+        _clock { clock },
+        _advanceOnRead { advanceOnRead },
+        _dribble { dribble },
+        _die { die }
     {
         _log->live = this;
     }
@@ -122,6 +133,27 @@ class ScriptedPeer final: public ISocket
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
         _log->reads += 1;
+
+        // ONE jump past the deadline, from inside the reactor, on the first read --
+        // which is the same mechanism "A peer that accepts and then goes quiet"
+        // describes and the same reason for one jump rather than a run of small
+        // ones. Done HERE rather than from a detached task beside the exchange,
+        // because a peer that answers synchronously finishes the whole exchange
+        // before `Run()` is ever entered: the reactor then returns on its stop flag
+        // with that task still parked, and ASan reports the frame as leaked. The
+        // clock has to move from something the exchange itself drives.
+        if (_advanceOnRead > std::chrono::milliseconds::zero() && _log->reads == 1)
+            _clock->Advance(_advanceOnRead);
+
+        // A connection that DIED, as distinct from one this side closed. It is what
+        // a keepalive probe that goes unanswered produces at the socket layer, and
+        // the whole point of the distinction is that nothing here calls `Close()` --
+        // so `SocketDeadlineTarget::expired` stays false and the exchange can tell
+        // the two apart (#247).
+        if (_die)
+            return IoAwaitable { std::unexpected(
+                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted peer died" }) };
+
         if (_closed)
             return IoAwaitable { std::unexpected(
                 NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "closed" }) };
@@ -200,7 +232,12 @@ class ScriptedPeer final: public ISocket
     std::span<std::byte> _pending;
     std::size_t _offset { 0 };
     IoAwaitable* _parked { nullptr };
+    /// Where the jump below lands; null when no case asked for one.
+    ManualClock* _clock { nullptr };
+    std::chrono::milliseconds _advanceOnRead { 0 };
     bool _dribble { false };
+    /// The connection breaks on its own; see `ScriptedConnector::DieMidExchange`.
+    bool _die { false };
     bool _closed { false };
 };
 
@@ -213,9 +250,7 @@ namespace
 class ScriptedConnector final: public IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds /*connectTimeout*/) override
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
     {
         _dials += 1;
         _lastHost = std::move(host);
@@ -224,7 +259,7 @@ class ScriptedConnector final: public IConnector
             co_return std::unexpected(
                 NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
 
-        auto peer = std::make_unique<ScriptedPeer>(_reply, _log, _dribble);
+        auto peer = std::make_unique<ScriptedPeer>(_reply, _log, _dribble, _die, _clock, _advanceOnRead);
         co_return peer;
     }
 
@@ -242,6 +277,29 @@ class ScriptedConnector final: public IConnector
     void DribbleReplies() noexcept
     {
         _dribble = true;
+    }
+
+    /// Accept, then have the connection break on its own.
+    ///
+    /// The half a dribbler cannot express: a dribbler is ALIVE and slow, and is
+    /// bounded by the total budget. This peer is GONE, and nothing but the
+    /// connection breaking says so -- which is what keepalive buys and what the
+    /// exchange has to be able to name separately.
+    void DieMidExchange() noexcept
+    {
+        _die = true;
+    }
+
+    /// Move @p past onto `clock` when the peer is first read.
+    ///
+    /// From inside the exchange rather than beside it, so it works for a peer that
+    /// answers synchronously as well as one that parks. See `ScriptedPeer::Read`.
+    /// @param clock The clock to move; must outlive the peer.
+    /// @param past How far to jump.
+    void AdvanceOnFirstRead(ManualClock& clock, std::chrono::milliseconds past) noexcept
+    {
+        _clock = &clock;
+        _advanceOnRead = past;
     }
 
     [[nodiscard]] int Dials() const noexcept
@@ -279,8 +337,11 @@ class ScriptedConnector final: public IConnector
     PeerLog _log;
     int _dials { 0 };
     std::uint16_t _lastPort { 0 };
+    ManualClock* _clock { nullptr };
+    std::chrono::milliseconds _advanceOnRead { 0 };
     bool _refuse { false };
     bool _dribble { false };
+    bool _die { false };
 };
 
 } // namespace
@@ -533,4 +594,105 @@ TEST_CASE("A reactor exchange runs once")
     // assertion is not portable and the guard's value is that it fires during
     // development rather than that a suite can observe it.
     CHECK(connector.Dials() == 1);
+}
+
+TEST_CASE("A peer that dies and a peer that is merely slow are recorded differently")
+{
+    // **This is the case that makes #247 worth anything.** Keepalive makes a
+    // dispatch against a vanished host fail in seconds instead of at the compile
+    // deadline minutes later -- and if both endings still produce the same recorded
+    // answer, the only observable difference is that a build got slower somewhere
+    // less often. Nobody can see that, and nobody can act on it.
+    //
+    // The two are indistinguishable at the socket: expiry CLOSES the connection, so
+    // a caller looking at the error alone sees a broken socket either way. Only the
+    // deadline knows which, which is why it now records it
+    // (`SocketDeadlineTarget::expired`) instead of the caller inferring it from
+    // elapsed time.
+    //
+    // Both halves in one case, deliberately. Either assertion alone passes under a
+    // reason that is hardcoded to the value that half expects, and the defect being
+    // guarded against is precisely that the two collapse.
+    auto const runAgainst = [](bool die) {
+        // Inside, so nothing has to be captured: clang refuses an implicit capture
+        // of a `constexpr` object even where MSVC allows it, and a capture-default
+        // here would exist only to satisfy the compiler.
+        constexpr Cc::ExchangeBudget Budget {};
+
+        ManualClock clock;
+        TestReactor reactor { clock };
+        ScriptedConnector connector;
+        connector.Reply({}); // accepts, and answers nothing on its own
+        // The clock moves in BOTH arms, and by the same mechanism. A dead peer
+        // answers before the deadline can matter, so the jump changes nothing for
+        // it -- but running the two arms under different fixtures would leave the
+        // difference explainable by the fixture rather than by the peer, which is
+        // the one thing this case must not allow.
+        connector.AdvanceOnFirstRead(clock, Budget.total * 4);
+        if (die)
+            connector.DieMidExchange();
+
+        Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+        return exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
+    };
+
+    auto const died = runAgainst(true);
+    auto const slow = runAgainst(false);
+
+    // Same OUTCOME -- both answer "compile it locally", and an optional accelerator
+    // must never fail a build.
+    REQUIRE(died.kind == Cc::CacheOutcomeKind::Transport);
+    REQUIRE(slow.kind == Cc::CacheOutcomeKind::Transport);
+
+    // Different CAUSE, which is the whole point.
+    CHECK(died.transportFailure == Cc::TransportFailure::PeerLost);
+    CHECK(slow.transportFailure == Cc::TransportFailure::Expired);
+    CHECK(died.transportFailure != slow.transportFailure);
+
+    // And the cause survives into words an operator reads. Asserted through the
+    // shared table rather than against a literal, so the sentences cannot drift from
+    // the taxonomy -- but asserted as DIFFERENT, because a table that returned one
+    // string for every row would satisfy every other check here.
+    CHECK(Cc::DescribeTransportFailure(died.transportFailure) != Cc::DescribeTransportFailure(slow.transportFailure));
+}
+
+TEST_CASE("An endpoint that was never reached is not reported as a lost peer")
+{
+    // The third state, and it is not a pedantic one: "the address is wrong or that
+    // machine is off" and "the machine was there and went away mid-compile" send an
+    // operator to different places. `Unreached` is also the seeded default, so this
+    // pins that an exchange which never ran cannot read as a peer that was contacted.
+    ManualClock clock;
+    TestReactor reactor { clock };
+    ScriptedConnector connector;
+    connector.Refuse();
+
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+    auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, {});
+
+    CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
+    CHECK(outcome.transportFailure == Cc::TransportFailure::Unreached);
+}
+
+TEST_CASE("Every transport failure has words of its own")
+{
+    // A table that answered the same phrase twice would pass the pairwise check
+    // above for the pair it happens to separate, and lose the distinction for the
+    // next one added. Asserted over the whole enumeration instead, which is what
+    // makes it hold for a row nobody has written yet.
+    constexpr auto All = std::to_array({ Cc::TransportFailure::None,
+                                         Cc::TransportFailure::Unreached,
+                                         Cc::TransportFailure::PeerLost,
+                                         Cc::TransportFailure::Expired });
+
+    std::vector<std::string_view> phrases;
+    for (auto const failure: All)
+    {
+        auto const phrase = Cc::DescribeTransportFailure(failure);
+        CHECK_FALSE(phrase.empty());
+        phrases.push_back(phrase);
+    }
+
+    std::ranges::sort(phrases);
+    CHECK(std::ranges::adjacent_find(phrases) == phrases.end());
 }

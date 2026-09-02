@@ -86,7 +86,7 @@ FastCache::DetachedTask DriveExchange(FastCache::IocpReactor* loop,
                                       std::vector<std::byte>* seen,
                                       std::string* why)
 {
-    *out = co_await dialer->Connect("127.0.0.1", port, 5s);
+    *out = co_await dialer->Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
     auto& dialResult = out->value();
     if (dialResult.has_value() && dialResult.value() != nullptr)
     {

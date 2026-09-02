@@ -61,6 +61,13 @@ struct DialLog
 {
     FastCache::ManualClock* clock { nullptr };
     std::vector<std::chrono::milliseconds> allowances;
+    /// What each candidate was told about keepalive.
+    ///
+    /// Recorded per ATTEMPT rather than once, because the property is that the
+    /// caller's answer reaches EVERY candidate: a flow that forwarded it only to
+    /// the first would leave a two-record host dialling its second address
+    /// unarmed, which is invisible in a case that only ever has one candidate.
+    std::vector<FastCache::KeepAlive> keepAlives;
     std::chrono::milliseconds consume { 0 };
     std::size_t succeedAt { 999 };
 };
@@ -89,10 +96,12 @@ constexpr std::size_t NeverSucceeds = 999;
 /// succeeds only at a chosen index.
 FastCache::Task<FastCache::SocketResult> ScriptedDial(void* state,
                                                       FastCache::ResolvedEndpoint /*endpoint*/,
-                                                      FastCache::TimePoint deadline)
+                                                      FastCache::TimePoint deadline,
+                                                      FastCache::KeepAlive keepAlive)
 {
     auto& log = *static_cast<DialLog*>(state);
     log.allowances.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - log.clock->Now()));
+    log.keepAlives.push_back(keepAlive);
 
     if (log.consume > 0ms)
         log.clock->Advance(log.consume);
@@ -115,8 +124,8 @@ TEST_CASE("An empty host is refused without touching the resolver", "[net][conne
     ListResolver resolver { 1 };
     auto log = MakeLog(clock);
 
-    auto result =
-        FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "", 6674, 1s, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(
+        &resolver, nullptr, &clock, "", 6674, FastCache::DialOptions { .connectTimeout = 1s }, &ScriptedDial, &log));
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == FastCache::NetErrorCode::AddressNotAvail);
@@ -133,8 +142,14 @@ TEST_CASE("The last candidate's failure is the one reported", "[net][connectflow
     ListResolver resolver { 3 };
     auto log = MakeLog(clock);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 1s, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 1s },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().context == "scripted dial refusal");
@@ -147,8 +162,14 @@ TEST_CASE("A later candidate succeeds after an earlier one fails", "[net][connec
     ListResolver resolver { 3 };
     auto log = MakeLog(clock, 0ms, 1);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 1s, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 1s },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE(result.has_value());
     // Stopped at the one that worked rather than working through the rest.
@@ -162,8 +183,14 @@ TEST_CASE("A resolution failure is reported without dialling", "[net][connectflo
     resolver.Fail();
     auto log = MakeLog(clock);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "nowhere.example.com", 6674, 1s, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "nowhere.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 1s },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == FastCache::NetErrorCode::AddressNotAvail);
@@ -184,8 +211,14 @@ TEST_CASE("The budget is shared across candidates, not handed to each", "[net][c
     ListResolver resolver { 3 };
     auto log = MakeLog(clock, 300ms);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 900ms, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 900ms },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE_FALSE(result.has_value());
     REQUIRE(log.allowances.size() == 3);
@@ -203,8 +236,14 @@ TEST_CASE("No single candidate may spend the whole budget", "[net][connectflow]"
     ListResolver resolver { 3 };
     auto log = MakeLog(clock);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 900ms, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 900ms },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE_FALSE(result.has_value());
     REQUIRE_FALSE(log.allowances.empty());
@@ -223,8 +262,14 @@ TEST_CASE("A candidate that black-holes cannot starve the ones after it", "[net]
     ListResolver resolver { 2 };
     auto log = MakeLog(clock, 500ms, 1);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 1s, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 1s },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE(result.has_value());
     REQUIRE(log.allowances.size() == 2);
@@ -239,8 +284,14 @@ TEST_CASE("An exhausted budget reports a timeout naming the endpoint", "[net][co
     ListResolver resolver { 3 };
     auto log = MakeLog(clock, 400ms);
 
-    auto result = FastCache::SyncRun(
-        FastCache::Detail::RunConnectFlow(&resolver, nullptr, &clock, "host.example.com", 6674, 600ms, &ScriptedDial, &log));
+    auto result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                       nullptr,
+                                                                       &clock,
+                                                                       "host.example.com",
+                                                                       6674,
+                                                                       FastCache::DialOptions { .connectTimeout = 600ms },
+                                                                       &ScriptedDial,
+                                                                       &log));
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == FastCache::NetErrorCode::Timeout);
@@ -248,4 +299,59 @@ TEST_CASE("An exhausted budget reports a timeout naming the endpoint", "[net][co
     CHECK(result.error().context.contains("6674"));
     // Stopped rather than working through the rest of the list.
     CHECK(log.allowances.size() < 3);
+}
+
+TEST_CASE("The dial's keepalive answer reaches every candidate", "[net][connect][keepalive]")
+{
+    // The flow forwards what the CALLER asked, to each candidate it tries. It is a
+    // per-call option precisely so it cannot be decided anywhere else
+    // ([#247](https://github.com/LASTRADA-Software/fastcached/issues/247)), and a
+    // flow that dropped it would leave the dispatched compile -- the one exchange
+    // whose deadline is minutes long -- unarmed, with nothing anywhere saying so.
+    //
+    // Two candidates, not one. A flow that forwarded the answer only to the FIRST
+    // address would still pass a single-candidate case, and a host with both an AAAA
+    // and an A record is the ordinary shape rather than an exotic one.
+    FastCache::ManualClock clock;
+    ListResolver resolver { 2 };
+    auto log = MakeLog(clock);
+
+    auto const result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(
+        &resolver,
+        nullptr,
+        &clock,
+        "host.example.com",
+        6674,
+        FastCache::DialOptions { .connectTimeout = 1s, .keepAlive = FastCache::KeepAlive::Yes },
+        &ScriptedDial,
+        &log));
+    std::ignore = result;
+
+    REQUIRE(log.keepAlives.size() == 2);
+    CHECK(log.keepAlives[0] == FastCache::KeepAlive::Yes);
+    CHECK(log.keepAlives[1] == FastCache::KeepAlive::Yes);
+}
+
+TEST_CASE("A dial that does not ask for keepalive does not get it", "[net][connect][keepalive]")
+{
+    // The default, asserted rather than assumed. Every caller in this tree except the
+    // dispatched compile relies on it, and a `DialOptions` whose default flipped
+    // would arm the daemon's Raft links and the launcher's cache round trips too --
+    // the fleet-wide change the option exists to avoid.
+    FastCache::ManualClock clock;
+    ListResolver resolver { 1 };
+    auto log = MakeLog(clock);
+
+    auto const result = FastCache::SyncRun(FastCache::Detail::RunConnectFlow(&resolver,
+                                                                             nullptr,
+                                                                             &clock,
+                                                                             "host.example.com",
+                                                                             6674,
+                                                                             FastCache::DialOptions { .connectTimeout = 1s },
+                                                                             &ScriptedDial,
+                                                                             &log));
+    std::ignore = result;
+
+    REQUIRE(log.keepAlives.size() == 1);
+    CHECK(log.keepAlives[0] == FastCache::KeepAlive::No);
 }

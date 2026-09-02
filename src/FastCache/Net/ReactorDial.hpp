@@ -8,6 +8,7 @@
     #include <FastCache/Core/Clock.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ISocket.hpp>
+    #include <FastCache/Net/KeepAlive.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
@@ -16,6 +17,7 @@
     #include <coroutine>
     #include <expected>
     #include <memory>
+    #include <tuple>
     #include <utility>
 
 namespace FastCache::Detail
@@ -121,11 +123,13 @@ void SettleDial(ReadinessDialOp<Traits>& op, std::expected<void, NetError> outco
 /// @param endpoint Candidate to dial. By value: this is a coroutine, so a
 ///        reference parameter could dangle at the first suspend.
 /// @param deadline When to give up on THIS candidate.
+/// @param keepAlive Whether the connected socket probes a silent peer.
 /// @return The connected socket, or why this candidate did not produce one.
 template <typename Traits>
 [[nodiscard]] Task<SocketResult> DialReadiness(typename Traits::Reactor* reactor,
                                                ResolvedEndpoint endpoint,
-                                               TimePoint deadline)
+                                               TimePoint deadline,
+                                               KeepAlive keepAlive)
 {
     OwnedNativeSocket holder { static_cast<NativeSocket>(::socket(endpoint.family, SOCK_STREAM, endpoint.protocol)) };
     if (!holder.Valid())
@@ -200,6 +204,14 @@ template <typename Traits>
         co_return std::unexpected(MakeNetError(probed != 0 ? LastNetworkError() : pendingError, "connect did not complete"));
 
     ApplyHotSocketOptions(holder.Get());
+
+    // AFTER the hot options and separate from them, which is the point: that
+    // function is what every socket this process owns passes through, and this is
+    // asked for by ONE dial. Best-effort by contract -- see `ArmKeepAlive` -- so a
+    // socket that would not take it is still handed over rather than failing a
+    // build over a tuning option.
+    if (keepAlive == KeepAlive::Yes)
+        std::ignore = ArmKeepAlive(holder.Get(), KeepAliveSettings {});
 
     // The peer string is the ADDRESS, not the requested host: it feeds the
     // `--log-source` prefix, which records the IP, and that is how the accept

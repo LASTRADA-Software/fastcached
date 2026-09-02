@@ -497,6 +497,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   which makes `StorageTier`'s enumerator order a wire contract.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
+- So is keepalive, and for the mirror reason: `ApplyHotSocketOptions` is where every
+  socket passes, so arming there would change when every idle client connection and
+  every Raft link is dropped. It is a `DialOptions` field, and the flag without the
+  intervals inherits a two-hour default that reads back as armed. A faster failure
+  nobody can NAME is not an improvement — expiry and a lost peer are one broken socket,
+  so the timer records which.
 - A child inherits this process's sockets too, and neither platform stops it: a
   Windows handle arrives inheritable and `BlockingListener::Accept` is a plain
   `::accept()`. Armed once, in `ApplyHotSocketOptions`. A spawn names what it hands

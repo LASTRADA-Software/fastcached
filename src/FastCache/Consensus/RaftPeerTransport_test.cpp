@@ -197,11 +197,9 @@ class ScriptedConnector final: public IConnector
     /// cases that are not about dialling free of clock arithmetic. It *can* park,
     /// because `PlatformConnector` does: a dial in flight is a real state, and the
     /// transport has to behave when a peer moves during one.
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds connectTimeout) override
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override
     {
-        std::ignore = connectTimeout;
+        std::ignore = options;
         _attempts.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock const guard { _targetMutex };

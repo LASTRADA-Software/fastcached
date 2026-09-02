@@ -3,6 +3,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/KeepAlive.hpp>
 #include <FastCache/Net/NetError.hpp>
 
 #include <chrono>
@@ -84,6 +85,47 @@ namespace FastCache
 /// actually cares about with `Async/DeadlineTimer`, which is strictly more than
 /// the socket option offered -- that one bounds a single call, so a peer
 /// dribbling a byte at a time could still take forever.
+/// What one dial asks for beyond the address.
+///
+/// **A named descriptor rather than positional parameters, because the next option
+/// is not speculative.** `Connect` took a bare `connectTimeout`, and
+/// [#247](https://github.com/LASTRADA-Software/fastcached/issues/247) needed a
+/// second knob; #245 is already known to want a third. Threaded positionally, each
+/// one is a new argument through ten signatures and four implementations, and the
+/// point at which two of them share a type is the point at which a caller can
+/// transpose them silently. `ExchangeBudget` records the same argument for the same
+/// reason.
+///
+/// **And it is per CALL rather than per connector**, which is the half that matters
+/// here. Fixing keepalive at construction would be per-socket today only by
+/// accident of how `Cc::RunOneExchange` happens to build a connector per exchange,
+/// and would become per-many-sockets, silently, the first time anyone reuses one.
+///
+/// `IConnector` records a post-connect timeout being moved OUT of the per-call
+/// surface into `BlockingConnectorOptions`, which reads like an argument for
+/// construction-time. It is not: the reason given there is that `SO_RCVTIMEO` is
+/// meaningless to a socket whose reads suspend, so it belonged to the blocking
+/// connector ALONE. That is a fact about *which connector*, not about per-call
+/// versus construction. Keepalive is meaningful to all four.
+struct DialOptions
+{
+    /// How long to allow for the **whole call**, name resolution and every
+    /// candidate address included. A non-positive value leaves the platform
+    /// default in place, which may be minutes.
+    ///
+    /// A total and not a per-candidate budget: a host with both an AAAA and an A
+    /// record used to be able to take twice what the caller asked for, which is a
+    /// bound that is not one.
+    std::chrono::milliseconds connectTimeout { 0 };
+
+    /// Whether the connection probes a silent peer.
+    ///
+    /// Off by default, so a caller that does not ask gets exactly the behaviour
+    /// every connection in this tree had before the option existed. See
+    /// `Net/KeepAlive.hpp` for what it does and does not detect.
+    KeepAlive keepAlive { KeepAlive::No };
+};
+
 class IConnector
 {
   public:
@@ -110,16 +152,9 @@ class IConnector
     ///        another route. The value is also what a threaded resolver hands to
     ///        a worker, so the copy is one the implementation needed anyway.
     /// @param port TCP port in host byte order.
-    /// @param connectTimeout How long to allow for the **whole call**, name
-    ///        resolution and every candidate address included. A non-positive
-    ///        value leaves the platform default in place, which may be minutes.
-    ///        A total and not a per-candidate budget: a host with both an AAAA
-    ///        and an A record used to be able to take twice what the caller
-    ///        asked for, which is a bound that is not one.
+    /// @param options The budget, and whether the connection carries keepalive.
     /// @return The connected socket, or why the attempt did not succeed.
-    [[nodiscard]] virtual Task<SocketResult> Connect(std::string host,
-                                                     std::uint16_t port,
-                                                     std::chrono::milliseconds connectTimeout) = 0;
+    [[nodiscard]] virtual Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) = 0;
 };
 
 } // namespace FastCache

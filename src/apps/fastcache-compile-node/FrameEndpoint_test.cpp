@@ -152,7 +152,7 @@ struct Fleet
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::span<std::byte const> frame)
 {
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, 5s));
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
 
     // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits
@@ -178,7 +178,7 @@ class Conversation
   public:
     explicit Conversation(std::uint16_t port)
     {
-        auto socket = SyncRun(_connector.Connect("127.0.0.1", port, 5s));
+        auto socket = SyncRun(_connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
         REQUIRE(socket.has_value());
         _socket = std::move(*socket);
     }
@@ -893,7 +893,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     fleet.Serve();
 
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, 5s));
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     auto* const peer = (*socket).get();
 
@@ -1414,7 +1414,7 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     // sends its request before reading exercises whether the refusal survives the
     // close as well, and that is a separate defect with a case of its own below.
     BlockingConnector connector;
-    auto second = SyncRun(connector.Connect("127.0.0.1", port, 5s));
+    auto second = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(second.has_value());
     auto const refusal = SyncRun(ReadOneReply((*second).get()));
     (*second)->Close();

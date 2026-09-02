@@ -127,7 +127,7 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     // type rather than an `IConnector`, which is what keeps that fact checkable
     // rather than a comment.
     BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialTimeout);
+    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialOptions { .connectTimeout = DialTimeout });
     if (client == nullptr)
         return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
 

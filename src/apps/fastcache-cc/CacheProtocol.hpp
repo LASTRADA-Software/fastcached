@@ -3,6 +3,7 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/KeepAlive.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -32,6 +33,66 @@ enum class CacheOutcomeKind : std::uint8_t
     Transport, ///< The exchange never completed (socket error, short read).
 };
 
+/// Which way a `Transport` outcome went wrong.
+///
+/// **Three states, not one, and the collapse was the bug**
+/// ([#247](https://github.com/LASTRADA-Software/fastcached/issues/247)). Every one
+/// of these is answered the same way -- compile locally, because the client is
+/// holding the source -- and that sameness is exactly why they were folded into one
+/// sentence. But the same ACTION is not the same DIAGNOSIS: "that machine is off"
+/// and "that compile took longer than the budget" are fixed in different places, by
+/// different people, and an operator handed one string for both has nothing to act
+/// on.
+///
+/// It matters more since #223 made the compile budget minutes long, and more again
+/// now that keepalive answers a dead host in seconds: without a name for what
+/// happened, the improvement is invisible -- the same non-answer, sooner.
+enum class TransportFailure : std::uint8_t
+{
+    /// No transport failure; the exchange completed. The default, because a
+    /// `Hit`/`Miss`/`Rejected` outcome must not carry a cause it does not have.
+    None,
+
+    /// No connection was ever made: the host refused, was unroutable, or the name
+    /// did not resolve inside the dial budget. The peer may never have existed.
+    Unreached,
+
+    /// Connected, then the connection broke on its own.
+    ///
+    /// **This is what a vanished host looks like**, and the state keepalive exists
+    /// to reach quickly: without probes the same host produces `Expired` minutes
+    /// later, because nothing else notices. See `Net/KeepAlive.hpp`.
+    PeerLost,
+
+    /// The exchange was still running when the total budget ran out, and THIS side
+    /// closed the socket. The peer may be entirely healthy and merely slow -- which
+    /// is the reading a `PeerLost` must never be given.
+    Expired,
+};
+
+/// A phrase naming @p failure, for the sentence a fall-back is recorded under.
+///
+/// A table rather than a `switch` at the one call site that needs it today: the
+/// next consumer -- `--show-stats`, a log line -- must say the same words, and two
+/// places spelling one taxonomy is how they drift.
+/// @param failure What went wrong.
+/// @return A phrase, always non-empty, so a caller never has to handle a gap.
+[[nodiscard]] constexpr std::string_view DescribeTransportFailure(TransportFailure failure) noexcept
+{
+    switch (failure)
+    {
+        case TransportFailure::None:
+            return "completed";
+        case TransportFailure::Unreached:
+            return "could not be reached";
+        case TransportFailure::PeerLost:
+            return "went away mid-exchange";
+        case TransportFailure::Expired:
+            return "ran out of budget";
+    }
+    return "could not be reached";
+}
+
 /// The result of one FETCH or STORE.
 struct CacheOutcome
 {
@@ -50,6 +111,13 @@ struct CacheOutcome
     /// Discovering that from a security review rather than from the tool is the
     /// silent no-op this codebase keeps a list about.
     bool credentialIgnored { false };
+
+    /// Which way a `Transport` outcome went wrong; `None` for every other kind.
+    ///
+    /// Defaulted to `Unreached` alongside the `Transport` default above, because the
+    /// two defaults describe one seeded answer: an exchange that never ran must read
+    /// as "nothing was reached", never as a peer that was contacted and lost.
+    TransportFailure transportFailure { TransportFailure::Unreached };
 
     /// @return True when the daemon served a value.
     [[nodiscard]] bool IsHit() const noexcept
@@ -187,7 +255,7 @@ struct Credential
     }
 };
 
-/// The two deadlines one exchange runs under.
+/// What one exchange runs under: its two deadlines, and how a dead peer is noticed.
 ///
 /// Two rather than one, because they bound different things and neither implies the
 /// other -- the collapse `DialEndpoint` used to make. They are also a named struct
@@ -224,6 +292,27 @@ struct ExchangeBudget
     {
         return total > std::chrono::milliseconds::zero();
     }
+
+    /// Whether the connection probes a peer that has stopped answering.
+    ///
+    /// **The third thing, and it is here because `total` alone cannot answer both
+    /// questions** ([#247](https://github.com/LASTRADA-Software/fastcached/issues/247)).
+    /// *How slow may this exchange legitimately be* and *how fast is a dead peer
+    /// noticed* are separate, and #223 already established that collapsing them
+    /// costs the wrong one: shortening `total` to notice a dead worker abandons
+    /// every translation unit worth distributing while the worker finishes the job
+    /// anyway.
+    ///
+    /// So a cache round trip -- bounded by a round trip, `total` measured in seconds
+    /// -- leaves this `No` and loses nothing. A dispatched compile, bounded by how
+    /// long a COMPILER runs and therefore minutes long by design, sets it: without
+    /// it, a client whose worker's host is powered off holds a build slot for the
+    /// whole compile budget, and on a `-j16` build a handful of those is a stalled
+    /// build.
+    ///
+    /// It detects a dead connection or host, never a peer that is alive and merely
+    /// silent -- that is #245's progress frames. See `Net/KeepAlive.hpp`.
+    KeepAlive keepAlive { KeepAlive::No };
 };
 
 /// Send one framed request and read its reply, presenting `credential` if

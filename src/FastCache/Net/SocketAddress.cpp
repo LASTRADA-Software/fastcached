@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <expected>
 #include <format>
@@ -17,6 +18,10 @@
     #include <winsock2.h>
 
     #include <ws2tcpip.h>
+
+    // SIO_KEEPALIVE_VALS and `struct tcp_keepalive`. Winsock's keepalive knobs are
+    // an ioctl rather than socket options; there is no TCP_KEEPIDLE here.
+    #include <mstcpip.h>
 #else
     #include <sys/socket.h>
 
@@ -169,6 +174,75 @@ namespace Detail
         ::setsockopt(static_cast<int>(socket), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_SNDBUF, &socketBufferBytes, sizeof(socketBufferBytes));
         ::setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_RCVBUF, &socketBufferBytes, sizeof(socketBufferBytes));
+#endif
+    }
+
+    bool ArmKeepAlive(NativeSocket socket, KeepAliveSettings const& settings) noexcept
+    {
+#if defined(_WIN32)
+        // One ioctl sets the flag and both intervals together, so there is no
+        // partially-armed state to unwind. The probe COUNT is absent on purpose:
+        // Windows fixes it at 10 and offers no way to set it -- see
+        // `KeepAliveSettings`, which states what that does to the detection time
+        // rather than pretending the parameter was applied.
+        std::ignore = settings.count;
+
+        // Milliseconds here, unlike every other platform in this function.
+        tcp_keepalive request {};
+        request.onoff = 1;
+        request.keepalivetime = static_cast<ULONG>(settings.idle.count());
+        request.keepaliveinterval = static_cast<ULONG>(settings.interval.count());
+
+        DWORD returned = 0;
+        return ::WSAIoctl(static_cast<SOCKET>(socket),
+                          SIO_KEEPALIVE_VALS,
+                          &request,
+                          sizeof(request),
+                          nullptr,
+                          0,
+                          &returned,
+                          nullptr,
+                          nullptr)
+               == 0;
+#else
+        // Whole seconds, and never zero. These options take seconds, and a zero is
+        // not "immediately" -- it is rejected, or read as "keep the default",
+        // depending on the option and the platform. Rounding a sub-second request
+        // down to nothing would leave the two-hour system default in place while
+        // this function reported success, which is exactly the silently-unarmed
+        // state `KeepAliveSettings` says is worth nothing.
+        auto const seconds = [](std::chrono::milliseconds value) {
+            auto const whole = std::chrono::ceil<std::chrono::seconds>(value);
+            return whole.count() > 0 ? static_cast<int>(whole.count()) : 1;
+        };
+
+        auto const fd = static_cast<int>(socket);
+
+        // The INTERVALS FIRST, and the flag last. Reversed, a socket whose intervals
+        // could not be applied would be left probing on the system default -- two
+        // hours on Linux -- which is indistinguishable from no keepalive at all for
+        // every deadline this protects, while reading back as armed to anything that
+        // checks the flag.
+    #if defined(__APPLE__)
+        // macOS spells the idle time `TCP_KEEPALIVE`; it is `TCP_KEEPIDLE`
+        // everywhere else. The other two are spelled the same on both.
+        constexpr int IdleOption = TCP_KEEPALIVE;
+    #else
+        constexpr int IdleOption = TCP_KEEPIDLE;
+    #endif
+        auto const idle = seconds(settings.idle);
+        auto const interval = seconds(settings.interval);
+        auto const count = static_cast<int>(settings.count);
+
+        if (::setsockopt(fd, IPPROTO_TCP, IdleOption, &idle, sizeof(idle)) != 0)
+            return false;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) != 0)
+            return false;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) != 0)
+            return false;
+
+        int const on = 1;
+        return ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) == 0;
 #endif
     }
 
