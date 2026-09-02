@@ -1616,11 +1616,22 @@ issue the scan can resolve. So the state is reachable only by a deliberate act t
 records where the decision is tracked, and the printed count cannot be driven to
 zero by relabelling.
 
-Two refusals still have **no** counter on purpose, and both are the first case
-above. A verb this node runs no component for — a `LEASE` at a plain worker, a
-`FETCH` at a node with no cache tier — is answered `unimplemented-verb` and counted
-nowhere; so is the cache tier's own `AUTH` refusal, for the same reason and because
-the router sends `AUTH` to the scheduler anyway.
+A verb this node runs **no component for** — a `LEASE` at a plain worker, a `FETCH`
+at a node with no cache tier — is answered `unimplemented-verb` and counted nowhere,
+which is the first case above: it is what a healthy build gets, once per exchange.
+
+The cache surface's other six arms are uncounted deliberately, and each for its own
+reason rather than one shared sentence. They are listed so the decision can be
+disagreed with rather than rediscovered:
+
+| Refusal | Answers | Why nothing rises |
+|---|---|---|
+| An `AUTH` at the cache tier | `unimplemented-verb` | What a `FASTCACHE_TOKEN` launcher sends once per exchange for a whole build. A counter would be dominated by healthy traffic. |
+| A scheduler or compile verb at the cache tier | `dispatch-not-permitted` | The listener routes by verb family, so a frame reaching the tier already names a cache verb. Unreachable through the port. |
+| An opcode with no table row | `unknown-opcode` | Same routing, and stronger: an unrecognised opcode has no family, so it is answered at the door and never reaches this surface. |
+| A payload that is not its declared length | `malformed-frame` | The listener reads exactly the declared length, so the two figures are one figure. Kept as defence in depth for a direct call. |
+| A cache verb reached without a credential | `unauthenticated` | This surface requires none, by standing decision — so the pre-payload gate cannot produce this answer for it. |
+| An `AUTH` payload that will not decode or verify | `malformed-frame`, `unauthenticated` | `AUTH` belongs to the scheduler, which owns the credential. No credential outcome is ever decided against the cache. |
 
 **Why the cache and compile surfaces answer an unreachable arm differently.** The
 compile surface mints counters for credential arms it cannot currently reach
