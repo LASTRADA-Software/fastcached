@@ -87,32 +87,61 @@ function(fastcached_read_lines path outVar)
     set(${outVar} "${lines}" PARENT_SCOPE)
 endfunction()
 
-# Every CMakeLists in the tree, so a registration in a directory nobody thought of is
-# still covered.
+# Every CMakeLists a first-party directory holds, so a registration in a directory
+# nobody thought of is still covered.
 #
-# ONE recursive glob and a filter, not a set of depth-shaped patterns. `GLOB_RECURSE`
-# recurses from the base directory and treats only the last component as the pattern,
-# so `<src>/src/*/CMakeLists.txt` does not mean "one level under src" -- it walks the
-# whole tree, build directories included, and the first run of this check duly
-# reported a registration inside `_deps/catch2-src`. Vendored third-party code is not
-# this rule's business and cannot be edited here.
-file(GLOB_RECURSE listFiles RELATIVE "${FASTCACHED_SOURCE_DIR}"
-     "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
+# The top level is listed ONE level deep and each surviving entry is recursed into
+# separately, rather than recursing once from the source root. Two reasons, and the
+# second is why this shape is worth the extra lines:
+#
+#   `GLOB_RECURSE` recurses from the base directory and treats only the last component
+#   as the pattern, so `<src>/src/*/CMakeLists.txt` does not mean "one level under
+#   src" -- it walks the whole tree. The first version of this check duly reported a
+#   registration inside `_deps/catch2-src`, which is vendored third-party code nobody
+#   here can edit.
+#
+#   And walking the whole tree is SLOW where it matters. CMake's glob stats every
+#   entry, and on a DrvFs checkout with a build tree present that cost 55 s -- `user
+#   0.067s, sys 3.328s`, so pure I/O wait -- against a 60 s timeout on a check that
+#   runs in the default set. `find` over the same tree takes 2.3 s, which is why the
+#   filesystem is not the thing to blame. Skipping `out/` entirely is the fix; the
+#   same pathology, one directory over, is #502.
+#
+# Still derived rather than enumerated: a NEW first-party top-level directory is
+# picked up automatically, and only build and vendor trees are named.
+set(excludeNames
+    "out"        # build trees: generated copies of what is already scanned
+    "build"      # ditto, for anyone configuring outside out/
+    "_deps"      # vendored third-party sources, not ours to edit
+    ".git"       # not source
+    ".claude")   # sibling worktrees, if one is nested under this checkout
 
-# What is NOT scanned, and why. Patterns rather than filenames, so a new build
-# directory or a newly vendored dependency is excluded automatically while a new
-# FIRST-PARTY directory is not -- the direction that fails closed.
-set(excludePatterns
-    "(^|/)out/"      # build trees: generated copies of what is already scanned
-    "(^|/)build/"    # ditto, for anyone configuring outside out/
-    "(^|/)_deps/"    # vendored third-party sources, not ours to edit
-    "(^|/)\\.claude/") # sibling worktrees, if one is nested under this checkout
+set(listFiles "")
+if(EXISTS "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
+    list(APPEND listFiles "CMakeLists.txt")
+endif()
 
+file(GLOB topLevel RELATIVE "${FASTCACHED_SOURCE_DIR}" "${FASTCACHED_SOURCE_DIR}/*")
+foreach(entry IN LISTS topLevel)
+    if(NOT IS_DIRECTORY "${FASTCACHED_SOURCE_DIR}/${entry}")
+        continue()
+    endif()
+    if("${entry}" IN_LIST excludeNames)
+        continue()
+    endif()
+    file(GLOB_RECURSE found RELATIVE "${FASTCACHED_SOURCE_DIR}"
+         "${FASTCACHED_SOURCE_DIR}/${entry}/CMakeLists.txt")
+    list(APPEND listFiles ${found})
+endforeach()
+
+# A nested build directory inside a first-party tree would still be walked above, so
+# the results are filtered as well. Belt and braces on purpose: the walk decides the
+# COST, this decides the ANSWER, and getting the cost wrong must not change the answer.
 set(scanFiles "")
 foreach(candidate IN LISTS listFiles)
     set(skip FALSE)
-    foreach(pattern IN LISTS excludePatterns)
-        if(candidate MATCHES "${pattern}")
+    foreach(name IN LISTS excludeNames)
+        if(candidate MATCHES "(^|/)${name}/")
             set(skip TRUE)
             break()
         endif()
@@ -122,11 +151,12 @@ foreach(candidate IN LISTS listFiles)
     endif()
 endforeach()
 set(listFiles ${scanFiles})
+list(REMOVE_DUPLICATES listFiles)
 list(SORT listFiles)
 
 if(NOT listFiles)
     message("")
-    message("  No CMakeLists.txt was found under src/ at all.")
+    message("  No CMakeLists.txt was found under any first-party directory.")
     message("")
     message("That is not a clean tree, it is a scan that stopped working -- a moved")
     message("source root, or a FASTCACHED_SOURCE_DIR pointing somewhere else.")
