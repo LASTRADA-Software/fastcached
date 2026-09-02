@@ -421,6 +421,24 @@ tag, so a future change to the value format or the canonicalization spec re-keys
 the cache — stale entries then miss and are rewritten, rather than being served
 under rules they were not written by.
 
+`CompileValueVersion` names the **canonicalization spec**, not only the byte
+layout. Canonical text travels nowhere but inside a stored value, and every server
+on this wire has to rewrite one identically — including servers at different
+builds, since a fleet is permanently mid-upgrade. So the byte is pinned to the
+behaviour rather than maintained by hand: a conformance corpus is run through the
+canonicalizer and its inverse, digested, and matched against the row for the live
+generation. Change how a path span is found, rewritten or framed and that test
+fails naming the bump.
+
+A reader that meets a generation it does not implement **refuses the value**. It
+cannot canonicalize it, and storing or serving it uncanonicalized would put the
+producing checkout's absolute paths into a shared cache under a key every machine
+computes — so a store is declined, and a fetch is a miss the launcher reports
+under its own `--show-stats` reason rather than as a malformed value. Refusing
+costs the hits of one upgrade window; the alternative costs every consumer that
+replays those paths into its dependency graph, where no edit in its own checkout
+can invalidate them.
+
 ## The value format
 
 A stored value is an object blob plus zero or more text regions, each tagged

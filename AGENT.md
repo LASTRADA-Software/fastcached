@@ -314,6 +314,16 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   dependency record, so those never invalidate. A path with no `<SRCROOT>` sentinel is
   ordinary (92 of 93 in a trivial TU are toolchain headers), so retirement is a schema
   bump, never a sniff.
+  - And by every **VERSION** of them, or the rule holds at no moment a fleet is
+    actually in: a fleet is permanently mid-upgrade (#173), so "every server" spans
+    generations or means nothing. `CompileValueVersion` names the canonicalization
+    spec and not only the framing, pinned to the BEHAVIOUR by a conformance digest —
+    a rewrite rule that moves without it makes two servers stamp one number on text
+    they rewrote differently. Measured: an ordinary edit to `JoinLocalized` passed
+    2006 of 2007 cases. A value from a generation this build does not implement is
+    `ForeignGeneration` and is REFUSED, carrying no bytes to store — the one `nullopt`
+    that used to mean that AND "damaged bytes" met a node whose policy for the second
+    is *store verbatim*, which is #229 during an ordinary rolling upgrade (#483).
 - A manifest naming the TU and no header revalidates forever: `IsToolchainHeader` calls
   every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
   exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were

@@ -1243,6 +1243,81 @@ stops being one — the same confound that cost #493 a re-run.
   replays objects naming another checkout; a line reporting only the applied half
   would read the same in all three cases.
 
+## Two servers on one wire are two VERSIONS on one wire
+
+`AGENT.md` requires every server on this wire to canonicalize a stored value's text
+regions identically, through the one `CanonicalStoredValue`. That rule was written
+about a *moment* — the moment #229 made a compile node a second server and it turned
+out to have no copy of the recipe. But a fleet is permanently mid-upgrade
+([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)), so the servers
+on the wire are at several builds at once and the property has to hold **across
+generations or it does not hold at all**
+([#483](https://github.com/LASTRADA-Software/fastcached/issues/483)). Two routes
+were open to breaking it, and neither needed anybody's install to be stale.
+
+- **The version byte named nothing.** `PathCanon` deliberately carries no version of
+  its own and says so, on the reasoning that canonical text travels only inside a
+  `CompileValue` and that container carries `CompileValueVersion` — so a change to
+  the canonicalization spec is *expressed by bumping that*. Correct, and enforced by
+  nothing: the byte was a bare constant referenced by the encoder and the decoder.
+  Widen a grammar's span match, change how a root is joined back on, move a byte of
+  framing — every behaviour-pinning test in the tree is updated to the new
+  expectation, as it must be, and the value ships still calling itself generation 1.
+  Two servers then stamp one number on text they rewrote by different rules, which
+  is a wrong value under a correct key at fleet scale.
+  - **The pin is a conformance digest paired with the byte**, in
+    `CompileValue_test.cpp`: a corpus of regions run through `CanonicalStoredValue`
+    and `PathCanon::LocalizeRegion`, digested, and matched against the row for the
+    live `CompileValueVersion`. A digest alone would not do it — the behaviour and
+    the golden are one edit two hunks apart, and moving both leaves the suite green,
+    which is `Test::RetiredGeneration`'s argument arriving at the same place from the
+    key side. Retired rows stay, and the live digest must reproduce none of them.
+  - **Measured, because a guard nobody has watched refuse is not a guard**: a
+    plausible "collapse the double separator" edit to `JoinLocalized` — which changes
+    what every consumer replays — passed **2006 of 2007** cases, the pin being the
+    one that refused it. The first cut of the corpus did not catch it either, because
+    it exercised bare roots only as a PRODUCER; a rewrite and its inverse are one
+    spec, so both ends of every shape reach the digest.
+  - **It also pins the digest across HOSTS.** Every entry point in `PathCanon`
+    derives its conventions from the layout rather than from the running binary, so
+    the corpus yields one digest on Windows, Linux and macOS. A change that broke
+    that would make a Windows server and a POSIX one disagree about a value they both
+    hold — the same defect with no version skew anywhere near it.
+- **The reader could not tell a foreign value from a damaged one.**
+  `CanonicalStoredValue` returned `std::optional`, and its `nullopt` meant both "these
+  bytes are not a stored value" and "this IS one, of a generation I do not
+  implement". The two servers apply *opposite* policies to that single state — the
+  daemon refuses, a node's cache tier stores the bytes **verbatim**, each defensible
+  for genuinely opaque bytes — so a launcher at generation N storing into a node at
+  N+1 put the producing checkout's absolute paths into the shared cache under a key
+  every machine computes. That is #229/#319 reached by nothing worse than a rolling
+  upgrade, and it is `.agent/rules/metrics-and-observability.md`'s four-states rule:
+  an `optional` cannot carry it.
+  - `CanonicalizationOutcome` names three, and `ForeignGeneration` **carries no
+    bytes** — so "store it verbatim" is not a thing a caller can do by accident,
+    there being nothing to store.
+  - `DecodeCompileValue` answers `UnsupportedFeature` for an unknown generation and
+    `MalformedFrame` for everything else, and the classifier reads that code back
+    rather than re-testing the version byte: two spellings of one rule are two places
+    for it to drift. It is `.agent/rules/storage.md`'s `UnsupportedFormatVersion`
+    against `Corrupt`, one layer up and on the wire instead of on disk — and for the
+    same reason, since the obvious remedy for a cache reported corrupt is to wipe it.
+  - **A blob whose leading byte is unrecognised is called foreign even when it is
+    not a stored value at all.** Deliberate and one-directional: the cost is a
+    refused store of something no client on this wire sends, and the alternative is
+    guessing a foreign generation's framing well enough to rule it out.
+  - **No tag moved for this.** Nothing observable about generation 1 changed, and
+    `CompileValueVersion` has never moved, so the population of values stored
+    verbatim by this route is empty **by construction**. That is a condition, not a
+    standing property: it stops being true the first time somebody bumps the byte,
+    which is exactly when the refusal above starts doing work.
+- **The launcher says which of the two it met.** `DecodeFailureReason` gives a
+  foreign generation its own `--show-stats` row, because a mixed fleet is a rolling
+  upgrade that ends by itself while a malformed value is a defect somebody has to
+  look at, and an operator does different things about them. Otherwise an upgrade
+  window presents as an endlessly cold cache with no diagnostic, which this wire has
+  already recorded paying for once.
+
 ## Accepted trade-offs
 
 These are argued in place above and are **not** open work — do not "fix" one

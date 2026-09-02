@@ -5,7 +5,7 @@
 #include <FastCache/Core/WireFields.hpp>
 
 #include <array>
-#include <optional>
+#include <format>
 #include <ranges>
 #include <utility>
 
@@ -13,8 +13,6 @@ namespace FastCache
 {
 namespace
 {
-
-    constexpr std::uint8_t CompileValueVersion = 1;
 
     /// The fewest wire bytes one encoded text region can occupy: its grammar tag and
     /// its length prefix, with empty text. Read straight off `EncodeCompileValue`'s
@@ -127,6 +125,21 @@ namespace
         return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = std::move(context) });
     }
 
+    /// The refusal for a value whose leading byte names a generation this build does
+    /// not implement -- deliberately NOT `Malformed`, because the bytes are not
+    /// damaged and a caller that cannot tell those two apart applies one policy to
+    /// both. `CanonicalStoredValue` reads this code back; nothing else has to.
+    /// @param generation The leading byte that was read.
+    /// @return The typed refusal, naming both generations.
+    [[nodiscard]] std::unexpected<ProtocolError> ForeignGeneration(std::uint8_t generation)
+    {
+        return std::unexpected(ProtocolError {
+            .code = ProtocolErrorCode::UnsupportedFeature,
+            .context =
+                std::format("compile-value generation {}; this build writes and reads {}", generation, CompileValueVersion),
+        });
+    }
+
 } // namespace
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
@@ -155,7 +168,7 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     if (!cursor.ReadU8(version))
         return Malformed("empty compile-value frame");
     if (version != CompileValueVersion)
-        return Malformed("unknown compile-value version");
+        return ForeignGeneration(version);
 
     CompileValue value;
 
@@ -202,13 +215,27 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     return value;
 }
 
-std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte const> value,
-                                                           std::string_view sourceRoot,
-                                                           std::string_view buildTree)
+StoredValueCanonicalization CanonicalStoredValue(std::span<std::byte const> value,
+                                                 std::string_view sourceRoot,
+                                                 std::string_view buildTree)
 {
     auto decoded = DecodeCompileValue(value);
     if (!decoded.has_value())
-        return std::nullopt;
+    {
+        // The one place the two absent cases are told apart. `DecodeCompileValue`
+        // answers `UnsupportedFeature` for a leading byte naming another generation
+        // and `MalformedFrame` for everything else, so the split is read back from
+        // the code rather than restated by a second version test here -- two
+        // spellings of one rule are two places for it to drift.
+        if (decoded.error().code != ProtocolErrorCode::UnsupportedFeature)
+            return { .bytes = {}, .outcome = CanonicalizationOutcome::NotACompileValue, .generation = 0 };
+
+        // Safe by construction: `UnsupportedFeature` is only ever produced after the
+        // leading byte has been read, so `value` is non-empty here.
+        return { .bytes = {},
+                 .outcome = CanonicalizationOutcome::ForeignGeneration,
+                 .generation = static_cast<std::uint8_t>(value.front()) };
+    }
 
     PathCanon::Layout const producer { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
 
@@ -217,7 +244,7 @@ std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte c
     for (auto& region: decoded->textRegions)
         region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
 
-    return EncodeCompileValue(*decoded);
+    return { .bytes = EncodeCompileValue(*decoded), .outcome = CanonicalizationOutcome::Canonicalized, .generation = 0 };
 }
 
 } // namespace FastCache
