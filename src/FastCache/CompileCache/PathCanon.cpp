@@ -44,8 +44,14 @@ namespace
         return out;
     }
 
-    /// True when `rootCmp` (comparison form, no trailing separator) is a
-    /// segment-boundary prefix of `pathCmp` (comparison form).
+    /// True when `rootCmp` (comparison form) is a segment-boundary prefix of
+    /// `pathCmp` (comparison form).
+    ///
+    /// A trailing separator on the root is handled here rather than assumed away.
+    /// This summary used to promise one absent, which was a precondition no caller
+    /// enforced: the daemon and the node take these roots straight off a STORE frame
+    /// and `RootReconciler` deliberately exempts a bare root from trimming, so `/`
+    /// and `C:\` arrive with one and always did.
     /// @param pathCmp Comparison form of the candidate path.
     /// @param rootCmp Comparison form of a root.
     /// @return Whether the root prefixes the path on a segment boundary.
@@ -191,6 +197,15 @@ namespace
         // Either separator counts, not just the one `SeparatorOf` picked: a root
         // mixing styles (`C:\src/`) reports `\` and ends with `/`, so testing only
         // against the reported one would append a second separator to it.
+        //
+        // The emptiness test guards `back()` and states no policy, because there is
+        // no reachable configuration to have one for: an EMPTY root is refused before
+        // any layout is built (`RunCached` returns on an empty `srcRoot`/`buildTree`),
+        // and on the producing side `IsSegmentPrefix` answers false for one, so no
+        // token exists to come back through here. Were one ever to arrive, neither
+        // answer is right -- a relative path can resolve against the build directory
+        // and name a different real file -- and the token should be left standing for
+        // `MissingReplayedDependency` to refuse rather than localized into a guess.
         if (!out.empty() && out.back() != '/' && out.back() != '\\')
             out.push_back(sep);
 

@@ -1576,6 +1576,15 @@ worth acting on is worth one clause saying which of the two it is.
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
   arguments even though their dependency sets now agree.
+- **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
+  RETIRED generation's conformance digest is a dated record and nothing can
+  re-derive it: it describes the corpus as that generation met it, and #547 retired
+  generation 1 while adding three corpus rows in the same commit. The live row is
+  guarded, and a reverted bump is caught structurally (unique ascending versions,
+  the live byte naming the last row) — what is missing is any assertion that a bump
+  changed what it SAID it changed, which needs a per-generation frozen corpus. Read
+  with #548, since the key side's retired rows have the same property and whichever
+  lands second inherits the other's shape.
 - **[#548](https://github.com/LASTRADA-Software/fastcached/issues/548)** — the
   retired-generation idiom has two homes with different key types:
   `apps/fastcache-cc/KeyDigestTestSupport.hpp` keyed on a schema-tag string, and

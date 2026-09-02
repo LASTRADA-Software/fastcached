@@ -522,21 +522,26 @@ constexpr std::array ConformanceCorpus {
 /// needs to happen. A digest alone would not do it: the behaviour and the golden
 /// value are one edit two hunks apart, so moving both leaves the suite green and
 /// every server still calling itself generation N. Pairing the digest with the
-/// version is what closes that, and it is why the rows for retired generations
-/// stay -- the live digest must reproduce none of them, so putting an old version
-/// byte back is caught whatever the golden says.
+/// version is what closes that.
+///
+/// A retired row's digest is a DATED RECORD and not a second guard, which is worth
+/// saying out loud because the obvious reading is the wrong one. It describes the
+/// corpus as that generation met it -- this table's first retirement added three
+/// rows in the same commit, so `be1728...` no longer describes anything the live
+/// corpus can produce. And the live digest could not reproduce a retired one even
+/// if the corpus had stood still: `ConformanceDigest` frames `canonical.bytes`,
+/// whose FIRST BYTE is `CompileValueVersion`, so comparing across generations is
+/// unequal by construction. What catches a bump being put back is structural and
+/// lives in the case below.
 struct StoredValueGeneration
 {
-    std::string_view digest; ///< What the live corpus yields under that generation.
+    std::string_view digest; ///< What the corpus of its day yielded under that generation.
     std::uint8_t version;    ///< The `CompileValueVersion` it was written under.
 };
 
 /// Every generation of the stored-value contract this build knows about.
 ///
-/// The live one is last; everything above it is retired and stays. A retired row is
-/// not decoration: the live digest must reproduce none of them, so putting an old
-/// version byte back is caught whatever golden was pasted with it -- which a lone
-/// golden value could not do.
+/// The live one is LAST and that ordering is load-bearing -- see the case below.
 /// @return The table, newest last.
 constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
@@ -632,7 +637,11 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // servers do with one value, and the answer there is a new generation. A message
     // naming only the second teaches whoever meets the first to bump the byte for
     // nothing, which retires every entry in the fleet to buy exactly that.
-    INFO("the stored-value contract produced "
+    // Scoped, like the note above it: unscoped, this whole paragraph was reprinted
+    // under the structural failure below, which is a different fact with a different
+    // remedy -- and the reader meets the digest advice first.
+    {
+        INFO("the stored-value contract produced "
          << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << pinned.digest
          << ".\nIf you widened ConformanceCorpus to cover behaviour that was ALREADY in this generation, repin "
             "generation "
@@ -644,19 +653,33 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
             "generation "
          << static_cast<unsigned>(CompileValueVersion)
          << " while rewriting a value differently. Bump CompileValueVersion and add a row carrying " << live << ".");
-    CHECK(live == pinned.digest);
-
-    // A version and its digest move together, so no two generations may carry
-    // either -- which is what catches a bump being put back afterwards, the golden
-    // re-pasted with it.
-    for (auto const& row: rows)
-    {
-        if (row.version == CompileValueVersion)
-            continue;
-        INFO("the live contract reproduces retired generation " << static_cast<unsigned>(row.version)
-                                                                << " -- its bump was reverted");
-        CHECK(live != row.digest);
+        CHECK(live == pinned.digest);
     }
+
+    // What catches a bump being put back afterwards with a freshly pasted golden.
+    //
+    // This used to be `CHECK(live != row.digest)` over the retired rows, which reads
+    // like that guard and cannot be that guard: `ConformanceDigest` frames
+    // `canonical.bytes`, whose leading byte IS `CompileValueVersion`, so a digest
+    // taken under one generation can never equal one taken under another. The check
+    // could not fail, and a check that cannot fail is indistinguishable from one that
+    // holds -- which is the same thing `RegionEffect` exists to say one table over.
+    //
+    // The structure carries it instead, and structure is what the reverting author
+    // actually has to defeat. A bump ADDS a row, so the live byte names the LAST one;
+    // putting the byte back names an earlier row however good its digest is.
+    for (auto const i: std::views::iota(std::size_t { 1 }, rows.size()))
+    {
+        INFO("StoredValueGenerations is out of order at row " << i << ": generations are unique and ascending, so a "
+                                                              << "bump appends");
+        REQUIRE(rows[i].version > rows[i - 1].version);
+    }
+
+    INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion) << " but the newest generation in "
+                                   << "the table is " << static_cast<unsigned>(rows.back().version)
+                                   << ". A bump appends a row, so the live byte is the last one -- naming an earlier "
+                                   << "generation is a bump that was reverted, whatever digest was pasted with it.");
+    CHECK(CompileValueVersion == rows.back().version);
 }
 
 namespace
