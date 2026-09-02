@@ -139,7 +139,12 @@ src/FastCache/
                 on-FETCH, leading-key group prefetch), CompileCacheWire
                 (header-only, dependency-free: the 0xFC magic/version/opcode/
                 status/error tables and their encoders, shared verbatim by the
-                daemon, fastcache-cc and the test client)
+                daemon, fastcache-cc and the test client) and SurfaceRefusal
+                (the ONE way any 0xFC surface answers a refusal: Refuse with a
+                row carrying the counter, RefuseWithoutCounter with the reason
+                nothing rises, RefuseUntriaged with the issue that will decide
+                -- so a scan can tell a decision from an omission, which it
+                could not while both were a bare EncodeErrorReply)
   Server/       Connection (per-client coroutine), Server,
                 ReactorServerLoop (the server driver), AdminHttpServer (the
                 read-only HTTP surface; its routes are a table a caller

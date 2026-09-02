@@ -9,9 +9,11 @@
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <ranges>
 
@@ -22,6 +24,20 @@ namespace FastCache::Node
 
 namespace Detail
 {
+    /// The issue that will decide which of the CACHE surface's refusals are events.
+    ///
+    /// Both of this surface's refusal arms carried a written rationale and neither was
+    /// a decision: one argued the framing arms are "visible to the peer", when #491's
+    /// scenario is a peer that IS the attacker; the other called the byte budget a
+    /// transient, when #491 records that `MaxInFlightBytes()` folds to the largest
+    /// owner -- this cache -- so it is the byte-budget refusal a real node reaches.
+    ///
+    /// Written as decided, they also left the backlog, and #491's completion measure
+    /// would then have read `CacheProxy`'s sites -- a different surface -- letting it
+    /// close while the two arms in its own title stayed undecided. An instrument
+    /// measuring the wrong set and reporting success is the defect #492 exists to fix.
+    constexpr std::uint32_t CacheSurfaceTriage = 491;
+
     /// What the SCHEDULER surface answers each endpoint-decided refusal with.
     ///
     /// `Cc::SurfaceRefusal` rows and `Cc::Refuse`, not an `Increment` beside an
@@ -157,15 +173,22 @@ class SchedulerResponder final: public IFrameResponder
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
-        if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
-            _metrics.Increment(IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated);
-
         // The caller's wording, which is empty for every decision but the frame
         // ceiling -- and that one names both numbers, because "too large" without the
         // limit tells an operator nothing about a kilobyte cap. Nothing is added here:
         // what a message could say is which verb the caller failed to reach, and an
         // unauthenticated peer learns nothing from being told that.
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), detail);
+        if (decision == CompileCacheWire::PrePayloadDecision::Unauthenticated)
+            return Cc::Refuse(_metrics,
+                              { .code = CompileCacheWire::ErrorCodeFor(decision),
+                                .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated },
+                              detail);
+        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::ErrorCodeFor(decision),
+                                          .rationale =
+                                              "a size or opcode refusal says the peer is confused; an operator watching "
+                                              "for somebody reaching after verbs they hold no secret for does not want "
+                                              "it summed into that series" },
+                                        detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
@@ -193,7 +216,12 @@ class SchedulerResponder final: public IFrameResponder
     {
         auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)].answer;
         if (!row.has_value())
-            return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
+            return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal),
+                                              .rationale =
+                                                  "the byte budget says this surface is momentarily full, which the peer "
+                                                  "sees and retries; summed into a security series it is what makes that "
+                                                  "series unreadable" },
+                                            detail);
         return Cc::Refuse(_metrics, *row, detail);
     }
 
@@ -354,9 +382,10 @@ class CacheResponder final: public IFrameResponder
     {
         if (_locality.IsThisMachine(peer))
             return std::nullopt;
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal);
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCode::NotAMember,
-                                                  "this node serves its cache to its own machine only");
+        return Cc::Refuse(_metrics,
+                          { .code = CompileCacheWire::ErrorCode::NotAMember,
+                            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal },
+                          "this node serves its cache to its own machine only");
     }
 
     /// @copydoc IFrameResponder::AuthRequired
@@ -395,28 +424,37 @@ class CacheResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::RefusalReply
     ///
-    /// Nothing to count: this surface requires no credential, so it can never
-    /// produce the one refusal that carries a counter. The size and opcode arms are
-    /// framing errors and are already visible as such to the peer.
+    /// **Undecided, not decided.** The position this used to state -- that the size
+    /// and opcode arms are "already visible as such to the peer" -- answers a question
+    /// nobody asked: #491's scenario is a client hammering a cache-tier node with
+    /// oversized declarations while an operator watches a flat graph, so **the peer is
+    /// the attacker** and visibility to it is not the property anyone needs. That is
+    /// one of the arms #491 was filed to rule on, so it says so rather than claiming
+    /// the ruling.
     [[nodiscard]] std::vector<std::byte> RefusalReply(CompileCacheWire::PrePayloadDecision decision,
                                                       std::uint8_t /*opRaw*/,
                                                       std::string_view detail) const override
     {
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::ErrorCodeFor(decision), detail);
+        return Cc::RefuseUntriaged({ .code = CompileCacheWire::ErrorCodeFor(decision), .issue = Detail::CacheSurfaceTriage },
+                                   detail);
     }
 
     /// @copydoc IFrameResponder::EndpointRefusalReply
     ///
-    /// Nothing to count here either, and for two different reasons. The credential
-    /// arms are unreachable: this surface requires none, so `AUTH` never routes to it
-    /// and `CheckCredential` answers `NoPolicy` unconditionally. The byte budget is
-    /// reachable and is a transient the peer retries past, not a signal -- the same
-    /// position `RefusalReply` above takes on the framing arms.
+    /// **Undecided, and the byte budget is why.** Calling it "a transient the peer
+    /// retries past" is the OPPOSITE of what #491 records: `MaxInFlightBytes()` folds
+    /// to the largest owner, in practice this cache, so the byte-budget refusal a real
+    /// node actually reaches is THIS one. #491 names it as the uncounted arm that
+    /// fires, which is #326's scenario one surface over.
+    ///
+    /// The credential arms genuinely are unreachable here -- this surface requires no
+    /// credential, so `AUTH` never routes to it -- but they share the one answer, and
+    /// an arm that cannot fire is not a reason to call the arm that does decided.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        return CompileCacheWire::EncodeErrorReply(ErrorCodeFor(refusal), detail);
+        return Cc::RefuseUntriaged({ .code = ErrorCodeFor(refusal), .issue = Detail::CacheSurfaceTriage }, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout
@@ -762,8 +800,12 @@ class MergedResponder final: public IFrameResponder
     /// @return The encoded refusal.
     [[nodiscard]] static std::vector<std::byte> UnservedReply()
     {
-        return CompileCacheWire::EncodeErrorReply(CompileCacheWire::UnimplementedVerb,
-                                                  "this node serves no component for that verb family");
+        return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
+                                          .rationale =
+                                              "an ANSWER healthy traffic produces continuously, not an event: a node runs "
+                                              "its components independently, so one it does not hold refuses every "
+                                              "exchange of a whole build and a port scan would be invisible inside it" },
+                                        "this node serves no component for that verb family");
     }
 
     /// The largest value the present owners report for one ceiling.

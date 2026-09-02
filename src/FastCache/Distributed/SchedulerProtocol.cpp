@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,19 @@ namespace FastCache::Distributed
 namespace
 {
     namespace Wire = CompileCacheWire;
+
+    /// The issue that will decide which of this surface's refusals are events.
+    ///
+    /// This class holds no metrics sink at all, so every refusal below is answered
+    /// correctly and counted nowhere -- on the one surface that carries lease grants
+    /// and worker registration, which is where a credential-guessing client shows up
+    /// first. None of the arms has been argued either way, so they are
+    /// `RefuseUntriaged` rather than `RefuseWithoutCounter`: the latter would claim a
+    /// decision nobody has made, which is a worse lie than the bare encoder it
+    /// replaces. Deciding them per arm, against "would a rise here mean something
+    /// happened", is
+    /// [#494](https://github.com/LASTRADA-Software/fastcached/issues/494).
+    constexpr std::uint32_t SchedulerRefusalTriage = 494;
 
     /// The verbs a scheduler answers.
     ///
@@ -71,7 +85,7 @@ std::optional<std::vector<std::byte>> SchedulerProtocol::RefusePeer(CallerContex
     // Encoded exactly as `Answer` encodes a refusal, so an early refusal and a late
     // one are the same bytes on the wire -- a client must not be able to tell which
     // side of the payload read it was refused on.
-    return Wire::EncodeErrorReply(refusal->error, refusal->message);
+    return Cc::RefuseUntriaged({ .code = refusal->error, .issue = SchedulerRefusalTriage }, refusal->message);
 }
 
 std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> frame, CallerContext const& caller)
@@ -87,37 +101,37 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
     if (!Wire::IsSupported(header->version))
         // Naming the supported range, because a rejection that cannot say what
         // would have worked cannot be acted on.
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion,
-                                      std::format("supported versions {}..{}",
-                                                  static_cast<unsigned>(Wire::MinSupportedVersion),
-                                                  static_cast<unsigned>(Wire::CurrentVersion)));
+        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnsupportedVersion, .issue = SchedulerRefusalTriage },
+                                   std::format("supported versions {}..{}",
+                                               static_cast<unsigned>(Wire::MinSupportedVersion),
+                                               static_cast<unsigned>(Wire::CurrentVersion)));
 
     auto const* descriptor = Wire::FindOp(header->opRaw);
     if (descriptor == nullptr)
         // Stepped over rather than fatal: the framing exists so a receiver can skip
         // a verb it does not know, which is what lets a newer client talk to an
         // older scheduler at all.
-        return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode);
+        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnknownOpcode, .issue = SchedulerRefusalTriage });
 
     if (!IsSchedulerVerb(descriptor->code))
     {
         if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-            return Wire::EncodeErrorReply(row->code, row->why);
+            return Cc::RefuseUntriaged({ .code = row->code, .issue = SchedulerRefusalTriage }, row->why);
 
         // A cache verb at the scheduler's port. Answered rather than dropped, so a
         // misconfigured client learns which port it got wrong instead of seeing
         // something indistinguishable from a dead host.
-        return Wire::EncodeErrorReply(Wire::ErrorCode::DispatchNotPermitted);
+        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::DispatchNotPermitted, .issue = SchedulerRefusalTriage });
     }
 
     auto const payload = frame.subspan(Wire::RequestHeaderSize);
     if (payload.size() != header->payloadLength)
-        return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
+        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = SchedulerRefusalTriage });
 
     auto const reply = Route(descriptor->code, payload, caller);
     if (reply.status == Wire::Status::Ok)
         return Wire::EncodeReply(Wire::Status::Ok, reply.payload);
-    return Wire::EncodeErrorReply(reply.error, reply.message);
+    return Cc::RefuseUntriaged({ .code = reply.error, .issue = SchedulerRefusalTriage }, reply.message);
 }
 
 namespace

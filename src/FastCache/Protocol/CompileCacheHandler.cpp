@@ -7,6 +7,7 @@
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,15 @@ namespace
 {
 
     namespace Wire = CompileCacheWire;
+
+    /// The issue that will decide which of the daemon's `0xFC` refusals are events.
+    ///
+    /// This is the one funnel every refusal on the surface passes through, and it
+    /// counts nothing. Whether it should -- and which arms, against "would a rise here
+    /// mean something happened" -- is
+    /// [#494](https://github.com/LASTRADA-Software/fastcached/issues/494). Untriaged
+    /// rather than deliberately uncounted, because nobody has made that argument yet.
+    constexpr std::uint32_t DaemonRefusalTriage = 494;
 
     /// Cap on a single framed line/field's length. The compile-cache protocol
     /// never uses line reads, but ByteReader requires a line cap; set it to the
@@ -142,7 +152,7 @@ namespace
     /// @return true when the whole reply reached the socket.
     [[nodiscard]] Task<bool> ReplyError(ISocket* socket, Wire::ErrorCode code, std::string message)
     {
-        auto const frame = Wire::EncodeErrorReply(code, message);
+        auto const frame = Cc::RefuseUntriaged({ .code = code, .issue = DaemonRefusalTriage }, message);
         co_return co_await WriteAll(socket, frame);
     }
 

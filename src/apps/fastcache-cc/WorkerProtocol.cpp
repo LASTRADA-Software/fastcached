@@ -5,6 +5,7 @@
 #include "WorkerProtocol.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>
@@ -166,12 +167,6 @@ LeaseValidator UncheckedLeaseValidator()
     return [](std::string_view, std::string_view) {
         return std::optional<Distributed::LeaseRefusal> {};
     };
-}
-
-std::vector<std::byte> Refuse(IMetricsSink& metrics, SurfaceRefusal const& refusal, std::string_view detail)
-{
-    metrics.Increment(refusal.counter);
-    return Wire::EncodeErrorReply(refusal.code, detail);
 }
 
 WorkerProtocol::WorkerProtocol(ICompileJobRunner& jobs,

@@ -2,9 +2,11 @@
 #include "CacheProxy.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <format>
 #include <string_view>
 
@@ -14,6 +16,19 @@ namespace FastCache::Node
 namespace
 {
     namespace Wire = CompileCacheWire;
+
+    /// The issue that will decide which of this tier's refusals are events worth
+    /// counting.
+    ///
+    /// Every refusal below is answered correctly and counts nothing, and none of them
+    /// has been argued either way -- so they are `RefuseUntriaged` rather than
+    /// `RefuseWithoutCounter`, which would claim a decision nobody has made. The test
+    /// #447 extracted is "would a rise here mean something happened", and applying it
+    /// per arm on this surface is
+    /// [#491](https://github.com/LASTRADA-Software/fastcached/issues/491).
+    /// `worker-refusals-counted` counts these and prints the total on every run, so
+    /// the backlog cannot be added to unnoticed.
+    constexpr std::uint32_t CacheRefusalTriage = 491;
 
     /// This surface's rows. The shape, the lookup and why they exist are on
     /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
@@ -45,25 +60,25 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
         co_return std::vector<std::byte> {};
 
     if (!Wire::IsSupported(header->version))
-        co_return Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion,
-                                         std::format("supported versions {}..{}",
-                                                     static_cast<unsigned>(Wire::MinSupportedVersion),
-                                                     static_cast<unsigned>(Wire::CurrentVersion)));
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnsupportedVersion, .issue = CacheRefusalTriage },
+                                      std::format("supported versions {}..{}",
+                                                  static_cast<unsigned>(Wire::MinSupportedVersion),
+                                                  static_cast<unsigned>(Wire::CurrentVersion)));
 
     auto const* descriptor = Wire::FindOp(header->opRaw);
     if (descriptor == nullptr)
-        co_return Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode);
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnknownOpcode, .issue = CacheRefusalTriage });
 
     auto const payload = frame.subspan(Wire::RequestHeaderSize);
     if (payload.size() != header->payloadLength)
-        co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
+        co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
     switch (descriptor->code)
     {
         case Wire::Op::Fetch: {
             auto const key = Wire::DecodeFetchPayload(payload);
             if (!key.has_value())
-                co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
             auto const found = co_await _cache.Fetch(Wire::AsStringView(*key));
             if (!found.has_value())
@@ -77,7 +92,7 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
         case Wire::Op::Store: {
             auto const fields = Wire::DecodeStorePayload(payload);
             if (!fields.has_value())
-                co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedFrame);
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = CacheRefusalTriage });
 
             // Canonicalized against the roots the client sent, through the one
             // recipe both servers on this wire share.
@@ -100,20 +115,20 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
-                co_return Wire::EncodeErrorReply(Wire::ErrorCode::StorageWriteFailed);
+                co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::StorageWriteFailed, .issue = CacheRefusalTriage });
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }
         default:
             if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-                co_return Wire::EncodeErrorReply(row->code, row->why);
+                co_return Cc::RefuseUntriaged({ .code = row->code, .issue = CacheRefusalTriage }, row->why);
 
             // A scheduler or worker verb at the cache port. Answered rather than
             // dropped, so a client that reached the wrong one of this node's ports
             // learns which instead of seeing something indistinguishable from a dead
             // host.
-            co_return Wire::EncodeErrorReply(Wire::ErrorCode::DispatchNotPermitted,
-                                             "this endpoint is the node's cache; scheduling and compiles are served on "
-                                             "their own ports");
+            co_return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::DispatchNotPermitted, .issue = CacheRefusalTriage },
+                                          "this endpoint is the node's cache; scheduling and compiles are served on "
+                                          "their own ports");
     }
 }
 
