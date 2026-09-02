@@ -183,17 +183,22 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   checkout. Measured: `g++` 143 B, `clang++` 6 B, `clang-cl` 23 B, and `cl` **11 B with
   no debug flag at all** — `.debug$S`'s `S_OBJNAME` holds the absolute object path, so
   `/Z7` widens this and does not open it. `-fdebug-prefix-map` closes it on ELF and on
-  NEITHER COFF driver; that residue is an accepted cost, not open work. Never
-  `-ffile-prefix-map`, which rewrites `__FILE__` INTO the text the key hashes -- and for
-  that reason it and `-fmacro-prefix-map` get no table row either, or the key hashes text
-  the compile never produced. The build-tree rule is mapped LAST (both drivers honour the
-  LAST match, measured off `DW_AT_comp_dir`); a root with a SPACE is not mapped at all,
-  since the rules are spliced into a space-separated flags string; and a DISPATCHED
-  compile is not covered, because `RemoteCompileArgs` drops every path-valued flag. And the flag names the producing root BY
-  CONSTRUCTION, so the key relativizes its head (`PathValueRole::PrefixMap`) and leaves
-  the replacement literal — two machines mapping differently must MISS. Relative is not
-  checkout-independent: `file(RELATIVE_PATH)` answers `../../mnt/d/.../checkout`
-  out-of-tree, and with a trailing separator. `ctest -R debug-prefix-map-rules`.
+  NEITHER COFF driver; that residue is an accepted cost, not open work.
+  - Never `-ffile-prefix-map`, and no table row for it or `-fmacro-prefix-map` either:
+    both rewrite `__FILE__` INTO the text the key hashes, and a row would make the key
+    hash text the compile never produced.
+  - The flag names the producing root BY CONSTRUCTION, so the key relativizes its head
+    (`PathValueRole::PrefixMap`, a table COLUMN rather than a branch) and leaves the
+    replacement literal — two machines mapping differently must MISS.
+  - The build-tree rule is mapped LAST: both drivers honour the LAST match, measured off
+    `DW_AT_comp_dir`. No object comparison can see this, since both orders are
+    checkout-independent.
+  - Relative is not checkout-independent — `file(RELATIVE_PATH)` answers
+    `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
+    with a SPACE is not mapped at all, the rules being spliced into a space-separated
+    flags string. `ctest -R debug-prefix-map-rules`.
+  - A DISPATCHED compile is not covered ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)):
+    `RemoteCompileArgs` drops every path-valued flag.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
