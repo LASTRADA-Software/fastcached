@@ -2528,6 +2528,12 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         // disagreement rather than the loopback.
         loopbackBound.nodeListen = "127.0.0.1:6674";
         loopbackBound.advertise = "127.0.0.1:6674";
+        // And so does the SCHEDULER, which is the half this case claimed and did not
+        // have (#463): `Installable()` registers with `cache.internal`, so as written
+        // this was a loopback endpoint handed to a machine that could not dial it --
+        // the fourth reachability row's exact subject, not the loopback fleet the
+        // harnesses run. `dist-compile-e2e.sh` names 127.0.0.1 here too.
+        loopbackBound.scheduler = "127.0.0.1:6675";
         loopbackBound.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
 
