@@ -62,9 +62,12 @@ port() {
 
 # Start the daemon just long enough for it to create its store(s), then stop it.
 # The conversion must run against a store nobody has open.
-# $1: the directory the store files appear in. $2..: the daemon's storage flags.
+# $1: the directory the store files appear in.
+# $2: how many `.cow` files the caller goes on to assert.
+# $3..: the daemon's storage flags.
 create_store() {
     local watch="$1"; shift
+    local expected="$1"; shift
     local p
     p="$(port)" || fail "could not allocate a port"
 
@@ -75,21 +78,49 @@ create_store() {
     "$FASTCACHED" --config "$EMPTY_CONFIG" --port="$p" "$@" &
     local pid=$!
 
-    # Bounded, and it says what it waited for. The daemon's own liveness is
-    # checked each pass: one that dies at startup would otherwise present as a
-    # ten-second wait for a file, which names the wrong problem entirely.
+    # Waits for the number of stores the CALLER asserts, and that count is a
+    # parameter for exactly that reason. It used to break on the FIRST `.cow` to
+    # appear and then sleep a fixed 0.3 s before killing the daemon, while the
+    # sharded caller went on to assert four -- so whenever shard creation spanned
+    # more than that window the daemon was killed partway through and the
+    # assertion failed on a correct build (#576, observed as "created 3 shard
+    # file(s), expected 4"). Mechanical rather than unlucky: it fires on runner
+    # load, not on chance.
+    #
+    # The comment this replaces said "it says what it waited for", which was
+    # true, and was the whole defect -- what it waited for was not what the
+    # caller asserts. A guard may wait for a condition STRONGER than the
+    # assertion, never a weaker one.
+    #
+    # Bounded at 10 s still, and the daemon's own liveness is checked each pass:
+    # one that dies at startup would otherwise present as a ten-second wait for a
+    # file, which names the wrong problem entirely.
     local waited=0
+    local seen=0
     while [[ $waited -lt 100 ]]; do
-        [[ -n "$(find "$watch" -name '*.cow' 2>/dev/null | head -1)" ]] && break
-        kill -0 "$pid" 2>/dev/null || fail "the daemon exited before creating a store under $watch"
+        seen="$(find "$watch" -name '*.cow' 2>/dev/null | wc -l)"
+        [[ "$seen" -ge "$expected" ]] && break
+        kill -0 "$pid" 2>/dev/null \
+            || fail "the daemon exited after creating $seen of $expected store(s) under $watch"
         sleep 0.1
         waited=$((waited + 1))
     done
-    [[ -n "$(find "$watch" -name '*.cow' 2>/dev/null | head -1)" ]] \
-        || { kill "$pid" 2>/dev/null; fail "waited 10s for a .cow file under $watch and none appeared"; }
 
-    # The store file exists before the daemon has finished starting; let it
-    # settle before taking it away.
+    # Re-counted rather than trusting the loop to have exited for the right
+    # reason: running out of iterations and reaching the count are the same exit
+    # from the `while`, so without this a timeout would return quietly and hand
+    # the caller a half-built store to assert against -- a fixture timing out
+    # INTO a pass, which is the shape this file exists to not have.
+    seen="$(find "$watch" -name '*.cow' 2>/dev/null | wc -l)"
+    [[ "$seen" -ge "$expected" ]] \
+        || { kill "$pid" 2>/dev/null
+             fail "waited 10s for $expected store file(s) under $watch and saw $seen"; }
+
+    # The store file exists before the daemon has finished writing it, and this
+    # is still a fixed sleep because it stands for a different condition than the
+    # count above: the files are all THERE, and this waits for their contents to
+    # be readable by the conversion. Narrower than what it used to cover, and the
+    # one part of this function that is still a duration rather than a condition.
     sleep 0.3
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
@@ -98,7 +129,7 @@ create_store() {
 # ---------------------------------------------------------------- single file
 mkdir -p "$WORK/single"
 SINGLE="$WORK/single/cache.cow"
-create_store "$WORK/single" "--storage=$SINGLE"
+create_store "$WORK/single" 1 "--storage=$SINGLE"
 [[ -f "$SINGLE" ]] || fail "the daemon did not create $SINGLE"
 
 out="$(fc --migrate-storage "--storage=$SINGLE" 2>&1)" || fail "single-file conversion exited non-zero: $out"
@@ -108,7 +139,13 @@ echo "single file: $out"
 # ------------------------------------------------------------- sharded layout
 SHARDS="$WORK/shards"
 mkdir -p "$SHARDS"
-create_store "$SHARDS" "--storage=$SHARDS" --storage-shards=4
+create_store "$SHARDS" 4 "--storage=$SHARDS" --storage-shards=4
+
+# Still asserted, and NOT made redundant by the wait above: that waits for at
+# least four `*.cow`, this requires exactly four named `shard-NN.cow`. A daemon
+# that created five, or that named them something else, passes the wait and
+# fails here. Deleting it as duplication would drop the naming and the upper
+# bound, which are the parts the conversion below depends on.
 count="$(find "$SHARDS" -name 'shard-*.cow' | wc -l)"
 [[ "$count" -eq 4 ]] || fail "the daemon created $count shard file(s), expected 4"
 
