@@ -91,36 +91,25 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     if (bound.has_value())
         return surface;
 
-    // **Fatal, whoever named the address and whatever else this node runs**, and that
-    // is stage 3 deleting a branch's PREMISE rather than the branch being wrong.
+    // **Fatal, whoever named the address and whatever else this node runs** -- and
+    // WHY is the row's, not this function's (#352). `RowFor(NodeSurface::Node)`
+    // carries the reasoning; repeating it here would put it back in the two places
+    // the ticket is about, and the copy a maintainer editing this function reads is
+    // the one no guard checks.
     //
-    // A taken DEFAULT port used to be tolerated, and correctly: the launcher reaches
-    // whatever else holds it -- almost always a `fastcached` on this machine -- so the
-    // build still worked, and what was lost was a cache tier the operator had not
-    // asked for. That reasoning depended entirely on the worker having a compile port
-    // of its own to fall back to. It has none now. A node opens exactly one 0xFC port,
-    // and without it there is nowhere for a dispatched compile to arrive.
+    // What belongs here is what the row cannot say. A taken DEFAULT port used to be
+    // tolerated, and correctly: the worker had a compile port of its own to fall back
+    // to, so what was lost was a cache tier nobody had asked for. #290 stage 3 retired
+    // that port, which deleted the branch's PREMISE rather than showing the branch
+    // wrong -- so the provenance bit stopped deciding this and `--serve-scheduler`
+    // stopped being the one flag that escalated it. Both were answering "is this port
+    // load-bearing", and since the merge the answer is yes unconditionally.
     //
-    // Continuing would then produce the worst-shaped failure this system has, and it
-    // would produce it on the deployment the docs describe. `--scheduler` is required,
-    // so every node registers; `registrars` are built from `AdvertisedEndpoint(cfg)`,
-    // which is derived from the CONFIGURATION rather than from the listener, so the
-    // registration is unaffected by the bind having failed. The node would announce an
-    // address nothing answers, the scheduler would lease it out, and every client
-    // would fail to connect and fall back to compiling locally -- which is silent by
-    // design, because a client must never let distribution break a build. Green
-    // everywhere, working nowhere.
-    //
-    // So the provenance bit stops deciding this, and `--serve-scheduler` stops being
-    // the one flag that escalates it. Both were answering "is this port load-bearing",
-    // and since the merge the answer is yes unconditionally.
-    //
-    // The sentence names the REMEDY rather than the diagnosis. "cannot bind" is a wall
-    // at three in the morning; the operator needs to be told what almost certainly
-    // holds the port and that this node does not need it (#229).
-    // The verdict is the ROW's, not this function's (#352). What stays here is the
-    // sentence: it names the remedy rather than the diagnosis (#229), and the row
-    // carries the rationale instead -- two different readers, two different texts.
+    // And the sentence below, which names the REMEDY rather than the diagnosis:
+    // "cannot bind" is a wall at three in the morning, and the operator needs to be
+    // told what almost certainly holds the port and that this node does not need it
+    // (#229). Two readers, two texts -- the row answers a maintainer's "why is this
+    // fatal", this answers an operator's "what do I do now".
     auto judged = JudgeBindFailure(
         RowFor(NodeSurface::Node),
         std::format("--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "

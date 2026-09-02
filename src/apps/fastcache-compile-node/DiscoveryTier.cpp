@@ -151,10 +151,9 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
         // alone sends an operator to look at a port that bound perfectly.
         auto judged = JudgeBindFailure(
             RowFor(NodeSurface::Discovery),
-            std::format("cannot bind the UDP sockets discovery needs: {}:{} to listen on, and {} to answer on",
-                        bindHost,
-                        beaconSocket.port,
-                        cfg.discoveryReplyPort != 0 ? std::format("{}:{}", bindHost, cfg.discoveryReplyPort)
+            std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on",
+                        FormatHostPort(bindHost, beaconSocket.port),
+                        cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
                                                     : std::string { "a port of this node's own" }),
             logger);
         if (!judged.has_value())

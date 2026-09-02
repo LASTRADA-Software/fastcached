@@ -181,9 +181,9 @@ namespace
             .bindFailure = BindFailurePolicy::Refuse,
             .bindFailureReason = "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
                                  "it, so a worker that started without one looks healthy to the only thing that would have "
-                                 "noticed. fastcached answers this differently and correctly for itself: its admin surface "
-                                 "is shared infrastructure an operator watches deliberately, where a node's is a probe "
-                                 "target somebody attached. Same surface, two binaries, two right answers",
+                                 "noticed. fastcached continues past the same failure, and is right to for what it is: its "
+                                 "admin surface is shared infrastructure an operator watches deliberately, where a node's is "
+                                 "a probe target somebody attached. Same surface, two binaries, two right answers",
             .defaultHost = AdminListenDefaultHost,
             .spec = &NodeConfig::adminListen,
             .grammar = ListenEndpointGrammar,

@@ -463,10 +463,9 @@ class AdminEndpoint
   public:
     /// Bind the endpoint and start serving it.
     ///
-    /// Fallible, and reported rather than warned about: an operator who asked a
-    /// *worker* for an endpoint is almost always wiring a probe to it, so a worker
-    /// that silently started without one looks healthy to the very thing that
-    /// would otherwise have noticed it was not.
+    /// Fallible. What a bind failure DOES is `RowFor(surface)`'s answer, which
+    /// carries the reasoning too (#352); it is not restated here, because a second
+    /// copy of a policy is what that ticket is about.
     ///
     /// The error is a diagnostic string rather than one of the project's four error
     /// enums, and that is a deliberate departure. This fails in two ways that belong

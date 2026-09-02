@@ -304,16 +304,12 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // the defect the worker's own listener records having shipped once.
     if (_listener == nullptr || !_listener->IsBound())
     {
-        // Through the row (#352). Tolerating here would leave consensus dialling
-        // peers with nothing able to answer back -- this node would campaign, be
-        // counted in the quorum, and never receive a vote or an AppendEntries. That
-        // is precisely the failure the row's reason describes, which is why the row
-        // says `Refuse` and why this branch exists only so the row is what decides.
+        // Through the row (#352), which carries why this is fatal. Not restated
+        // here: a paraphrase beside a pointer is two copies that can disagree.
         auto judged =
             JudgeBindFailure(RowFor(NodeSurface::Raft),
-                             std::format("cannot bind {}:{}: {}",
-                                         bindAddress,
-                                         bindPort,
+                             std::format("cannot bind {}: {}",
+                                         FormatHostPort(bindAddress, bindPort),
                                          _listener ? _listener->BindError() : std::string_view { "null listener" }),
                              _logger);
         if (!judged.has_value())

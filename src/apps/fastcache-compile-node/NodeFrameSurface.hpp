@@ -100,26 +100,17 @@ class NodeFrameSurface
 ///   - **An error** — an address that was asked for could not be served, so startup
 ///     must stop.
 ///
-/// **A bind failure is fatal unconditionally, and #290 stage 3 is what made it so.**
-/// A taken DEFAULT port used to be tolerated, and the reasoning was sound while it
-/// held: the launcher reaches whatever else has the port -- almost always a
-/// `fastcached` on this machine -- so the build still worked, and what was lost was a
-/// cache tier nobody had asked for. That rested entirely on the worker having a
-/// compile port of its OWN to fall back to. There is one 0xFC port now, so without it
-/// there is nowhere for a dispatched compile to arrive.
+/// **What a bind failure DOES is the row's answer, not this function's** (#352):
+/// `RowFor(NodeSurface::Node)` states the policy and the reasoning behind it, and
+/// this header deliberately does not restate either. A copy here would go stale the
+/// moment the column moved, and no build would notice.
 ///
-/// And the node would not fail quietly, it would fail invisibly. `--scheduler` is
-/// required, so every node registers; the registrars are built from
-/// `AdvertisedEndpoint(cfg)`, which reads the CONFIGURATION and not the listener, so
-/// a failed bind does not reach them. The node announces an address nothing answers,
-/// the scheduler leases it out, and every client meets a failed connection and
-/// compiles locally -- silently, because a client must never let distribution break a
-/// build.
-///
-/// So `nodeListenExplicit` and `--serve-scheduler` stop deciding this. Both were
-/// answering "is this port load-bearing", and since the merge the answer is yes
-/// whatever the operator typed. The provenance bit is still what
-/// `--install-service` emits on, which is where #286 needed it.
+/// What stays here is what the row cannot say: #290 stage 3 is why the question is
+/// open at all. A taken DEFAULT port used to be tolerated, on reasoning that was
+/// sound while the worker had a compile port of its OWN to fall back to. There is one
+/// 0xFC port now, so `nodeListenExplicit` and `--serve-scheduler` stopped deciding
+/// this -- both were answering "is this port load-bearing". The provenance bit is
+/// still what `--install-service` emits on, which is where #286 needed it.
 ///
 /// @param io The loop this surface accepts and answers on.
 /// @param cfg What the operator asked for.
