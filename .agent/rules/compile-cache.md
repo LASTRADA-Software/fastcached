@@ -1248,26 +1248,30 @@ stops being one — the same confound that cost #493 a re-run.
 These are argued in place above and are **not** open work — do not "fix" one
 without reopening the argument:
 
-- **A manifest naming the TU and no header still validates, when a compile reports
-  no dependencies at all.** `NoProjectDeps` is `!includePaths.empty() && recorded
-  == 0`, so an EMPTY reported set skips it; `ManifestAssertsNothing` is
-  `entries.empty()`, and a TU-only manifest is not empty. So the hollow shape that
-  produced [#368](https://github.com/LASTRADA-Software/fastcached/issues/368) is
-  still constructible through that one door, and it validates in a checkout it was
-  not built from — `ctest -R fastcache-cc` covers exactly that, in
-  `DirectManifest_test.cpp`.
-  It is accepted because it is **sound as long as an empty reported set is
-  honest**, and both dishonest routes are closed: `UnreadablePaths` in `main.cpp`
-  refuses a manifest when a reported path is not readable as text (`47ee5e5`), and
-  `NoProjectDeps` refuses when paths were reported and all dropped (`4739f54`).
-  What remains is a TU that genuinely includes nothing, where a TU-only manifest is
-  the correct answer. The residue is that *"reported nothing"* and *"observed
-  nothing"* are two states an empty vector renders identically — so a THIRD way to
-  arrive at an empty list, added later at any caller, reopens #368 silently. That
-  is the thing to check before adding one, and it is why the test asserts the
-  current behaviour rather than a fix: it goes red if the guards are tightened,
-  which forces the edge to be reconsidered deliberately instead of drifting.
-
+- **`ValidateManifest` accepts a manifest that names the TU and no header, and
+  nothing but the PRODUCER stops one existing.** `ManifestAssertsNothing` is
+  `entries.empty()`, and a TU-only manifest is not empty — so a hollow manifest
+  reaching the validator would revalidate on the TU hash alone and serve its
+  recorded object into any checkout that computes the key, which is
+  [#368](https://github.com/LASTRADA-Software/fastcached/issues/368).
+  It cannot currently be built. `RecordManifest` refuses on THREE producer-side
+  guards, and the first is the one that closes this shape:
+  `includes.empty()` (`apps/fastcache-cc/main.cpp`, after the depfile fallback —
+  "no dependency record at all means no manifest"), `UnreadablePaths` when a
+  reported path is not readable as text (`47ee5e5`), and `NoProjectDeps` when paths
+  were reported and every one dropped (`4739f54`). The first two are invisible from
+  `DirectManifest.cpp`, which is why reasoning about `BuildManifest` alone gets this
+  wrong — it has exactly one non-test caller and the caller is where two of the
+  three guards live.
+  **So the accepted cost is the asymmetry, not a live hole**: the defence is
+  entirely on the produce side, and the validator would accept a hollow manifest
+  that arrived any other way — decoded from a store written by an older or foreign
+  producer, for instance. Tightening `ManifestAssertsNothing` to refuse a TU-only
+  manifest is the defence-in-depth fix, and it is cheap; what is NOT acceptable is
+  removing any of the three producer guards on the belief that the validator would
+  catch it. `DirectManifest_test.cpp`'s two cross-checkout cases characterize the
+  validator's current answer and say in-place that they must change if it is
+  tightened.
 - MurmurHash3 is not collision-resistant against an adversary. Accepted because
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust

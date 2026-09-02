@@ -15,7 +15,6 @@
 #include <fstream>
 #include <ranges>
 #include <set>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1535,14 +1534,25 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // checkout's headers. Every one of those paths lies outside this checkout's
     // roots, `IsToolchainHeader` calls every such path toolchain, all of them
     // drop -- and what is recorded is the TU and nothing else. That route is
-    // closed twice over now (`CanonicalStoredValue` on the node, `NoProjectDeps`
-    // here -- and "A compile whose every reported dependency was dropped records
-    // no manifest" above already pins that refusal), which is why this case
-    // reaches the same state the only way still open: by reporting NO
-    // dependencies at all. `NoProjectDeps` is `!includePaths.empty() && recorded
-    // == 0`, so an empty reported set skips it, and `ManifestAssertsNothing` asks
-    // only whether the manifest is empty. A TU-only manifest is therefore still
-    // constructible, and this is what it does.
+    // closed on the produce side now, and closed in THREE places rather than the
+    // one this comment used to claim: `RecordManifest` refuses when the compile
+    // reported no dependencies at all, again when a reported path is not readable
+    // as text, and `BuildManifest` refuses when paths were reported and every one
+    // dropped. So this case builds the hollow manifest DIRECTLY, through a door
+    // the launcher no longer opens -- `BuildManifest` is a library entry point and
+    // its one production caller guards it.
+    //
+    // What it characterizes is therefore the VALIDATOR, not a live launcher path:
+    // `ManifestAssertsNothing` is `entries.empty()`, a TU-only manifest is not
+    // empty, and so a hollow manifest that reached the validator by any other
+    // route -- decoded from a store an older or foreign producer wrote, say --
+    // would be accepted. The defence is entirely on the produce side, which is
+    // the asymmetry recorded in `.agent/rules/compile-cache.md`.
+    //
+    // IF `ManifestAssertsNothing` IS TIGHTENED to refuse a TU-only manifest, which
+    // is the defence-in-depth fix and is cheap, this case must be updated rather
+    // than worked around: the `CHECK` below deliberately pins today's answer, and
+    // an assertion that pins an answer is a change-detector unless it says so.
     TwoCheckouts const checkouts;
 
     auto const oldCheckout = checkouts.LayoutOf("checkout-old");
