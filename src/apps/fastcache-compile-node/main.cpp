@@ -942,9 +942,10 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error());
         return ExitUsage;
     }
-    // May legitimately be null: a node with neither component serves no 0xFC port, and
-    // a DEFAULT address already taken is a warning rather than a failure. Both have
-    // been logged.
+    // May legitimately be null, and for exactly one reason: a node with none of the
+    // three components serves no 0xFC port, which has been logged. A bind FAILURE is
+    // not that case -- this surface's row states `Refuse`, so it arrives as the error
+    // above rather than as a null. See `BindFailurePolicy` in NodeSurfaces.hpp.
     auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
 
     // Consensus, when the operator configured a cluster. It is what turns the
