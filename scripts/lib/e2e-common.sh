@@ -857,3 +857,42 @@ run_bounded() {
     fi
     return "$status"
 }
+
+# Put a command to whoever leads NOW, and assert what comes back.
+#
+# Generalised from `cluster-e2e.sh`'s `submit_setting`, which was this logic with
+# the verb hard-coded to `--cluster-set`. The name changed with it: that one was
+# already wrong before the generalisation, because it is also what asserts a
+# REFUSAL (a typo'd setting refused by name), so it never only submitted settings.
+#
+# The caller supplies `cluster`, `find_leader` and `$leader_endpoint`; bash binds
+# them late, so this stays a pure control-flow helper and the selftest can drive
+# it with stubs. That is the whole reason it lives here rather than in the fixture:
+# `cluster-e2e.sh` defines its functions BETWEEN executable sections, so sourcing
+# it to test one helper would run three sections of a real cluster first.
+#
+# Why the retry is on "the answer is not what the caller asserts" rather than on a
+# recognised "not the leader" refusal: that refusal has TWO spellings, one for
+# "somebody else leads" and one for "an election is in progress", and a fixture
+# matching them stops retrying the day either sentence is reworded -- silently.
+# Inherited verbatim from `submit_setting`, where it was learned the hard way.
+#
+# `$leader_endpoint` is pinned when a section derives it, and leadership may
+# legitimately move before that section finishes: a slow enough runner blows any
+# election timeout, and the rulebook's own note is that a cluster which has ELECTED
+# is not one that has FORMED. So a command put to the endpoint that led a moment
+# ago is a command put to a node that now answers "ask somebody else" (#117, #172).
+#
+# @param 1 the `--cluster-*` argument to send
+# @param 2 the substring an answer carries when the command did what was asked --
+#          which for a refusal-asserting caller is the refusal's own wording
+# @param 3 what to report when it never does
+ask_leader() {
+    local answer
+    answer="$(cluster "$leader_endpoint" "$1")"
+    if [[ "$answer" != *"$2"* ]]; then
+        find_leader "whoever leads now, to re-offer a command the previous leader did not take"
+        answer="$(cluster "$leader_endpoint" "$1")"
+    fi
+    [[ "$answer" == *"$2"* ]] || fail "$3 (asked ${leader_endpoint}): ${answer}"
+}
