@@ -112,6 +112,13 @@ namespace
             .name = "node",
             .flags = { "--listen-node", {} },
             .protocol = SurfaceProtocol::Tcp,
+            .bindFailure = BindFailurePolicy::Refuse,
+            .bindFailureReason =
+                "a node opens exactly one 0xFC port, so without it a dispatched compile has nowhere to "
+                "arrive -- and the node would still register, because the endpoint it advertises comes from "
+                "the configuration rather than from the listener. It would announce an address nothing "
+                "answers, be leased out, and every client would meet a failed connection and fall back to "
+                "compiling locally, which is silent by design. Green everywhere, working nowhere",
             // Empty, and the one row where that is not "this surface has no default".
             // Its default host depends on the CONFIGURATION -- loopback on a worker,
             // the wildcard on a node that schedules -- so it cannot be one constant,
@@ -171,6 +178,13 @@ namespace
             .name = "admin",
             .flags = { "--admin-listen", {} },
             .protocol = SurfaceProtocol::Tcp,
+            .bindFailure = BindFailurePolicy::Refuse,
+            .bindFailureReason =
+                "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
+                "it, so a worker that started without one looks healthy to the only thing that would have "
+                "noticed. fastcached answers this differently and correctly for itself: its admin surface "
+                "is shared infrastructure an operator watches deliberately, where a node's is a probe "
+                "target somebody attached. Same surface, two binaries, two right answers",
             .defaultHost = AdminListenDefaultHost,
             .spec = &NodeConfig::adminListen,
             .grammar = ListenEndpointGrammar,
@@ -185,6 +199,13 @@ namespace
             .name = "raft",
             .flags = { "--listen-raft", {} },
             .protocol = SurfaceProtocol::Tcp,
+            .bindFailure = BindFailurePolicy::Refuse,
+            .bindFailureReason =
+                "consensus is the one thing a node cannot do partially: a peer that cannot be dialled is "
+                "counted in the quorum it is absent from, so a cluster sized to include it stalls elections "
+                "rather than degrading. This node would still serve compiles and still cache -- which is "
+                "what makes carrying on tempting and wrong, because the fleet's decisions are the part that "
+                "stops working and nothing here would report it",
             .defaultHost = RaftListenDefaultHost,
             .spec = &NodeConfig::raftListen,
             .grammar = ListenEndpointGrammar,
@@ -205,6 +226,11 @@ namespace
             .name = "discovery",
             .flags = { "--discovery", "--discovery-reply-port" },
             .protocol = SurfaceProtocol::Udp,
+            .bindFailure = BindFailurePolicy::Refuse,
+            .bindFailureReason =
+                "a node that started without the discovery it was told to run looks healthy to a fleet "
+                "that will never hear from it. Peers are seen and never admitted, which is the same silence "
+                "--discovery-reply-port exists to prevent and is diagnosed at the firewall rather than here",
             .defaultHost = DiscoveryBindHost,
             .spec = &NodeConfig::discoveryAddress,
             .grammar = BeaconAddressGrammar,
@@ -248,6 +274,23 @@ namespace
                                           return !row.name.empty() && !row.flags[0].empty() && row.resolve != nullptr;
                                       }),
                   "every row needs a name, a first flag and a resolver");
+
+    // Every row states what happens when it cannot be bound, and why. `Unstated` is
+    // the zero value, so this fires on a row that simply omits the column -- which is
+    // what a fifth surface added by copying a neighbour looks like.
+    //
+    // The reason is checked as well as the verdict, and that is the half #352 turns
+    // on. All four surfaces already refused; what was missing was the sentence. Raft's
+    // did not exist anywhere in the tree -- its bind site records only why the listener
+    // is a reactor one and why `IsBound()` beats a null check -- so a guard that
+    // demanded only a policy would have been satisfied by the value Raft already had,
+    // and the row would still not say why.
+    static_assert(std::ranges::all_of(Surfaces,
+                                      [](SurfaceRow const& row) {
+                                          return row.bindFailure != BindFailurePolicy::Unstated
+                                                 && !row.bindFailureReason.empty();
+                                      }),
+                  "every row states its bind-failure policy and the reason for it");
 
     // A spec and its grammar travel together: text nothing validates is text an
     // operator can typo into a registration that replays forever, and a grammar with
@@ -309,6 +352,42 @@ namespace
 std::array<SurfaceRow, EnumeratorCount<NodeSurface>> const& NodeSurfaceTable() noexcept
 {
     return Surfaces;
+}
+
+std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::string message, ILogger& logger)
+{
+    switch (row.bindFailure)
+    {
+        case BindFailurePolicy::Refuse:
+            // The opener's own sentence, unchanged. It names the remedy rather than
+            // the diagnosis (#229), and the row's reason is a maintainer's answer to
+            // "why is this fatal" rather than an operator's to "what do I do now" --
+            // appending it here would bury the second in the first.
+            return std::unexpected { std::move(message) };
+
+        case BindFailurePolicy::Tolerate:
+            // Warn, never info: the operator asked for a surface and is not getting
+            // it. The reason travels HERE because there is no refusal to carry it,
+            // and because a tolerated failure is the case where somebody later asks
+            // why the node thought this was survivable.
+            logger.Logf(LogLevel::Warn,
+                        "{}: {}; continuing without it -- {}",
+                        row.name,
+                        message,
+                        row.bindFailureReason);
+            return {};
+
+        case BindFailurePolicy::Unstated:
+            break;
+    }
+
+    // Unreachable through the table, which `static_assert`s no row is `Unstated`.
+    // Reached only by a caller that built a row by hand and left the column out --
+    // which is a programmer error, and is the one case where refusing is not a
+    // judgement about the surface but about the caller.
+    return std::unexpected { std::format("{}: {} (no bind-failure policy stated for this surface)",
+                                         row.name,
+                                         std::move(message)) };
 }
 
 std::vector<std::string_view> FlagsOf(SurfaceRow const& row)

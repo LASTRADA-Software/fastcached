@@ -4,6 +4,7 @@
 #include "NodeConfig.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/Logger.hpp>
 
 #include <array>
 #include <cstdint>
@@ -63,6 +64,37 @@ enum class SurfaceProtocol : std::uint8_t
     Udp,
 };
 
+/// What this node does when a surface cannot be bound.
+///
+/// Decided per surface and stated nowhere until #352. Four openers each reached
+/// their own conclusion, all four agreed, and the reasoning survived in two of
+/// them, in a third only as a parenthetical inside a *different* surface's comment,
+/// and in the fourth not at all.
+///
+/// **`Unstated` is why this is an enum and not a `bool`.** It is the zero value, so
+/// a row that omits the column has it, and the table `static_assert`s no row does --
+/// a new surface therefore fails the build rather than inheriting whichever
+/// neighbour its author copied. That is `LeaseEpochCheck`'s argument and the wire
+/// table's `PreAuth` column's: a row that does not state its classification does not
+/// compile. It is never a policy, only the absence of one.
+enum class BindFailurePolicy : std::uint8_t
+{
+    /// No row may hold this. Present so omission is a build failure.
+    Unstated = 0,
+
+    /// The node refuses to start. The opener's own message reaches the operator.
+    Refuse,
+
+    /// The node logs and carries on without the surface.
+    ///
+    /// No row is `Tolerate` today, and the column is not speculative for that: the
+    /// compile port held it until #290, on the provenance bit #286 added, and it was
+    /// removed for a reason specific to that surface rather than to the idea. It also
+    /// remains `fastcached`'s answer for the admin surface, which is why the node's
+    /// Admin row explains itself against the daemon rather than in isolation.
+    Tolerate,
+};
+
 /// One endpoint a surface would actually bind.
 ///
 /// Owning, deliberately. `role` points into the static table and outlives any call;
@@ -119,6 +151,33 @@ struct SurfaceRow
 
     /// TCP or UDP.
     SurfaceProtocol protocol {};
+
+    /// What happens when this surface cannot be bound.
+    ///
+    /// **Read by `JudgeBindFailure`, which every opener routes its bind failure
+    /// through** -- so this column decides behaviour rather than describing it. That
+    /// distinction is why it is here at all: `presence` and `HostOrigin` were both
+    /// written and both removed, and `HostOrigin`'s epitaph is that "nothing in
+    /// production ever read it: it documented rather than drove". A policy column
+    /// nothing consults would fail the same test.
+    BindFailurePolicy bindFailure {};
+
+    /// Why, in one sentence an operator or a maintainer can read.
+    ///
+    /// `static_assert`ed non-empty, which is the half of #352 that a policy
+    /// enumerator alone would not deliver: the ticket's complaint was never that the
+    /// four surfaces disagreed -- they do not -- but that the reasoning existed in
+    /// two of them, in a third only inside another surface's comment, and in the
+    /// fourth nowhere. A column that forced only the verdict would have left Raft's
+    /// sentence unwritten, since `Refuse` is what it already did.
+    ///
+    /// It is the RATIONALE, never the operator-facing refusal. Each opener keeps its
+    /// own message: the compile port's is a remedy rather than a diagnosis (#229) and
+    /// naming what probably holds the port is worth more at three in the morning than
+    /// any sentence here. `JudgeBindFailure` passes the opener's message through
+    /// untouched and uses this only on the `Tolerate` path, where there is no refusal
+    /// to carry it.
+    std::string_view bindFailureReason {};
 
     // There is deliberately **no** `presence` column. It was written, and it was
     // both redundant and wrong.
@@ -227,6 +286,23 @@ struct SurfaceRow
 ///
 /// @return The table; stable for the life of the process.
 [[nodiscard]] std::array<SurfaceRow, EnumeratorCount<NodeSurface>> const& NodeSurfaceTable() noexcept;
+
+/// Apply @p row's bind-failure policy to a bind that failed.
+///
+/// The one place the verdict is reached, so a fifth surface cannot arrive at its own.
+/// It takes the ROW rather than a `NodeSurface`, which is what lets a test hand it a
+/// synthetic row -- including one whose policy is `Tolerate`, a shape no production
+/// row has. A test that only asserted today's four refuse would pass forever once
+/// somebody added a tolerant fifth, which is the failure this whole ticket is about
+/// one level up.
+///
+/// @param row The surface that would not bind.
+/// @param message The opener's own operator-facing sentence, passed through unchanged.
+/// @param logger Where a tolerated failure is reported.
+/// @return Nothing when the caller may continue; @p message when it must refuse.
+[[nodiscard]] std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row,
+                                                                std::string message,
+                                                                ILogger& logger);
 
 /// The flags a row names, without the empty second entry.
 /// @param row The surface to read.
