@@ -415,7 +415,23 @@ UnitContribution() {
         argv+=("$line")
     done < <(printf '%s\n' "$words" | tail -n +2)
     [[ "${#argv[@]}" -gt 0 ]] || { echo unknown; return; }
-    out="$(cd "$directory" 2>/dev/null && "${argv[@]}" 2>/dev/null | ProducedCode "$2")"
+
+    # Through a FILE so the preprocessor's own exit status is observed. A pipeline
+    # hands the caller `ProducedCode`'s status, which is always 0 -- so a compiler
+    # that failed produced no output, `ProducedCode` correctly said `empty` of an
+    # empty stream, and the unit was reported as contributing nothing. That is this
+    # ticket's own defect rebuilt inside its fix: an absence of evidence rendered as
+    # evidence of absence. Found by mutation testing, which showed nothing could
+    # tell `unknown` from `empty` because nothing ever produced `unknown`.
+    local preprocessed
+    preprocessed="$(mktemp)" || { echo unknown; return; }
+    if ! ( cd "$directory" && "${argv[@]}" ) > "$preprocessed" 2>/dev/null; then
+        rm -f "$preprocessed"
+        echo unknown
+        return
+    fi
+    out="$(ProducedCode "$2" < "$preprocessed")"
+    rm -f "$preprocessed"
     [[ -n "$out" ]] || { echo unknown; return; }
     printf '%s\n' "$out"
 }
@@ -935,7 +951,10 @@ if [[ "${#unknowns[@]}" -gt 0 ]]; then
 fi
 
 if [[ "$status" -eq 0 ]]; then
-    covered=$((index - ${#empties[@]}))
+    # Unknowns are subtracted too. A unit whose preprocessor failed has not been
+    # shown to contribute, and counting it as covered would be the same overstatement
+    # in a quieter place -- the number would still be larger than the evidence.
+    covered=$((index - ${#empties[@]} - ${#unknowns[@]}))
     echo "TIDY SWEEP CLEAN (${covered} of ${index} translation unit(s) contributed code, ${TIDY})"
 fi
 exit "$status"
