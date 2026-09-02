@@ -1939,20 +1939,26 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // nothing refused it at a hand start, which is the reverse of the asymmetry
         // #166 composed the tables to delete.
         //
-        // The admission gate is identical to its three siblings for the reason they
-        // give, and the message names the two flags together because naming only
-        // `--advertise` is what steers an operator into the row above.
+        // The admission gate is its three siblings' for the reason they give. Their
+        // `!c.scheduler.empty()` half is not repeated: `SchedulerIsRemote` asks a
+        // strictly stronger question, and a clause that can never decide anything is
+        // one a reader has to prove harmless every time they meet it.
+        //
+        // The message names both flags, because naming only `--advertise` is what
+        // steers an operator into the row above -- and it says what the ENDPOINT is
+        // rather than which flag was omitted, since an explicit `--advertise=127.0.0.1`
+        // reaches this row too and a sentence about flags nobody typed would be false
+        // for it.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty())
-                         && AdvertisesLoopbackToARemoteScheduler(c);
+                  return (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesLoopbackToARemoteScheduler(c);
               },
-          .message = "--scheduler names a machine that is not this one, and this worker would register loopback "
-                     "with it -- neither --advertise nor --listen-node was given, so both fall back to an address "
-                     "only this machine can dial. Every client the scheduler leases it to would dial ITSELF: the "
-                     "worker registers, heartbeats, is leased out and is never reached, with no error at either "
-                     "end. Give --listen-node=0.0.0.0:6674 and --advertise=<this host>:6674. (A fleet that really "
-                     "is one machine names --scheduler on loopback too, and is fine.)" },
+          .message = "--scheduler names a machine that is not this one, and this worker would register LOOPBACK "
+                     "with it: --advertise resolves to an address only this machine can dial, whether it was "
+                     "named or left to fall back to --listen-node. Every client the scheduler leases it to would "
+                     "dial ITSELF -- the worker registers, heartbeats, is leased out and is never reached, with no "
+                     "error at either end. Give --listen-node=0.0.0.0:6674 and --advertise=<this host>:6674. (A "
+                     "fleet that really is one machine names --scheduler on loopback too, and is fine.)" },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "
