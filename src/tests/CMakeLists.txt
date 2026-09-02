@@ -1758,3 +1758,71 @@ else()
         TIMEOUT 300
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# fetch-transfer-bound: the dependency-fetch bound is watched refusing a stall.
+#
+# A dependency `git clone` that stops delivering never ends, because nothing
+# bounds it (#526). `cmake/FetchTransferBound.cmake` states the bound, the
+# measurements behind it and the reasoning for its numbers; this registration
+# deliberately restates none of that, because a figure others cite lives in one
+# place they point at.
+#
+# Registered here rather than beside a binary because it names two executables
+# -- git and cmake -- and neither is a target of this project.
+#
+# Python and not the usual .sh/.ps1 pair, which is the exception this file
+# otherwise does not make: the fixture needs a LISTENING SOCKET that accepts a
+# connection and answers nothing, plus process-tree control to kill a wedged
+# git without draining pipes its grandchildren hold (#239). POSIX shell can
+# express neither, so a shell version would be a PowerShell implementation with
+# a stub beside it rather than two implementations of one rule.
+#
+# It contacts nothing outside 127.0.0.1 and needs no daemon, no compiler and no
+# network, so it is `hygiene` like the other checks that need none of those.
+# The port comes from `bind(0)`: the per-run allocation rule exists because a
+# fixture CHOOSING a port cannot see one already held as an outbound
+# connection's local endpoint, and letting the kernel choose sidesteps that
+# question rather than answering it.
+#
+# `find_package(Python3)` and not a `find_program`: it VALIDATES the interpreter
+# by running it, which is what screens out Windows' App Execution Alias -- a
+# zero-byte reparse point on PATH named `python3.exe` that a `find_program`
+# returns happily and that does not run Python. A third spelling of "find
+# python" would also disagree with `cmake/Coverage.cmake`'s about which
+# interpreter it means.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NOT Python3_Interpreter_FOUND)
+    # A WARNING and not a STATUS. The outcome here is that a guard standing
+    # behind a rule which has already cost three lanes forty minutes each is
+    # ABSENT from this build tree, and absent is not the same as passing.
+    message(WARNING
+        "fetch-transfer-bound: no Python 3 interpreter found, so the dependency-fetch "
+        "transfer bound (#526) is NOT guarded in this build tree")
+else()
+    add_test(
+        NAME "fetch-transfer-bound"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
+            --source-dir "${CMAKE_SOURCE_DIR}"
+            --git "${GIT_EXECUTABLE}"
+            --cmake "${CMAKE_COMMAND}"
+            # The numbers as THIS TREE resolved them. They are cache variables,
+            # and a `cmake -P` probe has no cache -- so the guard reading the
+            # module on its own would always see the defaults, and would have
+            # reported "the bound is 120s" for a tree configured with
+            # -DFASTCACHED_FETCH_SILENCE_SECONDS=0, which is the one tree where
+            # the answer matters. Passed from here, where they are resolved.
+            --configured-window "${FASTCACHED_FETCH_SILENCE_SECONDS}"
+            --configured-floor "${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND}"
+    )
+    # 77 is this file's script-driven convention for "a prerequisite is
+    # missing", which here means git or cmake could not be run at all. TIMEOUT
+    # is the outer supervisor rather than the measurement: the script bounds
+    # every wait it makes, and this is what catches it failing to.
+    set_tests_properties("fetch-transfer-bound" PROPERTIES
+        LABELS "hygiene"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+endif()
