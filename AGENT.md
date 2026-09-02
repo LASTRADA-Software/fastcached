@@ -782,7 +782,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
   direction: four defects in four tickets were reachable only by the analyser or a
   sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
   them. A platform's leg answers a different question, not a weaker version of the same one.
-- **A retry makes an instrument's own failures disappear without fixing them.** Ten ways
+- **A retry makes an instrument's own failures disappear without fixing them.** Eleven ways
   the gate reported on something other than the tree under test have turned up across four
   tickets — `| tail` reporting the pipe's status, quoting collapsing through three parsers
   so the run never happened, two gates in one build directory, a dirty tree, the log on
@@ -793,8 +793,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `ctest` total that counts only the TARGET SET it was configured with — `-DFASTCACHED_BUILD_TESTCLIENT`
   and `-DFASTCACHED_BUILD_BENCHMARKS` default OFF, so one commit on one platform gives two
   different totals and the tree just looks smaller. A total is comparable only against the
-  same tree, the same platform AND the same target set. None
-  announces itself; each looks like a flake; a re-run clears all ten. A dirty-tree guard
+  same tree, the same platform AND the same target set, and a LOG THAT DOES NOT NAME ITS
+  OWN COMMIT — a `/tmp` wipe left the previous run's durable copy sitting where the current
+  one goes, reporting a failure already fixed, and only an accident of timestamps told them
+  apart. A verdict must carry what it is a verdict about. None
+  announces itself; each looks like a flake; a re-run clears all eleven. A dirty-tree guard
   that samples once AT THE START cannot see an instrument that dirties the tree itself —
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a
