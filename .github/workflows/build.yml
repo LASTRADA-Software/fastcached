@@ -1074,6 +1074,10 @@ jobs:
     # announced by the configure, genuinely used — and could not possibly hit. The
     # E2E job's own statistics are the receipt: 231 compile requests, 2 hits.
     #
+    # Those two figures are history, not the current cost: what these jobs take
+    # now, what fraction of it is `ctest` rather than the build, and what the hit
+    # rate actually is are one table in `.agent/rules/build-and-toolchain.md`.
+    #
     # The action does not set this itself — its README tells you to — and without
     # it sccache never looks at the Actions cache at all. Set at job level rather
     # than per step because it has to be visible to the configure (which picks
@@ -1099,12 +1103,23 @@ jobs:
         # master indefinitely with every status check green (#315).
         #
         # A third leg rather than replacing a Release one, and that is measured
-        # rather than assumed. Windows costs ~9 and ~7 minutes today (it was 21.2
-        # and 15.7 before `SCCACHE_GHA_ENABLED`, which is what `build.yml` still
-        # said in prose), and neither leg is anywhere near the critical path —
-        # `clang-tidy` runs ~20 minutes and finishes last. So this leg costs about
-        # eight runner-minutes and no wall clock at all, which is cheaper than
-        # giving up a Release configuration to buy it.
+        # rather than assumed. No Windows leg was the longest job in any of the 13
+        # code-touching pull-request runs sampled for the per-event table in
+        # `.agent/rules/build-and-toolchain.md` — that is `Code coverage` or an
+        # escalated `clang-tidy` sweep — so this leg costs runner-minutes and no
+        # wall clock at all, which is cheaper than giving up a Release
+        # configuration to buy it.
+        #
+        # The per-leg figures live in that table and are deliberately not restated
+        # here. The pre-`SCCACHE_GHA_ENABLED` numbers in the comment above were
+        # copied into this spot once already, and by the time anyone re-measured
+        # they described a two-leg matrix that no longer existed while reading
+        # like current fact. Which job "finishes last" is likewise a property of
+        # the EVENT, not of this workflow: it is `clang-tidy` on master and inside
+        # the queue, where every sweep is a full one, and on a pull request it is
+        # `Code coverage` in most runs and an escalated `clang-tidy` sweep in the
+        # rest — 9 and 4 of the 13 sampled. Not one of them is a Windows leg,
+        # which is the only part of it this comment depends on.
         #
         # It runs `ctest` like its siblings, because a Debug leg that only
         # compiles exercises none of the runtime it was added for. The
