@@ -785,8 +785,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
   `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
-  DrvFs log redirect that failed while leaving the gate child ALIVE. None announces itself;
-  each looks like a flake; a re-run clears all eight. Presence is not usability, and a
+  DrvFs log redirect that failed while leaving the gate child ALIVE, and the gate's own
+  `clang-format -i` REWRITING the commit and then measuring what it had rewritten. None
+  announces itself; each looks like a flake; a re-run clears all nine. A dirty-tree guard
+  that samples once AT THE START cannot see an instrument that dirties the tree itself —
+  sample at both ends, and note that implementing half of a two-clause rule looks exactly
+  like compliance. Presence is not usability, and a
   finding fixed at the line rather than at the rule comes back.
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
   reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
@@ -794,7 +798,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
   and a bound nobody has watched fire is untested rather than proven. The general form: "a
   SIGTERM does not take 55 seconds to arrive" is true of `local-gate.sh` only because it
   traps `EXIT` and not `TERM` — bash defers a TRAPPED signal, so the general claim and the
-  specific one point opposite ways and nothing warns you which you hold.
+  specific one point opposite ways and nothing warns you which you hold. And **the tree
+  you measured is not necessarily the tree in question** — a grep in a checkout parked on
+  a merged branch produced a CONFIDENT CORRECTION, which propagates where a missing log
+  merely stalls. The tell is that the answer was too convenient.
 - A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
