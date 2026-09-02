@@ -315,6 +315,13 @@ AffectedTranslationUnits() {
 # prints a confident count. So it gets asserted, on a synthetic tree, with no
 # compile database and no clang-tidy needed. The CI job runs this before the
 # sweep for the same reason the sweep canaries its binary.
+# ---------------------------------------------------------------------------
+# Contribution
+#
+# Whether a translation unit contained any code from the FILE it names. These run
+# during a real sweep; they are above `SelfTest` only because it exercises them.
+# ---------------------------------------------------------------------------
+
 # Did this translation unit contain any code FROM THE FILE ITSELF? (#466)
 #
 # PURE: reads preprocessed output on stdin, prints `produced` or `empty`, and
@@ -403,18 +410,32 @@ PYARGV
 # contributes: folding that into `empty` invents a finding, folding it into
 # `produced` hides one.
 #
+# Record an `unknown` with the reason it happened, and say so on stdout.
+#
+# Every route to `unknown` goes through here. A reason recorded on only the loud
+# path is the half that never fires in the case anybody investigates.
+# @param 1 Repo-relative path of the unit.
+# @param 2 Slot prefix.
+# @param 3 Why it could not be decided.
+UnknownUnit() {
+    printf '%s\n' "$1" > "${2}.unknown"
+    printf '    %s\n' "$3" >> "${2}.unknown"
+    echo unknown
+}
+
 # @param 1 Directory holding compile_commands.json.
 # @param 2 Repo-relative path of the unit.
+# @param 3 Slot prefix; `<slot>.unknown` is written with the reason when it fires.
 UnitContribution() {
     local words directory out line
-    words="$(PreprocessArgv "$1" "$2" 2>/dev/null)" || { echo unknown; return; }
-    [[ -n "$words" ]] || { echo unknown; return; }
+    words="$(PreprocessArgv "$1" "$2" 2>/dev/null)" || { UnknownUnit "$2" "$3" "no compile command"; return; }
+    [[ -n "$words" ]] || { UnknownUnit "$2" "$3" "no compile command"; return; }
     directory="$(printf '%s\n' "$words" | head -1)"
     local -a argv=()
     while IFS= read -r line; do
         argv+=("$line")
     done < <(printf '%s\n' "$words" | tail -n +2)
-    [[ "${#argv[@]}" -gt 0 ]] || { echo unknown; return; }
+    [[ "${#argv[@]}" -gt 0 ]] || { UnknownUnit "$2" "$3" "empty compile command"; return; }
 
     # Through a FILE so the preprocessor's own exit status is observed. A pipeline
     # hands the caller `ProducedCode`'s status, which is always 0 -- so a compiler
@@ -423,15 +444,29 @@ UnitContribution() {
     # ticket's own defect rebuilt inside its fix: an absence of evidence rendered as
     # evidence of absence. Found by mutation testing, which showed nothing could
     # tell `unknown` from `empty` because nothing ever produced `unknown`.
-    local preprocessed
-    preprocessed="$(mktemp)" || { echo unknown; return; }
-    if ! ( cd "$directory" && "${argv[@]}" ) > "$preprocessed" 2>/dev/null; then
-        rm -f "$preprocessed"
-        echo unknown
+    #
+    # Inside $scratch, which the EXIT trap removes. A bare `mktemp` puts a 2.5 MB
+    # preprocessed dump per unit somewhere nothing cleans up, and an interrupt or a
+    # CI timeout then leaks up to $JOBS of them permanently.
+    local preprocessed reason
+    preprocessed="$(mktemp -p "$scratch")" || { echo unknown; return; }
+    reason="${preprocessed}.err"
+    if ! ( cd "$directory" && "${argv[@]}" ) > "$preprocessed" 2>"$reason"; then
+        # The reason is KEPT. An `unknown` that fires systematically -- a database
+        # whose module-map files do not exist yet, a clang-cl database spelling `-c`
+        # as `/c` -- otherwise prints "0 of N contributed code" with nothing an
+        # operator can act on, which is a confident count over nothing.
+        #
+        # Through `UnknownUnit` like every other route. This branch used to write its
+        # own marker, which made it the ONE unknown path a mutation of `UnknownUnit`
+        # could not reach -- so the suite reported that mutation as caught while the
+        # loudest case went straight past it.
+        UnknownUnit "$2" "$3" "$(head -1 "$reason" 2>/dev/null)"
+        rm -f "$preprocessed" "$reason"
         return
     fi
     out="$(ProducedCode "$2" < "$preprocessed")"
-    rm -f "$preprocessed"
+    rm -f "$preprocessed" "$reason"
     [[ -n "$out" ]] || { echo unknown; return; }
     printf '%s\n' "$out"
 }
@@ -570,6 +605,65 @@ SelfTest() {
     Expect "an empty stream reads as empty, never as produced" \
            "empty" \
            "$(printf '' | ProducedCode src/A.cpp)"
+
+    # `UnitContribution`, against a STUB COMPILER (#466).
+    #
+    # The classifier checks above prove the decision and say nothing about whether
+    # the compile command is reconstructed correctly, whether the preprocessor's
+    # exit status is observed, or whether `unknown` is reachable at all -- and that
+    # last one was not: a failed compiler produced no output, the classifier
+    # honestly said `empty` of an empty stream, and a unit nothing could be learned
+    # about was recorded as contributing nothing. Mutation testing found it because
+    # every check here was blind to it.
+    #
+    # A stub compiler is enough. What is under test is the plumbing between the
+    # database and the classifier, so the stub prints linemarker text and the real
+    # compiler is never invoked -- which is what lets this run in the default ctest
+    # set on a machine with no toolchain.
+    mkdir -p "$scratch/db" "$scratch/tree/src"
+    printf '#!/bin/sh\nprintf "# 1 \\"%%s\\"\\nint a;\\n" "$1"\n' > "$scratch/stub-cc"
+    printf '#!/bin/sh\nprintf "# 1 \\"/usr/include/x.h\\"\\nint h;\\n"\n' > "$scratch/stub-empty"
+    printf '#!/bin/sh\nexit 3\n' > "$scratch/stub-broken"
+    chmod +x "$scratch/stub-cc" "$scratch/stub-empty" "$scratch/stub-broken"
+    : > "$scratch/tree/src/Has.cpp"
+    : > "$scratch/tree/src/None.cpp"
+    : > "$scratch/tree/src/Broken.cpp"
+    printf '[
+      {"directory":"%s","file":"%s/src/Has.cpp","command":"%s %s/src/Has.cpp -c -o has.o"},
+      {"directory":"%s","file":"%s/src/None.cpp","command":"%s %s/src/None.cpp -c -o none.o"},
+      {"directory":"%s","file":"%s/src/Broken.cpp","command":"%s %s/src/Broken.cpp -c -o broken.o"}
+    ]\n' \
+        "$scratch" "$scratch/tree" "$scratch/stub-cc" "$scratch/tree" \
+        "$scratch" "$scratch/tree" "$scratch/stub-empty" "$scratch/tree" \
+        "$scratch" "$scratch/tree" "$scratch/stub-broken" "$scratch/tree" \
+        > "$scratch/db/compile_commands.json"
+
+    Expect "a unit whose compiler emits its own lines is produced" \
+           "produced" "$(UnitContribution "$scratch/db" "src/Has.cpp" "$scratch/slotA")"
+    Expect "a unit whose compiler emits only header lines is empty" \
+           "empty" "$(UnitContribution "$scratch/db" "src/None.cpp" "$scratch/slotB")"
+    # The state that was unreachable. A compiler that FAILS has told us nothing;
+    # reporting that as `empty` is an absence of evidence rendered as evidence of
+    # absence, which is this ticket's own defect one level down.
+    Expect "a unit whose compiler fails is unknown, never empty" \
+           "unknown" "$(UnitContribution "$scratch/db" "src/Broken.cpp" "$scratch/slotC")"
+    Expect "and the reason it failed is kept, not discarded" \
+           "yes" \
+           "$( [[ -s "$scratch/slotC.unknown" ]] && echo yes || echo no )"
+    # A file the database does not describe is also unknown, and for the same
+    # reason: nothing was learned. It must not read as "contributed nothing".
+    Expect "a unit absent from the database is unknown" \
+           "unknown" "$(UnitContribution "$scratch/db" "src/Absent.cpp" "$scratch/slotD")"
+    Expect "and that unknown records why as well" \
+           "yes" \
+           "$( grep -q 'no compile command' "$scratch/slotD.unknown" 2>/dev/null && echo yes || echo no )"
+    # NOT asserted here, deliberately: that the preprocessed dump is created inside
+    # $scratch rather than $TMPDIR. Both paths delete it on the way out, so the
+    # difference is visible only when the process is INTERRUPTED -- and a check that
+    # passes whether or not `mktemp -p "$scratch"` is there is worse than no check,
+    # because it reads as coverage. Mutation testing is what showed it: removing the
+    # `-p` left the suite green. The `-p` stays because it is right on an interrupt;
+    # this comment stays because the next person will otherwise add the check back.
 
     # The interpreter verdict (#588). Pinned on BOTH sides of the floor, because a
     # bound demonstrated once from the middle is where an off-by-one lives.
@@ -852,10 +946,20 @@ TidyOne() {
     # clang-tidy reports cleanly on it -- that clean report is the defect (#466).
     # Costs one preprocessor run, measured at 5-26% of what clang-tidy costs on the
     # same unit, worst on the cheapest units because those are the empty ones.
-    contribution="$(UnitContribution "$database" "$file")"
+    contribution="$(UnitContribution "$database" "$file" "$slot")"
     case "$contribution" in
-        empty)   printf '%s\n' "$file" > "${slot}.empty" ;;
-        unknown) printf '%s\n' "$file" > "${slot}.unknown" ;;
+        produced) printf '%s\n' "$file" > "${slot}.produced" ;;
+        empty)    printf '%s\n' "$file" > "${slot}.empty" ;;
+        unknown)  : ;;  # `UnknownUnit` already wrote the marker AND the reason
+        *)
+            # A verdict this case does not know is recorded as its own thing rather
+            # than falling through to "covered". Deriving coverage by subtracting the
+            # bad buckets means anything unrecognised is silently counted as good --
+            # the repo's own rule inverted, and in the overstating direction this
+            # change exists to remove.
+            printf '%s\n' "$file" > "${slot}.unknown"
+            printf '    unrecognised contribution verdict: %s\n' "$contribution" >> "${slot}.unknown"
+            ;;
     esac
     out="$("$TIDY" -p "$database" --quiet "$file" 2>&1)"
     rc=$?
@@ -923,38 +1027,74 @@ done
 
 # The count that means something, and the two that qualify it (#466).
 #
-# `index` is units ANALYSED. Some of them contribute nothing of their own -- a file
-# whose body sits behind a platform or feature guard preprocesses to an empty
-# translation unit here, so clang-tidy read nothing of it and reported nothing
-# about it. Summing those into one number is what let a syntax error survive five
-# green signals.
+# Reported per FILE, not per compile command, because a file can carry several and
+# they need not agree. Measured on this tree: six files have three commands each and
+# are empty in all three, so a per-command count said "18" over a list of six names
+# and left the reader to reconcile them. Seventy-five files have more than one
+# command, and one that is empty in a target which excludes it while contributing in
+# a target that does not is NOT a file this run says nothing about -- captioning it
+# that way would be false.
+#
+# So the precedence is: any command that produced code means the file contributed;
+# otherwise any UNKNOWN command means we cannot say; only a file whose every command
+# produced nothing is reported as producing nothing.
 #
 # "produced no code in this configuration" and not "on this platform": of the
-# thirteen such units measured in a default Linux build, eleven are platform-gated
+# thirteen such files measured in a default Linux build, eleven are platform-gated
 # and two (`TlsContext_test.cpp`, `TlsSocket_test.cpp`) are gated on
 # `FC_TLS_ENABLED` and would contribute on this very platform with TLS on. Naming
-# the platform would tell a reader the file belongs to another OS when it belongs
-# to another build -- and this sentence must never read as a fault, because an
-# empty unit here is the guard working.
+# the platform would tell a reader the file belongs to another OS when it belongs to
+# another build -- and this must never read as a fault, because an empty unit here
+# is the guard working.
 shopt -s nullglob
-empties=("$scratch"/*.empty)
-unknowns=("$scratch"/*.unknown)
-if [[ "${#empties[@]}" -gt 0 ]]; then
-    echo "TIDY SWEEP: ${#empties[@]} of ${index} unit(s) produced no code in this configuration,"
-    echo "            so this run says NOTHING about them (they are analysed, not covered):"
-    sort -u "${empties[@]}" | sed 's/^/              /'
+producedMarks=("$scratch"/*.produced)
+emptyMarks=("$scratch"/*.empty)
+unknownMarks=("$scratch"/*.unknown)
+
+# Every analysed unit records exactly one verdict, and that is ASSERTED rather than
+# assumed. Deriving coverage by subtracting the bad buckets is the shape this
+# repository has a standing rule against -- a conclusion drawn from a count of bad
+# things needs a separate assertion that the good things exist -- and its failure
+# direction is the overstatement this whole change removes.
+verdictCount=$(( ${#producedMarks[@]} + ${#emptyMarks[@]} + ${#unknownMarks[@]} ))
+if [[ "$verdictCount" -ne "$index" ]]; then
+    fatal "recorded ${verdictCount} contribution verdict(s) for ${index} analysed unit(s); the sweep cannot say what it covered"
 fi
-if [[ "${#unknowns[@]}" -gt 0 ]]; then
-    echo "TIDY SWEEP: ${#unknowns[@]} unit(s) could not be preprocessed, so whether they"
+
+producedFiles="${scratch}/files.produced"
+emptyFiles="${scratch}/files.empty"
+unknownFiles="${scratch}/files.unknown"
+: > "$producedFiles"; : > "$emptyFiles"; : > "$unknownFiles"
+[[ "${#producedMarks[@]}" -gt 0 ]] && sort -u "${producedMarks[@]}" > "$producedFiles"
+[[ "${#unknownMarks[@]}" -gt 0 ]] && grep -hv '^    ' "${unknownMarks[@]}" | sort -u > "$unknownFiles"
+[[ "${#emptyMarks[@]}" -gt 0 ]] && sort -u "${emptyMarks[@]}" > "$emptyFiles"
+
+# A file that produced code anywhere is not unknown and not empty; a file that is
+# unknown anywhere is not empty.
+comm -23 "$unknownFiles" "$producedFiles" > "${unknownFiles}.net"
+comm -23 "$emptyFiles" "$producedFiles" > "${emptyFiles}.tmp"
+comm -23 "${emptyFiles}.tmp" "${unknownFiles}.net" > "${emptyFiles}.net"
+
+emptyCount=$(wc -l < "${emptyFiles}.net" | tr -d ' ')
+unknownCount=$(wc -l < "${unknownFiles}.net" | tr -d ' ')
+producedCount=$(wc -l < "$producedFiles" | tr -d ' ')
+fileCount=$(( producedCount + emptyCount + unknownCount ))
+
+if [[ "$emptyCount" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${emptyCount} of ${fileCount} file(s) produced no code in this configuration,"
+    echo "            so this run says NOTHING about them (they are analysed, not covered):"
+    sed 's/^/              /' "${emptyFiles}.net"
+fi
+if [[ "$unknownCount" -gt 0 ]]; then
+    echo "TIDY SWEEP: ${unknownCount} file(s) could not be preprocessed, so whether they"
     echo "            contribute is UNKNOWN rather than either answer:"
-    sort -u "${unknowns[@]}" | sed 's/^/              /'
+    sed 's/^/              /' "${unknownFiles}.net"
+    # The reasons, which is what makes a systematic `unknown` actionable rather than
+    # a confident count over nothing.
+    [[ "${#unknownMarks[@]}" -gt 0 ]] && grep -h '^    ' "${unknownMarks[@]}" | sort -u | head -5
 fi
 
 if [[ "$status" -eq 0 ]]; then
-    # Unknowns are subtracted too. A unit whose preprocessor failed has not been
-    # shown to contribute, and counting it as covered would be the same overstatement
-    # in a quieter place -- the number would still be larger than the evidence.
-    covered=$((index - ${#empties[@]} - ${#unknowns[@]}))
-    echo "TIDY SWEEP CLEAN (${covered} of ${index} translation unit(s) contributed code, ${TIDY})"
+    echo "TIDY SWEEP CLEAN (${producedCount} of ${fileCount} file(s) contributed code across ${index} translation unit(s), ${TIDY})"
 fi
 exit "$status"
