@@ -1458,3 +1458,159 @@ TEST_CASE("NormalizePath answers for a spelling this host cannot read, instead o
     // Still normalizes everything it can read, which is every path a build has.
     CHECK(NormalizePath("/x/src/./inc/../a.h") == std::filesystem::path { "/x/src/a.h" }.make_preferred().string());
 }
+
+namespace
+{
+/// Two checkouts of one project, differing exactly as the two in issue #368 did:
+/// the translation unit is BYTE-IDENTICAL and a header it depends on is not.
+///
+/// That combination is the whole point. A manifest naming the TU and no header
+/// revalidates on the TU hash alone, so it is sound precisely when the TU is the
+/// only thing that matters -- and catastrophic when a header moved underneath it.
+struct TwoCheckouts
+{
+    /// The leaf names, spelled once. They appear in the writes and again in the
+    /// accessors, and two spellings of one filename is how a fixture comes to
+    /// write `dep.hpp` and hash `dep.hpp ` forever.
+    static constexpr std::string_view SourceName = "src/tu.cpp";
+    static constexpr std::string_view HeaderName = "src/dep.hpp";
+
+    FastCache::Testing::ScratchDirectory root { "manifest-two-checkouts" };
+
+    TwoCheckouts()
+    {
+        Make("checkout-old", "constexpr int Answer = 1;\n");
+        Make("checkout-new", "constexpr int Answer = 2;\n");
+    }
+
+    void Make(std::string_view name, std::string_view header) const
+    {
+        auto const in = std::string { name } + "/";
+        // `ScratchDirectory::Write` rather than a private `ofstream`: it creates
+        // the parents and THROWS when the open or the close fails, which is the
+        // half that matters here. The first case below asserts that a hollow
+        // manifest validates in a checkout it was not built from -- an assertion
+        // about an ABSENCE -- so a fixture that silently wrote nothing would make
+        // it pass for the wrong reason, on two checkouts that do not differ
+        // because neither has a `dep.hpp` at all.
+        //
+        // Twenty older cases in this file still open `std::ofstream` by hand, so
+        // hand-rolling would have matched the local habit. That is not a reason
+        // to add a twenty-first.
+        // Identical in both checkouts, deliberately: that is the condition under
+        // which a hollow manifest validates, and it is what the original report
+        // stated before anyone was looking for it.
+        root.Write(in + std::string { SourceName }, "#include \"dep.hpp\"\nint Value() { return Answer; }\n");
+        root.Write(in + std::string { HeaderName }, header);
+    }
+
+    [[nodiscard]] FastCache::PathCanon::Layout LayoutOf(std::string_view name) const
+    {
+        auto const base = root.Path() / name;
+        return { .sourceRoot = base.string(), .buildTree = (base / "out").string() };
+    }
+
+    [[nodiscard]] std::string Source(std::string_view name) const
+    {
+        return (root / (std::string { name } + "/" + std::string { SourceName })).string();
+    }
+
+    [[nodiscard]] std::string Header(std::string_view name) const
+    {
+        return (root / (std::string { name } + "/" + std::string { HeaderName })).string();
+    }
+};
+
+constexpr std::string_view Stamp = "cl 19.51.36231 x64";
+} // namespace
+
+TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it was not built from")
+{
+    // Issue #368's mechanism, shown rather than described. This is the state the
+    // installed launcher reached, and the assertion below is what it cost.
+    //
+    // How it was reached there: the node stored values without canonicalizing
+    // their text regions, so a replayed dependency record named the PRODUCING
+    // checkout's headers. Every one of those paths lies outside this checkout's
+    // roots, `IsToolchainHeader` calls every such path toolchain, all of them
+    // drop -- and what is recorded is the TU and nothing else. That route is
+    // closed on the produce side now, and closed in THREE places rather than the
+    // one this comment used to claim: `RecordManifest` refuses when the compile
+    // reported no dependencies at all, again when a reported path is not readable
+    // as text, and `BuildManifest` refuses when paths were reported and every one
+    // dropped. So this case builds the hollow manifest DIRECTLY, through a door
+    // the launcher no longer opens -- `BuildManifest` is a library entry point and
+    // its one production caller guards it.
+    //
+    // What it characterizes is therefore the VALIDATOR, not a live launcher path:
+    // `ManifestAssertsNothing` is `entries.empty()`, a TU-only manifest is not
+    // empty, and so a hollow manifest that reached the validator by any other
+    // route -- decoded from a store an older or foreign producer wrote, say --
+    // would be accepted. The defence is entirely on the produce side, which is
+    // the asymmetry recorded in `.agent/rules/compile-cache.md`.
+    //
+    // IF `ManifestAssertsNothing` IS TIGHTENED to refuse a TU-only manifest, which
+    // is the defence-in-depth fix and is cheap, this case must be updated rather
+    // than worked around: the `CHECK` below deliberately pins today's answer, and
+    // an assertion that pins an answer is a change-detector unless it says so.
+    TwoCheckouts const checkouts;
+
+    auto const oldCheckout = checkouts.LayoutOf("checkout-old");
+    auto const newCheckout = checkouts.LayoutOf("checkout-new");
+
+    auto const hollow = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
+                                        .includePaths = {},
+                                        .workingDirectory = oldCheckout.sourceRoot,
+                                        .toolchainStamp = std::string { Stamp },
+                                        .objectKey = "object-from-the-old-checkout" },
+                                      oldCheckout);
+    REQUIRE(hollow.has_value());
+    // The TU and nothing else. `entries.size()` rather than a header count,
+    // because the TU is always entry one.
+    REQUIRE(hollow->entries.size() == 1);
+
+    // And here is the hazard: it validates in the OTHER checkout, whose header
+    // differs, and vouches for an object built against the header it does not
+    // mention. The manifest key is a function of the canonical source token and
+    // the relativized args, so both checkouts address this manifest by
+    // construction -- that portability is the feature, and this is its cost when
+    // the entry set is hollow.
+    CHECK(ValidateManifest(*hollow, newCheckout, Stamp));
+
+    // Not asserted, deliberately: `CHECK_FALSE(ManifestAssertsNothing(*hollow))`
+    // cannot fail while the line above passes, because `ValidateManifest` returns
+    // false whenever `ManifestAssertsNothing` is true. A signal that cannot be
+    // false in the failing case is not evidence, so it would read as a second
+    // check while testing nothing. The fact it was standing in for is that
+    // `ManifestAssertsNothing` asks only whether the manifest is EMPTY and this
+    // one names the TU -- which is a statement about the guard, and belongs in
+    // `.agent/rules/compile-cache.md` beside the other accepted costs rather than
+    // dressed up as an assertion here -- and it is now recorded there, under
+    // Accepted trade-offs, with the reason it is sound and the condition that
+    // would reopen it.
+}
+
+TEST_CASE("An honest manifest still records its header, and still fails in the other checkout")
+{
+    // The guard above must not be the reason everything refuses. A compile whose
+    // dependency lies under its own roots records it, validates at home, and --
+    // the property the hollow manifest lost -- FAILS where that header differs.
+    TwoCheckouts const checkouts;
+
+    auto const oldCheckout = checkouts.LayoutOf("checkout-old");
+    auto const newCheckout = checkouts.LayoutOf("checkout-new");
+
+    auto const sound = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
+                                       .includePaths = { checkouts.Header("checkout-old") },
+                                       .workingDirectory = oldCheckout.sourceRoot,
+                                       .toolchainStamp = std::string { Stamp },
+                                       .objectKey = "object-key" },
+                                     oldCheckout);
+    REQUIRE(sound.has_value());
+    CHECK(sound->entries.size() == 2);
+
+    CHECK(ValidateManifest(*sound, oldCheckout, Stamp));
+    // The header differs there, so this is the answer the hollow manifest could
+    // not give.
+    CHECK_FALSE(ValidateManifest(*sound, newCheckout, Stamp));
+}

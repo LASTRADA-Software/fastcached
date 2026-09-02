@@ -1248,6 +1248,30 @@ stops being one — the same confound that cost #493 a re-run.
 These are argued in place above and are **not** open work — do not "fix" one
 without reopening the argument:
 
+- **`ValidateManifest` accepts a manifest that names the TU and no header, and
+  nothing but the PRODUCER stops one existing.** `ManifestAssertsNothing` is
+  `entries.empty()`, and a TU-only manifest is not empty — so a hollow manifest
+  reaching the validator would revalidate on the TU hash alone and serve its
+  recorded object into any checkout that computes the key, which is
+  [#368](https://github.com/LASTRADA-Software/fastcached/issues/368).
+  It cannot currently be built. `RecordManifest` refuses on THREE producer-side
+  guards, and the first is the one that closes this shape:
+  `includes.empty()` (`apps/fastcache-cc/main.cpp`, after the depfile fallback —
+  "no dependency record at all means no manifest"), `UnreadablePaths` when a
+  reported path is not readable as text (`47ee5e5`), and `NoProjectDeps` when paths
+  were reported and every one dropped (`4739f54`). The first two are invisible from
+  `DirectManifest.cpp`, which is why reasoning about `BuildManifest` alone gets this
+  wrong — it has exactly one non-test caller and the caller is where two of the
+  three guards live.
+  **So the accepted cost is the asymmetry, not a live hole**: the defence is
+  entirely on the produce side, and the validator would accept a hollow manifest
+  that arrived any other way — decoded from a store written by an older or foreign
+  producer, for instance. Tightening `ManifestAssertsNothing` to refuse a TU-only
+  manifest is the defence-in-depth fix, and it is cheap; what is NOT acceptable is
+  removing any of the three producer guards on the belief that the validator would
+  catch it. `DirectManifest_test.cpp`'s two cross-checkout cases characterize the
+  validator's current answer and say in-place that they must change if it is
+  tightened.
 - MurmurHash3 is not collision-resistant against an adversary. Accepted because
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust
