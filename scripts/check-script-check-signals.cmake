@@ -1,20 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Every `cmake -P` check registered in src/tests/CMakeLists.txt must carry a
-# failure signal, because it cannot report one with an exit code.
+# Every `cmake -P` check registered in src/tests/CMakeLists.txt must carry
+# FAIL_REGULAR_EXPRESSION, as the SECOND of two independent failure signals.
 #
-# `message(FATAL_ERROR)` in script mode prints `CMake Error ...` and exits **0**
-# on CMake 3.28 -- this project's declared minimum. Measured: 3.28.3 exits 0,
-# 4.3.1 exits 1. So a check registered as a bare `cmake -P` is a check ctest
-# marks PASSED however loudly it objected, on the platform CI builds on. Thirteen
-# were registered that way, several of them the only thing standing behind a rule
-# that has already been a bug.
+# ## The reason this file used to give, which was wrong (#565)
 #
-# The fix is FAIL_REGULAR_EXPRESSION, and the fix's own weakness is that it is a
-# property somebody has to remember. `script-check-canary` covers the case where
-# the mechanism stops working; this covers the case where a new registration
-# never opts into it -- which is the far likelier of the two, and the one that
-# reads as a working check.
+# It said `message(FATAL_ERROR)` in script mode prints `CMake Error ...` and exits
+# **0** on CMake 3.28, this project's declared minimum -- so a bare `cmake -P`
+# registration was a check ctest marked PASSED however loudly it objected, and the
+# property was the only thing standing between thirteen checks and silence.
+#
+# That does not reproduce. Re-measured on CMake 3.28.3 with one probe file per
+# shape -- bare, inside `if()`, inside a function, inside `foreach()`, after prior
+# output, and after `cmake_minimum_required()` -- `FATAL_ERROR` exits **1** in every
+# one. A clean script exits 0 in the same harness, so the probe could tell them
+# apart. The original measurement is unreproducible rather than conditional: no
+# shape tested reproduces it on that version.
+#
+# It was wrong a second and independent way, which matters because the argument
+# leaned on it: "on the platform CI builds on" was never true of 3.28. CI installs
+# no CMake, so it uses the runner image's, and `ubuntu-24.04` at the release these
+# runs use ships CMake **3.31.5** and 4.1.2. The declared minimum and the CI
+# toolchain were being treated as the same thing.
+#
+# ## Why the requirement stays anyway
+#
+# Because a guard is not deleted on the strength of its motivation being wrong.
+# What changes is its status: FAIL_REGULAR_EXPRESSION is defence in depth, not the
+# only signal. A `-P` check that objects both exits nonzero and prints `CMake
+# Error` -- always both, since no route to a nonzero exit is silent -- so two
+# independent things must break before a failing check reports green.
+#
+# The cost is one property per registration. The benefit is a ctest that stopped
+# honouring exit codes, or a wrapper that captured and re-emitted them, still
+# fails the check.
+#
+# ## What proves each signal
+#
+# Both, separately, or "defence in depth" is one signal and a story:
+# `script-check-canary` prints the pattern and exits 0, so only the property can
+# fail it; `script-check-exit-canary` exits nonzero and prints nothing, so only the
+# exit code can. Neither can pass on the other's signal, and that is the property
+# #565 found the old single canary lacked.
+#
+# This file covers the third case, which neither canary can: a registration that
+# never opts in. That is the likeliest of the three and the one that reads as a
+# working check.
 #
 # The set of checks is READ from src/tests/CMakeLists.txt, never restated here.
 # A second copy of the list is not a cross-check; it is a second thing to be
@@ -28,8 +59,8 @@
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-script-check-signals.cmake
 #
-# Exit codes: 0 always -- see above. The verdict is the presence of `CMake Error`
-# in the output.
+# Exit codes: nonzero on failure, and the output also carries `CMake Error`. Both,
+# because a `-P` script cannot fail silently -- see above.
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
@@ -154,8 +185,8 @@ if(violations)
         message("  ${violation}")
     endforeach()
     message("")
-    message("A `cmake -P` script cannot fail its own test: message(FATAL_ERROR) prints")
-    message("`CMake Error` and exits 0 on CMake 3.28, this project's minimum. Add")
+    message("Script checks carry two independent failure signals, and this is the")
+    message("second one: the exit code, plus `CMake Error` in the output. Add")
     message("")
     message("    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"")
     message("")

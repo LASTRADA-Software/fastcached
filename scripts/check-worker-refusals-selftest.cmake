@@ -103,10 +103,13 @@ function(fastcached_run_check tree outObjected outOutput)
         RESULT_VARIABLE ignored)
     set(combined "${captured}${capturedErrors}")
 
-    # The verdict is read from the OUTPUT, never from the exit code: a `cmake -P`
-    # script's `message(FATAL_ERROR)` exits 0 on CMake 3.28, this project's declared
-    # minimum, and 1 on 4.x. Reading the status here would make this selftest agree
-    # with the check on one host and disagree on the other.
+    # The verdict is read from the OUTPUT rather than from the exit code, and the
+    # reason is no longer the one that used to be written here. A `cmake -P` script's
+    # `message(FATAL_ERROR)` exits nonzero on 3.28.3 as on 4.x -- the claim that 3.28
+    # exits 0 did not reproduce (#565) -- so the status would in fact work. Output is
+    # still what is read, because this selftest asserts the check said the RIGHT
+    # THING, and an exit code cannot distinguish the intended refusal from a CMake
+    # syntax error in the check itself.
     string(FIND "${combined}" "CMake Error" position)
     if(position EQUAL -1)
         set(${outObjected} FALSE PARENT_SCOPE)

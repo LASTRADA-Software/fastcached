@@ -61,9 +61,11 @@
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-byte-order-qualifier.cmake
 #
-# Exit codes: 0 always -- `message(FATAL_ERROR)` exits 0 on CMake 3.28, this
-# project's declared minimum. The verdict is the presence of `CMake Error` in the
-# output, which is what the FAIL_REGULAR_EXPRESSION on the registration reads.
+# Exit codes: `message(FATAL_ERROR)` exits NONZERO, on CMake 3.28.3 as on 4.x --
+# the note that once claimed 0 here did not reproduce (#565). The verdict is
+# therefore carried two ways: the exit code, and the presence of `CMake Error` in
+# the output that the registration's FAIL_REGULAR_EXPRESSION reads. Both, always
+# together, because a `-P` script cannot exit nonzero without printing one.
 
 # Under CMP0007 OLD, `list()` DISCARDS empty elements -- every blank line in every
 # file scanned here -- so a reported line number would be off by however many
