@@ -44,8 +44,22 @@ endif()
 # a line containing a semicolon becomes two elements, the line numbers drift and
 # every verdict after it is drawn from the wrong place. Escaping first is what
 # keeps one line one element.
+#
+# A semicolon is only HALF the hazard. CMake's list grouping also treats `[` and
+# `]` as structure, so one unbalanced bracket -- in a COMMENT, where nobody is
+# thinking about CMake syntax -- merges every following line into one element.
+#
+# This check is the sharp case for that, because going blind does NOT make it
+# fail. It counts registrations and asserts each one can report failure, so a
+# splitter that stops seeing most of the file leaves a smaller set that still
+# passes unanimously. Measured while fixing #502: a bracket in a comment took it
+# from 21 registrations to 3, and it reported success both times. An emptiness
+# guard cannot catch that -- 3 is not 0 -- so the fix has to be here, in the
+# splitter, rather than in a check on the count.
 file(READ "${testsFile}" content)
 string(REPLACE ";" "\\;" content "${content}")
+string(REPLACE "[" " " content "${content}")
+string(REPLACE "]" " " content "${content}")
 string(REPLACE "\r\n" "\n" content "${content}")
 string(REPLACE "\n" ";" lines "${content}")
 

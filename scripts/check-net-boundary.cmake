@@ -110,6 +110,31 @@ function(fastcached_split_rows rows pathsOut reasonsOut)
 endfunction()
 
 fastcached_split_rows(FastCachedNetStandaloneDirs standaloneDirs standaloneDirReasons)
+
+# Turn a list of shell globs into one anchored regex, so a directory can be walked
+# ONCE and the results filtered in memory.
+#
+# `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN. On DrvFs one
+# traversal of `src/` costs 2.09 s, so a list of N patterns is N x that -- and the call
+# site reads as a single glob, which is what made the cost invisible (#502).
+#
+# This is the fourth copy of this idiom across the hygiene checks; consolidating them
+# into a shared module is #495, deliberately not pre-empted here.
+# @param globs The shell globs, each like `*.hpp` or `*.hpp.in`.
+# @param outVar Set to an anchored alternation regex.
+function(fastcached_globs_to_regex globs outVar)
+    set(parts "")
+    foreach(glob IN LISTS globs)
+        string(REPLACE "." "PLACEHOLDERDOT" one "${glob}")
+        string(REPLACE "*" ".*" one "${one}")
+        string(REPLACE "PLACEHOLDERDOT" "\\." one "${one}")
+        list(APPEND parts "${one}")
+    endforeach()
+    string(REPLACE ";" "|" joined "${parts}")
+    set(${outVar} "(${joined})$" PARENT_SCOPE)
+endfunction()
+
+fastcached_globs_to_regex("${FastCachedNetStandaloneSourceGlobs}" sourceRegex)
 fastcached_split_rows(FastCachedNetStandaloneLeaves standaloneLeaves standaloneLeafReasons)
 
 # ---------------------------------------------------------------------------
@@ -198,11 +223,10 @@ foreach(dir IN LISTS standaloneDirs)
         continue()
     endif()
 
-    set(unitGlobs "")
-    foreach(glob IN LISTS FastCachedNetStandaloneSourceGlobs)
-        list(APPEND unitGlobs "${sourceRoot}/${dir}/${glob}")
-    endforeach()
-    file(GLOB_RECURSE unitSources LIST_DIRECTORIES false ${unitGlobs})
+    # ONE traversal per unit directory, filtered afterwards.
+    file(GLOB_RECURSE unitAll LIST_DIRECTORIES false "${sourceRoot}/${dir}/*")
+    set(unitSources ${unitAll})
+    list(FILTER unitSources INCLUDE REGEX "${sourceRegex}")
 
     # A directory that contributes nothing is a renamed or mistyped row, and the
     # whole check would then pass by scanning nothing at all -- which is the one

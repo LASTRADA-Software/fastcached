@@ -97,8 +97,30 @@ foreach(cmakeFile IN LISTS cmakeFiles)
     # `if()` condition can be torn in half, after which every verdict for the
     # rest of the file is drawn from the wrong stack. Escaping first is what
     # keeps one line one element.
+    #
+    # A semicolon is only HALF of that hazard, and this check carried the other
+    # half open until #502. CMake's list grouping also treats `[` and `]` as
+    # structure, so one unbalanced bracket -- in a COMMENT, where nobody is
+    # thinking about CMake syntax -- merges every following line into a single
+    # element. `check-sccache-backend-caveat.cmake` had already recorded the same
+    # failure ("one stray `]` in a comment swallowed 451 lines") and solved it;
+    # the reasoning stayed in that file and never reached this one.
+    #
+    # Observed here: a sentence added to `src/tests/CMakeLists.txt` mentioning a
+    # stray `]` swallowed the rest of the file, and all 25 `$<TARGET_FILE:>`
+    # references in it became invisible. Note the shape of the near-miss -- the
+    # check did not report "all guarded" over a file it could no longer see. It
+    # reported that it had found NOTHING and would pass vacuously, which is the
+    # `no reference was found at all` refusal below doing exactly its job. Fixing
+    # the splitter is what makes that refusal rare rather than load-bearing.
+    #
+    # Brackets are replaced rather than escaped because nothing here matches on
+    # them: the patterns are `$<TARGET_FILE:x>` and `if`/`elseif`/`endif`, and a
+    # space preserves every column and every line number.
     file(READ "${cmakeFile}" content)
     string(REPLACE ";" "\\;" content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
     string(REPLACE "\n" ";" lines "${content}")
 

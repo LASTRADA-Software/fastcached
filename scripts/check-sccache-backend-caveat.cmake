@@ -272,24 +272,46 @@ endif()
 # ---------------------------------------------------------------------------
 # Collect the files to search, and remember which of them may be judged.
 set(scanFiles "")
+# Turn a list of shell globs into one anchored regex, so a directory can be walked
+# ONCE and the results partitioned in memory.
+#
+# `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN, and this check
+# passed it ~19 of them per root, twice. Measured on DrvFs: one traversal of `src/`
+# costs 2.09 s, and 38 of them is the 78.7 s this check took -- arithmetic that
+# matches the observation almost exactly.
+# @param globs The shell globs, each like `*.md`.
+# @param outVar Set to an anchored alternation regex.
+function(fastcached_globs_to_regex globs outVar)
+    set(parts "")
+    foreach(glob IN LISTS globs)
+        string(REPLACE "." "PLACEHOLDERDOT" one "${glob}")
+        string(REPLACE "*" ".*" one "${one}")
+        string(REPLACE "PLACEHOLDERDOT" "\\." one "${one}")
+        list(APPEND parts "${one}")
+    endforeach()
+    string(REPLACE ";" "|" joined "${parts}")
+    set(${outVar} "(${joined})$" PARENT_SCOPE)
+endfunction()
+
+fastcached_globs_to_regex("${FastCachedSccacheScanGlobs}" scanRegex)
+fastcached_globs_to_regex("${FastCachedSccacheJudgedGlobs}" judgedRegex)
+
 set(judgedFiles "")
 set(missingRoots "")
 foreach(row IN LISTS FastCachedSccacheScanRoots)
     fastcached_row_fields("${row}" scanRoot scanRootReason)
     set(rootPath "${FASTCACHED_SOURCE_DIR}/${scanRoot}")
     if(IS_DIRECTORY "${rootPath}")
-        set(rootGlobs "")
-        foreach(glob IN LISTS FastCachedSccacheScanGlobs)
-            list(APPEND rootGlobs "${rootPath}/${glob}")
-        endforeach()
-        file(GLOB_RECURSE rootFiles LIST_DIRECTORIES false ${rootGlobs})
+        # ONE traversal per root, partitioned afterwards. See
+        # `fastcached_globs_to_regex` for the arithmetic this replaces.
+        file(GLOB_RECURSE rootAll LIST_DIRECTORIES false "${rootPath}/*")
+
+        set(rootFiles ${rootAll})
+        list(FILTER rootFiles INCLUDE REGEX "${scanRegex}")
         list(APPEND scanFiles ${rootFiles})
 
-        set(judgedGlobs "")
-        foreach(glob IN LISTS FastCachedSccacheJudgedGlobs)
-            list(APPEND judgedGlobs "${rootPath}/${glob}")
-        endforeach()
-        file(GLOB_RECURSE rootJudged LIST_DIRECTORIES false ${judgedGlobs})
+        set(rootJudged ${rootAll})
+        list(FILTER rootJudged INCLUDE REGEX "${judgedRegex}")
         list(APPEND judgedFiles ${rootJudged})
     elseif(EXISTS "${rootPath}")
         list(APPEND scanFiles "${rootPath}")
