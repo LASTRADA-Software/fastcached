@@ -127,16 +127,15 @@ struct UntriagedRefusal
 /// a genuinely absent one would then be indistinguishable at the call site. That is
 /// this project's absent-is-not-zero rule stated at a seam.
 ///
-/// So the guard lives HERE rather than at each caller: `CompileCacheHandler` alone has
-/// twelve refusals, and twelve hand-written null checks are twelve chances to write
-/// `*metrics` instead. Callers pass the pointer they were handed and say nothing about
-/// nullability.
+/// The guard lives HERE because it cannot live at the caller: a null branch there would
+/// have to call `EncodeErrorReply`, which `worker-refusals-counted` forbids outside this
+/// header. That is also why the whole `Refuse` family spells the encoder exactly ONCE
+/// and the reference overload delegates -- one encoder call per spelling is what the
+/// check requires, and an overload encoding separately would raise the call count
+/// without raising the name count, which is the evasion that check exists to catch,
+/// arriving through the header it guards.
 ///
-/// It is also why the whole `Refuse` family spells `EncodeErrorReply` exactly ONCE:
-/// `worker-refusals-counted` requires one encoder call per spelling, and an overload
-/// that encoded separately would have raised the call count without raising the name
-/// count -- which is the evasion that check exists to catch, arriving through the
-/// header it guards.
+/// Callers pass the pointer they were handed and say nothing about nullability.
 /// @param metrics Where the refusal is recorded, or null when nothing collects.
 /// @param refusal Which refusal, as one row.
 /// @param detail Words for a person, or empty when there are none to add.

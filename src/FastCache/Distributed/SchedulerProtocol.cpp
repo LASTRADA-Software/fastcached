@@ -18,20 +18,11 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    // **Triaged in #494. Four of this surface's seven arms count; three do not, and
-    // each of the three defers to a decision made below rather than inventing one.**
-    //
-    // The controlling fact is that `SchedulerService` has already triaged its own
-    // refusals completely: `RefusalTable` counts six codes, `UncountedRefusals` names
-    // seven it deliberately does not count and why, and `RefusalsAreDisjoint()` is a
-    // `static_assert` proving every refusal is in exactly one of them. So the two arms
-    // that hand a service refusal back -- `RefusePeer` and `Route`'s reply -- are not
-    // undecided, they are decided one layer down. Counting them here would sum six
-    // refusals a second time and drag the other seven into series they were kept out
-    // of, which is how two layers come to disagree about one fact.
-    //
-    // The four that DO count are the ones the service never sees: a frame is refused
-    // before any verb reaches it.
+    // **Triaged in #494.** Four of this surface's seven arms count -- the ones the
+    // service never sees, where a frame is refused before any verb reaches it. The
+    // other three defer to `SchedulerService`, which triages its own refusals
+    // completely (`RefusalTable`, `UncountedRefusals`, and `RefusalsAreDisjoint()`
+    // proving every code is in exactly one). Each arm states its own reasoning.
 
     /// The verbs a scheduler answers.
     ///
@@ -181,11 +172,8 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
     auto const reply = Route(descriptor->code, payload, caller);
     if (reply.status == Wire::Status::Ok)
         return Wire::EncodeReply(Wire::Status::Ok, reply.payload);
-    // **Uncounted here, because it is counted at the decision.** Every code reaching
-    // this line has already passed through `SchedulerService::Refuse`, which increments
-    // for the six in `RefusalTable` and deliberately increments nothing for the seven
-    // in `UncountedRefusals`. A counter here would double the first six and pull the
-    // other seven into a series their own reasoning kept them out of.
+    // A counter here would double the six the service counts and pull the seven it
+    // does not into series their own reasoning kept them out of.
     return Cc::RefuseWithoutCounter(
         { .code = reply.error,
           .rationale = "counted at the decision, in SchedulerService::Refuse, which triages every code it can produce "

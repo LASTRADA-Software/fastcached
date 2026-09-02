@@ -30,14 +30,6 @@ namespace
 
     namespace Wire = CompileCacheWire;
 
-    /// The issue that will decide which of the daemon's `0xFC` refusals are events.
-    ///
-    /// This is the one funnel every refusal on the surface passes through, and it
-    /// counts nothing. Whether it should -- and which arms, against "would a rise here
-    /// mean something happened" -- is
-    /// [#494](https://github.com/LASTRADA-Software/fastcached/issues/494). Untriaged
-    /// rather than deliberately uncounted, because nobody has made that argument yet.
-
     /// Cap on a single framed line/field's length. The compile-cache protocol
     /// never uses line reads, but ByteReader requires a line cap; set it to the
     /// same generous bound the other handlers use.
@@ -173,53 +165,44 @@ namespace
 
     /// What a pre-payload refusal answers with, and what it moves.
     ///
-    /// A table rather than `ErrorCodeFor(decision)` plus one counter, because the two
-    /// reachable decisions are opposite operator problems: a client sending more than
-    /// it may, and a client that never learned it needs a credential. One series
-    /// carrying both could answer neither.
+    /// A row per decision rather than one counter for whatever `ErrorCodeFor` returns:
+    /// the two reachable outcomes are opposite operator problems -- a client sending
+    /// more than it may, and a client that never learned it needs a credential -- and
+    /// one series carrying both could answer neither.
     ///
-    /// A plain array indexed by the enumerator rather than `EnumTable`, and the reason
-    /// is the enum: `PrePayloadDecision` is a WIRE type carrying no trailing `Last`,
-    /// which `EnumTable` takes its extent from. Adding one to a shared wire header to
-    /// satisfy a table in this file would be the tail wagging the dog, so the extent is
-    /// asserted here instead -- anchored on the last enumerator by name, which is the
-    /// shape the rulebook warns about and is the honest option only because there is no
-    /// count to anchor on.
-    constexpr std::array PrePayloadRefusals {
-        // `Serve` never reaches a refusal; its row exists so the array is indexable by
-        // the enumerator, and would answer `UnknownOpcode` if one ever did.
-        Cc::SurfaceRefusal { .code = Wire::ErrorCode::UnknownOpcode,
-                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode },
-        // Answered earlier, where the opcode is first resolved, so the payload can be
-        // skipped and the connection kept usable. Its row names that arm's counter, so
-        // a caller arriving here with it cannot invent a second series for one event.
-        Cc::SurfaceRefusal { .code = Wire::ErrorCode::UnknownOpcode,
-                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode },
-        Cc::SurfaceRefusal { .code = Wire::ErrorCode::PayloadTooLarge,
-                             .counter = IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge },
-        Cc::SurfaceRefusal { .code = Wire::ErrorCode::Unauthenticated,
-                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnauthenticated },
-    };
-
-    static_assert(PrePayloadRefusals.size() == static_cast<std::size_t>(Wire::PrePayloadDecision::Unauthenticated) + 1,
-                  "a decision added to PrePayloadDecision needs a row here");
-
-    // And every row must answer the code the wire's own mapping already promises, or a
-    // client would be told one thing by `ErrorCodeFor` and another by this surface.
-    static_assert(PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::UnknownOpcode)].code
-                          == Wire::ErrorCodeFor(Wire::PrePayloadDecision::UnknownOpcode)
-                      && PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::PayloadTooLarge)].code
-                             == Wire::ErrorCodeFor(Wire::PrePayloadDecision::PayloadTooLarge)
-                      && PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::Unauthenticated)].code
-                             == Wire::ErrorCodeFor(Wire::PrePayloadDecision::Unauthenticated),
-                  "a pre-payload row must answer the code ErrorCodeFor already promises");
-
-    /// The refusal one pre-payload decision answers with.
+    /// A switch rather than a table indexed by the enumerator, which is the shape
+    /// `CompileResponder::RefusalFor` already chose for this same enum and for the
+    /// reason recorded there: `PrePayloadDecision` states no `Last`, it is a wire enum
+    /// both binaries compile in, and adding a count to a shared header to satisfy a
+    /// local table idiom would be a wire change bought for nothing. `ErrorCodeFor`
+    /// answers it the same way. No `default`, so a fifth outcome is a build failure --
+    /// where an indexed array's size assertion would still read `4 == 4` and index one
+    /// past the end.
+    ///
+    /// The CODE is not restated here. It comes from `ErrorCodeFor`, which already owns
+    /// that mapping, so this answers only the half that is this surface's own.
     /// @param decision What the wire's own gate concluded.
-    /// @return Its row.
-    [[nodiscard]] constexpr Cc::SurfaceRefusal const& RefusalForDecision(Wire::PrePayloadDecision decision) noexcept
+    /// @return The counter a refusal for @p decision moves.
+    [[nodiscard]] constexpr IMetricsSink::Counter CounterForDecision(Wire::PrePayloadDecision decision) noexcept
     {
-        return PrePayloadRefusals[static_cast<std::size_t>(decision)];
+        switch (decision)
+        {
+            case Wire::PrePayloadDecision::PayloadTooLarge:
+                return IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge;
+            case Wire::PrePayloadDecision::UnknownOpcode:
+                // Refused earlier, where the opcode is first resolved, so the payload
+                // can be skipped and the connection kept usable. Named anyway, so a
+                // caller arriving here with it cannot invent a second series for one
+                // event.
+                return IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode;
+            case Wire::PrePayloadDecision::Unauthenticated:
+            case Wire::PrePayloadDecision::Serve:
+                // `Serve` is not a refusal, and a total function still has to answer
+                // it. It follows `ErrorCodeFor`'s own choice rather than inventing a
+                // second one.
+                break;
+        }
+        return IMetricsSink::Counter::CacheFramesRefusedUnauthenticated;
     }
 
     /// Send one refusal that is deliberately not counted.
@@ -789,12 +772,10 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // refusal in this loop. Unchanged from the two branches this replaced.
             if (!(co_await reader.Skip(header->payloadLength)).has_value())
                 co_return;
-            // A row PER DECISION rather than one counter for whatever
-            // `ErrorCodeFor` returns. The two reachable decisions here are opposite
-            // operator problems -- a client sending more than it may, and a client
-            // that never learned it needs a credential -- and one series carrying both
-            // could answer neither.
-            if (!co_await ReplyRefused(socket, session.metrics, RefusalForDecision(decision), std::move(message)))
+            if (!co_await ReplyRefused(socket,
+                                       session.metrics,
+                                       { .code = Wire::ErrorCodeFor(decision), .counter = CounterForDecision(decision) },
+                                       std::move(message)))
                 co_return;
             continue;
         }
