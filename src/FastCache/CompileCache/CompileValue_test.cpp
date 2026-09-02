@@ -507,8 +507,11 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // nothing, which retires every entry in the fleet to buy exactly that.
     INFO("the stored-value contract produced "
          << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << pinned.digest
-         << ".\nIf you added, removed or edited a ConformanceCorpus row and changed no behaviour, repin generation "
+         << ".\nIf you widened ConformanceCorpus to cover behaviour that was ALREADY in this generation, repin "
+            "generation "
          << static_cast<unsigned>(CompileValueVersion) << " to " << live
+         << ".\nAdding a PathCanon::Grammar is NOT that -- see the grammar-coverage case, which sends you here "
+            "with a row to add and a bump to take"
          << ".\nIf you changed how a path span is found, rewritten, localized or framed, that is a new "
             "canonicalization spec: two servers on one wire at different builds must not both call themselves "
             "generation "
@@ -578,10 +581,14 @@ TEST_CASE("The conformance corpus covers every grammar the decoder accepts")
 
     for (auto const tag: accepted)
     {
-        INFO("grammar tag " << static_cast<unsigned>(tag)
-                            << " decodes, but no ConformanceCorpus row exercises it -- so a change to how that "
-                               "grammar finds or rewrites path spans would not move the digest, and would ship "
-                               "under the current CompileValueVersion");
+        INFO("grammar tag "
+             << static_cast<unsigned>(tag)
+             << " decodes, but no ConformanceCorpus row exercises it -- so a change to how that grammar finds or "
+                "rewrites path spans would not move the digest, and would ship under the current "
+                "CompileValueVersion.\nAdd a row AND bump CompileValueVersion. Both: a new grammar is a new "
+                "canonicalization spec, because an older build meets the tag and refuses it, so the row alone "
+                "would repin the CURRENT generation and ship the change under a number that already means "
+                "something else. The generation case's repin branch does not apply here.");
         CHECK(std::ranges::any_of(
             ConformanceCorpus, [tag](ConformanceCase const& row) { return static_cast<std::uint8_t>(row.grammar) == tag; }));
     }
