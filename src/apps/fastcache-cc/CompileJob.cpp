@@ -2,6 +2,7 @@
 #include "CmdLine.hpp"
 #include "CompileCorrelation.hpp"
 #include "CompileJob.hpp"
+#include "FileBytes.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
 
@@ -74,31 +75,6 @@ namespace
         return std::ranges::find(ReservedDeviceNames, folded) == ReservedDeviceNames.end();
     }
 
-    /// Read a whole file as bytes.
-    /// Read a whole file as bytes.
-    ///
-    /// Sized from the stream and read in one call, deliberately NOT through
-    /// `std::istreambuf_iterator`. GCC 14 at -O2 inlines that iterator's `sgetc`
-    /// and then reports `-Werror=null-dereference` inside `<streambuf>` itself --
-    /// a false positive, but one this project cannot silence, since warnings are
-    /// errors and the rule is to fix them at the source rather than suppress them.
-    /// Seeking is also one allocation and one read instead of a per-character
-    /// loop, so the workaround is the better implementation regardless.
-    [[nodiscard]] std::optional<std::vector<std::byte>> ReadBytes(std::filesystem::path const& path)
-    {
-        std::ifstream in { path, std::ios::binary | std::ios::ate };
-        if (!in)
-            return std::nullopt;
-        auto const size = in.tellg();
-        if (size < 0)
-            return std::nullopt;
-        in.seekg(0, std::ios::beg);
-
-        std::vector<std::byte> out(static_cast<std::size_t>(size));
-        if (!out.empty() && !in.read(reinterpret_cast<char*>(out.data()), size))
-            return std::nullopt;
-        return out;
-    }
 } // namespace
 
 namespace
@@ -920,7 +896,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     };
     if (run.exitCode == 0)
     {
-        auto bytes = ReadBytes(object);
+        auto bytes = ReadFileBytes(object);
         if (!bytes.has_value())
             // The compiler said it succeeded and produced nothing readable. Refused
             // rather than returned as an empty object, which the client would write

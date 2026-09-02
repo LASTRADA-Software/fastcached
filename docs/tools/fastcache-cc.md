@@ -214,6 +214,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` running `--serve-scheduler`. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** member of the cluster, not the current leader — no launcher needs re-pointing after an election. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
+| `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
 
 The statistics log is located from the usual per-user state variables rather than
 one of the launcher's own. These are read but never written:
@@ -449,6 +450,46 @@ ask.
 | `could not write object on hit` | The object output path was not writable. |
 | `a worker answered about a different compile` | **A defect somewhere in the fleet, not a fleet declining to help.** The worker's reply did not belong to the request that asked for it — see [`correlation`](../protocols/compile-cache.md#distributed-execution). The object is refused unread and the translation unit is compiled locally, so the build is correct and the caching of it is unaffected (the outcome is still a miss). This is the one reason printed unconditionally rather than only under `FASTCACHE_VERBOSE`, and the line names the worker, the correlation this client expected and the one that arrived. Accepting such a reply would store a wrong object under a correct key and serve it to every other machine that fetches it, so there is no configuration that relaxes this. If it appears at all, find the machine the line names. |
 | `a reported dependency path is not text this host can read`, `a captured region names a path that is not text this host can read` | Deliberate, and Windows-only. `cl.exe` writes the paths in `/showIncludes` in the **console output** code page, while this launcher's own roots arrive as UTF-8 -- so a header under a non-ASCII directory can reach it as bytes it cannot read as text. Such a path prefix-matches no root, which would key a project header as toolchain content and serve a stale object under a zero exit code, so the compile is not cached at all. Reported as *uncacheable*, not as an error. The fix is the console: `chcp 65001` makes `cl` emit UTF-8 and this stops appearing. |
+
+## Verifying that a hit is the right object
+
+A wrong object served under a correct key is this cache's worst failure: it links,
+it usually runs, and nothing says anything. `FASTCACHE_VERIFY=<n>` makes one hit in
+every *n* prove itself — the translation unit is compiled again and the two objects
+are compared. On a mismatch the **freshly compiled** object is the one left on disk,
+so a build that has just caught its cache is still a correct build, and the key is
+named on stderr whether or not `FASTCACHE_VERBOSE` is set.
+
+It costs a whole compile per verified hit, so it is off by default.
+
+**What "the same object" means is not "the same bytes", and on Windows it cannot
+be.** Every MSVC-family driver stamps the wall clock into the COFF header, and a
+cached object was compiled earlier than the fresh one it is checked against by
+construction. Measured on MSVC 14.51 and clang-cl, two compiles of one translation
+unit to one object path differ in that 4-byte `TimeDateStamp` and in nothing else,
+whether two seconds or five minutes apart, with `/Z7` or without. That one field is
+therefore normalised, and nothing else is. On Linux nothing is normalised at all:
+clang 20.1 and GCC 14.2 objects are byte-identical between two compiles, `-g`
+included, so ELF keeps a strict byte comparison.
+
+What that deliberately does **not** overlook is `cl`'s record of *where* it
+compiled — the object's absolute path in `.debug$S`, and the source hash in
+`.chks64`. Those vary with the path rather than with the clock, and verification
+recompiles to the same path, so a hit produced on this machine differs in neither.
+A hit that *does* differ there was built somewhere else — another checkout, or
+another machine — and is reported, with the message saying so rather than leaving
+"wrong object" to mean either that or stale code.
+
+Four outcomes reach you, and only one of them is a finding. The last two are
+different from each other in the way that decides what to do next — one is worth
+retrying, the other never will be:
+
+| Outcome | Meaning |
+|---|---|
+| *(silence)* | The cached object is the object this compiler produces. |
+| `WRONG OBJECT served for key …` | It is not. The message names what differed — a section such as `.text$mn` is stale code; `.debug$S` or `.chks64` is a foreign build path. The fresh object was used, so this build is unaffected. Find the machine that stored it. |
+| `could not verify the hit for key …` | The check did not complete: the fresh compile failed, or a file could not be read. Nothing is known about the cached object either way, and the next hit may well answer. |
+| `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing about any hit — not this one and not the next. A property of the toolchain, not a statement about your cache. |
 
 ## Known limitations
 

@@ -178,6 +178,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
+- An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
+  and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
+  older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
+  object on the platform where #368 was observed. Measured: the 4-byte `TimeDateStamp`
+  and nothing else at 2 s and at 300 s; ELF is identical, `-g` included, so it keeps
+  the byte comparison. `.debug$S`/`.chks64` are volatile in the PATH, not in time, and
+  the verifier holds the path fixed — so they are NOT excused, or #489 (a hit from
+  another checkout) goes silent, which is #493 cured by no longer looking. Parsing
+  never grants an excuse; it only says WHERE. A FRESH object that will not lay out is
+  `Unsupported`, refused by name; a SERVED one that will not while the fresh one does
+  is `Mismatched`, because that is a truncated transfer. Never `/Brepro`.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,
@@ -737,7 +748,17 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
-- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate — and a
+  RED run is silent about every leg after the failure, so "GATE FAILED: clang-debug tests"
+  does not mean the rest passed (#501). Two `-Werror` defects in one change hid behind
+  five red runs that never reached `gcc-release`.
+- **A retry makes an instrument's own failures disappear without fixing them.** Six ways
+  the gate reported on something other than the tree under test turned up in one ticket —
+  `| tail` reporting the pipe's status, quoting collapsing through three parsers so the
+  run never happened, two gates in one build directory, a dirty tree, the log on `/tmp`
+  where a WSL idle-out erases it, and the wrapper edited WHILE bash was executing it. None
+  announces itself; each looks like a flake; a re-run clears all six. Presence is not
+  usability, and a finding fixed at the line rather than at the rule comes back.
 - A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in

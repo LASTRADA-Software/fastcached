@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ObjectEquivalence.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace FastCache::Cc
@@ -44,6 +48,18 @@ enum class HitVerdict : std::uint8_t
     /// that did not happen, and read as `Mismatched` it fails a build over a full
     /// disk. What it means is "ask again", and only a distinct value can say that.
     Inconclusive,
+    /// Sampled, both objects were read, and this build cannot lay out the format
+    /// its own compiler just produced -- so the clock every MSVC-family driver
+    /// stamps into an object cannot be told apart from a real difference.
+    ///
+    /// Distinct from `Inconclusive` because the two say opposite things about
+    /// asking again: `Inconclusive` means the attempt failed and the next one may
+    /// not, while this is a property of the toolchain that will hold for every hit
+    /// until this program learns the format. Answering `Mismatched` here is the
+    /// defect [#493](https://github.com/LASTRADA-Software/fastcached/issues/493)
+    /// records -- a precise wrong answer, which is worse than none, and exactly how
+    /// a verifier gets switched off for good.
+    Unsupported,
 };
 
 /// Verification is off; no hit is checked.
@@ -76,25 +92,67 @@ inline constexpr unsigned VerificationOff = 0;
 /// value is echoed on the first hit so a typo is visible rather than silent.
 [[nodiscard]] unsigned ParseVerificationRate(std::string_view text) noexcept;
 
+/// A verdict, and enough about it to act on.
+struct HitComparison
+{
+    HitVerdict verdict { HitVerdict::Inconclusive };
+    /// What the image comparison found, or nothing when no images were compared --
+    /// the hit was not sampled, or one of the two files could not be read.
+    ///
+    /// A disengaged optional rather than an extra enumerator, because "there was no
+    /// comparison" is not a comparison outcome. Carried at all because `verdict`
+    /// deliberately folds `Identical` and `EquivalentApartFromVolatile` into
+    /// `Matched`, and one caller needs them apart again: recovering that from
+    /// `detail` being non-empty would rebuild a state from prose, which is the exact
+    /// collapse `HitVerdict` refuses two enumerators above.
+    std::optional<ObjectComparison> comparison;
+    /// Where the difference was, what was overlooked, or which format could not be
+    /// read. Empty when there is nothing to add. Owned rather than viewed: the two
+    /// images it describes are read into buffers this call drops on the way out.
+    std::string detail;
+};
+
 /// Compare the object a hit produced against one a fresh compile produced.
 ///
 /// A byte comparison rather than a hash: the two files are already on this disk, the
 /// sizes are megabytes at most, and a hash would add a way for the comparison itself
 /// to be the thing that is wrong.
 ///
+/// **Not a bare `memcmp`, and that is #493.** Every MSVC-family driver stamps the
+/// wall clock into the object header, and a cached object was compiled earlier than
+/// the fresh one it is checked against by construction -- so a byte comparison
+/// answered `Mismatched` on every Windows hit, on the platform where the defect it
+/// exists to detect was observed. `ObjectEquivalence.hpp` carries the measurements
+/// and the single field that is normalised; on ELF, where the bytes are reproducible
+/// (measured, with and without `-g`), nothing is normalised and this stays the byte
+/// comparison it was.
+///
+/// Both files are read whole. A streaming pass that answered "identical" without
+/// allocating was tried and removed: on every MSVC driver the clock guarantees a
+/// difference, so it fell through to reading both files anyway on the one platform
+/// this exists for, while claiming in a comment to have saved the read.
+///
 /// @param served What the cache put on disk.
-/// @param fresh What the compiler just produced.
-/// @return `Matched`, `Mismatched`, or `Inconclusive` when either could not be read.
-[[nodiscard]] HitVerdict CompareObjectFiles(std::filesystem::path const& served, std::filesystem::path const& fresh);
+/// @param fresh What the compiler just produced, at the same path the served object
+///        occupied -- which is what keeps the driver's path records out of the
+///        comparison without anything having to overlook them.
+/// @return The verdict, plus a sentence naming what it turned on.
+[[nodiscard]] HitComparison CompareObjectFiles(std::filesystem::path const& served, std::filesystem::path const& fresh);
 
 /// What to tell an operator about @p verdict, or empty when there is nothing to say.
 ///
 /// One spelling, because the message is the entire product of this feature: a
 /// mismatch that is counted and not described is a number somebody has to come back
 /// and ask about.
-/// @param verdict What the comparison found.
+/// Takes the whole `HitComparison` rather than a verdict and an optional detail:
+/// the two always travel together, a defaulted detail existed only so tests could
+/// omit it, and the pairing is load-bearing prose -- a mismatch naming `.text$mn`
+/// and one naming `.debug$S` are a stale object and a foreign build path, acted on
+/// differently. Passing them separately made a mismatched pairing spellable.
+///
+/// @param comparison What the comparison found, and what it turned on.
 /// @param key The object key, so the entry can be looked at rather than only counted.
 /// @return The line, or empty for `NotChecked` and `Matched`.
-[[nodiscard]] std::string DescribeVerdict(HitVerdict verdict, std::string_view key);
+[[nodiscard]] std::string DescribeVerdict(HitComparison const& comparison, std::string_view key);
 
 } // namespace FastCache::Cc

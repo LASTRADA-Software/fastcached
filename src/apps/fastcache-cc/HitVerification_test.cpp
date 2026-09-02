@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "HitVerification.hpp"
+#include "StubCoffTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cc;
+using namespace FastCache::Cc::Test;
 
 namespace
 {
@@ -45,6 +52,36 @@ namespace
             ++sampled;
     return sampled;
 }
+
+/// The sections the file-layer cases use: one, carrying data.
+///
+/// The builder itself is `StubCoffTestSupport.hpp` -- shared with
+/// `ObjectEquivalence_test.cpp`, where the format is asserted. These cases are about
+/// reaching the object comparison through the FILE layer, not about COFF.
+/// @return One section of data.
+[[nodiscard]] std::vector<StubSection> OneCodeSection()
+{
+    return { { .name = ".text$mn", .data = "CODE-AND-DATA" } };
+}
+
+/// A stub object as a byte string, for `WriteFile`.
+/// @param timestamp What to put in `TimeDateStamp`.
+/// @return The image.
+[[nodiscard]] std::string StubCoff(std::uint32_t timestamp)
+{
+    auto const image = BuildCoff(OneCodeSection(), timestamp);
+    std::string bytes;
+    std::ranges::transform(image, std::back_inserter(bytes), [](std::byte byte) { return static_cast<char>(byte); });
+    return bytes;
+}
+
+/// Where `StubCoff` puts a byte that is section DATA.
+///
+/// Derived from the builder's own constants rather than spelled out, so a corruption
+/// case cannot quietly start flipping a byte in the header -- part of which the
+/// comparison is allowed to overlook, which would make the case pass for the
+/// opposite of its stated reason.
+constexpr std::size_t CodeByteOffset = StubFirstSectionDataAt(1) + 2;
 
 } // namespace
 
@@ -131,18 +168,46 @@ TEST_CASE("Identical objects match and differing ones do not", "[launcher][verif
 
     auto const served = WriteFile(dir, "served.o", std::string(4096, '\x7f'));
     auto const same = WriteFile(dir, "same.o", std::string(4096, '\x7f'));
-    CHECK(CompareObjectFiles(served, same) == HitVerdict::Matched);
+    CHECK(CompareObjectFiles(served, same).verdict == HitVerdict::Matched);
 
-    // A single byte, deep inside, and past the first comparison chunk: a comparison
-    // that only checked a prefix, or a length, would pass this and is exactly what a
-    // wrong object looks like -- an object file that differs in one instruction still
-    // links.
+    // A single byte, deep inside: a comparison that only checked a prefix, or a
+    // length, would pass this and is exactly what a wrong object looks like -- an
+    // object file that differs in one instruction still links.
     auto differing = std::string(4096, '\x7f');
     differing[3000] = '\x00';
-    CHECK(CompareObjectFiles(served, WriteFile(dir, "differs.o", differing)) == HitVerdict::Mismatched);
+    CHECK(CompareObjectFiles(served, WriteFile(dir, "differs.o", differing)).verdict == HitVerdict::Mismatched);
 
     // A length difference is a mismatch, not an error.
-    CHECK(CompareObjectFiles(served, WriteFile(dir, "short.o", std::string(4095, '\x7f'))) == HitVerdict::Mismatched);
+    CHECK(CompareObjectFiles(served, WriteFile(dir, "short.o", std::string(4095, '\x7f'))).verdict
+          == HitVerdict::Mismatched);
+}
+
+TEST_CASE("A hit whose object differs only in the COFF clock verifies clean", "[launcher][verify]")
+{
+    // #493, through the file layer this time: the chunked pass finds a difference and
+    // hands over to the object comparison rather than answering `Mismatched` on it.
+    // Without that handover every Windows hit reported a wrong object, because a
+    // cached object is older than the fresh compile it is checked against BY
+    // CONSTRUCTION -- which made the one instrument that can see a wrong object
+    // useless on the platform where one was observed.
+    Testing::ScratchDirectory const scratch { "hit-verify-clock" };
+    auto const& dir = scratch.Path();
+
+    auto const served = WriteFile(dir, "served.obj", StubCoff(1000));
+    auto const fresh = WriteFile(dir, "fresh.obj", StubCoff(2000));
+
+    auto const clean = CompareObjectFiles(served, fresh);
+    CHECK(clean.verdict == HitVerdict::Matched);
+    CHECK_FALSE(clean.detail.empty());
+
+    // And the guard still bites: the same clock difference plus one byte of section
+    // data is a wrong object. A verifier that stopped crying wolf by no longer
+    // looking would pass the case above and fail this one.
+    auto corrupted = StubCoff(2000);
+    corrupted[CodeByteOffset] = 'Z';
+    auto const caught = CompareObjectFiles(served, WriteFile(dir, "wrong.obj", corrupted));
+    CHECK(caught.verdict == HitVerdict::Mismatched);
+    CHECK_FALSE(caught.detail.empty());
 }
 
 TEST_CASE("A comparison that could not be made says so rather than guessing", "[launcher][verify]")
@@ -154,8 +219,8 @@ TEST_CASE("A comparison that could not be made says so rather than guessing", "[
     auto const& dir = scratch.Path();
     auto const present = WriteFile(dir, "present.o", "abc");
 
-    CHECK(CompareObjectFiles(present, dir / "not-here.o") == HitVerdict::Inconclusive);
-    CHECK(CompareObjectFiles(dir / "not-here.o", present) == HitVerdict::Inconclusive);
+    CHECK(CompareObjectFiles(present, dir / "not-here.o").verdict == HitVerdict::Inconclusive);
+    CHECK(CompareObjectFiles(dir / "not-here.o", present).verdict == HitVerdict::Inconclusive);
 }
 
 TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verify]")
@@ -164,16 +229,48 @@ TEST_CASE("A mismatch is described, and says what was linked", "[launcher][verif
     // described is a number somebody has to come back and ask about -- and the second
     // half, that the fresh object was used, is what tells a reader whether the build
     // they are holding is trustworthy.
-    auto const line = DescribeVerdict(HitVerdict::Mismatched, "objkey-v3:abcdef");
+    auto const line =
+        DescribeVerdict({ .verdict = HitVerdict::Mismatched, .comparison = std::nullopt, .detail = {} }, "objkey-v3:abcdef");
     CHECK(line.contains("objkey-v3:abcdef"));
     CHECK(line.contains("WRONG OBJECT"));
     CHECK(line.contains("freshly compiled"));
 
     // Nothing to say about the two ordinary outcomes -- a line per hit would make the
-    // one that matters unreadable.
-    CHECK(DescribeVerdict(HitVerdict::NotChecked, "k").empty());
-    CHECK(DescribeVerdict(HitVerdict::Matched, "k").empty());
+    // one that matters unreadable. Including when the comparison overlooked a clock,
+    // which on Windows is EVERY hit.
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::NotChecked, .comparison = std::nullopt, .detail = {} }, "k").empty());
+    CHECK(DescribeVerdict({ .verdict = HitVerdict::Matched, .comparison = std::nullopt, .detail = {} }, "k").empty());
+    CHECK(DescribeVerdict(
+              { .verdict = HitVerdict::Matched, .comparison = std::nullopt, .detail = "the compiler's timestamp" }, "k")
+              .empty());
 
     // And the inconclusive one is described too, because it is not a pass.
-    CHECK_FALSE(DescribeVerdict(HitVerdict::Inconclusive, "objkey-v3:abcdef").empty());
+    CHECK_FALSE(DescribeVerdict({ .verdict = HitVerdict::Inconclusive, .comparison = std::nullopt, .detail = {} },
+                                "objkey-v3:abcdef")
+                    .empty());
+}
+
+TEST_CASE("What differed is carried into the line, not left to be asked about", "[launcher][verify]")
+{
+    // `.debug$S` and `.text$mn` mean a foreign build path and stale code, and those
+    // are acted on differently -- so a mismatch naming neither makes an operator come
+    // back and ask a question the comparison had already answered.
+    auto const line = DescribeVerdict(
+        { .verdict = HitVerdict::Mismatched, .comparison = std::nullopt, .detail = "3 differing byte(s), in .text$mn" },
+        "k");
+    CHECK(line.contains(".text$mn"));
+    CHECK(line.contains("WRONG OBJECT"));
+}
+
+TEST_CASE("A toolchain that cannot be compared is not reported as a wrong object", "[launcher][verify]")
+{
+    // The state that must never read as a finding. An operator who takes "cannot
+    // verify" for "your cache is broken" switches verification off, and the class it
+    // guards goes invisible again -- which is #493 restated one level up.
+    auto const line = DescribeVerdict(
+        { .verdict = HitVerdict::Unsupported, .comparison = std::nullopt, .detail = "some format" }, "objkey-v3:abcdef");
+    CHECK_FALSE(line.empty());
+    CHECK(line.contains("objkey-v3:abcdef"));
+    CHECK(line.contains("cannot verify"));
+    CHECK_FALSE(line.contains("WRONG OBJECT"));
 }

@@ -173,8 +173,12 @@ namespace
         EnvVarSpec { .name = EnvName::NoStats, .summary = "Do not record invocations to the statistics log." },
         EnvVarSpec { .name = EnvName::Verify,
                      .summary = "Verify one cache hit in every N by compiling the\n"
-                                "translation unit again and comparing the object\n"
-                                "byte for byte. Unset or 0 is off, which is the\n"
+                                "translation unit again and comparing the objects.\n"
+                                "Byte for byte, except the timestamp every MSVC\n"
+                                "driver stamps into a COFF header -- which a cached\n"
+                                "object always carries an older copy of, so nothing\n"
+                                "on Windows could ever have verified without this.\n"
+                                "Unset or 0 is off, which is the\n"
                                 "default: a verified hit costs a whole compile.\n"
                                 "On a mismatch the FRESHLY compiled object is\n"
                                 "used and the key is named on stderr, whether or\n"

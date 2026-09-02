@@ -451,6 +451,72 @@ determinism rests on.
     is why the gate sets `print_suppressions=1` on **every** run, canary included,
     and prints ThreadSanitizer's own `Matched N suppressions` line.
 
+## A retry makes every one of these disappear without fixing it
+
+Six separate ways the gate reported something that was not about the tree under test
+turned up while fixing one ticket ([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)).
+Not one of them announced itself. Every one presented as an ordinary flake, and
+**a re-run would have cleared all five without fixing any of them** — which is the
+whole reason they are written down here rather than in that pull request.
+
+The specific traps are examples. The rule is the mechanism.
+
+- **`local-gate.sh | tail`** reports the *pipeline's* last stage, so a run whose log
+  ended in `GATE FAILED` came back as exit 0. Same shape as `producer | grep -q`
+  under `pipefail`, above. Capture the status into a variable first; print the log
+  after it.
+- **Quoting through three parsers.** PowerShell → `wsl` → `bash -lc` silently dropped
+  an escaped `$?`; the command collapsed, wrote no log, and exited 0. **A gate that
+  did not run is not a gate that passed** — and an absent log is indistinguishable
+  from a gate that produced nothing, unless you keep the log somewhere it survives.
+  Author the commands in a script file and run the file.
+- **Two gates in one build directory.** A run that had already *reported its verdict*
+  was still driving `ninja` when the next one started. This is the worst of the five,
+  because the reading belongs to *neither* tree and neither process can detect it:
+  from inside each one, everything looks entirely normal. `flock`, non-blocking —
+  queued, the incident becomes invisible, which is the same defect as the failure it
+  prevents.
+- **A dirty or moving tree.** CI reads a commit; a local gate reads whatever is on
+  disk as each phase touches it, so a long run can straddle an edit and different
+  phases can judge different trees. An accurate verdict about something nobody asked
+  about. Name the commit before starting, re-check it at the end, and refuse when the
+  tree is dirty.
+- **The log under `/tmp`.** `wsl -e bash` detaches, so a build outlives the wrapper
+  that reports on it — and the wrapper is what keeps the WSL session alive, so
+  *killing it to tidy up* starts an idle countdown that takes the VM, the orphaned
+  build and `/tmp` with it. Write the log to `/mnt/c`.
+- **The instrument edited while it was measuring.** bash reads a script incrementally,
+  from a byte offset, so editing the wrapper the gate was running re-ran its header
+  block and shifted an `exec 9>` redirect into a different path — and the run
+  continued **with no lock while reporting as though it held one**. A guard that
+  silently stopped guarding. Launch long-running scripts from an immutable per-run
+  copy.
+
+Two that are not about shells at all, and are the ones a reader is most likely to
+recognise in themselves:
+
+- **A finding fixed at the line rather than at the rule comes back.** clang-tidy
+  reported `bugprone-unchecked-optional-access` at two lines; the rule is "clang-tidy
+  cannot see that Catch2's `SKIP` does not return, so a bare dereference after one is
+  always this error". Fixing the two lines left the identical defect in the half of
+  the tree the report had not happened to name, and a refactor then moved the line
+  numbers so it did not resurface for two more gate cycles. Read a finding as a
+  statement about the tree, not as a list of locations.
+- **Presence is not usability.** A probe asks whether the tool *did the job*, never
+  whether it exists. A `clang-cl` with no MSVC SDK is on `PATH`, spawns perfectly and
+  can build nothing; so does a driver whose toolset was uninstalled under it. The
+  only question that survives is "did an object appear?" — which is the same lesson
+  `dist-compile-e2e.ps1` records for `Get-Command`, and the same one behind
+  `exitCode == NotSpawned` being a guard about *running*, not about *working*.
+
+The asymmetry is what justifies the cost. **Looking costs minutes; retrying turns a
+wrong reading into a permanent one**, because the evidence that something was off is
+gone and the next run starts clean. Every one above was caught only
+because something looked slightly wrong and got *looked at* rather than re-run — a
+log sitting at zero bytes for slightly too long, an output file containing a single
+backslash, an exit code disagreeing with its own log's last line, a finding
+reappearing that had supposedly been closed.
+
 ## A comment can be true in its premise and false in its conclusion
 
 `pr-labels.yml` carried this, and every word before the comma was correct:
