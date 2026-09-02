@@ -446,6 +446,21 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "intact and every record still verifies. These were reported as Corrupt until #296, "
               "which moved fastcached_write_errors_total and told operators their disk had failed.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FrameRequestDeadlineSweeps,
+      .prometheusName = "fastcache_frame_request_deadline_sweeps_total",
+      .help = "Connections swept before the peer named a verb. A peer counted here "
+              "connected and did not speak, so no honest client of this surface "
+              "appears in it. Never sum with answer_deadline: that one is a request "
+              "this node accepted outrunning its budget, this one is a knock at the "
+              "door.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FrameAnswerDeadlineSweeps,
+      .prometheusName = "fastcache_frame_answer_deadline_sweeps_total",
+      .help = "Connections swept after the peer named a verb, meaning the answer "
+              "outran the window that verb allows. For a compile that is a "
+              "translation unit outliving its lease grant, so a rise is a question "
+              "about the lease timeout rather than about this worker.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
