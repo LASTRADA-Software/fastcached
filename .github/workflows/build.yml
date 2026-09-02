@@ -449,6 +449,7 @@ jobs:
       # synthetic tree, before it is trusted — the same reason the sweep itself
       # canaries its binary before believing a clean result.
       - name: "Self-test the sweep's scope computation"
+        id: selftest
         run: scripts/tidy-sweep.sh --self-test
 
       # `--all` on the master PUSH only, and the queue diff-scopes like a pull
@@ -492,9 +493,9 @@ jobs:
           TIDY: clang-tidy-${{ env.CLANG_TOOLS_VERSION }}
           DB: out/build/clang-debug
           BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || format('origin/{0}', github.base_ref || 'master') }}
-        run: >-
-          scripts/tidy-sweep.sh
-          ${{ github.event_name == 'push' && '--all' || '' }}
+        run: |
+          echo "DEMO: forcing the sweep to fail so the report step's condition is exercised"
+          exit 1
 
       # The step above is now the ONLY full sweep, and a master push blocks
       # nothing and reaches nobody: every one of the last 30 master-push runs was
@@ -525,7 +526,7 @@ jobs:
       # idempotent, and it is tolerated failing so a missing label cannot swallow
       # the report it exists to carry.
       - name: "Report a full sweep that only master saw"
-        if: ${{ failure() && steps.sweep.conclusion == 'failure' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        if: ${{ failure() && steps.sweep.conclusion == 'failure' && github.event_name == 'pull_request' && github.ref != 'refs/heads/master' }}
         env:
           GH_TOKEN: ${{ github.token }}
           LABEL: "ci/master-sweep"
@@ -542,17 +543,25 @@ jobs:
           almost always the analyser drifting rather than any one change. Nothing
           is blocked by this, and the next pull request whose change escalates to a
           full sweep will fail for a reason that has nothing to do with it."
-          gh label create "$LABEL" --force \
-            --color B60205 \
-            --description "The full clang-tidy sweep is failing on master" || true
+          echo "DEMO: would run: gh label create $LABEL --force --color B60205"
+          echo "DEMO: the read below is REAL, so it proves GH_TOKEN and the query:"
           existing="$(gh issue list --state open --label "$LABEL" --limit 1 --json number --jq '.[0].number // empty')"
+          echo "DEMO: gh issue list returned existing='${existing}' (empty is expected: the label does not exist yet)"
           if [[ -n "$existing" ]]; then
-            echo "updating existing report #${existing}"
-            gh issue comment "$existing" --body "$body"
+            echo "DEMO: would run: gh issue comment $existing"
           else
-            echo "opening a new report"
-            gh issue create --title "$TITLE" --label "$LABEL" --body "$body"
+            echo "DEMO: would run: gh issue create --title '$TITLE' --label '$LABEL'"
           fi
+          echo "DEMO: --- the body it would carry ---"
+          printf '%s\n' "$body"
+
+      # DEMO negative control. Identical in shape to the step above but keyed on
+      # the SELF-TEST step, which passes. It must be SKIPPED. If it runs, then
+      # `failure()` is doing all the work and `steps.<id>.conclusion` is not
+      # discriminating -- which is the 18-firings-instead-of-1 defect.
+      - name: "DEMO negative control (must be skipped)"
+        if: ${{ failure() && steps.selftest.conclusion == 'failure' && github.event_name == 'pull_request' && github.ref != 'refs/heads/master' }}
+        run: echo "DEMO FAILURE - this step must never have run"
 
   # The other half of what used to be the clang-tidy job. The ctest run here is
   # load-bearing and is the reason this job exists rather than the tidy job
