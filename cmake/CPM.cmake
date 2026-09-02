@@ -42,11 +42,17 @@ get_filename_component(CPM_DOWNLOAD_LOCATION ${CPM_DOWNLOAD_LOCATION} ABSOLUTE)
 # download is believed to have finished; on a timeout it is the status that
 # carries the reason, so the failure names the transfer rather than the
 # consequence.
+#
+# Every argument is quoted, the destination included. A checkout or a
+# CPM_SOURCE_CACHE under a path containing a space -- routine on Windows, which
+# this project ships to -- otherwise splits into two arguments, and
+# `EXPECTED_HASH` lands in the wrong position: the configure then fails talking
+# about a hash when the problem is a path.
 file(DOWNLOAD
     "${CPM_DOWNLOAD_URL}"
-    ${CPM_DOWNLOAD_LOCATION}
-    EXPECTED_HASH SHA256=${CPM_HASH_SUM}
-    INACTIVITY_TIMEOUT ${FASTCACHED_FETCH_SILENCE_SECONDS}
+    "${CPM_DOWNLOAD_LOCATION}"
+    EXPECTED_HASH "SHA256=${CPM_HASH_SUM}"
+    INACTIVITY_TIMEOUT "${FASTCACHED_FETCH_SILENCE_SECONDS}"
     STATUS cpmDownloadStatus
 )
 # The status carries the reason, and the message repeats it rather than
@@ -67,4 +73,4 @@ if(NOT cpmDownloadCode EQUAL 0)
         "is what abandoned it and why.")
 endif()
 
-include(${CPM_DOWNLOAD_LOCATION})
+include("${CPM_DOWNLOAD_LOCATION}")

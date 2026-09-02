@@ -1807,6 +1807,14 @@ else()
             --source-dir "${CMAKE_SOURCE_DIR}"
             --git "${GIT_EXECUTABLE}"
             --cmake "${CMAKE_COMMAND}"
+            # The numbers as THIS TREE resolved them. They are cache variables,
+            # and a `cmake -P` probe has no cache -- so the guard reading the
+            # module on its own would always see the defaults, and would have
+            # reported "the bound is 120s" for a tree configured with
+            # -DFASTCACHED_FETCH_SILENCE_SECONDS=0, which is the one tree where
+            # the answer matters. Passed from here, where they are resolved.
+            --configured-window "${FASTCACHED_FETCH_SILENCE_SECONDS}"
+            --configured-floor "${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND}"
     )
     # 77 is this file's script-driven convention for "a prerequisite is
     # missing", which here means git or cmake could not be run at all. TIMEOUT

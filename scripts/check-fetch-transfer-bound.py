@@ -77,6 +77,35 @@ WINDOW_CEILING_SECONDS = 600
 # worse direction, and this is the only thing guarding it.
 FLOOR_CEILING_BYTES_PER_SECOND = 1024
 
+#: Where this project's own CMake lives. A list, because the alternative --
+#: walking everything and excluding build-directory names -- is a guess that
+#: fails the moment somebody configures into `build/` or puts a
+#: `CPM_SOURCE_CACHE` in the checkout.
+AUTHORED_CMAKE_PATHS = ("CMakeLists.txt", "cmake", "src", "packaging")
+
+#: Environment a child must not inherit, because every one of these can decide
+#: a verdict this guard is supposed to draw from the transport itself.
+AMBIENT_SETTINGS_TO_CLEAR = (
+    "GIT_HTTP_LOW_SPEED_LIMIT",
+    "GIT_HTTP_LOW_SPEED_TIME",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
+
+#: The same question at git's OTHER spelling.  `GIT_HTTP_LOW_SPEED_*` is the
+#: environment form; `http.lowSpeedLimit`/`http.lowSpeedTime` is the canonical
+#: one, and a developer with either in `~/.gitconfig` -- or a proxy -- would
+#: otherwise hand the control leg a bound this guard believes it removed.
+GIT_NEUTRALISING_CONFIG = [
+    "-c", "http.lowSpeedLimit=0",
+    "-c", "http.lowSpeedTime=0",
+    "-c", "http.proxy=",
+]
+
 #: What one run of a transport against the stall did.  ``ended`` is the whole
 #: verdict; the rest is the evidence a reader needs when it disagrees with what
 #: was expected.
@@ -123,7 +152,7 @@ WIRING_ROWS = [
     ),
     Wiring(
         path=os.path.join("cmake", "CPM.cmake"),
-        needle="INACTIVITY_TIMEOUT ${FASTCACHED_FETCH_SILENCE_SECONDS}",
+        needle='INACTIVITY_TIMEOUT "${FASTCACHED_FETCH_SILENCE_SECONDS}"',
         before=None,
         why="the bootstrap download would carry a number of its own, and the tree "
         "would state one policy in two places",
@@ -205,10 +234,13 @@ def start_against_stall(command, environment, workdir):
     findings are collected after every leg has been waited on.
     """
     child_environment = dict(os.environ)
-    # Whatever the developer or CI has set for these must not decide the
-    # verdict: the control leg has to be genuinely unbounded, and the bounded
-    # leg has to be bounded by the values under test.
-    for name in ("GIT_HTTP_LOW_SPEED_LIMIT", "GIT_HTTP_LOW_SPEED_TIME"):
+    # Whatever the developer or CI has set must not decide the verdict: the
+    # control leg has to be genuinely unbounded, and the bounded leg has to be
+    # bounded by the values under test.  A proxy is the sharper of the two --
+    # with one configured the clone never reaches 127.0.0.1 at all, and a proxy
+    # error ends the control leg instantly, which this guard would report as
+    # "the stall is not a stall": the instrument blaming the subject.
+    for name in AMBIENT_SETTINGS_TO_CLEAR:
         child_environment.pop(name, None)
     child_environment.update(environment)
     child_environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -306,16 +338,28 @@ def check_downloads_are_bounded(source_dir):
     it cannot include the module that states this one -- and that accepted
     duplicate is exactly the thing that goes quietly wrong. A THIRD download
     added anywhere, by anyone, is caught by the same row.
+
+    The scan covers the directories this project AUTHORS, listed rather than
+    derived by excluding build-directory names: a build tree configured
+    anywhere inside the checkout, or an in-tree `CPM_SOURCE_CACHE`, drops
+    third-party CMake into scope, and failing this project's guard for
+    somebody else's `file(DOWNLOAD)` is a check nobody can satisfy.
     """
     violations = []
-    for root, directories, files in os.walk(source_dir):
-        directories[:] = [
-            d for d in directories if not d.startswith(".") and d not in ("out",)
-        ]
-        for name in files:
-            if name != "CMakeLists.txt" and not name.endswith(".cmake"):
-                continue
-            path = os.path.join(root, name)
+    for relative in AUTHORED_CMAKE_PATHS:
+        base = os.path.join(source_dir, relative)
+        if os.path.isfile(base):
+            candidates = [base]
+        elif os.path.isdir(base):
+            candidates = [
+                os.path.join(root, name)
+                for root, _, files in os.walk(base)
+                for name in files
+                if name == "CMakeLists.txt" or name.endswith(".cmake")
+            ]
+        else:
+            continue
+        for path in candidates:
             body = strip_cmake_comments(read_text(path))
             for match in re.finditer(r"file\s*\(\s*DOWNLOAD", body):
                 depth, end = 0, len(body)
@@ -328,13 +372,23 @@ def check_downloads_are_bounded(source_dir):
                             end = index
                             break
                 call = body[match.start() : end]
-                if "INACTIVITY_TIMEOUT" not in call:
-                    line = body.count("\n", 0, match.start()) + 1
+                where = "%s (non-comment line %d)" % (
+                    os.path.relpath(path, source_dir).replace("\\", "/"),
+                    body.count("\n", 0, match.start()) + 1,
+                )
+                # The VALUE, not only the token. Zero is how CMake spells *no
+                # bound*, so a call carrying `INACTIVITY_TIMEOUT 0` satisfies
+                # every structural reading of this rule and reinstates #526.
+                bound = re.search(r"INACTIVITY_TIMEOUT\s+\"?([^\s\")]+)", call)
+                if bound is None:
                     violations.append(
-                        "%s (non-comment line %d): a file(DOWNLOAD) with no "
-                        "INACTIVITY_TIMEOUT -- a stalled response hangs the configure "
-                        "forever, which is #526"
-                        % (os.path.relpath(path, source_dir).replace("\\", "/"), line)
+                        "%s: a file(DOWNLOAD) with no INACTIVITY_TIMEOUT -- a stalled "
+                        "response hangs the configure forever, which is #526" % where
+                    )
+                elif bound.group(1).isdigit() and int(bound.group(1)) == 0:
+                    violations.append(
+                        "%s: a file(DOWNLOAD) whose INACTIVITY_TIMEOUT is 0, which is "
+                        "how CMake spells no bound at all" % where
                     )
     return violations
 
@@ -389,7 +443,7 @@ def build_legs(arguments, url, workspace, window, floor):
             )
         return path
 
-    clone = [arguments.git, "clone", url, "clone-dir"]
+    clone = [arguments.git] + GIT_NEUTRALISING_CONFIG + ["clone", url, "clone-dir"]
     return [
         Leg(
             label="git",
@@ -481,17 +535,20 @@ def run_transports(arguments, stall, workspace, window, floor):
                 "bound is not reaching it.\n%s"
                 % (leg.label, patience, window, bounded.output)
             )
-        elif bounded.code == 0:
-            failures.append(
-                "bounded %s ended after %.1fs but reported SUCCESS against a server "
-                "that sent nothing.\n%s"
-                % (leg.label, bounded.seconds, bounded.output)
-            )
+        # The OUTPUT is the verdict, and the exit code is only evidence. A
+        # `cmake -P` leg reports its refusal through message(FATAL_ERROR),
+        # whose exit status this repository has recorded as differing between
+        # CMake versions -- so a check that read the status could call a
+        # correct refusal a success on some minimum-version machine and pass on
+        # others, which is the worst available split. Measured here: WSL CMake
+        # 3.28.3 exits 1 and 4.3.1 exits 1, both against a real stall; the
+        # ordering below means it would not have mattered either way.
         elif not leg.refusal.search(bounded.output):
             failures.append(
                 "bounded %s ended after %.1fs (rc=%s) but its message names no "
-                "transfer refusal, so an operator cannot tell this from an unrelated "
-                "failure.\n%s"
+                "transfer refusal -- against a server that sent nothing, that is "
+                "either a success or a failure an operator cannot tell from an "
+                "unrelated one.\n%s"
                 % (leg.label, bounded.seconds, bounded.code, bounded.output)
             )
         else:
@@ -514,8 +571,32 @@ def stall_url(stall):
 
 
 def read_shipped_numbers(arguments, workspace):
-    """The shipped window and floor, or complaints saying why there are none."""
-    table = read_shipped_bound(arguments.cmake, arguments.source_dir, workspace)
+    """The window and floor THIS TREE will use, or why there are none.
+
+    The values come from the build tree when it passed them
+    (``--configured-window``/``--configured-floor``, filled in by
+    `src/tests/CMakeLists.txt` where they are resolved against `CMakeCache.txt`)
+    and from the module otherwise. That distinction is the whole point: the
+    module's numbers are CACHE variables, and a `cmake -P` has no cache, so a
+    probe alone always reads the defaults -- it would have reported "shipped
+    window is 120s" for a tree configured with `-DFASTCACHED_FETCH_SILENCE_SECONDS=0`,
+    which is the one tree where the answer matters.
+
+    The probe still runs, because it is what asserts the DELIVERY CHANNEL: that
+    including the module puts these two names into the environment at all.
+    """
+    exported = read_shipped_bound(arguments.cmake, arguments.source_dir, workspace)
+    source = "the module's defaults"
+    table = dict(exported)
+    if arguments.configured_window or arguments.configured_floor:
+        source = "this build tree"
+        table["GIT_HTTP_LOW_SPEED_TIME"] = arguments.configured_window
+        table["GIT_HTTP_LOW_SPEED_LIMIT"] = arguments.configured_floor
+    missing = [
+        name
+        for name in ("GIT_HTTP_LOW_SPEED_TIME", "GIT_HTTP_LOW_SPEED_LIMIT")
+        if not exported.get(name)
+    ]
     window, window_complaint = check_number(
         "GIT_HTTP_LOW_SPEED_TIME",
         table.get("GIT_HTTP_LOW_SPEED_TIME", ""),
@@ -534,7 +615,13 @@ def read_shipped_numbers(arguments, workspace):
         "broken build",
     )
     complaints = [c for c in (window_complaint, floor_complaint) if c]
-    return window, floor, complaints
+    if missing:
+        complaints.append(
+            "including cmake/FetchTransferBound.cmake leaves %s unset, so the module "
+            "no longer delivers the bound to git at all"
+            % " and ".join(sorted(missing))
+        )
+    return window, floor, complaints, source
 
 
 def main():
@@ -564,22 +651,44 @@ def main():
         help="run the bounded legs at the shipped window rather than a compressed "
         "one; slow by construction",
     )
+    parser.add_argument(
+        "--configured-window",
+        default="",
+        help="FASTCACHED_FETCH_SILENCE_SECONDS as THIS BUILD TREE resolved it; "
+        "passed by the ctest registration, because a `cmake -P` probe has no cache "
+        "and would always read the module's default instead",
+    )
+    parser.add_argument(
+        "--configured-floor",
+        default="",
+        help="FASTCACHED_FETCH_MIN_BYTES_PER_SECOND as this build tree resolved it",
+    )
     arguments = parser.parse_args()
 
-    for name, tool in (("git", arguments.git), ("cmake", arguments.cmake)):
-        if shutil.which(tool) is None:
-            print("SKIP: %s was not found, so this guard cannot run" % name)
-            return SKIP
-
+    # The static halves are pure file reads and answer for the TREE, so they run
+    # before anything can skip. Losing them behind a missing git would take the
+    # "no download in this tree is left unbounded" assertion with it, silently,
+    # behind a green Skipped -- skipped is not passed.
     failures = check_wiring(arguments.source_dir)
     failures += check_downloads_are_bounded(arguments.source_dir)
     notes = []
     exercised = shipped = None
+    source = None
+
+    for name, tool in (("git", arguments.git), ("cmake", arguments.cmake)):
+        if shutil.which(tool) is None:
+            if failures:
+                return report(failures, notes, None)
+            print(
+                "SKIP: the tree's wiring is intact, but %s was not found, so no "
+                "transport could be watched refusing a stall" % name
+            )
+            return SKIP
 
     workspace = tempfile.mkdtemp(prefix="fetch-transfer-bound-")
     stall = Stall()
     try:
-        shipped, floor, complaints = read_shipped_numbers(arguments, workspace)
+        shipped, floor, complaints, source = read_shipped_numbers(arguments, workspace)
         failures += complaints
         if shipped is not None and floor is not None:
             exercised = shipped if arguments.full else arguments.window
@@ -610,6 +719,17 @@ def main():
         stall.close()
         shutil.rmtree(workspace, ignore_errors=True)
 
+    return report(failures, notes, (exercised, shipped, source, arguments.full))
+
+
+def report(failures, notes, verdict):
+    """Print the evidence, then the verdict. Returns the exit code.
+
+    The verdict names the window that was actually exercised AND the window the
+    bound is set to, because they differ by default: quoting one for the other
+    is the failure this project has already paid for once, and a figure that
+    states its own conditions is what prevents it.
+    """
     for note in notes:
         print("  " + note)
     if failures:
@@ -620,10 +740,11 @@ def main():
         print("fetch-transfer-bound: %d of the guard's assertions failed" % len(failures))
         return 1
 
+    exercised, configured, source, full = verdict
     print(
-        "fetch-transfer-bound: both transports refuse a stalled transfer; window "
-        "exercised was %ds%s, shipped window is %ds"
-        % (exercised, "" if arguments.full else " (compressed)", shipped)
+        "fetch-transfer-bound: both transports refuse a stalled transfer. Window "
+        "exercised: %ds%s. Window in force per %s: %ds."
+        % (exercised, "" if full else " (compressed)", source, configured)
     )
     return 0
 

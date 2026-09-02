@@ -124,5 +124,29 @@ set(FASTCACHED_FETCH_SILENCE_SECONDS 120 CACHE STRING
 set(FASTCACHED_FETCH_MIN_BYTES_PER_SECOND 1 CACHE STRING
     "Bytes/second below which a dependency transfer counts as delivering nothing")
 
+# Both values are refused unless they are positive integers, and the reason is
+# that the two ways of getting this wrong are both SILENT.
+#
+# Empty is the louder half and still unhelpful: `INACTIVITY_TIMEOUT ${empty}`
+# collapses the bootstrap's argument list, and the configure dies inside CPM
+# with a CMake argument error naming neither the setting nor the cause.
+#
+# Zero is the dangerous half. It is how BOTH transports spell *no bound*, so
+# `-DFASTCACHED_FETCH_SILENCE_SECONDS=0` restores #526 exactly while every
+# structural check still sees a bound being passed -- the token is there, the
+# wiring is there, and the number disarms it. A setting whose zero means "off"
+# has to say so or refuse it, and there is nothing here that "off" is for.
+foreach(fetchBoundSetting
+        FASTCACHED_FETCH_SILENCE_SECONDS
+        FASTCACHED_FETCH_MIN_BYTES_PER_SECOND)
+    if(NOT "${${fetchBoundSetting}}" MATCHES "^[0-9]+$" OR "${${fetchBoundSetting}}" EQUAL 0)
+        message(FATAL_ERROR
+            "${fetchBoundSetting}=\"${${fetchBoundSetting}}\" is not a positive integer. "
+            "It bounds how long a stalled dependency fetch is waited on; zero and empty "
+            "both mean no bound at all, which is the defect this file exists to close "
+            "(#526). Raise it rather than clearing it.")
+    endif()
+endforeach()
+
 set(ENV{GIT_HTTP_LOW_SPEED_LIMIT} "${FASTCACHED_FETCH_MIN_BYTES_PER_SECOND}")
 set(ENV{GIT_HTTP_LOW_SPEED_TIME} "${FASTCACHED_FETCH_SILENCE_SECONDS}")
