@@ -130,11 +130,16 @@ which node that is:
 
 ```sh
 fastcache-compile-node \
-    --serve-scheduler --listen-node=0.0.0.0:6675 --fleet-open \
+    --serve-scheduler --listen-node=0.0.0.0:6675 \
+    --fleet-open --cluster-key-file=/etc/fastcached/cluster.key \
     --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6674 \
     --toolchain=/usr/bin/g++
 ```
+
+`--cluster-key-file` is not optional here: `--fleet-open` over a bind that faces the
+network is a node that would compile for anybody who can reach the port, and without
+the key it cannot check the lease a client presents. That is a startup refusal.
 
 One of `--fleet-member` or `--fleet-open` is required: a scheduler with no member
 list refuses every caller, which is the right default and not a working
@@ -145,10 +150,25 @@ A worker, on each machine that should take work:
 ```sh
 fastcache-compile-node \
     --scheduler=build-cache.internal:6675 \
+    --listen-node=0.0.0.0:6674 \
     --advertise=worker-01.internal:6674 \
-    --fleet-open \
+    --fleet-open --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
+
+**`--listen-node` and `--advertise` are typed together or neither is worth
+anything.** A bare `--listen-node` binds **loopback** on a worker, so naming only
+`--advertise` tells peers to dial an address this node never accepts on; and naming
+only `--listen-node=0.0.0.0:6674` advertises the wildcard, which resolves to the
+*caller's* machine. Both are refused at startup by name; so, since
+[#463](https://github.com/LASTRADA-Software/fastcached/issues/463), is naming
+neither while `--scheduler` points at another machine. Whichever you got wrong, the
+refusal names the flag and a working value.
+
+All three refusals are scoped to a node that names a membership flag, because that
+is what says peers are meant to dial this worker at all. Without one, the worker
+admits its own machine and refuses every dispatched compile — a different problem,
+which the startup line reports rather than this table.
 
 **A worker needs a membership flag too**, and that is the half most easily
 missed: the same `--fleet-member` / `--fleet-open` policy gates this node's
@@ -175,8 +195,36 @@ The scheduler hands your string to clients **verbatim**. A worker that
 advertises `127.0.0.1` is leased and then never answers, and the symptom is a
 build that mysteriously falls back to local compiles on every machine but one.
 
-It defaults to `--listen-node`, which is correct only when that already
-name an address other machines can reach.
+It defaults to `--listen-node`, which is correct only when that already names an
+address other machines can reach.
+
+### Why a fleet worker still has to widen `--listen-node` by hand
+
+`--serve-scheduler` moves a bare port to the wildcard; `--scheduler`,
+`--fleet-member` and `--fleet-open` do not, and
+[#463](https://github.com/LASTRADA-Software/fastcached/issues/463) asked whether they
+should. They do not, for four reasons:
+
+- **It would save one flag, and only after three others.** Widening the bind is what
+  makes the compile verbs face the network, so `--cluster-key-file` becomes required;
+  and the widened bind becomes the advertised endpoint, so `--advertise` becomes
+  required too. A fleet worker still names four flags either way.
+- **It would silence the message that teaches.** The refusal you get today for naming
+  `--advertise` and leaving the bind alone *is* the fix, spelled out, while you are
+  watching.
+- **A defaulted `--listen-node` whose port is already held is a warning, not fatal**
+  (see the table above). Today a fleet worker types that address, so a collision stops
+  the node. Under a widened default the fleet-facing case would land on the warning
+  path — no `0xFC` port, still registering, still leased, answering nothing.
+- **A listening socket that widened itself on a predicate over three flags is a
+  security decision nobody typed.** The cache verbs would stay closed —
+  `CacheResponder` admits this machine alone whatever the bind is — but that is a
+  property of today's responder set, not a promise about what is served there next.
+
+What the ticket *did* find is that a worker naming neither flag — and naming a
+membership flag and a `--scheduler` on another machine — was refused by nothing at a
+hand start, while `--install-service` refused the same command line. That is now a
+startup refusal as well.
 
 ## Anything the fleet reads has to be text
 
