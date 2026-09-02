@@ -2097,6 +2097,26 @@ feature working, right up until the first pull request enters the queue.
   nothing reports at all. On that same commit `Linux-*` and `Windows-*` came back
   `success`, because those are gated on their steps for exactly that reason. One
   hangs, one passes; the difference is the matrix.
+- **And the converse, which is worse: a GREEN required context is not evidence that
+  anything ran.** The bullet above ends at the skip. Finish the thought, because the
+  two errors point the same way and an audit by conclusion is therefore wrong twice
+  over. Measured on the docs-only #585 (run `33688370443`): `Linux-clang-release`,
+  `Linux-gcc-release`, `Windows-cl-release`, `Windows-cl-debug` and
+  `Windows-clangcl-release` all reported **`success`** in **3-9 seconds each**, with
+  every step inside them skipped — `actions/checkout` included, so not one of them
+  even had the tree. The whole run was about **38 runner-seconds**. Nothing was
+  compiled, nothing was tested, and five required contexts went green saying so to
+  nobody.
+
+  That is the anti-hang design working exactly as intended and is not a defect: a
+  matrix job must not be skipped at the job level, so `linux` and `windows` are
+  gated `if: !cancelled()` with all ten of their steps gated on the scope instead.
+  The defect is only ever in the READING. A skip at least looks unusual in the UI
+  and invites a second glance; a green check looks precisely like the thing you
+  wanted, so the wrong conclusion is the comfortable one. **The only discriminator
+  is opening the job and reading its step list** — `conclusion` cannot carry this,
+  in either direction, and no count of green contexts can either. Ask "did CI
+  exercise this change" of the steps, never of the checks.
 - **So a dependency's failure must not be allowed to skip a required gate.**
   `apply` is skipped inside a queue — there is no pull request to label — and a
   skipped dependency skips its dependents by default, which by the above is not a
