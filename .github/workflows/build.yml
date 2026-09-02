@@ -585,28 +585,50 @@ jobs:
           almost always the analyser drifting rather than any one change. Nothing
           is blocked by this, and the next pull request whose change escalates to a
           full sweep will fail for a reason that has nothing to do with it."
-          # NOT `--search`, and that is the whole reason this reads by label and
-          # matches by title rather than searching for the title. `--search` goes
-          # through GitHub's issue search INDEX, which lags creation by seconds to
-          # minutes — so two master pushes failing inside that window would each
-          # find nothing and each open an issue, which is the noise this step
-          # exists to avoid. A plain `--label` listing is the directly-consistent
-          # REST endpoint: the second push sees what the first just opened.
+          # NOT `--search`, and that is the whole reason this lists and matches by
+          # title rather than searching for the title. `--search` goes through
+          # GitHub's issue search INDEX, which lags creation by seconds to minutes
+          # — so two master pushes failing inside that window would each find
+          # nothing and each open an issue, which is the noise this step exists to
+          # avoid. A plain `gh issue list` reads the repository's issue connection
+          # directly rather than the index, so the second push sees what the first
+          # just opened.
           #
-          # The labels narrow it (7 open issues carry both today) and the exact
-          # title decides it, because `--label` cannot be exact about which issue
-          # this is. `$ENV.TITLE` rather than the title spliced into the jq
-          # program, so no quoting in a title anyone rewords later can turn the
-          # lookup into a syntax error and every later failure into a second issue.
-          existing="$(gh issue list --state open \
-                      --label type/bug --label area/build \
-                      --limit 200 --json number,title \
-                      --jq '[.[] | select(.title == $ENV.TITLE) | .number] | first // empty')"
+          # That connection is GRAPHQL — `gh issue list` is not a REST call, which
+          # this comment claimed until the error message said otherwise. It does
+          # not change the consistency argument, which is about the index and not
+          # about the transport, but it is a different rate-limit budget from the
+          # `gh api` calls elsewhere in this repository and a reader chasing a
+          # failure here should know which one it spends.
+          #
+          # It lists every OPEN issue and is deliberately NOT narrowed by the
+          # labels this step applies. Narrowing by them was the first shape and it
+          # made the dedup depend on labels nobody promised to keep — this step
+          # invites a human to touch them by applying `status/needs-triage`, and a
+          # triager re-areaing the report (clang-tidy drift is arguably not
+          # `area/build`) would make the next failure miss the open issue and open
+          # a second one. The exact title decides it; the labels are for the
+          # humans. 161 open issues today against a 500 cap, and when the listing
+          # comes back AT the cap it says so rather than silently vouching for a
+          # set it did not see.
+          #
+          # `$ENV.TITLE` rather than the title spliced into the jq program, so no
+          # quoting in a title anyone rewords later can turn the lookup into a
+          # syntax error and every later failure into a second issue.
+          limit=500
+          found="$(gh issue list --state open --limit "$limit" --json number,title \
+                   --jq '(length | tostring) + "\t"
+                         + ([.[] | select(.title == $ENV.TITLE) | .number] | first // "" | tostring)')"
+          seen="${found%%$'\t'*}"
+          existing="${found#*$'\t'}"
+          if [[ "$seen" -ge "$limit" ]]; then
+            echo "::warning::the open-issue listing hit its ${limit} cap; a duplicate report may be opened"
+          fi
           if [[ -n "$existing" ]]; then
-            echo "updating existing report #${existing}"
+            echo "updating existing report #${existing} (searched ${seen} open issues)"
             gh issue comment "$existing" --body "$body"
           else
-            echo "opening a new report"
+            echo "opening a new report (searched ${seen} open issues, no title match)"
             gh issue create --title "$TITLE" --body "$body" \
               --label type/bug --label area/build --label status/needs-triage
           fi

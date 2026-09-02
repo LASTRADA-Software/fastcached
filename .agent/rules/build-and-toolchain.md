@@ -1054,13 +1054,35 @@ makes it anyway and says so there.
   translation units — the failure `tidy-sweep.sh` exists to prevent one level down,
   reached one level up. Delete the report step and the full sweep still runs, still
   fails and still reaches nobody. So the check reads the workflow for four things:
-  that `--all` is passed and passed on `push` (and by naming that event rather than
-  negating another, which is the shape that silently re-widens when a fifth trigger
-  is added), that a queue entry diffs against its own `base_sha`, that some step
-  reads the sweep STEP's conclusion for `refs/heads/master`, and that the job grants
-  the `issues: write` without which that reader is decorative. Each is driven red on
-  a synthetic workflow by `--self-test`, in both directions, because a guard nobody
-  has seen bite is a guard that has told you nothing.
+  that `--all` is passed, and that its guard **EXCLUDES the two diff-scoped events**
+  rather than NAMING the event that gets the full sweep; that a queue entry diffs
+  against its own `base_sha`; that some step reads the sweep STEP's conclusion for
+  `refs/heads/master`; and that the job grants the `issues: write` without which
+  that reader is decorative.
+
+  The first of those is a spelling, and the spelling is the whole rule.
+  `event_name == 'push'` and `event_name != 'pull_request' && event_name !=
+  'merge_group'` select the same events today and fall opposite ways tomorrow: a
+  trigger added to `on:` later diff-scopes under the first and sweeps everything
+  under the second, and on master a diff-scoped run has an EMPTY diff, so
+  `tidy-sweep.sh` prints `no source changed` and exits 0 having analysed nothing.
+  Narrowing silently is the failure; re-widening is merely slow. The check
+  therefore refuses the inclusive spelling outright — this paragraph said the
+  reverse until the review caught it, which is worth leaving recorded, because an
+  agent reading this file before touching the area would have rewritten the guard
+  on its authority and been failed by the check.
+
+  Each rule is driven red on a GENERATED workflow by `--self-test`, in both
+  directions, because a guard nobody has seen bite has told you nothing. Generated
+  rather than sed-edited: the first shape edited a correct fragment with
+  `/pat/,+2d`, a GNU extension BSD sed rejects, and checked no exit status — so on
+  macOS the edit failed, the fragment came out empty, the check failed because
+  there was no workflow at all, and the case printed `ok` for a break it had never
+  staged. Every case now also asserts its fragment DIFFERS from the correct one, so
+  a knob that does nothing fails instead of passing. Two cases run the other way and
+  assert a pure REFLOW is not read as a deletion — the `run:` block collapsed to one
+  line, the reader's `if:` wrapped as a folded scalar — because a red build accusing
+  an author of deleting the sweep they only reformatted is worse than no check.
 
   **The residual is narrower than it first reads, and the narrowing is the part that
   matters.** A clang-tidy finding depends on a translation unit's own sources and its
