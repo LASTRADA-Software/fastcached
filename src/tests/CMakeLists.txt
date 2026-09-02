@@ -227,6 +227,13 @@ set_tests_properties("glob-traversals" PROPERTIES
 # its REAL line -- CMake's list grouping merges lines, and this check once named line
 # 217 for a call at line 307.
 #
+# The unbalanced brackets in this comment block are DELIBERATE and load-bearing. One of
+# them caught `check-target-file-guards.cmake` reading this file through a splitter that
+# escaped `;` and ignored brackets: that check then saw none of this file's 25
+# `$<TARGET_FILE:>` references and refused as vacuous rather than passing over a file it
+# could no longer read. Do not "tidy" them away -- they are what exercises that splitter,
+# and they cost nothing now that it is fixed.
+#
 # The last two cases exist because the check got them wrong while it was written, which
 # is the best reason a case can have.
 add_test(
