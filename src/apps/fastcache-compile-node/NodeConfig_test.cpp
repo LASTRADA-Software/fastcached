@@ -5,6 +5,9 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -16,12 +19,16 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <optional>
 #include <ranges>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -2648,4 +2655,208 @@ TEST_CASE("NodeConfig: a registration for a worker given no file names none", "[
 
     CHECK(std::ranges::none_of(spec.arguments, [](auto const& argument) { return argument.starts_with("--config="); }));
     CHECK(spec.configPath.empty());
+}
+
+namespace
+{
+
+/// Write @p body to a configuration file this case owns.
+/// @param dir Scratch directory.
+/// @param body YAML text.
+/// @return The path written.
+[[nodiscard]] std::filesystem::path WriteNodeConfigFile(std::filesystem::path const& dir, std::string_view body)
+{
+    std::filesystem::create_directories(dir);
+    auto const path = dir / "node.yaml";
+    std::ofstream out { path, std::ios::binary | std::ios::trunc };
+    out << body;
+    return path;
+}
+
+/// Read @p path into a fresh configuration, exactly as a reload does.
+///
+/// A FRESH configuration, never the live one, and an empty argv -- the "no command
+/// line to outrank the file" case. Deliberately the same recipe `main` wires into its
+/// reloader: writing a different one here would let these cases pass while production
+/// reloaded some other way.
+/// @param path The configuration file.
+/// @return The candidate, or why it could not be read.
+[[nodiscard]] std::expected<NodeConfig, ConfigError> ReparseNodeConfig(std::filesystem::path const& path)
+{
+    NodeConfig candidate;
+    auto const loaded = ReadYamlSettings(path).and_then([&candidate, &path](std::vector<YamlSetting> const& settings) {
+        return ApplyNodeConfiguration(settings, path, {}, candidate);
+    });
+    if (!loaded.has_value())
+        return std::unexpected(loaded.error());
+    return candidate;
+}
+
+/// A reloader over @p initial reading @p path, wired as `main` wires one.
+/// @param initial What the worker is running with.
+/// @param path The configuration file.
+/// @return The reloader.
+[[nodiscard]] ConfigReloaderOf<NodeConfig> MakeNodeReloader(NodeConfig initial, std::filesystem::path const& path)
+{
+    return ConfigReloaderOf<NodeConfig> { std::move(initial), path, &ReparseNodeConfig, &ValidateNodeReloadable };
+}
+
+} // namespace
+
+TEST_CASE("A reloadable setting reaches the SUBSYSTEM, not just the snapshot", "[node][config][reload]")
+{
+    // **The case that decides whether the column means anything** (#292).
+    //
+    // `--log-level` is marked `Reloadable::Yes` because `ILogger::SetMinLevel` exists.
+    // That is a fact about the CODE, verified by hand, and the column does not create
+    // it -- it records it. A row marked `Yes` whose subsystem does not honour the field
+    // is not a policy mistake, it is a LIE about the code, and it produces exactly the
+    // failure `Reloadable::No` exists to prevent: a published snapshot the running
+    // process disagrees with.
+    //
+    // So this asserts on what the LOGGER emits, never on `reloader.Current()`. A case
+    // that read the value back out of the snapshot would pass for a row that changes
+    // nothing at all, which is the whole defect.
+    Testing::ScratchDirectory const scratch { "node-reload-live" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "log_level: error\n");
+
+    NodeConfig initial;
+    initial.logLevel = LogLevel::Info;
+
+    std::ostringstream sink;
+    ConsoleLogger logger { sink, initial.logLevel, LogTimestamps::No };
+
+    logger.Logf(LogLevel::Info, "before the reload");
+    REQUIRE(sink.str().contains("before the reload"));
+
+    auto reloader = MakeNodeReloader(initial, path);
+    REQUIRE(reloader.Reload().has_value());
+
+    // The one line `main` performs on a successful reload.
+    logger.SetMinLevel(reloader.Current()->logLevel);
+
+    // The same call is now BELOW the threshold and must produce nothing. This is the
+    // subsystem's observable behaviour, and it is the only thing that can tell a
+    // reloadable row from one that merely claims to be.
+    sink.str({});
+    logger.Logf(LogLevel::Info, "after the reload");
+    CHECK(sink.str().empty());
+
+    // And the level it was raised TO is in force, not merely "not Info".
+    logger.Logf(LogLevel::Error, "an error survives");
+    CHECK(sink.str().contains("an error survives"));
+}
+
+TEST_CASE("An unreloadable setting that changed is reported, and nothing is applied", "[node][config][reload]")
+{
+    // The other arm. `--slots` is live-wired: the worker advertised a slot count to the
+    // scheduler and sized a pool from it, so a reload changing it would leave the
+    // scheduler dispatching against a number this worker no longer serves -- which is
+    // the argument `main.cpp`'s SIGHUP comment used to give for handling no reload at
+    // all, restated as the reason this row is not marked.
+    Testing::ScratchDirectory const scratch { "node-reload-refused" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "slots: 9\n");
+
+    NodeConfig initial;
+    initial.slots = 4;
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const outcome = reloader.Reload();
+
+    REQUIRE_FALSE(outcome.has_value());
+    CHECK(outcome.error().code == ConfigErrorCode::ImmutableChanged);
+    // Named, because "reload failed" sends an operator reading logs rather than the one
+    // line that says which setting, and what happened as a result.
+    CHECK(outcome.error().context.contains("--slots"));
+    CHECK(outcome.error().context.contains("nothing was applied"));
+
+    CHECK(reloader.Current()->slots == 4);
+}
+
+TEST_CASE("One save touching both is refused whole, and names every unreloadable field", "[node][config][reload]")
+{
+    // **The case that decides reject-all is real.** The issue's two clauses are each
+    // single-field, so both are satisfied by either semantics; only a save touching a
+    // reloadable AND an unreloadable field distinguishes them. Partial application
+    // would leave the file and the running process disagreeing field by field, with no
+    // single artefact describing what is in force -- and the operator saved ONCE.
+    Testing::ScratchDirectory const scratch { "node-reload-mixed" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "log_level: error\nslots: 9\nnode_class: dedicated\n");
+
+    NodeConfig initial;
+    initial.logLevel = LogLevel::Info;
+    initial.slots = 4;
+
+    auto reloader = MakeNodeReloader(initial, path);
+    REQUIRE_FALSE(reloader.Reload().has_value());
+
+    // The reloadable half did NOT sneak through. This assertion is the one that fails
+    // under apply-the-reloadable-and-report-the-rest.
+    CHECK(reloader.Current()->logLevel == LogLevel::Info);
+    CHECK(reloader.Current()->slots == 4);
+
+    // And EVERY unreloadable field that changed is named, never the first: a refusal
+    // that stopped at one sends the operator round the same loop per field.
+    auto const candidate = ReparseNodeConfig(path);
+    REQUIRE(candidate.has_value());
+    auto const changed = UnreloadableChanges(*reloader.Current(), *candidate);
+    CHECK(std::ranges::contains(changed, std::string_view { "--slots" }));
+    CHECK(std::ranges::contains(changed, std::string_view { "--node-class" }));
+    // The reloadable one is absent from the refusal, or the report would tell an
+    // operator to restart for something that did not need it.
+    CHECK_FALSE(std::ranges::contains(changed, std::string_view { "--log-level" }));
+}
+
+TEST_CASE("A file that fails halfway is declined, never half-applied", "[node][config][reload]")
+{
+    // The clause nobody would think to write. A document whose first key is good and
+    // whose second is not must leave the worker running what it had -- not "some of the
+    // settings, up to the bad line", which is a configuration nobody wrote.
+    //
+    // It holds by CONSTRUCTION rather than by a guard: the reparse builds a fresh
+    // NodeConfig and returns it only on success, so a partial application is discarded
+    // with the candidate. That is why this asserts the live snapshot rather than a
+    // rejection path -- there is no guard here that could later be removed.
+    Testing::ScratchDirectory const scratch { "node-reload-halfparse" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "log_level: error\nslots: not-a-number\n");
+
+    NodeConfig initial;
+    initial.logLevel = LogLevel::Info;
+    initial.slots = 4;
+
+    auto reloader = MakeNodeReloader(initial, path);
+    REQUIRE_FALSE(reloader.Reload().has_value());
+
+    // The GOOD key that preceded the bad one is not in force either.
+    CHECK(reloader.Current()->logLevel == LogLevel::Info);
+    CHECK(reloader.Current()->slots == 4);
+}
+
+TEST_CASE("Every reloadable row is one the option table can actually compare", "[node][config][reload]")
+{
+    // A row marked `Reloadable::Yes` with no comparator would be skipped by
+    // `UnreloadableChanges` for the wrong reason -- not because it may change, but
+    // because nothing can tell whether it did. The static_assert beside the table
+    // forbids that shape already; this states the property the reload path depends on,
+    // so a reader of the reload code need not go and find that assertion.
+    //
+    // Derived from the table, never restated: a row added tomorrow is covered.
+    std::vector<OptionSpec<NodeConfig> const*> reloadable;
+    for (auto const& spec: NodeOptions())
+        if (spec.reloadable == Reloadable::Yes)
+            reloadable.push_back(&spec);
+
+    // Not vacuous. Nothing being reloadable would satisfy every other case here, and
+    // this is what fails if the one marked row is ever unmarked.
+    REQUIRE(!reloadable.empty());
+    for (auto const* spec: reloadable)
+    {
+        INFO("flag: " << spec->primary);
+        CHECK(spec->same != nullptr);
+        CHECK_FALSE(spec->yamlKey.empty());
+    }
 }

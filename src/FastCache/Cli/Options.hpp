@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace FastCache
@@ -46,6 +47,66 @@ enum class ParseFlow : std::uint8_t
 /// @return Nothing on success; the value parser's ConfigError verbatim otherwise.
 template <typename Result>
 using ApplyFlag = std::expected<void, ConfigError> (*)(Result& result, std::string_view value);
+
+/// The configuration type a `Result` carries, for the reload column below.
+///
+/// Mirrors `TargetOf`'s branch and must keep mirroring it: a parse result either
+/// wraps its configuration in a `config` member (the daemon's `CliResult`) or IS the
+/// configuration (the node's `NodeConfig`). A comparator typed on the wrong one of
+/// those does not fail at the column -- it fails at every row, as
+/// `'config': is not a member of NodeConfig` -- so the two must be derived from one
+/// question asked the same way.
+template <typename Result>
+struct ConfigOfImpl
+{
+    using type = Result;
+};
+
+template <typename Result>
+    requires requires(Result& r) { r.config; }
+struct ConfigOfImpl<Result>
+{
+    using type = std::remove_cvref_t<decltype(std::declval<Result&>().config)>;
+};
+
+template <typename Result>
+using ConfigOf = ConfigOfImpl<Result>::type;
+
+/// Compares one field of two configurations. See `OptionSpec::same`.
+template <typename Result>
+using SameFieldFn = bool (*)(ConfigOf<Result> const&, ConfigOf<Result> const&);
+
+/// Whether a setting can take effect without restarting the process.
+///
+/// **Opt-in, and that default is the guard.** The daemon's reloader decides this in a
+/// hand-written ladder, which means a flag added today is *silently reloadable* --
+/// [#406](https://github.com/LASTRADA-Software/fastcached/issues/406), measured at 10
+/// of 38 members guarded. Defaulting to `No` inverts that failure: a new flag is
+/// silently IMMUTABLE, so the worst a forgotten column costs is a reload refused with
+/// a name attached, never a live-wired object left disagreeing with the configuration
+/// that claims to describe it.
+enum class Reloadable : std::uint8_t
+{
+    /// Live-wired at startup; a change requires a restart. **The default, and it is
+    /// the safe direction rather than the conservative one.**
+    ///
+    /// The instinct on reading this is that `Yes` would be friendlier. It is not, and
+    /// the two failure directions are not equivalent:
+    ///
+    /// - A row that should be reloadable and is left `No` costs a **reload refused
+    ///   with the field named**. The operator sees exactly what did not apply and why,
+    ///   and restarts. Nothing is wrong afterwards.
+    /// - A row that should be immutable and is silently `Yes` costs a **live-wired
+    ///   object disagreeing with the configuration that claims to describe it** --
+    ///   `Current()` reporting one thing and the running sockets, threads or toolchain
+    ///   table doing another, with nothing anywhere saying so.
+    ///
+    /// The second is unbounded and invisible; the first is a sentence on a terminal.
+    /// So a forgotten column fails closed. This is the inverse of #406, where the
+    /// daemon's hand-written ladder means a new flag is silently RELOADABLE.
+    No,
+    Yes, ///< Takes effect on reload.
+};
 
 /// One accepted command-line option.
 ///
@@ -88,6 +149,33 @@ struct OptionSpec
     /// operator's decision forever. Which rows those are is a named list beside the
     /// table, and a guard walks the table requiring every other row to carry a key.
     std::string_view yamlKey {};
+
+    /// Whether a reload may apply a change to this setting.
+    ///
+    /// **A column of THIS table rather than a list beside it.** A second list is not a
+    /// cross-check, it is a second thing to be wrong -- and the reload path is where
+    /// that costs most, because the failure is an operator editing a file, seeing no
+    /// error, and believing the change took.
+    ///
+    /// The reason most rows are `No` is stated once, in the node's own table, and it
+    /// is the argument `fastcache-compile-node/main.cpp` used to give for handling no
+    /// SIGHUP at all: a worker's toolchain table is what its registration advertised,
+    /// so re-reading it would leave the scheduler dispatching against a set this
+    /// worker no longer serves.
+    Reloadable reloadable { Reloadable::No };
+
+    /// Whether two configurations agree about this row's field.
+    ///
+    /// Paired with `reloadable` and derived from the SAME member pointer the applier
+    /// uses -- `FieldEq<&NodeConfig::slots>()` beside
+    /// `AssignFrom<&NodeConfig::slots, ...>()` -- so the two mentions sit adjacent on
+    /// one line and a mismatch is visible rather than silent.
+    ///
+    /// Null for a row that is not configuration state at all: a one-shot verb has no
+    /// field to compare, exactly as it has no `yamlKey`. A guard requires every row
+    /// with a `yamlKey` to carry one, because those are precisely the rows a file can
+    /// change.
+    SameFieldFn<Result> same { nullptr };
 
     /// Empties this row's target before command-line values replace file-sourced
     /// ones, or null for a row whose value is not a list.
@@ -271,6 +359,21 @@ template <auto Field, auto Parse>
     return [](auto& result, std::string_view value) -> std::expected<void, ConfigError> {
         return Parse(value).transform(
             [&result](auto&& parsed) { TargetOf<Field>(result) = std::forward<decltype(parsed)>(parsed); });
+    };
+}
+
+/// A comparator for `OptionSpec::same`, over the same field an applier assigns.
+///
+/// Takes the member pointer rather than deriving one from the applier, because an
+/// applier is a lambda by the time the row holds it and there is nothing left to ask.
+/// Written beside the applier on the same row so the two spellings of the field are
+/// adjacent.
+/// @return The comparator, usable as an OptionSpec::same in a `constexpr` table.
+template <auto Field>
+[[nodiscard]] constexpr auto FieldEq() noexcept
+{
+    return [](auto const& previous, auto const& candidate) -> bool {
+        return previous.*Field == candidate.*Field;
     };
 }
 
