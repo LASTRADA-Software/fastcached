@@ -122,6 +122,35 @@ enum class LogSource : std::uint8_t
     Yes, ///< Prefix each connection log line with the client IP.
 };
 
+/// Whether a console log line carries a time by default on THIS platform.
+///
+/// **A platform default rather than a constant, because the fact it encodes is a
+/// property of the platform** ([#496](https://github.com/LASTRADA-Software/fastcached/issues/496)).
+/// Nothing on macOS stamps a service's output: launchd redirects both standard
+/// streams straight to a plain file, and omitting those keys sends them to
+/// `/dev/null` instead, so a macOS log answers *when* only if the process says so.
+/// Linux has journald, which stamps every entry, and the Windows service path never
+/// reaches a `ConsoleLogger` at all -- it writes to the event log, whose records
+/// carry their own time.
+///
+/// The four sinks and which of them stamps are tabulated once, in
+/// `.agent/rules/platform-service-and-config.md`. Read it before changing this: a
+/// `#if` on a configuration default looks arbitrary and is not, and simplifying it
+/// away would put macOS back to logs that cannot be correlated with anything.
+///
+/// **It is a DEFAULT and not an override**, which is the whole reason it lives here
+/// rather than in the installer. `log_timestamps: false` in a configuration file
+/// wins over it by ordinary precedence, because nothing has set the explicit bit
+/// that makes a command-line value outrank the file. An installer that appended
+/// `--log-timestamps` instead would set that bit and silently kill the documented
+/// key -- which is what the first attempt at #496 did.
+inline constexpr bool DefaultLogTimestamps =
+#if defined(__APPLE__)
+    true;
+#else
+    false;
+#endif
+
 /// Whether each console log line carries an ISO 8601 UTC instant.
 ///
 /// A scoped enum for the reason `LogSource` above is one, and then a second reason

@@ -367,6 +367,32 @@ struct ServiceSpec
                                                         ServiceScope scope,
                                                         std::filesystem::path const& home);
 
+/// Which spelling of a two-sided switch a registration must carry, if either.
+///
+/// **Extracted so it can be tested against both platform defaults**, which is the
+/// only way to see the defect it was written for. `emitSwitchIfSet` emits the
+/// POSITIVE flag whenever the value differs from the default, which says "on" --
+/// correct while the default is false everywhere, and inverted once it is not. With
+/// `logTimestamps` defaulting true under macOS (#496), an operator's explicit
+/// `--no-log-timestamps` differs from that default and was registered as
+/// `--log-timestamps`: the thing they turned off, turned back on, at every boot and
+/// silently, because a registration replays its command line forever.
+///
+/// Only a flag whose default is platform-dependent needs this. `--log-source` and
+/// `--log-everything` default false everywhere, so "differs" still means "on" for
+/// them and `emitSwitchIfSet` stays right -- do not unify the two.
+///
+/// @param onFlag Flag name, without dashes, that sets the value true.
+/// @param offFlag Flag name, without dashes, that sets it false.
+/// @param value What this configuration holds.
+/// @param fallback What the value would be if the registration said nothing.
+/// @return The flag name to emit, or nullopt when the default already produces
+///         @p value and the registration has nothing to say.
+[[nodiscard]] std::optional<std::string_view> SwitchSpellingFor(std::string_view onFlag,
+                                                                std::string_view offFlag,
+                                                                bool value,
+                                                                bool fallback) noexcept;
+
 /// Fill in the per-scope path arguments the operator left unset.
 ///
 /// Pure, and declared here rather than kept private to the launchd

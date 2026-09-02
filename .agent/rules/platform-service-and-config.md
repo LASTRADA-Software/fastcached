@@ -666,11 +666,55 @@ Three consequences, and none is obvious from either end:
 - **launchd stamps nothing**, and that plist is built by the shared
   `ServiceControl.cpp` — so it is the same gap in `fastcached`. A per-binary default
   chosen to work around it papers over one packaging defect in whichever binary
-  noticed and leaves the other writing timeless files
-  ([#496](https://github.com/LASTRADA-Software/fastcached/issues/496)).
+  noticed and leaves the other writing timeless files.
 - **So a log default cannot be picked per binary.** Two binaries with the same flag
   and opposite defaults is a vocabulary split over a bug that lives in neither of
-  them. One spelling, one default, and fix the plist where the plist is.
+  them. One spelling, one default, and fix the gap where the gap is.
+
+**The gap is the platform's, so the default is the platform's**
+([#496](https://github.com/LASTRADA-Software/fastcached/issues/496)).
+`Core/Logger.hpp` carries `DefaultLogTimestamps`, true under `__APPLE__` and false
+everywhere else, and both binaries' config structs initialise from it. Two things
+about that placement:
+
+- **It is wider than launchd, deliberately.** A default injected into the plist would
+  reach launchd only, and would then be a *value* recorded in a registration — which
+  overrides a configuration file forever, because the command line wins, and kills the
+  documented `log_timestamps:` key for every macOS operator. A default is the one
+  form of "on unless you say otherwise" that a file can still outrank. The price is
+  that a macOS operator running the binary in a terminal also gets stamps; that is the
+  price and it is stated in the help text rather than hidden.
+- **The reason lives beside the constant**, pointing here. A platform `#if` with no
+  rationale reads as an accident, and the table above is the measurement that makes
+  it defensible.
+
+**A two-sided flag needs a two-sided emitter**
+([#507](https://github.com/LASTRADA-Software/fastcached/issues/507), a prerequisite
+for the above rather than a follow-up from it). `emitSwitchIfSet` emits the POSITIVE
+flag whenever a value differs from its default, which spells *on* — correct while
+every default is false, and **inverted** the moment one is not. Under the macOS
+default an operator's explicit `--no-log-timestamps` differs from the default and was
+registered as `--log-timestamps`: the thing they turned off, turned back on, at every
+boot, silently, because a registration replays its command line forever. So:
+
+- **A flag whose default is platform-dependent needs a negative spelling** and
+  `SwitchSpellingFor`, which emits whichever of the pair PRODUCES the value.
+  `--log-source` and `--log-everything` default false everywhere, so *differs* still
+  means *on* for them and `emitSwitchIfSet` stays right — do not unify the two.
+- **The negative spelling gets no `yamlKey`.** A file already says both things with
+  `log_timestamps: true|false`; a second key for the same field would be two ways to
+  spell one setting, with a precedence question nobody asked for. It is on
+  `notFromFile` with that reason.
+- **The defect lives in a COMBINATION, so the test must drive one.** On a false
+  default the old emitter is correct, and with one value driven the wrong spelling is
+  still A spelling. Both values against both platform defaults — which needs the
+  decision extracted as a pure function, since a host runs one default and cannot be
+  asked for the other.
+- **A coverage sweep cannot hold a mutually-exclusive pair.** "one configuration,
+  every flag appears in it" is a shape that demands a contradiction for two spellings
+  of one field; excluding just the negative one passed on Windows and silently dropped
+  `--log-timestamps` from the sweep on macOS. Exclude the pair, and name the case that
+  took the coverage over.
 
 ## Open work
 

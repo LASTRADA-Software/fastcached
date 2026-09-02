@@ -222,8 +222,17 @@
 # Log threshold: trace, debug, info, warn, error, fatal.
 #log_level: info
 
-# Leave log_timestamps off under systemd — journald already timestamps every
-# line, so enabling it prints the time twice.
+# prefix every log line with an ISO 8601 UTC timestamp
+#
+# Default: ON under macOS, off elsewhere. The reason is the sink, not the
+# platform's taste -- launchd sends a service's output straight to a plain file
+# that nothing stamps, while journald stamps every line on Linux and a Windows
+# service writes to the event log instead. So this key is what you reach for on
+# Linux when the log is going somewhere journald is not: a foreground run, a
+# redirected file, a CI artefact.
+#
+# Setting it here WINS over the platform default in both directions, including
+# turning it off on macOS.
 #log_timestamps: false
 
 # Prefix connection-scoped log lines with the client IP.

@@ -256,9 +256,32 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
 
     // Valueless switches: present or absent, never `--flag=true`, because that
     // is not a spelling CliParser accepts.
+    //
+    // Sound only while the DEFAULT is the same everywhere, which is what makes
+    // "differs from the default" mean "on". Its sibling below is for the one flag
+    // where that stopped being true.
     auto const emitSwitchIfSet = [&argv](std::string_view flag, bool value, bool fallback) {
         if (value != fallback)
             argv.emplace_back(std::format("--{}", flag));
+    };
+
+    // The same thing for a flag whose default is PLATFORM-DEPENDENT, which needs both
+    // spellings because it must be able to say either word.
+    //
+    // `emitSwitchIfSet` inverts here and does it silently. With `logTimestamps`
+    // defaulting true under macOS (#496), an operator who asks for `--no-log-timestamps`
+    // and runs `--install-service` has a value that DIFFERS from the default -- so the
+    // old helper emitted `--log-timestamps`, and the registration turned back on the
+    // very thing they turned off. A registration replays its command line at every
+    // boot, so that is permanent and silent, and it is the same class as the defect
+    // #496 started from, pointed the other way.
+    //
+    // Only this flag needs it. `--log-source` and `--log-everything` default false on
+    // every platform, so "differs" still means "on" for them and they keep the helper
+    // above -- do not unify the two.
+    auto const emitSwitchEitherWay = [&argv](std::string_view onFlag, std::string_view offFlag, bool value, bool fallback) {
+        if (auto const spelling = SwitchSpellingFor(onFlag, offFlag, value, fallback); spelling.has_value())
+            argv.emplace_back(std::format("--{}", *spelling));
     };
 
     if (daemonFlag == EmitDaemonFlag::Yes)
@@ -283,7 +306,7 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     emitIfSet("port", cfg.port, defaults.port);
     emitIfSet("max-memory", cfg.maxMemoryBytes, defaults.maxMemoryBytes);
     emitIfSet("log-level", cfg.logLevel, defaults.logLevel);
-    emitSwitchIfSet("log-timestamps", cfg.logTimestamps, defaults.logTimestamps);
+    emitSwitchEitherWay("log-timestamps", "no-log-timestamps", cfg.logTimestamps, defaults.logTimestamps);
     emitSwitchIfSet("log-source", cfg.logSource, defaults.logSource);
     emitSwitchIfSet("log-everything", cfg.logEverything, defaults.logEverything);
     emitPathIfSet("storage", cfg.storagePath);
@@ -741,6 +764,16 @@ std::filesystem::path DefaultLogDirectory(std::string_view label, ServiceScope s
     if (scope == ServiceScope::User)
         return home / "Library/Logs/fastcached";
     return std::filesystem::path { MacOsPrefix } / "var/log" / label;
+}
+
+std::optional<std::string_view> SwitchSpellingFor(std::string_view onFlag,
+                                                  std::string_view offFlag,
+                                                  bool value,
+                                                  bool fallback) noexcept
+{
+    if (value == fallback)
+        return std::nullopt;
+    return value ? onFlag : offFlag;
 }
 
 ServiceSpec WithScopeDefaults(ServiceSpec spec,

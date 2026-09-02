@@ -335,7 +335,11 @@ struct Config
     LogLevel logLevel { LogLevel::Info };
 
     /// When true, each ConsoleLogger line is prefixed with an ISO 8601 UTC timestamp.
-    bool logTimestamps { false };
+    ///
+    /// **On by default under macOS and off elsewhere** -- see `DefaultLogTimestamps`,
+    /// which carries the reason: launchd stamps nothing, journald stamps everything,
+    /// and the Windows service never reaches this logger.
+    bool logTimestamps { DefaultLogTimestamps };
 
     /// When true, each connection-scoped log line is prefixed with the client
     /// IP that caused it (e.g. `[INFO] [203.0.113.7] ...`). Global/server log
