@@ -122,6 +122,21 @@ enum class LogSource : std::uint8_t
     Yes, ///< Prefix each connection log line with the client IP.
 };
 
+/// Whether each console log line carries an ISO 8601 UTC instant.
+///
+/// A scoped enum for the reason `LogSource` above is one, and then a second reason
+/// this flag paid for. `{ std::cerr, level, true }` says nothing at the call site --
+/// and an argument that reads as nothing is one whose ABSENCE reads as nothing
+/// either, which is how `fastcache-compile-node` shipped unable to emit a time at
+/// all ([#485](https://github.com/LASTRADA-Software/fastcached/issues/485)). The
+/// constructor takes it with **no default**, so omitting it is a compile error in
+/// every binary rather than a silent `false`.
+enum class LogTimestamps : std::uint8_t
+{
+    No,  ///< `[LEVEL] message`.
+    Yes, ///< `2026-06-05T14:23:01.123456Z [LEVEL] message`.
+};
+
 /// Logging decorator that prefixes a fixed source tag onto every record before
 /// delegating to an inner ILogger, then forwards the level-filter calls
 /// unchanged. Used per connection so each client's log lines carry its IP
@@ -171,10 +186,19 @@ class ConsoleLogger final: public ILogger
 {
   public:
     /// Construct over a stream reference whose lifetime exceeds this logger.
+    ///
+    /// **Neither trailing parameter has a default, deliberately.** They had one, and
+    /// `fastcache-compile-node` was constructed with two arguments of the three -- so
+    /// the node could not emit a timestamp, no flag existed to ask for one, and this
+    /// class was correct throughout (#485). The argument was not wrong, it was ABSENT,
+    /// which is the one mistake a defaulted parameter makes unreadable at the call
+    /// site and invisible to every test of this class. Without the defaults it is a
+    /// compile error, in this binary and in any added later.
+    ///
     /// @param sink Output stream (e.g., std::cerr).
     /// @param initialMinLevel Initial filter threshold.
-    /// @param timestamps When true, prefix each line with an ISO 8601 UTC timestamp.
-    explicit ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel = LogLevel::Info, bool timestamps = false) noexcept;
+    /// @param timestamps Whether to prefix each line with an ISO 8601 UTC timestamp.
+    explicit ConsoleLogger(std::ostream& sink, LogLevel initialMinLevel, LogTimestamps timestamps) noexcept;
 
     void Log(LogLevel level, std::string_view message) override;
     [[nodiscard]] LogLevel MinLevel() const noexcept override;
@@ -184,7 +208,7 @@ class ConsoleLogger final: public ILogger
     std::ostream& _sink;
     std::atomic<LogLevel> _minLevel;
     std::mutex _writeMutex;
-    bool _timestamps;
+    LogTimestamps _timestamps;
 };
 
 /// Capturing logger that stores every emitted record in memory. Designed for

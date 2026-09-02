@@ -1490,6 +1490,40 @@ that sends work to the smallest machines first and leaves the big ones idle.
 Equal headroom is broken by utilization, so between two workers with four slots
 free the one with proportionally more of itself left takes the job.
 
+## What it logs, and when
+
+Two flags, one concern. `--log-level` decides *how much* — `trace`, `debug`,
+`info`, `warn`, `error`, `fatal`, default `info`. `--log-timestamps` decides
+whether each line carries *when*, as an ISO 8601 UTC instant, and is **off by
+default**. In YAML they are `log_level:` and `log_timestamps:`.
+
+```sh
+fastcache-compile-node --log-level=debug --log-timestamps
+2026-09-01T23:10:24.135816Z [ERROR] --no-toolchain-discovery was given and no --toolchain
+```
+
+The timestamp is a *prefix*, so anything already grepping for `[ERROR]` keeps
+working.
+
+**Turn it on whenever this node's log is going somewhere that does not stamp it
+for you.** Of the three deployments whose lines come from this logger, only
+systemd adds a time — its journal stamps every entry, which is why the default is
+off. macOS's launchd sends them to a plain file that nothing stamps, and the
+Windows service does not use this logger at all. So turn it on for a foreground
+run during fleet bring-up, for anything you redirect to a file, for CI artefacts,
+and on a launchd-installed node until
+[#496](https://github.com/LASTRADA-Software/fastcached/issues/496) closes.
+
+A completed run cannot be asked afterwards what time anything happened: a leader
+elected at second 59 and one elected at second 3 that never affirms are the same
+bytes without times, which is
+[#485](https://github.com/LASTRADA-Software/fastcached/issues/485) and cost a real
+diagnosis.
+
+`--install-service` carries the setting into the registration, so a node installed
+with timestamps on comes back with them on — they are most wanted exactly when
+something is being diagnosed, which is the worst time to lose them to a restart.
+
 ## Watching one
 
 `--admin-listen` serves `/metrics` and `/healthz`, and is **off unless you ask

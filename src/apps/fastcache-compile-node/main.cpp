@@ -19,6 +19,7 @@
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
@@ -1501,7 +1502,12 @@ int main(int argc, char** argv)
     // is therefore exactly what somebody copies out of `sc qc` to try by hand. Their
     // refusals going to the event log while the terminal showed only an exit code
     // would be the same defect this file is fixing, pointed the other way.
-    ConsoleLogger consoleLogger { std::cerr, cfg.logLevel };
+    // Built by the factory, never here: the third argument used to be absent at this
+    // very line, so the node could not emit a time and no flag existed to ask for one
+    // (#485). Omitting it no longer compiles -- `ConsoleLogger` takes `LogTimestamps`
+    // with no default -- and the factory is what carries the CONFIGURATION to it,
+    // which is the half a signature cannot check.
+    auto const consoleLogger = MakeNodeConsoleLogger(std::cerr, cfg);
 
     // Service registration, before anything that costs time. A misconfiguration is
     // decided in microseconds while a toolchain fingerprint takes seconds, which is
@@ -1529,7 +1535,7 @@ int main(int argc, char** argv)
         if (cfg.installService)
             if (auto const rejection = NodeInstallRejection(cfg))
             {
-                consoleLogger.Logf(LogLevel::Error, "{}", *rejection);
+                consoleLogger->Logf(LogLevel::Error, "{}", *rejection);
                 return ExitUsage;
             }
 
@@ -1560,7 +1566,7 @@ int main(int argc, char** argv)
         auto const outcome = MigrateDiskTier(cfg);
         if (!outcome.has_value())
         {
-            consoleLogger.Logf(LogLevel::Error, "{}", outcome.error());
+            consoleLogger->Logf(LogLevel::Error, "{}", outcome.error());
             return ExitUsage;
         }
         std::cout << "fastcache-compile-node: " << *outcome << '\n';
@@ -1593,7 +1599,7 @@ int main(int argc, char** argv)
     // "am I on Windows" is what keeps a foreground run pointed at its terminal on a
     // machine that has one.
     auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
-    ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(consoleLogger);
+    ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(*consoleLogger);
 
     // Both are refused at startup rather than at the first job. A worker missing
     // either would register (or fail to) and then refuse everything, which presents

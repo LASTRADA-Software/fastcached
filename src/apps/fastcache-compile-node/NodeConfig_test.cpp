@@ -309,6 +309,12 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // credential rather than the credential.
     cfg.schedulerTokenFile = "scheduler.token";
     cfg.logLevel = LogLevel::Debug;
+    // Worker state, so it has to survive a registration: a service installed with
+    // timestamps on must come back with them on, or the operator who turned them on
+    // to diagnose something finds them gone at the next boot -- which is exactly when
+    // they are being relied upon. Presence IS the setting, so it is emitted as a bare
+    // switch and this is what makes that emitter fire.
+    cfg.logTimestamps = true;
     cfg.pidfile = "worker.pid";
     cfg.drainTimeoutSeconds = 90;
     // Worker state like any other, and the one that supplies most of the rest: a

@@ -264,5 +264,14 @@
 # trace, debug, info, warn, error, fatal (default info)
 #log_level:
 
+# prefix every log line with an ISO 8601 UTC timestamp (default off)
+#
+# Off because under systemd -- which is how this file is being read -- journald
+# stamps every entry already, so turning it on writes a second time inside the
+# message. Turn it ON when this worker's log is going anywhere journald is not:
+# a foreground run during fleet bring-up, a redirected file, a CI artefact. A
+# completed run cannot be asked afterwards what time anything happened (#485).
+#log_timestamps: false
+
 # write the pid here when daemonizing (POSIX)
 #pidfile:

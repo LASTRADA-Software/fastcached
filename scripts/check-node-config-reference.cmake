@@ -17,6 +17,22 @@
 # tool -- see check-repository-hygiene.cmake for the longer argument. It needs no
 # compiler, no daemon and no socket, and belongs in the default `ctest` set.
 #
+# ## What this check does NOT see: the VALUE a key ships with
+#
+# It compares key NAMES. A line's value shape is invisible to it, and for one kind
+# of setting that is a real gap rather than a boundary: a BOOLEAN shipped as a bare
+# `#key:` is a trap, because "uncomment to enable" is the natural reading and
+# uncommenting alone yields `TypeMismatch: setting names no value` and a worker that
+# refuses to start. Booleans therefore ship as `#key: false`, like their six
+# siblings in the reference file -- and #485 shipped one that did not, which this
+# check passed.
+#
+# The same bare shape is CORRECT for a value-taking setting (`#scheduler:`,
+# `#log_level:`): uncommenting alone fails loudly and self-explanatorily, and the
+# operator was always going to supply the value the prose above it describes. So
+# this is not a rule that could simply be extended to every key, which is why it is
+# recorded here for the next person adding a setting rather than encoded.
+#
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-node-config-reference.cmake
 #
