@@ -519,8 +519,9 @@ jobs:
       #
       # One issue, reopened by comment rather than replaced — a fresh issue per
       # push is the same noise problem in another medium. Found by its TITLE, which
-      # is the env var three lines above, so the lookup and the create cannot drift
-      # apart without one edit changing both. Not by a label of its own:
+      # both the lookup and the create read out of the step's own `TITLE` env var,
+      # so they cannot drift apart without one edit changing both. Not by a label
+      # of its own:
       # `CONTRIBUTING.md` enumerates the label prefixes this repository uses and
       # there is no room in it for a private one, so a `ci/…` key would be a label
       # every documented filter is blind to.
