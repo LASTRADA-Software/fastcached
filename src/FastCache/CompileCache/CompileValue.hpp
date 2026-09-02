@@ -39,7 +39,28 @@ namespace FastCache
 /// row and it goes red too. Before that table the invariant was stated in
 /// `PathCanon.hpp` and enforced by nothing, which is the difference between an
 /// invariant and a hope.
-inline constexpr std::uint8_t CompileValueVersion = 1;
+/// **Generation 2** retired generation 1 at
+/// [#547](https://github.com/LASTRADA-Software/fastcached/issues/547), the first
+/// real customer of the machinery above. A bare root — `/`, `C:\` — is its own
+/// trailing separator, and neither side of the transformation knew it: the producer
+/// matched nothing, so a value stored by a build rooted at the filesystem root kept
+/// that machine's absolute paths, and the consumer emitted `//inc/a.hpp` on POSIX
+/// and a UNC-shaped path on Windows.
+///
+/// **What the bump retires, stated positively rather than as a rule that did not
+/// apply.** Moving this byte retires stored objects AND direct-mode manifests, on
+/// its own: a manifest is stored wrapped in a `CompileValue`, so the launcher
+/// decodes it through `DecodeCompileValue` and a build at generation 2 meeting a
+/// generation-1 envelope gets nothing back and misses. `manifest-v*` therefore buys
+/// no additional retirement here and would spend a second invalidation event to do
+/// it — and the standing lock-step that would have demanded one runs `objkey-v*` to
+/// `manifest-v*`, which is a different pair and one-way. The producer half re-keys
+/// by itself for the reason the `objkey-v4` bullet gives: the key changes for
+/// exactly the translation units whose canonicalization changed, so a stale entry
+/// becomes unreachable rather than servable under rules it was not written by. The
+/// consumer half is what genuinely needs this byte, since there the key is unchanged
+/// and only the localization moved.
+inline constexpr std::uint8_t CompileValueVersion = 2;
 
 /// One captured compiler text stream (e.g. stdout carrying `/showIncludes`, or
 /// stderr carrying diagnostics), tagged with the grammar that locates path

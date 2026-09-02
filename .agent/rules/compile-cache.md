@@ -1305,6 +1305,37 @@ were open to breaking it, and neither needed anybody's install to be stale.
     that, and the coverage case asks for the row *and* the bump. Note how it was
     found — by reading, in review. Every test was green, and a message is not
     something a suite can be wrong about.
+  - **A digest cannot tell a row that does work from one that does not**, and that
+    is a property of digests rather than a flaw in this one: both rows contribute
+    bytes, so a corpus can grow, read as thorough, and assert progressively less. The
+    bare-root row added here was the demonstration — it was commented *"a bare root
+    produces, and a bare root consumes"* and did **neither**, because nothing
+    canonicalized so there was no token, so there was nothing to localize either. The
+    guard that caught the `JoinLocalized` mutation fired on the *drive-root* row
+    instead, and everything still passed. `RegionEffect` is the assertion the digest
+    structurally cannot make: each row declares `Rewrites` or `Preserves` per side and
+    is checked against what actually happened
+    ([#547](https://github.com/LASTRADA-Software/fastcached/issues/547)).
+    - **A declaration, not "every row must change something."** Two rows here are
+      deliberately inert and always will be — canonicalizing a region that already
+      carries tokens must be a no-op or canonicalizing twice would be a second
+      rewrite, and the empty region exists to prove the framing survives with no text.
+      A guard that has to be waived twice is a guard on its way to becoming
+      decoration.
+    - It also **says which row broke**. Reverting the producer fix fails the digest
+      once and the effect assertion twice, naming both rows that went inert; the
+      digest alone can only report that something moved.
+  - **Vary BOTH sides of a transformation, or the corpus cannot see the side it
+    fixed.** The bare-root miss was producer-varied and consumer-fixed, and the
+    mutation written specifically to prove the guard bites passed all 2007 cases
+    because of it. The audit that followed enumerated every root shape against both
+    sides and found the defect on **four cells across two shapes** — plus a bare
+    WINDOWS producer absent from the corpus in any form, which neither the inertness
+    check nor the one-sided check would have found alone. Two shapes that were also
+    varied on one side only, drive-relative and UNC, turned out to be **correct** —
+    which is the point: nothing distinguished them from the broken ones beforehand, so
+    they get rows too. A row documenting a shape as sound is worth as much as one that
+    catches a defect.
   - **It also pins the digest across HOSTS.** Every entry point in `PathCanon`
     derives its conventions from the layout rather than from the running binary, so
     the corpus yields one digest on Windows, Linux and macOS. A change that broke

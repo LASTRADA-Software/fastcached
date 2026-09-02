@@ -87,7 +87,12 @@ namespace
 [[nodiscard]] std::vector<std::byte> FrameDeclaring(std::uint32_t regionCount, std::size_t trailingBytes)
 {
     std::vector<std::byte> frame;
-    frame.push_back(std::byte { 1 }); // version
+    // The constant, not a literal: this helper exists to exercise the region-count
+    // guard and needs a frame of the CURRENT generation to do it. The literal that
+    // used to sit here was the byte's only anchor by accident, and a generation
+    // bump then failed two tests that have nothing to do with versioning. The byte
+    // is pinned deliberately instead, in its own case below.
+    frame.push_back(std::byte { CompileValueVersion });
     for ([[maybe_unused]] auto const i: { 0, 1, 2, 3 })
         frame.push_back(std::byte { 0 }); // objectLen = 0
     for (auto const shift: { 24, 16, 8, 0 })
@@ -96,6 +101,24 @@ namespace
     return frame;
 }
 } // namespace
+
+TEST_CASE("The generation byte is pinned by value, not only by name")
+{
+    // A wire constant has TWO facts -- its name and its value -- and a symbol both
+    // ends spell can only test the first. Every other case in this file compares
+    // against `CompileValueVersion` or against `CompileValueVersion + 1`, so all of
+    // them would still agree if the constant moved, while every already-deployed
+    // launcher disagreed and nobody here could recompile them.
+    //
+    // So one case reads the raw byte. It is the anchor, not the code smell it looks
+    // like, and it is expected to be edited by a deliberate generation bump -- which
+    // is exactly the moment somebody should have to think about it.
+    //
+    // Generation 2 since #547.
+    auto const encoded = EncodeCompileValue(CompileValue {});
+    REQUIRE_FALSE(encoded.empty());
+    CHECK(encoded.front() == std::byte { 2 });
+}
 
 TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
 {
@@ -266,6 +289,32 @@ namespace
 /// The roots are `string_view`s rather than a `PathCanon::Layout`, so the whole
 /// corpus is a `constexpr` table and adding a case is adding a row. Layouts are
 /// built from them at the point of use.
+/// What a row claims one side of the transformation does to its text.
+///
+/// **A row that exercises nothing is byte-identical, inside a digest, to one that
+/// does real work** — both just contribute their bytes — so a corpus can grow, read
+/// as thorough, and assert progressively less. That is not a flaw in the digest; it
+/// is the class of thing a digest structurally cannot check, and this column is what
+/// covers it (issue #547).
+///
+/// It is a declaration rather than a blanket "every row must change something",
+/// because two rows here are *deliberately* inert and a guard that has to be waived
+/// twice is a guard on its way to becoming decoration: canonicalizing a region that
+/// already carries tokens must be a no-op, or canonicalizing twice would be a second
+/// rewrite, and the empty region exists to prove the framing survives with no text
+/// at all. Saying which it is per side keeps both honest.
+enum class RegionEffect : std::uint8_t
+{
+    Rewrites,  ///< This side must CHANGE the text. A row that stops doing so is inert.
+    Preserves, ///< This side must leave the text byte-identical, deliberately.
+};
+
+/// One case of the conformance corpus: what a producer captured, the roots it
+/// captured it under, and the roots a consumer localizes it back into.
+///
+/// The roots are `string_view`s rather than a `PathCanon::Layout`, so the whole
+/// corpus is a `constexpr` table and adding a case is adding a row. Layouts are
+/// built from them at the point of use.
 struct ConformanceCase
 {
     std::string_view name;               ///< What this row is here to pin.
@@ -274,7 +323,11 @@ struct ConformanceCase
     std::string_view consumerSourceRoot; ///< `<SRCROOT>` on the consuming machine.
     std::string_view consumerBuildTree;  ///< `<BUILDTREE>` on the consuming machine.
     std::string_view text;               ///< The captured region, exactly as a driver wrote it.
-    Grammar grammar;                     ///< Which grammar locates path spans in `text`.
+    // The byte-wide members sit together at the end, which is this tree's layout rule
+    // wherever a struct mixes them with wider ones.
+    Grammar grammar;             ///< Which grammar locates path spans in `text`.
+    RegionEffect producerEffect; ///< What canonicalization must do to `text`.
+    RegionEffect consumerEffect; ///< What localization must do to the canonical form.
 };
 
 /// The corpus the stored-value contract is digested over.
@@ -302,7 +355,9 @@ constexpr std::array ConformanceCorpus {
                       .text = "Note: including file: /home/dev/proj/inc/a.hpp\n"
                               "Note: including file:  /home/dev/proj/build/gen/cfg.hpp\n"
                               "Note: including file: /usr/include/stdio.h\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "windows showIncludes, mixed case, CRLF",
                       .producerSourceRoot = R"(C:\src\Proj)",
                       .producerBuildTree = R"(C:\src\Proj\out)",
@@ -311,14 +366,18 @@ constexpr std::array ConformanceCorpus {
                       .text = "Note: including file: c:\\SRC\\proj\\inc\\A.hpp\r\n"
                               "Note: including file: C:\\src\\Proj\\out\\gen\\cfg.hpp\r\n"
                               "Note: including file: C:\\Program Files\\MSVC\\include\\vector\r\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "showIncludes final line with no newline",
                       .producerSourceRoot = "/home/dev/proj",
                       .producerBuildTree = "/home/dev/proj/build",
                       .consumerSourceRoot = "/srv/ci/checkout",
                       .consumerBuildTree = "/srv/ci/checkout/out",
                       .text = "Note: including file: /home/dev/proj/z.h",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "showIncludes already carrying tokens is left alone",
                       .producerSourceRoot = "/home/dev/proj",
                       .producerBuildTree = "/home/dev/proj/build",
@@ -326,7 +385,9 @@ constexpr std::array ConformanceCorpus {
                       .consumerBuildTree = "/srv/ci/checkout/out",
                       .text = "Note: including file: <SRCROOT>/inc/a.hpp\n"
                               "Note: including file: <BUILDTREE>/gen/cfg.hpp\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Preserves,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "msvc diagnostics, line and column",
                       .producerSourceRoot = R"(C:\src\proj)",
                       .producerBuildTree = R"(C:\src\proj\out)",
@@ -335,7 +396,9 @@ constexpr std::array ConformanceCorpus {
                       .text = "C:\\src\\proj\\a.cpp(17): warning C4100: unreferenced\r\n"
                               "C:\\src\\proj\\a.cpp(17,9): note: see reference\r\n"
                               "cl : Command line warning D9002\r\n",
-                      .grammar = Grammar::MsvcDiagnostics },
+                      .grammar = Grammar::MsvcDiagnostics,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "gcc depfile, target, continuations and escaped space",
                       .producerSourceRoot = "/home/dev/proj",
                       .producerBuildTree = "/home/dev/proj/build",
@@ -346,51 +409,112 @@ constexpr std::array ConformanceCorpus {
                               "  /usr/include/stdio.h\n"
                               "\n"
                               "/home/dev/proj/inc/a\\ b.hpp:\n",
-                      .grammar = Grammar::GccDepfile },
+                      .grammar = Grammar::GccDepfile,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "depfile under a drive-relative root",
                       .producerSourceRoot = R"(C:src\proj)",
                       .producerBuildTree = R"(C:src\proj\out)",
                       .consumerSourceRoot = R"(D:\work\proj)",
                       .consumerBuildTree = R"(D:\work\proj\out)",
                       .text = "C:src\\proj\\out\\a.obj: C:src\\proj\\a.cpp\n",
-                      .grammar = Grammar::GccDepfile },
+                      .grammar = Grammar::GccDepfile,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "showIncludes under a UNC root",
                       .producerSourceRoot = R"(\\build01\share\proj)",
                       .producerBuildTree = R"(\\build01\share\proj\out)",
                       .consumerSourceRoot = R"(C:\local\proj)",
                       .consumerBuildTree = R"(C:\local\proj\out)",
                       .text = "Note: including file: \\\\build01\\share\\proj\\inc\\a.hpp\r\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "a bare root produces, and a bare root consumes",
-                      // A bare root IS its own trailing separator, so it is the
-                      // one shape where the join has a second separator to think
-                      // about. It reaches the digest on BOTH sides deliberately:
-                      // producing was covered and consuming was not, and a
-                      // plausible "collapse the double separator" edit to
-                      // `JoinLocalized` therefore passed the entire suite while
-                      // changing what every consumer replays. That is the drift
-                      // this vector exists to see, and a corpus that only
-                      // produces cannot see it.
+                      // A bare root IS its own trailing separator, which is the
+                      // whole of issue #547 on both sides at once: the producer
+                      // matched nothing (so the value kept absolute paths) and
+                      // the consumer emitted `//inc/a.hpp`.
+                      //
+                      // This row is why the `RegionEffect` columns exist. It was
+                      // added for #483 with a comment claiming it covered both
+                      // sides, and it covered NEITHER -- with nothing
+                      // canonicalized there was no token, so localization had
+                      // nothing to localize. A digest cannot tell that from a row
+                      // doing real work; both just contribute bytes. The columns
+                      // below are the assertion the digest structurally cannot
+                      // make.
                       .producerSourceRoot = "/",
                       .producerBuildTree = "/build",
                       .consumerSourceRoot = "/",
                       .consumerBuildTree = "/out",
                       .text = "Note: including file: /inc/a.hpp\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "a bare drive root produces, and a bare drive root consumes",
+                      // The Windows half of the row above. It was absent from the
+                      // corpus in ANY form -- not inert, missing -- so neither the
+                      // inertness check nor the one-sided-variation check would
+                      // have found it on its own. Only enumerating every shape
+                      // against both sides did.
+                      .producerSourceRoot = R"(C:\)",
+                      .producerBuildTree = R"(C:\out)",
+                      .consumerSourceRoot = R"(D:\)",
+                      .consumerBuildTree = R"(D:\out)",
+                      .text = R"(Note: including file: C:\inc\a.hpp)"
+                              "\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "a drive-relative root consumes",
+                      // The mirror of the drive-relative PRODUCER row above. It
+                      // passes, and it is here for that reason: nothing
+                      // distinguished it from the bare roots before it was run, so
+                      // a row documenting a shape as sound is worth as much as one
+                      // that catches a defect. "We checked once by hand" is not
+                      // coverage.
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(C:src\proj)",
+                      .consumerBuildTree = R"(C:src\proj\out)",
+                      .text = R"(Note: including file: C:\src\proj\inc\a.hpp)"
+                              "\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "a UNC root consumes",
+                      // The mirror of the UNC PRODUCER row above, and here for the
+                      // same reason. It also pins the one shape where a leading
+                      // double separator is CORRECT, so a future "collapse the
+                      // double separator" fix cannot quietly break it.
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(\\host\share\proj)",
+                      .consumerBuildTree = R"(\\host\share\proj\out)",
+                      .text = R"(Note: including file: C:\src\proj\inc\a.hpp)"
+                              "\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "a bare drive root consumes",
                       .producerSourceRoot = R"(C:\src\proj)",
                       .producerBuildTree = R"(C:\src\proj\out)",
                       .consumerSourceRoot = R"(D:\)",
                       .consumerBuildTree = R"(D:\out)",
                       .text = "Note: including file: C:\\src\\proj\\inc\\a.hpp\r\n",
-                      .grammar = Grammar::ShowIncludes },
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "empty region",
                       .producerSourceRoot = "/home/dev/proj",
                       .producerBuildTree = "/home/dev/proj/build",
                       .consumerSourceRoot = "/srv/ci/checkout",
                       .consumerBuildTree = "/srv/ci/checkout/out",
                       .text = "",
-                      .grammar = Grammar::MsvcDiagnostics },
+                      .grammar = Grammar::MsvcDiagnostics,
+                      .producerEffect = RegionEffect::Preserves,
+                      .consumerEffect = RegionEffect::Preserves },
 };
 
 /// One generation of the stored-value contract: the `CompileValueVersion` it was
@@ -419,7 +543,13 @@ struct StoredValueGeneration
 /// below are where the retired ones then live.
 /// @return The table, newest last.
 constexpr std::array StoredValueGenerations {
+    // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
+    // producer side and doubled its separator on the consumer side. The row stays so
+    // that putting the old byte back reproduces a retired digest and fails, whatever
+    // the golden says -- which is the whole reason the table is keyed on the version
+    // rather than being a lone golden value.
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
+    StoredValueGeneration { .digest = "2de61702e93b6c84e24c6d54c7c6db072d5ac0d5591826c871ec8f2aa37ca669", .version = 2 },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
@@ -564,7 +694,64 @@ namespace
     return accepted;
 }
 
+/// Render a `RegionEffect` for a failure message.
+/// @param effect What a row declared.
+/// @return Its spelling.
+[[nodiscard]] std::string_view NameOf(RegionEffect effect)
+{
+    switch (effect)
+    {
+        case RegionEffect::Rewrites:
+            return "Rewrites";
+        case RegionEffect::Preserves:
+            return "Preserves";
+    }
+    return "?";
+}
+
 } // namespace
+
+TEST_CASE("Every conformance row does what it says on each side")
+{
+    // The assertion a digest structurally cannot make. A row that rewrites nothing
+    // contributes bytes exactly as one that rewrites everything does, so without
+    // this the corpus can grow, read as thorough, and assert progressively less --
+    // which is what happened to the bare-root row added in #483 and repaired in
+    // #547. Declaring the effect per side, rather than requiring every row to change
+    // something, is what keeps the two DELIBERATE no-ops honest instead of waived.
+    for (auto const& row: ConformanceCorpus)
+    {
+        CompileValue produced;
+        produced.objectBlob = { std::byte { 0x7F } };
+        produced.textRegions.push_back(TextRegion { .grammar = row.grammar, .bytes = std::string { row.text } });
+
+        auto const canonical =
+            CanonicalStoredValue(EncodeCompileValue(produced), row.producerSourceRoot, row.producerBuildTree);
+        REQUIRE(canonical.outcome == CanonicalizationOutcome::Canonicalized);
+        auto const stored = DecodeCompileValue(canonical.bytes);
+        REQUIRE(stored.has_value());
+        REQUIRE(stored->textRegions.size() == 1);
+        auto const& canonText = stored->textRegions.front().bytes;
+
+        PathCanon::Layout const consumer { .sourceRoot = std::string { row.consumerSourceRoot },
+                                           .buildTree = std::string { row.consumerBuildTree } };
+        auto const localized = PathCanon::LocalizeRegion(canonText, row.grammar, consumer);
+
+        auto const observed = [](bool changed) {
+            return changed ? RegionEffect::Rewrites : RegionEffect::Preserves;
+        };
+
+        INFO("row \"" << row.name << "\" declares producerEffect=" << NameOf(row.producerEffect) << " but canonicalization "
+                      << (canonText != row.text ? "CHANGED" : "did not change")
+                      << " the text. A row that rewrites nothing asserts nothing, and the digest cannot see the "
+                         "difference.");
+        CHECK(observed(canonText != row.text) == row.producerEffect);
+
+        INFO("row \"" << row.name << "\" declares consumerEffect=" << NameOf(row.consumerEffect) << " but localization "
+                      << (localized != canonText ? "CHANGED" : "did not change") << " the canonical text.");
+        CHECK(observed(localized != canonText) == row.consumerEffect);
+    }
+}
 
 TEST_CASE("The conformance corpus covers every grammar the decoder accepts")
 {
