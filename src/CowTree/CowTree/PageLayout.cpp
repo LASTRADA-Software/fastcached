@@ -41,17 +41,6 @@ namespace
             return std::byteswap(raw);
     }
 
-    template <typename T>
-    T PeekLe(BytesView src, std::size_t offset) noexcept
-    {
-        T raw {};
-        std::memcpy(&raw, src.data() + offset, sizeof(T));
-        if constexpr (std::endian::native == std::endian::little)
-            return raw;
-        else
-            return std::byteswap(raw);
-    }
-
 } // namespace
 
 std::expected<PageHeader, CowTreeError> DecodePageHeader(BytesView page) noexcept
