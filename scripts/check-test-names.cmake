@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
+# Policies are pinned because a `cmake -P` script gets OLD defaults for every
+# policy the project has not stated, which has already cost this tree once
+# (CMP0057, where `if(... IN_LIST ...)` silently did nothing in a check).
+cmake_minimum_required(VERSION 3.28)
+#
 # Test-name hygiene: fail if a Catch2 case is named something the CTest
 # registration cannot pass back to the runner.
 #
@@ -52,9 +57,41 @@ set(caseCount 0)
 
 foreach(source IN LISTS testSources)
     math(EXPR scannedCount "${scannedCount} + 1")
-    file(STRINGS "${source}" lines REGEX "${FastCachedCaseMacroPattern}")
+    # Read the bytes and walk the newlines. Never build a CMake list from file
+    # content, and never neutralise anything in it.
+    #
+    # `file(STRINGS)` returns a LIST, and one UNBALANCED `[` or `]` makes CMake's
+    # list parser swallow every following element. Measured on this check: one `]`
+    # appended to a TEST_CASE line took it from 2992 cases to 2985, and it PASSED
+    # both times -- the file count did not move, so nothing in the summary said so.
+    #
+    # The REGEX argument does not protect it: it filters BEFORE the list is built.
+    #
+    # Neutralising the brackets -- the fix the other converted readers use -- is
+    # WRONG here and was tried first. Catch2 tags are literally `[cache]` and a case
+    # name may contain brackets, so replacing them rewrites the very text this check
+    # extracts and round-trips: it moved the count to 2990 and altered every tag.
+    #
+    # Walking newlines preserves the text exactly and costs nothing measurable --
+    # 1s across all 192 sources against 1s for `file(STRINGS)`, same 2992 lines.
+    file(READ "${source}" sourceRest)
+    string(REPLACE "\r\n" "\n" sourceRest "${sourceRest}")
     file(RELATIVE_PATH relative "${FASTCACHED_SOURCE_DIR}" "${source}")
-    foreach(line IN LISTS lines)
+    while(NOT sourceRest STREQUAL "")
+        string(FIND "${sourceRest}" "\n" sourceNewline)
+        if(sourceNewline EQUAL -1)
+            set(line "${sourceRest}")
+            set(sourceRest "")
+        else()
+            string(SUBSTRING "${sourceRest}" 0 ${sourceNewline} line)
+            math(EXPR sourceNewline "${sourceNewline} + 1")
+            string(SUBSTRING "${sourceRest}" ${sourceNewline} -1 sourceRest)
+        endif()
+    
+        # What the REGEX argument used to do, now that the reader cannot.
+        if(NOT line MATCHES "${FastCachedCaseMacroPattern}")
+            continue()
+        endif()
         # The case name is the first string literal on the line. Taken that way
         # rather than as "the first argument", which is what lets one expression
         # cover TEST_CASE_METHOD too -- its name is the SECOND argument, and a
@@ -68,7 +105,7 @@ foreach(source IN LISTS testSources)
         if(caseName MATCHES "^-")
             list(APPEND violations "  ${relative}: \"${caseName}\"")
         endif()
-    endforeach()
+    endwhile()
 endforeach()
 
 if(NOT violations STREQUAL "")
