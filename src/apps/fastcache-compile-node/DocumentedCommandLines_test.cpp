@@ -204,13 +204,42 @@ constexpr std::array SkippedExamples {
 }
 
 /// Whether @p command names a verb that ends the process before the startup gate.
+///
+/// A range-based `for` rather than `ranges::find_if`, and that is portability rather
+/// than taste: an iterator into a `std::array` is a raw POINTER on libstdc++ and
+/// libc++ and a CLASS on the MSVC STL, so `readability-qualified-auto` asks for a
+/// spelling (`auto const *const`) that only compiles on two of the three. The three
+/// lookups in this file each take the same shape for the same reason.
 /// @param command The command line as written.
 /// @return The row, or nullptr when this command line is a start.
 [[nodiscard]] NonStartVerb const* NonStartVerbIn(std::string_view command)
 {
-    auto const row = std::ranges::find_if(
-        NonStartVerbs, [command](NonStartVerb const& verb) { return command.find(verb.flag) != std::string_view::npos; });
-    return row == NonStartVerbs.end() ? nullptr : &*row;
+    for (auto const& verb: NonStartVerbs)
+        if (command.contains(verb.flag))
+            return &verb;
+    return nullptr;
+}
+
+/// The exclusion row covering @p page, if any.
+/// @param page A page path, relative to the repository root.
+/// @return The row, or nullptr when the page is checked.
+[[nodiscard]] ExcludedPage const* ExclusionFor(std::string_view page)
+{
+    for (auto const& row: ExcludedPages)
+        if (page.contains(row.needle))
+            return &row;
+    return nullptr;
+}
+
+/// The skip row covering @p command, if any.
+/// @param command A documented command line.
+/// @return The row, or nullptr when the command line is checked.
+[[nodiscard]] SkippedExample const* SkipFor(std::string_view command)
+{
+    for (auto const& row: SkippedExamples)
+        if (command.contains(row.needle))
+            return &row;
+    return nullptr;
 }
 
 /// One command line found in the documentation.
@@ -407,9 +436,7 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
     std::vector<std::string> excludedSeen;
     for (auto const& page: pages)
     {
-        auto const excluded = std::ranges::find_if(
-            ExcludedPages, [&page](ExcludedPage const& row) { return page.find(row.needle) != std::string::npos; });
-        if (excluded != ExcludedPages.end())
+        if (auto const* excluded = ExclusionFor(page); excluded != nullptr)
         {
             excludedSeen.emplace_back(excluded->needle);
             continue;
@@ -438,10 +465,7 @@ TEST_CASE("Every documented command line is one the node would start on", "[node
             continue;
         }
 
-        auto const skip = std::ranges::find_if(SkippedExamples, [&found](SkippedExample const& row) {
-            return found.command.find(row.needle) != std::string::npos;
-        });
-        if (skip != SkippedExamples.end())
+        if (auto const* skip = SkipFor(found.command); skip != nullptr)
         {
             skipsUsed.emplace_back(skip->needle);
             continue;
