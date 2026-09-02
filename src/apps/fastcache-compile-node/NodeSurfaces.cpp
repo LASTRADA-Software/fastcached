@@ -179,12 +179,11 @@ namespace
             .flags = { "--admin-listen", {} },
             .protocol = SurfaceProtocol::Tcp,
             .bindFailure = BindFailurePolicy::Refuse,
-            .bindFailureReason =
-                "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
-                "it, so a worker that started without one looks healthy to the only thing that would have "
-                "noticed. fastcached answers this differently and correctly for itself: its admin surface "
-                "is shared infrastructure an operator watches deliberately, where a node's is a probe "
-                "target somebody attached. Same surface, two binaries, two right answers",
+            .bindFailureReason = "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
+                                 "it, so a worker that started without one looks healthy to the only thing that would have "
+                                 "noticed. fastcached answers this differently and correctly for itself: its admin surface "
+                                 "is shared infrastructure an operator watches deliberately, where a node's is a probe "
+                                 "target somebody attached. Same surface, two binaries, two right answers",
             .defaultHost = AdminListenDefaultHost,
             .spec = &NodeConfig::adminListen,
             .grammar = ListenEndpointGrammar,
@@ -370,11 +369,7 @@ std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::st
             // it. The reason travels HERE because there is no refusal to carry it,
             // and because a tolerated failure is the case where somebody later asks
             // why the node thought this was survivable.
-            logger.Logf(LogLevel::Warn,
-                        "{}: {}; continuing without it -- {}",
-                        row.name,
-                        message,
-                        row.bindFailureReason);
+            logger.Logf(LogLevel::Warn, "{}: {}; continuing without it -- {}", row.name, message, row.bindFailureReason);
             return {};
 
         case BindFailurePolicy::Unstated:
@@ -385,9 +380,8 @@ std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::st
     // Reached only by a caller that built a row by hand and left the column out --
     // which is a programmer error, and is the one case where refusing is not a
     // judgement about the surface but about the caller.
-    return std::unexpected { std::format("{}: {} (no bind-failure policy stated for this surface)",
-                                         row.name,
-                                         std::move(message)) };
+    return std::unexpected { std::format(
+        "{}: {} (no bind-failure policy stated for this surface)", row.name, std::move(message)) };
 }
 
 std::vector<std::string_view> FlagsOf(SurfaceRow const& row)

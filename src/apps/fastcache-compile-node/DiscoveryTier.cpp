@@ -145,15 +145,22 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
 
     auto socket = OpenSharedPortUdpSocket(bindHost, beaconSocket.port, replyPort);
     if (socket == nullptr)
-        // Both are named, because either can be the one that failed and this
-        // cannot tell which. A message that blamed the beacon port alone would
-        // send an operator to look at a port that bound perfectly.
-        return std::unexpected { std::format(
-            "cannot bind the UDP sockets discovery needs: {}:{} to listen on, and {} to answer on",
-            bindHost,
-            beaconSocket.port,
-            cfg.discoveryReplyPort != 0 ? std::format("{}:{}", bindHost, cfg.discoveryReplyPort)
-                                        : std::string { "a port of this node's own" }) };
+    {
+        // Through the row (#352). Both ports are named because either can be the one
+        // that failed and this cannot tell which -- a message blaming the beacon port
+        // alone sends an operator to look at a port that bound perfectly.
+        auto judged = JudgeBindFailure(
+            RowFor(NodeSurface::Discovery),
+            std::format("cannot bind the UDP sockets discovery needs: {}:{} to listen on, and {} to answer on",
+                        bindHost,
+                        beaconSocket.port,
+                        cfg.discoveryReplyPort != 0 ? std::format("{}:{}", bindHost, cfg.discoveryReplyPort)
+                                                    : std::string { "a port of this node's own" }),
+            logger);
+        if (!judged.has_value())
+            return std::unexpected { std::move(judged).error() };
+        return std::unique_ptr<DiscoveryTier> {};
+    }
 
     // The port the operator configured, which is NOT the one the pair reports:
     // that is where this node is answered. Both go in the startup line.

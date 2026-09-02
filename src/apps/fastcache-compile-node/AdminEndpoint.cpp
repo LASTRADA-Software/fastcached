@@ -858,10 +858,20 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
 
     auto listener = BlockingListener::Bind(endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())
-        return std::unexpected { std::format("cannot bind {}:{} ({})",
-                                             endpoint.host,
-                                             endpoint.port,
-                                             listener ? listener->BindError() : std::string_view { "null listener" }) };
+    {
+        // The verdict is the row's (#352), and this surface is the one where it is
+        // genuinely a per-BINARY decision rather than a per-surface one: fastcached
+        // warns past the same failure on the same surface, correctly for what it is.
+        auto judged = JudgeBindFailure(RowFor(surface),
+                                       std::format("cannot bind {}:{} ({})",
+                                                   endpoint.host,
+                                                   endpoint.port,
+                                                   listener ? listener->BindError() : std::string_view { "null listener" }),
+                                       logger);
+        if (!judged.has_value())
+            return std::unexpected { std::move(judged).error() };
+        return std::unique_ptr<AdminEndpoint> {};
+    }
 
     // The endpoint's own values, not this caller's: the daemon serves the same
     // server on the same terms, and two spellings of one decision drift.

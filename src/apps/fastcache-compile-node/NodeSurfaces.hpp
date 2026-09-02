@@ -300,9 +300,7 @@ struct SurfaceRow
 /// @param message The opener's own operator-facing sentence, passed through unchanged.
 /// @param logger Where a tolerated failure is reported.
 /// @return Nothing when the caller may continue; @p message when it must refuse.
-[[nodiscard]] std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row,
-                                                                std::string message,
-                                                                ILogger& logger);
+[[nodiscard]] std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::string message, ILogger& logger);
 
 /// The flags a row names, without the empty second entry.
 /// @param row The surface to read.

@@ -303,10 +303,24 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // diagnostic rather than nothing at all, so testing for null tests nothing --
     // the defect the worker's own listener records having shipped once.
     if (_listener == nullptr || !_listener->IsBound())
-        return std::unexpected { std::format("cannot bind {}:{}: {}",
-                                             bindAddress,
-                                             bindPort,
-                                             _listener ? _listener->BindError() : std::string_view { "null listener" }) };
+    {
+        // Through the row (#352). Tolerating here would leave consensus dialling
+        // peers with nothing able to answer back -- this node would campaign, be
+        // counted in the quorum, and never receive a vote or an AppendEntries. That
+        // is precisely the failure the row's reason describes, which is why the row
+        // says `Refuse` and why this branch exists only so the row is what decides.
+        auto judged =
+            JudgeBindFailure(RowFor(NodeSurface::Raft),
+                             std::format("cannot bind {}:{}: {}",
+                                         bindAddress,
+                                         bindPort,
+                                         _listener ? _listener->BindError() : std::string_view { "null listener" }),
+                             _logger);
+        if (!judged.has_value())
+            return std::unexpected { std::move(judged).error() };
+        _listener.reset();
+        return {};
+    }
 
     // Two lists out of two, and the split is the whole of how a node joins. Who
     // this node DIALS is everything its operator named; who consensus COUNTS is

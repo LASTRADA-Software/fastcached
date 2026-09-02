@@ -118,14 +118,26 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // The sentence names the REMEDY rather than the diagnosis. "cannot bind" is a wall
     // at three in the morning; the operator needs to be told what almost certainly
     // holds the port and that this node does not need it (#229).
-    return std::unexpected { std::format(
-        "--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
-        "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
-        "address nothing answers, which every client meets as a failed connection and a silent local "
-        "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
-        "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "
-        "daemon does, its cache verbs included",
-        bound.error()) };
+    // The verdict is the ROW's, not this function's (#352). What stays here is the
+    // sentence: it names the remedy rather than the diagnosis (#229), and the row
+    // carries the rationale instead -- two different readers, two different texts.
+    auto judged = JudgeBindFailure(
+        RowFor(NodeSurface::Node),
+        std::format("--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
+                    "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
+                    "address nothing answers, which every client meets as a failed connection and a silent local "
+                    "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
+                    "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "
+                    "daemon does, its cache verbs included",
+                    bound.error()),
+        logger);
+    if (!judged.has_value())
+        return std::unexpected { std::move(judged).error() };
+
+    // Tolerated. Unreachable while this row is `Refuse`, and written rather than
+    // asserted because the row is what decides it: a build that flips the column
+    // must not also need this branch written.
+    return std::unique_ptr<NodeFrameSurface> {};
 }
 
 } // namespace FastCache::Node
