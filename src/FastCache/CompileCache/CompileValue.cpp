@@ -5,6 +5,7 @@
 #include <FastCache/Core/WireFields.hpp>
 
 #include <array>
+#include <format>
 #include <optional>
 #include <ranges>
 #include <utility>
@@ -13,8 +14,6 @@ namespace FastCache
 {
 namespace
 {
-
-    constexpr std::uint8_t CompileValueVersion = 1;
 
     /// The fewest wire bytes one encoded text region can occupy: its grammar tag and
     /// its length prefix, with empty text. Read straight off `EncodeCompileValue`'s
@@ -122,12 +121,64 @@ namespace
         std::size_t _pos { 0 };
     };
 
+    /// One typed refusal from this decoder.
+    /// @param code    Which kind of refusal this is.
+    /// @param context What was wrong with the bytes, for a log.
+    /// @return The refusal.
+    [[nodiscard]] std::unexpected<ProtocolError> Refuse(ProtocolErrorCode code, std::string context)
+    {
+        return std::unexpected(ProtocolError { .code = code, .context = std::move(context) });
+    }
+
+    /// The refusal for bytes that are damaged or mis-framed.
+    /// @param context What was wrong.
+    /// @return The refusal.
     [[nodiscard]] std::unexpected<ProtocolError> Malformed(std::string context)
     {
-        return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = std::move(context) });
+        return Refuse(ProtocolErrorCode::MalformedFrame, std::move(context));
+    }
+
+    /// The refusal for a value whose leading byte names a generation this build does
+    /// not implement -- deliberately NOT `Malformed`, because the bytes are not
+    /// damaged and a caller that cannot tell those two apart applies one policy to
+    /// both. `IsForeignGeneration` is how a caller reads it back.
+    /// @param generation The leading byte that was read.
+    /// @return The typed refusal, naming both generations.
+    [[nodiscard]] std::unexpected<ProtocolError> ForeignGenerationRefusal(std::uint8_t generation)
+    {
+        return Refuse(ProtocolErrorCode::UnsupportedFeature, ForeignGenerationMessage(generation));
+    }
+
+    /// Where the generation sits in an encoded value: its leading byte.
+    ///
+    /// The named form of a position `DecodeCompileValue` also reads, through its
+    /// `Cursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
+    /// together -- a field added ahead of the generation changes both. It exists so
+    /// that `CanonicalStoredValue`, which needs the number for a refusal that names
+    /// it, asks a question with a name rather than writing `front()` a hundred lines
+    /// from the code that guarantees the answer.
+    ///
+    /// @param bytes An encoded value, possibly empty.
+    /// @return The declared generation, or none when there is no leading byte to
+    ///         declare one -- which is not the same as declaring generation zero.
+    [[nodiscard]] std::optional<std::uint8_t> DeclaredGeneration(std::span<std::byte const> bytes) noexcept
+    {
+        if (bytes.empty())
+            return std::nullopt;
+        return static_cast<std::uint8_t>(bytes.front());
     }
 
 } // namespace
+
+bool IsForeignGeneration(ProtocolError const& error) noexcept
+{
+    return error.code == ProtocolErrorCode::UnsupportedFeature;
+}
+
+std::string ForeignGenerationMessage(std::uint8_t generation)
+{
+    return std::format("stored value is generation {}; this build implements {}", generation, CompileValueVersion);
+}
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
@@ -147,6 +198,67 @@ std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
     return out;
 }
 
+namespace
+{
+    /// Everything after the generation byte, which is the whole of the layout.
+    ///
+    /// Split out because it is run TWICE, and the second run is what tells a stored
+    /// value of another generation from bytes that are not a stored value at all: the
+    /// generation byte alone cannot, since almost no opaque blob happens to begin with
+    /// this build's. `DecodeCompileValue` reads the leading byte and hands the rest
+    /// here either way.
+    ///
+    /// @param cursor Positioned immediately after the generation byte.
+    /// @return The decoded value, or why the layout did not hold.
+    [[nodiscard]] std::expected<CompileValue, ProtocolError> DecodeAfterGeneration(Cursor& cursor)
+    {
+        CompileValue value;
+
+        std::uint32_t objectLen {};
+        if (!cursor.ReadU32(objectLen))
+            return Malformed("truncated object length");
+        if (!cursor.ReadBytes(objectLen, value.objectBlob))
+            return Malformed("truncated object blob");
+
+        std::uint32_t regionCount {};
+        if (!cursor.ReadU32(regionCount))
+            return Malformed("truncated region count");
+
+        // The count is a claim about bytes this frame must already carry -- see
+        // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
+        // before anything is sized from it (issue #267).
+        if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
+            return Malformed("region count exceeds what the remaining bytes can supply");
+
+        // No `reserve(regionCount)`: a validated count is still an amplifier, and the
+        // realistic count here is one per grammar, so growing from the regions actually
+        // decoded costs nothing measurable beside the object blob copied just above.
+        for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
+        {
+            std::uint8_t grammarTag {};
+            if (!cursor.ReadU8(grammarTag))
+                return Malformed("truncated region grammar");
+            if (!IsKnownGrammar(grammarTag))
+                return Malformed("unknown region grammar tag");
+
+            std::uint32_t textLen {};
+            if (!cursor.ReadU32(textLen))
+                return Malformed("truncated region text length");
+
+            TextRegion region { .grammar = static_cast<PathCanon::Grammar>(grammarTag), .bytes = {} };
+            if (!cursor.ReadString(textLen, region.bytes))
+                return Malformed("truncated region text");
+            value.textRegions.push_back(std::move(region));
+        }
+
+        if (cursor.Remaining() != 0)
+            return Malformed("trailing bytes after compile-value frame");
+
+        return value;
+    }
+
+} // namespace
+
 std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byte const> bytes)
 {
     Cursor cursor { bytes };
@@ -154,61 +266,64 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     std::uint8_t version {};
     if (!cursor.ReadU8(version))
         return Malformed("empty compile-value frame");
-    if (version != CompileValueVersion)
-        return Malformed("unknown compile-value version");
 
-    CompileValue value;
-
-    std::uint32_t objectLen {};
-    if (!cursor.ReadU32(objectLen))
-        return Malformed("truncated object length");
-    if (!cursor.ReadBytes(objectLen, value.objectBlob))
-        return Malformed("truncated object blob");
-
-    std::uint32_t regionCount {};
-    if (!cursor.ReadU32(regionCount))
-        return Malformed("truncated region count");
-
-    // The count is a claim about bytes this frame must already carry -- see
-    // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
-    // before anything is sized from it (issue #267).
-    if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
-        return Malformed("region count exceeds what the remaining bytes can supply");
-
-    // No `reserve(regionCount)`: a validated count is still an amplifier, and the
-    // realistic count here is one per grammar, so growing from the regions actually
-    // decoded costs nothing measurable beside the object blob copied just above.
-    for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, regionCount))
-    {
-        std::uint8_t grammarTag {};
-        if (!cursor.ReadU8(grammarTag))
-            return Malformed("truncated region grammar");
-        if (!IsKnownGrammar(grammarTag))
-            return Malformed("unknown region grammar tag");
-
-        std::uint32_t textLen {};
-        if (!cursor.ReadU32(textLen))
-            return Malformed("truncated region text length");
-
-        TextRegion region { .grammar = static_cast<PathCanon::Grammar>(grammarTag), .bytes = {} };
-        if (!cursor.ReadString(textLen, region.bytes))
-            return Malformed("truncated region text");
-        value.textRegions.push_back(std::move(region));
-    }
-
-    if (cursor.Remaining() != 0)
-        return Malformed("trailing bytes after compile-value frame");
-
-    return value;
+    // The layout is parsed BEFORE the generation is judged, because a leading byte
+    // that is not ours is on its own no evidence of another generation. Reading it
+    // that way was a real defect rather than a conservative one: almost no opaque
+    // blob begins with 0x01, so every opaque value was called foreign and REFUSED --
+    // destroying the node cache tier's documented policy of storing an opaque value
+    // verbatim, which is a policy this layer has no business overturning. Two of that
+    // tier's tests said so.
+    //
+    // So a foreign generation is reported only for a frame that HOLDS TOGETHER behind
+    // the byte: positive evidence, rather than the absence of ours.
+    //
+    // The residual is real and its first description here was BACKWARDS. A future
+    // generation that moves the FRAMING as well parses as junk and comes back
+    // `NotACompileValue` -- and a node's tier handles that by storing the bytes
+    // VERBATIM, so the residual re-enters through the exact door this closes, for the
+    // class of bump most likely to cause it. `CompileValueVersion` names the framing
+    // too, and nothing couples it to an `objkey-v*` bump, so two such generations do
+    // meet over one key by design. Nothing in this build can separate an unknown
+    // layout from junk, so it is bounded rather than closed, and the bounds are worth
+    // naming because they are what makes it survivable: the daemon refuses
+    // `NotACompileValue` outright, so `RemoteUpstream::Store` cannot carry it to the
+    // SHARED cache, and a node's tier is loopback-only -- one machine's own build
+    // output, not the fleet's. Tracked rather than left in prose.
+    //
+    // The generation that keeps the framing and moves the canonicalization -- the
+    // shape #547 will have -- is caught exactly.
+    auto decoded = DecodeAfterGeneration(cursor);
+    if (version == CompileValueVersion)
+        return decoded;
+    if (decoded.has_value())
+        return ForeignGenerationRefusal(version);
+    return Malformed(std::format("leading byte {} is not this build's generation and the layout behind it does not "
+                                 "hold, so these bytes are not a stored value",
+                                 version));
 }
 
-std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte const> value,
-                                                           std::string_view sourceRoot,
-                                                           std::string_view buildTree)
+StoredValueCanonicalization CanonicalStoredValue(std::span<std::byte const> value,
+                                                 std::string_view sourceRoot,
+                                                 std::string_view buildTree)
 {
     auto decoded = DecodeCompileValue(value);
     if (!decoded.has_value())
-        return std::nullopt;
+    {
+        // The one place the two absent cases are told apart, and it asks the shared
+        // predicate rather than comparing the code itself -- two spellings of one
+        // rule are two places for it to drift, which is the argument this file makes
+        // about the canonicalization recipe one paragraph up.
+        if (!IsForeignGeneration(decoded.error()))
+            return { .bytes = {}, .outcome = CanonicalizationOutcome::NotACompileValue, .generation = 0 };
+
+        return { .bytes = {},
+                 .outcome = CanonicalizationOutcome::ForeignGeneration,
+                 // Cannot be absent: that refusal is only produced after the leading
+                 // byte was read. `value_or` rather than a dereference so the
+                 // impossible case is a zero rather than undefined behaviour.
+                 .generation = DeclaredGeneration(value).value_or(0) };
+    }
 
     PathCanon::Layout const producer { .sourceRoot = std::string { sourceRoot }, .buildTree = std::string { buildTree } };
 
@@ -217,7 +332,7 @@ std::optional<std::vector<std::byte>> CanonicalStoredValue(std::span<std::byte c
     for (auto& region: decoded->textRegions)
         region.bytes = PathCanon::CanonicalizeRegion(region.bytes, region.grammar, producer);
 
-    return EncodeCompileValue(*decoded);
+    return { .bytes = EncodeCompileValue(*decoded), .outcome = CanonicalizationOutcome::Canonicalized, .generation = 0 };
 }
 
 } // namespace FastCache

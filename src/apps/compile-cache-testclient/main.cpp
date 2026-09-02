@@ -328,7 +328,10 @@ int DoFetch(TestClient::Args const& a)
 
     auto decoded = DecodeCompileValue(payload);
     if (!decoded.has_value())
-        Die("FETCH returned a malformed compile-value");
+        // The decoder's own words, not a fixed sentence: this tool exists to diagnose
+        // this wire, and a foreign generation and a damaged value are the two things
+        // it would otherwise be the one place unable to tell apart (#483).
+        Die("FETCH returned a value this build cannot read: " + decoded.error().context);
 
     // Localize every region to the CONSUMER layout (srcRoot/buildTree passed on
     // the fetch command line), then require every dependency it names to exist.

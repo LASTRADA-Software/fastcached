@@ -190,16 +190,47 @@ namespace
         // were spelled out in this function and nowhere else -- so when a compile node
         // became a second server for this wire it had none of them (#319). Sharing
         // only the rewrite would have left the ORDER here to be remembered twice.
-        auto const canonicalBytes =
+        auto canonical =
             CanonicalStoredValue(fields->value, BytesToString(fields->srcRoot), BytesToString(fields->buildTree));
-        if (!canonicalBytes.has_value())
-            // This server speaks the whole protocol and says so; a node's cache tier
-            // stores an opaque value verbatim instead. One policy each, above the one
-            // they now share.
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
+        switch (canonical.outcome)
+        {
+            case CanonicalizationOutcome::Canonicalized:
+                break;
+            case CanonicalizationOutcome::NotACompileValue:
+                // This server speaks the whole protocol and says so; a node's cache
+                // tier stores an opaque value verbatim instead. One policy each,
+                // above the one they now share.
+                co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
+            case CanonicalizationOutcome::ForeignGeneration:
+                // A value written under a canonicalization spec this build does not
+                // implement. Refused rather than stored, because storing it would
+                // mean storing text this server cannot rewrite -- the producing
+                // checkout's absolute paths under a key every machine computes, which
+                // is what `CanonicalStoredValue` exists to prevent (#483). Neither
+                // server has a choice about this one.
+                //
+                // The MESSAGE names both generations, and it is the whole of the
+                // operator's diagnostic here: a rolling upgrade otherwise presents as
+                // stores that fail for no stated reason, and this reply is the only
+                // place a client of the DAEMON can see that the fleet is merely mixed.
+                //
+                // The CODE is still `MalformedValue`, and that is wrong in the way
+                // `.agent/rules/storage.md` records for `Corrupt` against
+                // `UnsupportedFormatVersion` -- the obvious remedy for a cache
+                // reported damaged is to wipe it. Its own wire code and counter row
+                // are #544, which depends on this change rather than being part of
+                // it, and which is what turns these two arms into a table.
+                co_return co_await ReplyError(
+                    socket, Wire::ErrorCode::MalformedValue, ForeignGenerationMessage(canonical.generation))
+                    ? Next::Continue
+                    : Next::Abort;
+        }
         auto const keyStr = BytesToString(fields->key);
         auto const groupStr = BytesToString(fields->prefetchGroup);
-        auto const stored = engine->Set(keyStr, *canonicalBytes, /*flags=*/0, /*exptime=*/0);
+        // Moved, not copied: `CacheEngine::Set` takes the value BY VALUE and
+        // `canonical` is dead after this call, so passing it by name spent a full
+        // object-blob memcpy plus an allocation on every STORE.
+        auto const stored = engine->Set(keyStr, std::move(canonical.bytes), /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
             co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
 

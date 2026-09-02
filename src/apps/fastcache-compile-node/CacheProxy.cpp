@@ -67,6 +67,39 @@ namespace
             .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload,
         };
 
+        /// A `STORE` whose value names a canonicalization generation this build does
+        /// not implement.
+        ///
+        /// **Counted**, and the ground matters because the obvious one does not hold.
+        /// "`CompileValueVersion` has never moved, so the baseline is zero" is true
+        /// today and expires exactly when this counter starts doing work — it argues
+        /// for the series from the absence of the thing it counts, and a future author
+        /// copying it would carry that mistake to the next arm.
+        ///
+        /// The ground that survives a bump: **a converged fleet produces none.** That
+        /// is what separates it from the `AUTH` arm below, which a correctly
+        /// configured launcher emits once per exchange forever, so no scan can ever be
+        /// seen inside that series. This one is zero, then a burst while a rollout is
+        /// in flight — once per TU, which is a lot — then zero again. A series that
+        /// returns to zero is readable however tall the burst was, and the burst is
+        /// the event. Against the third test: nothing else sees it, since
+        /// `LocalCache::Store` counts writes that FAILED and this is a write never
+        /// attempted.
+        ///
+        /// Reachable by the ordinary path rather than a direct `Answer`: it is what a
+        /// launcher at another generation produces, and a fleet is permanently
+        /// mid-upgrade
+        /// ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)).
+        ///
+        /// What an operator does about it is what they do about the version row above
+        /// — find the machine that is out of step, finish or roll back — and it is the
+        /// only view of what #483's decision costs, since refusing buys correctness by
+        /// giving up hits and the launcher reports only a miss.
+        constexpr Cc::SurfaceRefusal ForeignGeneration {
+            .code = Wire::ErrorCode::MalformedValue,
+            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
+        };
+
         /// A frame whose payload is not the length its header declared.
         ///
         /// **Uncounted, because it cannot fire through the listener.**
@@ -227,13 +260,40 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             // absolute paths and every consumer replayed them into its build system's
             // dependency graph (#319).
             //
-            // A value that does not decode is stored VERBATIM rather than refused,
-            // which is where this server's policy differs from the daemon's: an
-            // opaque value is not this tier's business to reject. `CanonicalStoredValue`
-            // answers `nullopt` and each server says what it wants to.
+            // Bytes that are not a stored value at all are stored VERBATIM rather
+            // than refused, which is where this server's policy differs from the
+            // daemon's: an opaque value is not this tier's business to reject.
+            //
+            // A value of another GENERATION is not in that category and this tier has
+            // no choice about it (#483). It used to be, because `CanonicalStoredValue`
+            // answered one `nullopt` for both -- so a launcher at generation N storing
+            // into a node at N+1 landed on the verbatim arm and put the producing
+            // checkout's absolute paths into the shared cache under a key every
+            // machine computes, which is #229/#319 reached by nothing worse than a
+            // rolling upgrade. The switch is what protects: `bytes` is empty for the
+            // foreign case, but the fallback here was never the canonical bytes, so
+            // `outcome == Canonicalized ? canonical.bytes : fields->value` would
+            // compile, read naturally, and reinstate the whole thing.
             auto const canonical = CanonicalStoredValue(
                 fields->value, Wire::AsStringView(fields->srcRoot), Wire::AsStringView(fields->buildTree));
-            auto const toStore = canonical.has_value() ? std::span<std::byte const> { *canonical } : fields->value;
+
+            std::span<std::byte const> toStore {};
+            switch (canonical.outcome)
+            {
+                case CanonicalizationOutcome::Canonicalized:
+                    toStore = canonical.bytes;
+                    break;
+                case CanonicalizationOutcome::NotACompileValue:
+                    // The verbatim policy, at the case label that means it. It used
+                    // to be the initializer above, which is the same separation the
+                    // comment warns about in miniature: an arm reading `break;` says
+                    // "nothing to do" where this one decides something.
+                    toStore = fields->value;
+                    break;
+                case CanonicalizationOutcome::ForeignGeneration:
+                    co_return Cc::Refuse(
+                        _metrics, TierRefusal::ForeignGeneration, ForeignGenerationMessage(canonical.generation));
+            }
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Cc::RefuseWithoutCounter(TierRefusal::StorageWriteFailed);

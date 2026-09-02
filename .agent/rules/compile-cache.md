@@ -1243,6 +1243,129 @@ stops being one — the same confound that cost #493 a re-run.
   replays objects naming another checkout; a line reporting only the applied half
   would read the same in all three cases.
 
+## Two servers on one wire are two VERSIONS on one wire
+
+`AGENT.md` requires every server on this wire to canonicalize a stored value's text
+regions identically, through the one `CanonicalStoredValue`. That rule was written
+about a *moment* — the moment #229 made a compile node a second server and it turned
+out to have no copy of the recipe. But a fleet is permanently mid-upgrade
+([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)), so the servers
+on the wire are at several builds at once and the property has to hold **across
+generations or it does not hold at all**
+([#483](https://github.com/LASTRADA-Software/fastcached/issues/483)). Two routes
+were open to breaking it, and neither needed anybody's install to be stale.
+
+- **The version byte named nothing.** `PathCanon` deliberately carries no version of
+  its own and says so, on the reasoning that canonical text travels only inside a
+  `CompileValue` and that container carries `CompileValueVersion` — so a change to
+  the canonicalization spec is *expressed by bumping that*. Correct, and enforced by
+  nothing: the byte was a bare constant referenced by the encoder and the decoder.
+  Widen a grammar's span match, change how a root is joined back on, move a byte of
+  framing — every behaviour-pinning test in the tree is updated to the new
+  expectation, as it must be, and the value ships still calling itself generation 1.
+  Two servers then stamp one number on text they rewrote by different rules, which
+  is a wrong value under a correct key at fleet scale.
+  - **The pin is a conformance digest paired with the byte**, in
+    `CompileValue_test.cpp`: a corpus of regions run through `CanonicalStoredValue`
+    and `PathCanon::LocalizeRegion`, digested, and matched against the row for the
+    live `CompileValueVersion`. A digest alone would not do it — the behaviour and
+    the golden are one edit two hunks apart, and moving both leaves the suite green,
+    which is `Test::RetiredGeneration`'s argument arriving at the same place from the
+    key side. Retired rows stay, and the live digest must reproduce none of them.
+  - **Measured, because a guard nobody has watched refuse is not a guard**: a
+    plausible "collapse the double separator" edit to `JoinLocalized` — which changes
+    what every consumer replays — passes **2007 of 2008** cases, the pin being the one
+    that refused it. The first cut of the corpus did not catch it either, because it
+    exercised bare roots only as a PRODUCER; a rewrite and its inverse are one spec,
+    so both ends of every shape reach the digest. That miss generalises past this
+    file and is [#547](https://github.com/LASTRADA-Software/fastcached/issues/547):
+    **a corpus that varies one side of a transformation and fixes the other cannot
+    see a defect on the fixed side, and looks complete while doing it** — everything
+    passes, which is exactly what a corpus with a hole looks like.
+  - **A grammar is a spec change the digest cannot see on its own**, so the corpus's
+    completeness is asked OF THE DECODER rather than restated: all 256 tag bytes are
+    offered to `DecodeCompileValue` and every one it accepts must have a row. A
+    hand-kept list of grammars would be exact about the ones it knows and silent
+    about the one just added, which is the failure the check exists to prevent. What
+    makes a new grammar a spec change is the far end: an older build meets the tag,
+    `IsKnownGrammar` refuses it, the decoder calls that a malformed frame rather than
+    a foreign generation, and a server whose policy for malformed bytes is *store
+    verbatim* then stores the producer's absolute paths.
+  - **A guard's MESSAGE is part of the guard, and two correct refusals can still
+    route an author past both.** Adding a grammar fails the coverage case, which asks
+    for a corpus row; adding that row moves the digest, which fails the generation
+    case, whose message offered *"you widened the corpus, repin"* first. Both
+    refusals were right. From the author's seat that clause reads as precisely what
+    they just did — so the pair walked them into shipping a canonicalization change
+    under the generation it was not written by, which is this section's own defect
+    reproduced one level up, inside the fix for it. **The remedy a refusal offers
+    FIRST is the one that gets taken**, so a message reachable by two different edits
+    has to name both and say which is which: the repin branch is narrowed to
+    behaviour ALREADY in this generation and points at the grammar case as not being
+    that, and the coverage case asks for the row *and* the bump. Note how it was
+    found — by reading, in review. Every test was green, and a message is not
+    something a suite can be wrong about.
+  - **It also pins the digest across HOSTS.** Every entry point in `PathCanon`
+    derives its conventions from the layout rather than from the running binary, so
+    the corpus yields one digest on Windows, Linux and macOS. A change that broke
+    that would make a Windows server and a POSIX one disagree about a value they both
+    hold — the same defect with no version skew anywhere near it.
+- **The reader could not tell a foreign value from a damaged one.**
+  `CanonicalStoredValue` returned `std::optional`, and its `nullopt` meant both "these
+  bytes are not a stored value" and "this IS one, of a generation I do not
+  implement". The two servers apply *opposite* policies to that single state — the
+  daemon refuses, a node's cache tier stores the bytes **verbatim**, each defensible
+  for genuinely opaque bytes — so a launcher at generation N storing into a node at
+  N+1 put the producing checkout's absolute paths into the shared cache under a key
+  every machine computes. That is #229/#319 reached by nothing worse than a rolling
+  upgrade, and it is `.agent/rules/metrics-and-observability.md`'s four-states rule:
+  an `optional` cannot carry it.
+  - `CanonicalizationOutcome` names three, and what protects a caller is **switching
+    on it with no `default:`**, never the empty `bytes` that `ForeignGeneration`
+    carries. Empty bytes stop a server storing *nothing*; they do not stop one
+    storing the ORIGINAL, and a node's verbatim fallback was never the canonical
+    bytes but the STORE's own payload — so `outcome == Canonicalized ? canonical.bytes
+    : payload` compiles, reads naturally, and reinstates the whole defect. No type
+    can refuse that. The exhaustive switch is what makes the third state impossible
+    to leave out.
+  - `DecodeCompileValue` answers `UnsupportedFeature` for an unknown generation and
+    `MalformedFrame` for everything else, and the classifier reads that code back
+    rather than re-testing the version byte: two spellings of one rule are two places
+    for it to drift. It is `.agent/rules/storage.md`'s `UnsupportedFormatVersion`
+    against `Corrupt`, one layer up and on the wire instead of on disk — and for the
+    same reason, since the obvious remedy for a cache reported corrupt is to wipe it.
+  - **Another generation is proved, never inferred from the leading byte alone** —
+    and the first cut of this got it backwards, which the OTHER server's tests caught
+    rather than any reasoning here. Almost no opaque blob begins with `0x01`, so
+    "leading byte is not ours" called every opaque value foreign and refused it,
+    overturning the node cache tier's documented policy of storing an opaque value
+    verbatim — a policy this layer does not own. `DecodeAfterGeneration` therefore
+    runs on the rest of the frame too, and only a layout that holds together is
+    reported as a generation. The shape that matters (#547 — framing kept,
+    canonicalization moved) is then caught exactly. **The residual is not the harmless
+    direction, and saying so was this bullet's own first mistake**: a generation that
+    moves the FRAMING as well reads as junk, comes back `NotACompileValue`, and a
+    node's tier handles THAT by storing verbatim — so it re-enters through the door
+    this closes, for the class of bump most likely to cause it, since
+    `CompileValueVersion` names the framing too and nothing couples it to an
+    `objkey-v*` bump. Bounded rather than closed: the daemon refuses
+    `NotACompileValue`, so the forward cannot reach the shared cache, and a tier is
+    loopback-only. Bounds are not a fix, so it is tracked. The general form is the one worth carrying: **absence
+    of the expected value is not evidence of a particular alternative**, and a
+    classifier built on it will be confidently wrong about everything that is merely
+    unfamiliar.
+  - **No tag moved for this.** Nothing observable about generation 1 changed, and
+    `CompileValueVersion` has never moved, so the population of values stored
+    verbatim by this route is empty **by construction**. That is a condition, not a
+    standing property: it stops being true the first time somebody bumps the byte,
+    which is exactly when the refusal above starts doing work.
+- **The launcher says which of the two it met.** `DecodeFailureReason` gives a
+  foreign generation its own `--show-stats` row, because a mixed fleet is a rolling
+  upgrade that ends by itself while a malformed value is a defect somebody has to
+  look at, and an operator does different things about them. Otherwise an upgrade
+  window presents as an endlessly cold cache with no diagnostic, which this wire has
+  already recorded paying for once.
+
 ## Accepted trade-offs
 
 These are argued in place above and are **not** open work — do not "fix" one
@@ -1413,3 +1536,19 @@ worth acting on is worth one clause saying which of the two it is.
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
   arguments even though their dependency sets now agree.
+- **[#547](https://github.com/LASTRADA-Software/fastcached/issues/547)** —
+  `JoinLocalized` appends a separator unconditionally, so a bare CONSUMER root
+  localizes `<SRCROOT>/inc/a.hpp` to `//inc/a.hpp` on POSIX and `C:\inc.hpp` on
+  Windows — a leading `//` is implementation-defined on one host and reads as UNC on
+  the other. The conformance corpus pins the CURRENT behaviour deliberately, so the
+  fix is forced to bump `CompileValueVersion` and drag `manifest-v*` with it: this is
+  the generation machinery's first real customer rather than a path tidy-up. The
+  ticket also asks for an audit of which other root shapes are varied on one side of
+  the transformation only, since that is the generalisable half.
+- **[#548](https://github.com/LASTRADA-Software/fastcached/issues/548)** — the
+  retired-generation idiom has two homes with different key types:
+  `apps/fastcache-cc/KeyDigestTestSupport.hpp` keyed on a schema-tag string, and
+  `CompileValue_test.cpp`'s generation table keyed on a version byte. It could not be
+  reused as it stands because a library test may not include an app header, so the
+  shared home is `src/tests/` — and that constraint is what shapes the fix rather
+  than being incidental to it.

@@ -355,6 +355,46 @@ void Note(std::string_view reason)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
+/// The fixed `--show-stats` reason for a stored value this build could not decode.
+///
+/// Two reasons rather than one, for the same argument `DescribeOutcome` makes about
+/// a daemon's refusal words: a value written under another generation is not a
+/// damaged one, and an operator does different things about them. A mixed-version
+/// fleet is a rolling upgrade in progress and ends by itself, while a malformed
+/// value is a defect somebody has to look at — and a fleet is permanently
+/// mid-upgrade, so this is the ordinary case rather than the exotic one (#483).
+/// Lumping them together makes the tally say "the cache is broken" for a cache that
+/// is merely being upgraded.
+///
+/// Both are FIXED strings under `RecordFallback`'s rule. Which generations were
+/// involved varies per compile, so it goes in a `Note` beside the call rather than
+/// into a tally that would then hold a row per invocation.
+///
+/// The classification is `IsForeignGeneration`, never a comparison against an error
+/// code spelled out here: the decoder owns which refusal means what, and a launcher
+/// restating it is the second place for that rule to drift.
+///
+/// @param error What `DecodeCompileValue` refused with.
+/// @return The reason to record.
+[[nodiscard]] std::string_view DecodeFailureReason(ProtocolError const& error) noexcept
+{
+    return IsForeignGeneration(error) ? "fetch decoded another generation's value" : "fetch decoded malformed";
+}
+
+/// Say, under `FASTCACHE_VERBOSE`, that a stored value would not decode.
+///
+/// A rolling upgrade otherwise presents as an endlessly cold cache with no
+/// diagnostic, which is the shape this wire has already recorded paying for once.
+/// The decode error's own context names both generations, so nothing here has to
+/// restate them.
+///
+/// @param what  Which fetch this was, so two sites are told apart in a build log.
+/// @param error What `DecodeCompileValue` refused with.
+void NoteUndecodableValue(std::string_view what, ProtocolError const& error)
+{
+    Note(std::format("{} could not be decoded ({})", what, error.context));
+}
+
 /// The ways the cache can fail to serve a compile, as far as anybody outside this
 /// file can tell them apart.
 ///
@@ -1275,7 +1315,14 @@ struct MaterializedHit
 
     auto decoded = DecodeCompileValue(*payload);
     if (!decoded.has_value())
+    {
+        // Said rather than swallowed: direct mode falls through to the preprocessed
+        // path here, so an undecodable value costs a whole preprocess and shows up
+        // as nothing but a slower build. During a rolling upgrade that is every
+        // compile on the machine.
+        NoteUndecodableValue("the direct-mode object", decoded.error());
         return std::nullopt;
+    }
 
     // Anything short of Served falls back to preprocessing, which re-runs the same
     // check and, if it also finds the value stale, recompiles and re-stores it.
@@ -1513,6 +1560,8 @@ void RecordManifest(Config const& cfg,
 
     // Unwrap the compile-value envelope the manifest was stored in.
     auto const envelope = DecodeCompileValue(*manifestBytes);
+    if (!envelope.has_value())
+        NoteUndecodableValue("the direct-mode manifest", envelope.error());
     auto const manifestSpan =
         envelope.has_value() ? std::span<std::byte const> { envelope->objectBlob } : std::span<std::byte const> {};
     auto const manifest =
@@ -1997,7 +2046,10 @@ void RecordManifest(Config const& cfg,
         {
             auto decoded = DecodeCompileValue(outcome.value);
             if (!decoded.has_value())
-                return Warn("fetch decoded malformed");
+            {
+                NoteUndecodableValue("the fetched object", decoded.error());
+                return Warn(DecodeFailureReason(decoded.error()));
+            }
 
             // HIT: check what the value asserts, then write the object, reproduce
             // the depfile, and replay the streams (all with paths localized).

@@ -428,6 +428,15 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "series rather than any other malformed-frame counter, which describe a truncated "
               "compile frame, an undecodable compile payload and two AUTH payloads.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
+      .prometheusName = "fastcache_node_cache_requests_refused_foreign_generation_total",
+      .help = "Stores refused because the value names a canonicalization generation this build "
+              "does not implement -- the value-format twin of the unsupported-version series, "
+              "and the same operator action: find the machine that is out of step. Zero unless "
+              "a fleet is spanning a CompileValueVersion bump, so any rise is a real event. It "
+              "is also the only view of what refusing costs: the launcher sees a miss and "
+              "compiles locally, so the build stays correct and merely stops being fast.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
       .prometheusName = "fastcache_scheduler_requests_refused_unauthenticated_total",
       .help = "Scheduler requests refused because the connection presented no "

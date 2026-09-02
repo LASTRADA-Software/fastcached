@@ -417,9 +417,34 @@ of a stored blob, describes the *value format*. They are separate because a
 stored blob outlives any connection: the wire version is agreed per request,
 while the blob's version is discovered when it is decoded, however long after it
 was written. The launcher's cache key additionally carries an `objkey-v6` schema
-tag, so a future change to the value format or the canonicalization spec re-keys
-the cache — stale entries then miss and are rewritten, rather than being served
-under rules they were not written by.
+tag; bumping it re-keys the cache, so stale entries miss and are rewritten rather
+than being served under rules they were not written by.
+
+Those two tags move **independently**, and it matters which one is load-bearing
+here. Nothing couples a `CompileValueVersion` bump to an `objkey-v*` bump — the
+lock-step this project does enforce is `manifest-v*` behind `objkey-v*`, a
+different pair — so a canonicalization change need not re-key anything, and two
+generations can therefore meet over one key. Re-keying is an optimisation that
+makes them meet less often; the refusal below is the protection that does not
+depend on anybody having remembered to bump a second tag.
+
+`CompileValueVersion` names the **canonicalization spec**, not only the byte
+layout. Canonical text travels nowhere but inside a stored value, and every server
+on this wire has to rewrite one identically — including servers at different
+builds, since a fleet is permanently mid-upgrade. So the byte is pinned to the
+behaviour rather than maintained by hand: a conformance corpus is run through the
+canonicalizer and its inverse, digested, and matched against the row for the live
+generation. Change how a path span is found, rewritten or framed and that test
+fails naming the bump.
+
+A reader that meets a generation it does not implement **refuses the value**. It
+cannot canonicalize it, and storing or serving it uncanonicalized would put the
+producing checkout's absolute paths into a shared cache under a key every machine
+computes — so a store is declined, and a fetch is a miss the launcher reports
+under its own `--show-stats` reason rather than as a malformed value. Refusing
+costs the hits of one upgrade window; the alternative costs every consumer that
+replays those paths into its dependency graph, where no edit in its own checkout
+can invalidate them.
 
 ## The value format
 

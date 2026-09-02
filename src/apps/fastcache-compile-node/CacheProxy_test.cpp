@@ -157,6 +157,40 @@ TEST_CASE("A value the node cannot decode is stored verbatim rather than refused
     CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("not-a-value"));
 }
 
+TEST_CASE("A stored value from another generation is refused, not stored verbatim", "[node][cacheproxy]")
+{
+    // #483, and the one arm above where this tier gets no policy choice. A value it
+    // cannot canonicalize still carries the PRODUCER's absolute paths, so storing it
+    // would put them in the shared cache under a key every machine computes -- which
+    // is #229/#319, reached by nothing worse than a rolling upgrade, because a fleet
+    // is permanently mid-upgrade (#173).
+    //
+    // What separates this from the verbatim case above is the LAYOUT, not the leading
+    // byte: this frame is one a launcher would have written, stamped with a
+    // generation this build does not implement.
+    Fixture fix;
+
+    CompileValue produced;
+    produced.objectBlob = { std::byte { 0x01 } };
+    produced.textRegions.push_back(
+        TextRegion { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = "Note: including file: /src/inc/a.hpp\n" });
+    auto foreign = EncodeCompileValue(produced);
+    REQUIRE(static_cast<std::uint8_t>(foreign.front()) == CompileValueVersion);
+    foreign.front() = std::byte { CompileValueVersion + 1 };
+
+    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+        .key = "k-foreign", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = foreign })));
+    CHECK(ErrorOf(stored) == Wire::ErrorCode::MalformedValue);
+
+    // Refused means nothing was written. A `Miss` rather than the bytes coming back
+    // is what says the verbatim arm was not taken.
+    CHECK(StatusOf(SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-foreign")))) == Wire::Status::Miss);
+
+    // Counted, per this tier's own classification rule: the baseline is zero, so a
+    // rise is a real event and it is the only view of what refusing costs.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration) == 1);
+}
+
 TEST_CASE("A miss is Miss, never Error", "[node][cacheproxy]")
 {
     // The two were one byte once, and a rejected client saw an endlessly cold cache
