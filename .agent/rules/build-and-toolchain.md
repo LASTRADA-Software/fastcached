@@ -64,7 +64,13 @@ determinism rests on.
   blinding and is structurally incapable of catching partial, since 3 is not 0. And
   loud-versus-silent is a property of WHERE the bracket lands, not of the check — the
   same check refused outright under one bracket position and passed at 14% under
-  another — so no check may be assumed safe because it once failed loudly. And know
+  another — so no check may be assumed safe because it once failed loudly. And only an
+  UNBALANCED bracket groups: `[[nodiscard]]` is completely harmless. The tree said
+  `[` and `]` were "reserved", which is broader than the truth, and acting on the
+  broad rule is how the fix for this took `check-worker-refusals-counted` from three
+  refusal spellings to ZERO — neutralising brackets destroys text a check matches on.
+  Where brackets must survive, do not neutralise them: read the lines without ever
+  building a CMake list, which is immune by construction rather than by convention. And know
   what the method CANNOT see. A count detects a check examining a DIFFERENT NUMBER of
   subjects; it is blind to one examining the same number of DIFFERENT subjects. So it
   validates a change that alters HOW MUCH a check reads, and never one that alters WHAT

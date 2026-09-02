@@ -56,6 +56,15 @@ endif()
 # from 21 registrations to 3, and it reported success both times. An emptiness
 # guard cannot catch that -- 3 is not 0 -- so the fix has to be here, in the
 # splitter, rather than in a check on the count.
+#
+# Two precisions #495 measured, which this comment originally lacked. Only an
+# UNBALANCED bracket groups; `[[nodiscard]]` is completely harmless, so treating
+# every `[` and `]` as structure is broader than the truth. And replacing them is
+# safe here by WHAT THIS CHECK MATCHES -- `add_test(NAME ...)` and property names,
+# none containing a bracket -- rather than by construction. A pattern that did
+# contain one would break silently. `check-worker-refusals-counted` is the worked
+# example: the same fix took it from three refusal spellings to zero, and it now
+# walks its lines without ever building a CMake list.
 file(READ "${testsFile}" content)
 string(REPLACE ";" "\\;" content "${content}")
 string(REPLACE "[" " " content "${content}")
