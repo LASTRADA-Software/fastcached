@@ -239,6 +239,25 @@ set_tests_properties("catch-skip-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# The debug-path mapping cmake/portable/CompileCache.cmake appends so a replayed
+# object names no checkout (#203). A pure computation over two roots, checked
+# against a table of layouts -- including the out-of-tree and cross-mount ones
+# nobody has locally, which is where it was wrong twice before it was ever run.
+#
+# Not labelled "smoke": it starts nothing, needs no compiler and no launcher, and
+# finishes in milliseconds. The alternative is two ~40-second configures.
+add_test(
+    NAME "debug-prefix-map-rules"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-debug-prefix-map.cmake"
+)
+set_tests_properties("debug-prefix-map-rules" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 # ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git

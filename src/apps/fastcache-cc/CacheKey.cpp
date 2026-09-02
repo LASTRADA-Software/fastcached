@@ -61,6 +61,12 @@ namespace
     {
         std::string_view prefix; ///< The flag and its separator; empty for a bare path.
         std::string_view path;   ///< The path the argument carries.
+        /// Whatever followed the path inside the same argument, taken from the
+        /// matched row's `valueTailSeparator`; empty for every row without one.
+        /// It must survive the rewrite unchanged -- for a prefix-map flag it is
+        /// the replacement half, and two machines mapping to different
+        /// replacements have to compute different keys.
+        std::string_view suffix;
     };
 
     /// Isolate the path an argument carries, if it carries one.
@@ -84,6 +90,9 @@ namespace
     ///   no-op and the argument comes back byte-for-byte. A *bare* occurrence,
     ///   whose value is the next argument, carries no path of its own and is
     ///   reported as such — that value arrives on its own iteration as a bare path.
+    ///   A row whose value carries a TAIL (`-fdebug-prefix-map=<from>=<to>`)
+    ///   arrives already split, because `MatchPathValueFlag` reads that off the
+    ///   table row rather than leaving each consumer to cut the value itself.
     /// - **A bare path argument**: a source file or a response path.
     ///
     /// What the LAYOUT decides is which introducers may match, and therefore which
@@ -100,10 +109,10 @@ namespace
         auto const introducers = IntroducersFor(layout);
         if (auto const match = MatchPathValueFlag(arg, introducers, DriverFamily::Any);
             match.has_value() && !match->value.empty())
-            return PathPortion { .prefix = match->prefix, .path = match->value };
+            return PathPortion { .prefix = match->prefix, .path = match->value, .suffix = match->valueTail };
 
         if (!arg.empty() && !introducers.contains(arg.front()))
-            return PathPortion { .prefix = {}, .path = arg };
+            return PathPortion { .prefix = {}, .path = arg, .suffix = {} };
 
         return std::nullopt;
     }
@@ -132,9 +141,12 @@ namespace
 
         auto const path = Reconciled(resolve, portion->path);
         auto const canon = PathCanon::Canonicalize(path, layout);
-        if (canon != path)
-            return std::string { portion->prefix } + canon;
-        return std::string { arg };
+        if (canon == path)
+            return std::string { arg };
+
+        auto out = std::string { portion->prefix } + canon;
+        out.append(portion->suffix);
+        return out;
     }
 
 } // namespace

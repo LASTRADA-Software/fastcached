@@ -178,6 +178,27 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
+- A compiler with debug info on records the WORKING DIRECTORY, which is on no command
+  line, so no key can relativize it and a hit replays an object naming the producing
+  checkout. Measured: `g++` 143 B, `clang++` 6 B, `clang-cl` 23 B, and `cl` **11 B with
+  no debug flag at all** — `.debug$S`'s `S_OBJNAME` holds the absolute object path, so
+  `/Z7` widens this and does not open it. `-fdebug-prefix-map` closes it on ELF and on
+  NEITHER COFF driver; that residue is an accepted cost, not open work.
+  - Never `-ffile-prefix-map`, and no table row for it or `-fmacro-prefix-map` either:
+    both rewrite `__FILE__` INTO the text the key hashes, and a row would make the key
+    hash text the compile never produced.
+  - The flag names the producing root BY CONSTRUCTION, so the key relativizes its head
+    (`PathValueRole::PrefixMap`, a table COLUMN rather than a branch) and leaves the
+    replacement literal — two machines mapping differently must MISS.
+  - The build-tree rule is mapped LAST: both drivers honour the LAST match, measured off
+    `DW_AT_comp_dir`. No object comparison can see this, since both orders are
+    checkout-independent.
+  - Relative is not checkout-independent — `file(RELATIVE_PATH)` answers
+    `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
+    with a SPACE is not mapped at all, the rules being spliced into a space-separated
+    flags string. `ctest -R debug-prefix-map-rules`.
+  - A DISPATCHED compile is not covered ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)):
+    `RemoteCompileArgs` drops every path-valued flag.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
@@ -806,7 +827,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - A return type is not part of a function's mangled name on Linux, so two
   functions differing only in return type silently collide.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail
-  a configure.
+  a configure. `check_<lang>_compiler_flag` is a hard error for a language the project
+  has not ENABLED, and a bad flag in `CMAKE_<LANG>_FLAGS` fails the ABI check — so ask
+  `ENABLED_LANGUAGES` first, and CHECK a flag rather than gating on a compiler-ID
+  string. What it computes and appends is a function, checked as a computation
+  (`ctest -R debug-prefix-map-rules`): the layouts that break such a rule are the ones
+  nobody has locally.
 - A sanitizer that is on in the cache is not one that is on in the build — a tool
   that silently does nothing is worse than one that is visibly off.
 - A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler,

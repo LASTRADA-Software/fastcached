@@ -45,6 +45,89 @@
 # process is a bigger side effect than downloading a file and CI relies on no
 # daemon answering by default. To disable everything: -DUSE_COMPILER_CACHE=OFF.
 
+# --- the debug-path mapping, as a function so it can be tested ---------------
+#
+# Which `-fdebug-prefix-map` rules a given pair of roots deserves is a pure
+# computation over two strings, and it is the half of #203 that got the layout
+# wrong twice before it was run (see the block near the end of this file for
+# what each rule is for). Testing it through a real configure costs two
+# ~40-second configures and a compiler; testing it here costs nothing and covers
+# the layouts nobody has locally.
+#
+# @param binaryDir        The build tree.
+# @param sourceDir        The source tree.
+# @param outRules         Set to the `<from>=<to>` rules, build tree first.
+# @param outSourceMapped  Set to ON/OFF: was the source root mapped at all.
+function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped)
+    # A root with a SPACE in it is not mapped at all, and that is a refusal rather
+    # than a nicety. These rules are spliced into `CMAKE_<LANG>_FLAGS`, which is a
+    # space-separated string, so a rule naming `/Users/john doe/proj` reaches the
+    # driver as two arguments and every compile dies with
+    # `invalid argument '/Users/john' to '-fdebug-prefix-map'` -- measured. This
+    # file may never break a build, and `check_compiler_flag` cannot catch it
+    # because it probes a synthetic `/a=/b`. Quoting was the alternative and it is
+    # generator-dependent; declining is not.
+    if(binaryDir MATCHES " " OR sourceDir MATCHES " ")
+        set(${outRules} "" PARENT_SCOPE)
+        set(${outSourceMapped} OFF PARENT_SCOPE)
+        return()
+    endif()
+
+    file(RELATIVE_PATH back "${binaryDir}" "${sourceDir}")
+    # `file(RELATIVE_PATH)` answers with a TRAILING SEPARATOR (`../../../`), and
+    # leaving it on is not cosmetic: the compiler replaces the matched root with
+    # this text and the remainder already begins with one, so the rewritten path
+    # would read `../../..//src/tu.cpp` -- not the spelling the build system
+    # passes for the same file, so the absolute and relative spellings would stop
+    # converging and the mapping would buy less than it appears to.
+    string(REGEX REPLACE "/$" "" back "${back}")
+
+    # The replacement must itself be checkout-independent, and "relative" does not
+    # imply that. Measured: an out-of-tree build at `/tmp/x` against a source root
+    # under `/mnt/d/...` yields `../../mnt/d/fastcached/...` -- a relative path
+    # carrying the entire root inside it, so mapping to it would replace the
+    # checkout's path with the checkout's path and read as working. A `..`-only
+    # chain is exactly the case where it cannot: it says the build tree lies UNDER
+    # the source tree. Anything else drops the rule rather than guessing; the
+    # build-tree rule still lands, and that is the one carrying `DW_AT_comp_dir`.
+    set(rules "")
+    if(back MATCHES "^\.\.(/\.\.)*$")
+        list(APPEND rules "${sourceDir}=${back}")
+        set(${outSourceMapped} ON PARENT_SCOPE)
+    else()
+        set(${outSourceMapped} OFF PARENT_SCOPE)
+    endif()
+
+    # The build tree is mapped LAST, and that is the whole of the ordering: GCC and
+    # Clang honour the LAST matching rule, not the first. Measured directly off
+    # `DW_AT_comp_dir` on gcc 14 and clang 20, nested build tree `src/out/build/x`:
+    #
+    #   no rules      /abs/.../src/out/build/x
+    #   build first   ../../../out/build/x     <- the source rule wins
+    #   source first  .                        <- what is wanted
+    #
+    # This comment said the opposite for three commits, and no object comparison
+    # could catch it: `.` and `../../../out/build/x` are BOTH checkout-independent,
+    # so two checkouts still produced byte-identical objects and the e2e read
+    # green. What it costs is narrower and sharper -- two machines whose build
+    # trees sit at the same depth under different NAMES (`out/build/gcc-release`
+    # against `out/build/ci-release`) relativize to one key, because both flags
+    # tokenize to the same canonical text, while their objects differ. That is a
+    # mis-serve, and it is the #203 symptom reappearing inside the fix for it.
+    list(APPEND rules "${binaryDir}=.")
+    set(${outRules} "${rules}" PARENT_SCOPE)
+endfunction()
+
+# Everything below needs a project: there is no compiler to probe, no target to
+# front and no build to cache without one. `cmake -P` therefore stops here and
+# takes the pure computations above -- which is how `check-debug-prefix-map.cmake`
+# tests them. A stock condition rather than a variable of our own, so a project
+# that vendors this file inherits no undocumented mode flag whose only meaning is
+# that fastcached is testing itself.
+if(CMAKE_SCRIPT_MODE_FILE)
+    return()
+endif()
+
 option(USE_COMPILER_CACHE
        "Use a compiler-cache launcher when one is available (fastcache-cc when a daemon answers, else sccache, else ccache) [default: ON]"
        ON)
@@ -1176,6 +1259,116 @@ if(_fc_cache_chosen)
                 CMAKE_C_FLAGS_RELWITHDEBINFO)
             string(REGEX REPLACE "([-/])Zi" "\\1Z7" ${_var} "${${_var}}")
         endforeach()
+    endif()
+
+    # --- make the objects relocatable, where the driver can be asked to -------
+    #
+    # A cache hit replays an object BUILT SOMEWHERE ELSE, and a compiler with
+    # debug info on records where it was built: DWARF's `DW_AT_comp_dir` is the
+    # working directory, which appears on no command line and which no key can
+    # relativize. So a replayed object names the producing checkout, a debugger
+    # looks for sources in a tree this machine does not have, and nothing fails.
+    # Issue #203; issue #489 is the same defect approached from the key end.
+    #
+    # Measured on one TU, byte-identical in two roots differing only in name,
+    # against a same-root baseline of 0 differing bytes:
+    #
+    #   driver      debug info off   debug info on    prefix-map
+    #   g++         identical        differs, 143 B   -> identical
+    #   clang++     identical        differs,   6 B   -> identical
+    #   clang-cl    identical        differs,  23 B   -> STILL 23 B
+    #   cl          differs, 11 B    differs, 28-31 B  no such switch exists
+    #
+    # Hence GNU spellings only, and hence the honest gap: on COFF a replayed
+    # object's debug records name the producing checkout and no flag closes it.
+    # `-ffile-prefix-map` does not help clang-cl -- CodeView's `S_OBJNAME` and the
+    # embedded `-cc1` line are not remapped -- and `cl` has no path-map switch at
+    # all. `.agent/rules/compile-cache.md` records that as an accepted cost.
+    #
+    # `-fdebug-prefix-map` and not `-ffile-prefix-map`, which also implies
+    # `-fmacro-prefix-map` and would rewrite `__FILE__`. That buys nothing here:
+    # the preprocessor expands `__FILE__` and the cache key hashes preprocessed
+    # output raw, so whenever the expansion is checkout-dependent it is
+    # checkout-dependent in the hashed text too and the two checkouts never share
+    # a key. Changing program-visible strings to fix a defect that cannot occur is
+    # a bad trade.
+    #
+    # The mapping MUST be identical on every machine sharing the cache, or two
+    # producers write different objects. That is not left as advice: the launcher
+    # relativizes the flag's root and leaves its replacement literal, so a machine
+    # mapping somewhere else computes a different key and misses rather than
+    # mis-serving (`PathValueRole::PrefixMap`).
+    #
+    # Never fatal, per this file's contract. `check_<lang>_compiler_flag` is stock
+    # CMake and reports rather than refuses, which matters because a bad flag left
+    # in CMAKE_<LANG>_FLAGS fails the compiler ABI check and takes the whole
+    # configure down -- exactly what this module may not do.
+    #
+    # Per LANGUAGE throughout, because the C and C++ compilers need not be the
+    # same product -- which the previous shape asserted in a comment while asking
+    # `CMAKE_CXX_COMPILER_ID` once and applying the answer to both.
+    _fc_debug_prefix_map_rules("${CMAKE_BINARY_DIR}" "${CMAKE_SOURCE_DIR}"
+                               _fc_prefix_maps _fc_source_mapped)
+    list(TRANSFORM _fc_prefix_maps PREPEND "-fdebug-prefix-map=" OUTPUT_VARIABLE _fc_prefix_map_flags)
+    list(JOIN _fc_prefix_map_flags " " _fc_prefix_map_flags)
+
+    # A language this project has not ENABLED is asked nothing: `check_compiler_flag`
+    # is a hard `CMake Error` ("C: needs to be enabled before use") otherwise, which
+    # fails the configure -- the one thing this file may not do. Measured rather than
+    # anticipated: this module is included from a `project()` that lists CXX before C
+    # is added, and the first run of the check ended the configure outright. A
+    # language nobody enabled also has no compile lines to put a flag on, so skipping
+    # it is right rather than merely safe.
+    get_property(_fc_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+    set(_fc_prefix_map_langs "")
+    set(_fc_prefix_map_skipped "")
+    include(CheckCompilerFlag)
+    foreach(_lang IN ITEMS C CXX)
+        if(NOT "${_lang}" IN_LIST _fc_enabled_languages)
+            continue()
+        endif()
+
+        # The MSVC family is excluded by NAME rather than left to the probe. `cl`
+        # does not reject an unknown `-f...` outright -- it reports D9002 and exits
+        # 0 -- so the check would succeed and the flag would be appended to a
+        # compiler that ignores it, on the one platform where this cannot work at
+        # all. `clang-cl` matches "Clang" and is excluded by the simulate-id clause,
+        # which is what the 23-byte measurement above is about.
+        if(NOT CMAKE_${_lang}_COMPILER_ID MATCHES "GNU|Clang"
+           OR CMAKE_${_lang}_SIMULATE_ID STREQUAL "MSVC")
+            list(APPEND _fc_prefix_map_skipped "${_lang} (no path-map switch on this driver)")
+            continue()
+        endif()
+
+        # `check_compiler_flag` rather than the per-language modules, and cached in
+        # `FASTCACHE_<LANG>_HAS_DEBUG_PREFIX_MAP`, so a reconfigure pays nothing.
+        check_compiler_flag(${_lang} "-fdebug-prefix-map=/a=/b" FASTCACHE_${_lang}_HAS_DEBUG_PREFIX_MAP)
+        if(FASTCACHE_${_lang}_HAS_DEBUG_PREFIX_MAP)
+            string(APPEND CMAKE_${_lang}_FLAGS " ${_fc_prefix_map_flags}")
+            list(APPEND _fc_prefix_map_langs ${_lang})
+        else()
+            list(APPEND _fc_prefix_map_skipped "${_lang} (driver rejected the flag)")
+        endif()
+    endforeach()
+
+    # Say which languages got it AND which did not, rather than only the happy
+    # half: a driver that cannot take the flag still caches, still shares, and
+    # still replays objects naming another checkout. Applied, rejected, no such
+    # switch, and not enabled are four different situations, and a line reporting
+    # only the first reads identically in all of them.
+    if(_fc_prefix_map_langs)
+        list(JOIN _fc_prefix_map_langs "/" _fc_prefix_map_langs)
+        message(STATUS "[cache] Mapping debug paths for ${_fc_prefix_map_langs} so replayed objects "
+                       "name no checkout: ${_fc_prefix_map_flags}")
+        if(NOT _fc_source_mapped)
+            message(STATUS "[cache] The source root is NOT mapped: the build tree lies outside it, so the "
+                           "relative path back would carry the checkout's own path")
+        endif()
+    endif()
+    if(_fc_prefix_map_skipped)
+        list(JOIN _fc_prefix_map_skipped ", " _fc_prefix_map_skipped)
+        message(STATUS "[cache] Debug paths NOT mapped for ${_fc_prefix_map_skipped}; replayed objects "
+                       "will carry the producing checkout's paths in their debug info")
     endif()
 else()
     # Define the launchers as empty rather than leaving them unset. Fetched

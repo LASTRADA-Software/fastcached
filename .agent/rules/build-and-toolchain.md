@@ -1143,6 +1143,27 @@ carriage return, so such a script does not misbehave — it fails to start at al
   must not lose the ability to build at all when GitHub is unreachable.
   `ctest -R compile-cache` covers both halves offline, the decline paths through a
   sandbox and the install path through a `file://` mirror.
+  - **The ways it can fail a configure are not obvious, and two of them arrived in one
+    change.** `check_<lang>_compiler_flag` is a hard `CMake Error` — "C: needs to be
+    enabled before use" — for a language the project has not enabled, and this module
+    is included from a `project()` that lists CXX first, so asking it unconditionally
+    ended the configure outright. Ask `get_property(GLOBAL PROPERTY ENABLED_LANGUAGES)`
+    first; a language nobody enabled also has no compile lines to put a flag on, so
+    skipping it is right rather than merely safe. And a bad flag left in
+    `CMAKE_<LANG>_FLAGS` fails the compiler ABI check, which is a configure failure
+    too — so a flag is **checked** rather than gated on a compiler-ID string. `cl`
+    answers an unknown `-f...` with warning D9002 and exits 0, so the check has to be
+    kept away from it by the guard rather than expected to reject it.
+  - **Anything this module computes and appends is a function, checked as a
+    computation.** `_fc_debug_prefix_map_rules` + `ctest -R debug-prefix-map-rules`,
+    which is in the default set and needs no compiler. The alternative is two
+    ~40-second configures per layout, so the layouts that break it — out-of-tree,
+    another mount, in-source — are exactly the ones nobody has locally and nobody
+    tests. It was wrong twice before it was first RUN: `file(RELATIVE_PATH)` answers
+    with a trailing separator, and out-of-tree it answers
+    `../../mnt/d/.../checkout`, which is *relative* and carries the whole checkout
+    path. **Relative does not imply machine-independent**, and a value that looks
+    portable is worse than one that obviously is not.
 ## `USE_COMPILER_CACHE` in full
 
 `USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler
