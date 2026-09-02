@@ -559,11 +559,13 @@ determinism rests on.
 
 ## A retry makes every one of these disappear without fixing it
 
-Six separate ways the gate reported something that was not about the tree under test
-turned up while fixing one ticket ([#493](https://github.com/LASTRADA-Software/fastcached/issues/493)).
-Not one of them announced itself. Every one presented as an ordinary flake, and
-**a re-run would have cleared all five without fixing any of them** — which is the
-whole reason they are written down here rather than in that pull request.
+Eight separate ways the gate reported something that was not about the tree under
+test have turned up across two tickets — six while fixing
+[#493](https://github.com/LASTRADA-Software/fastcached/issues/493), two more while
+fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247). Not one of
+them announced itself. Every one presented as an ordinary flake, and **a re-run would
+have cleared all of them without fixing any of them** — which is the whole reason they
+are written down here rather than in those pull requests.
 
 The specific traps are examples. The rule is the mechanism.
 
@@ -577,7 +579,7 @@ The specific traps are examples. The rule is the mechanism.
   from a gate that produced nothing, unless you keep the log somewhere it survives.
   Author the commands in a script file and run the file.
 - **Two gates in one build directory.** A run that had already *reported its verdict*
-  was still driving `ninja` when the next one started. This is the worst of the five,
+  was still driving `ninja` when the next one started. This is the worst of them,
   because the reading belongs to *neither* tree and neither process can detect it:
   from inside each one, everything looks entirely normal. `flock`, non-blocking —
   queued, the incident becomes invisible, which is the same defect as the failure it
@@ -597,6 +599,25 @@ The specific traps are examples. The rule is the mechanism.
   continued **with no lock while reporting as though it held one**. A guard that
   silently stopped guarding. Launch long-running scripts from an immutable per-run
   copy.
+- **A path mangled between shells, and the wrapper exiting `0` having run nothing.**
+  `nohup wsl.exe -e bash /mnt/c/...` launched from Git Bash becomes
+  `C:/Program Files/Git/mnt/c/...`: Git Bash rewrites a leading `/mnt` as though it
+  were a POSIX path inside its own install prefix. `bash` then reports
+  `No such file or directory` — on stderr, from the launched process, which the
+  backgrounding discarded — and the launcher returns **success**. This is the purest
+  specimen in the set: not a wrong answer, an *absent* one wearing a right answer's
+  exit code. Run `wsl` from PowerShell, where the path survives, and check that the
+  log the run was supposed to write exists before reading anything into its contents.
+- **The wrapper dying on its own log while leaving the work alive.** The gate log
+  lived on `/mnt/c`; DrvFs refused the redirect once — `No such file or directory` on
+  a directory that existed and was writable seconds later — so the wrapper exited 1
+  having run nothing **and left the gate child running**. That is worse than a clean
+  failure: an orphaned run means the next reading is ambiguous between "nothing
+  happened" and "something is still happening", and the tree it is building is no
+  longer the one anybody is looking at. **An instrument must not depend on the
+  filesystem it exists to measure** — write the log to ext4 and copy it to `/mnt/c`
+  at the end, which keeps it surviving a WSL idle-out without putting DrvFs in the
+  path of opening it.
 
 Two that are not about shells at all, and are the ones a reader is most likely to
 recognise in themselves:
@@ -622,6 +643,48 @@ because something looked slightly wrong and got *looked at* rather than re-run �
 log sitting at zero bytes for slightly too long, an output file containing a single
 backslash, an exit code disagreeing with its own log's last line, a finding
 reappearing that had supposedly been closed.
+
+## A claim about a tool is checked against the tool
+
+The section above is about instruments reporting on the wrong tree. This one is about
+the step before: **reasoning about what a tool does instead of reading what it does.**
+Both were found in the same hour as the last two entries above, and they are the same
+error one level up — a general claim standing in for a specific one.
+
+- **A pattern is broader than its author reads it as.** `pgrep -f "scripts/local.gate"`
+  was written to name one file and is a **regex**: the unescaped `.` matches the `-`
+  in `local-gate.sh`, so it matched a family. Distinct from a pattern that is
+  deliberately broad — this one *looks* exact. It also matched its own invoking
+  shell, which is why it returned 143 and why the count it reported included itself.
+  `pgrep -F` for a fixed string, or anchor it. And a cleanup that is about to send a
+  signal identifies its targets by the **process tree**, walking to an ancestor that
+  owns a directory this session owns — never by a command-line match, and not by the
+  leaf's `cwd` either: a wrapper's `cwd` is where it was launched, and CMake's is a
+  `TryCompile` scratch directory. Judging a process by an attribute inherited from its
+  launcher is the adjacency-attribution rule with a third way to be adjacent.
+- **A guard that has never been seen to refuse is not a guard.** A dependency clone
+  wedged for 43 minutes in `read()` on a socket that had delivered zero bytes, because
+  `http.lowSpeedLimit`/`http.lowSpeedTime` are unset and git therefore applies no
+  timeout to a transfer that stops delivering. Setting them turns a permanent hang
+  into a named failure after 60 seconds of silence — and the next run **succeeded**,
+  which proves nothing about the bound: a cold `CPM_SOURCE_CACHE` still fetches once,
+  so that populate crossed the network too and merely did not stall. The bound is
+  **untested, not proven.** Reporting it as vindicated because the run it accompanied
+  passed is the same defect as every entry above, and the same one
+  `tsan-canary-rate.sh` exists to prevent.
+
+**The general form, and it is the one worth carrying away.** "A SIGTERM does not take
+55 seconds to arrive" was offered as evidence in an incident review. It is true of
+`local-gate.sh` — and *only* because that script traps `EXIT` and not `TERM`. bash
+defers a **trapped** signal until the running foreground command returns, so a signal
+trap on the same line would have made a TERM at second four produce a death at second
+sixty-nine, and `143` is what bash reports either way. The general claim and the
+specific one point opposite directions, and nothing about the general one advertises
+that it does not apply. **Check the claim against the tool in front of you, not
+against how tools of that kind behave.** Every finding in both sections is an instance
+of this: a pipeline's exit code, a `.` in a pattern, a `cwd`, an unset git timeout, a
+signal disposition — each one a fact somebody knew generally and did not verify
+locally.
 
 ## A comment can be true in its premise and false in its conclusion
 
