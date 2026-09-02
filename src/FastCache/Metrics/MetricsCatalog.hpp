@@ -149,6 +149,29 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "Never sum with unknown-lease refusals: those name a lease this "
               "scheduler issued and has forgotten, this one was never issued.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion,
+      .prometheusName = "fastcached_dispatch_frames_refused_unsupported_version_total",
+      .help = "Frames refused at the fleet scheduler's port for naming a protocol "
+              "version this build does not serve: a peer built against another "
+              "release.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode,
+      .prometheusName = "fastcached_dispatch_frames_refused_unknown_opcode_total",
+      .help = "Frames naming an opcode this build has no row for, at the fleet "
+              "scheduler's port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedNotPermitted,
+      .prometheusName = "fastcached_dispatch_frames_refused_not_permitted_total",
+      .help = "Frames naming a verb the fleet scheduler does not serve, typically a "
+              "cache verb sent to the scheduler's port. Any rise names a client "
+              "pointed at the wrong address.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedMalformedPayload,
+      .prometheusName = "fastcached_dispatch_frames_refused_malformed_payload_total",
+      .help = "Frames at the fleet scheduler's port whose declared payload length did "
+              "not match what arrived. Distinct from the scheduler's own uncounted "
+              "malformed-frame refusal, which is about a payload it could not parse.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
       .help = "Compiles this worker began. Minus jobs_completed_total, the number "

@@ -274,7 +274,7 @@ class FleetHarness final: public Cc::IEndpointExchange
                       // builds: a grant minted by any of them must verify on any
                       // other, which is what the harness exists to exercise (#322).
                       FleetHarness::ClusterId },
-            protocol { service }
+            protocol { service, harness._metrics }
         {
         }
 

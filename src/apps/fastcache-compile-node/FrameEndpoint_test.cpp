@@ -56,7 +56,7 @@ struct Fleet
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
     Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
-    Distributed::SchedulerProtocol protocol { service };
+    Distributed::SchedulerProtocol protocol { service, metrics };
     // Loopback, because that is the host a test connection arrives from. The
     // endpoint is given with a port so the constructor's host/endpoint collapse is
     // exercised rather than bypassed.

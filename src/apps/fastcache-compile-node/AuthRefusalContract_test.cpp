@@ -87,7 +87,7 @@ namespace Wire = CompileCacheWire;
     // Leadership is not part of this contract, and a line setting it would tell a
     // reader it is.
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
-    Distributed::SchedulerProtocol protocol { service };
+    Distributed::SchedulerProtocol protocol { service, metrics };
 
     auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" });
     return protocol.Answer(auth, Distributed::CallerContext { .peerId = "127.0.0.1" });

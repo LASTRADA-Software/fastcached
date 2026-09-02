@@ -150,6 +150,47 @@ class IMetricsSink
         /// has since forgotten. This one was never issued at all.
         DispatchLeasesUnauthorized,
 
+        /// Frames refused at the FLEET SCHEDULER's port for naming a protocol version
+        /// this build does not serve.
+        ///
+        /// The scheduler's own half of `WorkerFramesRefusedUnsupportedVersion`, and a
+        /// separate counter for the reason every split on this surface has one: the
+        /// two ports are reached by different peers for different purposes, and a
+        /// worker built against another release is a different operator problem from a
+        /// client that is. Rising during a staggered upgrade is expected and bounded;
+        /// rising afterwards names a node that never came back.
+        DispatchFramesRefusedUnsupportedVersion,
+
+        /// Frames naming an opcode this build has no row for, at the scheduler's port.
+        ///
+        /// Stepped over rather than fatal by design -- the framing exists so a receiver
+        /// can skip a verb it does not know, which is what lets a newer client talk to
+        /// an older scheduler. So a rise is either that, or somebody walking the opcode
+        /// space; both are worth seeing on the surface that carries lease grants.
+        DispatchFramesRefusedUnknownOpcode,
+
+        /// Frames naming a verb this scheduler does not serve, at the scheduler's port.
+        ///
+        /// A CACHE verb arriving here, answered `DispatchNotPermitted` rather than
+        /// `UnknownOpcode`: the verb exists and is served on another port, and telling
+        /// a client it is unknown would say this daemon is too OLD when it is merely
+        /// the wrong port. A rise is a misconfigured client, which is a thing an
+        /// operator fixes rather than a thing they wait out.
+        DispatchFramesRefusedNotPermitted,
+
+        /// Frames whose declared payload length did not match what arrived, at the
+        /// scheduler's port.
+        ///
+        /// **Not the same refusal as `SchedulerService`'s uncounted `MalformedFrame`,
+        /// and that is the point.** The service refuses a payload it could not make
+        /// sense of, and deliberately counts nothing for it because a broken client's
+        /// noise must stay out of the numbers a fleet is sized from. This one is a
+        /// frame whose own header disagrees with itself, before any verb is routed --
+        /// a different event with the same wire code. A table keyed on the CODE could
+        /// not hold both, which is exactly why the row rather than the code is the
+        /// unit (#327, #494).
+        DispatchFramesRefusedMalformedPayload,
+
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this
         /// interface deliberately does not have, and their difference is what
