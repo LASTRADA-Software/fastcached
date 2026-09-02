@@ -99,6 +99,18 @@ if(objected)
     list(APPEND failures "correct: the check objected to a registration that carries the property -- it now refuses everything, which is as useless as refusing nothing")
 endif()
 
+# And it must say it took the WALK. A synthetic tree is not a git repository, so every
+# case above this line exercises the fallback -- which is exactly how the git path went
+# untested until CI found a vendored registration the walk had been excluding by name.
+# The mode is asserted on both sides now, so neither half can quietly become the only
+# one exercised: this case fails if the git path somehow answered, and `git-untracked`
+# below fails if the walk did.
+string(FIND "${output}" "directory walk (no git index)" position)
+if(position EQUAL -1)
+    list(APPEND failures
+         "correct: the check did not report scanning via the directory walk, so the fallback -- the mode a release tarball with no git index takes -- was not the mode this case exercised")
+endif()
+
 # 2. Bare -- the defect itself.
 fastcached_make_tree("bare" "src/thing/CMakeLists.txt"
     "add_executable(thing-tests a.cpp)\ncatch_discover_tests(thing-tests)\n" tree)

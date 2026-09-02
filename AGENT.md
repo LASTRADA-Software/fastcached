@@ -1013,6 +1013,13 @@ and what they may assume.
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
   `--help ...` printed usage and reported a pass for a case that never ran.
+- A fixture states which PATH it exercised. `check-catch-skip-return-code` derives its
+  file set from `git ls-files` and falls back to a directory walk; its selftest had six
+  green cases and CI still failed, with no contradiction between them — a synthetic
+  tree is not a git repository, so every case exercised the FALLBACK while CI exercised
+  GIT. **The mode under test was not the mode in use**, which is a guard passing
+  because it is testing something else. So the mode is part of the OUTPUT and asserted
+  on both sides, or the cheap-to-construct path silently becomes the only one tested.
 - A Catch2 `SKIP(...)` exits **4**, so every `catch_discover_tests` registration
   carries `PROPERTIES SKIP_RETURN_CODE 4` — without it ctest scores a skip as a
   FAILURE, and the binary prints `1 skipped` while ctest prints `***Failed` for the

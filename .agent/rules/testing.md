@@ -797,6 +797,38 @@ Four things about the shape, and the last two are the ones that generalise.
   pass reported for a case that never ran — this ticket's own failure mode, wearing the
   hat of its fix.
 
+## A fixture must state which PATH it exercised
+
+`check-catch-skip-return-code` derives the files it scans from `git ls-files`, and
+falls back to a directory walk where there is no git index. Its selftest had six cases
+and they all passed. CI then failed on a vendored registration the check should never
+have seen — and there was no contradiction between those two facts:
+
+> a synthetic tree is not a git repository, so all six cases exercised the **fallback**
+> path while CI exercised the **git** path — the mode under test was not the mode in
+> use.
+
+**A guard that passes because it is testing something else.** Nothing about the suite
+could have revealed it: every case was correct, every assertion was real, and none of
+them ran the code that runs in production.
+
+- **Any code with a primary path and a fallback needs its fixtures to say which one
+  they exercised**, or the cheap-to-construct path silently becomes the only one
+  tested. A synthetic tree with no git index is the easy fixture, so it is the one that
+  gets written — and it is the one CI never runs.
+- **The mode is therefore part of the output**, not an internal detail: the check
+  prints `via git ls-files` or `via directory walk (no git index)`, and the fixtures
+  assert it. Without that, a silent fall back to the walk passes for the wrong reason,
+  which is the same failure one level down.
+- **Assert it on BOTH sides.** Covering only the path that broke swaps which half is
+  unexercised rather than fixing it. One case requires the walk and one requires git,
+  so neither can quietly become the only one tested — and each is shown red by making
+  the check misreport its mode.
+- **The fallback is exercised where it is actually used, too.** A real `git archive`
+  export has no `.git`, takes the walk, says so, and reaches the same verdict — which
+  is what makes the fallback sound there and unsound in a working checkout, where a
+  dependency cache lives inside the source tree.
+
 ## A SKIP that ctest scores as a failure
 
 A Catch2 case that calls `SKIP(...)` exits **4**, and `SKIP_RETURN_CODE` is the only
