@@ -786,8 +786,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
   `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
   DrvFs log redirect that failed while leaving the gate child ALIVE, and the gate's own
-  `clang-format -i` REWRITING the commit and then measuring what it had rewritten. None
-  announces itself; each looks like a flake; a re-run clears all nine. A dirty-tree guard
+  `clang-format -i` REWRITING the commit and then measuring what it had rewritten, and a
+  `ctest` total that counts only the TARGET SET it was configured with — `-DFASTCACHED_BUILD_TESTCLIENT`
+  and `-DFASTCACHED_BUILD_BENCHMARKS` default OFF, so one commit on one platform gives two
+  different totals and the tree just looks smaller. A total is comparable only against the
+  same tree, the same platform AND the same target set. None
+  announces itself; each looks like a flake; a re-run clears all ten. A dirty-tree guard
   that samples once AT THE START cannot see an instrument that dirties the tree itself —
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a

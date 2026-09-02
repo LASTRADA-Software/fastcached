@@ -559,11 +559,12 @@ determinism rests on.
 
 ## A retry makes every one of these disappear without fixing it
 
-Nine separate ways the gate reported something that was not about the tree under
-test have turned up across three tickets — six while fixing
+Ten separate ways the gate reported something that was not about the tree under
+test have turned up across four tickets — six while fixing
 [#493](https://github.com/LASTRADA-Software/fastcached/issues/493), two more while
-fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), and one
-while fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243). Not
+fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), one while
+fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243), and one
+while fixing [#292](https://github.com/LASTRADA-Software/fastcached/issues/292). Not
 one of them announced itself. Every one presented as an ordinary flake, and **a re-run would
 have cleared all of them without fixing any of them** — which is the whole reason they
 are written down here rather than in those pull requests.
@@ -643,6 +644,25 @@ The specific traps are examples. The rule is the mechanism.
     a translation unit's contents and can change what compiles. Amend the formatting
     into the commit and **re-run** the legs that measured the other tree, rather than
     reasoning about whether whitespace could matter.
+
+- **A `ctest` total is only a total for the target set it was configured with.**
+  `-DFASTCACHED_BUILD_TESTCLIENT` and `-DFASTCACHED_BUILD_BENCHMARKS` default OFF, so
+  two runs of *one commit on one platform* report different totals, and **nothing in
+  the output says which you asked for**. A gated-off target is invisible to the run
+  rather than absent from it: the suite passes, the count looks like a count, and the
+  tree simply appears smaller. This is the rule about a clang-tidy sweep being only as
+  complete as its compile database's targets, arriving at a different instrument and a
+  different artefact.
+  - **So a total needs three conditions before it is comparable**, not two: the same
+    tree, the same platform, **and the same target set**. Two were already written
+    down; the third is the one that reads as a smaller codebase rather than as an
+    error.
+  - **Caught by arithmetic, and only because the number could not be lower.** A branch
+    adding five cases reported 2982 where a sibling branch adding one reported 2992 on
+    the same base — impossible in that direction. Reconciled, both fall out of one
+    base once the conditions match: 2996 = 2991 + 5 against 2992 = 2991 + 1. A
+    plausibly-*higher* wrong number would have passed unexamined, which is the honest
+    boundary of this check rather than a reason not to make it.
 
 Two that are not about shells at all, and are the ones a reader is most likely to
 recognise in themselves:
