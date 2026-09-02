@@ -718,7 +718,17 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
-- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate.
+- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate — and a
+  RED run is silent about every leg after the failure, so "GATE FAILED: clang-debug tests"
+  does not mean the rest passed (#501). Two `-Werror` defects in one change hid behind
+  five red runs that never reached `gcc-release`.
+- **A retry makes an instrument's own failures disappear without fixing them.** Six ways
+  the gate reported on something other than the tree under test turned up in one ticket —
+  `| tail` reporting the pipe's status, quoting collapsing through three parsers so the
+  run never happened, two gates in one build directory, a dirty tree, the log on `/tmp`
+  where a WSL idle-out erases it, and the wrapper edited WHILE bash was executing it. None
+  announces itself; each looks like a flake; a re-run clears all six. Presence is not
+  usability, and a finding fixed at the line rather than at the rule comes back.
 - A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
