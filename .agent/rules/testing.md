@@ -797,6 +797,51 @@ Four things about the shape, and the last two are the ones that generalise.
   pass reported for a case that never ran — this ticket's own failure mode, wearing the
   hat of its fix.
 
+## A SKIP that ctest scores as a failure
+
+A Catch2 case that calls `SKIP(...)` exits **4**, and `SKIP_RETURN_CODE` is the only
+thing that tells ctest an exit code means *skipped* rather than *failed*. None of the
+five `catch_discover_tests` registrations set it, so the binary printed `1 skipped`
+and ctest printed `***Failed` **for the very same run** (#499).
+
+- **Measured, not inferred.** One forced skip: `test cases: 1 | 1 skipped` with
+  `BINARY EXIT: 4`, ctest `***Failed`; after `PROPERTIES SKIP_RETURN_CODE 4`,
+  `***Skipped` and `100% tests passed`.
+- **It is a false RED, which is the insidious direction.** All seven `SKIP` sites in
+  this tree are environment-conditional — three on `AvailableCodecs().size() < 2`,
+  four on being able to bind loopback — so they fire on a constrained runner or a
+  build configured without codecs and report a regression that is not there. Nobody
+  had hit it because those conditions had not arisen on CI, which is **luck rather
+  than coverage**: the codec skips depend on how the build is configured and the
+  loopback ones on what the runner allows, and neither is a property of the code.
+- **It makes `SKIP` unusable as a tool.** Whoever adds one, watches the suite go red
+  and concludes the skip was wrong will delete the skip rather than suspect the
+  registration — the wrong lesson, learned permanently, by someone who did nothing
+  wrong.
+- **The value is part of the rule.** `77` is the GNU convention the eleven
+  script-driven `add_test` registrations use, because a shell script picks its own
+  exit code. A Catch2 binary does not: it exits **4**. `SKIP_RETURN_CODE 77` on a
+  Catch2 registration is present, reads correctly in a diff, satisfies any
+  "is the property there" scan, and still scores every skip as a failure.
+- **A comment was never what was missing.** The mechanism was already written down in
+  `src/tests/CMakeLists.txt` and applied eleven times, one directory away from five
+  registrations that did not apply it. So the guard is a check —
+  `ctest -R catch-skip-return-code`, reading the registrations from the tree rather
+  than restating them — because **a sixth test binary would reopen this by omission
+  exactly as the fifth did**.
+- **`catch_discover_tests` writes its list at BUILD time.** A `POST_BUILD` step, so
+  editing the CMakeLists and reconfiguring is not enough: measured, the old list
+  survived a full successful `cmake --preset` and the case still reported `***Failed`;
+  only a REBUILD turned it into `***Skipped`. **A stale result reads exactly like a
+  current one**, so verify this property by hand only after rebuilding the target.
+- **The guard is shown failing on every direction it claims**
+  (`ctest -R catch-skip-selftest`): a bare registration, a wrong value, a
+  registration split across lines that must NOT be reported, and a tree with no
+  registrations at all, which must report a broken scan rather than a clean tree. Its
+  own first version walked into `_deps/catch2-src` and reported vendored third-party
+  code — `file(GLOB_RECURSE)` recurses from the base directory and treats only the
+  last component as a pattern, so `src/*/CMakeLists.txt` does not mean one level down.
+
 ## Open work
 
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two

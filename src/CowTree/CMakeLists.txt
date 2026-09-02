@@ -70,5 +70,10 @@ if(FASTCACHED_BUILD_TESTS)
     # top-level CMakeLists, regardless of whether Catch2 came from CPM source
     # or a system find_package.
     include(Catch)
-    catch_discover_tests(CowTreeTests)
+    # `SKIP_RETURN_CODE 4`, because a Catch2 `SKIP(...)` exits 4 and ctest scores that
+    # as a FAILURE unless told otherwise -- a false red on any runner where an
+    # environment-conditional skip fires. The whole argument is in
+    # src/tests/CMakeLists.txt beside the registrations that already spell it;
+    # `catch-skip-return-code` enforces it (#499).
+    catch_discover_tests(CowTreeTests PROPERTIES SKIP_RETURN_CODE 4)
 endif()

@@ -30,7 +30,30 @@ target_compile_definitions(FastCacheTest
 # top-level CMakeLists, regardless of whether Catch2 came from CPM source or a
 # system find_package.
 include(Catch)
-catch_discover_tests(FastCacheTest)
+# A Catch2 case that calls `SKIP(...)` exits **4**, and `SKIP_RETURN_CODE` is the
+# only thing that tells ctest an exit code means *skipped* rather than *failed*.
+# Without it the binary prints `1 skipped` and ctest prints `***Failed` for the very
+# same run -- measured, not inferred (#499).
+#
+# That is a false RED, which is the insidious direction: the seven `SKIP` sites in
+# this tree are all environment-conditional -- three on `AvailableCodecs().size() < 2`
+# and four on being able to bind loopback -- so they fire on a constrained runner or a
+# build configured without codecs, and report a regression that is not there. Nobody
+# has hit it because those conditions have not arisen on CI, which is luck rather than
+# coverage.
+#
+# It also makes `SKIP` unusable as a tool: whoever adds one and watches the suite go
+# red concludes the skip is wrong and deletes it, rather than suspecting the
+# registration. The wrong lesson, learned permanently.
+#
+# The repository already knew this. Eleven script-driven `add_test` registrations
+# below set `SKIP_RETURN_CODE 77`; it was simply never carried to the five Catch2
+# registrations, which are the ones discovering thousands of cases.
+#
+# `catch-skip-return-code` covers the door this comment cannot: a sixth test binary
+# added without the property would reopen the hole by omission, exactly as the fifth
+# did.
+catch_discover_tests(FastCacheTest PROPERTIES SKIP_RETURN_CODE 4)
 
 # ---------------------------------------------------------------------------
 # The ThreadSanitizer canary: a program that MUST fail, so that a green sanitizer
@@ -160,6 +183,59 @@ set_tests_properties("script-check-signals" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# Every `catch_discover_tests` registration tells ctest that exit 4 means SKIPPED.
+#
+# A Catch2 case that calls `SKIP(...)` exits 4, and without `SKIP_RETURN_CODE` ctest
+# scores that as a FAILURE -- so the binary prints `1 skipped` and ctest prints
+# `***Failed` for the very same run. Measured on a forced skip, not inferred (#499).
+#
+# None of the five Catch2 registrations set it, while eleven script-driven `add_test`
+# registrations below set `SKIP_RETURN_CODE 77` one directory away. So the mechanism
+# was known and simply never carried to the registrations that discover thousands of
+# cases -- which is why a comment is not the fix and a check is: a SIXTH test binary
+# would reopen it by omission exactly as the fifth did. Same argument as
+# `script-check-signals`, and the set of registrations is READ from the tree.
+#
+# In the default set with the other hygiene checks: it reads files and compares
+# strings.
+add_test(
+    NAME "catch-skip-return-code"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-return-code.cmake"
+)
+set_tests_properties("catch-skip-return-code" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be SEEN to fail, on each direction it claims.
+#
+# Six synthetic trees, one verdict asserted each: a correct registration passes, a
+# bare one fails and NAMES the file, `SKIP_RETURN_CODE 77` fails (present, reads
+# correctly in a diff, and does nothing, because Catch2 exits 4 and not 77), the
+# property on a continuation line passes, a tree with no registrations reports a
+# broken scan rather than a clean tree, and a registration inside a build tree is
+# ignored -- the first version of the check walked into `_deps/catch2-src` and
+# reported vendored code nobody here can edit.
+#
+# Per case rather than `WILL_FAIL`, because a check that stopped refusing and one
+# that refuses everything are opposite defects a bare inversion reports identically.
+add_test(
+    NAME "catch-skip-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/catch-skip-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-selftest.cmake"
+)
+set_tests_properties("catch-skip-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
 )
 
 # ---------------------------------------------------------------------------

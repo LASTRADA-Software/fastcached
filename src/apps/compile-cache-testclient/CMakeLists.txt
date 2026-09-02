@@ -27,5 +27,10 @@ if(FASTCACHED_BUILD_TESTS)
     target_include_directories(compile-cache-testclient-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(compile-cache-testclient-tests PRIVATE FastCache Catch2::Catch2WithMain)
     include(Catch)
-    catch_discover_tests(compile-cache-testclient-tests)
+    # `SKIP_RETURN_CODE 4`, because a Catch2 `SKIP(...)` exits 4 and ctest scores that
+    # as a FAILURE unless told otherwise -- a false red on any runner where an
+    # environment-conditional skip fires. The whole argument is in
+    # src/tests/CMakeLists.txt beside the registrations that already spell it;
+    # `catch-skip-return-code` enforces it (#499).
+    catch_discover_tests(compile-cache-testclient-tests PROPERTIES SKIP_RETURN_CODE 4)
 endif()

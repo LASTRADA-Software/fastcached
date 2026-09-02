@@ -1013,6 +1013,17 @@ and what they may assume.
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
   `--help ...` printed usage and reported a pass for a case that never ran.
+- A Catch2 `SKIP(...)` exits **4**, so every `catch_discover_tests` registration
+  carries `PROPERTIES SKIP_RETURN_CODE 4` — without it ctest scores a skip as a
+  FAILURE, and the binary prints `1 skipped` while ctest prints `***Failed` for the
+  same run (#499). A false RED: all seven skip sites are environment-conditional, so
+  they fire on a constrained runner and report a regression that is not there, and
+  whoever meets it deletes the SKIP rather than suspecting the registration. The value
+  is part of the rule — `77` is the script-driven convention and does nothing here.
+  The mechanism was already applied eleven times one directory away, so the guard is a
+  check (`catch-skip-return-code`, shown failing by `catch-skip-selftest`), because a
+  sixth test binary reopens it by omission. And the list is written at BUILD time, so
+  a reconfigure alone leaves a stale one that reads exactly like a current one.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process
   counter is not unique — `catch_discover_tests` gives every case its own
   process, and the suite runs in parallel.
