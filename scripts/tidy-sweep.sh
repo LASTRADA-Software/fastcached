@@ -110,18 +110,30 @@ InterpreterVerdict() {
     echo fatal
 }
 
+# Named once. "bash >= 4.4 is required" without saying what is actually HERE sends
+# somebody to check a version the message never showed them.
+interpreterIs="${BASH:-bash} is ${BASH_VERSION:-not bash}"
+
 case "$(InterpreterVerdict "${BASH_VERSINFO[0]:-}" "${BASH_VERSINFO[1]:-0}" "$selfTestRequested")" in
     ok) ;;
     skip)
-        # Both halves named. "bash >= 4.4 is required" without saying what is
-        # actually here sends somebody to check a version the message never showed.
-        echo "TIDY SWEEP SELF-TEST SKIPPED: ${BASH:-bash} is ${BASH_VERSION:-not bash}, and this needs bash >= 4.4." >&2
+        echo "TIDY SWEEP SELF-TEST SKIPPED: ${interpreterIs}, and this needs bash >= 4.4." >&2
         echo "  A SKIP is not a pass: the scope computation was NOT checked on this machine." >&2
         echo "  Install a newer bash to run it here (on macOS: brew install bash)." >&2
         exit 77
         ;;
+    fatal)
+        echo "TIDY SWEEP FATAL: ${interpreterIs}, and bash >= 4.4 is required" >&2
+        exit 2
+        ;;
     *)
-        echo "TIDY SWEEP FATAL: ${BASH:-bash} is ${BASH_VERSION:-not bash}, and bash >= 4.4 is required" >&2
+        # A verdict this case does not know renders as UNRECOGNISED rather than as
+        # the nearest plausible neighbour. Folding it into the `fatal` arm would be
+        # cheaper and would report a bash-version problem for what is actually a bug
+        # in the function above -- sending somebody to install a shell they already
+        # have. Same rule as `leg_summary`'s default arm in `local-gate.sh`, and for
+        # the same reason: a fourth state must not arrive silently as a third.
+        echo "TIDY SWEEP FATAL: InterpreterVerdict returned an unrecognised verdict; this is a bug in this script, not a problem with ${interpreterIs}" >&2
         exit 2
         ;;
 esac
