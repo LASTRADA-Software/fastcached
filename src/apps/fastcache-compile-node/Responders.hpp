@@ -101,17 +101,24 @@ namespace Detail
     /// -- is sound for the SCHEDULER, whose ceiling is kilobytes and whose series is
     /// about credentials. It is the opposite of what happens here, and inheriting it
     /// is how a decision about one surface came to describe another.
+    /// Why neither credential arm counts, stated once for the two rows that share it.
+    ///
+    /// The two enumerators are separate because a client is told different things
+    /// about them; the ARGUMENT is one argument about one fact -- which family `AUTH`
+    /// belongs to -- so it is one sentence. Written out twice it is two literals that
+    /// can drift on any edit with nothing to catch it, which is the "second statement
+    /// of one fact" this table's own wire-code column is deliberately shaped to avoid.
+    inline constexpr std::string_view CredentialIsTheSchedulersRationale =
+        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
+        "decided against this surface";
+
     inline constexpr EnumTable<EndpointRefusal, CacheEndpointRefusal> CacheEndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
           .policy = { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy, .rationale = {} } },
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .policy = { .counter = std::nullopt,
-                      .rationale = "AUTH is the Session family, which MergedResponder routes to the scheduler; no "
-                                   "credential outcome is ever decided against this surface" } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .policy = { .counter = std::nullopt,
-                      .rationale = "AUTH is the Session family, which MergedResponder routes to the scheduler; no "
-                                   "credential outcome is ever decided against this surface" } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
     } };
 
     // Positional rows alone would not catch an appended enumerator: it leaves a
@@ -130,13 +137,15 @@ namespace Detail
 
     /// What the CACHE surface does about each pre-payload decision (#491).
     ///
-    /// A total switch rather than an `EnumTable`, and the reason is the enum:
-    /// `PrePayloadDecision` is `CompileCacheWire`'s, which is header-only and
-    /// dependency-free because the launcher compiles it in, so it carries no `Last`
-    /// and an `EnumTable` cannot take its extent. `-Werror=switch` is the guard
-    /// instead, and it is the same one `CompileCacheWire::ErrorCodeFor` relies on for
-    /// this enumeration -- a fifth decision fails the build here rather than falling
-    /// through to a neighbour's answer.
+    /// A total switch rather than an `EnumTable`, which is **not** a local exception:
+    /// `CompileResponder::RefusalFor` answers the same question about the same enum
+    /// the same way, and its comment is where the reason is written down. In short,
+    /// `PrePayloadDecision` is a wire enum both binaries compile in, so giving it a
+    /// `Last` to satisfy a node-local table idiom would be a wire change bought for
+    /// nothing. `-Werror=switch` is the guard instead -- the same one
+    /// `CompileCacheWire::ErrorCodeFor` relies on for this enumeration -- so a fifth
+    /// decision fails the build here rather than falling through to a neighbour's
+    /// answer.
     ///
     /// @param decision A decision other than `Serve`.
     /// @return What this surface does about it.

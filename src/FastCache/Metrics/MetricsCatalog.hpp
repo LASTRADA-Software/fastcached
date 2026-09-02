@@ -393,6 +393,41 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "wrong verb -- and what an operator watches there is the shape of the curve rather "
               "than its existence.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_node_cache_requests_refused_payload_too_large_total",
+      .help = "Cache verbs refused because the header declared more payload than the surface "
+              "will buffer, so nothing was read. The cheapest probe there is -- 24 bytes and no "
+              "body -- and on a node holding a cache tier it is the frame ceiling that actually "
+              "fires, because the listener asks the component owning the verb. Never sum with "
+              "fastcache_worker_frames_refused_payload_too_large_total: both answer "
+              "payload-too-large and they name different subsystems on one port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy,
+      .prometheusName = "fastcache_node_cache_requests_refused_endpoint_busy_total",
+      .help = "Cache verbs refused because the request would not fit in the bytes already in "
+              "flight on this surface. A slot was free and the memory was not. This is the "
+              "byte-budget refusal a node with a cache tier reaches, the listener's in-flight "
+              "ceiling being the largest of the components present and that usually being the "
+              "cache's. Never sum with fastcache_worker_jobs_refused_endpoint_busy_total or "
+              "fastcache_node_frame_connections_refused_at_capacity_total, which share the "
+              "endpoint-busy code and nothing else.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion,
+      .prometheusName = "fastcache_node_cache_requests_refused_unsupported_version_total",
+      .help = "Cache requests refused because this build cannot decode the wire version they "
+              "were sent at -- a client compiled against another release. Worth alerting on "
+              "because the only other evidence is a cache that looks permanently cold: a "
+              "launcher steps over a refused fetch and compiles locally, so the build stays "
+              "correct and merely stops being fast.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload,
+      .prometheusName = "fastcache_node_cache_requests_refused_malformed_payload_total",
+      .help = "Fetch or store bodies the cache tier could not decode, in frames whose declared "
+              "length arrived in full. A client-library or version mismatch between two ends "
+              "that agree on the framing, or somebody malforming bodies deliberately. Its own "
+              "series rather than any other malformed-frame counter, which describe a truncated "
+              "compile frame, an undecodable compile payload and two AUTH payloads.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
       .prometheusName = "fastcache_scheduler_requests_refused_unauthenticated_total",
       .help = "Scheduler requests refused because the connection presented no "

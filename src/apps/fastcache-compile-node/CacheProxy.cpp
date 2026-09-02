@@ -113,12 +113,12 @@ namespace
                          "caller is visible and not only the ones that arrived over the wire",
         };
 
-        /// A verb named by `RefusedVerbs` -- today, `AUTH`.
+        /// Why a verb named by `RefusedVerbs` -- today, `AUTH` -- counts nothing.
         ///
-        /// **Uncounted, and this is the arm where a counter would be actively
-        /// harmful.** It is what a `FASTCACHE_TOKEN`-configured launcher produces once
-        /// per exchange for a whole build, so the series would be dominated by healthy
-        /// traffic and a port scan would be invisible inside it -- the same argument
+        /// **The arm where a counter would be actively harmful.** It is what a
+        /// `FASTCACHE_TOKEN`-configured launcher produces once per exchange for a whole
+        /// build, so the series would be dominated by healthy traffic and a port scan
+        /// would be invisible inside it -- the same argument
         /// `MergedResponder::UnservedReply` carries, which is why #447 withdrew a
         /// counter of its own rather than shipping one that could not be read.
         ///
@@ -126,11 +126,15 @@ namespace
         /// routed to the scheduler or answered unserved. Either clause alone settles
         /// it; both are recorded because the first survives a routing change and the
         /// second does not.
-        constexpr Cc::UncountedRefusal RefusedVerb {
-            .code = Wire::UnimplementedVerb,
-            .rationale = "a token-configured launcher sends AUTH once per exchange for a whole build, so this series "
-                         "would be dominated by healthy traffic and a scan invisible inside it",
-        };
+        ///
+        /// A bare rationale and **not** a `Cc::UncountedRefusal`, unlike every other
+        /// row here: the code this arm answers with comes from the matched
+        /// `Wire::RefusedVerb` row, so a `code` member beside this text would be built,
+        /// documented and never read -- a field that looks load-bearing because its
+        /// neighbours are.
+        constexpr std::string_view RefusedVerbRationale =
+            "a token-configured launcher sends AUTH once per exchange for a whole build, so this series would be "
+            "dominated by healthy traffic and a scan invisible inside it";
 
         /// A scheduler or compile verb at the cache tier.
         ///
@@ -240,7 +244,7 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
                 // `row->why` is the sentence the CLIENT is sent; `rationale` on the row
                 // above is why nothing rises and is never transmitted. The two meet in
                 // this one expression, which is exactly where the names have to differ.
-                co_return Cc::RefuseWithoutCounter({ .code = row->code, .rationale = TierRefusal::RefusedVerb.rationale },
+                co_return Cc::RefuseWithoutCounter({ .code = row->code, .rationale = TierRefusal::RefusedVerbRationale },
                                                    row->why);
 
             // A scheduler or worker verb at the cache port. Answered rather than

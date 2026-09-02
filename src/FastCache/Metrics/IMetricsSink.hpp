@@ -460,6 +460,60 @@ class IMetricsSink
         /// a zero the merge made false.
         NodeCacheRequestsRefusedNotLocal,
 
+        /// A cache verb whose header declared more payload than the surface will
+        /// buffer, so nothing was read.
+        ///
+        /// **The cheapest probe there is**: twenty-four bytes and no body. It is also
+        /// the frame ceiling that fires on a real node, which is why it is a row at
+        /// all -- the merged `0xFC` listener asks the component owning the verb, and
+        /// until #491 the cache's answer moved nothing, so an operator alerting on
+        /// `fastcache_worker_frames_refused_payload_too_large_total` watched a flat
+        /// graph while the port was being hammered (#326's scenario, one surface
+        /// over).
+        ///
+        /// **Never summed with `WorkerFramesRefusedPayloadTooLarge`.** Both answer
+        /// `payload-too-large` and a client does the same thing about both; an
+        /// operator does not, because the two name different subsystems on one port
+        /// and one of them is what a misconfigured launcher produces.
+        NodeCacheRequestsRefusedPayloadTooLarge,
+
+        /// A cache verb that would not fit in the bytes the surface already holds in
+        /// flight.
+        ///
+        /// **The byte-budget refusal a node with a tier actually reaches.**
+        /// `MergedResponder::MaxInFlightBytes()` folds to the largest owner's budget,
+        /// which in practice is this cache's, so the endpoint's in-flight ceiling is
+        /// the cache's ceiling and a `STORE` is what runs into it.
+        ///
+        /// **Never summed with `WorkerJobsRefusedEndpointBusy` or
+        /// `NodeFrameConnectionsRefusedAtCapacity`.** Three refusals answer
+        /// `endpoint-busy` on this listener and an operator does three different
+        /// things: shrink the objects being stored, add compile capacity, raise a
+        /// connection ceiling.
+        NodeCacheRequestsRefusedEndpointBusy,
+
+        /// A cache request whose wire version this build cannot decode.
+        ///
+        /// A client compiled against another release, and every one of its exchanges
+        /// fails. Counted because the only other evidence is a cache that looks
+        /// permanently cold: the launcher steps over a refused `FETCH` and compiles
+        /// locally, so the build stays correct and merely stops being fast, which is
+        /// the failure shape this tree has paid for before.
+        NodeCacheRequestsRefusedUnsupportedVersion,
+
+        /// A `FETCH` or `STORE` body this build could not decode.
+        ///
+        /// The frame was well formed -- its declared length arrived in full -- and the
+        /// payload inside it was not. That is a client-library or version mismatch
+        /// between two ends that agree on the framing, or somebody malforming bodies
+        /// on purpose; either way no healthy launcher produces one.
+        ///
+        /// **Its own row rather than any other `malformed-frame` counter.** The code
+        /// is shared by a truncated compile frame, an undecodable compile payload and
+        /// two `AUTH` payloads; the row is the refusal and not the code, so a table
+        /// keyed on the code could not hold them.
+        NodeCacheRequestsRefusedMalformedPayload,
+
         /// Scheduler requests refused because the connection presented no accepted
         /// credential.
         ///

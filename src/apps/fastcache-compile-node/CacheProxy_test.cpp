@@ -503,41 +503,32 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
               == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion));
     }
 
-    SECTION("a FETCH whose body will not decode")
-    {
-        // The frame is well formed -- its declared length arrives in full -- and the
-        // payload inside it is not, which is two ends agreeing on the framing and
-        // disagreeing about what goes in it. The declared length MATCHES the bytes
-        // sent, deliberately: shortened instead, this would be refused as truncated,
-        // answer the same wire code, and move a different counter -- which is exactly
-        // how the compile surface's equivalent test passed under the bug it was
-        // written to catch.
-        Fixture fix;
-        std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
-        WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), 2);
-        frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
-        frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
-
-        auto const before = AllCounters(fix.metrics);
-        CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
-        CHECK(Moved(before, AllCounters(fix.metrics))
-              == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload));
-    }
-
-    SECTION("a STORE whose body will not decode reaches the same row")
+    SECTION("a FETCH or a STORE whose body will not decode reaches one row")
     {
         // One row for both verbs: they carry different fields and say the same thing
-        // about the peer, and an operator does one thing about it.
-        Fixture fix;
-        std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
-        WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Store), 2);
-        frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
-        frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
+        // about the peer, and an operator does one thing about it. Driven over the two
+        // verbs rather than written twice, because a second copy of this frame is a
+        // second place for the length below to be got wrong.
+        //
+        // The declared length MATCHES the bytes sent, deliberately. Shortened instead,
+        // this would be refused as TRUNCATED -- answering the same wire code and
+        // moving a different counter -- which is exactly how the compile surface's
+        // equivalent test passed under the bug it was written to catch.
+        for (auto const op: { Wire::Op::Fetch, Wire::Op::Store })
+        {
+            INFO("verb " << static_cast<unsigned>(op));
+            Fixture fix;
+            std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
+            WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(op), 2);
+            // A length prefix claiming far more field than the payload can hold.
+            frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
+            frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
 
-        auto const before = AllCounters(fix.metrics);
-        CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
-        CHECK(Moved(before, AllCounters(fix.metrics))
-              == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload));
+            auto const before = AllCounters(fix.metrics);
+            CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
+            CHECK(Moved(before, AllCounters(fix.metrics))
+                  == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload));
+        }
     }
 
     SECTION("and the AUTH refusal a token-configured launcher gets every exchange moves nothing")
