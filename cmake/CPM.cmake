@@ -29,7 +29,10 @@ else()
 endif()
 
 # Expand relative path. This is important if the provided path contains a tilde (~)
-get_filename_component(CPM_DOWNLOAD_LOCATION ${CPM_DOWNLOAD_LOCATION} ABSOLUTE)
+# -- and quoted for the same reason the download below is: a CPM_SOURCE_CACHE
+# under a path with a space splits here first, and `ABSOLUTE` lands in the wrong
+# position, so quoting only the call below would leave the claim it makes false.
+get_filename_component(CPM_DOWNLOAD_LOCATION "${CPM_DOWNLOAD_LOCATION}" ABSOLUTE)
 
 # `INACTIVITY_TIMEOUT` and not `TIMEOUT`: the bound is on SILENCE, so a slow but
 # progressing download still completes however long it takes. See
