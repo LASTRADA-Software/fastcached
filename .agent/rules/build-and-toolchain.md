@@ -184,6 +184,21 @@ determinism rests on.
     is enough, since the package job builds the library and every app. The
     workaround is nearly always a C++20 spelling: `std::views::iota` over the
     index range says what `enumerate` says and is ten years older.
+  - **And the mirror holds: a Windows verification is green about a smaller set of
+    questions than it looks.** The paragraph above counts what a Linux-only gate
+    misses; this direction is measured too. One session's four tickets produced
+    **four defects a fully green MSVC run of ~2997 tests could not have reported** --
+    a partial designated initializer (`-Wmissing-designated-field-initializers`,
+    which clang makes an error and MSVC does not diagnose at all), a leaked coroutine
+    frame in a test fixture (ASan; no Windows preset runs a sanitizer), and two
+    clang-tidy findings on code MSVC compiles happily
+    (`readability-redundant-typename`, `performance-unnecessary-copy-initialization`).
+    Not one of the four is reachable by running *more tests* on Windows: three exist
+    only in the analyser and the fourth needs a sanitizer. So the inference to refuse
+    is "the Windows run was green, therefore it was green about everything" -- the
+    Windows leg answers a different question, not a weaker version of the same one.
+    Four in four tickets is recorded rather than one anecdote, because a rule argued
+    from a single instance reads as an accident.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,

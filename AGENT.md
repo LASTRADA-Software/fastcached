@@ -778,9 +778,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Run `scripts/local-gate.sh` before pushing. One configuration is not the gate — and a
   RED run is silent about every leg after the failure, so "GATE FAILED: clang-debug tests"
   does not mean the rest passed (#501). Two `-Werror` defects in one change hid behind
-  five red runs that never reached `gcc-release`.
-- **A retry makes an instrument's own failures disappear without fixing them.** Eight ways
-  the gate reported on something other than the tree under test have turned up across two
+  five red runs that never reached `gcc-release`. A GREEN run is silent in the OTHER
+  direction: four defects in four tickets were reachable only by the analyser or a
+  sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
+  them. A platform's leg answers a different question, not a weaker version of the same one.
+- **A retry makes an instrument's own failures disappear without fixing them.** Ten ways
+  the gate reported on something other than the tree under test have turned up across four
   tickets — `| tail` reporting the pipe's status, quoting collapsing through three parsers
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
