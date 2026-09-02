@@ -76,12 +76,18 @@ set -u
 # settled before anything 4.4-only executes. `${1+"$@"}` and not `"$@"`, for the
 # very reason 4.4 is the floor: on 3.2 the bare form is an unbound-variable error
 # when there are no arguments, so this guard would die instead of reporting.
+# `--self-test` AND NOTHING ELSE. The canonical parse is far below, after code this
+# interpreter may not be able to run, so this is a second place the command line is
+# read -- and two readings that can disagree are worse than one that is coarse.
+# `--self-test --all` is a full sweep on a modern bash (the real loop is last-wins),
+# so answering "skipped self-test" for it on 3.2 would have the two interpreters
+# reporting different outcomes for one command line, in the green-reading direction.
+# Anything else falls through to the sweep's refusal, which is what a modern bash
+# does with it too.
 selfTestRequested=0
-for arg in ${1+"$@"}; do
-    if [[ "$arg" == "--self-test" ]]; then
-        selfTestRequested=1
-    fi
-done
+if [[ "$#" -eq 1 ]] && [[ "${1:-}" == "--self-test" ]]; then
+    selfTestRequested=1
+fi
 
 # The decision, as a pure function of the three things it depends on.
 #
@@ -376,11 +382,21 @@ SelfTest() {
     ExpectForce "README.md" no
     ExpectForce ".agent/rules/testing.md" no
 
-    # Non-vacuity, asserted rather than inferred (#588). Every check above compares
-    # against a non-empty literal and so would fail if the graph were empty -- except
-    # the `.hpp` one, whose expected value IS zero and which therefore passes
-    # perfectly over a graph that was never built. Two empty answers agreeing is the
-    # `node-config-reference` scar, and this is where it would land here.
+    # Non-vacuity, asserted rather than inferred (#588).
+    #
+    # FIVE rows above survive an empty input, not one, and the count is measured
+    # rather than reasoned: `a changed TU sweeps itself` needs no graph at all (a
+    # .cpp is its own unit), and the four `ExpectForce ... no` rows all pass over an
+    # EMPTY escalation table because "no" is what an empty table answers. What keeps
+    # clause 3 satisfied is that each of them is paired with a positive row that does
+    # NOT survive -- the six `yes` rows guard the table, the two reach rows guard the
+    # graph.
+    #
+    # The `.hpp` row was the one with no pair: its expected value IS zero, so it
+    # passed perfectly over a graph that had never been built. That is the
+    # `node-config-reference` scar -- two empty answers agreeing -- and this
+    # assertion is its pair. A new row whose expected value is an absence needs one
+    # too.
     Expect "the synthetic include graph was actually built" \
            "yes" \
            "$( [[ "${#includers[@]}" -gt 0 ]] && echo yes || echo no )"

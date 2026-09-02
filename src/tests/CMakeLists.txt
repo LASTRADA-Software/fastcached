@@ -925,7 +925,14 @@ endif()
 # `tidy-sweep.sh` requires bash 4.4 -- `wait -n` is 4.3, and expanding an empty
 # array under `set -u` stops erroring at 4.4 -- and macOS ships a 2007 bash 3.2.
 # Without this the script exits 2 there and a stock macOS runner goes RED for an
-# interpreter that is merely old; with it, ctest reports SKIPPED and says so.
+# interpreter that is merely old; with it, ctest reports SKIPPED.
+#
+# The three-line reason the script prints goes to stderr, and ctest does not show a
+# SKIPPED test's output by default -- `CTEST_OUTPUT_ON_FAILURE` covers failures
+# only -- so in a CI log the reason is in `LastTest.log` rather than on screen. The
+# STATE is what carries in CI; the explanation is for whoever runs it by hand or
+# opens the log. Said here because the difference is invisible until somebody goes
+# looking for a sentence that is not there.
 #
 # And the guard has to be here rather than at configure time, which is the
 # tempting repair and the wrong one: the floor is a property of whichever `bash`
