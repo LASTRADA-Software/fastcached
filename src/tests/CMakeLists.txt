@@ -517,6 +517,41 @@ set_tests_properties("target-file-guards" PROPERTIES
     TIMEOUT 60
 )
 
+# And that check must be SEEN to refuse. It never had been.
+#
+# #510 exists because a stray `]` somebody left in a comment caught this check going
+# blind -- an accident, not the check reporting a problem. Before #510 one `]` on an
+# app table row took it from 25 references across 5 optional targets to 10 across 1,
+# and it PASSED: the old refusal was a floor of ZERO and 1 is not 0.
+#
+# Five synthetic trees, one verdict asserted each: a guarded reference passes, an
+# unguarded one is refused and NAMES file:line, a tree with no reference at all is
+# refused as vacuous rather than reported as clean, a stray `]` on a table ROW changes
+# nothing, and a build option the reader never turned into a target is refused as lost
+# rows rather than silently dropped.
+#
+# The bracket sits on a ROW and not in a comment, which is the difference between a
+# regression test and the appearance of one: a REGEX-filtered `file(STRINGS)` discards
+# non-matching lines BEFORE building its list, so the first version of that case put
+# the bracket where it reached nothing and PASSED against the unfixed check.
+#
+# Shown to bite: run against master's reader, two of the five cases fail.
+#
+# In the default set with the other hygiene checks: it reads files and compares
+# strings.
+add_test(
+    NAME "target-file-guards-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/target-file-guards-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-target-file-guards-selftest.cmake"
+)
+set_tests_properties("target-file-guards-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # ---------------------------------------------------------------------------
 # Every refusal a `0xFC` surface answers with is routed, and says which fact it is
 # asserting.

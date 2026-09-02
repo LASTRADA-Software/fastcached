@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
+# Policies are pinned because a `cmake -P` script gets OLD defaults for every
+# policy the project has not stated. That has already cost this tree once, when
+# `if(... IN_LIST ...)` (CMP0057) silently did nothing in a check. Here it is
+# CMP0007: without it, `list(FILTER)` over a split file warns on every empty
+# element, and a check that prints a wall of warnings is a check nobody reads.
+cmake_minimum_required(VERSION 3.28)
+#
 # Target-file guard hygiene: fail when a test registration names an OPTIONAL
 # executable through `$<TARGET_FILE:>` without first asking whether that target
 # exists -- and, since #423, when it asks a question that can only ever be
@@ -63,7 +70,33 @@ if(NOT EXISTS "${appTable}")
     message(FATAL_ERROR "the app table is missing: ${appTable}")
 endif()
 
-file(STRINGS "${appTable}" appRows REGEX "^[ \t]*\"[A-Za-z0-9_-]+\\|FASTCACHED_BUILD_")
+# Read and split by hand rather than with `file(STRINGS)`.
+#
+# `file(STRINGS)` returns a CMake LIST, and CMake's list parser treats an UNBALANCED
+# `[` or `]` as structure: one of them merges every following element into a single
+# one. Measured on this very check, by appending one `]` to an app table row:
+#
+#     before:  25 reference(s) to 5 optional target(s), all guarded
+#     after:   10 reference(s) to 1 optional target(s), all guarded -- and it PASSED
+#
+# A REGEX argument does not save it: it filters lines BEFORE the list is built, so it
+# protects only where an unbalanced bracket cannot appear on a line the filter KEEPS,
+# which is an accident of the pattern rather than a property of the reader.
+#
+# `file(STRINGS)` takes a PATH, so there is no content to neutralise beforehand and
+# the fix used for the other reader in this file cannot be applied to it. Reading the
+# bytes and splitting them here can be. Balanced brackets are harmless and are left
+# alone; only the grouping characters go, and a space preserves every column.
+#
+# #509 fixed this file's OTHER reader and left this one, because that change was
+# scoped to the splitter that led to it rather than to every reader in the file.
+file(READ "${appTable}" appTableContent)
+string(REPLACE "[" " " appTableSplit "${appTableContent}")
+string(REPLACE "]" " " appTableSplit "${appTableSplit}")
+string(REPLACE ";" "\;" appTableSplit "${appTableSplit}")
+string(REPLACE "\r\n" "\n" appTableSplit "${appTableSplit}")
+string(REPLACE "\n" ";" appRows "${appTableSplit}")
+list(FILTER appRows INCLUDE REGEX "^[ \t]*\"[A-Za-z0-9_-]+\\|FASTCACHED_BUILD_")
 set(optionalTargets "")
 foreach(row IN LISTS appRows)
     if(row MATCHES "\"([A-Za-z0-9_-]+)\\|")
@@ -76,6 +109,33 @@ endforeach()
 if(NOT optionalTargets)
     message(FATAL_ERROR
         "no optional targets were read from ${appTable}; this check would pass vacuously")
+endif()
+
+# The refusal above is a FLOOR OF ZERO, and a floor of zero cannot catch a
+# truncation that leaves something behind. When one unbalanced bracket took this
+# check from five optional targets to one, `optionalTargets` was still non-empty
+# and every assertion below still passed: 1 is not 0.
+#
+# So assert COMPLETENESS, not presence. `FASTCACHED_BUILD_<NAME>` appears exactly
+# once per row, and `string(REGEX MATCHALL)` over the RAW bytes never passes
+# through CMake's list parser -- the matches themselves contain no brackets, so
+# that count survives whatever the rest of the file contains. It is derived from
+# the same table, never restated: a second list would not be a cross-check, it
+# would be a second thing to be wrong.
+#
+# This is what makes the check robust against the NEXT blinding mechanism rather
+# than only against brackets. Any reader defect that drops rows now fails here.
+string(REGEX MATCHALL "FASTCACHED_BUILD_[A-Z_]+" appTableOptionTokens "${appTableContent}")
+list(REMOVE_DUPLICATES appTableOptionTokens)
+list(LENGTH appTableOptionTokens appTableOptionCount)
+list(LENGTH optionalTargets optionalTargetsFound)
+
+if(NOT optionalTargetsFound EQUAL appTableOptionCount)
+    message(FATAL_ERROR
+        "the app table declares ${appTableOptionCount} build option(s) but only "
+        "${optionalTargetsFound} optional target(s) were read from it. The reader "
+        "lost rows -- every verdict below would be drawn from a table this check "
+        "can no longer see in full.")
 endif()
 list(LENGTH optionalTargets optionalTargetCount)
 
