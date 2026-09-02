@@ -902,12 +902,10 @@ live on master indefinitely with every status check green (#315).
   *What CI costs* below and are not restated here — the last two written down in
   this spot went stale twice over, once when `SCCACHE_GHA_ENABLED` landed and again
   when the matrix grew a third leg, and both times they read as current fact. So
-  does "`clang-tidy` finishes last", which was true on master and inside the merge
-  queue and true on only some pull requests — the ones whose change escalated the
-  sweep. That claim has now gone stale a third time, in the other direction: #554
-  diff-scoped the queue's sweep, so `clang-tidy` no longer finishes last there
-  either. Which job is longest is a row of the table in *What CI costs*, per event,
-  and is not restated anywhere including here.
+  does "`clang-tidy` finishes last", which has now gone stale a third time and in
+  the other direction, #554 having diff-scoped the queue's sweep. Which job is
+  longest is the last column of the table in *What CI costs*, per event; this
+  paragraph deliberately no longer says what it holds.
 - **Guarded to `MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"`, which means its
   absence elsewhere is normal.** That is worth knowing before debugging it: a
   platform-guarded registration is indistinguishable from a lost one when you look
@@ -1268,14 +1266,12 @@ that does not happen.
 
   **The price was understated and one supporting clause was simply false**, and
   both are worth having straight, because a refusal has to survive being re-argued
-  with correct numbers. Re-measured 2026-09-02 over 13 code-touching pull-request
-  runs: `coverage` plus the three `package-*` jobs are **26.7 runner-minutes, 26%
-  of the run**, not the ~17 this bullet used to claim. And `coverage` **is** the
-  longest job in 9 of those 13 runs, at 10.3–17.0 minutes — so "coverage is not on
-  the critical path", which this bullet also used to claim, was wrong. Dropping all
-  four from pull requests would take those **26.7 runner-minutes (−26%)** off a run
-  and bring its longest job to **14.2 (−18%)**; in the four runs where an escalated
-  `clang-tidy` sweep is longest it would buy no wall clock whatever.
+  with correct numbers. It was re-measured on 2026-09-02 over 13 pull-request runs,
+  which found the price understated (~17 claimed against 26.7 actual) and one
+  supporting clause simply false ("coverage is not on the critical path"); those
+  figures are superseded by the 99-run sample below and are not kept here, because
+  three stacked measurements of one quantity in one bullet is how a grep finds the
+  dead one first.
 
   Neither guard objects, so neither can be leaned on as though it were the reason.
   `check-release-gate` asserts the *list* in `release.needs`, not that each job

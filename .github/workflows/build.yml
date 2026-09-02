@@ -451,37 +451,32 @@ jobs:
       - name: "Self-test the sweep's scope computation"
         run: scripts/tidy-sweep.sh --self-test
 
-      # `--all` on the master PUSH only, and the queue diff-scopes like a pull
-      # request. This is the workflow's critical path and it was the same 22-minute
-      # full sweep three times per landed change; measured over 99 green runs on
-      # 2026-09-01/02, the queue's sweep step cost 22.50 min against a pull
-      # request's 12.80 for a job whose fixed overhead is 0.9. The figures and the
-      # soundness argument are in *What CI costs* in
-      # `.agent/rules/build-and-toolchain.md` and are not restated here.
+      # `--all` on the PUSH only; the queue diff-scopes like a pull request. Why
+      # that is sound, what it costs and what it buys are one bullet in *What CI
+      # costs* in `.agent/rules/build-and-toolchain.md` — pointed at rather than
+      # summarised, because the last two figures written down in this file went
+      # stale while reading as current fact. What is here is only what a reader
+      # AT THIS STEP cannot get from there.
       #
-      # It is sound because the two halves compose. Master@N is proved FULLY clean
-      # by the push that landed it, and the diff scope over-approximates everything
-      # a change can reach — the changed `.cpp` files union every `.cpp` that
-      # transitively includes a changed header, plus `SweepEverythingWhen`. So the
-      # union covers master@N+1. That makes the master push LOAD-BEARING rather
-      # than the redundant re-run it looks like: narrowing `on: push` to tags would
-      # take away the full sweep this scoping rests on, on top of freezing the
-      # cache scope only a push writes.
+      # BASE in a queue is the event's own `base_sha`, which is the head of the
+      # entry AHEAD of this one, not master: the queue stacks, and the branch names
+      # say so — `pr-546-f209cf1c…` ran at head `d483441a`, which is the base of
+      # `pr-551-d483441a…`. So each entry sweeps its own change against a tree that
+      # already carries the entries before it, which is the scope that composes.
       #
-      # What that gives up: a finding only a full sweep can see is now caught after
-      # the merge rather than before it. No code change can plant one — a
-      # clang-tidy finding depends on a translation unit's own sources and its
-      # include closure, both inside the scope — so what is left is the analyser
-      # drifting under us, which the diff-scoped PULL REQUEST sweep could never
-      # have caught either. The `Report a full sweep that only master saw` step
-      # below is what makes sure somebody hears about it.
-      #
-      # BASE in a queue is the event's own `base_sha`. `tidy-sweep.sh` reads BASE
-      # only through `git rev-parse --verify` and `git diff BASE...HEAD`, both of
-      # which take a raw SHA, and `fetch-depth: 0` above puts it in the clone. If
-      # it were ever absent the sweep would find an unresolvable base and sweep
+      # `tidy-sweep.sh` reads BASE only through `git rev-parse --verify` and
+      # `git diff BASE...HEAD`, both of which take a raw SHA, and `fetch-depth: 0`
+      # above puts it in the clone. A BASE it cannot resolve makes it sweep
       # EVERYTHING — `ci-scope.sh`'s own principle, already inside the script — so
-      # the failure direction here is towards more checking, never less.
+      # every way of being wrong here is towards more checking, never less.
+      #
+      # This does NOT contradict the `changes` job's refusal to scope a queue
+      # entry, which stands. That job decides whether a JOB RUNS AT ALL, where a
+      # wrong answer is a required context reporting green over code nothing
+      # compiled, and its stated reason is that it will not reason about a batch
+      # shape GitHub chooses. This decides how WIDE one analysis is, over a tree
+      # that is being fully built either way, and it does not have to reason about
+      # the batch shape because being wrong about it escalates.
       #
       # `github.base_ref` is empty on a push, where `--all` is passed anyway and
       # BASE is never read. Defaulted rather than left as `origin/` so the two
@@ -496,39 +491,38 @@ jobs:
           scripts/tidy-sweep.sh
           ${{ github.event_name == 'push' && '--all' || '' }}
 
-      # The step above is now the ONLY full sweep, and a master push blocks
-      # nothing and reaches nobody: every one of the last 30 master-push runs was
-      # triggered by `github-merge-queue[bot]`, so GitHub's failure mail goes to an
-      # app account with no mailbox; nothing under `.github/` sends a notification
-      # of any kind; and all 18 failed master-push runs back to 2026-06-10 sit at
-      # `run_attempt: 1`, never once re-run. A check nobody reads is a check that
-      # does not exist, so moving one onto that path means putting a reader on it.
+      # The step above is now the only full sweep, and a master push blocks nothing
+      # and reaches nobody — measured three ways, recorded in the same rulebook
+      # bullet. A check nobody reads is a check that does not exist, so moving one
+      # onto that path means putting a reader on it.
       #
-      # Scoped to THIS step's failure rather than to the job's, and that is the
-      # difference between a signal and a thing people mute. Over the same sample a
-      # notifier on any failing master-push job would have fired 18 times, almost
-      # all of it infrastructure — the apt 403 of #550, macOS runner flakes, a
-      # sanitizer timeout. `clang-tidy`'s sweep failed on a master push ONCE. The
-      # test a new alarm has to pass here is whether a firing means something
-      # happened, which is why #447 withdrew a counter that would have been
-      # dominated by ordinary traffic; at 1-in-24 this passes and at 18-in-24 it
-      # would not. `failure()` alone is the 18; `steps.sweep.conclusion` is the 1.
+      # `steps.sweep.conclusion` rather than the job's `failure()`, and that is the
+      # difference between a signal and a thing people mute: on the sampled runs
+      # `failure()` alone fires 18 times, almost all of it infrastructure, and this
+      # fires once. `failure()` itself is NOT redundant and must not be removed —
+      # it is the status function that lets the step run at all after a failed one.
       #
       # `refs/heads/master` because `on: push` also carries `fix-ci`, which exists
       # for deliberately breaking CI, and the release tags, where `--all` running
       # green is not news.
       #
-      # One issue, reopened by comment rather than replaced: a notifier that files
-      # a fresh issue per push is the same noise problem in another medium. Keyed
-      # on a LABEL rather than on the title, so re-wording the title later does not
-      # silently start a second thread; `--force` makes the label creation
-      # idempotent, and it is tolerated failing so a missing label cannot swallow
-      # the report it exists to carry.
+      # One issue, reopened by comment rather than replaced — a fresh issue per
+      # push is the same noise problem in another medium. Found by its TITLE, which
+      # is the env var three lines above, so the search and the create cannot drift
+      # apart without one edit changing both. Not by a label of its own:
+      # `CONTRIBUTING.md` enumerates the label prefixes this repository uses and
+      # there is no room in it for a private one, so a `ci/…` key would be a label
+      # every documented filter is blind to.
+      #
+      # `status/needs-triage` is applied HERE rather than left to
+      # `issue-triage.yml`, which cannot see this issue at all: an issue opened
+      # with `GITHUB_TOKEN` triggers no workflow, so the repository's one
+      # reader-attachment mechanism does not fire and the report would land
+      # outside every triage query — a reader put on it in name only.
       - name: "Report a full sweep that only master saw"
         if: ${{ failure() && steps.sweep.conclusion == 'failure' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          LABEL: "ci/master-sweep"
           TITLE: "clang-tidy: the full sweep on master is failing"
         run: |
           set -euo pipefail
@@ -542,16 +536,21 @@ jobs:
           almost always the analyser drifting rather than any one change. Nothing
           is blocked by this, and the next pull request whose change escalates to a
           full sweep will fail for a reason that has nothing to do with it."
-          gh label create "$LABEL" --force \
-            --color B60205 \
-            --description "The full clang-tidy sweep is failing on master" || true
-          existing="$(gh issue list --state open --label "$LABEL" --limit 1 --json number --jq '.[0].number // empty')"
+          # The server-side search is a filter, not the match: `in:title` is
+          # word-based and would also return a near-miss. `$ENV.TITLE` rather than
+          # the title spliced into the jq program, so no quoting in a title anyone
+          # rewords later can turn the lookup into a syntax error and every later
+          # failure into a second issue.
+          existing="$(gh issue list --state open --search "\"${TITLE}\" in:title" \
+                      --limit 20 --json number,title \
+                      --jq '[.[] | select(.title == $ENV.TITLE) | .number] | first // empty')"
           if [[ -n "$existing" ]]; then
             echo "updating existing report #${existing}"
             gh issue comment "$existing" --body "$body"
           else
             echo "opening a new report"
-            gh issue create --title "$TITLE" --label "$LABEL" --body "$body"
+            gh issue create --title "$TITLE" --body "$body" \
+              --label type/bug --label area/build --label status/needs-triage
           fi
 
   # The other half of what used to be the clang-tidy job. The ctest run here is
