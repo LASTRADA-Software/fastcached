@@ -13,6 +13,7 @@
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -88,6 +89,17 @@ namespace Detail
         CacheRefusalPolicy policy;   ///< What this surface does about it.
     };
 
+    /// Why neither credential arm counts, stated once for the two rows that share it.
+    ///
+    /// The two enumerators are separate because a client is told different things
+    /// about them; the ARGUMENT is one argument about one fact -- which family `AUTH`
+    /// belongs to -- so it is one sentence. Written out twice it is two literals that
+    /// can drift on any edit with nothing to catch it, which is the "second statement
+    /// of one fact" the row type's own documentation is shaped to avoid.
+    inline constexpr std::string_view CredentialIsTheSchedulersRationale =
+        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
+        "decided against this surface";
+
     /// What the CACHE surface does about each endpoint-decided refusal (#491).
     ///
     /// The byte budget is the arm #491 was filed about, and the one this surface
@@ -101,17 +113,6 @@ namespace Detail
     /// -- is sound for the SCHEDULER, whose ceiling is kilobytes and whose series is
     /// about credentials. It is the opposite of what happens here, and inheriting it
     /// is how a decision about one surface came to describe another.
-    /// Why neither credential arm counts, stated once for the two rows that share it.
-    ///
-    /// The two enumerators are separate because a client is told different things
-    /// about them; the ARGUMENT is one argument about one fact -- which family `AUTH`
-    /// belongs to -- so it is one sentence. Written out twice it is two literals that
-    /// can drift on any edit with nothing to catch it, which is the "second statement
-    /// of one fact" this table's own wire-code column is deliberately shaped to avoid.
-    inline constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
-        "decided against this surface";
-
     inline constexpr EnumTable<EndpointRefusal, CacheEndpointRefusal> CacheEndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
           .policy = { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedEndpointBusy, .rationale = {} } },
@@ -183,6 +184,27 @@ namespace Detail
         // that was served is the one wrong answer available here.
         return { .counter = std::nullopt, .rationale = "Serve is not a refusal and the endpoint never asks about it" };
     }
+
+    // The same guard the table above gets, over the switch -- and it is NOT redundant
+    // with `-Werror=switch`, which catches a MISSING arm and not an EMPTY one. An arm
+    // returning `{ nullopt, {} }` -- a rationale dropped in an edit, or a new decision
+    // written in a hurry -- reaches `RefuseWithoutCounter` with nothing to say: a
+    // refusal answered correctly, counted nowhere and asserting NOTHING, which is the
+    // state this whole change exists to remove. It is also the one state no scan can
+    // see, because `worker-refusals-counted` tallies `RefuseUntriaged` and an empty
+    // rationale joins no backlog and is reported by nobody.
+    //
+    // Spelled over a list because `PrePayloadDecision` has no `Last` to iterate. The
+    // list cannot go stale unnoticed: a fifth decision fails `-Werror=switch` first,
+    // which puts the author in this function with the list on screen.
+    static_assert(std::ranges::all_of(std::array { CompileCacheWire::PrePayloadDecision::Serve,
+                                                   CompileCacheWire::PrePayloadDecision::UnknownOpcode,
+                                                   CompileCacheWire::PrePayloadDecision::PayloadTooLarge,
+                                                   CompileCacheWire::PrePayloadDecision::Unauthenticated },
+                                      [](CompileCacheWire::PrePayloadDecision decision) {
+                                          return StatesOneClaim(CachePrePayloadPolicy(decision));
+                                      }),
+                  "every cache pre-payload decision must state either a counter or a rationale, and not both");
 
     /// What the SCHEDULER surface answers each endpoint-decided refusal with.
     ///
