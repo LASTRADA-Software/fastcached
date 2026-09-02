@@ -245,8 +245,7 @@ TEST_CASE("A cache verb at the scheduler's port is counted, and named as the wro
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted) == 1);
 }
 
-TEST_CASE("A refusal the service decided is not counted a second time here",
-          "[distributed][scheduler][protocol][metrics]")
+TEST_CASE("A refusal the service decided is not counted a second time here", "[distributed][scheduler][protocol][metrics]")
 {
     // **The half that would be invisible if it regressed.** `SchedulerService` triages
     // every code it can produce into `RefusalTable` or `UncountedRefusals`, proven

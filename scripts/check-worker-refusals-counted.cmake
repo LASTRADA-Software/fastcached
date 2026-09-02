@@ -569,3 +569,20 @@ endforeach()
 foreach(site IN LISTS untriaged)
     message(STATUS "worker refusals:     ${site}")
 endforeach()
+
+# **The backlog is EMPTY, so a non-empty one is now a failure rather than a report.**
+#
+# #494 emptied it -- the fleet scheduler's seven arms and the daemon's twelve were the
+# last of them -- and an empty backlog is the only state in which this can become a
+# guard instead of a number somebody reads. While it was non-zero the count could only
+# be published and watched, which is how five sites accumulated the last time (#447).
+#
+# Adding an untriaged refusal is still legitimate; it is no longer SILENT. The way to
+# add one is to file the issue that will decide it and relax this assertion in the same
+# change, which is a sentence in a review rather than a line nobody sees.
+message("")
+message("The triage backlog was emptied by #494, so a new untriaged refusal is a")
+message("regression rather than a report. Decide it -- `Refuse` with a row when a rise")
+message("means something, `RefuseWithoutCounter` with the reason when it does not --")
+message("or file the issue that will, and relax this assertion in the same change.")
+message(FATAL_ERROR "worker refusals: ${untriagedCount} site(s) awaiting triage, expected none")

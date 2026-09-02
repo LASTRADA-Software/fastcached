@@ -11,6 +11,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -1166,4 +1167,140 @@ TEST_CASE("An oversize control frame is refused on the control ceiling", "[compi
     CHECK(ErrorOf(frames[0]).message.contains("lease"));
     // Still answering afterwards, which is the point of draining rather than closing.
     CHECK(ErrorOf(frames[1]).code == Wire::ErrorCode::DispatchNotPermitted);
+}
+
+TEST_CASE("The daemon's 0xFC refusals are counted, and the three malformed-frame arms are told apart",
+          "[protocol][compilecache][metrics]")
+{
+    // #494's daemon half. Every refusal in this file passed through one private
+    // `ReplyError(socket, code, message)` funnel -- twelve of them, across nine codes
+    // -- so a counter at the funnel would have collapsed twelve refusals into one
+    // series. THREE of the twelve answer `MalformedFrame`, which is precisely the case
+    // a table keyed on the code cannot hold. The funnel now takes a row and each call
+    // site states its own.
+    //
+    // The sink arrives through `SessionContext::metrics`, which is nullable by
+    // contract; the null case is asserted separately below.
+    AtomicMetricsSink metrics;
+    SessionContext session {};
+    session.metrics = &metrics;
+
+    SECTION("a STORE whose payload will not decode")
+    {
+        CcFixture fix;
+        // Well FRAMED and undecodable: the declared length matches what arrives, so
+        // the reader hands the payload over and the STORE decoder is what refuses.
+        // A truncated frame would exercise the read path instead, which closes the
+        // connection without replying and counts nothing by design.
+        std::vector<std::byte> frame(Wire::RequestHeaderSize + 1);
+        WireFrame::PutHeader(
+            frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Store), /*payloadLength=*/1);
+        frame.back() = std::byte { 0xFF };
+
+        (void) ExchangeWith(fix, frame, session);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedMalformedPayload) >= 1);
+        // And NOT the credential series, which is the split that matters: garbage at
+        // the credential verb is what a scanner produces, and summing the two would
+        // bury it under ordinary client defects.
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedMalformedCredential) == 0);
+    }
+
+    SECTION("a malformed AUTH payload, which is NOT the ordinary malformed-payload arm")
+    {
+        // **The section that was missing, and its absence was invisible.** The STORE
+        // case above asserts the credential counter stayed at zero -- which is true
+        // there for the trivial reason that nothing sent an AUTH, so it would pass
+        // just as happily with both arms wired to one counter. That is the
+        // absence-of-the-negative trap: a zero proves nothing unless something could
+        // have made it non-zero.
+        //
+        // So this drives the credential arm directly. Garbage aimed at the credential
+        // verb is what a scanner produces, and burying it under ordinary client
+        // defects is exactly what the split exists to prevent.
+        CcFixture fix;
+        auto authed = RequireSecret("", "s3cret");
+        authed.session.metrics = &metrics;
+
+        std::vector<std::byte> frame(Wire::RequestHeaderSize + 1);
+        WireFrame::PutHeader(
+            frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Auth), /*payloadLength=*/1);
+        frame.back() = std::byte { 0xFF };
+
+        (void) ExchangeWith(fix, frame, authed.session);
+
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedMalformedCredential) == 1);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedMalformedPayload) == 0);
+    }
+
+    SECTION("a credential presented and refused")
+    {
+        // Distinct again from the arm above: this one PRESENTED a credential and got
+        // it wrong. A wrong password and a client that never learned it needs one send
+        // an operator to different places.
+        CcFixture fix;
+        auto authed = RequireSecret("", "s3cret");
+        authed.session.metrics = &metrics;
+
+        (void) ExchangeWith(fix, AuthFrame("", "wrong"), authed.session);
+
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheCredentialsRejected) == 1);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedMalformedCredential) == 0);
+    }
+
+    SECTION("an unknown opcode")
+    {
+        CcFixture fix;
+        std::array<std::byte, Wire::RequestHeaderSize> frame {};
+        WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, /*kindRaw=*/0xEE, /*payloadLength=*/0);
+
+        (void) ExchangeWith(fix, std::vector<std::byte> { frame.begin(), frame.end() }, session);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode) == 1);
+    }
+
+    SECTION("a version this build does not serve")
+    {
+        CcFixture fix;
+        std::array<std::byte, Wire::RequestHeaderSize> frame {};
+        WireFrame::PutHeader(
+            frame, Wire::Magic, static_cast<Wire::WireVersion>(0xFE), static_cast<std::uint8_t>(Wire::Op::Fetch), 0);
+
+        (void) ExchangeWith(fix, std::vector<std::byte> { frame.begin(), frame.end() }, session);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedUnsupportedVersion) == 1);
+    }
+
+    SECTION("a declared payload over the session cap")
+    {
+        CcFixture fix;
+        SessionContext small = session;
+        small.maxPayloadBytes = 8;
+
+        std::array<std::byte, Wire::RequestHeaderSize> frame {};
+        WireFrame::PutHeader(
+            frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), /*payloadLength=*/4096);
+
+        (void) ExchangeWith(fix, std::vector<std::byte> { frame.begin(), frame.end() }, small);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge) == 1);
+    }
+}
+
+TEST_CASE("A daemon refusal with nothing collecting still answers", "[protocol][compilecache][metrics]")
+{
+    // **`SessionContext::metrics` is nullable by contract** -- "a scheduler must
+    // schedule whether or not anyone is scraping it" -- and its own documentation
+    // refuses a null-object default, because a discarding sink and an absent one would
+    // be indistinguishable at the call site.
+    //
+    // So the guard is real and has to be exercised: with no sink the refusal must be
+    // answered exactly as it is with one. A crash here would mean a daemon started
+    // without metrics dies on its first malformed frame, which is the shape this
+    // nullability exists to avoid and the reason a null-object default was refused.
+    CcFixture fix;
+    SessionContext none {};
+    REQUIRE(none.metrics == nullptr);
+
+    std::array<std::byte, Wire::RequestHeaderSize> frame {};
+    WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, /*kindRaw=*/0xEE, /*payloadLength=*/0);
+
+    auto const reply = ExchangeWith(fix, std::vector<std::byte> { frame.begin(), frame.end() }, none);
+    CHECK_FALSE(reply.empty());
 }

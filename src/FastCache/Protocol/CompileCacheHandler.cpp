@@ -37,7 +37,6 @@ namespace
     /// mean something happened" -- is
     /// [#494](https://github.com/LASTRADA-Software/fastcached/issues/494). Untriaged
     /// rather than deliberately uncounted, because nobody has made that argument yet.
-    constexpr std::uint32_t DaemonRefusalTriage = 494;
 
     /// Cap on a single framed line/field's length. The compile-cache protocol
     /// never uses line reads, but ByteReader requires a line cap; set it to the
@@ -145,14 +144,92 @@ namespace
         co_return co_await WriteAll(socket, frame);
     }
 
-    /// Send one typed error reply.
+    /// Send one refusal, and record it.
+    ///
+    /// **Takes a ROW rather than a code, which is the whole of #494's daemon half.**
+    /// This was `ReplyError(socket, code, message)` -- one private funnel that all
+    /// twelve of this file's refusals passed through, so a counter here would have
+    /// collapsed twelve refusals into one series. Three of the twelve answer
+    /// `MalformedFrame`, which is exactly the case a table keyed on the CODE cannot
+    /// hold. Pushing the row to the call site is the same argument that made `Refuse`
+    /// take one, applied a level in.
+    ///
+    /// The sink is a pointer because `SessionContext::metrics` is one; the guard lives
+    /// in `Cc::Refuse`'s own overload rather than here, so no call site in this file
+    /// says anything about nullability.
     /// @param socket Client socket.
-    /// @param code The refusal reason.
+    /// @param metrics Where the refusal is recorded, or null when nothing collects.
+    /// @param refusal Which refusal, as one row.
     /// @param message Detail; the code's default message is used when empty.
     /// @return true when the whole reply reached the socket.
-    [[nodiscard]] Task<bool> ReplyError(ISocket* socket, Wire::ErrorCode code, std::string message)
+    [[nodiscard]] Task<bool> ReplyRefused(ISocket* socket,
+                                          IMetricsSink* metrics,
+                                          Cc::SurfaceRefusal const& refusal,
+                                          std::string message)
     {
-        auto const frame = Cc::RefuseUntriaged({ .code = code, .issue = DaemonRefusalTriage }, message);
+        auto const frame = Cc::Refuse(metrics, refusal, message);
+        co_return co_await WriteAll(socket, frame);
+    }
+
+    /// What a pre-payload refusal answers with, and what it moves.
+    ///
+    /// A table rather than `ErrorCodeFor(decision)` plus one counter, because the two
+    /// reachable decisions are opposite operator problems: a client sending more than
+    /// it may, and a client that never learned it needs a credential. One series
+    /// carrying both could answer neither.
+    ///
+    /// A plain array indexed by the enumerator rather than `EnumTable`, and the reason
+    /// is the enum: `PrePayloadDecision` is a WIRE type carrying no trailing `Last`,
+    /// which `EnumTable` takes its extent from. Adding one to a shared wire header to
+    /// satisfy a table in this file would be the tail wagging the dog, so the extent is
+    /// asserted here instead -- anchored on the last enumerator by name, which is the
+    /// shape the rulebook warns about and is the honest option only because there is no
+    /// count to anchor on.
+    constexpr std::array PrePayloadRefusals {
+        // `Serve` never reaches a refusal; its row exists so the array is indexable by
+        // the enumerator, and would answer `UnknownOpcode` if one ever did.
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::UnknownOpcode,
+                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode },
+        // Answered earlier, where the opcode is first resolved, so the payload can be
+        // skipped and the connection kept usable. Its row names that arm's counter, so
+        // a caller arriving here with it cannot invent a second series for one event.
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::UnknownOpcode,
+                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode },
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::PayloadTooLarge,
+                             .counter = IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge },
+        Cc::SurfaceRefusal { .code = Wire::ErrorCode::Unauthenticated,
+                             .counter = IMetricsSink::Counter::CacheFramesRefusedUnauthenticated },
+    };
+
+    static_assert(PrePayloadRefusals.size() == static_cast<std::size_t>(Wire::PrePayloadDecision::Unauthenticated) + 1,
+                  "a decision added to PrePayloadDecision needs a row here");
+
+    // And every row must answer the code the wire's own mapping already promises, or a
+    // client would be told one thing by `ErrorCodeFor` and another by this surface.
+    static_assert(PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::UnknownOpcode)].code
+                          == Wire::ErrorCodeFor(Wire::PrePayloadDecision::UnknownOpcode)
+                      && PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::PayloadTooLarge)].code
+                             == Wire::ErrorCodeFor(Wire::PrePayloadDecision::PayloadTooLarge)
+                      && PrePayloadRefusals[static_cast<std::size_t>(Wire::PrePayloadDecision::Unauthenticated)].code
+                             == Wire::ErrorCodeFor(Wire::PrePayloadDecision::Unauthenticated),
+                  "a pre-payload row must answer the code ErrorCodeFor already promises");
+
+    /// The refusal one pre-payload decision answers with.
+    /// @param decision What the wire's own gate concluded.
+    /// @return Its row.
+    [[nodiscard]] constexpr Cc::SurfaceRefusal const& RefusalForDecision(Wire::PrePayloadDecision decision) noexcept
+    {
+        return PrePayloadRefusals[static_cast<std::size_t>(decision)];
+    }
+
+    /// Send one refusal that is deliberately not counted.
+    /// @param socket Client socket.
+    /// @param refusal Which refusal, and why nothing rises for it.
+    /// @param message Detail; the code's default message is used when empty.
+    /// @return true when the whole reply reached the socket.
+    [[nodiscard]] Task<bool> ReplyUncounted(ISocket* socket, Cc::UncountedRefusal const& refusal, std::string message)
+    {
+        auto const frame = Cc::RefuseWithoutCounter(refusal, message);
         co_return co_await WriteAll(socket, frame);
     }
 
@@ -177,13 +254,20 @@ namespace
     ///                 views below point into it.
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleStore(ISocket* socket,
+                                         IMetricsSink* metrics,
                                          CacheEngine* engine,
                                          PrefetchGroupManifest* manifest,
                                          std::vector<std::byte> payload)
     {
         auto const fields = Wire::DecodeStorePayload(payload);
         if (!fields.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
+            co_return co_await ReplyRefused(socket,
+                                            metrics,
+                                            { .code = Wire::ErrorCode::MalformedFrame,
+                                              .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedPayload },
+                                            {})
+                ? Next::Continue
+                : Next::Abort;
 
         // `CompileCache/CompileValue`'s recipe, not a copy here. Decoding, building
         // the layout from the two root fields, rewriting the regions and re-encoding
@@ -200,7 +284,13 @@ namespace
                 // This server speaks the whole protocol and says so; a node's cache
                 // tier stores an opaque value verbatim instead. One policy each,
                 // above the one they now share.
-                co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedValue, {}) ? Next::Continue : Next::Abort;
+                co_return co_await ReplyRefused(socket,
+                                                metrics,
+                                                { .code = Wire::ErrorCode::MalformedValue,
+                                                  .counter = IMetricsSink::Counter::CacheStoresRefusedNotACompileValue },
+                                                {})
+                    ? Next::Continue
+                    : Next::Abort;
             case CanonicalizationOutcome::ForeignGeneration:
                 // A value written under a canonicalization spec this build does not
                 // implement. Refused rather than stored, because storing it would
@@ -220,8 +310,19 @@ namespace
                 // reported damaged is to wipe it. Its own wire code and counter row
                 // are #544, which depends on this change rather than being part of
                 // it, and which is what turns these two arms into a table.
-                co_return co_await ReplyError(
-                    socket, Wire::ErrorCode::MalformedValue, ForeignGenerationMessage(canonical.generation))
+                //
+                // COUNTED, and its own counter rather than the one above: these two
+                // arms answer the same wire code for opposite reasons -- a client
+                // writing something that is not a compile value at all, against a
+                // fleet midway through a rolling upgrade. Summed, neither is readable.
+                // #544 gives this arm a code of its own; the counter did not have to
+                // wait for that, and separating them now is what makes #544 a rename
+                // rather than a re-triage.
+                co_return co_await ReplyRefused(socket,
+                                                metrics,
+                                                { .code = Wire::ErrorCode::MalformedValue,
+                                                  .counter = IMetricsSink::Counter::CacheStoresRefusedForeignGeneration },
+                                                ForeignGenerationMessage(canonical.generation))
                     ? Next::Continue
                     : Next::Abort;
         }
@@ -232,7 +333,17 @@ namespace
         // object-blob memcpy plus an allocation on every STORE.
         auto const stored = engine->Set(keyStr, std::move(canonical.bytes), /*flags=*/0, /*exptime=*/0);
         if (!stored.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::StorageWriteFailed, {}) ? Next::Continue : Next::Abort;
+            // The one arm of this surface that is about THIS MACHINE rather than
+            // whoever is talking to it, and nothing counted it: the
+            // `fastcached_write_errors_total` named in `CacheMalformedValues`'s own
+            // history does not exist any more.
+            co_return co_await ReplyRefused(
+                socket,
+                metrics,
+                { .code = Wire::ErrorCode::StorageWriteFailed, .counter = IMetricsSink::Counter::CacheStoresFailed },
+                {})
+                ? Next::Continue
+                : Next::Abort;
 
         // Record prefetch group membership (best-effort: a manifest failure must not fail
         // the STORE — the value is already safely stored).
@@ -264,6 +375,7 @@ namespace
     ///                      revoke something the peer already proved.
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleAuth(ISocket* socket,
+                                        IMetricsSink* metrics,
                                         std::shared_ptr<AuthPolicy const> policy,
                                         std::vector<std::byte> payload,
                                         bool* credentialAccepted)
@@ -273,7 +385,16 @@ namespace
         switch (CheckCredential(policy.get(), payload))
         {
             case CredentialOutcome::Malformed:
-                co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
+                // Its own counter, not the ordinary malformed-payload one: garbage
+                // aimed at the credential verb is what a scanner produces, and summing
+                // it with client defects buries the series somebody is watching.
+                co_return co_await ReplyRefused(socket,
+                                                metrics,
+                                                { .code = Wire::ErrorCode::MalformedFrame,
+                                                  .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedCredential },
+                                                {})
+                    ? Next::Continue
+                    : Next::Abort;
 
             case CredentialOutcome::NoPolicy:
                 // Auth is off, so there is no credential to check and nothing to
@@ -290,7 +411,11 @@ namespace
                 co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
 
             case CredentialOutcome::Rejected:
-                co_return co_await ReplyError(socket, Wire::ErrorCode::Unauthenticated, "authentication failed")
+                co_return co_await ReplyRefused(
+                    socket,
+                    metrics,
+                    { .code = Wire::ErrorCode::Unauthenticated, .counter = IMetricsSink::Counter::CacheCredentialsRejected },
+                    "authentication failed")
                     ? Next::Continue
                     : Next::Abort;
 
@@ -384,6 +509,7 @@ namespace
     /// @param payload       The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
     [[nodiscard]] Task<Next> HandleFetch(ISocket* socket,
+                                         IMetricsSink* metrics,
                                          CacheEngine* engine,
                                          PrefetchGroupManifest* manifest,
                                          std::set<std::string, std::less<>>* primedGroups,
@@ -391,7 +517,13 @@ namespace
     {
         auto const key = Wire::DecodeFetchPayload(payload);
         if (!key.has_value())
-            co_return co_await ReplyError(socket, Wire::ErrorCode::MalformedFrame, {}) ? Next::Continue : Next::Abort;
+            co_return co_await ReplyRefused(socket,
+                                            metrics,
+                                            { .code = Wire::ErrorCode::MalformedFrame,
+                                              .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedPayload },
+                                            {})
+                ? Next::Continue
+                : Next::Abort;
 
         auto const keyStr = BytesToString(*key);
         auto const got = engine->Get(keyStr);
@@ -443,8 +575,20 @@ namespace
         // would say the daemon is too old when it is in fact too new. The message
         // names where the scheduler went, because a refusal that cannot say what
         // would have worked cannot be acted on.
+        // **Uncounted, and for the reason the scheduler's equivalent arm is:** the
+        // code comes from the matched row, so a counter beside it would have to be
+        // built from a table that has no counter column. Unlike the scheduler's, this
+        // table is NOT empty -- every scheduling verb lands here -- so the second
+        // clause that arm records does not apply and is deliberately not claimed.
         auto const refusal = RefusalFor(op);
-        co_return co_await ReplyError(socket, refusal.code, std::string { refusal.why }) ? Next::Continue : Next::Abort;
+        co_return co_await ReplyUncounted(
+            socket,
+            { .code = refusal.code,
+              .rationale = "the code comes from the matched RefusalFor row, which carries no counter column; a rise "
+                           "would name the verb rather than the surface, and the verb is already in the message" },
+            std::string { refusal.why })
+            ? Next::Continue
+            : Next::Abort;
     }
 
 } // namespace
@@ -531,7 +675,11 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             session.LogFrameDrop(
                 ProtocolLabel,
                 ProtocolError { .code = ProtocolErrorCode::UnsupportedFeature, .context = std::string { message } });
-            (void) co_await ReplyError(socket, Wire::ErrorCode::UnsupportedVersion, std::move(message));
+            (void) co_await ReplyRefused(socket,
+                                         session.metrics,
+                                         { .code = Wire::ErrorCode::UnsupportedVersion,
+                                           .counter = IMetricsSink::Counter::CacheFramesRefusedUnsupportedVersion },
+                                         std::move(message));
             co_return;
         }
         pinnedVersion = header->version;
@@ -559,7 +707,11 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
 
             // Answer either way: even a frame too big to drain gets its reason,
             // on the chance the sender is not still writing and can read it.
-            if (!co_await ReplyError(socket, Wire::ErrorCode::PayloadTooLarge, std::move(message)))
+            if (!co_await ReplyRefused(socket,
+                                       session.metrics,
+                                       { .code = Wire::ErrorCode::PayloadTooLarge,
+                                         .counter = IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge },
+                                       std::move(message)))
                 co_return;
             if (!drained)
                 co_return;
@@ -574,9 +726,11 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // which is what allows a later version to add one without a flag day.
             if (!(co_await reader.Skip(header->payloadLength)).has_value())
                 co_return;
-            if (!co_await ReplyError(socket,
-                                     Wire::ErrorCode::UnknownOpcode,
-                                     std::format("unknown opcode 0x{:02x}", static_cast<unsigned>(header->opRaw))))
+            if (!co_await ReplyRefused(socket,
+                                       session.metrics,
+                                       { .code = Wire::ErrorCode::UnknownOpcode,
+                                         .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode },
+                                       std::format("unknown opcode 0x{:02x}", static_cast<unsigned>(header->opRaw))))
                 co_return;
             continue;
         }
@@ -635,7 +789,12 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // refusal in this loop. Unchanged from the two branches this replaced.
             if (!(co_await reader.Skip(header->payloadLength)).has_value())
                 co_return;
-            if (!co_await ReplyError(socket, Wire::ErrorCodeFor(decision), std::move(message)))
+            // A row PER DECISION rather than one counter for whatever
+            // `ErrorCodeFor` returns. The two reachable decisions here are opposite
+            // operator problems -- a client sending more than it may, and a client
+            // that never learned it needs a credential -- and one series carrying both
+            // could answer neither.
+            if (!co_await ReplyRefused(socket, session.metrics, RefusalForDecision(decision), std::move(message)))
                 co_return;
             continue;
         }
@@ -651,13 +810,13 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
         switch (descriptor->code)
         {
             case Wire::Op::Store:
-                next = co_await HandleStore(socket, engine, &manifest, std::move(*payload));
+                next = co_await HandleStore(socket, session.metrics, engine, &manifest, std::move(*payload));
                 break;
             case Wire::Op::Fetch:
-                next = co_await HandleFetch(socket, engine, &manifest, &primedGroups, std::move(*payload));
+                next = co_await HandleFetch(socket, session.metrics, engine, &manifest, &primedGroups, std::move(*payload));
                 break;
             case Wire::Op::Auth:
-                next = co_await HandleAuth(socket, policy, std::move(*payload), &credentialAccepted);
+                next = co_await HandleAuth(socket, session.metrics, policy, std::move(*payload), &credentialAccepted);
                 break;
 
             // Distributed execution and cluster administration, neither of which

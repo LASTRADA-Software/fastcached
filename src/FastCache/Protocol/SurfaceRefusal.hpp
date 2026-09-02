@@ -115,10 +115,45 @@ struct UntriagedRefusal
     std::uint32_t issue;              ///< The issue that will decide whether this counts.
 };
 
-/// Answer a refusal, and record it.
+/// Answer a refusal, and record it when anything is collecting.
 ///
 /// Taking a ROW rather than a code is what makes the counter impossible to forget:
 /// there is no argument to pass a bare `ErrorCode` to.
+///
+/// **The pointer overload is the one that encodes, and it takes a pointer because
+/// `SessionContext::metrics` is one.** That member is optional by contract -- "a
+/// scheduler must schedule whether or not anyone is scraping it" -- and its own
+/// documentation refuses a null-object default, because a silently-discarding sink and
+/// a genuinely absent one would then be indistinguishable at the call site. That is
+/// this project's absent-is-not-zero rule stated at a seam.
+///
+/// So the guard lives HERE rather than at each caller: `CompileCacheHandler` alone has
+/// twelve refusals, and twelve hand-written null checks are twelve chances to write
+/// `*metrics` instead. Callers pass the pointer they were handed and say nothing about
+/// nullability.
+///
+/// It is also why the whole `Refuse` family spells `EncodeErrorReply` exactly ONCE:
+/// `worker-refusals-counted` requires one encoder call per spelling, and an overload
+/// that encoded separately would have raised the call count without raising the name
+/// count -- which is the evasion that check exists to catch, arriving through the
+/// header it guards.
+/// @param metrics Where the refusal is recorded, or null when nothing collects.
+/// @param refusal Which refusal, as one row.
+/// @param detail Words for a person, or empty when there are none to add.
+/// @return The encoded reply.
+[[nodiscard]] inline std::vector<std::byte> Refuse(IMetricsSink* metrics,
+                                                   SurfaceRefusal const& refusal,
+                                                   std::string_view detail = {})
+{
+    if (metrics != nullptr)
+        metrics->Increment(refusal.counter);
+    return CompileCacheWire::EncodeErrorReply(refusal.code, detail);
+}
+
+/// Answer a refusal, and record it.
+///
+/// The reference overload, for a surface that holds a sink outright rather than
+/// reaching one through a session. Delegates, so there is one encoder call for both.
 /// @param metrics Where the refusal is recorded.
 /// @param refusal Which refusal, as one row.
 /// @param detail Words for a person, or empty when there are none to add.
@@ -127,8 +162,7 @@ struct UntriagedRefusal
                                                    SurfaceRefusal const& refusal,
                                                    std::string_view detail = {})
 {
-    metrics.Increment(refusal.counter);
-    return CompileCacheWire::EncodeErrorReply(refusal.code, detail);
+    return Refuse(&metrics, refusal, detail);
 }
 
 /// Answer a refusal that is deliberately not counted.
