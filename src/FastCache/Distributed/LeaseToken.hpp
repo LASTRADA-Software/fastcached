@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Sha256.hpp>
@@ -253,13 +254,20 @@ struct LeaseRefusal
     std::string detail;
 };
 
-/// Domain separation label, folded in ahead of every field.
+/// Which construction the cluster's pre-shared key is signing here.
 ///
-/// The cluster's pre-shared key already MACs discovery proofs, and one key serving
-/// two constructions is how a tag produced for one purpose comes to be accepted for
-/// the other. The differing field arity makes that implausible on its own; this
-/// makes it impossible, for eighteen bytes on a message that is being hashed anyway.
-inline constexpr std::string_view LeaseTokenDomain = "fastcache-lease-v1";
+/// That key already MACs discovery proofs, and one key serving two constructions
+/// is how a tag produced for one purpose comes to be accepted for the other. The
+/// differing field arity makes that implausible on its own; the domain label
+/// `Cluster::SignFields` folds in makes it impossible, for eighteen bytes on a
+/// message that is being hashed anyway.
+///
+/// Named once here rather than at the mint and the verify separately, for the
+/// reason `Detail::PackClaims` is one function: a minter and a verifier that each
+/// spell the domain are a minter and a verifier that can one day spell it
+/// differently, which presents as every lease in the fleet failing to
+/// authenticate after a change nobody connected to it.
+inline constexpr Cluster::SigningDomain LeaseTokenDomain = Cluster::SigningDomain::LeaseToken;
 
 /// The token layout this build emits.
 ///
@@ -329,15 +337,18 @@ namespace Detail
         });
     }
 
-    /// The tag a holder of @p signingKey must produce for @p claims.
+    /// The tag a holder of @p signingKey must produce for @p packedClaims.
+    ///
+    /// The claims go into the message as ONE field rather than as eight, which is
+    /// what lets the verifier authenticate the bytes a peer actually sent instead
+    /// of a re-encoding of them -- see `AuthenticateLeaseToken`.
     /// @param signingKey The cluster's pre-shared key.
     /// @param packedClaims The output of `PackClaims`.
     /// @return The expected tag.
     [[nodiscard]] inline Sha256::Digest ExpectedTag(std::span<std::byte const> signingKey,
                                                     std::span<std::byte const> packedClaims)
     {
-        auto const message = WireFields::Encode({ WireFields::AsBytes(LeaseTokenDomain), packedClaims });
-        return HmacSha256(signingKey, message);
+        return Cluster::SignFields(signingKey, LeaseTokenDomain, { packedClaims });
     }
 
     /// How many fields a token's outer envelope holds: the claims, and the tag.
@@ -434,11 +445,12 @@ namespace Detail
     // of the decoded claims. Re-encoding would authenticate what this build would have
     // written, not what the peer sent, so any encoder asymmetry -- now or after a
     // future field is added -- would quietly accept a token whose bytes say something
-    // else. `ConstantTimeEquals` because a caller can retry, and a comparison that
-    // stops at the first difference lets them recover the tag one byte at a time.
+    // else. `Cluster::VerifyFields` compares in constant time because a caller can
+    // retry, and a comparison that stops at the first difference lets them recover
+    // the tag one byte at a time.
     Sha256::Digest presented {};
     std::ranges::copy(tag, presented.begin());
-    if (!ConstantTimeEquals(Detail::ExpectedTag(signingKey, packed), presented))
+    if (!Cluster::VerifyFields(signingKey, LeaseTokenDomain, { packed }, presented))
         return std::unexpected { LeaseRefusalReason::Unauthorized };
 
     return LeaseClaims { .serial = std::string { WireFields::AsStringView((*fields)[1]) },

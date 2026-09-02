@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
@@ -96,6 +97,12 @@ struct Proof
 /// the object key's are: a separator that can occur inside a value is not a
 /// framing, so `{node="a", endpoint="b:1"}` and `{node="a:b", endpoint="1"}`
 /// would otherwise authenticate identically.
+///
+/// Signed through `Cluster::SignFields`, which folds
+/// `SigningDomain::DiscoveryProof`'s label in ahead of these four fields. The
+/// same pre-shared key MACs lease tokens, and before #402 a proof carried no
+/// label at all -- the two constructions were kept apart only by happening to
+/// have different field arities, which is a coincidence and not a property.
 /// @param key The cluster's pre-shared key.
 /// @param challenge What was asked.
 /// @param nodeId Who is answering.
@@ -106,13 +113,14 @@ struct Proof
                                                      std::string_view nodeId,
                                                      std::string_view raftEndpoint)
 {
-    auto const message = WireFields::Encode({
-        WireFields::AsBytes(challenge.clusterId),
-        std::span<std::byte const> { challenge.nonce },
-        WireFields::AsBytes(nodeId),
-        WireFields::AsBytes(raftEndpoint),
-    });
-    return HmacSha256(key, message);
+    return SignFields(key,
+                      SigningDomain::DiscoveryProof,
+                      {
+                          WireFields::AsBytes(challenge.clusterId),
+                          std::span<std::byte const> { challenge.nonce },
+                          WireFields::AsBytes(nodeId),
+                          WireFields::AsBytes(raftEndpoint),
+                      });
 }
 
 /// Wrap an already-encoded payload in this protocol's frame header.
