@@ -1513,6 +1513,24 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return host.empty() || host == "0.0.0.0" || host == "::";
 }
 
+/// Whether the endpoint this node would advertise names only this machine.
+///
+/// The third author of `IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)))`
+/// deleted. Three of the four reachability rows ask it -- two positively, one
+/// negated -- and it is the composition rather than the primitives that was copied,
+/// which is the defect `AdvertisedEndpoint` itself was extracted for: its own comment
+/// records that the expression once stood character-for-character in `main.cpp`.
+///
+/// Returns a `bool` and never the host: `AdvertisedEndpoint` hands back a value, so a
+/// helper yielding the `string_view` `HostOfEndpoint` carves out of it would dangle
+/// into a destroyed temporary at every call site.
+/// @param cfg The parsed configuration.
+/// @return Whether peers would be told to dial a loopback address.
+[[nodiscard]] bool AdvertisedHostIsLoopback(NodeConfig const& cfg)
+{
+    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+}
+
 /// Whether a machine that is not this one could reach this node's COMPILE verbs.
 ///
 /// **ONE port answers them now**, and this function is what is left of a rule that
@@ -1560,7 +1578,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// @return Whether remote clients would be told to dial their own machine.
 [[nodiscard]] bool AdvertisesLoopbackFromAReachableBind(NodeConfig const& cfg)
 {
-    if (!IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg))))
+    if (!AdvertisedHostIsLoopback(cfg))
         return false;
 
     // **And the bind has to disagree with it.** A node whose surface is ALSO on
@@ -1610,7 +1628,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     // bind is not any row's business at all -- it is the single-machine fleet.
     if (AdvertisesWildcard(cfg))
         return false;
-    if (IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg))))
+    if (AdvertisedHostIsLoopback(cfg))
         return false;
 
     // The row is asked rather than `nodeListen` read, for the reason
@@ -1633,6 +1651,31 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// machine, or a typo -- and the caller below only cares which of those it is.
 /// @param cfg The parsed configuration.
 /// @return Whether `--scheduler` names a host that is not this machine's loopback.
+/// Whether the operator named a membership policy at all.
+///
+/// The gate all four reachability rows share, given the name `NodeConfig.hpp` already
+/// cites it by ("the reachability rows' gate", one of the three deliberately different
+/// spellings of *is this node a fleet participant*). It was four inline `||`s and three
+/// comments asserting by hand that they were the same expression -- and two of the four
+/// were NOT, which is what a comment vouching for a duplicate always eventually says.
+///
+/// Positive and self-contained, never "what the other rows are not": the hazard the
+/// sibling predicates document is a row defined by NEGATING its neighbours, which
+/// changes meaning silently when a neighbour moves. A row that later needs a different
+/// gate writes a different expression, exactly as the fourth already does -- it drops
+/// the `--scheduler` half, because `SchedulerIsRemote` asks something stronger.
+///
+/// It is deliberately NOT `AdmitsRemotePeers`, which excludes a loopback-only member
+/// list and includes `--raft-join`. These rows are about whether the operator asked for
+/// peers to dial this worker; that one is about whether any of them is on another
+/// machine. Both questions are real and they are not the same one.
+/// @param cfg The parsed configuration.
+/// @return Whether `--fleet-open` or at least one `--fleet-member` was given.
+[[nodiscard]] bool NamesAMembershipPolicy(NodeConfig const& cfg)
+{
+    return cfg.fleetOpen || !cfg.fleetMembers.empty();
+}
+
 [[nodiscard]] bool SchedulerIsRemote(NodeConfig const& cfg)
 {
     return !cfg.scheduler.empty() && !IsLoopbackHost(HostOfEndpoint(cfg.scheduler));
@@ -1670,7 +1713,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
     if (!SchedulerIsRemote(cfg))
         return false;
-    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+    return AdvertisedHostIsLoopback(cfg);
 }
 
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
@@ -1866,9 +1909,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // no membership flags is untouched, which is what keeps the one-machine
         // deployment -- no advertise, loopback clients, and correct -- working.
         { .refuses =
-              [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesWildcard(c);
-              },
+              [](NodeConfig const& c) { return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesWildcard(c); },
           .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, and --advertise "
                      "names no address they can dial: the wildcard resolves to "
                      "the CALLER's own machine. This worker would register, heartbeat, be leased out and never be "
@@ -1893,8 +1934,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // the package.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty())
-                         && AdvertisesLoopbackFromAReachableBind(c);
+                  return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesLoopbackFromAReachableBind(c);
               },
           .message = "--fleet-member and --fleet-open admit peers so that they can dial this worker, --listen-node "
                      "accepts from the network, and --advertise names loopback -- so every peer is told to dial "
@@ -1918,7 +1958,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // load-bearing and no configuration can be answered by the wrong one.
         { .refuses =
               [](NodeConfig const& c) {
-                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesPastALoopbackBind(c);
+                  return !c.scheduler.empty() && NamesAMembershipPolicy(c) && AdvertisesPastALoopbackBind(c);
               },
           .message = "--advertise names an address peers can dial, but --listen-node binds loopback, so this worker "
                      "would never accept the connections it told them to make: it registers, heartbeats, is leased "
@@ -1926,23 +1966,31 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "--listen-node=0.0.0.0:6674 so it accepts from the network, or drop the membership flags and "
                      "serve this machine alone." },
         // The rule's FOURTH spelling, and the only one an operator reaches by typing
-        // neither flag. #463 asked whether `--listen-node` should widen itself for a
-        // fleet participant so that this case stops arising; the answer is no -- a
-        // default that widens a listening socket on a three-flag predicate is a
-        // security decision nobody typed, and the defaulted bind is the one whose
-        // failure to bind is a WARNING rather than fatal, so widening it would hand a
-        // fleet worker the "no 0xFC port at all, still registers, still leased"
-        // shape. What the ticket found is real, though: the three rows above all
-        // judge a flag somebody wrote, so a worker started with neither `--advertise`
-        // nor `--listen-node` sailed past all of them and registered loopback with a
-        // remote scheduler. `NodeServiceRejection` refuses that at INSTALL time and
-        // nothing refused it at a hand start, which is the reverse of the asymmetry
-        // #166 composed the tables to delete.
+        // neither flag. The three rows above all judge a flag somebody WROTE, so a
+        // worker started with neither `--advertise` nor `--listen-node` sailed past
+        // all of them and registered loopback with a remote scheduler.
+        // `NodeServiceRejection` refuses that at INSTALL time and nothing refused it
+        // at a hand start, which is the reverse of the asymmetry #166 composed the two
+        // tables to delete.
+        //
+        // #463 asked instead whether `--listen-node` should widen itself for a fleet
+        // participant so the case stops arising. The answer is no and the argument is
+        // on `NodeListenDefaultHost`, where the default itself lives -- not restated
+        // here, because a decision written down twice is a decision that will be
+        // revised in one place.
         //
         // The admission gate is its three siblings' for the reason they give. Their
         // `!c.scheduler.empty()` half is not repeated: `SchedulerIsRemote` asks a
         // strictly stronger question, and a clause that can never decide anything is
         // one a reader has to prove harmless every time they meet it.
+        //
+        // That gate is why `--scheduler=remote.internal` with NO membership flag is
+        // still not refused, which is closer to "typing nothing" than the shape this
+        // row is about and is deliberate: such a worker admits its own machine alone,
+        // so it refuses every dispatched compile with `NotAMember` (#235) and the
+        // endpoint it registered never mattered. That is the ready line's job
+        // (`AdmissionSummary`), and answering it here would tell an operator about an
+        // address when their problem is a policy.
         //
         // The message names both flags, because naming only `--advertise` is what
         // steers an operator into the row above -- and it says what the ENDPOINT is
@@ -1950,9 +1998,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // reaches this row too and a sentence about flags nobody typed would be false
         // for it.
         { .refuses =
-              [](NodeConfig const& c) {
-                  return (c.fleetOpen || !c.fleetMembers.empty()) && AdvertisesLoopbackToARemoteScheduler(c);
-              },
+              [](NodeConfig const& c) { return NamesAMembershipPolicy(c) && AdvertisesLoopbackToARemoteScheduler(c); },
           .message = "--scheduler names a machine that is not this one, and this worker would register LOOPBACK "
                      "with it: --advertise resolves to an address only this machine can dial, whether it was "
                      "named or left to fall back to --listen-node. Every client the scheduler leases it to would "
