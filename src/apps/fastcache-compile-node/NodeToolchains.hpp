@@ -366,8 +366,8 @@ enum class RecheckDepth : std::uint8_t
 /// Whether a configuration reload moved what this worker advertises.
 ///
 /// An enum rather than a `bool` at this seam: the call site reads
-/// `RecheckDepthFor(claims, beat)`, and a bare `true` there says nothing about which
-/// of the two inputs it is.
+/// `RecheckDepthFor(reloaded, beat, sweepEveryBeats)`, where a bare `true` would say
+/// nothing about which of three arguments it is.
 enum class ClaimsReloaded : std::uint8_t
 {
     No,
@@ -384,23 +384,26 @@ enum class ClaimsReloaded : std::uint8_t
 /// heartbeats. Split out, both directions are one assertion each (#403, and the same
 /// lesson as #354's readings record).
 ///
-/// The periodic sweep fires on beat 0 as well as every `sweepEveryBeats` after it,
-/// which is the modulo's own behaviour and is right: the first beat after the initial
-/// survey is when a machine that came up serving less than it has should be looked at.
 /// @param claims Whether a reload changed what this worker would advertise.
-/// @param beat Which heartbeat this is, counting from one at the first.
-/// @param sweepEveryBeats How often the unconditional sweep comes round; never zero.
+/// @param beat Which heartbeat this is. The caller increments before asking, so the
+///        first is 1 and 0 never arrives -- the sweep therefore lands on
+///        `sweepEveryBeats` and its multiples, not on the first beat.
+/// @param sweepEveryBeats How often the unconditional sweep comes round. Zero means
+///        never, which leaves the witnesses and a reload as the two triggers.
 /// @return The depth to pass `RefreshToolchains`.
 [[nodiscard]] constexpr RecheckDepth RecheckDepthFor(ClaimsReloaded claims,
                                                      std::uint64_t beat,
                                                      std::uint64_t sweepEveryBeats) noexcept
 {
-    // Guarded rather than trusted: a zero would be a division by zero on the
-    // heartbeat thread, and the caller's constant is the kind of thing a later edit
-    // makes configurable. Zero means "never sweep", which leaves the witnesses and a
-    // reload as the two remaining triggers.
+    // A reload outranks the cadence: it is the one trigger that knows something the
+    // witnesses cannot see.
     if (claims == ClaimsReloaded::Yes)
         return RecheckDepth::Unconditional;
+
+    // Guarded rather than trusted. The caller's `sweepEveryBeats` is a constant today,
+    // which is exactly the kind of thing a later edit makes configurable -- and the
+    // failure would be a modulo by zero on the heartbeat thread rather than a wrong
+    // answer.
     if (sweepEveryBeats == 0)
         return RecheckDepth::WhenEvidenceMoved;
     return beat % sweepEveryBeats == 0 ? RecheckDepth::Unconditional : RecheckDepth::WhenEvidenceMoved;

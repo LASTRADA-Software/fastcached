@@ -1175,32 +1175,36 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             options, [](OptionSpec<NodeConfig> const& spec) { return spec.yamlKey.empty() == (spec.same == nullptr); }),
         "a row with a yamlKey needs a FieldEq comparator, and a row without one must not have it");
 
-    // **The reloadable set is pinned, because marking a row is a decision about the
-    // FLEET and not only about this process.** Two of the three feed what this worker
-    // registers, so a reload of them has to re-derive and re-register
-    // (`AdvertisedClaimsDiffer`, which the heartbeat thread acts on); the third,
-    // `--log-level`, is purely local. A fourth row marked `Reloadable::Yes` is one or
-    // the other and nothing here could guess which -- so this fails the build and
-    // sends its author to make that call, rather than letting a registration-bearing
-    // flag become live and silently never reach the scheduler.
-    static_assert(
-        std::ranges::count_if(options, [](OptionSpec<NodeConfig> const& spec) { return spec.reloadable == Reloadable::Yes; })
-            == 3,
-        "a new Reloadable::Yes row must be classified in AdvertisedClaimsDiffer first");
+    // **Marking a row reloadable is a decision about the FLEET, not only about this
+    // process, so every such row must say which.** A flag that feeds REGISTER has to
+    // re-derive and re-register when it changes (`AdvertisedReloadableFlags`, which
+    // `AdvertisedClaimsDiffer` walks); one that is local wiring must not, because that
+    // re-derivation is minutes of include-tree walking. Nothing here can guess which a
+    // new row is, so an unclassified one fails the build rather than defaulting into
+    // the silent half -- a registration-bearing flag that goes live and never reaches
+    // the scheduler.
+    //
+    // One assertion, not two. A count of `Reloadable::Yes` rows stood beside this and
+    // is subsumed by it -- any row this does not name already fails here -- while
+    // adding a hand-kept literal next to the very list it counted, which is the
+    // "hand-checked list beside a table" shape the note above calls the joke telling
+    // itself.
     static_assert(std::ranges::all_of(options,
                                       [](OptionSpec<NodeConfig> const& spec) {
-                                          return spec.reloadable != Reloadable::Yes || spec.primary == "--log-level"
-                                                 || spec.primary == "--toolchain"
-                                                 || spec.primary == "--no-toolchain-discovery";
+                                          return spec.reloadable != Reloadable::Yes
+                                                 || std::ranges::contains(AdvertisedReloadableFlags, spec.primary)
+                                                 || std::ranges::contains(LocalReloadableFlags, spec.primary);
                                       }),
-                  "a new Reloadable::Yes row must be classified in AdvertisedClaimsDiffer first");
+                  "a new Reloadable::Yes row must be listed in AdvertisedReloadableFlags or LocalReloadableFlags");
 
     return options;
 }
 
 bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate)
 {
-    return previous.toolchains != candidate.toolchains || previous.toolchainDiscovery != candidate.toolchainDiscovery;
+    return std::ranges::any_of(NodeOptions(), [&](OptionSpec<NodeConfig> const& spec) {
+        return std::ranges::contains(AdvertisedReloadableFlags, spec.primary) && !spec.same(previous, candidate);
+    });
 }
 
 std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate)

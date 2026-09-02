@@ -766,15 +766,30 @@ struct NodeConfig
 /// 300 s cold (#354). Re-running it because somebody raised the log level mid-incident
 /// would be the worst possible moment to spend that.
 ///
-/// It compares the two fields directly rather than walking `NodeOptions()` for
-/// `Reloadable::Yes` rows, and that is safe only because the table says so: every other
-/// registration-bearing flag is `Reloadable::No`, so no reload can move it. A
-/// `static_assert` beside the table pins the reloadable set, so a fourth row cannot be
-/// marked without its author being sent here to decide whether the fleet has to hear
-/// about it.
+/// **Driven off the table rather than comparing fields by hand.** The rows it consults
+/// are named once, in `AdvertisedReloadableFlags`, and the comparison is each row's own
+/// `same` -- so a flag's idea of "changed" is written in exactly one place, beside the
+/// flag. Spelled out here instead, the two `!=` expressions would be a second copy of
+/// two `FieldEq` comparators sitting in the very rows this is about.
+///
+/// A `static_assert` beside the table requires every `Reloadable::Yes` row to appear on
+/// that list or on the local-only one, so a fourth reloadable row cannot be added
+/// without its author saying which kind it is.
 /// @param previous The configuration that was in force.
 /// @param candidate The configuration just adopted.
 /// @return Whether what this worker advertises has changed.
+/// The reloadable flags that are CLAIMS this worker made to the fleet.
+///
+/// Changing one means re-deriving what this node serves and re-registering, so the
+/// scheduler stops dispatching against a set this worker no longer has.
+inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--toolchain", "--no-toolchain-discovery" };
+
+/// The reloadable flags that are local wiring and reach no other machine.
+///
+/// A list rather than "whatever is not advertised", so that adding a reloadable row
+/// forces a choice instead of defaulting into the cheap answer.
+inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-level" };
+
 [[nodiscard]] bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate);
 
 /// What a bare `--listen-raft` binds.

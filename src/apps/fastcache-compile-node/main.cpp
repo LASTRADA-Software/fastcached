@@ -534,16 +534,21 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 /// in force.
 /// @param reloader The pipeline, or null when this worker has no configuration file.
 /// @param logger Where the outcome is reported.
-/// @return Whether what this worker ADVERTISES changed, so the heartbeat thread has to
-///         re-derive its served set rather than wait for a witness to move on disk.
-[[nodiscard]] bool ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
+///
+/// Returns nothing: the heartbeat thread notices a reload by comparing snapshots, so
+/// there is no signal to hand it. A `ConfigReloaderOf::Subscribe` callback would be the
+/// house idiom for one, and is declined here for a lifetime reason rather than a
+/// stylistic one -- the reloader is declared in `main` and outlives `WorkerBody`, and
+/// `Subscribe` has no unsubscribe, so a subscriber capturing this frame's locals would
+/// outlive them.
+void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
 {
     if (reloader == nullptr)
     {
         // Not silence: an operator who sent SIGHUP believes this worker has a file to
         // re-read, and the useful answer is that it has none.
         logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
-        return false;
+        return;
     }
 
     // Taken BEFORE the swap, because "did the advertised set change" cannot be asked
@@ -559,28 +564,24 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
         // changed something immutable -- because the operator's situation is the same:
         // they saved once, and NOTHING was applied.
         logger.Logf(LogLevel::Warn, "reload declined, configuration unchanged: {}", outcome.error().ToString());
-        return false;
+        return;
     }
 
     auto const current = reloader->Current();
     logger.SetMinLevel(current->logLevel);
 
-    // Compared rather than assumed changed. A reload that touched only `--log-level`
-    // must not re-derive the toolchain set: that survey spawns a driver per compiler
-    // and walks every include tree, and a node whose operator raised the log level
-    // mid-incident is the worst moment to spend minutes on one.
-    auto const claimsMoved = Node::AdvertisedClaimsDiffer(*before, *current);
-    if (claimsMoved)
-        // Said here, at the moment the operator acted, rather than only when the
-        // heartbeat gets to it: the re-survey is the expensive part and an operator
-        // who saved a file deserves to know it was accepted before it completes.
+    // Asked here only to say the right thing to the operator, at the moment they
+    // acted: the re-survey is the expensive part (`AdvertisedClaimsDiffer` carries
+    // what it costs and why it is not run unconditionally), and somebody who saved a
+    // file should know it was accepted before it finishes. The heartbeat thread asks
+    // the same question again for itself, from the same function.
+    if (Node::AdvertisedClaimsDiffer(*before, *current))
         logger.Logf(LogLevel::Info,
                     "configuration reloaded; log level is now {}. What this worker serves has changed, so it will "
                     "re-derive its toolchains and re-register on the next heartbeat",
                     ToStringView(current->logLevel));
     else
         logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
-    return claimsMoved;
 }
 
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
@@ -1217,6 +1218,12 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
     // writes it.
     std::uint64_t beat = 0;
 
+    // The configuration snapshot this thread last surveyed against, so a reload is
+    // noticed by COMPARISON rather than by a flag somebody else sets. Null until the
+    // first beat, and null forever on a worker with no configuration file -- neither
+    // of which can be a reload, which is what the first-beat guard below says.
+    ConfigReloaderOf<NodeConfig>::Snapshot actedOn;
+
     // Where this node believes the scheduler's leader is. Declared out here so it
     // survives across rounds -- remembering the leader is the whole reason a
     // steady-state fleet does not spend a redirect on every heartbeat -- and, like
@@ -1242,13 +1249,6 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
     // every one of them failed to yield a usable identity. `ResolveToolchains` has
     // already logged which, and the exit code is what a supervisor reads.
     std::atomic<bool> surveyFoundNothing { false };
-
-    // Raised by a reload on the main loop, lowered by the heartbeat thread that acts
-    // on it. The re-derivation itself is `RefreshToolchains`, which is driven by
-    // WITNESSES -- a compiler's stamp moving on disk -- and an edited configuration
-    // file moves none of them. Without this the reload would be accepted, logged, and
-    // then do nothing until the next unconditional sweep (#403).
-    std::atomic<bool> advertisedClaimsChanged { false };
 
     std::jthread const heartbeat { [&](std::stop_token const& stop) {
         // The initial survey, and it runs HERE rather than at startup because it is
@@ -1322,12 +1322,10 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
             ++beat;
 
             // The configuration this beat acts on, which is the RELOADED one when a
-            // file exists. Held as a snapshot for the whole beat rather than read
-            // twice: `Current()` can be swapped underneath by a reload arriving
-            // mid-beat, and deciding the depth against one configuration and the
-            // survey against another is how a re-derivation gets skipped for a change
-            // it was raised by. Each snapshot is immutable, so holding it is free and
-            // a reload that lands mid-beat is answered by the next one.
+            // file exists. Read once and held for the whole beat: `Current()` can be
+            // swapped underneath by a reload arriving mid-beat, and deciding the depth
+            // against one configuration and then surveying against another is how a
+            // re-derivation gets skipped for the very change that asked for it.
             auto const snapshot = reloader != nullptr ? reloader->Current() : nullptr;
             auto const& liveCfg = snapshot ? *snapshot : cfg;
 
@@ -1336,9 +1334,20 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
             // sweep came round, which is the only way back from serving LESS than this
             // machine has; or an operator edited the file, which moves no witness at
             // all and would otherwise wait for that sweep.
-            auto const reloaded = advertisedClaimsChanged.exchange(false, std::memory_order_relaxed)
+            //
+            // **Asked here rather than signalled from the reload.** This thread now
+            // holds both operands -- the snapshot it last acted on and the one it is
+            // acting on now -- so a flag set on the main loop would be a second
+            // author of a fact this thread can just compute. It would also be lossy in
+            // both directions: a beat racing the store misses it until the next one,
+            // and two reloads that cancel each other still buy a survey that had
+            // nothing to find. Comparing the snapshots has neither problem, because
+            // identity is what changed rather than an edge that can be missed.
+            auto const reloaded = snapshot != nullptr && snapshot != actedOn
+                                          && (actedOn == nullptr || Node::AdvertisedClaimsDiffer(*actedOn, *snapshot))
                                       ? Node::ClaimsReloaded::Yes
                                       : Node::ClaimsReloaded::No;
+            actedOn = snapshot;
             auto const depth = Node::RecheckDepthFor(reloaded, beat, SweepEveryBeats);
 
             if (auto refreshed = Node::RefreshToolchains(
@@ -1438,12 +1447,12 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
         // Taken here rather than in the handler, for the reason the handler's own note
         // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
         // costs one re-read rather than one per signal.
-        // Set here and cleared by the heartbeat thread, which is the only reader.
-        // Relaxed on both sides deliberately: it orders nothing, it is a request that
-        // the next beat take the expensive path, and a beat that raced past it is
-        // answered by the following one.
-        if (DaemonControls::Instance().TakeReloadRequest() && ApplyReloadRequest(reloader, logger))
-            advertisedClaimsChanged.store(true, std::memory_order_relaxed);
+        //
+        // Nothing is handed to the heartbeat thread: it compares snapshots itself, so
+        // this call publishes a new configuration and says so, and the next beat picks
+        // it up on its own.
+        if (DaemonControls::Instance().TakeReloadRequest())
+            ApplyReloadRequest(reloader, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
