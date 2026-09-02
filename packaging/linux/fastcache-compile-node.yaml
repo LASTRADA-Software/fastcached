@@ -271,7 +271,7 @@
 # message. Turn it ON when this worker's log is going anywhere journald is not:
 # a foreground run during fleet bring-up, a redirected file, a CI artefact. A
 # completed run cannot be asked afterwards what time anything happened (#485).
-#log_timestamps:
+#log_timestamps: false
 
 # write the pid here when daemonizing (POSIX)
 #pidfile:
