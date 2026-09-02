@@ -549,7 +549,8 @@ never receives it — an object built on the fleet carries the worker's scratch
 directory as its compilation directory and the dispatching machine's paths in its
 `#line` markers, under the same key a locally built and correctly mapped object
 would use. Forwarding it needs the client's root to travel with the job, which is
-its own change.
+its own change:
+[#506](https://github.com/LASTRADA-Software/fastcached/issues/506).
 
 **On Windows there is no equivalent and the paths stay.** `cl` has no path-map
 switch, and `-ffile-prefix-map` does not reach the records that matter for

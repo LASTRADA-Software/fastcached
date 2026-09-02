@@ -1224,12 +1224,15 @@ stops being one — the same confound that cost #493 a re-run.
   separator, clang at the first. The launcher follows gcc. Reachable only when a
   mapped root itself contains a separator, and it costs a MISS rather than a
   mis-serve — the head the launcher isolates lies under no root either way.
-- **A dispatched compile is not covered.** `RemoteCompileArgs` drops every
-  path-valued flag, so a worker never receives the mapping: a fleet-built object
-  carries the worker's scratch directory as its compilation directory, under the
-  same key a locally mapped one uses. Stated rather than claimed away, the way the
-  COFF residue is; forwarding the flag needs the client's root to travel with the
-  job.
+- **A dispatched compile is not covered**
+  ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
+  `RemoteCompileArgs` drops every path-valued flag, so a worker never receives the
+  mapping: a fleet-built object carries the worker's scratch directory as its
+  compilation directory, under the same key a locally mapped one uses. Stated
+  rather than claimed away, the way the COFF residue is. It is OPEN work and not
+  an accepted trade-off, because unlike the COFF residue it has a fix — and the
+  decision it turns on is whether the replacement token becomes a contract both
+  ends share rather than a convention each machine chooses for itself.
 - **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
   hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
   module is included from a `project()` that lists CXX first — so the first run
@@ -1337,6 +1340,14 @@ which conditions?" gets asked.
   per-spawn environment on `IProcessRunner` -- setting it process-wide would change the
   language of the diagnostics the operator sees. Not token extraction: no rule over
   "the version-looking word and the last one" survives a locale nobody has read.
+- **[#506](https://github.com/LASTRADA-Software/fastcached/issues/506)** — a
+  DISPATCHED compile gets no `-fdebug-prefix-map`, because `RemoteCompileArgs`
+  drops every path-valued flag, so a fleet-built object carries the worker's
+  scratch directory as its compilation directory under the same key a locally
+  mapped one uses. Unlike the COFF residue beside it this has a fix, which is why
+  it is open work rather than an accepted trade-off — and the decision it turns on
+  is whether the replacement token becomes a contract both ends share rather than a
+  convention each machine picks for itself.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the
