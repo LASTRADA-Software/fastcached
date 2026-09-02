@@ -1219,10 +1219,14 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     std::uint64_t beat = 0;
 
     // The configuration snapshot this thread last surveyed against, so a reload is
-    // noticed by COMPARISON rather than by a flag somebody else sets. Null until the
-    // first beat, and null forever on a worker with no configuration file -- neither
-    // of which can be a reload, which is what the first-beat guard below says.
-    ConfigReloaderOf<NodeConfig>::Snapshot actedOn;
+    // noticed by COMPARISON rather than by a flag somebody else sets.
+    //
+    // Seeded BEFORE the initial survey rather than left null, which is what makes the
+    // first beat comparable to every other one: the survey is expensive and a reload
+    // can land while it runs, so a baseline taken afterwards would either miss that
+    // reload or -- taken as "null means new" -- treat every ordinary start as one.
+    // Null only when this worker has no configuration file at all.
+    ConfigReloaderOf<NodeConfig>::Snapshot actedOn = reloader != nullptr ? reloader->Current() : nullptr;
 
     // Where this node believes the scheduler's leader is. Declared out here so it
     // survives across rounds -- remembering the leader is the whole reason a
@@ -1343,8 +1347,15 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
             // and two reloads that cancel each other still buy a survey that had
             // nothing to find. Comparing the snapshots has neither problem, because
             // identity is what changed rather than an edge that can be missed.
-            auto const reloaded = snapshot != nullptr && snapshot != actedOn
-                                          && (actedOn == nullptr || Node::AdvertisedClaimsDiffer(*actedOn, *snapshot))
+            // `actedOn` is non-null from the moment this thread starts, so a null here
+            // means only "this worker has no configuration file" -- never "first beat".
+            // Written the other way round it read as a reload on beat 1 of every node
+            // that HAS a file, buying a second full survey immediately after the
+            // initial one: minutes of include-tree walking on a cold machine, and a
+            // window in which one transient probe failure drops toolchains the node
+            // had just successfully identified.
+            auto const reloaded = actedOn != nullptr && snapshot != nullptr && snapshot != actedOn
+                                          && Node::AdvertisedClaimsDiffer(*actedOn, *snapshot)
                                       ? Node::ClaimsReloaded::Yes
                                       : Node::ClaimsReloaded::No;
             actedOn = snapshot;
@@ -1758,16 +1769,11 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
         return ExitUsage;
     }
-    // Only when the machine will not be asked. With discovery on, "no toolchain" is
-    // not yet a fact -- it is a question the node answers a few lines later, and
-    // refusing here would refuse every worker installed by a package.
-    if (cfg.toolchains.empty() && !cfg.toolchainDiscovery)
-    {
-        logger.Logf(LogLevel::Error,
-                    "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
-                    "and then refuse every job the scheduler sent it");
-        return ExitUsage;
-    }
+    // "no --toolchain and no discovery" used to be refused HERE, and is now a
+    // `StartupPolicyRejection` row. It depends on nothing but the parsed
+    // configuration, which is what that table is for -- and leaving it in the tier
+    // meant a reload could reach the state a start refuses, since #403 made both of
+    // its flags reloadable and `ValidateNodeReloadable` composes the startup rules.
 
     // Checked here rather than inside WorkerBody, for the reason the two above are:
     // the POSIX host has already redirected stdout to /dev/null by the time the body

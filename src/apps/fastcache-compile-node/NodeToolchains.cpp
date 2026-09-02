@@ -639,7 +639,19 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
     // "changed" would re-register every worker in the fleet on that timer for no
     // reason. Nothing is lost by discarding its witnesses -- no stamp moved, so they
     // say what the ones already held say.
-    if (stale.empty() && std::ranges::equal(std::views::keys(served), std::views::keys(next)))
+    // The KEYS are not the answer on their own. An operator's `<fingerprint>=<compiler>`
+    // override is never probed, so it carries no witness and can never be `stale` --
+    // and repointing one at a different compiler leaves the key set identical. Compared
+    // on keys alone, that edit surveyed correctly and then threw the result away, so
+    // the worker went on spawning the old compiler under a fingerprint the operator had
+    // redefined: a wrong object under a key the whole fleet trusts, with nothing said.
+    // Unreachable until #403 made `--toolchain` reloadable, and silent once it was.
+    auto const sameMapping = [](auto const& left, auto const& right) {
+        return std::ranges::equal(left, right, [](auto const& a, auto const& b) {
+            return a.first == b.first && a.second.compiler == b.second.compiler;
+        });
+    };
+    if (stale.empty() && sameMapping(served, next))
         return {};
 
     // Otherwise `changed` follows the STAMP as much as the fingerprint set, and the

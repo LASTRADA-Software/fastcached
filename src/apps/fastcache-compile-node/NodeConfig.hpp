@@ -753,6 +753,18 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
+/// The reloadable flags that are CLAIMS this worker made to the fleet.
+///
+/// Changing one means re-deriving what this node serves and re-registering, so the
+/// scheduler stops dispatching against a set this worker no longer has.
+inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--toolchain", "--no-toolchain-discovery" };
+
+/// The reloadable flags that are local wiring and reach no other machine.
+///
+/// A list rather than "whatever is not advertised", so that adding a reloadable row
+/// forces a choice instead of defaulting into the cheap answer.
+inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-level" };
+
 /// Whether a reload changed something this worker had TOLD the fleet.
 ///
 /// The band #403 made reloadable is not local wiring: `--toolchain` and
@@ -778,18 +790,6 @@ struct NodeConfig
 /// @param previous The configuration that was in force.
 /// @param candidate The configuration just adopted.
 /// @return Whether what this worker advertises has changed.
-/// The reloadable flags that are CLAIMS this worker made to the fleet.
-///
-/// Changing one means re-deriving what this node serves and re-registering, so the
-/// scheduler stops dispatching against a set this worker no longer has.
-inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--toolchain", "--no-toolchain-discovery" };
-
-/// The reloadable flags that are local wiring and reach no other machine.
-///
-/// A list rather than "whatever is not advertised", so that adding a reloadable row
-/// forces a choice instead of defaulting into the cheap answer.
-inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-level" };
-
 [[nodiscard]] bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate);
 
 /// What a bare `--listen-raft` binds.

@@ -3002,12 +3002,14 @@ TEST_CASE("A toolchain change is reloadable, and says the fleet must be told", "
 
 TEST_CASE("Turning discovery off is reloadable, and also a claim", "[node][config][reload]")
 {
-    // The band's other member. It only ever decides anything when no `--toolchain` is
-    // named -- an operator-named set is `ToolchainSource::OperatorNamed` and discovery
-    // is never consulted -- so this configuration deliberately names none.
+    // The band's other member, and it has to be turned off ALONGSIDE naming a
+    // toolchain: on its own it is a worker with nothing to serve, which the startup
+    // rules refuse and a reload may therefore not reach either. That case is asserted
+    // separately below; this one is the legitimate edit -- an operator pinning the set
+    // and telling the node to stop searching the machine.
     Testing::ScratchDirectory const scratch { "node-reload-discovery" };
     auto const& dir = scratch.Path();
-    auto const path = WriteNodeConfigFile(dir, "no_toolchain_discovery: true\n");
+    auto const path = WriteNodeConfigFile(dir, "no_toolchain_discovery: true\ntoolchain:\n  - /usr/bin/g++\n");
 
     NodeConfig initial;
     REQUIRE(initial.toolchainDiscovery);
@@ -3105,4 +3107,55 @@ TEST_CASE("A reload forces the survey a witness would never trigger", "[node][co
     // crash, and not a survey on every single beat either.
     CHECK(RecheckDepthFor(ClaimsReloaded::No, 7, 0) == RecheckDepth::WhenEvidenceMoved);
     CHECK(RecheckDepthFor(ClaimsReloaded::Yes, 7, 0) == RecheckDepth::Unconditional);
+}
+
+TEST_CASE("A malformed toolchain is declined by the reload, not applied", "[node][config][reload]")
+{
+    // The grammar used to be enforced at SURVEY time, which was harmless while this
+    // flag could only arrive at startup: a bad value exited with a message and nothing
+    // had been applied. Reloadable, it stopped being harmless -- the value passed the
+    // applier, was published, and the heartbeat thread then discovered it was malformed
+    // with nothing left to do but serve NOTHING, unrecoverably, because an empty served
+    // set has no witnesses to notice a correction with.
+    //
+    // Both halves of a pinned toolchain have to be non-empty, which is exactly what
+    // `SplitToolchain` says; this asserts the reload asks it.
+    for (auto const* bad: { "toolchain:\n  - =/usr/bin/g++\n", "toolchain:\n  - abc=\n" })
+    {
+        INFO(bad);
+        Testing::ScratchDirectory const scratch { "node-reload-bad-toolchain" };
+        auto const path = WriteNodeConfigFile(scratch.Path(), bad);
+
+        NodeConfig initial;
+        initial.toolchains = { "/usr/bin/g++" };
+
+        auto reloader = MakeNodeReloader(initial, path);
+        CHECK_FALSE(reloader.Reload().has_value());
+
+        // The live configuration is untouched, which is the half that matters: the
+        // worker goes on serving what it was serving.
+        CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
+    }
+}
+
+TEST_CASE("A reload cannot reach a state startup would have refused", "[node][config][reload]")
+{
+    // `--no-toolchain-discovery` with no `--toolchain` is a worker with nothing to
+    // serve. Startup refuses it by name; until #403 no reload could produce it, because
+    // neither flag was reloadable. Both are now, so the reload path composes the
+    // startup rules exactly as `NodeInstallRejection` does -- the same reasoning, since
+    // whatever is accepted here becomes the configuration in force.
+    Testing::ScratchDirectory const scratch { "node-reload-nothing-to-serve" };
+    auto const path = WriteNodeConfigFile(scratch.Path(), "no_toolchain_discovery: true\n");
+
+    NodeConfig initial;
+    initial.toolchains = { "/usr/bin/g++" };
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const outcome = reloader.Reload();
+
+    REQUIRE_FALSE(outcome.has_value());
+    // Named, so an operator is told which setting and not merely that something failed.
+    CHECK(outcome.error().context.contains("--toolchain"));
+    CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
 }

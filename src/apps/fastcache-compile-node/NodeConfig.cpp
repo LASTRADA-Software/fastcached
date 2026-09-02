@@ -2,6 +2,7 @@
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
+#include "NodeToolchains.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -240,13 +241,34 @@ namespace
     /// registration that bakes in a fingerprint no scheduler will accept is one that
     /// fails at every boot with nobody watching.
     ///
+    /// **The GRAMMAR is checked here, not only the text.** It used to be enforced by
+    /// `SplitToolchain` at survey time, which was harmless while this flag could only
+    /// arrive at startup -- a malformed value exited with a message and nothing had
+    /// been applied. Since #403 made the row reloadable it is not: such a value now
+    /// passes the applier, passes `ValidateNodeReloadable`, is published, and is
+    /// discovered to be malformed on the heartbeat thread, where the only thing left
+    /// to do is serve NOTHING. The worker cannot recover either, because an empty
+    /// served set has no witnesses to notice a later correction with.
+    ///
+    /// So it is asked where every other value grammar is asked -- in the row -- and a
+    /// bad one declines the whole reload with the previous configuration still in
+    /// force. `SplitToolchain` is the authority and is called rather than restated.
     /// @param sv The flag's value.
-    /// @return `sv` verbatim, or why its pinned half is not text.
+    /// @return `sv` verbatim, or why it is not a usable toolchain.
     [[nodiscard]] std::expected<std::string, ConfigError> ParseToolchain(std::string_view sv)
     {
         if (auto const eq = sv.find('='); eq != std::string_view::npos)
             if (auto const pinned = ParseUtf8Text(sv.substr(0, eq)); !pinned.has_value())
                 return std::unexpected(pinned.error());
+        if (!SplitToolchain(sv).has_value())
+            return std::unexpected(
+                ConfigError { .code = ConfigErrorCode::ParseError,
+                              .source = {},
+                              .line = 0,
+                              .field = {},
+                              .context = std::format("'{}' is not <compiler> or <fingerprint>=<compiler>; both halves "
+                                                     "of a pinned toolchain have to be non-empty",
+                                                     sv) });
         return std::string { sv };
     }
 
@@ -1197,6 +1219,19 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                                       }),
                   "a new Reloadable::Yes row must be listed in AdvertisedReloadableFlags or LocalReloadableFlags");
 
+    // And the converse, which is what makes `AdvertisedClaimsDiffer` safe to write as
+    // a table walk: every name on that list is a real row AND carries a comparator.
+    // Without this a listed flag that no row answers to would compare nothing and
+    // report "unchanged" forever, and one whose row had no `same` would be a null call
+    // on the reload path -- both silent, both at run time.
+    static_assert(std::ranges::all_of(AdvertisedReloadableFlags,
+                                      [](std::string_view flag) {
+                                          return std::ranges::any_of(options, [flag](OptionSpec<NodeConfig> const& spec) {
+                                              return spec.primary == flag && spec.same != nullptr;
+                                          });
+                                      }),
+                  "every AdvertisedReloadableFlags entry must name a row that carries a FieldEq comparator");
+
     return options;
 }
 
@@ -1225,6 +1260,24 @@ std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, No
 
 std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previous, NodeConfig const& candidate)
 {
+    // **A candidate is judged by the STARTUP rules as well**, which is the same
+    // composition `NodeInstallRejection` makes and for the same reason: whatever this
+    // accepts becomes the configuration in force, so a reload must not be able to
+    // reach a state the process would have refused to start in. Newly reachable
+    // because #403 made the toolchain pair reloadable -- `no_toolchain_discovery: true`
+    // with no `toolchain:` key is a worker with nothing to serve, refused at startup by
+    // name and, until this, accepted by a reload that then quietly emptied the served
+    // set on the heartbeat thread.
+    //
+    // Asked FIRST, because it describes the candidate on its own terms; the
+    // immutability check below is about the pair.
+    if (auto const rejection = StartupPolicyRejection(candidate))
+        return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                             .source = {},
+                                             .line = 0,
+                                             .field = {},
+                                             .context = std::format("not applied: {}", *rejection) });
+
     auto const changed = UnreloadableChanges(previous, candidate);
     if (changed.empty())
         return {};
@@ -1942,6 +1995,18 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     };
 
     constexpr auto Rules = std::to_array<Rule>({
+        // Only when the machine will not be asked. With discovery on, "no toolchain"
+        // is not yet a fact -- it is a question this node answers once its survey
+        // lands -- and refusing here would refuse every worker installed by a package.
+        //
+        // A row rather than a check in `main`, where it used to live: it reads nothing
+        // but the parsed configuration, and a rule in the tier is one a RELOAD cannot
+        // consult. Since #403 made both its flags reloadable, that was reachable --
+        // the reload was accepted and the heartbeat thread then quietly emptied the
+        // served set, leaving a live worker registering nothing.
+        { .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
+          .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
+                     "and then refuse every job the scheduler sent it." },
         { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty(); },
           .message = "--serve-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
                      "refuses every caller, which is the right default but not a working configuration. It would "
