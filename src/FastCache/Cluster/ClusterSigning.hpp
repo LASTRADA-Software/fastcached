@@ -190,8 +190,18 @@ static_assert(SigningLabelsSeparateDomains(),
 /// is `ConstantTimeEquals`: `==` on two digests stops at the first difference, so
 /// its timing tells a caller who can retry how many leading bytes a guess got
 /// right and lets them recover a tag one byte at a time instead of guessing all
-/// 32. Exposing only this means there is nothing for a verifier to compare with
-/// the wrong operator.
+/// 32.
+///
+/// **What that does and does not guarantee.** This module exposes no other
+/// comparison, and each wire's verifier goes through it -- `VerifyLeaseToken` via
+/// `AuthenticateLeaseToken`, and `DiscoveryService` via
+/// `DiscoveryWire::VerifyProofTag`. It does NOT make a hand-rolled comparison
+/// impossible: signing entry points are public because minting is a separate act,
+/// so a future caller could take a tag from one and compare it itself. That is
+/// the residual, and it is smaller than it was rather than gone. `ctest -R
+/// psk-signing-seam` covers the other half -- a second construction -- and does
+/// not cover this one, because a legitimately obtained tag compared with the
+/// wrong operator is not a call to the primitive.
 ///
 /// @param key The cluster's pre-shared key.
 /// @param domain Which construction this message belongs to.

@@ -73,7 +73,7 @@ set(FastCachedPskSigners
 # fields...}))` the long way, so the construction is asserted against something
 # other than the code that produces it. Both are the check working, not a hole:
 # what this rule is about is what SIGNS on the wire.
-set(FastCachedPskTestSuffix "_test.cpp")
+set(FastCachedPskTestRegex "_test[.]cpp$")
 
 # Which files count as source. Wider than the extensions this tree happens to use,
 # for check-net-boundary.cmake's reason: a file this does not scan is a hole that
@@ -98,6 +98,13 @@ endif()
 
 # Split a "path|reason" table into two parallel lists, so the reason can be
 # printed beside the rule it explains rather than being a comment nobody reads.
+#
+# Copied verbatim from the sibling checks rather than varied, and that is the
+# point: consolidating these into a shared module is #495, deliberately not
+# pre-empted here, and #495's validation compares the copies as TEXT. A copy that
+# rewrote an escape or a spelling would be equivalent and non-identical, which is
+# exactly the divergence that consolidation cannot detect. Keep this byte-for-byte
+# with `check-net-boundary.cmake`, and count this file in when #495 lands.
 # @param rows Name of the list variable holding the rows.
 # @param pathsOut Set to the paths.
 # @param reasonsOut Set to the reasons, in the same order.
@@ -123,6 +130,10 @@ endfunction()
 # ONCE and the results filtered in memory. `file(GLOB_RECURSE var a b c)`
 # traverses once PER PATTERN, and one traversal of `src/` costs 2.09 s on DrvFs
 # (#502).
+#
+# Verbatim from the sibling checks; consolidating them into a shared module is
+# #495, deliberately not pre-empted here. See `fastcached_split_rows` above for
+# why the copy must stay byte-identical rather than merely equivalent.
 # @param globs The shell globs, each like `*.hpp` or `*.hpp.in`.
 # @param outVar Set to an anchored alternation regex.
 function(fastcached_globs_to_regex globs outVar)
@@ -130,7 +141,7 @@ function(fastcached_globs_to_regex globs outVar)
     foreach(glob IN LISTS globs)
         string(REPLACE "." "PLACEHOLDERDOT" one "${glob}")
         string(REPLACE "*" ".*" one "${one}")
-        string(REPLACE "PLACEHOLDERDOT" "[.]" one "${one}")
+        string(REPLACE "PLACEHOLDERDOT" "\\." one "${one}")
         list(APPEND parts "${one}")
     endforeach()
     string(REPLACE ";" "|" joined "${parts}")
@@ -186,7 +197,6 @@ set(violations)
 set(signerCalls 0)
 set(testCalls 0)
 
-string(LENGTH "${FastCachedPskTestSuffix}" testSuffixLength)
 
 foreach(source IN LISTS sources)
     file(RELATIVE_PATH relativeSource "${sourceRoot}" "${source}")
@@ -216,14 +226,9 @@ foreach(source IN LISTS sources)
     endif()
 
     # Tests may spell the primitive; see the table above.
-    string(LENGTH "${relativeSource}" sourceLength)
-    if(sourceLength GREATER testSuffixLength)
-        math(EXPR testSuffixStart "${sourceLength} - ${testSuffixLength}")
-        string(SUBSTRING "${relativeSource}" ${testSuffixStart} -1 tail)
-        if(tail STREQUAL "${FastCachedPskTestSuffix}")
-            math(EXPR testCalls "${testCalls} + ${namingCount}")
-            continue()
-        endif()
+    if(relativeSource MATCHES "${FastCachedPskTestRegex}")
+        math(EXPR testCalls "${testCalls} + ${namingCount}")
+        continue()
     endif()
 
     list(JOIN namingLines "\n        " namingText)
@@ -235,13 +240,14 @@ endforeach()
 # total of zero is the function having been renamed out from under this check,
 # and a row that never matched is a table entry describing a file that has
 # stopped doing what the row vouches for.
-set(staleRows)
-foreach(allowed IN LISTS allowedPaths)
-    list(FIND seenAllowed "${allowed}" seenPosition)
-    if(seenPosition EQUAL -1)
-        list(APPEND staleRows "  ${allowed}")
-    endif()
-endforeach()
+#
+# The stale rows are the set difference, so they are written as one:
+# `REMOVE_ITEM` on an empty `seenAllowed` is a no-op rather than an error, which
+# is the case that matters -- nothing matched at all.
+set(staleRows ${allowedPaths})
+if(seenAllowed)
+    list(REMOVE_ITEM staleRows ${seenAllowed})
+endif()
 
 if(signerCalls EQUAL 0)
     message(FATAL_ERROR
@@ -254,9 +260,9 @@ endif()
 
 list(LENGTH staleRows staleCount)
 if(staleCount GREATER 0)
-    list(JOIN staleRows "\n" staleReport)
+    list(JOIN staleRows "\n  " staleReport)
     message(FATAL_ERROR
-        "File(s) named in the signer table no longer call ${FastCachedPskPrimitive}():\n"
+        "File(s) named in the signer table no longer call ${FastCachedPskPrimitive}():\n  "
         "${staleReport}\n\n"
         "A row that matches nothing vouches for a file that has stopped signing, and leaves the "
         "table looking complete while covering less than it says. If the seam moved, move the "

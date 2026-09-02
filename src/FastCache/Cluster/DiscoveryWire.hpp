@@ -87,6 +87,39 @@ struct Proof
     Sha256::Digest tag {};    ///< HMAC over the challenge; see `ExpectedProofTag`.
 };
 
+namespace Detail
+{
+
+    /// The four fields a proof authenticates, in wire order.
+    ///
+    /// One function rather than one per direction, for `LeaseToken::PackClaims`'
+    /// reason: a signer and a verifier that each spell this list are a signer and a
+    /// verifier that will one day spell it differently, which presents as every
+    /// node on the segment failing to prove a key they all hold.
+    ///
+    /// `Detail`, because the returned spans BORROW from @p challenge, @p nodeId and
+    /// @p raftEndpoint -- this is the shape `.agent/rules/wire-and-protocol.md`
+    /// names as having already been a use-after-free twice, and the mitigation here
+    /// is that the only two callers are the two functions directly below, each of
+    /// which consumes the result inside the full expression that built it.
+    /// @param challenge What was asked.
+    /// @param nodeId Who is answering.
+    /// @param raftEndpoint Where they will answer Raft traffic.
+    /// @return The fields, borrowing from the arguments.
+    [[nodiscard]] inline std::array<std::span<std::byte const>, 4> ProofFields(Challenge const& challenge,
+                                                                              std::string_view nodeId,
+                                                                              std::string_view raftEndpoint)
+    {
+        return {
+            WireFields::AsBytes(challenge.clusterId),
+            std::span<std::byte const> { challenge.nonce },
+            WireFields::AsBytes(nodeId),
+            WireFields::AsBytes(raftEndpoint),
+        };
+    }
+
+} // namespace Detail
+
 /// The tag a holder of @p key must produce for @p challenge.
 ///
 /// The joiner's identity and endpoint are inside the MAC, not merely alongside
@@ -113,14 +146,34 @@ struct Proof
                                                      std::string_view nodeId,
                                                      std::string_view raftEndpoint)
 {
-    return SignFields(key,
-                      SigningDomain::DiscoveryProof,
-                      {
-                          WireFields::AsBytes(challenge.clusterId),
-                          std::span<std::byte const> { challenge.nonce },
-                          WireFields::AsBytes(nodeId),
-                          WireFields::AsBytes(raftEndpoint),
-                      });
+    return SignFields(key, SigningDomain::DiscoveryProof, Detail::ProofFields(challenge, nodeId, raftEndpoint));
+}
+
+/// Whether @p presented is the tag a holder of @p key would have produced.
+///
+/// The verifier's half, and it exists so that no caller has to hold a tag and
+/// choose a comparison for it. `Cluster::VerifyFields` compares in constant time;
+/// `==` and `std::ranges::equal` stop at the first difference, and a peer that can
+/// retry -- which anything on the segment can, by sending another beacon -- would
+/// learn a tag one byte at a time from the timing.
+///
+/// `ExpectedProofTag` stays public because SIGNING is a separate act: a node
+/// answering a challenge has to produce a tag, and the tests have to produce one
+/// to send. What this removes is the reason for a *verifier* to call it.
+/// @param key The cluster's pre-shared key.
+/// @param challenge What was asked.
+/// @param nodeId Who is answering.
+/// @param raftEndpoint Where they claim they will answer Raft traffic.
+/// @param presented The tag the proof carried.
+/// @return True when it authenticates.
+[[nodiscard]] inline bool VerifyProofTag(std::span<std::byte const> key,
+                                         Challenge const& challenge,
+                                         std::string_view nodeId,
+                                         std::string_view raftEndpoint,
+                                         Sha256::Digest const& presented)
+{
+    return VerifyFields(
+        key, SigningDomain::DiscoveryProof, Detail::ProofFields(challenge, nodeId, raftEndpoint), presented);
 }
 
 /// Wrap an already-encoded payload in this protocol's frame header.

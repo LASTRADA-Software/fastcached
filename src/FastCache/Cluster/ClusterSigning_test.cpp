@@ -31,14 +31,18 @@ namespace
 }
 } // namespace
 
-TEST_CASE("Every signing domain declares a label of its own", "[cluster][signing]")
+TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signing]")
 {
-    // The table's own `static_assert`s already refuse an empty or duplicated label
-    // at compile time, so this case is not what enforces the rule -- it is what
-    // makes the rule readable, and what fails loudly if the consteval check is ever
-    // weakened to get a build through.
-    CHECK(SigningLabelsSeparateDomains());
-
+    // The labels themselves, spelled out, because they are covered by the MAC:
+    // changing one retires every outstanding tag in that domain, and that should
+    // be a deliberate act with a test to update rather than a silent edit.
+    // `fastcache-lease-v1` in particular is what the lease carried BEFORE the seam
+    // existed, which is what made moving it a no-op on the wire.
+    //
+    // That the two are non-empty and distinct is `SigningLabelsSeparateDomains`,
+    // `static_assert`ed three lines below its own definition -- a runtime `CHECK`
+    // of a `consteval` predicate cannot fail in a translation unit that compiled,
+    // so it would read as a guarantee while asserting nothing.
     CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
     CHECK(DescribeSigningDomain(SigningDomain::LeaseToken).label == "fastcache-lease-v1");
 }
@@ -140,21 +144,17 @@ TEST_CASE("A tag covers these fields, this key, and this arity", "[cluster][sign
     CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, padded, honest));
 }
 
-TEST_CASE("Fields are framed, not joined", "[cluster][signing]")
+TEST_CASE("The label boundary cannot be shifted into", "[cluster][signing]")
 {
-    // The lesson the object key and the discovery proof already record: a separator
-    // that can occur inside a value is not a framing. Here it is not hypothetical --
-    // an endpoint is `host:port`, so the separator is ALWAYS inside a value, and
-    // without length prefixes these two would authenticate identically.
+    // That fields are framed rather than joined is `WireFields`' property, and
+    // `DiscoveryWire_test` and `LeaseToken_test` each already assert it for the
+    // claim lists they own. What is this seam's alone is the boundary between the
+    // label and the first field: the label is the one part of the message a caller
+    // does not supply, so if it were a prefix glued onto the first field rather
+    // than a field of its own, a caller choosing that field could spell the tail of
+    // another domain's label into it and produce that domain's message.
     auto const key = Key();
 
-    auto const split = SignFields(key, SigningDomain::LeaseToken, { Bytes("a"), Bytes("b:1") });
-    auto const shifted = SignFields(key, SigningDomain::LeaseToken, { Bytes("a:b"), Bytes("1") });
-    CHECK_FALSE(ConstantTimeEquals(split, shifted));
-
-    // And the same across the label boundary, which is why the label is a field
-    // rather than a prefix glued onto the first one: a caller choosing the first
-    // field must not be able to shift bytes into the label's position.
     auto const label = std::string { DescribeSigningDomain(SigningDomain::LeaseToken).label };
     REQUIRE_FALSE(label.empty());
 

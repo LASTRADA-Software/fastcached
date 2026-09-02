@@ -143,9 +143,19 @@ Every rule below has already been a bug.
     of first field can shift bytes across the boundary and spell a different
     domain's label. It is the object key's rule and the proof's own, applied to
     the one part of the message a caller does not supply.
-  - **`VerifyFields` is the only comparison exposed.** A verifier therefore
-    cannot reach for `==` on a digest and lose `ConstantTimeEquals` without
-    anybody noticing -- there is nothing else to reach for.
+  - **`VerifyFields` is the only comparison the seam exposes, and every verifier
+    goes through it** -- `AuthenticateLeaseToken` for the lease,
+    `DiscoveryWire::VerifyProofTag` for the proof. That second one is the whole
+    reason this bullet is worth reading: the seam landed with `DiscoveryService`
+    still taking an expected tag and comparing it by hand, so the property was
+    true of one of the two wires it named. It was constant-time, so nothing was
+    exploitable -- but #402's subject is that an invariant stated and enforced
+    nowhere is not an invariant, and a seam whose own claim holds on half its
+    callers reproduces the ticket inside its fix. Signing entry points stay
+    public, because minting is a separate act, so a future caller *could* still
+    take a tag and compare it itself; that residual is smaller than it was rather
+    than gone, and `psk-signing-seam` does not cover it -- a legitimately obtained
+    tag compared with the wrong operator is not a call to the primitive.
   - **What it deliberately does NOT own**, because each is per protocol and
     getting it wrong here would be getting it wrong everywhere: which fields a
     message carries, whether a weak or empty key may sign (`ReadClusterKey`

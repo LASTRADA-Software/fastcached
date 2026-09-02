@@ -466,7 +466,7 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     auto const key = Key();
     auto const claims = Grant();
     auto const packedV1 = Detail::PackClaims(1, claims);
-    auto const tag = Detail::ExpectedTag(key, packedV1);
+    auto const tag = Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packedV1 } });
     auto const envelope =
         WireFields::Encode({ std::span<std::byte const> { packedV1 }, std::span<std::byte const> { tag } });
 
@@ -508,12 +508,10 @@ TEST_CASE("A discovery proof is not a lease, under the same key", "[distributed]
     auto const bare = Base64Encode(std::span<std::byte const> { proof });
     CHECK_FALSE(VerifyLeaseToken(key, bare, Worker(), Noon()).has_value());
 
-    // Since #402 both wires sign through one seam, so the separation is now a
-    // property of each construction rather than of the two happening to differ:
-    // the identical fields signed in either domain are different tags.
-    auto const claims = std::array<std::span<std::byte const>, 1> { AsBytes(std::string_view { "whatever" }) };
-    CHECK_FALSE(ConstantTimeEquals(Cluster::SignFields(key, Cluster::SigningDomain::DiscoveryProof, claims),
-                                   Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, claims)));
+    // The seam-level property -- one field list, two domains, two tags -- is
+    // `ClusterSigning_test.cpp`'s and is deliberately not restated here. This case
+    // asserts the protocol-level consequence with a real proof and a real token,
+    // which is the part `LeaseToken` owns.
 }
 
 TEST_CASE("Moving the lease onto the shared seam changed none of its bytes", "[distributed][lease][token]")

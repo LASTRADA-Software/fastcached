@@ -254,21 +254,6 @@ struct LeaseRefusal
     std::string detail;
 };
 
-/// Which construction the cluster's pre-shared key is signing here.
-///
-/// That key already MACs discovery proofs, and one key serving two constructions
-/// is how a tag produced for one purpose comes to be accepted for the other. The
-/// differing field arity makes that implausible on its own; the domain label
-/// `Cluster::SignFields` folds in makes it impossible, for eighteen bytes on a
-/// message that is being hashed anyway.
-///
-/// Named once here rather than at the mint and the verify separately, for the
-/// reason `Detail::PackClaims` is one function: a minter and a verifier that each
-/// spell the domain are a minter and a verifier that can one day spell it
-/// differently, which presents as every lease in the fleet failing to
-/// authenticate after a change nobody connected to it.
-inline constexpr Cluster::SigningDomain LeaseTokenDomain = Cluster::SigningDomain::LeaseToken;
-
 /// The token layout this build emits.
 ///
 /// Carried as a field of its own rather than inferred, so a future layout is a
@@ -337,20 +322,6 @@ namespace Detail
         });
     }
 
-    /// The tag a holder of @p signingKey must produce for @p packedClaims.
-    ///
-    /// The claims go into the message as ONE field rather than as eight, which is
-    /// what lets the verifier authenticate the bytes a peer actually sent instead
-    /// of a re-encoding of them -- see `AuthenticateLeaseToken`.
-    /// @param signingKey The cluster's pre-shared key.
-    /// @param packedClaims The output of `PackClaims`.
-    /// @return The expected tag.
-    [[nodiscard]] inline Sha256::Digest ExpectedTag(std::span<std::byte const> signingKey,
-                                                    std::span<std::byte const> packedClaims)
-    {
-        return Cluster::SignFields(signingKey, LeaseTokenDomain, { packedClaims });
-    }
-
     /// How many fields a token's outer envelope holds: the claims, and the tag.
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
@@ -382,7 +353,15 @@ namespace Detail
 [[nodiscard]] inline std::string MintLeaseToken(std::span<std::byte const> signingKey, LeaseClaims const& claims)
 {
     auto const packed = Detail::PackClaims(LeaseTokenVersion, claims);
-    auto const tag = Detail::ExpectedTag(signingKey, packed);
+
+    // The claims go into the message as ONE field rather than as eight, which is
+    // what lets `AuthenticateLeaseToken` authenticate the bytes a peer actually
+    // sent instead of a re-encoding of them. Signed through the seam directly, so
+    // the mint and the verify below reach one construction through one door --
+    // there was briefly a `Detail::ExpectedTag` wrapper here, and once verify moved
+    // onto `VerifyFields` it covered only half the pair it existed to keep together.
+    auto const tag =
+        Cluster::SignFields(signingKey, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packed } });
     auto const envelope = WireFields::Encode({ std::span<std::byte const> { packed }, std::span<std::byte const> { tag } });
 
     // Base64 rather than the raw bytes, which would travel perfectly well: the token
@@ -450,7 +429,7 @@ namespace Detail
     // the tag one byte at a time.
     Sha256::Digest presented {};
     std::ranges::copy(tag, presented.begin());
-    if (!Cluster::VerifyFields(signingKey, LeaseTokenDomain, { packed }, presented))
+    if (!Cluster::VerifyFields(signingKey, Cluster::SigningDomain::LeaseToken, { packed }, presented))
         return std::unexpected { LeaseRefusalReason::Unauthorized };
 
     return LeaseClaims { .serial = std::string { WireFields::AsStringView((*fields)[1]) },
