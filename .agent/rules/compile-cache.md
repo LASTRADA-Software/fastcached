@@ -1271,7 +1271,15 @@ were open to breaking it, and neither needed anybody's install to be stale.
     live `CompileValueVersion`. A digest alone would not do it — the behaviour and
     the golden are one edit two hunks apart, and moving both leaves the suite green,
     which is `Test::RetiredGeneration`'s argument arriving at the same place from the
-    key side. Retired rows stay, and the live digest must reproduce none of them.
+    key side. Retired rows stay, and what makes a reverted bump fail is STRUCTURAL:
+    generations are unique and ascending and the live byte names the LAST row, so
+    putting the byte back names an earlier one however good the digest pasted with it.
+    It used to be "the live digest must reproduce none of them", which reads like the
+    same guard and is not one: the digest frames `canonical.bytes`, whose leading byte
+    IS the version, so two generations are unequal by construction and that check
+    could not fail. And a retired digest is a dated record besides — it describes the
+    corpus as that generation met it, which the next corpus row invalidates
+    ([#583](https://github.com/LASTRADA-Software/fastcached/issues/583)).
   - **Measured, because a guard nobody has watched refuse is not a guard**: an edit to
     `JoinLocalized` — which changes what every consumer replays — is refused by
     **exactly one** case in the whole suite, the pin. Stated that way on purpose: the

@@ -77,6 +77,25 @@ namespace
         return pathCmp.size() == rootCmp.size() || pathCmp[rootCmp.size()] == '/';
     }
 
+    /// How deep a root reaches, for deciding which of two matching roots is the
+    /// longer. A trailing separator adds a byte and no depth, so it must not decide
+    /// the question: `/x/proj` and `/x/proj/` name one directory, and comparing raw
+    /// sizes made the second beat the first on that byte alone -- so an in-source
+    /// layout spelling its two roots differently sent every path to `<BUILDTREE>`,
+    /// and a consumer with a real out-of-source layout then replayed a path that does
+    /// not exist. Reachable only from a client that does not trim, which the daemon
+    /// and the node are, since they take these roots straight off a STORE frame.
+    ///
+    /// Two roots of equal depth remain a tie, resolved where the tie-break is: the
+    /// build tree wins, which is the rule for a build tree nested at the source root.
+    ///
+    /// @param rootCmp Comparison form of a root.
+    /// @return Its length, less one trailing separator.
+    [[nodiscard]] constexpr std::size_t RootDepth(std::string_view rootCmp) noexcept
+    {
+        return (!rootCmp.empty() && rootCmp.back() == '/') ? rootCmp.size() - 1 : rootCmp.size();
+    }
+
     /// Rewrite a single native path to a token. Longest matching root wins.
     /// @param absolutePath Native-form path.
     /// @param layout       Producing machine's roots.
@@ -91,8 +110,8 @@ namespace
         bool const buildMatch = IsSegmentPrefix(pathCmp, buildCmp);
 
         // Longest root wins so a build tree nested under the source root maps to
-        // <BUILDTREE>, not <SRCROOT>.
-        if (buildMatch && (!srcMatch || buildCmp.size() >= srcCmp.size()))
+        // <BUILDTREE>, not <SRCROOT>. Depth rather than size -- see RootDepth.
+        if (buildMatch && (!srcMatch || RootDepth(buildCmp) >= RootDepth(srcCmp)))
             return std::string { BuildTreeSentinel } + '/' + PosixTail(absolutePath, layout.buildTree.size());
         if (srcMatch)
             return std::string { SrcRootSentinel } + '/' + PosixTail(absolutePath, layout.sourceRoot.size());
@@ -198,14 +217,9 @@ namespace
         // mixing styles (`C:\src/`) reports `\` and ends with `/`, so testing only
         // against the reported one would append a second separator to it.
         //
-        // The emptiness test guards `back()` and states no policy, because there is
-        // no reachable configuration to have one for: an EMPTY root is refused before
-        // any layout is built (`RunCached` returns on an empty `srcRoot`/`buildTree`),
-        // and on the producing side `IsSegmentPrefix` answers false for one, so no
-        // token exists to come back through here. Were one ever to arrive, neither
-        // answer is right -- a relative path can resolve against the build directory
-        // and name a different real file -- and the token should be left standing for
-        // `MissingReplayedDependency` to refuse rather than localized into a guess.
+        // The root is non-empty by `LocalizeOne`'s contract, which answers an empty
+        // one by leaving the token standing rather than reaching here; the test below
+        // protects `back()` and decides nothing.
         if (!out.empty() && out.back() != '/' && out.back() != '\\')
             out.push_back(sep);
 
@@ -235,6 +249,22 @@ namespace
         {
             if (!token.starts_with(sentinel))
                 continue;
+
+            // An EMPTY consuming root localizes to NOTHING, and the token is left
+            // standing to say so. Joining against one produces a relative path, which
+            // is the worst of the three answers available: it resolves against the
+            // process's working directory and can name a different real file, silently,
+            // where a surviving token is refused by `Cc::MissingReplayedDependency`
+            // before anything is written. (Prefixing a separator instead, which is what
+            // this did before #547, invents an absolute path out of no root at all.)
+            //
+            // Not reachable from the launcher -- `RunCached` returns on an empty
+            // `srcRoot`/`buildTree` before a layout exists -- but this function takes a
+            // `Layout` from whoever hands it one, and the producing side already answers
+            // "under no root" for the same case rather than inventing a token.
+            if ((layout.*root).empty())
+                return std::string { token };
+
             std::string_view tail = token.substr(sentinel.size());
             if (!tail.empty() && tail.front() == '/')
                 tail.remove_prefix(1);

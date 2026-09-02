@@ -462,6 +462,29 @@ constexpr std::array ConformanceCorpus {
                       .grammar = Grammar::ShowIncludes,
                       .producerEffect = RegionEffect::Rewrites,
                       .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "an untrimmed root produces, and an untrimmed root consumes",
+                      // The other shape that ends in a separator, and the one the
+                      // bare-root fix claimed in a comment to have picked up on the
+                      // way past. A claim in a comment is not coverage, so it gets a
+                      // row -- and the row pays for itself, because the claim was
+                      // half true: untrimmed roots now MATCH, and until `RootDepth`
+                      // the trailing byte also made the build tree beat the source
+                      // root on length alone. Both roots untrimmed on both sides, and
+                      // the second line sits under the build tree so the tie-break is
+                      // what decides it.
+                      //
+                      // `RootReconciler` trims these, so only a client that does not
+                      // reaches here -- which the daemon and the node are, taking the
+                      // roots straight off a STORE frame.
+                      .producerSourceRoot = "/home/dev/proj/",
+                      .producerBuildTree = "/home/dev/proj/build/",
+                      .consumerSourceRoot = R"(C:\work\proj\)",
+                      .consumerBuildTree = R"(C:\work\proj\out\)",
+                      .text = "Note: including file: /home/dev/proj/inc/a.hpp\n"
+                              "Note: including file: /home/dev/proj/build/gen/cfg.hpp\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
     ConformanceCase { .name = "a drive-relative root consumes",
                       // The mirror of the drive-relative PRODUCER row above. It
                       // passes, and it is here for that reason: nothing
@@ -547,7 +570,7 @@ constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
     // producer side and doubled its separator on the consumer side.
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
-    StoredValueGeneration { .digest = "2de61702e93b6c84e24c6d54c7c6db072d5ac0d5591826c871ec8f2aa37ca669", .version = 2 },
+    StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
@@ -642,17 +665,18 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // remedy -- and the reader meets the digest advice first.
     {
         INFO("the stored-value contract produced "
-         << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to " << pinned.digest
-         << ".\nIf you widened ConformanceCorpus to cover behaviour that was ALREADY in this generation, repin "
-            "generation "
-         << static_cast<unsigned>(CompileValueVersion) << " to " << live
-         << ".\nAdding a PathCanon::Grammar is NOT that -- see the grammar-coverage case, which sends you here "
-            "with a row to add and a bump to take"
-         << ".\nIf you changed how a path span is found, rewritten, localized or framed, that is a new "
-            "canonicalization spec: two servers on one wire at different builds must not both call themselves "
-            "generation "
-         << static_cast<unsigned>(CompileValueVersion)
-         << " while rewriting a value differently. Bump CompileValueVersion and add a row carrying " << live << ".");
+             << live << ", but generation " << static_cast<unsigned>(CompileValueVersion) << " is pinned to "
+             << pinned.digest
+             << ".\nIf you widened ConformanceCorpus to cover behaviour that was ALREADY in this generation, repin "
+                "generation "
+             << static_cast<unsigned>(CompileValueVersion) << " to " << live
+             << ".\nAdding a PathCanon::Grammar is NOT that -- see the grammar-coverage case, which sends you here "
+                "with a row to add and a bump to take"
+             << ".\nIf you changed how a path span is found, rewritten, localized or framed, that is a new "
+                "canonicalization spec: two servers on one wire at different builds must not both call themselves "
+                "generation "
+             << static_cast<unsigned>(CompileValueVersion)
+             << " while rewriting a value differently. Bump CompileValueVersion and add a row carrying " << live << ".");
         CHECK(live == pinned.digest);
     }
 
