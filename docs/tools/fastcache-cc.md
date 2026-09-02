@@ -491,6 +491,62 @@ retrying, the other never will be:
 | `could not verify the hit for key …` | The check did not complete: the fresh compile failed, or a file could not be read. Nothing is known about the cached object either way, and the next hit may well answer. |
 | `cannot verify hits for this toolchain …` | This build cannot lay out the object format its own compiler produced, so it can say nothing about any hit — not this one and not the next. A property of the toolchain, not a statement about your cache. |
 
+## Debug paths in a replayed object
+
+A cache hit replays an object that was **built somewhere else**, and a compiler
+with debug information on records where it was built — DWARF's `DW_AT_comp_dir`
+is the compile's working directory. That directory is on no command line, so
+nothing in the cache key can distinguish two checkouts by it, and a debugger
+opening the replayed object then looks for sources in a tree this machine may not
+have. Nothing fails; the paths are simply somebody else's.
+
+**On GCC and Clang the build does something about it for you.** When
+`cmake/portable/CompileCache.cmake` enables a launcher it also appends
+
+```
+-fdebug-prefix-map=<build tree>=.
+-fdebug-prefix-map=<source tree>=<relative path from the build tree>
+```
+
+which makes the objects byte-identical across checkouts — measured on both
+drivers. The build tree is mapped first because GCC and Clang take the first
+matching rule and the build tree usually lives inside the source tree. The second
+rule is emitted only when the relative path back is a pure `../` chain; for an
+out-of-tree build it would otherwise carry the checkout's own path, and the
+configure says so rather than mapping to something that only looks portable:
+
+```
+-- [cache] The source root is NOT mapped: the build tree lies outside it, so the
+   relative path back would carry the checkout's own path
+```
+
+Passing your own `-fdebug-prefix-map` is fine and is keyed correctly: the
+launcher relativizes the root the flag names, so two checkouts still share, and
+leaves the **replacement** literal, so two machines mapping to *different*
+replacements miss rather than exchange objects that disagree. The mapping has to
+be the same everywhere a cache is shared, and that is enforced by the key rather
+than left to a convention.
+
+**On Windows there is no equivalent and the paths stay.** `cl` has no path-map
+switch, and `-ffile-prefix-map` does not reach the records that matter for
+`clang-cl` — CodeView's `S_OBJNAME` and the embedded `-cc1` line are not remapped,
+measured. So a replayed object on Windows names the checkout that produced it in
+its debug records. That is an accepted cost of cross-checkout sharing, which on
+that platform is most of the value: closing it means keying on the compile's
+location, and then no two checkouts ever share an entry. It affects debug
+information only — `.text`, `.data`, `.xdata`, `.pdata`, the relocations and the
+symbol table are byte-identical.
+
+Two things this is **not**:
+
+- It is not `__FILE__`. The preprocessor expands `__FILE__` and the key hashes
+  preprocessed output raw, so a translation unit whose `__FILE__` differs between
+  checkouts also *keys* differently and the two never share an entry. There is no
+  arrangement in which a program reports a source location from another checkout.
+- It is not coverage. Coverage mapping has the same defect and is guarded
+  outright: configuring a coverage build with a launcher imposed is a hard error,
+  not a warning.
+
 ## Known limitations
 
 - `__TIME__` / `__DATE__` / `__TIMESTAMP__` detection scans the source file

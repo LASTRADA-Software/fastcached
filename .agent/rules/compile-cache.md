@@ -1117,6 +1117,94 @@ change here also shows a deliberately corrupted object still answering `Mismatch
 and an object from another checkout still answering `Mismatched`, on **real compiler
 output** rather than only on synthetic bytes.
 
+## A compiler records WHERE it was built, and the key cannot see that
+
+The key is portable across checkouts by design — that is what the launcher is
+for. A compiler with debug info on is not: it writes the compile's working
+directory into the object, and the working directory appears on no command line,
+so no amount of relativizing reaches it. A hit therefore replays an object naming
+the producing checkout, a debugger looks for sources in a tree this machine does
+not have, and nothing fails. Issue #203; issue #489 is the same defect
+approached from the key end.
+
+**Measured, one TU byte-identical in two roots differing only in name and by the
+same character count, against a same-root baseline of 0 differing bytes:**
+
+| driver | debug info off | debug info on | remedy the driver offers |
+| --- | --- | --- | --- |
+| `g++` (ELF) | identical | **differs, 143 B** — `DW_AT_comp_dir` | `-fdebug-prefix-map` → identical |
+| `clang++` (ELF) | identical | **differs, 6 B** | `-fdebug-prefix-map` → identical |
+| `clang-cl` (COFF) | identical | **differs, 23 B** | `-ffile-prefix-map` → **still 23 B** |
+| `cl` (COFF) | **differs, 11 B** | **differs, 28–31 B** | none exists |
+
+The baseline is not a formality. Write each compile to a *different* `/Fo` name
+and every command line differs, `/Z7` embeds the command line, and the baseline
+stops being one — the same confound that cost #493 a re-run.
+
+- **It is not `/Z7`, and the launcher does not create the precondition.** `cl` with
+  no debug flag at all already differs cross-root: `.debug$S` carries an
+  `S_OBJNAME` record holding the resolved **absolute** object path, and `.chks64`
+  a hash derived from it. `CompileCache.cmake`'s `/Zi`→`/Z7` rewrite widens 11
+  bytes to 28; it does not open the hole, and turning debug info off does not
+  close it.
+- **A key-side fix cannot work by hardening argument handling.** With a fully
+  relative command line — cwd at the checkout root, source and output both named
+  relatively, so the two command lines are **byte-identical** — the objects still
+  differ. What is embedded is the working directory and the path the driver
+  resolves `/Fo` against. Neither is an argument. So #489's shape needs the
+  compile *location* as a key input in its own right, which costs cross-checkout
+  sharing on every `cl` compile.
+- **The divergence is debug and identity records only.** `.text`, `.data`,
+  `.xdata`, `.pdata`, the relocations and the symbol table are byte-identical in
+  every differing pair. A wrong *artefact* under a correct key, not wrong *code* —
+  which is why neither ticket can be #368's mechanism.
+- **`-fdebug-prefix-map`, never `-ffile-prefix-map`.** The wider flag implies
+  `-fmacro-prefix-map` and rewrites `__FILE__`, and that buys nothing here.
+  `__FILE__` is **self-protecting**: the preprocessor expands it and `ComputeKey`
+  hashes preprocessed output raw, so whenever the expansion is checkout-dependent
+  it is checkout-dependent in the hashed text too, and whenever the hashed text
+  agrees the expansion agrees. Measured through `/EP` alone — absolute source
+  spelling differs, relative agrees, relative plus `/FC` differs. There is no
+  arrangement in which two checkouts share a key while their `__FILE__` strings
+  differ, so changing program-visible strings would fix a defect that cannot
+  occur.
+- **The flag names the producing checkout by construction, so the KEY has to
+  relativize it.** Measured before the row existed: `RelativizeArgs` returned
+  `-fdebug-prefix-map=/home/ci/checkout-aaa=/fastcache/src` byte-for-byte, so
+  appending the flag alone would have produced correct objects and turned every
+  cross-checkout hit into a **miss** — silently, since a miss is what a cold cache
+  looks like too. `PathValueRole::PrefixMap` splits the value at the last `=`,
+  the way GNU does, and relativizes only the head.
+- **The replacement half is deliberately left literal.** Two machines mapping to
+  different replacements write different objects, so they must compute different
+  keys. That is what makes "the mapping must be identical on every machine sharing
+  the cache" a property of the key rather than a line of advice — a disagreeing
+  machine misses instead of mis-serving.
+- **The rules are computed by one function and checked as a computation.**
+  `_fc_debug_prefix_map_rules` in `cmake/portable/CompileCache.cmake`, driven by
+  `ctest -R debug-prefix-map-rules` over a table of layouts. It was wrong twice
+  before it was ever run, in ways invisible in the layout a developer has:
+  `file(RELATIVE_PATH)` answers with a **trailing separator**, so the rewritten
+  path read `../../..//src/tu.cpp` and stopped matching the spelling the build
+  system passes for the same file; and for an out-of-tree build it answers
+  `../../mnt/d/…/checkout` — *relative*, and carrying the entire root inside it,
+  which would have replaced the checkout's path with the checkout's path and read
+  as working. **Relative does not imply checkout-independent**; the test asserts
+  that property separately from the expected values, because a table can be edited
+  to agree with wrong code.
+- **The build tree is mapped FIRST.** GCC and Clang take the first matching rule,
+  and this project's build tree lives *inside* the source tree
+  (`out/build/<preset>`), so source-first would swallow every build-tree path.
+- **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
+  hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
+  module is included from a `project()` that lists CXX first — so the first run
+  ended the configure outright, which is the one thing
+  `cmake/portable/CompileCache.cmake` may never do.
+- **Skipped, rejected and applied are three states and the STATUS line says
+  which.** A driver that rejected the flag still caches, still shares, and still
+  replays objects naming another checkout; a line reporting only the applied half
+  would read the same in all three cases.
+
 ## Accepted trade-offs
 
 These are argued in place above and are **not** open work — do not "fix" one
@@ -1140,6 +1228,16 @@ without reopening the argument:
   alternative is the one that cannot work: an entry storing the producer's code
   page is an entry no other machine can canonicalize, which is the whole of what
   this cache is for. `chcp 65001` makes the two identical.
+- **On COFF a replayed object's debug records name the producing checkout, and no
+  flag closes it.** `-ffile-prefix-map` does not remap CodeView's `S_OBJNAME` or
+  clang-cl's embedded `-cc1` line — measured, still 23 bytes apart with the flag —
+  and `cl` has no path-map switch at all. The alternative is #489's shape, which
+  gives up cross-checkout sharing on **every** `cl` compile, debug info or not,
+  and that sharing is what the launcher exists to provide on that platform. So the
+  residue is accepted and stated rather than closed. Coverage, which has the same
+  defect, is hard-guarded (`cmake/Coverage.cmake` refuses a launcher outright);
+  debug info is not, because a wrong source path in a debugger is a nuisance and a
+  wrong coverage report is a lie that looks like data.
 
 ## A performance figure is a quantity under conditions, and both halves get lost separately
 
