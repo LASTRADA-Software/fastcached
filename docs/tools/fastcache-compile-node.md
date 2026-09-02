@@ -1553,8 +1553,9 @@ a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
 These are what a probe of that port looks like from outside the machine. They are
 separate series rather than one `refused_total` because an operator does a
-different thing about each; where two of them share a wire code, that is said
-explicitly.
+different thing about each; several of them share a wire code, and every such
+group is named below so a dashboard grouping by the code in a client log does not
+quietly merge two things you would act on differently.
 
 **Read the "counted for" column before alerting.** The listener routes each
 refusal to the component that owns the verb, and the components do not all count

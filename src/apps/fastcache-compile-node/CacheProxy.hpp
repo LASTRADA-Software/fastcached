@@ -34,11 +34,16 @@ namespace FastCache::Node
 /// client that reached the wrong port learns which.
 ///
 /// `Auth` is the exception, and refusing it correctly is a **wire contract**: it
-/// is answered with `UnknownOpcode`, because that is the one refusal
-/// `Cc::CacheProtocol` reads as "this endpoint implements no credential" and
-/// proceeds past. Any other code makes the launcher treat the exchange as fatal
-/// and miss every subsequent compile in silence. See `RefusedVerbs` in the
+/// is answered `CompileCacheWire::UnimplementedVerb`, because that is the one
+/// refusal `Cc::CacheProtocol` reads as "this endpoint implements no credential"
+/// and proceeds past. Any other code makes the launcher treat the exchange as
+/// fatal and miss every subsequent compile in silence. See `RefusedVerbs` in the
 /// implementation for why that is a table row rather than a comment.
+///
+/// **The name, not the enumerator it aliases.** `UnimplementedVerb` is today
+/// `ErrorCode::UnknownOpcode`, and naming the alias here rather than the contract
+/// is how three surfaces came to spell one refusal separately and then disagree
+/// about it (#283, #340).
 class CacheProxy
 {
   public:
