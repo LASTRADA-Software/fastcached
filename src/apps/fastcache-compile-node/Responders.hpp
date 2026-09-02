@@ -85,8 +85,8 @@ namespace Detail
     /// One row of `CacheEndpointRefusals`.
     struct CacheEndpointRefusal
     {
-        EndpointRefusal refusal;     ///< Which endpoint decision this describes.
-        CacheRefusalPolicy policy;   ///< What this surface does about it.
+        EndpointRefusal refusal;   ///< Which endpoint decision this describes.
+        CacheRefusalPolicy policy; ///< What this surface does about it.
     };
 
     /// Why neither credential arm counts, stated once for the two rows that share it.

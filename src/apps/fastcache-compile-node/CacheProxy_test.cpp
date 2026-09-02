@@ -549,8 +549,7 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
     }
 }
 
-TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rather than asserted",
-          "[node][cache][metrics]")
+TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rather than asserted", "[node][cache][metrics]")
 {
     // Four arms here are uncounted BECAUSE nothing can reach them, which is a claim
     // about routing rather than about policy -- and a claim about routing is exactly

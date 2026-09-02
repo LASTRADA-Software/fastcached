@@ -252,8 +252,8 @@ Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame
             // learns which instead of seeing something indistinguishable from a dead
             // host.
             co_return Cc::RefuseWithoutCounter(TierRefusal::WrongSurface,
-                                              "this endpoint is the node's cache; scheduling and compiles are served "
-                                              "on their own ports");
+                                               "this endpoint is the node's cache; scheduling and compiles are served "
+                                               "on their own ports");
     }
 }
 
