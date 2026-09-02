@@ -1620,6 +1620,59 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return std::ranges::any_of(bound, [](SurfaceEndpoint const& endpoint) { return IsLoopbackHost(endpoint.host); });
 }
 
+/// Whether this node registers with a scheduler that is on another machine.
+///
+/// Syntactic, never resolved, for the reason `AdvertisesPastALoopbackBind` gives: this
+/// table is a set of pure functions of argv, and a lookup here would make the node's
+/// ability to start depend on a resolver being up.
+///
+/// "Not loopback" rather than "routable", which is the same asymmetry
+/// `AdvertisesWildcard` documents from the other side: a host that is down today can
+/// be the right one at the next boot, so only the shapes that are wrong on every
+/// machine and forever are judged. Loopback is one of exactly two things -- this
+/// machine, or a typo -- and the caller below only cares which of those it is.
+/// @param cfg The parsed configuration.
+/// @return Whether `--scheduler` names a host that is not this machine's loopback.
+[[nodiscard]] bool SchedulerIsRemote(NodeConfig const& cfg)
+{
+    return !cfg.scheduler.empty() && !IsLoopbackHost(HostOfEndpoint(cfg.scheduler));
+}
+
+/// Whether a worker registers an address only its own machine can reach, with a
+/// scheduler that is not on that machine.
+///
+/// **The fourth cell of the reachability rule, and the one an operator reaches by
+/// typing NOTHING.** Its three siblings all need a flag to have been written: the
+/// wildcard and the loopback-past-a-network-bind rows judge an `--advertise` somebody
+/// typed, and `AdvertisesPastALoopbackBind` judges a `--listen-node` they did not
+/// widen after being told to name `--advertise`. A fleet worker started with neither
+/// flag reaches none of them -- `--advertise` falls back to the `Node` surface, which
+/// is loopback on a worker, so the advertise and the bind AGREE and the rule about
+/// their disagreement has nothing to say. That configuration registers `127.0.0.1`
+/// with a scheduler on another machine, heartbeats, is leased out, and every client
+/// dials its own machine: the silent shape all four rows exist to refuse, arrived at
+/// by leaving both flags off, which is precisely the line an operator omits (#463).
+///
+/// **What separates it from the single-machine fleet is WHERE THE SCHEDULER IS**, and
+/// nothing else can. Loopback-bind-plus-loopback-advertise is a correct configuration
+/// -- `dist-compile-e2e.sh` runs whole fleets that way -- so the bind cannot decide
+/// this and neither can the advertise. A scheduler on another machine is the one part
+/// of such a configuration that cannot also be true of a fleet living on this host.
+///
+/// Ordered after its siblings, which are more specific about the configurations they
+/// share with it: a loopback advertise over a WIDE bind is answered by
+/// `AdvertisesLoopbackFromAReachableBind`, whose message names the two flags that
+/// disagree. This one answers what is left, where the two flags agree and both are
+/// wrong for the fleet they were pointed at.
+/// @param cfg The parsed configuration.
+/// @return Whether a remote scheduler is handed an endpoint only this machine can dial.
+[[nodiscard]] bool AdvertisesLoopbackToARemoteScheduler(NodeConfig const& cfg)
+{
+    if (!SchedulerIsRemote(cfg))
+        return false;
+    return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
+}
+
 /// An EMPTY bind address is the wildcard rather than a missing answer: it reaches
 /// `getaddrinfo` as nullptr under AI_PASSIVE, the same third case `AdvertisesWildcard`
 /// exists for. So it is reachable, and `IsLoopbackHost("")` answering false is the
@@ -1872,6 +1925,34 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "out, and every dispatched compile fails to connect with no error at either end. Give "
                      "--listen-node=0.0.0.0:6674 so it accepts from the network, or drop the membership flags and "
                      "serve this machine alone." },
+        // The rule's FOURTH spelling, and the only one an operator reaches by typing
+        // neither flag. #463 asked whether `--listen-node` should widen itself for a
+        // fleet participant so that this case stops arising; the answer is no -- a
+        // default that widens a listening socket on a three-flag predicate is a
+        // security decision nobody typed, and the defaulted bind is the one whose
+        // failure to bind is a WARNING rather than fatal, so widening it would hand a
+        // fleet worker the "no 0xFC port at all, still registers, still leased"
+        // shape. What the ticket found is real, though: the three rows above all
+        // judge a flag somebody wrote, so a worker started with neither `--advertise`
+        // nor `--listen-node` sailed past all of them and registered loopback with a
+        // remote scheduler. `NodeServiceRejection` refuses that at INSTALL time and
+        // nothing refused it at a hand start, which is the reverse of the asymmetry
+        // #166 composed the tables to delete.
+        //
+        // The admission gate is identical to its three siblings for the reason they
+        // give, and the message names the two flags together because naming only
+        // `--advertise` is what steers an operator into the row above.
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return !c.scheduler.empty() && (c.fleetOpen || !c.fleetMembers.empty())
+                         && AdvertisesLoopbackToARemoteScheduler(c);
+              },
+          .message = "--scheduler names a machine that is not this one, and this worker would register loopback "
+                     "with it -- neither --advertise nor --listen-node was given, so both fall back to an address "
+                     "only this machine can dial. Every client the scheduler leases it to would dial ITSELF: the "
+                     "worker registers, heartbeats, is leased out and is never reached, with no error at either "
+                     "end. Give --listen-node=0.0.0.0:6674 and --advertise=<this host>:6674. (A fleet that really "
+                     "is one machine names --scheduler on loopback too, and is fine.)" },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
           .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
                      "identity, because that is what the cluster admits and what every vote is counted against. "

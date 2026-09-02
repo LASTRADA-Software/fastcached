@@ -1212,6 +1212,32 @@ Six more about what the tier IS and who gets to see it:
   **`--advertise` is not a surface.** It is what this node tells others to dial, not a
   socket it opens.
 
+  **A bare `--listen-node` follows `--serve-scheduler` and nothing else, and that is a
+  decision rather than an omission**
+  ([#463](https://github.com/LASTRADA-Software/fastcached/issues/463)). Widening it for
+  a *fleet participant* -- `--scheduler`, `--fleet-member`, `--fleet-open` -- restores
+  no ergonomics: the wider bind is what makes `CompilePortFacesTheNetwork` true, so
+  `--cluster-key-file` becomes required, and the wider bind *becomes* the advertised
+  endpoint, so `AdvertisesWildcard` requires `--advertise` too. It costs three things.
+  It silences `AdvertisesPastALoopbackBind`, whose message is the remedy. It moves the
+  fleet-facing bind onto the DEFAULTED path, where a port already held is a warning and
+  the node runs with no `0xFC` port while still registering and being leased. And "is
+  this a fleet participant" already has three deliberately different spellings -- the
+  reachability rows' gate, `AdmitsRemotePeers`, `CompilePortFacesTheNetwork` -- so a
+  fourth would decide a bind by one predicate and judge it by another.
+
+  What the question exposed is a hole in the refusals instead, and the refusals are the
+  mechanism: **all three reachability rows judged a flag somebody had TYPED.** A worker
+  naming neither `--advertise` nor `--listen-node` fell through every one -- the
+  advertise falls back to the `Node` surface, so both halves are loopback and the rule
+  about their *disagreement* has nothing to say -- and registered `127.0.0.1` with a
+  scheduler on another machine. `NodeServiceRejection` refused exactly that at install
+  time while nothing refused it at a hand start, which is the reverse of the asymmetry
+  #166 composed the two tables to delete. `AdvertisesLoopbackToARemoteScheduler` is the
+  fourth cell, and **the scheduler's host is the only thing that can decide it**: a
+  loopback bind advertising loopback is the single-machine fleet this repository's own
+  fixtures run, so neither the bind nor the advertise separates the two.
+
   **"The operator typed it" is `cfg.cacheListenExplicit`, never a comparison against
   the default** ([#286](https://github.com/LASTRADA-Software/fastcached/issues/286)).
   Why a comparison cannot answer it, and why the registration side of the same flag

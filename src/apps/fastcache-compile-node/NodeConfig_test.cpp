@@ -1400,6 +1400,72 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK_FALSE(StartupPolicyRejection(worker).has_value());
     }
 
+    SECTION("a worker that names neither flag and registers with a remote scheduler")
+    {
+        // #463. The three rows above all judge a flag somebody TYPED, so the worker
+        // that typed neither reached none of them: `--advertise` falls back to the
+        // `Node` surface and `--listen-node` defaults to loopback, so the advertise
+        // and the bind agree and the rule about their disagreement is silent. That
+        // node registers `127.0.0.1:6674` with a scheduler on another machine and
+        // every client it is leased to dials its own box.
+        //
+        // Refused at install time since #290 stage 3 and by nothing at a hand start,
+        // which is the asymmetry the tables were composed to delete -- so both paths
+        // are asserted here.
+        NodeConfig bare;
+        bare.scheduler = "scheduler.internal:6675";
+        bare.fleetOpen = true;
+
+        auto const refusal = StartupPolicyRejection(bare);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--advertise"));
+        CHECK(Unwrap(refusal).contains("--listen-node"));
+        CHECK(Unwrap(refusal).contains("dial ITSELF"));
+        CHECK(NodeInstallRejection(bare).has_value());
+
+        // A listed member set rather than `--fleet-open` reaches the same row: the
+        // admission gate is the siblings' and answers either spelling.
+        NodeConfig listed;
+        listed.scheduler = "scheduler.internal:6675";
+        listed.fleetMembers = { "10.0.0.1:6674" };
+        CHECK(StartupPolicyRejection(listed).has_value());
+
+        // And an explicit loopback `--advertise` is the same configuration spelled
+        // out, judged on the endpoint rather than on which flag produced it.
+        NodeConfig spelled = bare;
+        spelled.advertise = "127.0.0.1:6674";
+        CHECK(StartupPolicyRejection(spelled).has_value());
+
+        // **Told apart from its three siblings**, for the reason they are told apart
+        // from each other: the way this regresses is one predicate widening to cover
+        // several, which leaves an operator reading about a flag they never wrote.
+        NodeConfig wide = bare;
+        wide.nodeListen = "0.0.0.0:6674";
+        wide.advertise = "127.0.0.1:6674"; // a loopback advertise over a NETWORK bind
+        wide.clusterKeyFile = "cluster.key";
+        auto const wideRefusal = StartupPolicyRejection(wide);
+        REQUIRE(wideRefusal.has_value());
+        CHECK(Unwrap(wideRefusal) != Unwrap(refusal));
+
+        // The two configurations this row must NOT refuse, each of which is a
+        // working deployment.
+
+        // The single-machine fleet, which is the whole reason the scheduler's host
+        // decides this and not the bind: every address here is loopback and that is
+        // correct. `dist-compile-e2e.sh` runs exactly this.
+        NodeConfig singleMachine = bare;
+        singleMachine.scheduler = "127.0.0.1:6675";
+        CHECK_FALSE(StartupPolicyRejection(singleMachine).has_value());
+
+        // And the worker that answered the refusal: both flags named, so nothing
+        // about it is loopback any more.
+        NodeConfig fixed = bare;
+        fixed.nodeListen = "0.0.0.0:6674";
+        fixed.advertise = "worker-01.internal:6674";
+        fixed.clusterKeyFile = "cluster.key";
+        CHECK_FALSE(StartupPolicyRejection(fixed).has_value());
+    }
+
     SECTION("a joiner with no identity")
     {
         // The cluster admits an ID and counts every vote against one. A node waiting
@@ -2363,8 +2429,16 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // or the reachability rows refuse the pair -- which would fail this case for a
     // reason it is not about. `Installable()` names a routable pair because that is
     // the ordinary fleet worker; pinning the bind to its default makes this the
-    // single-machine one, and both halves move together.
+    // single-machine one, and ALL THREE halves move together.
+    //
+    // The scheduler and the member list are the third half, and leaving them remote
+    // was wrong before this line ever ran (#463): a node advertising `127.0.0.1` to
+    // `cache.internal` registers an address that scheduler's clients cannot dial. It
+    // read as a single-machine fleet and was one only in the two fields this comment
+    // named, which is what the fourth reachability row now refuses.
     cfg.advertise = "127.0.0.1:6674";
+    cfg.scheduler = "127.0.0.1:6675";
+    cfg.fleetMembers = { "127.0.0.1:6676" };
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 

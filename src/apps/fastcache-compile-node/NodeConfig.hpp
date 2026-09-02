@@ -793,6 +793,34 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 /// A function rather than a constant because a surface row's `defaultHost` is one
 /// value and this depends on the configuration; the row delegates here rather than
 /// carrying a second copy of the rule.
+///
+/// **It follows `--serve-scheduler` and NOT "is this node a fleet participant",** which
+/// #463 asked for and which is deliberately refused here rather than left unwritten:
+///
+/// - It would save one flag, and only for an operator who has already typed three.
+///   Widening the bind is what makes `CompilePortFacesTheNetwork` true, so the
+///   `--cluster-key-file` row starts refusing; and the widened bind becomes the
+///   advertised endpoint, so `AdvertisesWildcard` refuses until `--advertise` is named
+///   too. The participant still cannot start without `--scheduler`, a membership flag,
+///   `--advertise` and `--cluster-key-file`.
+/// - It would silence the refusal that teaches. `AdvertisesPastALoopbackBind` answers
+///   the operator who named `--advertise` and left the bind alone, and its message is
+///   `--listen-node=0.0.0.0:6674` -- the ergonomics fix, delivered while they are
+///   watching.
+/// - **A defaulted `--listen-node` whose port is taken is a WARNING, not fatal**, and
+///   such a node runs with no `0xFC` port at all while still registering and
+///   advertising. Today a fleet worker must TYPE the address, so that collision is
+///   fatal; under a widened default the fleet-facing case would land on the warning
+///   path, be leased out, and answer nothing.
+/// - "Is this a fleet participant" already has three spellings that deliberately
+///   disagree -- the reachability rows' gate, `AdmitsRemotePeers` (which excludes a
+///   loopback-only member list and includes `--raft-join`) and
+///   `CompilePortFacesTheNetwork`. A default computed from a fourth would be a bind
+///   decided by one predicate and judged by another.
+///
+/// What the ticket correctly found is that a worker typing neither flag was refused by
+/// nothing; that is `AdvertisesLoopbackToARemoteScheduler`, a row rather than a wider
+/// default.
 /// @param cfg What the operator asked for.
 /// @return The host a bare port falls back to.
 [[nodiscard]] inline std::string_view NodeListenDefaultHost(NodeConfig const& cfg) noexcept
