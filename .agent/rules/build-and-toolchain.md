@@ -902,9 +902,12 @@ live on master indefinitely with every status check green (#315).
   *What CI costs* below and are not restated here — the last two written down in
   this spot went stale twice over, once when `SCCACHE_GHA_ENABLED` landed and again
   when the matrix grew a third leg, and both times they read as current fact. So
-  does "`clang-tidy` finishes last", which is true on master and inside the merge
-  queue and true on only 4 of 13 sampled pull requests — the ones whose change
-  escalated the sweep.
+  does "`clang-tidy` finishes last", which was true on master and inside the merge
+  queue and true on only some pull requests — the ones whose change escalated the
+  sweep. That claim has now gone stale a third time, in the other direction: #554
+  diff-scoped the queue's sweep, so `clang-tidy` no longer finishes last there
+  either. Which job is longest is a row of the table in *What CI costs*, per event,
+  and is not restated anywhere including here.
 - **Guarded to `MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug"`, which means its
   absence elsewhere is normal.** That is worth knowing before debugging it: a
   platform-guarded registration is indistinguishable from a lost one when you look
@@ -922,30 +925,52 @@ where it is.
 **A CI figure without its EVENT is not a figure.** This one workflow costs three
 different things depending on what triggered it, and the longest job is a
 different job in each — so "the critical path is N minutes" is answerable only
-once you say which. Measured 2026-09-02 over 37 completed, green `build.yml` runs
-between 08:04Z and 16:07Z, on the three-leg Windows matrix, with
-`SCCACHE_GHA_ENABLED` in force; runner-minutes sum the non-skipped jobs, and job
-durations come from `repos/:owner/:repo/actions/runs/:id/jobs` rather than from
-impressions. Two of the bullets below quote **step** timings, and those come from
-a separate 10-run sample taken the same day — how far it overlaps these 37 runs
-was not recorded, so do not reconcile a step mean against a job range below to the
-tenth:
+once you say which. Measured over 99 completed, green `build.yml` runs between
+2026-09-01T09:28Z and 2026-09-02T19:03Z, on the three-leg Windows matrix, with
+`SCCACHE_GHA_ENABLED` in force; runner-minutes sum the non-skipped jobs, run wall
+clock is the last job's end minus the first job's start, and job durations come
+from `repos/:owner/:repo/actions/runs/:id/jobs` rather than from impressions.
+Some of the bullets below quote **step** timings, and those come from separate
+samples taken on 2026-09-02 — how far they overlap these 99 runs was not
+recorded, so do not reconcile a step mean against a job range below to the tenth.
+**Every one of these figures is the state BEFORE the merge-queue sweep was
+diff-scoped**, which is the bullet three below and is what makes them worth
+re-measuring rather than citing forward:
 
-| event | runs | runner-min, mean | longest job, mean | which job is longest |
-|---|--:|--:|--:|---|
-| `pull_request`, code-touching | 13 | 103.2 | 17.3 | `Code coverage` (9 of 13) |
-| `pull_request`, docs-only | 4 | 0.7 | 0.2 | — (7 jobs, none over 15 s) |
-| `merge_group` | 11 | 111.8 | 24.6 | `clang-tidy`, full sweep |
-| `push` on master | 9 | 102.1 | 22.5 | `clang-tidy`, full sweep |
+| event | runs | runner-min, mean | longest job, mean | run wall, mean | which job is longest |
+|---|--:|--:|--:|--:|---|
+| `pull_request`, code-touching | 36 | 102.7 | 19.0 | 24.1 | `clang-tidy` (18 of 36) |
+| `pull_request`, docs-only | 7 | 0.6 | 0.1 | 1.1 | — (7 jobs, none over 10 s) |
+| `merge_group` | 33 | 113.6 | 23.5 | 31.7 | `clang-tidy`, full sweep (32 of 33) |
+| `push` on master | 23 | 109.8 | 22.7 | 27.0 | `clang-tidy`, full sweep (23 of 23) |
 
-Two things follow that the older figures do not carry. **On a pull request the
-longest job is `Code coverage`, not `clang-tidy`** — the diff-scoped sweep
-averages 11.0 min but ranges 0.8–26.0, and it is longest only in the 4 of 13 runs
-where the change escalated it to a full sweep. And **landing a change pays both
-of the bottom two rows**, which is the next bullet.
+**Runner-minutes and wall clock are different questions and the answer differs by
+which you asked.** Landing one change costs **326.1 runner-minutes** — all three
+rows — but only the top two rows are on the path from "ready" to "merged", because
+the master `push` fires AFTER the merge. So the CI wall clock a contributor waits
+through is **24.1 + 31.7 = 55.8 minutes**, and the push's 109.8 runner-minutes buy
+**zero** merge latency. A lever that removes cheap parallel jobs buys minutes and
+no latency; one that shortens the longest job buys both. Say which you are
+selling.
 
-- **The `push` on master rebuilds a tree the merge queue has already proved, and
-  its only unique product is a handful of cache entries.** A `merge_group` run and the
+The other thing the older figures did not carry: **on a pull request the sweep is
+bimodal, not average.** Over 19 sampled pull-request sweeps, 11 were diff-scoped
+(0.0–8.4 min) and 8 escalated to a full sweep (21.8–25.5). The mean of 12.8
+describes none of them, and any prediction from it is a prediction about a run
+that does not happen.
+
+- **The `push` on master is LOAD-BEARING, and it is the only full `clang-tidy`
+  sweep left.** It reads like the workflow's most obviously redundant run and was
+  documented that way until #554; the bullet below is that case, kept because the
+  measurements in it are still true and still the reason the trigger is shaped as it
+  is. What changed is not a number: the merge queue now diff-scopes its sweep
+  against its own `base_sha`, and *what makes that sound* is that master@N was
+  proved fully clean by the push that landed it. Narrowing `on: push` to tags would
+  therefore now remove the analysis every other run's scoping rests on, on top of
+  freezing the cache scope only a push writes. It has TWO unique products, not one.
+
+- **The `push` on master otherwise rebuilds a tree the merge queue has already
+  proved, and its other unique product is a handful of cache entries.** A `merge_group` run and the
   `push` on master that follows it carry the *same* `head_sha` — 6 of 6 pairs
   checked on 2026-09-02 — so the master push recompiles, retests and repackages a
   tree the queue has already proved green. That is a whole bottom row of the table
@@ -973,7 +998,75 @@ of the bottom two rows**, which is the next bullet.
   deleting `on: push`, whose `tags:` row is the only way the `release` job is ever
   reached — would therefore trade a bottom-row run per merge for a cache that goes
   cold at whatever rate master changes: a real trade, not an obvious one, and
-  nobody has priced the second half of it.
+  nobody has priced the second half of it. **A third measurement, 2026-09-02**:
+  `refs/heads/master` holds **2521 cache entries totalling 7.9 GB**, and no other
+  ref can be written to it, which is the inference above confirmed from the
+  `actions/caches` listing rather than from the documentation.
+
+- **The merge queue diff-scopes the `clang-tidy` sweep; only the master `push`
+  sweeps everything.** The step was `--all` for every event but a pull request, so
+  the workflow's critical path was the same full sweep three times per landed
+  change. Measured on the 99-run sample above: the `Sweep` step costs **22.50 min**
+  in the queue against **12.80** on a pull request, in a job whose entire fixed
+  overhead — checkout, apt, configure, the scope self-test — is **0.9 min**. So the
+  sweep *is* the job, and the queue was paying for the same 497 translation units
+  the push was about to walk again.
+
+  Applying the pull request's scoping to the queue takes it from 113.6 to **104.0**
+  runner-minutes, its longest job from 23.5 to **15.0**, and its wall clock from
+  31.7 to **24.5** — which is **55.8 → 48.6 minutes of merge-path wall clock**, the
+  only lever anyone has found that moves that number by more than a couple of
+  minutes. Per change, 326.1 → 316.5 runner-minutes.
+
+  **What it stops checking, and where that is still caught.** In the queue: findings
+  in translation units the change cannot reach. Still caught by the master push's
+  `--all`, and the union is complete — master@N proved fully clean, plus a scope
+  that over-approximates everything a change can reach, covers master@N+1.
+
+  **The residual is narrower than it first reads, and the narrowing is the part that
+  matters.** A clang-tidy finding depends on a translation unit's own sources and its
+  include closure, both of which the scope covers; `SweepEverythingWhen` covers the
+  changes that alter how every unit is read. So no *code change* can plant a finding
+  outside its own scope. What is left is the analyser drifting under us — apt.llvm.org
+  publishing a new `clang-tidy-22` — which the diff-scoped PULL REQUEST sweep could
+  never have caught either, and which a deliberate version bump escalates anyway
+  because `CLANG_TOOLS_VERSION` lives in `build.yml`, itself a `SweepEverythingWhen`
+  row. Drift therefore surfaces at the master push, and failing that at the next
+  pull request whose change escalates — 8 of 19 sampled, so hours rather than weeks.
+  It is a check that MOVED, not one that was lost.
+
+  **Evidence the escalation was not paying, honestly bounded.** Four `merge_group`
+  `clang-tidy` failures in the window (`1312bc6c`, `45760033`, `d04bb8ab`,
+  `f77f4fbf`). All four are one root cause — a batch that was pairwise clean and
+  conflicted serially, `FrameEndpoint_test.cpp: no viable conversion from
+  'chrono::seconds' to 'DialOptions'` — and at each of them **13 other jobs failed
+  too**, every Linux, Windows and macOS build among them. So in this sample the full
+  sweep caught nothing the ordinary builds did not. Four failures with one cause is
+  not a proof that it never pays, and it is not offered as one.
+
+- **A master push blocks nothing and reaches nobody, so moving a check onto it means
+  putting a reader on it.** Checked three ways on 2026-09-02, all negative: every one
+  of the last 30 master-push runs was triggered by `github-merge-queue[bot]`, so
+  GitHub's failure mail goes to an app account with no mailbox; nothing under
+  `.github/` sends a notification of any kind; and **all 18 failed master-push runs
+  back to 2026-06-10 sit at `run_attempt: 1`**, never once re-run. That last one is
+  not proof nobody read them, and it is 18 for 18 of nobody acting.
+
+  So the sweep's own failure opens or updates one issue — and the shape of that is
+  the whole point. It keys on `steps.sweep.conclusion`, never on the job's
+  `failure()`: over the same sample a notifier on any failing master-push job would
+  have fired **18 times**, almost all of it infrastructure (the apt 403 of #550,
+  macOS runner flakes, a sanitizer timeout), while `clang-tidy`'s sweep failed
+  **once**. The test a new alarm has to pass here is whether a firing means something
+  happened — the same test that withdrew a counter in #447 — and 1-in-24 passes it
+  where 18-in-24 would not. One issue reopened by comment, keyed on a label rather
+  than a title so a reworded title cannot start a second thread.
+
+  It is a STEP inside the tidy job rather than a job of its own, and that is forced:
+  `check-release-gate` asserts every job in the file appears in `release.needs`, and
+  a job that is skipped on a tag push — which any push-failure notifier is, always —
+  skips `release` with it. That is this file's never-arrives failure aimed at the
+  release instead of at a required context.
 
 - **A ccache hit does not skip clang-tidy, so caching harder was never the fix.**
   That job reported **535 hits out of 592 cacheable calls (90.4%)** and its build
@@ -1198,6 +1291,28 @@ of the bottom two rows**, which is the next bullet.
   job strands a queued pull request. The recipe is in that header
   (`gh api …/rulesets`). The refusal is on the merits regardless, and the merits
   are `package-macos`.
+
+  **Re-measured a third time on the 99-run sample, and the question has MOVED.**
+  Dropping all four from pull requests is **102.7 → 76.6 runner-minutes (−25%)**,
+  longest job 19.0 → 16.4, wall clock **24.1 → 21.4 (−11%)** — so it is still
+  mostly a runner-minutes lever and barely a latency one, because `clang-tidy` is
+  the longest pull-request job in 18 of 36 runs and remains so afterwards. What
+  changed is where the interesting instance is: with the queue's sweep diff-scoped,
+  **`Code coverage` at 14.0 min is now the longest job in the merge queue**, which
+  is on the merge path in a way the pull-request copy never was. Anyone reopening
+  this should reopen it there. The `package-macos` merits are unchanged and still
+  decide it.
+
+- **The merge queue's wall clock sits 8.2 min above its longest job, and that gap
+  is runner acquisition, not the `changes` gate.** Worth knowing before anyone
+  proposes ungating the queue to save it. Measured on the same sample: run creation
+  to `changes` starting is **1.39 min**, but `changes` finishing to `clang-tidy`
+  starting is **6.55 min** — ~20 jobs asking for hosted runners at once, across
+  three events that overlap. Removing the gate buys at most the first number and
+  breaks the docs-only scoping that makes a `pull_request` cost 0.6 runner-minutes.
+  It follows that anything cutting the total number of concurrently queued jobs buys
+  wall clock *indirectly*, and that second-order effect is **unquantified** — it is
+  recorded as a direction, not as a figure.
 
 - **`Code coverage` is four-fifths an uncached compile, and it cannot be cached.**
   Step timings over 10 code-touching pull-request runs on 2026-09-02: `Build`
