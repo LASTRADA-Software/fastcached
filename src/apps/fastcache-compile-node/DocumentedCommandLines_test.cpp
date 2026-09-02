@@ -11,8 +11,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <optional>
 #include <ranges>
+#include <regex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,40 +56,106 @@ using namespace FastCache::Node;
 /// **Refusals that are not in the table.** This runs `StartupPolicyRejection`, so a
 /// cross-flag rule enforced anywhere else is invisible to it. That is not
 /// hypothetical: run against the pre-fix documentation this check reports SIX of the
-/// seven defects, and misses `tools.md:1099` entirely, because `--scheduler is
-/// required` is refused in `main.cpp` rather than by the table
-/// ([#585](https://github.com/LASTRADA-Software/fastcached/issues/585)). Its
-/// install-time twin IS a table row, which is how the two came to disagree. So the
-/// check's coverage is exactly the table's, and it grows when the table does.
+/// seven defects and misses `tools.md:1099`, whose only fault was a missing
+/// `--scheduler` -- refused by an inline `if` in `main.cpp` rather than by the table.
 ///
-/// That is also why the six were verified by RUNNING them before this existed. A
-/// table check and a spawn answer different questions, and the one that found the
-/// seventh defect was the spawn.
+/// That gap is **a bug in the table, not a boundary of this check**
+/// ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)): the rule
+/// depends on nothing but the parsed configuration, which is precisely what
+/// `platform-service-and-config.md` says belongs in a table "never in the tier that
+/// happens to need it". Its install-time twin already IS a row, so the two agree by
+/// coincidence rather than by construction. When #386 lands this check gets wider
+/// for free and no line here changes. It is left open only because the fix collides
+/// with #403 in `main.cpp`, not because it is settled.
+///
+/// Whoever moves that row: it belongs in `StartupPolicyRejection`, **not** in
+/// `NodeServiceRejection`, which #386 as filed names. That one is install-time only
+/// -- its sole production caller is `NodeInstallRejection` and its messages say
+/// "required *to install a service*" -- so deleting the inline `if` in favour of it
+/// would let a node START with an empty `--scheduler`, which is the refusal the
+/// ticket exists to protect.
 ///
 /// **Anything past the startup policy**: a flag whose *value* is wrong in a way only
 /// a running node discovers, a path that does not exist, a port already held. Those
 /// are properties of a machine rather than of a command line, and a check that tried
 /// to have opinions about them would fail on every developer's box for reasons the
 /// documentation cannot fix.
+///
+/// **This whole binary is gated on `FASTCACHED_BUILD_NODE`.** Configure with it
+/// `OFF` and this check silently stops running while `node-config-reference` carries
+/// on -- so a docs-only change validated in such a tree is validated by less than it
+/// looks. That is the same shape as the sweep-scope trap in
+/// `build-and-toolchain.md`: a check is only as complete as the target set that
+/// built it.
 namespace
 {
 
-/// A documentation page whose command lines are checked.
+/// A documentation page whose command lines are NOT checked.
 ///
-/// A table rather than a glob: a page added here is a decision, and a glob would
-/// silently start checking a page whose examples are deliberately illustrative --
-/// which is a check that grows opinions nobody agreed to.
-struct DocumentedPage
+/// The pages are **globbed** rather than listed, and this is the exclusion table.
+/// The direction matters and it is the whole lesson of this ticket: a hand-written
+/// include list silently omits, and what it omits is a page nobody re-ran. Two pages
+/// with real node invocations -- `operations/cluster-communication.md` and
+/// `operations/upgrading-a-store.md` -- were invisible to the first draft of this
+/// check for exactly that reason. Globbing inverts the failure: a new page with a
+/// broken example fails loudly once, instead of never being covered at all.
+///
+/// Matched as a path SUBSTRING, so a row survives a file being moved between
+/// directories but not renamed.
+struct ExcludedPage
 {
-    std::string_view path; ///< Relative to the repository root.
-    std::string_view why;  ///< What this page's examples are for.
+    std::string_view needle; ///< A substring of the page's path, using '/' separators.
+    std::string_view why;    ///< Why its command lines are not startup configurations.
 };
 
-constexpr std::array DocumentedPages {
-    DocumentedPage { .path = "docs/getting-started/distributed-compilation.md",
-                     .why = "the page a reader follows first; its two central commands both exited (#563)" },
-    DocumentedPage { .path = "docs/tools/fastcache-compile-node.md",
-                     .why = "the node's reference page, and the one #463 already fixed once for this shape" },
+/// Pages deliberately outside the check.
+///
+/// Empty is legal here and is not the vacuity hazard `SkippedExamples` guards: an
+/// empty exclusion list means every page is checked, which is the strong position,
+/// whereas an empty *skip* list would mean the check had stopped looking.
+constexpr std::array<ExcludedPage, 0> ExcludedPages {};
+
+/// A verb that ends the process before the startup gate is ever consulted.
+///
+/// `main.cpp` handles five of these and `return`s: `--print-surfaces` (:1563),
+/// `--install-service` / `--uninstall-service` (:1596, judged by the stricter
+/// `NodeInstallRejection` instead), `--migrate-cache` (:1637) and the
+/// `cluster.action` verbs (:1653). A command line naming one of them is not a
+/// *start*, so asking whether it would start is asking the wrong question of it.
+///
+/// `--print-surfaces` is the sharp case and the reason this table exists. Its
+/// short-circuit is deliberate -- an operator reaches for it *because* a port is
+/// wrong, and withholding the map until the configuration is valid withholds it
+/// exactly when it is wanted. The first draft of this check did not know that, so
+/// the documented example failed it, and five flags were added to the page one at a
+/// time to appease it. Each satisfied one more row of a gate the binary skips for
+/// that verb; not one changed a line of the output block beneath it; and the page
+/// ended up teaching that `--print-surfaces` demands a scheduler and a cluster key,
+/// which is false. The edit was reverted. **A fix that needs several rounds of
+/// appeasing a checker, against a page whose expected output never moves, is the
+/// checker asking the wrong question.**
+///
+/// Unlike `SkippedExamples`, a row here that matches nothing is NOT a failure, and
+/// the difference is where the row comes from: these are derived from what the
+/// *binary* short-circuits on, so a verb with no documented example yet is ordinary.
+/// A skip row, by contrast, names one specific example that must still exist.
+struct NonStartVerb
+{
+    std::string_view flag; ///< The flag whose presence ends the process early.
+    std::string_view why;  ///< What it does instead of starting.
+};
+
+constexpr std::array NonStartVerbs {
+    NonStartVerb { .flag = "--print-surfaces",
+                   .why = "prints the resolved surface map and exits, deliberately ahead of the startup rules, "
+                          "because it is reached for when a port is wrong" },
+    NonStartVerb { .flag = "--install-service",
+                   .why = "registers a service and exits; judged by NodeInstallRejection, which is stricter" },
+    NonStartVerb { .flag = "--uninstall-service", .why = "removes a registration and exits" },
+    NonStartVerb { .flag = "--migrate-cache", .why = "converts a store and exits" },
+    NonStartVerb { .flag = "--cluster-status", .why = "a cluster admin verb: asks the leader and exits" },
+    NonStartVerb { .flag = "--cluster-admit", .why = "a cluster admin verb: proposes a member and exits" },
+    NonStartVerb { .flag = "--cluster-forget", .why = "a cluster admin verb: proposes a removal and exits" },
 };
 
 /// A command line the check deliberately does not judge.
@@ -99,10 +165,9 @@ constexpr std::array DocumentedPages {
 /// and a skip row that silently stops matching is a skip row that starts hiding a
 /// real example.
 ///
-/// Every row carries a reason, and both halves of the table are asserted below: a
-/// row that matches nothing fails, and an empty table fails. `node-config-reference`
-/// fails when either of its scans matches nothing for the same reason -- two empty
-/// lists agree perfectly.
+/// Every row carries a reason, and a row matching nothing FAILS.
+/// `node-config-reference` fails when either of its scans matches nothing for the
+/// same reason: two empty lists agree perfectly.
 struct SkippedExample
 {
     std::string_view needle; ///< A substring identifying the command line.
@@ -119,27 +184,24 @@ constexpr std::array SkippedExamples {
 /// Whether @p command is a template rather than a command.
 ///
 /// `--scheduler=...` and `--advertise=<host>:<port>` are shapes shown to be filled
-/// in. This is a RULE rather than a skip-table row because it is a property of the
-/// text -- a per-example row for each would go stale every time one was reworded.
+/// in. A RULE rather than skip-table rows, because a per-example row for each would
+/// go stale every time one was reworded.
 /// @param command The command line as written.
 /// @return True when it holds an elision or a placeholder.
 [[nodiscard]] bool IsTemplate(std::string_view command)
 {
-    if (command.find("...") != std::string_view::npos)
-        return true;
-    // `<host>`, `<port>`, `<id>` -- an angle-bracketed lowercase word.
-    for (auto i = command.find('<'); i != std::string_view::npos; i = command.find('<', i + 1))
-    {
-        auto const close = command.find('>', i);
-        if (close == std::string_view::npos)
-            break;
-        auto const inner = command.substr(i + 1, close - i - 1);
-        if (!inner.empty() && std::ranges::all_of(inner, [](char c) {
-                return (std::isalpha(static_cast<unsigned char>(c)) != 0) || c == '-';
-            }))
-            return true;
-    }
-    return false;
+    static std::regex const placeholder { R"(\.\.\.|<[A-Za-z-]+>)" };
+    return std::regex_search(command.begin(), command.end(), placeholder);
+}
+
+/// Whether @p command names a verb that ends the process before the startup gate.
+/// @param command The command line as written.
+/// @return The row, or nullptr when this command line is a start.
+[[nodiscard]] NonStartVerb const* NonStartVerbIn(std::string_view command)
+{
+    auto const row = std::ranges::find_if(
+        NonStartVerbs, [command](NonStartVerb const& verb) { return command.find(verb.flag) != std::string_view::npos; });
+    return row == NonStartVerbs.end() ? nullptr : &*row;
 }
 
 /// One command line found in the documentation.
@@ -155,15 +217,49 @@ struct FoundCommand
 /// `--service-scope=user   # macOS: registers a launchd agent` is one argument and
 /// a comment to `sh`, and the survey that preceded this check passed the `#` to the
 /// parser and reported an unrecognised argument that no reader would ever hit.
-/// Only a `#` that begins a word counts, so a `#` inside a value is left alone.
-/// @param command The command line as written.
+/// Only a `#` that begins a word counts, so a `#` inside a value is left alone --
+/// and this runs AFTER any `# ` root prompt is removed, or it would eat the command.
+/// @param command The command line, prompt already stripped.
 /// @return The command with any trailing comment removed.
 [[nodiscard]] std::string StripShellComment(std::string_view command)
 {
-    for (std::size_t i = 0; i < command.size(); ++i)
-        if (command[i] == '#' && (i == 0 || std::isspace(static_cast<unsigned char>(command[i - 1])) != 0))
-            return std::string { command.substr(0, i) };
+    for (auto const index: std::views::iota(std::size_t { 0 }, command.size()))
+        if (command[index] == '#'
+            && (index == 0 || std::isspace(static_cast<unsigned char>(command[index - 1])) != 0))
+            return std::string { command.substr(0, index) };
     return std::string { command };
+}
+
+/// Trim ASCII whitespace from both ends.
+/// @param text The text.
+/// @return The trimmed view.
+[[nodiscard]] std::string_view Trim(std::string_view text)
+{
+    while (!text.empty() && (std::isspace(static_cast<unsigned char>(text.front())) != 0))
+        text.remove_prefix(1);
+    while (!text.empty() && (std::isspace(static_cast<unsigned char>(text.back())) != 0))
+        text.remove_suffix(1);
+    return text;
+}
+
+/// Whether @p text is the node being INVOKED, rather than the node speaking.
+///
+/// `fastcache-compile-node: this node does not lead the cluster; ask ...` is an
+/// error message the binary prints, quoted in a fenced block so a reader recognises
+/// it. A `starts_with` on the program name alone matched it and reported the
+/// documentation as broken -- the check accusing its subject when the instrument was
+/// wrong, which is the failure this whole file exists to prevent one level down. The
+/// colon is what separates the two: a program name followed by anything but
+/// whitespace is not a command.
+/// @param text A trimmed line from a fenced block.
+/// @return True when it invokes the node.
+[[nodiscard]] bool IsInvocation(std::string_view text)
+{
+    constexpr std::string_view Program = "fastcache-compile-node";
+    if (!text.starts_with(Program))
+        return false;
+    auto const rest = text.substr(Program.size());
+    return rest.empty() || (std::isspace(static_cast<unsigned char>(rest.front())) != 0);
 }
 
 /// Split a command line on whitespace, honouring single and double quotes.
@@ -202,34 +298,14 @@ struct FoundCommand
     return out;
 }
 
-/// Whether @p text is the node being INVOKED, rather than the node speaking.
-///
-/// `fastcache-compile-node: this node does not lead the cluster; ask ...` is an
-/// error message the binary prints, quoted in a fenced block so a reader
-/// recognises it. A `starts_with` on the program name alone matched it and
-/// reported the documentation as broken -- the check accusing its subject when
-/// the instrument was wrong, which is the failure this whole file exists to
-/// prevent one level down. The colon is what separates the two: a program name
-/// followed by anything but whitespace is not a command.
-/// @param text A trimmed line from a fenced block.
-/// @return True when it invokes the node.
-[[nodiscard]] bool IsInvocation(std::string_view text)
-{
-    constexpr std::string_view Program = "fastcache-compile-node";
-    if (!text.starts_with(Program))
-        return false;
-    auto const rest = text.substr(Program.size());
-    return rest.empty() || (std::isspace(static_cast<unsigned char>(rest.front())) != 0);
-}
-
-/// Every `fastcache-compile-node` invocation inside a fenced block of @p path.
+/// Every `fastcache-compile-node` invocation inside a fenced block of @p page.
 ///
 /// Backslash continuations are joined, and the reported line is the one the command
 /// STARTS on, because that is where a reader looks.
 /// @param root The repository root.
-/// @param page The page's relative path.
+/// @param page The page's path, relative to the root.
 /// @return The commands, in document order.
-[[nodiscard]] std::vector<FoundCommand> CommandsIn(std::filesystem::path const& root, std::string_view page)
+[[nodiscard]] std::vector<FoundCommand> CommandsIn(std::filesystem::path const& root, std::string const& page)
 {
     std::ifstream in { root / page };
     REQUIRE(in.is_open());
@@ -241,42 +317,24 @@ struct FoundCommand
     std::string pending;
     int pendingLine = 0;
 
-    /// Take whatever `pending` holds as a complete command.
-    auto take = [&found, &pending, &pendingLine, page] {
-        auto const stripped = StripShellComment(pending);
-        auto trimmed = std::string_view { stripped };
-        while (!trimmed.empty() && (std::isspace(static_cast<unsigned char>(trimmed.front())) != 0))
-            trimmed.remove_prefix(1);
-        while (!trimmed.empty() && (std::isspace(static_cast<unsigned char>(trimmed.back())) != 0))
-            trimmed.remove_suffix(1);
-        for (auto const prefix: { std::string_view { "$ " }, std::string_view { "# " } })
-            if (trimmed.starts_with(prefix))
-                trimmed.remove_prefix(prefix.size());
-        if (IsInvocation(trimmed))
-            found.push_back(FoundCommand { .page = std::string { page },
-                                           .line = pendingLine,
-                                           .command = std::string { trimmed } });
-        pending.clear();
-        pendingLine = 0;
-    };
-
     while (std::getline(in, line))
     {
         ++number;
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
 
+        // A fence ends whatever was accumulating: an unterminated continuation
+        // inside a block is a documentation typo, not something to carry across.
         if (line.starts_with("```"))
         {
-            if (!pending.empty())
-                take();
             inFence = !inFence;
+            pending.clear();
             continue;
         }
         if (!inFence)
             continue;
 
-        if (pendingLine == 0)
+        if (pending.empty())
             pendingLine = number;
         if (!line.empty() && line.back() == '\\')
         {
@@ -285,109 +343,151 @@ struct FoundCommand
             continue;
         }
         pending += line;
-        take();
+
+        // The prompt comes off BEFORE the comment, or a `# ` root prompt is read as
+        // a comment and the whole command silently disappears.
+        auto text = Trim(pending);
+        for (auto const prompt: { std::string_view { "$ " }, std::string_view { "# " } })
+            if (text.starts_with(prompt))
+                text.remove_prefix(prompt.size());
+        auto const stripped = StripShellComment(text);
+        if (auto const command = Trim(stripped); IsInvocation(command))
+            found.push_back(
+                FoundCommand { .page = page, .line = pendingLine, .command = std::string { command } });
+        pending.clear();
     }
-    if (!pending.empty())
-        take();
     return found;
 }
 
-/// The repository root, handed in by CMake.
-[[nodiscard]] std::filesystem::path RepositoryRoot()
+/// Every markdown page under `docs/`, relative to @p root, in a stable order.
+/// @param root The repository root.
+/// @return The pages, using '/' separators.
+[[nodiscard]] std::vector<std::string> DocumentationPages(std::filesystem::path const& root)
 {
-    return std::filesystem::path { FASTCACHED_SOURCE_DIR };
+    std::vector<std::string> pages;
+    for (auto const& entry: std::filesystem::recursive_directory_iterator { root / "docs" })
+        if (entry.is_regular_file() && entry.path().extension() == ".md")
+            pages.push_back(entry.path().lexically_relative(root).generic_string());
+    std::ranges::sort(pages);
+    return pages;
 }
 
 } // namespace
 
 TEST_CASE("Every documented command line is one the node would start on", "[node][docs][config]")
 {
-    auto const root = RepositoryRoot();
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
 
-    std::vector<std::string> failures;
-    std::vector<bool> skipUsed(SkippedExamples.size(), false);
+    auto const pages = DocumentationPages(root);
+    // A tree with no documentation is this check examining nothing while agreeing
+    // with everything -- the shape its own subject had.
+    REQUIRE_FALSE(pages.empty());
+
+    std::vector<FoundCommand> commands;
+    std::vector<std::string> excludedSeen;
+    for (auto const& page: pages)
+    {
+        auto const excluded = std::ranges::find_if(ExcludedPages, [&page](ExcludedPage const& row) {
+            return page.find(row.needle) != std::string::npos;
+        });
+        if (excluded != ExcludedPages.end())
+        {
+            excludedSeen.emplace_back(excluded->needle);
+            continue;
+        }
+        auto found = CommandsIn(root, page);
+        commands.insert(commands.end(), std::make_move_iterator(found.begin()), std::make_move_iterator(found.end()));
+    }
+
+    std::vector<std::string> skipsUsed;
     std::size_t checked = 0;
     std::size_t templates = 0;
+    std::size_t nonStart = 0;
+    std::size_t failures = 0;
 
-    for (auto const& page: DocumentedPages)
+    for (auto const& found: commands)
     {
-        auto const commands = CommandsIn(root, page.path);
-        INFO("page " << page.path << " -- " << page.why);
-        // A page contributing nothing is a renamed or moved file, and the check
-        // would then pass by examining less than it claims.
-        CHECK_FALSE(commands.empty());
-
-        for (auto const& found: commands)
+        if (IsTemplate(found.command))
         {
-            if (IsTemplate(found.command))
-            {
-                ++templates;
-                continue;
-            }
+            ++templates;
+            continue;
+        }
 
-            auto const skip = std::ranges::find_if(SkippedExamples, [&found](SkippedExample const& row) {
-                return found.command.find(row.needle) != std::string::npos;
-            });
-            if (skip != SkippedExamples.end())
-            {
-                skipUsed[static_cast<std::size_t>(std::ranges::distance(SkippedExamples.begin(), skip))] = true;
-                continue;
-            }
+        if (auto const* verb = NonStartVerbIn(found.command); verb != nullptr)
+        {
+            ++nonStart;
+            continue;
+        }
 
-            auto const arguments = SplitArguments(found.command);
-            std::vector<char const*> argv;
-            argv.reserve(arguments.size());
-            // The program name is dropped: `ParseOptionsInto` takes flags only.
-            for (auto const& argument: std::span { arguments }.subspan(1))
-                argv.push_back(argument.c_str());
+        auto const skip = std::ranges::find_if(SkippedExamples, [&found](SkippedExample const& row) {
+            return found.command.find(row.needle) != std::string::npos;
+        });
+        if (skip != SkippedExamples.end())
+        {
+            skipsUsed.emplace_back(skip->needle);
+            continue;
+        }
 
-            ++checked;
-            NodeConfig cfg;
-            auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
-            if (!parsed.has_value())
-            {
-                failures.push_back(std::format("{}:{}: does not parse: {}\n    {}",
-                                               found.page,
-                                               found.line,
-                                               parsed.error().ToString(),
-                                               found.command));
-                continue;
-            }
+        ++checked;
+        auto const arguments = SplitArguments(found.command);
+        // The program name is dropped: `ParseOptionsInto` takes flags only.
+        auto flags = arguments | std::views::drop(1)
+                     | std::views::transform([](std::string const& argument) { return argument.c_str(); });
+        std::vector<char const*> argv { flags.begin(), flags.end() };
 
-            if (auto const rejection = StartupPolicyRejection(cfg); rejection.has_value())
-                failures.push_back(
-                    std::format("{}:{}: parses, and the node would refuse to start:\n    {}\n    {}",
-                                found.page,
-                                found.line,
-                                *rejection,
-                                found.command));
+        NodeConfig cfg;
+        auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
+        if (!parsed.has_value())
+        {
+            ++failures;
+            FAIL_CHECK(std::format("{}:{}: does not parse: {}\n    {}",
+                                   found.page,
+                                   found.line,
+                                   parsed.error().ToString(),
+                                   found.command));
+            continue;
+        }
+
+        if (auto const rejection = StartupPolicyRejection(cfg); rejection.has_value())
+        {
+            ++failures;
+            // The refusal is CORRECT. What is wrong is documentation telling a
+            // reader to run a configuration the binary refuses (#563).
+            FAIL_CHECK(std::format("{}:{}: parses, and the node would refuse to start:\n    {}\n    {}",
+                                   found.page,
+                                   found.line,
+                                   *rejection,
+                                   found.command));
         }
     }
 
-    // A skip row that matches nothing has stopped describing anything, and would
-    // sit there looking like coverage while hiding whatever moved into its place.
-    for (auto const index: std::views::iota(std::size_t { 0 }, SkippedExamples.size()))
-        if (!skipUsed[index])
-            failures.push_back(std::format("the skip row for \"{}\" matched no documented command line; it is stale, "
-                                           "and a stale row hides the example that took its place",
-                                           SkippedExamples[index].needle));
+    // Counts first, so they are in scope for every assertion below rather than
+    // trailing them where Catch2 would never print them.
+    INFO("scanned " << pages.size() << " page(s); found " << commands.size() << " command line(s); checked "
+                    << checked << "; templates " << templates << "; non-start verbs " << nonStart << "; failures "
+                    << failures);
 
-    // Both halves of the vacuity guard. A table that examined nothing agrees with
-    // every documentation there could be.
-    CHECK_FALSE(SkippedExamples.empty());
-    CHECK(checked > 0);
-
-    if (!failures.empty())
+    // A skip row that matches nothing has stopped describing anything, and would sit
+    // there looking like coverage while hiding whatever moved into its place.
+    for (auto const& row: SkippedExamples)
     {
-        std::string report =
-            std::format("{} documented command line(s) the node would not start on.\nThe refusals below are "
-                        "CORRECT -- what is wrong is documentation telling a reader to run a configuration the "
-                        "binary refuses (#563).\n\n",
-                        failures.size());
-        for (auto const& failure: failures)
-            report += "  " + failure + "\n\n";
-        FAIL(report);
+        INFO("skip row: " << row.why);
+        CHECK(std::ranges::contains(skipsUsed, row.needle));
+    }
+    for (auto const& row: ExcludedPages)
+    {
+        INFO("excluded page: " << row.why);
+        CHECK(std::ranges::contains(excludedSeen, row.needle));
     }
 
-    INFO("checked " << checked << " command line(s), skipped " << templates << " template(s)");
+    // The vacuity guard. A scan that examined nothing agrees with every
+    // documentation there could be.
+    CHECK(checked > 0);
+
+    // Restates the per-command failures above as one assertion, so the INFO in scope
+    // here -- what the check actually examined -- reaches the report. A `FAIL_CHECK`
+    // inside the loop cannot carry it: the counts are not final at that point. A
+    // summary nobody ever sees is the dead-INFO defect this file was itself written
+    // to avoid one level down.
+    CHECK(failures == 0);
 }
