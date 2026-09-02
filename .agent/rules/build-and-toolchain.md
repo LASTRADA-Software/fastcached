@@ -184,6 +184,21 @@ determinism rests on.
     is enough, since the package job builds the library and every app. The
     workaround is nearly always a C++20 spelling: `std::views::iota` over the
     index range says what `enumerate` says and is ten years older.
+  - **And the mirror holds: a Windows verification is green about a smaller set of
+    questions than it looks.** The paragraph above counts what a Linux-only gate
+    misses; this direction is measured too. One session's four tickets produced
+    **four defects a fully green MSVC run of ~2997 tests could not have reported** --
+    a partial designated initializer (`-Wmissing-designated-field-initializers`,
+    which clang makes an error and MSVC does not diagnose at all), a leaked coroutine
+    frame in a test fixture (ASan; no Windows preset runs a sanitizer), and two
+    clang-tidy findings on code MSVC compiles happily
+    (`readability-redundant-typename`, `performance-unnecessary-copy-initialization`).
+    Not one of the four is reachable by running *more tests* on Windows: three exist
+    only in the analyser and the fourth needs a sanitizer. So the inference to refuse
+    is "the Windows run was green, therefore it was green about everything" -- the
+    Windows leg answers a different question, not a weaker version of the same one.
+    Four in four tickets is recorded rather than one anecdote, because a rule argued
+    from a single instance reads as an accident.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins.** Both jobs
   run the `$CLANG_TOOLS_VERSION` binary (`.github/workflows/build.yml`), and successive LLVM
   releases do not agree with each other: the style job compares against a *newer formatter*,
@@ -559,11 +574,12 @@ determinism rests on.
 
 ## A retry makes every one of these disappear without fixing it
 
-Nine separate ways the gate reported something that was not about the tree under
-test have turned up across three tickets — six while fixing
+Eleven separate ways the gate reported something that was not about the tree under
+test have turned up across four tickets — six while fixing
 [#493](https://github.com/LASTRADA-Software/fastcached/issues/493), two more while
-fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), and one
-while fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243). Not
+fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), one while
+fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243), and two
+while fixing [#292](https://github.com/LASTRADA-Software/fastcached/issues/292). Not
 one of them announced itself. Every one presented as an ordinary flake, and **a re-run would
 have cleared all of them without fixing any of them** — which is the whole reason they
 are written down here rather than in those pull requests.
@@ -598,8 +614,20 @@ The specific traps are examples. The rule is the mechanism.
   from a byte offset, so editing the wrapper the gate was running re-ran its header
   block and shifted an `exec 9>` redirect into a different path — and the run
   continued **with no lock while reporting as though it held one**. A guard that
-  silently stopped guarding. Launch long-running scripts from an immutable per-run
-  copy.
+  silently stopped guarding.
+  - **It reports in whichever direction the read pointer happens to land**, and the
+    second direction is the one that gets believed. Editing a gate wrapper *to improve
+    it* -- adding the commit stamp the entry below asks for -- while that wrapper was
+    mid-run shifted every offset after the insertion, and bash resumed inside a later
+    line: `syntax error near unexpected token '('` on a `(` that had been inside
+    double quotes since the file was written. The gate itself had already **passed**
+    both legs; the corruption landed in the *reporting* step, so the task reported
+    `exit 2` for a green tree and never copied the log out. A false PASS hides a
+    defect, a false FAIL invents one, and a false FAIL that a re-run clears is how a
+    working gate gets a reputation for flakiness.
+  - So: **launch long-running scripts from an immutable per-run copy**, and do not
+    edit an instrument that is currently running -- *including to improve it*, which
+    is the version that feels safe and is not.
 - **A path mangled between shells, and the wrapper exiting `0` having run nothing.**
   `nohup wsl.exe -e bash /mnt/c/...` launched from Git Bash becomes
   `C:/Program Files/Git/mnt/c/...`: Git Bash rewrites a leading `/mnt` as though it
@@ -643,6 +671,41 @@ The specific traps are examples. The rule is the mechanism.
     a translation unit's contents and can change what compiles. Amend the formatting
     into the commit and **re-run** the legs that measured the other tree, rather than
     reasoning about whether whitespace could matter.
+
+- **A `ctest` total is only a total for the target set it was configured with.**
+  `-DFASTCACHED_BUILD_TESTCLIENT` and `-DFASTCACHED_BUILD_BENCHMARKS` default OFF, so
+  two runs of *one commit on one platform* report different totals, and **nothing in
+  the output says which you asked for**. A gated-off target is invisible to the run
+  rather than absent from it: the suite passes, the count looks like a count, and the
+  tree simply appears smaller. This is the rule about a clang-tidy sweep being only as
+  complete as its compile database's targets, arriving at a different instrument and a
+  different artefact.
+  - **So a total needs three conditions before it is comparable**, not two: the same
+    tree, the same platform, **and the same target set**. Two were already written
+    down; the third is the one that reads as a smaller codebase rather than as an
+    error.
+  - **Caught by arithmetic, and only because the number could not be lower.** A branch
+    adding five cases reported 2982 where a sibling branch adding one reported 2992 on
+    the same base — impossible in that direction. Reconciled, both fall out of one
+    base once the conditions match: 2996 = 2991 + 5 against 2992 = 2991 + 1. A
+    plausibly-*higher* wrong number would have passed unexamined, which is the honest
+    boundary of this check rather than a reason not to make it.
+
+- **An artefact that does not identify its subject cannot be told from a current
+  one.** A WSL idle-out emptied `/tmp` mid-cycle, and the durable copy of the
+  PREVIOUS run's log was left sitting exactly where a reader looks for the current
+  one — reporting a failure that had already been fixed, in a file that had every
+  appearance of being this run's. What distinguished them was a file timestamp that
+  happened to predate the commit under test: an **accident**, not a property. Two
+  runs landing in the same minute, or a clock that is off by a few, and there is
+  nothing left to read at all.
+  - **A verdict must carry what it is a verdict about.** The commit and the branch go
+    *inside* the log, written before the gate is invoked — not only onto the
+    wrapper's stdout, which is what dies with the terminal — for the same reason the
+    gate prints its gitdir in its own header.
+  - This is a **different mechanism** from the `/tmp` wipe it was discovered through,
+    and the worse of the two. The wipe destroys the current answer, which is loud;
+    this one leaves a stale answer looking current, which is read and acted on.
 
 Two that are not about shells at all, and are the ones a reader is most likely to
 recognise in themselves:
