@@ -23,6 +23,9 @@ is distinguishable from `Corrupt` by something other than reading English. If yo
 are alerting on storage errors, alert on the two differently: `Corrupt` means the
 bytes are damaged, this means they were written by a different build.
 
+If what you are actually looking at is `Corrupt`, this is the wrong page —
+[When a store reports `Corrupt`](corrupt-store.md) is the one.
+
 !!! warning "`Corrupt` used to mean a third thing, and it does not any more"
 
     A set or a stream is an ordinary value distinguished only by its flags word,

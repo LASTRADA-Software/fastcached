@@ -269,6 +269,12 @@ stop the other one, or give this daemon a path of its own.
 Running two daemons on one machine is fine — give each its own path. Nothing is
 written to the store to enforce this, so its files stay readable by any build.
 
+`InUse` is one of four codes an open failure can carry, and they call for
+different things. `UnsupportedFormatVersion` means a healthy store of another
+vintage — [convert it](upgrading-a-store.md), never delete it. `Corrupt` means the
+bytes really are damaged: [When a store reports `Corrupt`](corrupt-store.md) says
+whether the process starts, what deleting costs, and what to keep first.
+
 `--install-service` records the flags it was given on the command line into
 the service's command line (values from a `--config` file stay in the file)
 and makes path arguments absolute — a service starts with its

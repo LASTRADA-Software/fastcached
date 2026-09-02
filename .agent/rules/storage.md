@@ -63,6 +63,48 @@ conversion.
 **A marker too short to hold its own `u32` really is damage**, and keeps
 `Corrupt`. There is no version to report and nothing to convert.
 
+## When the bytes really are damaged
+
+Everything above is about keeping `Corrupt` narrow, so that it stays worth
+believing. The other half is what an operator does when it fires, and a rule that
+only prevents a wrong action is half a rule while the right one is unstated
+(#484). The operator-facing answer is `docs/operations/corrupt-store.md`; what
+belongs here is the part that constrains the code.
+
+**One code, two events, and WHERE decides which.** `Open` is not a scan: it reads
+the two meta slots, walks the free list and looks up two reserved keys — the
+in-flight-conversion marker and the format marker — and `Replay()` is deliberately
+a no-op. So damage inside that reach refuses the process to start, and damage
+anywhere else is found per key while the process serves. Both `fastcached` and
+`fastcache-compile-node` treat a store that will not open as **fatal**, on purpose
+— the operator named a path, and coming up without it delivers less than was
+configured — which makes the first an outage and the second a degradation.
+Anything that makes `Open` touch more of the store converts the second into the
+first for the pages it newly reads, and that is a decision rather than an
+optimisation.
+
+**Nothing repairs a damaged store, and that is the answer rather than an
+absence.** An operator who is told nothing goes looking for a tool, and the
+nearest thing to hand is the conversion — which is not a repair, refuses damage,
+and would waste the outage. Say "there is no salvage" out loud; do not let it be
+inferred.
+
+**Both halves are pinned, and the second is the one that gets forgotten.**
+`CowTreeStorage_test` asserts that damage to both meta pages refuses at `Open`
+with `Corrupt` — and, separately, that damage below them leaves the store **open**
+with *some* keys still readable. A test that only counted corrupt keys would pass
+against a store that had lost everything. That second assertion is what the whole
+operator answer rests on: partial loss is the normal shape, so deleting the store
+is both the correct procedure and the end of any chance of finding the cause, and
+a page that says "copy it first" has to be describing something true.
+
+**The signals are not the same on both binaries.** `WriteErrorReportingStorage` is
+constructed only by `fastcached`, so `fastcached_write_errors_total` and the
+`storage write failed` warning cannot move on a compile node — its tier is wrapped
+in `ShardedStorage` and nothing else. A counter that is exported and can never rise
+is the shape the metrics rules already name, so anything written about reacting to
+damage says which binary it is about.
+
 ## Converting a store
 
 **A format is convertible exactly as long as its reader is in
