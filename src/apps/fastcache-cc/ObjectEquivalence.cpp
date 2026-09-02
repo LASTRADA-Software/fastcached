@@ -460,7 +460,14 @@ namespace
         // contents changed, and the two are fixed in different places. A count rather
         // than a walk, because a count is all this asks -- and on a `/Gy` object a walk
         // is one heap-allocated name per function.
-        auto const servedCount = IsConsistent(*layout, served) ? SectionCount(*layout, served) : std::nullopt;
+        // Spelled as a statement rather than as `cond ? SectionCount(...) : std::nullopt`.
+        // GCC 14 at -O3 inlines that ternary far enough to report the disengaged arm as
+        // `-Werror=maybe-uninitialized` inside `<optional>`'s own `operator!=`, and clang
+        // emits nothing at any level -- the second-compiler class this project's gate
+        // exists for. Fixed at the source, since the rule here is never to silence.
+        std::optional<std::uint64_t> servedCount;
+        if (IsConsistent(*layout, served))
+            servedCount = SectionCount(*layout, served);
         auto const freshCount = SectionCount(*layout, fresh);
         if (servedCount != freshCount)
             return std::format("the cached object has {} section(s) where this compile produces {}",
