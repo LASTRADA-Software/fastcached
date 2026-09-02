@@ -88,7 +88,7 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
     }
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), 2s));
+    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     auto accepted = SyncRun(AcceptOne(listener.get()));
@@ -139,7 +139,7 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
     }
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), 2s));
+    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     struct sigaction current {};
@@ -162,7 +162,7 @@ TEST_CASE("A connected pair still round-trips bytes", "[net][socket]")
     }
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), 2s));
+    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     auto accepted = SyncRun(AcceptOne(listener.get()));

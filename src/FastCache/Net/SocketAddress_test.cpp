@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/KeepAlive.hpp>
 #include <FastCache/Net/SocketAddress.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -25,6 +27,7 @@
 
     #include <arpa/inet.h>
     #include <netinet/in.h>
+    #include <netinet/tcp.h>
 #endif
 
 namespace
@@ -473,6 +476,110 @@ TEST_CASE("A socket this process owns is not handed to the children it spawns", 
     FastCache::Detail::ApplyHotSocketOptions(native);
 
     CHECK((::fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+#endif
+
+    CloseRaw(native);
+}
+
+namespace
+{
+
+/// Read `SO_KEEPALIVE` back off a raw socket.
+///
+/// The flag rather than the intervals, because the flag is the half that is
+/// portable to read: Windows sets its intervals through `SIO_KEEPALIVE_VALS` and
+/// offers no matching get, so a case that insisted on reading them back could only
+/// run on two of the three platforms -- and a case that does not run is not a case.
+/// The intervals are asserted where they can be, below.
+/// @param socket Handle to inspect.
+/// @return True when the socket is probing.
+[[nodiscard]] bool KeepAliveIsOn(FastCache::Detail::NativeSocket socket)
+{
+    int value = 0;
+#if defined(_WIN32)
+    auto length = static_cast<int>(sizeof(value));
+    REQUIRE(::getsockopt(static_cast<SOCKET>(socket), SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<char*>(&value), &length)
+            == 0);
+#else
+    auto length = static_cast<socklen_t>(sizeof(value));
+    REQUIRE(::getsockopt(static_cast<int>(socket), SOL_SOCKET, SO_KEEPALIVE, &value, &length) == 0);
+#endif
+    return value != 0;
+}
+
+} // namespace
+
+TEST_CASE("Keepalive is armed only where it is asked for", "[net][socket][keepalive]")
+{
+    // **The negative half is the point, and it is asserted first**
+    // ([#247](https://github.com/LASTRADA-Software/fastcached/issues/247)). The
+    // obvious home for keepalive is `ApplyHotSocketOptions`, which every socket this
+    // process owns passes through -- and arming it there would silently change when
+    // an idle memcached or Redis client connection is dropped and when a Raft peer
+    // link is torn down, fleet-wide, for a change nobody asked for. Nothing about
+    // the dispatch path would look wrong; the daemon's would.
+    //
+    // So the acceptance is "no other socket in the process changes behaviour", and
+    // "assert this, do not assume it" -- the same shape as the close-on-exec case
+    // above, where the BEFORE assertion is the half that caught the old bug.
+    FastCache::Detail::EnsureNetworkInitialised();
+
+    auto const native = static_cast<FastCache::Detail::NativeSocket>(::socket(AF_INET, SOCK_STREAM, 0));
+    REQUIRE(native != FastCache::Detail::InvalidSocket);
+
+    // A fresh socket does not probe. Stated, because the whole claim below is
+    // relative to it: if the platform default were already on, "armed" would prove
+    // nothing.
+    CHECK_FALSE(KeepAliveIsOn(native));
+
+    // And the hot options -- the function EVERY socket takes -- must leave it that
+    // way. This is the assertion that fails if somebody later moves `ArmKeepAlive`
+    // into `ApplyHotSocketOptions` for tidiness.
+    FastCache::Detail::ApplyHotSocketOptions(native);
+    CHECK_FALSE(KeepAliveIsOn(native));
+
+    // Only the explicit call arms it.
+    CHECK(FastCache::Detail::ArmKeepAlive(native, FastCache::KeepAliveSettings {}));
+    CHECK(KeepAliveIsOn(native));
+
+#if !defined(_WIN32)
+    // Where the intervals can be read back, they are -- because the flag ALONE is
+    // worth nothing: without them the socket inherits the system default, two hours
+    // on Linux, which is longer than any deadline this protects while reading back
+    // as armed. A case that checked only the flag would pass under exactly that bug.
+    #if defined(__APPLE__)
+    constexpr int IdleOption = TCP_KEEPALIVE;
+    #else
+    constexpr int IdleOption = TCP_KEEPIDLE;
+    #endif
+    constexpr FastCache::KeepAliveSettings Defaults {};
+
+    auto const readBack = [native](int option) {
+        int value = 0;
+        auto length = static_cast<socklen_t>(sizeof(value));
+        REQUIRE(::getsockopt(static_cast<int>(native), IPPROTO_TCP, option, &value, &length) == 0);
+        return value;
+    };
+
+    CHECK(readBack(IdleOption) == std::chrono::duration_cast<std::chrono::seconds>(Defaults.idle).count());
+    CHECK(readBack(TCP_KEEPINTVL) == std::chrono::duration_cast<std::chrono::seconds>(Defaults.interval).count());
+    CHECK(readBack(TCP_KEEPCNT) == static_cast<int>(Defaults.count));
+
+    // The bar the values exist to clear: a dead host noticed in well under a minute,
+    // against a dispatch deadline that is minutes long by design since #223. Derived
+    // from the settings rather than restated, so a future retune cannot satisfy the
+    // literal and break the property.
+    auto const probesStopAt = Defaults.idle + Defaults.count * Defaults.interval;
+    CHECK(probesStopAt < std::chrono::seconds { 60 });
+#else
+    // Windows fixes the probe count at 10 and there is no getter for the intervals,
+    // so the arithmetic is what can be checked here -- and it is worth checking,
+    // because 10 probes is what makes this platform the slowest of the three and the
+    // one the interval had to be chosen for.
+    constexpr FastCache::KeepAliveSettings Defaults {};
+    constexpr int WindowsFixedProbeCount = 10;
+    auto const probesStopAt = Defaults.idle + WindowsFixedProbeCount * Defaults.interval;
+    CHECK(probesStopAt < std::chrono::seconds { 60 });
 #endif
 
     CloseRaw(native);

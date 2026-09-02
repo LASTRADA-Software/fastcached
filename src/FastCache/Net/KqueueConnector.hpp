@@ -36,9 +36,7 @@ class KqueueConnector final: public IConnector
     KqueueConnector(KqueueReactor& reactor, IAsyncAddressResolver& resolver, IClock& clock) noexcept;
 
     /// @copydoc IConnector::Connect
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds connectTimeout) override;
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override;
 
   private:
     KqueueReactor& _reactor;

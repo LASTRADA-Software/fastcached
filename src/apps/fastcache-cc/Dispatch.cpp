@@ -149,9 +149,15 @@ namespace
         auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
             // Unreachable, broken mid-reply, or out of budget. The three are one
-            // answer here -- compile it locally -- and the endpoint is named because
-            // that is the part an operator can act on.
-            return Refused(DispatchStatus::Unavailable, std::format("compile exchange with {} failed", job.endpoint));
+            // ANSWER here -- compile it locally -- and for a long time they were one
+            // sentence too, which is a different thing (#247). "that machine is off"
+            // and "that compile took longer than the budget" are fixed in different
+            // places, and the endpoint alone cannot tell them apart. Named, so the
+            // dispatch that now fails in seconds instead of minutes says why it did.
+            return Refused(DispatchStatus::Unavailable,
+                           std::format("compile exchange with {} {}",
+                                       job.endpoint,
+                                       DescribeTransportFailure(compileOutcome.transportFailure)));
         if (!compileOutcome.IsHit())
             // A refusal here is the worker declining the JOB -- an unknown lease, a
             // fingerprint it does not have, an argument it will not accept. Distinct

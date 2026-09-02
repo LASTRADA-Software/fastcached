@@ -78,9 +78,7 @@ class BlockingConnector final: public IConnector
                                IClock* clock = nullptr) noexcept;
 
     /// @copydoc IConnector::Connect
-    [[nodiscard]] Task<SocketResult> Connect(std::string host,
-                                             std::uint16_t port,
-                                             std::chrono::milliseconds connectTimeout) override;
+    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override;
 
   private:
     /// Declared before `_clock`, which may bind to it. Order is load-bearing and

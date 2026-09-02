@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/IAsyncAddressResolver.hpp>
+#include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Net/NetError.hpp>
 
@@ -29,7 +30,12 @@ namespace Detail
     /// `std::function`, matching `EpollFdHandler` and `IoAwaitable`'s suspend
     /// callback -- the house shape, and no allocation on a path that runs per
     /// dial.
-    using DialStep = Task<SocketResult> (*)(void* state, ResolvedEndpoint endpoint, TimePoint deadline);
+    ///
+    /// `keepAlive` travels as a parameter rather than inside `state`: the state is
+    /// the connector's own, built once per `Connect`, and folding a per-call answer
+    /// into it is how a per-call option quietly becomes a per-connector one -- the
+    /// design `DialOptions` exists to rule out.
+    using DialStep = Task<SocketResult> (*)(void* state, ResolvedEndpoint endpoint, TimePoint deadline, KeepAlive keepAlive);
 
     /// The platform-free half of every connector.
     ///
@@ -60,8 +66,9 @@ namespace Detail
     /// @param host Target host, unbracketed. By value, for the coroutine-frame
     ///        reason `IConnector::Connect` documents.
     /// @param port Target port in host byte order.
-    /// @param connectTimeout Total budget for the whole call; non-positive means
-    ///        no deadline of ours, leaving the platform's own.
+    /// @param options Total budget for the whole call -- non-positive means no
+    ///        deadline of ours, leaving the platform's own -- and whether each
+    ///        candidate socket is armed with keepalive.
     /// @param dial Per-candidate attempt.
     /// @param dialState Opaque pointer handed to `dial`.
     /// @return The connected socket, or why no candidate produced one.
@@ -70,7 +77,7 @@ namespace Detail
                                                     IClock* clock,
                                                     std::string host,
                                                     std::uint16_t port,
-                                                    std::chrono::milliseconds connectTimeout,
+                                                    DialOptions options,
                                                     DialStep dial,
                                                     void* dialState);
 

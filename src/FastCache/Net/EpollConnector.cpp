@@ -43,9 +43,10 @@ namespace
     };
 
     /// `Detail::DialStep` over the epoll dial.
-    Task<SocketResult> Dial(void* state, ResolvedEndpoint endpoint, TimePoint deadline)
+    Task<SocketResult> Dial(void* state, ResolvedEndpoint endpoint, TimePoint deadline, KeepAlive keepAlive)
     {
-        co_return co_await Detail::DialReadiness<EpollDialTraits>(static_cast<EpollReactor*>(state), endpoint, deadline);
+        co_return co_await Detail::DialReadiness<EpollDialTraits>(
+            static_cast<EpollReactor*>(state), endpoint, deadline, keepAlive);
     }
 
 } // namespace
@@ -57,11 +58,11 @@ EpollConnector::EpollConnector(EpollReactor& reactor, IAsyncAddressResolver& res
 {
 }
 
-Task<SocketResult> EpollConnector::Connect(std::string host, std::uint16_t port, std::chrono::milliseconds connectTimeout)
+Task<SocketResult> EpollConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
     co_return co_await Detail::RunConnectFlow(
-        &_resolver, &_reactor, &_clock, std::move(host), port, connectTimeout, &Dial, &_reactor);
+        &_resolver, &_reactor, &_clock, std::move(host), port, options, &Dial, &_reactor);
 }
 
 } // namespace FastCache

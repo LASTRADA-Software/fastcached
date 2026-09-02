@@ -7,12 +7,14 @@
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ConnectFlow.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
+    #include <FastCache/Net/KeepAlive.hpp>
 
     #include <winsock2.h>
 
     #include <coroutine>
     #include <cstring>
     #include <memory>
+    #include <tuple>
     #include <utility>
 
     #include <mswsock.h>
@@ -195,7 +197,7 @@ namespace
 {
 
     /// `Detail::DialStep` over ConnectEx.
-    Task<SocketResult> Dial(void* state, ResolvedEndpoint endpoint, TimePoint deadline)
+    Task<SocketResult> Dial(void* state, ResolvedEndpoint endpoint, TimePoint deadline, KeepAlive keepAlive)
     {
         auto& context = *static_cast<DialContext*>(state);
 
@@ -293,6 +295,15 @@ namespace
             co_return std::unexpected(Detail::MakeNetError(WSAGetLastError(), "SO_UPDATE_CONNECT_CONTEXT failed"));
 
         Detail::ApplyHotSocketOptions(holder.Get());
+
+        // AFTER the hot options and separate from them, which is the point: that
+        // function is what every socket this process owns passes through, and this
+        // is asked for by ONE dial. Best-effort by contract -- see `ArmKeepAlive` --
+        // so a socket that would not take it is still handed over rather than
+        // failing a build over a tuning option.
+        if (keepAlive == KeepAlive::Yes)
+            std::ignore = Detail::ArmKeepAlive(holder.Get(), KeepAliveSettings {});
+
         auto peer = FormatPeerAddress(endpoint);
 
         co_return std::make_unique<IocpSocket>(*context.reactor,
@@ -310,12 +321,12 @@ IocpConnector::IocpConnector(IocpReactor& reactor, IAsyncAddressResolver& resolv
 {
 }
 
-Task<SocketResult> IocpConnector::Connect(std::string host, std::uint16_t port, std::chrono::milliseconds connectTimeout)
+Task<SocketResult> IocpConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
     DialContext context { .reactor = &_reactor, .cache = &_connectEx };
     co_return co_await Detail::RunConnectFlow(
-        &_resolver, &_reactor, &_clock, std::move(host), port, connectTimeout, &Dial, &context);
+        &_resolver, &_reactor, &_clock, std::move(host), port, options, &Dial, &context);
 }
 
 } // namespace FastCache

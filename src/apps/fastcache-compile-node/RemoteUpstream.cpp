@@ -35,7 +35,7 @@ RemoteUpstream::RemoteUpstream(std::string endpoint,
 
 Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_view key)
 {
-    auto client = co_await Cc::DialEndpoint(&_connector, _endpoint, _connectTimeout);
+    auto client = co_await Cc::DialEndpoint(&_connector, _endpoint, DialOptions { .connectTimeout = _connectTimeout });
     if (client == nullptr)
         // Unreachable is a miss. `LocalCache` documents why: the caller compiles
         // either way, and a build that could FAIL because a cache was down is the
@@ -49,7 +49,8 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
     // Only with a reactor: over a blocking connector the socket's own
     // `SO_RCVTIMEO` is already the bound, and a second mechanism for one job is
     // how the two come to disagree.
-    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, client.get());
+    SocketDeadlineTarget target { .socket = client.get() };
+    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, &target);
 
     auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential);
     if (!outcome.IsHit())
@@ -59,14 +60,15 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
 
 Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::byte const> value)
 {
-    auto client = co_await Cc::DialEndpoint(&_connector, _endpoint, _connectTimeout);
+    auto client = co_await Cc::DialEndpoint(&_connector, _endpoint, DialOptions { .connectTimeout = _connectTimeout });
     if (client == nullptr)
         // `Declined`, not `NotConfigured`: there IS a shared cache and this node
         // could not reach it, which is exactly the condition an operator wants the
         // failure counter to be counting.
         co_return UpstreamStore::Declined;
 
-    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, client.get());
+    SocketDeadlineTarget target { .socket = client.get() };
+    auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, &target);
 
     // The roots travel empty, and what makes that correct is NOT what this comment
     // used to say. It claimed "the launcher rewrote its own layout out of the value

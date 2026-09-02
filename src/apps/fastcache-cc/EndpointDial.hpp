@@ -34,7 +34,8 @@ namespace FastCache::Cc
 ///        component on a reactor passes `PlatformConnector`, one on a thread that
 ///        may block passes `BlockingConnector` and drives the result with
 ///        `SyncRun`.
-/// @param connectTimeout Ceiling on the dial, name resolution included.
+/// @param options Ceiling on the dial, name resolution included, and whether the
+///        connection probes a peer that has stopped answering.
 ///
 /// There is no post-connect timeout here any more, and its absence is the point.
 /// It used to be ONE value passed twice -- as the dial bound AND as the socket's
@@ -53,7 +54,7 @@ namespace FastCache::Cc
 ///         parsed or reached.
 [[nodiscard]] Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
                                                           std::string_view hostPort,
-                                                          std::chrono::milliseconds connectTimeout);
+                                                          DialOptions options);
 
 /// Dial and hand back a socket synchronously, for a thread that may block.
 ///
@@ -66,10 +67,11 @@ namespace FastCache::Cc
 /// @param connector A blocking connector, already carrying whatever socket-level
 ///        timeouts the caller wants.
 /// @param hostPort `host:port`; a bare port is refused.
-/// @param connectTimeout Ceiling on the dial, name resolution included.
+/// @param options Ceiling on the dial, name resolution included, and whether the
+///        connection probes a peer that has stopped answering.
 /// @return The connected socket, or nullptr.
 [[nodiscard]] std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector,
                                                             std::string_view hostPort,
-                                                            std::chrono::milliseconds connectTimeout);
+                                                            DialOptions options);
 
 } // namespace FastCache::Cc

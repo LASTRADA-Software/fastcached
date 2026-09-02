@@ -666,7 +666,8 @@ class IdleListener final: public IListener
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::vector<std::byte> frame)
 {
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, std::chrono::seconds { 5 }));
+    auto socket =
+        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(socket.has_value());
 
     auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {

@@ -14,9 +14,7 @@
 namespace FastCache::Cc
 {
 
-Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
-                                            std::string_view hostPort,
-                                            std::chrono::milliseconds connectTimeout)
+Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector, std::string_view hostPort, DialOptions options)
 {
     // `ParseDialEndpoint` and not `SplitHostPort`/`ParseEndpoint`: the reasoning for
     // each of its three refusals -- a sentence that merely splits, an empty host, a
@@ -33,22 +31,20 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
     if (!target.has_value())
         co_return nullptr;
 
-    auto socket = co_await connector->Connect(target->first, target->second, connectTimeout);
+    auto socket = co_await connector->Connect(target->first, target->second, options);
     if (!socket.has_value())
         co_return nullptr;
     co_return std::move(*socket);
 }
 
 /// @copydoc DialEndpointBlocking
-std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector,
-                                              std::string_view hostPort,
-                                              std::chrono::milliseconds connectTimeout)
+std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector, std::string_view hostPort, DialOptions options)
 {
     // Sound because the parameter is a `BlockingConnector` and not an
     // `IConnector`: that connector resolves inline and waits with a syscall, so
     // its task is never left suspended, which is exactly what `SyncRun` requires.
     // Over a reactor connector this would throw.
-    return SyncRun(DialEndpoint(&connector, hostPort, connectTimeout));
+    return SyncRun(DialEndpoint(&connector, hostPort, options));
 }
 
 } // namespace FastCache::Cc

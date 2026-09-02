@@ -111,8 +111,15 @@ struct DispatchBudgets
     /// scheduler's own tables. The launcher's ordinary exchange budget.
     ExchangeBudget control {};
 
-    /// The worker's COMPILE: as long as a compiler runs.
-    ExchangeBudget compile { .total = DefaultDispatchTotal };
+    /// The worker's COMPILE: as long as a compiler runs, and the ONE exchange that
+    /// probes for a dead peer.
+    ///
+    /// The two go together and neither is meaningful alone. A deadline this long is
+    /// what makes a vanished worker expensive -- minutes of a held build slot -- and
+    /// keepalive is what answers that in seconds without shortening the deadline back
+    /// into #223. The control exchanges above leave it off: a lease or a release that
+    /// stalls is already bounded by a round trip.
+    ExchangeBudget compile { .total = DefaultDispatchTotal, .keepAlive = KeepAlive::Yes };
 
     /// Ceiling on the object a worker may declare its reply expands to.
     ///

@@ -532,6 +532,54 @@ Every rule below has already been a bug.
     disposition assertion instead. A regression test for a fatal signal that
     cannot be seen to fail is worth nothing.
 
+- **Keepalive is armed per DIAL, and `ApplyHotSocketOptions` is the wrong home for
+  it precisely because every socket passes through there.** That function is where
+  TCP_NODELAY and the buffer sizes live, and it is reached by every accepted and
+  every dialled socket on all four backends — so arming keepalive in it would change
+  when an idle memcached or Redis client connection is dropped, and when a Raft peer
+  link is torn down, fleet-wide, for a change nobody asked for. Same rule as SIGPIPE
+  above, reached from the option side rather than the signal side: per socket, never
+  process-wide. `DialOptions::keepAlive` says so at the call, `Detail::ArmKeepAlive`
+  applies it, and `SocketAddress_test` asserts the socket is **still not probing**
+  after `ApplyHotSocketOptions` — the negative half, which is the assertion that
+  fails when somebody later folds the two together for tidiness
+  ([#247](https://github.com/LASTRADA-Software/fastcached/issues/247)). Four things
+  come with it:
+  - **Bare `SO_KEEPALIVE` is worth nothing.** Without the intervals it inherits the
+    system default — two hours on Linux — which is longer than any deadline it would
+    be protecting, while reading back as armed to anything that checks the flag. The
+    intervals go on FIRST and the flag last, so a socket that would not take them is
+    never left looking protected.
+  - **A parameter that cannot be applied is not taken.** Windows sets idle and
+    interval through `SIO_KEEPALIVE_VALS` and fixes the probe count at 10 with no way
+    to change it, so detection is ~30 s there against ~16 s on Linux and macOS. Both
+    are under the bar the values were chosen for; the asymmetry is stated in
+    `KeepAliveSettings` rather than papered over by accepting a count and dropping it.
+  - **It answers "is this connection dead", never "is this peer working".** A worker
+    that is alive and simply not writing is #245's progress frames, and this does not
+    retire them. Collapsing the two is how a slow peer gets killed and a dead one gets
+    waited on.
+  - **A per-call option must stay per-call.** Fixing it on the connector would be
+    per-socket today only by accident of `Cc::RunOneExchange` building one connector
+    per exchange, and would become per-many-sockets, silently, the first time anyone
+    reused one. `IConnector.hpp` records a post-connect timeout being moved OUT of the
+    per-call surface, which reads like a precedent for the opposite — it is not: the
+    reason given there is that `SO_RCVTIMEO` is meaningless to a socket whose reads
+    suspend, so it belonged to the blocking connector ALONE. That is a fact about
+    *which connector*, not about per-call versus construction.
+
+- **A faster failure nobody can name is not an improvement.** Expiry CLOSES the
+  socket, so "this side gave up" and "the peer went away" reach the caller as the same
+  broken socket — and `Dispatch` folded them, with `Unreachable`, into one sentence
+  because the ACTION is the same (compile locally). The same action is not the same
+  diagnosis: "that machine is off" and "that compile took longer than the budget" are
+  fixed in different places by different people. So `SocketDeadlineTarget` records
+  that the timer fired, `Cc::TransportFailure` names the three states — `Unreached`,
+  `PeerLost`, `Expired` — and the cause is asked of the TIMER, never inferred from
+  elapsed time. Without it, keepalive turns a five-minute non-answer into a
+  sixteen-second one that reads identically, and the only visible effect is that
+  builds got faster for no stated reason.
+
 - **The same process hands those children its SOCKETS, and neither platform stops
   it.** A compiler that inherits a client connection holds it open for as long as it
   runs, so the client's peer sees a socket that will not finish closing -- and on a

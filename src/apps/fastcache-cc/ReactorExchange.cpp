@@ -39,12 +39,22 @@ namespace
                              ExchangeBudget budget,
                              CacheOutcome* out)
     {
-        auto client = co_await DialEndpoint(connector, hostPort, budget.connect);
+        // The budget carries both: how long the dial may take, and whether this is the
+        // exchange that must notice a peer whose host went away. See
+        // `ExchangeBudget::keepAlive` for why one number cannot answer both questions.
+        auto client = co_await DialEndpoint(
+            connector, hostPort, DialOptions { .connectTimeout = budget.connect, .keepAlive = budget.keepAlive });
         if (client == nullptr)
         {
             // Unreachable is a transport failure, which every caller answers by
             // compiling. An optional accelerator must never be able to fail a build.
+            //
+            // `Unreached` and not `PeerLost`: nothing was ever connected here, so
+            // there is no peer to have lost. The default-constructed outcome already
+            // says so; stated rather than relied upon, since the two live in
+            // different headers.
             *out = CacheOutcome {};
+            out->transportFailure = TransportFailure::Unreached;
             reactor->Stop();
             co_return;
         }
@@ -60,9 +70,18 @@ namespace
             // `ArmSocketDeadline`, which the node's upstream shares (#248) -- it was
             // implemented here and again in `RemoteUpstream`, and only one of the two
             // had a regression test.
-            auto const bound = ArmSocketDeadline(reactor, budget.total, client.get());
+            SocketDeadlineTarget target { .socket = client.get() };
+            auto const bound = ArmSocketDeadline(reactor, budget.total, &target);
 
             *out = co_await ExchangeFramed(client.get(), notice, std::move(frame), std::move(credential));
+
+            // Asked of the TIMER, never inferred from elapsed time. Both endings
+            // arrive here as a broken socket, and only the timer knows which one it
+            // was: `expired` means this side gave up, and its absence means the
+            // connection died on its own -- which, on a keepalive-armed dial, is a
+            // host that went away rather than a compile that was slow.
+            if (out->kind == CacheOutcomeKind::Transport)
+                out->transportFailure = target.expired ? TransportFailure::Expired : TransportFailure::PeerLost;
         }
 
         client->Close();

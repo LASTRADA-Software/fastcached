@@ -25,7 +25,7 @@ Task<SocketResult> ConnectTcp(std::string host,
     // frame, not of the call expression -- which is the whole reason this is a
     // coroutine rather than a function returning the connector's task.
     BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = ioTimeout } };
-    co_return co_await connector.Connect(std::move(host), port, connectTimeout);
+    co_return co_await connector.Connect(std::move(host), port, DialOptions { .connectTimeout = connectTimeout });
 }
 
 Task<bool> SendAll(ISocket* socket, std::span<std::byte const> bytes)
