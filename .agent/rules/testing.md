@@ -874,6 +874,69 @@ and ctest printed `***Failed` **for the very same run** (#499).
   code — `file(GLOB_RECURSE)` recurses from the base directory and treats only the
   last component as a pattern, so `src/*/CMakeLists.txt` does not mean one level down.
 
+## A leader-pinned command goes to whoever leads NOW
+
+`$leader_endpoint` is derived by whichever section of `cluster-e2e.sh` needed it
+first, and leadership may legitimately move before a later section runs. A cluster
+that has ELECTED is not one that has FORMED, a slow runner blows any election
+timeout, and admission puts the cluster back into the state with no slack. So a
+command put to the node that led a moment ago is a command put to a node that now
+answers "ask somebody else" -- and the fixture reports that as the cluster refusing
+something legitimate.
+
+Two halves, and the second is the one that gets lost.
+
+**A leader-pinned MUTATING command is put to whoever leads now, re-derived, never
+to an endpoint recorded earlier.** Reads are exempt: any node answers
+`--cluster-status`, and the one read that is leader-pinned re-derives inside its own
+loop.
+
+**The retry keys on the answer the caller ASSERTS, never on a recognised refusal
+wording.** That refusal has two spellings -- one for "somebody else leads", one for
+"an election is in progress" -- and a fixture matching them stops retrying the day
+either sentence is reworded, silently, and back to failing the way it used to. The
+contract is therefore "the answer carries this substring", never "the command
+succeeded", which is also what lets the same helper assert a REFUSAL: the typo'd
+setting case asserts that an unknown setting is refused BY NAME, and its substring
+is the typo.
+
+What makes this one worth writing down is where the rule already was.
+`submit_setting` **was** this rule, correct in both halves, at line 778 of the same
+file -- 117 lines above the `--cluster-admit` that lacked it and 212 above the
+`--cluster-forget`. The argument was written down in a comment above it before
+either of the sessions that read the file noticed the sites it did not cover.
+Learned at [#117](https://github.com/LASTRADA-Software/fastcached/issues/117),
+learned again at [#172](https://github.com/LASTRADA-Software/fastcached/issues/172).
+A helper that implements a rule does not spread it; only a call site using the
+helper does.
+
+## A first failure masks its identical siblings
+
+`--cluster-forget` in section 5 of `cluster-e2e.sh` was one-shot against a pinned
+leader endpoint, byte-identical in shape to the `--cluster-admit` in section 4, and
+had **never once been observed failing**. Not because it was sound: because the
+admit fails first. Under a moving leadership section 4 always failed, so section 5
+was never reached, and the flake's second instance sat behind the first with a clean
+record.
+
+Two consequences, both worse than the original defect.
+
+**Fixing only the observed site relocates the flake rather than removing it.** The
+admit is repaired, the fixture gets further, and the forget starts failing at the
+rate the admit used to.
+
+**The relocated one then presents as a regression introduced by the fix.** It has no
+failure history, it appears in the run immediately after the change, and everything
+about it points at the person who just fixed the thing above it. That is expensive
+to diagnose and it discredits a correct fix.
+
+Which is the argument for auditing rather than trusting instinct: the sibling was
+found by walking every call site of the pattern, and it was found *because* the walk
+was mechanical. Nothing about section 5 looked suspicious, and it never had been.
+When a failure is fixed, the question is not "is this site now correct" but "what
+else has this shape, and would I have seen it fail?"
+([#172](https://github.com/LASTRADA-Software/fastcached/issues/172))
+
 ## Open work
 
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two

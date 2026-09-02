@@ -1348,6 +1348,43 @@ A spread also states its own uncertainty, which a single number cannot. Anyone
 citing it has to pick a row, and picking a row is the moment the question "under
 which conditions?" gets asked.
 
+### The same rule governs a claim handed between people
+
+Everything above is written about a figure in a code comment, and the mechanism has
+nothing to do with code. It is a claim that was true when someone measured it,
+restated once, and arriving at the next reader with its conditions stripped. A
+**handoff is a citation**, and it is the citation that loses them.
+
+It is worse than the comment case in one specific way: a reader who doubts a comment
+can go and re-measure. A reader who is *handed* a claim usually cannot, because the
+measurement was made somewhere they cannot see -- another session, another machine,
+a run whose log has gone. What reaches them is a sentence with the same shape whether
+it was measured, inferred, remembered or guessed, and nothing in that sentence
+distinguishes the four.
+
+Four in one session, all through a handoff, none of them a mistake about the subject:
+
+- a mechanism reported by one session and published by another **as established**,
+  when it was a reconstruction that the subject itself contradicted
+  ([#517](https://github.com/LASTRADA-Software/fastcached/issues/517));
+- a `36/36` correspondence **verified by hand** and relayed as though a guard
+  enforced it;
+- a **pull request number** that was an issue number, handed over as checkable;
+- *"thirty lines up"*, written in a comment that quoted **both line numbers** and
+  never subtracted them -- the real distances being 117 and 212
+  ([#172](https://github.com/LASTRADA-Software/fastcached/issues/172)).
+
+That last one shows the correction usually strengthens the point rather than denting
+it. *Thirty lines* invites "somebody glanced past the helper"; **117 and 212** means a
+reader can arrive at either call site having never seen the helper at all, which is a
+better account of how a rule fails to travel and a worse one for anybody arguing that
+proximity is sufficient.
+
+**The remedy is on the sending end, because only the sending end can do it: say what
+was MEASURED and what was INFERRED, separately, every time.** The receiver cannot
+recover the distinction at any price, and the sender can state it for free. A claim
+worth acting on is worth one clause saying which of the two it is.
+
 ## Open work
 
 - **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
