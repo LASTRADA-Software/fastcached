@@ -921,8 +921,30 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--log-timestamps",
             .arity = Arity::None,
             .apply = SetTrue<&NodeConfig::logTimestamps>(),
-            .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)",
+            .description = "prefix every log line with an ISO 8601 UTC timestamp\n"
+                           "(default: on under macOS, where nothing else stamps a\n"
+                           "service's output; off elsewhere)",
             .yamlKey = "log_timestamps",
+        },
+        {
+            // The negative spelling, for the reason the daemon's carries: the DEFAULT
+            // is platform-dependent now (#496, #507), so under macOS this is the only
+            // way to say "off" -- and the only way a REGISTRATION can, since
+            // `--install-service` replays its command line forever and a flag that can
+            // only say "on" would turn an operator's explicit "off" back on at every
+            // boot.
+            //
+            // **No `yamlKey`, and it is on `notFromFile` below with that reason.** The
+            // file keeps one key, `log_timestamps`, a boolean that already wins in both
+            // directions. A second key would give the file two ways to say one thing,
+            // and `apply` runs on `true` alone -- so `no_log_timestamps: false` would
+            // pass nothing while reading like it said something.
+            .primary = "--no-log-timestamps",
+            .arity = Arity::None,
+            .apply = SetFalse<&NodeConfig::logTimestamps>(),
+            .description = "do not prefix log lines with a timestamp, overriding the\n"
+                           "platform default. The one way to ask for unstamped output\n"
+                           "under macOS",
         },
         { .primary = "--daemon",
           .arity = Arity::None,
@@ -1018,6 +1040,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
     // them from the very file the start already found is circular.
     static constexpr auto notFromFile = std::to_array<std::pair<std::string_view, std::string_view>>({
         { "--config", "names the file being read; a key for it would name a file to read while reading one" },
+        { "--no-log-timestamps",
+          "the negative spelling of a key the file already carries. `log_timestamps` is a boolean and "
+          "wins in both directions, so a second key would be two ways to say one thing -- and `apply` "
+          "runs on `true` alone, so `no_log_timestamps: false` would pass nothing while reading like it "
+          "said something. argv needs the spelling because argv cannot carry a value; a file can" },
         { "--daemon",
           "how this process was started, decided by whoever started it -- a service is already "
           "supervised, and a file that forked an operator's foreground run would take away the "
@@ -1212,13 +1239,18 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfSet("drain-timeout", cfg.drainTimeoutSeconds, defaults.drainTimeoutSeconds);
     emitIfSet("log-level", LogLevelName(cfg.logLevel), LogLevelName(defaults.logLevel));
 
-    // Presence IS the setting, so it is emitted as a bare switch when it is on and
-    // omitted when it is not -- the shape `--no-toolchain-discovery` below uses. No
-    // `explicitBit`: the default is false and the flag only ever sets true, so there
-    // is no value an operator could arrive at without having asked for it, which is
-    // the whole thing a provenance bit exists to tell apart.
-    if (cfg.logTimestamps)
-        argv.emplace_back("--log-timestamps");
+    // **Both spellings, because the DEFAULT is platform-dependent** (#496, #507).
+    // Emitting only the positive one is sound while the default is false everywhere:
+    // "it is on" is then the only thing a registration ever has to say. Under macOS
+    // the default is true, so an operator who asked for `--no-log-timestamps` would
+    // have that dropped from the registration and get timestamps back at every boot,
+    // silently and forever -- a registration replays its command line.
+    //
+    // Compared against the DEFAULT rather than tested for truth, so the registration
+    // carries a flag exactly when it has something to say. `--no-toolchain-discovery`
+    // below keeps the one-sided shape: its default is true on every platform.
+    if (cfg.logTimestamps != NodeConfig {}.logTimestamps)
+        argv.emplace_back(cfg.logTimestamps ? "--log-timestamps" : "--no-log-timestamps");
     emitPathIfSet("pidfile", cfg.pidfile);
 
     // Repeatable, so one token per toolchain rather than one joined value: a

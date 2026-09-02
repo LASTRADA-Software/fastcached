@@ -233,6 +233,22 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // emitting the secret would publish it to exactly the accounts it exists
         // to keep out. InlineCredentialRejection reports the omission instead.
         "--requirepass",
+        // BOTH spellings of the timestamp switch, and the pair is excluded rather
+        // than one of it. A registration carries whichever spelling PRODUCES the
+        // configured value and never both, so this sweep -- one configuration, every
+        // flag must appear in it -- cannot express the pair at all: demanding both is
+        // a contradiction, and demanding one is a guess about which platform the
+        // sweep is running on. The default is platform-dependent since #496, so that
+        // guess is wrong half the time and silently: excluding only the negative
+        // spelling passed here and dropped `--log-timestamps` from the sweep on
+        // macOS.
+        //
+        // The coverage moved rather than vanished. "the timestamp switch registers
+        // whichever spelling produces the value" drives all four combinations --
+        // both values against both platform defaults -- which is more than this
+        // sweep could assert for it even on one platform.
+        "--log-timestamps",
+        "--no-log-timestamps",
         // One-shot questions asked OF a running cluster, not state a worker runs
         // with. A registration carrying one would replay a single operator
         // decision at every boot, forever.
@@ -312,9 +328,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // Worker state, so it has to survive a registration: a service installed with
     // timestamps on must come back with them on, or the operator who turned them on
     // to diagnose something finds them gone at the next boot -- which is exactly when
-    // they are being relied upon. Presence IS the setting, so it is emitted as a bare
-    // switch and this is what makes that emitter fire.
-    cfg.logTimestamps = true;
+    // they are being relied upon. Away from the default WHATEVER the default is, so
+    // the fixture's own rule -- no field holds its default -- keeps holding on a
+    // platform where that default is true (#496).
+    cfg.logTimestamps = !FastCache::DefaultLogTimestamps;
     cfg.pidfile = "worker.pid";
     cfg.drainTimeoutSeconds = 90;
     // Worker state like any other, and the one that supplies most of the rest: a

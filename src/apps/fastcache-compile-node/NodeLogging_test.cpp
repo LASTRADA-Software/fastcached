@@ -49,8 +49,12 @@ TEST_CASE("The node's log-timestamps setting reaches the logger", "[node][loggin
     // setting travel" without owning a format.
     NodeConfig cfg;
 
-    // The default, stated rather than assumed -- see `NodeConfig::logTimestamps`.
-    REQUIRE_FALSE(cfg.logTimestamps);
+    // BOTH settings are driven explicitly. The default is platform-dependent since
+    // #496, and a case that leans on it cannot see the setting travel on the platform
+    // where the default already IS what the case set -- the two renderings would be
+    // compared against a factory that was never asked to change anything. What the
+    // default is belongs to `DefaultLogTimestamps` and is asserted beside it.
+    cfg.logTimestamps = false;
     auto const bare = LineFor(cfg);
     CHECK(bare == "[ERROR] a message\n");
 

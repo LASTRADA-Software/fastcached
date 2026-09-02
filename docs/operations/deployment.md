@@ -22,7 +22,8 @@ the foreground avoids both and gives journald the daemon's stderr directly.
 journalctl -u fastcached -f
 ```
 
-Leave `log_timestamps` off — journald timestamps every line already.
+Leave `log_timestamps` off — journald timestamps every line already, and off
+is the default on Linux.
 
 ### Reloading
 
@@ -163,6 +164,23 @@ system-wide:
 ```sh
 tail -f /opt/fastcached/var/log/software.lastrada.fastcached/software.lastrada.fastcached.err.log
 ```
+
+### Timestamps
+
+Those are plain files, and **launchd writes nothing into them itself** — unlike
+journald, which stamps every line it captures, and unlike the Windows event log,
+where the time is part of the record. A log with no times is close to useless the
+one time it is read.
+
+So `log_timestamps` **defaults to on when running on macOS**, in both binaries and
+in every deployment, not only under launchd: a terminal run stamps too. Turn it off
+with `log_timestamps: false` in the configuration file, or with the
+`--no-log-timestamps` flag, which exists for this — a bare `--log-timestamps` can
+only ask for the default that is already in force.
+
+A configuration file outranks the platform default in **both** directions, so
+`log_timestamps: false` on macOS is obeyed and `log_timestamps: true` on Linux is
+too. The command line outranks the file, as everywhere else.
 
 There is no reload equivalent to `systemctl reload`: send `SIGHUP` to the
 pid `launchctl print` reports, or kickstart the job.

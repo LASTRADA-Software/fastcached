@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -66,7 +67,61 @@ TEST_CASE("CliParser: --log-timestamps absent leaves the explicit-override flag 
     auto const result = FastCache::ParseCli(std::span<char const* const> { args });
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->logTimestampsExplicit);
-    REQUIRE_FALSE(result->config.logTimestamps);
+
+    // The PLATFORM's default, not `false`. It is on under macOS, where launchd sends
+    // a service's output to a plain file nothing stamps (#496), and this used to read
+    // `REQUIRE_FALSE` -- which pinned one platform's answer as the rule and would fail
+    // on the platform the default exists for.
+    //
+    // The explicit bit above is the load-bearing half either way: it stays clear when
+    // nobody typed the flag, which is what lets a configuration file win over whatever
+    // the platform default is.
+    REQUIRE(result->config.logTimestamps == FastCache::DefaultLogTimestamps);
+}
+
+TEST_CASE("CliParser: a config file outranks the platform's timestamp default", "[config][cli]")
+{
+    // **The property the platform default exists to preserve** (#496). The first
+    // attempt had the macOS installer append `--log-timestamps` to the registration
+    // instead, which set the explicit bit -- so `log_timestamps:` in the shipped
+    // reference configuration became dead on macOS: the operator edits it, kickstarts
+    // the job, and nothing changes, with no error anywhere.
+    //
+    // A default sets no explicit bit, so the file wins by ordinary precedence, in BOTH
+    // directions. Asserted through the merge rather than by reading the field, because
+    // the merge is where the injected flag would have won.
+    FastCache::Config fileCfg {};
+    FastCache::CliResult cli {};
+
+    SECTION("the file turns it off where the platform turns it on")
+    {
+        fileCfg.logTimestamps = false;
+        cli.config.logTimestamps = FastCache::DefaultLogTimestamps;
+        REQUIRE_FALSE(cli.logTimestampsExplicit);
+
+        auto const merged = FastCache::Merge(fileCfg, cli);
+        CHECK_FALSE(merged.logTimestamps);
+    }
+
+    SECTION("and on where the platform leaves it off")
+    {
+        fileCfg.logTimestamps = true;
+        cli.config.logTimestamps = FastCache::DefaultLogTimestamps;
+        REQUIRE_FALSE(cli.logTimestampsExplicit);
+
+        auto const merged = FastCache::Merge(fileCfg, cli);
+        CHECK(merged.logTimestamps);
+    }
+
+    SECTION("but a typed flag still outranks the file, which is what the bit is for")
+    {
+        fileCfg.logTimestamps = false;
+        cli.config.logTimestamps = true;
+        cli.logTimestampsExplicit = true;
+
+        auto const merged = FastCache::Merge(fileCfg, cli);
+        CHECK(merged.logTimestamps);
+    }
 }
 
 TEST_CASE("CliParser: --log-source sets the value and the explicit-override flag", "[config][cli]")

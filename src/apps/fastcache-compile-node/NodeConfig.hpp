@@ -477,21 +477,23 @@ struct NodeConfig
 
     /// Whether every console line carries an ISO 8601 UTC time.
     ///
-    /// **Off, matching `fastcached`** -- chosen rather than inherited (#485). The
-    /// short of it: of the three deployments whose sink is this logger, only systemd
-    /// stamps for you, and the one that stamps nothing is a plain file written by the
-    /// launchd plist that `fastcached` shares byte for byte (#496). Two binaries
-    /// defaulting oppositely would paper over that in whichever one noticed.
+    /// **On by default under macOS, off elsewhere** (#496), from the one
+    /// `DefaultLogTimestamps` both binaries read. The reason is the sink rather than
+    /// the binary: launchd redirects a service's output to a plain file nothing
+    /// stamps, journald stamps every line on Linux, and the Windows service path
+    /// never reaches this logger at all. The four-sink table is in
+    /// `.agent/rules/platform-service-and-config.md` and is not repeated here.
     ///
-    /// The full four-row table -- which supervisor stamps, which does not, and which
-    /// never reaches this logger at all -- is in
-    /// `.agent/rules/platform-service-and-config.md`, and is deliberately not repeated
-    /// here: a fact restated in three places loses a condition in two of them.
+    /// A DEFAULT, so `log_timestamps: false` in a configuration file still wins by
+    /// ordinary precedence. That is the difference between this and having the
+    /// installer append `--log-timestamps`, which sets the explicit bit and would
+    /// silently kill a key the shipped reference configuration documents.
     ///
-    /// Turn it on for a foreground run, a redirected file, or a CI artefact -- the
-    /// cases where nothing else knows the time and a completed run cannot be asked
-    /// afterwards (#457).
-    bool logTimestamps { false };
+    /// Off elsewhere is not a claim that times do not matter there: a foreground run,
+    /// a redirected file and a CI artefact are unstamped on every platform, and a
+    /// completed run cannot be asked afterwards (#457). It is a claim that the
+    /// *supervised* case is already covered.
+    bool logTimestamps { DefaultLogTimestamps };
 
     /// Which supervisor domain `--install-service` registers into.
     ServiceScope serviceScope { ServiceScope::System };

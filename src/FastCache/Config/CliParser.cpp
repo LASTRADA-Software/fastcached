@@ -404,7 +404,31 @@ namespace
         { .primary = "--log-timestamps",
           .apply = SetTrue<&Config::logTimestamps>(),
           .explicitBit = &CliResult::logTimestampsExplicit,
-          .description = "prefix every log line with an ISO 8601 UTC timestamp (default off)" },
+          .description = "prefix every log line with an ISO 8601 UTC timestamp\n"
+                         "(default: on under macOS, where nothing else stamps a\n"
+                         "service's output; off elsewhere)" },
+        // The negative spelling, and it exists because the DEFAULT is now
+        // platform-dependent (#496, #507). While the default was false everywhere,
+        // `--log-timestamps` alone could express every reachable state and this flag
+        // would have had no meaning beyond restating the default. Under macOS it is
+        // the only way to say "off" -- and, more sharply, the only way a service
+        // REGISTRATION can say it: `--install-service` replays its command line
+        // forever, and a flag that can only say "on" turns an operator's explicit
+        // "off" back on at every boot.
+        //
+        // No `yamlKey`, deliberately. The file keeps ONE key, `log_timestamps`, which
+        // is a boolean and wins in both directions already. A `no_log_timestamps` key
+        // would give a file two ways to say one thing -- and the worse half is that
+        // `apply` runs on `true` alone, so `no_log_timestamps: false` would pass
+        // nothing while reading like it said something. The negative spelling is a
+        // CLI-only affordance because argv is the only place that cannot carry a
+        // value.
+        { .primary = "--no-log-timestamps",
+          .apply = SetFalse<&Config::logTimestamps>(),
+          .explicitBit = &CliResult::logTimestampsExplicit,
+          .description = "do not prefix log lines with a timestamp, overriding the\n"
+                         "platform default. The one way to ask for unstamped output\n"
+                         "under macOS" },
         { .primary = "--log-source",
           .apply = SetTrue<&Config::logSource>(),
           .explicitBit = &CliResult::logSourceExplicit,

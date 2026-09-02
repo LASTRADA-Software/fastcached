@@ -55,6 +55,7 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--listen-tls", .value = "127.0.0.1:1235" },
     { .flag = "--notify-keyspace-events", .value = "KEA" },
     { .flag = "--log-timestamps", .value = "" },
+    { .flag = "--no-log-timestamps", .value = "" },
     { .flag = "--log-source", .value = "" },
     { .flag = "--log-everything", .value = "" },
     { .flag = "--storage", .value = "cache.db" },

@@ -264,13 +264,17 @@
 # trace, debug, info, warn, error, fatal (default info)
 #log_level:
 
-# prefix every log line with an ISO 8601 UTC timestamp (default off)
+# prefix every log line with an ISO 8601 UTC timestamp
 #
-# Off because under systemd -- which is how this file is being read -- journald
-# stamps every entry already, so turning it on writes a second time inside the
-# message. Turn it ON when this worker's log is going anywhere journald is not:
-# a foreground run during fleet bring-up, a redirected file, a CI artefact. A
-# completed run cannot be asked afterwards what time anything happened (#485).
+# Default: ON under macOS, off elsewhere. The reason is the sink, not the
+# platform's taste -- launchd sends a service's output straight to a plain file
+# that nothing stamps, while journald stamps every line on Linux and a Windows
+# service writes to the event log instead. So this key is what you reach for on
+# Linux when the log is going somewhere journald is not: a foreground run, a
+# redirected file, a CI artefact.
+#
+# Setting it here WINS over the platform default in both directions, including
+# turning it off on macOS.
 #log_timestamps: false
 
 # write the pid here when daemonizing (POSIX)

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -674,7 +675,23 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
         "--version",         //
         "--config",          // the operator's own assertion; see main.cpp
         "--service-name",    // emitted unconditionally, above the table
-        "--pidfile",         // POSIX daemon-mode only, never registered
+        // BOTH spellings of the timestamp switch, and the pair is excluded rather
+        // than one of it. A registration carries whichever spelling PRODUCES the
+        // configured value and never both, so this sweep -- one configuration, every
+        // flag must appear in it -- cannot express the pair at all: demanding both is
+        // a contradiction, and demanding one is a guess about which platform the
+        // sweep is running on. The default is platform-dependent since #496, so that
+        // guess is wrong half the time and silently: excluding only the negative
+        // spelling passed here and dropped `--log-timestamps` from the sweep on
+        // macOS.
+        //
+        // The coverage moved rather than vanished. "the timestamp switch registers
+        // whichever spelling produces the value" drives all four combinations --
+        // both values against both platform defaults -- which is more than this
+        // sweep could assert for it even on one platform.
+        "--log-timestamps",
+        "--no-log-timestamps",
+        "--pidfile", // POSIX daemon-mode only, never registered
         // The one Config field with no safe representation in launch arguments:
         // a supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists
@@ -694,7 +711,10 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
     cfg.port = 12345;
     cfg.maxMemoryBytes = 123456789;
     cfg.logLevel = FastCache::LogLevel::Debug;
-    cfg.logTimestamps = true;
+    // Away from the default WHATEVER the default is, so the fixture's own rule --
+    // no field holds its default -- keeps holding on a platform where that default
+    // is true (#496).
+    cfg.logTimestamps = !FastCache::DefaultLogTimestamps;
     cfg.logSource = true;
     cfg.logEverything = true;
     cfg.storagePath = "cache.db";
@@ -749,4 +769,67 @@ TEST_CASE("ServiceControl: every registration rule gates an install", "[platform
     REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", secret)).has_value());
 
     REQUIRE(!FastCache::ServiceRegistrationRejection(SpecFor("fastcached", FastCache::Config {})).has_value());
+}
+
+TEST_CASE("ServiceControl: the timestamp switch registers whichever spelling produces the value", "[platform][service]")
+{
+    // **Issue #507, and the four combinations are the case.** `emitSwitchIfSet` emits
+    // the POSITIVE flag whenever a value differs from its default, which spells "on".
+    // That is right while every default is false and inverted the moment one is not:
+    // with `logTimestamps` defaulting true under macOS (#496), an operator's explicit
+    // `--no-log-timestamps` differs from the default and was registered as
+    // `--log-timestamps`. The thing they turned off, turned back on, at every boot,
+    // silently -- a registration replays its command line forever.
+    //
+    // Neither half alone is visible. On a false default the old emitter is correct,
+    // so a case run only there passes under the bug; and with only one value driven,
+    // the wrong spelling is still A spelling and "something was emitted" holds. The
+    // defect lives in the COMBINATION, so the case drives both values against both
+    // defaults, and does it against the pure decision rather than against
+    // `BuildServiceArgv` -- a host runs one default and cannot be asked for the
+    // other.
+    struct Combination
+    {
+        bool value;    ///< What the operator configured.
+        bool fallback; ///< What the platform would do if the registration said nothing.
+        std::string_view expected;
+    };
+
+    // "" is the registration having nothing to say: the default already produces the
+    // value, so a flag would be noise that pins a decision the operator never made.
+    constexpr auto Combinations = std::to_array<Combination>({
+        { .value = true, .fallback = false, .expected = "log-timestamps" },
+        { .value = false, .fallback = false, .expected = "" },
+        // The macOS half. The second row is the one that was wrong.
+        { .value = true, .fallback = true, .expected = "" },
+        { .value = false, .fallback = true, .expected = "no-log-timestamps" },
+    });
+
+    for (auto const& c: Combinations)
+    {
+        INFO("value: " << c.value << " fallback: " << c.fallback);
+        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.fallback);
+        CHECK(spelling.value_or("") == c.expected);
+    }
+
+    // And the round trip, because a spelling is only correct if the daemon reading it
+    // back arrives at the value that produced it. Both directions, through the
+    // project's own parser -- the emitter and the parser are the two ends of one
+    // contract and a test that only inspected the string could not see them disagree.
+    for (auto const& c: Combinations)
+    {
+        INFO("value: " << c.value << " fallback: " << c.fallback);
+        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.fallback);
+        if (!spelling.has_value())
+            continue;
+
+        auto const flag = std::format("--{}", *spelling);
+        auto const args = std::array<char const*, 1> { flag.c_str() };
+        auto const parsed = FastCache::ParseCli(std::span<char const* const> { args });
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->config.logTimestamps == c.value);
+        // Provenance travels too: a value the operator named must read as named on
+        // the far side, or the next registration cannot tell it from a default.
+        CHECK(parsed->logTimestampsExplicit);
+    }
 }
