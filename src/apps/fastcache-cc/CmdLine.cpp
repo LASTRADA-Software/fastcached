@@ -358,9 +358,18 @@ namespace
         // `-ffile-prefix-map` while ignoring it for the records that matter --
         // measured, an object built with it still differs cross-root by the same
         // 23 bytes in `S_OBJNAME` and the embedded `-cc1` line.
-        { .spelling = "-fdebug-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
-        { .spelling = "-fmacro-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
-        { .spelling = "-ffile-prefix-map", .role = PathValueRole::PrefixMap, .families = DriverFamily::Gnu },
+        { .spelling = "-fdebug-prefix-map",
+          .role = PathValueRole::PrefixMap,
+          .families = DriverFamily::Gnu,
+          .valueTailSeparator = '=' },
+        { .spelling = "-fmacro-prefix-map",
+          .role = PathValueRole::PrefixMap,
+          .families = DriverFamily::Gnu,
+          .valueTailSeparator = '=' },
+        { .spelling = "-ffile-prefix-map",
+          .role = PathValueRole::PrefixMap,
+          .families = DriverFamily::Gnu,
+          .valueTailSeparator = '=' },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "/Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
@@ -817,11 +826,27 @@ std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::stri
         // A fused value is never empty — IsJoinedValue rejects a bare separator —
         // so an empty `value` unambiguously means "the value is the next argument".
         if (arg.size() == row.spelling.size())
-            return PathValueMatch { .flag = row, .prefix = {}, .value = {} };
+            return PathValueMatch { .flag = row, .prefix = {}, .value = {}, .valueTail = {} };
 
         auto const tail = arg.substr(row.spelling.size());
         auto const value = StripJoinSeparator(tail);
-        return PathValueMatch { .flag = row, .prefix = arg.substr(0, arg.size() - value.size()), .value = value };
+        auto const prefix = arg.substr(0, arg.size() - value.size());
+
+        // A row that says its value carries a tail is split HERE, so no consumer
+        // re-derives where the path ends. At the LAST separator, because that is
+        // where the driver splits it: for `-fdebug-prefix-map=old=new` the `old`
+        // half may contain one and the `new` half may not. A value with no
+        // separator at all is malformed and the driver will say so -- it is
+        // reported as a bare path rather than refused, because the diagnostic
+        // belongs to the compiler and relativizing a root it is about to reject
+        // changes nothing.
+        if (row.valueTailSeparator != '\0')
+            if (auto const at = value.rfind(row.valueTailSeparator); at != std::string_view::npos)
+                return PathValueMatch {
+                    .flag = row, .prefix = prefix, .value = value.substr(0, at), .valueTail = value.substr(at)
+                };
+
+        return PathValueMatch { .flag = row, .prefix = prefix, .value = value, .valueTail = {} };
     }
     return std::nullopt;
 }

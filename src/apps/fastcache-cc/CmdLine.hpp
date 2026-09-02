@@ -209,8 +209,8 @@ enum class PathValueRole : std::uint8_t
     DebugOutput,
 
     /// A path rewrite the compiler applies to what it EMBEDS (`-fdebug-prefix-map`
-    /// and the two spellings beside it). Alone among these roles the value is not
-    /// a path but a `<path>=<replacement>` pair, and only the head of it is one.
+    /// and the two spellings beside it). Its value carries a tail; where that is
+    /// cut is `PathValueFlag::valueTailSeparator`, not a fact about this role.
     ///
     /// It is here because the flag carries the producing checkout's absolute root
     /// by construction -- that is what it is for -- so an argument nothing
@@ -233,6 +233,23 @@ struct PathValueFlag
     std::string_view spelling;                        ///< The flag text, without its value.
     PathValueRole role { PathValueRole::IncludeDir }; ///< What the value names.
     DriverFamily families { DriverFamily::None };     ///< Which drivers accept this spelling.
+
+    /// For a flag whose value is `<path><sep><rest>`, the separator; `\0` when the
+    /// whole value is the path, which is every row but the prefix-map family.
+    ///
+    /// A COLUMN and not a branch at a consumer, because the shape of a value is a
+    /// fact about the FLAG. This header's own contract two paragraphs up is that
+    /// "the role is what each consumer filters on, so a new flag never grows a
+    /// branch" -- and a consumer asking `role == PrefixMap` to learn where to cut
+    /// is that branch, spelled as a role test. With the column, the next flag
+    /// whose value carries a tail (`-fprofile-prefix-map`, a `<path>:<something>`
+    /// spelling) is a row.
+    ///
+    /// The LAST occurrence is the split point, because that is where GNU splits
+    /// `-fdebug-prefix-map=old=new`: `old` may contain the separator and `new` may
+    /// not. Following the driver rather than being convenient is what makes the
+    /// launcher agree with the compiler about which part is a path.
+    char valueTailSeparator { '\0' };
 };
 
 /// Every flag whose value is a filesystem path, in one table.
@@ -274,7 +291,19 @@ struct PathValueMatch
 {
     PathValueFlag flag;      ///< The table row that matched.
     std::string_view prefix; ///< The argument up to the fused value (flag plus any `=`/`:` separator).
-    std::string_view value;  ///< The fused value; EMPTY when the value is the next argument instead.
+    /// The fused value's PATH portion; EMPTY when the value is the next argument
+    /// instead. For a row with a `valueTailSeparator` this is the part before the
+    /// last separator, and @ref valueTail carries the rest.
+    std::string_view value;
+    /// Whatever followed the path inside the same value, separator included;
+    /// empty for every row without a `valueTailSeparator`.
+    ///
+    /// Split HERE rather than by each consumer, for the same reason `prefix` and
+    /// `value` are: "where does a flag end and its value begin" is answered once,
+    /// and a second copy of that question is exactly how the object output came to
+    /// be relativized in its separated spelling and not in its fused one.
+    /// `prefix + value + valueTail` reconstitutes the argument.
+    std::string_view valueTail;
 };
 
 /// Recognise the path-valued flag an argument names, bare or with a fused value.

@@ -61,9 +61,11 @@ namespace
     {
         std::string_view prefix; ///< The flag and its separator; empty for a bare path.
         std::string_view path;   ///< The path the argument carries.
-        /// Whatever followed the path inside the same argument; empty for every
-        /// role but PrefixMap, whose value is a `<path>=<replacement>` pair and
-        /// whose replacement half must survive the rewrite unchanged.
+        /// Whatever followed the path inside the same argument, taken from the
+        /// matched row's `valueTailSeparator`; empty for every row without one.
+        /// It must survive the rewrite unchanged -- for a prefix-map flag it is
+        /// the replacement half, and two machines mapping to different
+        /// replacements have to compute different keys.
         std::string_view suffix;
     };
 
@@ -88,6 +90,9 @@ namespace
     ///   no-op and the argument comes back byte-for-byte. A *bare* occurrence,
     ///   whose value is the next argument, carries no path of its own and is
     ///   reported as such — that value arrives on its own iteration as a bare path.
+    ///   A row whose value carries a TAIL (`-fdebug-prefix-map=<from>=<to>`)
+    ///   arrives already split, because `MatchPathValueFlag` reads that off the
+    ///   table row rather than leaving each consumer to cut the value itself.
     /// - **A bare path argument**: a source file or a response path.
     ///
     /// What the LAYOUT decides is which introducers may match, and therefore which
@@ -104,24 +109,7 @@ namespace
         auto const introducers = IntroducersFor(layout);
         if (auto const match = MatchPathValueFlag(arg, introducers, DriverFamily::Any);
             match.has_value() && !match->value.empty())
-        {
-            if (match->flag.role != PathValueRole::PrefixMap)
-                return PathPortion { .prefix = match->prefix, .path = match->value, .suffix = {} };
-
-            // `<from>=<to>`, split at the LAST separator because that is where GNU
-            // splits it -- which makes a `from` containing `=` representable and a
-            // `to` containing one not. A value with no separator at all is
-            // malformed and the driver will say so; it is treated as a bare path
-            // here rather than refused, because relativizing a root the compile is
-            // about to reject changes nothing and refusing it would make the
-            // launcher the one reporting a diagnostic that is the compiler's.
-            auto const at = match->value.rfind('=');
-            if (at == std::string_view::npos)
-                return PathPortion { .prefix = match->prefix, .path = match->value, .suffix = {} };
-            return PathPortion { .prefix = match->prefix,
-                                 .path = match->value.substr(0, at),
-                                 .suffix = match->value.substr(at) };
-        }
+            return PathPortion { .prefix = match->prefix, .path = match->value, .suffix = match->valueTail };
 
         if (!arg.empty() && !introducers.contains(arg.front()))
             return PathPortion { .prefix = {}, .path = arg, .suffix = {} };
@@ -153,9 +141,12 @@ namespace
 
         auto const path = Reconciled(resolve, portion->path);
         auto const canon = PathCanon::Canonicalize(path, layout);
-        if (canon != path)
-            return std::string { portion->prefix } + canon + std::string { portion->suffix };
-        return std::string { arg };
+        if (canon == path)
+            return std::string { arg };
+
+        auto out = std::string { portion->prefix } + canon;
+        out.append(portion->suffix);
+        return out;
     }
 
 } // namespace

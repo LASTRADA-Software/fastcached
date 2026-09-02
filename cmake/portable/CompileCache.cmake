@@ -93,9 +93,13 @@ function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped
     set(${outRules} "${rules}" PARENT_SCOPE)
 endfunction()
 
-# A test may want the functions above without the selection below, which probes
-# for launchers, may download one and may start a daemon. Nothing else sets this.
-if(FASTCACHE_COMPILE_CACHE_DEFINE_ONLY)
+# Everything below needs a project: there is no compiler to probe, no target to
+# front and no build to cache without one. `cmake -P` therefore stops here and
+# takes the pure computations above -- which is how `check-debug-prefix-map.cmake`
+# tests them. A stock condition rather than a variable of our own, so a project
+# that vendors this file inherits no undocumented mode flag whose only meaning is
+# that fastcached is testing itself.
+if(CMAKE_SCRIPT_MODE_FILE)
     return()
 endif()
 
@@ -1275,84 +1279,71 @@ if(_fc_cache_chosen)
     # in CMAKE_<LANG>_FLAGS fails the compiler ABI check and takes the whole
     # configure down -- exactly what this module may not do.
     #
-    # The guard names the GNU-layout drivers POSITIVELY and then excludes the
-    # MSVC-simulating ones, rather than negating the block above. `cl` does not
-    # reject an unknown `-f...` outright -- it reports D9002 and carries on
-    # exiting 0 -- so `check_cxx_compiler_flag` succeeds there and the flag would
-    # be appended to a compiler that ignores it, on the one platform where this
-    # cannot work at all. `clang-cl` matches "Clang" and is excluded by the second
-    # clause, which is what the 23-byte measurement above is about.
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
-        # The build tree is mapped FIRST and this project's lives inside the
-        # source tree (`out/build/<preset>`). GCC and Clang take the first
-        # matching rule, so source-first would swallow every build-tree path and
-        # rewrite it to `./out/build/<preset>/...` -- still checkout-independent,
-        # but a different answer on a machine whose build tree is elsewhere, which
-        # is the one property this is for.
-        _fc_debug_prefix_map_rules("${CMAKE_BINARY_DIR}" "${CMAKE_SOURCE_DIR}"
-                                   _fc_prefix_maps _fc_source_mapped)
+    # Per LANGUAGE throughout, because the C and C++ compilers need not be the
+    # same product -- which the previous shape asserted in a comment while asking
+    # `CMAKE_CXX_COMPILER_ID` once and applying the answer to both.
+    _fc_debug_prefix_map_rules("${CMAKE_BINARY_DIR}" "${CMAKE_SOURCE_DIR}"
+                               _fc_prefix_maps _fc_source_mapped)
+    list(TRANSFORM _fc_prefix_maps PREPEND "-fdebug-prefix-map=" OUTPUT_VARIABLE _fc_prefix_map_flags)
+    list(JOIN _fc_prefix_map_flags " " _fc_prefix_map_flags)
 
-        set(_fc_prefix_map_flags "")
-        foreach(_map IN LISTS _fc_prefix_maps)
-            list(APPEND _fc_prefix_map_flags "-fdebug-prefix-map=${_map}")
-        endforeach()
-        list(JOIN _fc_prefix_map_flags " " _fc_prefix_map_flags)
-
-        # Asked per language, because the C and C++ compilers need not be the same
-        # product -- and cached by check_<lang>_compiler_flag, so a reconfigure
-        # pays nothing.
-        #
-        # Only for a language this project has actually ENABLED. `check_c_compiler_flag`
-        # is a hard `CMake Error` ("C: needs to be enabled before use") when it is
-        # not, which fails the configure -- the one thing this file may not do.
-        # Measured, not anticipated: this module is included from a `project()`
-        # that lists CXX before C is added, and the first run of the check ended
-        # the configure outright. A language the project never enables also has no
-        # compile lines to put a flag on, so skipping it is right rather than
-        # merely safe.
-        get_property(_fc_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
-        set(_fc_prefix_map_langs "")
-        set(_fc_prefix_map_skipped "")
-        if("C" IN_LIST _fc_enabled_languages)
-            include(CheckCCompilerFlag)
-            check_c_compiler_flag("-fdebug-prefix-map=/a=/b" FASTCACHE_C_HAS_DEBUG_PREFIX_MAP)
-            if(FASTCACHE_C_HAS_DEBUG_PREFIX_MAP)
-                string(APPEND CMAKE_C_FLAGS " ${_fc_prefix_map_flags}")
-                list(APPEND _fc_prefix_map_langs C)
-            else()
-                list(APPEND _fc_prefix_map_skipped "C (driver rejected the flag)")
-            endif()
-        endif()
-        if("CXX" IN_LIST _fc_enabled_languages)
-            include(CheckCXXCompilerFlag)
-            check_cxx_compiler_flag("-fdebug-prefix-map=/a=/b" FASTCACHE_CXX_HAS_DEBUG_PREFIX_MAP)
-            if(FASTCACHE_CXX_HAS_DEBUG_PREFIX_MAP)
-                string(APPEND CMAKE_CXX_FLAGS " ${_fc_prefix_map_flags}")
-                list(APPEND _fc_prefix_map_langs CXX)
-            else()
-                list(APPEND _fc_prefix_map_skipped "CXX (driver rejected the flag)")
-            endif()
+    # A language this project has not ENABLED is asked nothing: `check_compiler_flag`
+    # is a hard `CMake Error` ("C: needs to be enabled before use") otherwise, which
+    # fails the configure -- the one thing this file may not do. Measured rather than
+    # anticipated: this module is included from a `project()` that lists CXX before C
+    # is added, and the first run of the check ended the configure outright. A
+    # language nobody enabled also has no compile lines to put a flag on, so skipping
+    # it is right rather than merely safe.
+    get_property(_fc_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+    set(_fc_prefix_map_langs "")
+    set(_fc_prefix_map_skipped "")
+    include(CheckCompilerFlag)
+    foreach(_lang IN ITEMS C CXX)
+        if(NOT "${_lang}" IN_LIST _fc_enabled_languages)
+            continue()
         endif()
 
-        # Say which languages got it AND which did not, rather than only the happy
-        # half: a driver that rejected the flag still caches, still shares, and
-        # still replays objects naming another checkout. "Applied", "rejected" and
-        # "the language is not enabled" are three different situations and a
-        # single line saying only the first collapses them.
-        if(_fc_prefix_map_langs)
-            list(JOIN _fc_prefix_map_langs "/" _fc_prefix_map_langs)
-            message(STATUS "[cache] Mapping debug paths for ${_fc_prefix_map_langs} so replayed objects "
-                           "name no checkout: ${_fc_prefix_map_flags}")
-            if(NOT _fc_source_mapped)
-                message(STATUS "[cache] The source root is NOT mapped: the build tree lies outside it, so the "
-                               "relative path back would carry the checkout's own path")
-            endif()
+        # The MSVC family is excluded by NAME rather than left to the probe. `cl`
+        # does not reject an unknown `-f...` outright -- it reports D9002 and exits
+        # 0 -- so the check would succeed and the flag would be appended to a
+        # compiler that ignores it, on the one platform where this cannot work at
+        # all. `clang-cl` matches "Clang" and is excluded by the simulate-id clause,
+        # which is what the 23-byte measurement above is about.
+        if(NOT CMAKE_${_lang}_COMPILER_ID MATCHES "GNU|Clang"
+           OR CMAKE_${_lang}_SIMULATE_ID STREQUAL "MSVC")
+            list(APPEND _fc_prefix_map_skipped "${_lang} (no path-map switch on this driver)")
+            continue()
         endif()
-        if(_fc_prefix_map_skipped)
-            list(JOIN _fc_prefix_map_skipped ", " _fc_prefix_map_skipped)
-            message(STATUS "[cache] Debug paths NOT mapped for ${_fc_prefix_map_skipped}; replayed objects "
-                           "will carry the producing checkout's paths in their debug info")
+
+        # `check_compiler_flag` rather than the per-language modules, and cached in
+        # `FASTCACHE_<LANG>_HAS_DEBUG_PREFIX_MAP`, so a reconfigure pays nothing.
+        check_compiler_flag(${_lang} "-fdebug-prefix-map=/a=/b" FASTCACHE_${_lang}_HAS_DEBUG_PREFIX_MAP)
+        if(FASTCACHE_${_lang}_HAS_DEBUG_PREFIX_MAP)
+            string(APPEND CMAKE_${_lang}_FLAGS " ${_fc_prefix_map_flags}")
+            list(APPEND _fc_prefix_map_langs ${_lang})
+        else()
+            list(APPEND _fc_prefix_map_skipped "${_lang} (driver rejected the flag)")
         endif()
+    endforeach()
+
+    # Say which languages got it AND which did not, rather than only the happy
+    # half: a driver that cannot take the flag still caches, still shares, and
+    # still replays objects naming another checkout. Applied, rejected, no such
+    # switch, and not enabled are four different situations, and a line reporting
+    # only the first reads identically in all of them.
+    if(_fc_prefix_map_langs)
+        list(JOIN _fc_prefix_map_langs "/" _fc_prefix_map_langs)
+        message(STATUS "[cache] Mapping debug paths for ${_fc_prefix_map_langs} so replayed objects "
+                       "name no checkout: ${_fc_prefix_map_flags}")
+        if(NOT _fc_source_mapped)
+            message(STATUS "[cache] The source root is NOT mapped: the build tree lies outside it, so the "
+                           "relative path back would carry the checkout's own path")
+        endif()
+    endif()
+    if(_fc_prefix_map_skipped)
+        list(JOIN _fc_prefix_map_skipped ", " _fc_prefix_map_skipped)
+        message(STATUS "[cache] Debug paths NOT mapped for ${_fc_prefix_map_skipped}; replayed objects "
+                       "will carry the producing checkout's paths in their debug info")
     endif()
 else()
     # Define the launchers as empty rather than leaving them unset. Fetched
