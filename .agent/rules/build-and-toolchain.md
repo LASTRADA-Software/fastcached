@@ -559,11 +559,12 @@ determinism rests on.
 
 ## A retry makes every one of these disappear without fixing it
 
-Eight separate ways the gate reported something that was not about the tree under
-test have turned up across two tickets — six while fixing
+Nine separate ways the gate reported something that was not about the tree under
+test have turned up across three tickets — six while fixing
 [#493](https://github.com/LASTRADA-Software/fastcached/issues/493), two more while
-fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247). Not one of
-them announced itself. Every one presented as an ordinary flake, and **a re-run would
+fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), and one
+while fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243). Not
+one of them announced itself. Every one presented as an ordinary flake, and **a re-run would
 have cleared all of them without fixing any of them** — which is the whole reason they
 are written down here rather than in those pull requests.
 
@@ -618,6 +619,30 @@ The specific traps are examples. The rule is the mechanism.
   filesystem it exists to measure** — write the log to ext4 and copy it to `/mnt/c`
   at the end, which keeps it surviving a WSL idle-out without putting DrvFs in the
   path of opening it.
+
+- **The instrument edited the tree and then measured what it had edited.** Not a
+  mix-up: no wrong path, no stale ref, no forgotten `cd`. `scripts/local-gate.sh` runs
+  `clang-format -i` as its first leg, so a commit that was not already formatted is
+  **rewritten**, and the build and test legs then judge the rewritten tree. The gate
+  measured exactly the tree in front of it, and the tree in front of it was no longer
+  the commit *because the gate had changed it*. An observer effect rather than a
+  confusion — and every `--fix`-mode tool has the same shape.
+  - **The guard failure is structural, not an omission.** A dirty-tree check that
+    samples **once, at the start** cannot detect a change caused by the thing it is
+    guarding: the tree was clean when it looked. That is why "check the tree is clean
+    before you start" is insufficient on its own, and why the entry above says *name
+    the commit before starting, re-check it at the end*. Sampling at both ends is the
+    only shape that works.
+  - **Implementing half of a two-clause rule looks exactly like compliance.** The
+    wrapper that met this printed `N_GATE_COMMIT` and `N_GATE_DIRTY` before the run and
+    never again — the first clause faithfully, the second not at all. Nothing in the
+    output says a clause is missing, which makes this the most common way a two-part
+    rule fails.
+  - **"It's only formatting" is a claim, not a fact.** The delta was line wrapping and
+    one include reorder, which is where almost anyone stops. An include reorder changes
+    a translation unit's contents and can change what compiles. Amend the formatting
+    into the commit and **re-run** the legs that measured the other tree, rather than
+    reasoning about whether whitespace could matter.
 
 Two that are not about shells at all, and are the ones a reader is most likely to
 recognise in themselves:

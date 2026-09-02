@@ -785,8 +785,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
   `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
-  DrvFs log redirect that failed while leaving the gate child ALIVE. None announces itself;
-  each looks like a flake; a re-run clears all eight. Presence is not usability, and a
+  DrvFs log redirect that failed while leaving the gate child ALIVE, and the gate's own
+  `clang-format -i` REWRITING the commit and then measuring what it had rewritten. None
+  announces itself; each looks like a flake; a re-run clears all nine. A dirty-tree guard
+  that samples once AT THE START cannot see an instrument that dirties the tree itself —
+  sample at both ends, and note that implementing half of a two-clause rule looks exactly
+  like compliance. Presence is not usability, and a
   finding fixed at the line rather than at the rule comes back.
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
   reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
