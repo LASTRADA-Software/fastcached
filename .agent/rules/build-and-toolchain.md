@@ -944,8 +944,8 @@ averages 11.0 min but ranges 0.8–26.0, and it is longest only in the 4 of 13 r
 where the change escalated it to a full sweep. And **landing a change pays both
 of the bottom two rows**, which is the next bullet.
 
-- **Every merge builds the identical tree twice, and the second build's only
-  unique product is a handful of cache entries.** A `merge_group` run and the
+- **The `push` on master rebuilds a tree the merge queue has already proved, and
+  its only unique product is a handful of cache entries.** A `merge_group` run and the
   `push` on master that follows it carry the *same* `head_sha` — 6 of 6 pairs
   checked on 2026-09-02 — so the master push recompiles, retests and repackages a
   tree the queue has already proved green. That is a whole bottom row of the table
@@ -953,12 +953,13 @@ of the bottom two rows**, which is the next bullet.
   pull-request time, which is the scoping working, then **108.9 + 95.0** to land
   it.
 
-  The condition on those six pairs is a queue **batch of one**, which is what this
-  repository has had. GitHub batches queue entries, and a batch of N dispatches N
-  `merge_group` events and lands as ONE push — so "twice" is the batch-size-one
-  reading of a ratio that is really `(N + 1) / N`, and the per-merge price falls as
-  batches grow. `build.yml`'s `changes` job already records the batching from the
-  other side.
+  Per *merge* that is a doubling, and only at a queue **batch of one** — which is
+  what this repository has had, and is the condition on those six pairs. GitHub
+  batches queue entries, and a batch of N dispatches N `merge_group` events and
+  lands as ONE push, so the ratio is `(N + 1) / N` and the per-merge price falls as
+  batches grow. The duplicated *run* does not: there is one redundant full matrix
+  per batch whatever N is. `build.yml`'s `changes` job already records the batching
+  from the other side.
 
   It is not pure waste, and the difference is measurable rather than argued.
   *Measured*: on the same `head_sha` the queue run had just compiled, each Windows
