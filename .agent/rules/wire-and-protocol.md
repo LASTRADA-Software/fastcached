@@ -830,6 +830,73 @@ Every rule below has already been a bug.
   to complete the second after the first has taken the socket down; and the same edit
   went to `KqueueSocket::Close`, which was a copy of the same loop and had the same
   defect on a platform where nothing had ever run a sanitizer either.
+- **A watchdog may not write to a socket a coroutine owns, and the reason is
+  OWNERSHIP rather than interleaving.** `FrameServer::CloseOverdue` closes connections
+  past their deadline, so a peer got a bare TCP close it cannot tell from a crash, a
+  drop, or a refusal it never received. The obvious repair — have the sweeper send a
+  named refusal first — has an obvious objection and a decisive one, and only the
+  decisive one survives contact with a fix. The obvious objection is interleaving:
+  `ServeConnection` performs seven `WriteAll` calls across its loop, so a second writer
+  splices a refusal into somebody's answer, which is the crossed-reply hazard of
+  [`distributed-compilation.md`](distributed-compilation.md) reached from the OUTPUT
+  side. That is true, and it invites the wrong fix — a write lock — because it reads
+  as a synchronisation problem. **The decisive objection is that the socket lives in
+  `ServeConnection`'s coroutine frame (`std::unique_ptr<ISocket> owned`) and the
+  sweeper's table holds a bare pointer.** A `co_await socket->Write(...)` in the
+  sweeper holds that pointer across a suspension the connection can complete and
+  destroy through, so it is a use-after-free that **any amount of interlocking leaves
+  in place**. A lock there is a second bug wearing a fix's clothes.
+  - **So the sweep asks WHERE the connection is parked, and the two answers differ in
+    kind.** Parked on the socket — dribbling a header, dribbling a declared payload,
+    pushing out a reply — nothing but the close ends it, and the close is the write
+    side gone: it is closed, and told nothing. Parked inside the responder, the close
+    wakes nothing at all (the compile runs to completion, hops home, and its
+    `WriteAll` fails — `IFrameResponder::RequestTimeout` had already recorded this),
+    the write side is idle, and the coroutine comes back on its own. There the entry
+    is MARKED and left open, and the connection writes its own refusal when `Answer`
+    returns.
+  - **"Explainable" therefore means parked in the surface, never "has named a verb".**
+    The wider phrasing is the one that reads well and silently promises the
+    payload-dribble case, which cannot be honoured without a read-side half-close on
+    `ISocket` — and `SHUT_RD` waking a pending IOCP `WSARecv` is not the same story as
+    epoll. State the narrow rule; a clause delivered at 80% closes a ticket over a
+    surviving gap.
+  - **The observation point is ONE line — after `Answer` returns — and that is the
+    whole reason this is safe.** A "check whether you were swept before writing" rule
+    at each of seven write sites is a rule to forget at the eighth. Here it is a
+    consequence of where the mark can be set at all, so exactly one writer is
+    structural rather than agreed.
+  - **A deferral needs its own bound, and that bound is DERIVED from the responder's
+    own window — never a constant.** `Answer` is an interface and nothing can promise
+    it returns, so leaving the socket open would hold a descriptor for the life of the
+    process where the old close released it; `ExplanationGraceFor` closes it after all.
+    It shipped once as a flat `SweepInterval * 4`, which is five seconds, against a
+    `CompileResponder::RequestTimeout` of six hundred — **a factor of 120**. A TU that
+    has just outrun a ten-minute grant does not return inside five seconds, so the
+    deferral expired, the socket closed, and nothing was owed when `Answer` came back:
+    the fix explained itself reliably on the cache surface, where the problem is mild,
+    and silently not at all on the compile surface it was written for. The constant's
+    own justification — *"a property of this mechanism and not of a site's workload"* —
+    sat three hundred lines below `IFrameResponder::RequestTimeout` arguing that **one
+    number cannot bound both things this endpoint carries**, and pure virtual precisely
+    so no surface can inherit five seconds. The general form: **a duration this endpoint
+    applies to a responder's work belongs to the responder**, and a constant is how it
+    silently stops applying to the surface that needed it most. The connection SLOT is
+    held by the coroutine frame either way, so the close was only ever buying one
+    descriptor.
+  - **And the case that proves the fix could not see it.** The integration test used a
+    50 ms window and released its hold at once, so it never approached the grace. Nor is
+    the magnitude cheap to assert: the sweep fires at `RequestTimeout` and the grace is
+    derived from that same number, so discriminating the old constant needs a window
+    above five seconds and a hold between the two — sixteen-plus seconds, measured
+    through sleeps whose spread is the quantity. So the grace is a **pure function**
+    over the window, pinned on both sides, which is the testing rules' preference
+    applied to exactly the situation they describe.
+  - **Two counters, two events.** `FrameAnswerDeadlineSweeps` keeps its exact meaning
+    (a sweep happened) so nothing scraping it breaks; `FrameDeadlineRefusalsSent` says
+    how many of those peers were told why, moved by the connection when the write
+    SUCCEEDS. The gap between them is a real quantity — swept peers left to infer it —
+    rather than an error term, and a peer that had already hung up belongs in it.
 - **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
   grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
   way to take it back, which is why `DeadlineTimer` and `InterruptibleSleepUntil`

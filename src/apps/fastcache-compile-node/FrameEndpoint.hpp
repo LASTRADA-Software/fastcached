@@ -9,7 +9,9 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
+#include <FastCache/Protocol/SurfaceRefusal.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -20,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -68,6 +71,27 @@ enum class EndpointRefusal : std::uint8_t
     /// #447 it answered `Unauthenticated` on the wire and moved nothing at all.
     CredentialRejected,
 
+    /// The surface was still answering when the verb's own window ran out.
+    ///
+    /// **The one refusal here that is decided by a clock rather than by a frame**,
+    /// and the only one the connection writes on its own initiative rather than in
+    /// answer to something the peer just sent. `FrameServer::CloseOverdue` decides
+    /// it; `ServeConnection` writes it, from the one place that owns the write side.
+    ///
+    /// Reachable only for a connection parked INSIDE the responder. A peer swept
+    /// while the connection is parked on the socket -- dribbling a header, dribbling
+    /// a declared payload -- is ended by the close, because the close is the only
+    /// thing that ends a parked read and it is the write side gone. See
+    /// `FrameServer::CloseOverdue` for why that asymmetry is the design rather than
+    /// a shortfall ([#523](https://github.com/LASTRADA-Software/fastcached/issues/523)).
+    ///
+    /// **Counted by the ENDPOINT, not by the surface**, which is why every responder
+    /// answers it through `Cc::RefuseWithoutCounter`. The deadline is the endpoint's
+    /// fact: `FrameAnswerDeadlineSweeps` already tallies the sweep and
+    /// `FrameDeadlineRefusalsSent` tallies how many of those peers were told why.
+    /// Three per-surface copies of one endpoint fact would be three things to drift.
+    AnswerDeadline,
+
     /// The count. See `Core/EnumTable.hpp`.
     Last,
 };
@@ -95,10 +119,81 @@ inline constexpr EnumTable<EndpointRefusal, EndpointRefusalCode> EndpointRefusal
     { .refusal = EndpointRefusal::InFlightBudget, .code = CompileCacheWire::ErrorCode::EndpointBusy },
     { .refusal = EndpointRefusal::CredentialMalformed, .code = CompileCacheWire::ErrorCode::MalformedFrame },
     { .refusal = EndpointRefusal::CredentialRejected, .code = CompileCacheWire::ErrorCode::Unauthenticated },
+    { .refusal = EndpointRefusal::AnswerDeadline, .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded },
 } };
 
 static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::refusal),
               "EndpointRefusalCodes must hold one row per EndpointRefusal, in enumerator order");
+
+/// Why no surface counts `EndpointRefusal::AnswerDeadline`, stated once for all three.
+///
+/// Beside the enumerator rather than in any one responder, exactly as
+/// `EndpointRefusalCodes` is: this is a property of the refusal, not of the surface
+/// that happens to answer it. Three surfaces stating one fact separately is three
+/// sentences that agree today, and the divergence would be invisible.
+///
+/// The deadline belongs to the ENDPOINT. It decides the sweep and it already carries
+/// both halves: `FrameAnswerDeadlineSweeps` for the sweep, and
+/// `FrameDeadlineRefusalsSent` for the peer that was told why. A surface counting it
+/// again would be a third tally of one event, summed by whoever met two of them first.
+inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
+    "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
+    "refusal-sent row; a per-surface copy would be a third tally of one event";
+
+/// Whether a refusal row states exactly one of the two claims a refusal can make.
+///
+/// `Cc::Refuse` says a rise here means something an operator acts on;
+/// `Cc::RefuseWithoutCounter` says a rise would mean nothing, and why. A row must
+/// assert one of those and not the other: a row asserting NEITHER is what a guard
+/// short-circuiting on the absent counter passes vacuously, shipping a new refusal
+/// uncounted and unexplained, and a row asserting BOTH is an author who could not
+/// choose, answered here rather than at whichever call site read the fields in the
+/// luckier order.
+///
+/// **One predicate for all three surfaces**, beside the enumerator like
+/// `EndpointRefusalCodes` and `AnswerDeadlineIsTheEndpointsRationale`, because it is a
+/// property of what a refusal row IS rather than of any surface. It was briefly three:
+/// `Detail::StatesOneClaim` for the cache, plus the same truth table open-coded twice
+/// as `answer.has_value() != !rationale.empty()` -- one rule, three sites, two of them
+/// spelled in the inverted form and neither reachable by a grep for the name.
+/// @param counted Whether the row carries a counted answer.
+/// @param rationale The row's reason for counting nothing; empty when it counts.
+/// @return True when exactly one of the two is present.
+[[nodiscard]] constexpr bool StatesOneRefusalClaim(bool counted, std::string_view rationale) noexcept
+{
+    return counted == rationale.empty();
+}
+
+/// Answer an endpoint-decided refusal the way its row decided, counted or not.
+///
+/// The one door both the scheduler and the compile surface reach their
+/// `EndpointRefusalReply` through, so the counted and uncounted spellings are chosen
+/// from data rather than remembered at two call sites. `CacheResponder` has had this
+/// shape since #491 (`Detail::AnswerCacheRefusal`); the other two hand-wrote the same
+/// three-line branch, which is the one branch
+/// [`metrics-and-observability.md`](../../../.agent/rules/metrics-and-observability.md)
+/// singles out -- *"deliberately uncounted must not be spelled like forgot"* -- and so
+/// the one that least deserves three independent implementations.
+///
+/// The code is taken rather than re-derived, because both callers already hold it from
+/// `ErrorCodeFor(refusal)` and passing it keeps this function from needing to know
+/// which enumeration it is answering about.
+/// @param metrics Where a counted refusal is recorded.
+/// @param code What the client is told.
+/// @param answer The counted row, or nothing where this surface counts none.
+/// @param rationale Why nothing is counted; read only when @p answer is absent.
+/// @param detail Words for a person, or empty when there are none to add.
+/// @return The encoded reply. Never empty.
+[[nodiscard]] inline std::vector<std::byte> AnswerEndpointRefusal(IMetricsSink& metrics,
+                                                                  CompileCacheWire::ErrorCode code,
+                                                                  std::optional<Cc::SurfaceRefusal> const& answer,
+                                                                  std::string_view rationale,
+                                                                  std::string_view detail)
+{
+    if (!answer.has_value())
+        return Cc::RefuseWithoutCounter({ .code = code, .rationale = rationale }, detail);
+    return Cc::Refuse(metrics, *answer, detail);
+}
 
 /// The wire code @p refusal is answered with.
 /// @param refusal Any enumerator but `Last`.
@@ -513,6 +608,57 @@ class FrameServer
     /// a guarantee and is not one. So a refused socket outlives its answer by at most
     /// two ticks, against the six a served request may take.
     static constexpr std::chrono::milliseconds RefusalTimeout { SweepInterval };
+
+    /// How long a swept-but-not-closed connection is given to come back and explain
+    /// itself before it is closed after all.
+    ///
+    /// A connection swept while parked INSIDE the responder is not closed: closing it
+    /// there wakes nothing (`IFrameResponder::RequestTimeout` says why) and only
+    /// destroys the write side the refusal has to leave by. It is marked instead, and
+    /// the connection writes its own refusal when `Answer` returns.
+    ///
+    /// **This is what keeps that deferral from being unbounded.** `Answer` is an
+    /// interface, so nothing here can promise it returns at all -- a wedged responder
+    /// would otherwise hold the descriptor for the life of the process, where the old
+    /// unconditional close released it. When this expires the sweeper closes as it
+    /// always did, so the fix can only ever cost this much promptness and never the
+    /// property it replaced.
+    ///
+    /// **Derived from the verb's own window, and it shipped once as a flat constant
+    /// that was wrong by a factor of 120.** `SweepInterval * 4` resolves to five
+    /// seconds; `CompileResponder::RequestTimeout` is `DefaultCompileLeaseTimeout`,
+    /// which is six hundred. A translation unit that has just outrun a ten-minute
+    /// grant does not return inside five seconds, so the deferral expired, the socket
+    /// was closed, and the connection found nothing owed when `Answer` finally came
+    /// back -- delivering the explanation reliably on the cache surface, where the
+    /// problem is mild, and silently not at all on the compile surface, which is the
+    /// one #523 was filed about. The constant's own justification was that its value
+    /// is "a property of this mechanism and not of a site's workload", written three
+    /// hundred lines below `IFrameResponder::RequestTimeout` arguing that ONE NUMBER
+    /// CANNOT BOUND BOTH THINGS this endpoint carries -- and pure virtual so that no
+    /// surface can inherit five seconds, because five seconds is exactly the value
+    /// that makes this failure.
+    ///
+    /// So the rule is: **a responder gets at most twice its own budget before the
+    /// socket goes.** Ten seconds on the cache, twenty minutes on a compile; both
+    /// bounded, both proportional to what the surface itself said its work costs, and
+    /// neither able to drift from `RequestTimeout` because it is the same number. No
+    /// flag and no new virtual -- the value comes from a question the endpoint
+    /// already asks at the point it arms the answer window.
+    ///
+    /// A pure function over the window rather than arithmetic inlined at the sweep,
+    /// so the magnitude can be pinned on both sides without a case that waits out a
+    /// wall-clock spread the instrument's own noise is comparable to.
+    /// @param window The verb's answer window, as the responder named it.
+    /// @return How long past the sweep the descriptor is held open.
+    [[nodiscard]] static constexpr std::chrono::milliseconds ExplanationGraceFor(std::chrono::milliseconds window) noexcept
+    {
+        // Floored at the sweeper's cadence, which is the floor on how promptly any
+        // deadline here can be acted on: a grace under one tick would be a number
+        // that reads like a guarantee and is not one. The same argument
+        // `RefusalTimeout` above makes for the same reason.
+        return std::max(window, SweepInterval);
+    }
 
     /// @param io The loop this server accepts and answers on.
     /// @param listener Bound listener; must outlive the run.

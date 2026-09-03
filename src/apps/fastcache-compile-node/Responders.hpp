@@ -62,7 +62,12 @@ namespace Detail
     /// @return True when exactly one of the counter and the rationale is present.
     [[nodiscard]] constexpr bool StatesOneClaim(CacheRefusalPolicy const& policy) noexcept
     {
-        return policy.counter.has_value() == policy.rationale.empty();
+        // Delegated rather than restated. The rule belongs to a refusal ROW and not to
+        // this surface, so it lives beside the enumerator with the wire codes and the
+        // shared rationale. Three surfaces spelling one truth table separately is how
+        // it briefly came to exist in two idioms, one of them the double-negated form
+        // -- and a grep for the name reached only one of the three.
+        return StatesOneRefusalClaim(policy.counter.has_value(), policy.rationale);
     }
 
     /// Answer a cache-surface refusal the way its row decided.
@@ -122,6 +127,8 @@ namespace Detail
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
           .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+        { .refusal = EndpointRefusal::AnswerDeadline,
+          .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
     } };
 
     // Positional rows alone would not catch an appended enumerator: it leaves a
@@ -216,28 +223,61 @@ namespace Detail
     /// reinstates elsewhere in this change, and a file holding two new security
     /// counters is the last place to ship the other spelling.
     ///
-    /// A `std::optional` per row rather than a switch with a silent arm, because one
-    /// refusal here deliberately counts NOTHING: the byte budget says this surface is
+    /// A `std::optional` per row rather than a switch with a silent arm, because two
+    /// refusals here deliberately count NOTHING: the byte budget says this surface is
     /// momentarily full, which the peer retries past, and summed into a credential
-    /// series it would make that series unreadable. `nullopt` says so where a missing
-    /// `case` would only imply it. `EnumTable` takes its extent from
-    /// `EndpointRefusal::Last`, so a fourth enumerator leaves an empty row here rather
+    /// series it would make that series unreadable; and the answer deadline is the
+    /// endpoint's own decision, counted in the endpoint's own rows. `nullopt` says so
+    /// where a missing `case` would only imply it. `EnumTable` takes its extent from
+    /// `EndpointRefusal::Last`, so a fifth enumerator leaves an empty row here rather
     /// than silently borrowing a neighbour's.
     struct SchedulerEndpointRefusal
     {
         EndpointRefusal refusal;                  ///< Which endpoint decision this describes.
         std::optional<Cc::SurfaceRefusal> answer; ///< The row, or nothing where this surface counts none.
+
+        /// Why nothing is counted, for a row whose `answer` is `nullopt`.
+        ///
+        /// **On the ROW, because the reasons differ.** It used to be one literal at
+        /// the call site, correct while exactly one row was uncounted -- and the
+        /// moment a second appeared, that sentence would have explained the byte
+        /// budget to somebody reading about a deadline. `UncountedRefusal::rationale`
+        /// is a forcing function precisely so an author states the reason for THIS
+        /// refusal, and a shared literal is how it stops forcing anything.
+        std::string_view rationale;
     };
 
     inline constexpr EnumTable<EndpointRefusal, SchedulerEndpointRefusal> SchedulerEndpointRefusals { {
-        { .refusal = EndpointRefusal::InFlightBudget, .answer = std::nullopt },
+        { .refusal = EndpointRefusal::InFlightBudget,
+          .answer = std::nullopt,
+          .rationale = "the byte budget says this surface is momentarily full, which the peer sees and retries; summed "
+                       "into a security series it is what makes that series unreadable" },
+        // `.rationale` empty and SAID so, for the reason the compile surface's table
+        // spells it: clang and GCC refuse the omission under this project's pedantic
+        // flags and MSVC accepts it silently.
         { .refusal = EndpointRefusal::CredentialMalformed,
           .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed } },
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed },
+          .rationale = {} },
         { .refusal = EndpointRefusal::CredentialRejected,
           .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected } },
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected },
+          .rationale = {} },
+        { .refusal = EndpointRefusal::AnswerDeadline,
+          .answer = std::nullopt,
+          .rationale = AnswerDeadlineIsTheEndpointsRationale },
     } };
+
+    // Every uncounted row says why, and no counted row carries a reason it does not
+    // need. The same "states one claim" guard the cache table has, and for the same
+    // reason: a row asserting neither is the vacuous pass, and one asserting both is
+    // an author who could not choose, answered here rather than at whichever call
+    // site read the fields in the luckier order.
+    static_assert(std::ranges::all_of(SchedulerEndpointRefusals,
+                                      [](SchedulerEndpointRefusal const& row) {
+                                          return StatesOneRefusalClaim(row.answer.has_value(), row.rationale);
+                                      }),
+                  "every scheduler endpoint refusal must state either a counted answer or a rationale, not both");
 
     // Positional rows alone would not have caught this: appending an enumerator leaves
     // a value-initialised row here, whose `answer` is `nullopt` -- so a guard that
@@ -375,24 +415,20 @@ class SchedulerResponder final: public IFrameResponder
     /// three different things, which is the whole argument for a row being the
     /// refusal rather than the code.
     ///
-    /// The byte budget is not counted, for the reason the size and opcode arms of
-    /// `RefusalReply` are not: it says this surface is momentarily full, which the
-    /// peer sees and retries, and summing it into a security series is what makes
-    /// that series unreadable. `Detail::SchedulerEndpointRefusals` is where that is
-    /// said, and where the two that ARE counted carry their rows.
+    /// Two arms are not counted, and each says why in its own row. The byte budget
+    /// says this surface is momentarily full, which the peer sees and retries, and
+    /// summing it into a security series is what makes that series unreadable; the
+    /// answer deadline is the endpoint's decision and the endpoint counts it.
+    /// `Detail::SchedulerEndpointRefusals` is where both are said, and where the two
+    /// that ARE counted carry their rows -- the rationale travels with the row rather
+    /// than sitting here, because a sentence written once at the call site explained
+    /// the budget correctly and would have explained a deadline wrongly.
     [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal refusal,
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const override
     {
-        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)].answer;
-        if (!row.has_value())
-            return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal),
-                                              .rationale =
-                                                  "the byte budget says this surface is momentarily full, which the peer "
-                                                  "sees and retries; summed into a security series it is what makes that "
-                                                  "series unreadable" },
-                                            detail);
-        return Cc::Refuse(_metrics, *row, detail);
+        auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)];
+        return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout

@@ -146,6 +146,54 @@ struct Fleet
     co_return received;
 }
 
+/// Read every byte the peer sends until it closes, then return all of them.
+///
+/// The counterpart of `ReadOneReply` for a case that has to assert what is NOT on
+/// the wire. Reading one framed reply cannot see a second frame spliced in behind
+/// it, and "the reply parsed" is exactly the assertion a crossed or interleaved
+/// write passes -- so a case about two writers has to look at the whole byte stream
+/// and account for all of it.
+///
+/// Bounded, and the bound is a failure rather than a truncation: a caller asserting
+/// on the total must not be handed a prefix that happens to look right.
+/// @param peer Connected socket.
+/// @param limit Most bytes to accumulate before giving up.
+/// @return Everything received before EOF, or empty when the limit was reached first.
+[[nodiscard]] Task<std::vector<std::byte>> ReadUntilPeerCloses(ISocket* peer, std::size_t limit)
+{
+    std::vector<std::byte> received;
+    while (received.size() <= limit)
+    {
+        std::array<std::byte, 4096> chunk {};
+        auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+        if (!read.has_value() || *read == 0)
+            co_return received;
+        received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+    }
+    co_return std::vector<std::byte> {};
+}
+
+/// Write bytes to an already-connected peer, without reading anything back.
+///
+/// A free function taking a raw pointer for the reason `ReadAtLeast` is one: a
+/// capturing lambda coroutine outlives the expression that created it.
+///
+/// **It replaces two inline copies rather than adding a sixth.** The predicate "the
+/// write was accepted" is already spelled out at five places in this tree, including
+/// `FrameEndpoint.cpp`'s own `WriteAll` a hundred lines from the code under test --
+/// and this file had written the same coroutine out inline twice. There is no shared
+/// byte-span writer for test code to call; making one is a `src/tests/` change that
+/// would also want the three read helpers above it, and it is not this ticket's.
+/// Recorded here so the next person adding a seventh knows the count.
+/// @param peer Connected socket.
+/// @param bytes What to send; may be a partial frame, which is the point.
+/// @return Whether the write was accepted.
+[[nodiscard]] Task<bool> SendRaw(ISocket* peer, std::vector<std::byte> bytes)
+{
+    auto const written = co_await peer->Write(std::span<std::byte const> { bytes });
+    co_return written.has_value() && *written == bytes.size();
+}
+
 /// Send one frame to `port` and read the reply.
 /// @param port Where the endpoint is listening.
 /// @param frame The request, header included.
@@ -903,10 +951,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     constexpr std::uint32_t Declared = 32ULL * 1024ULL;
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
-    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
-        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
-        co_return written.has_value();
-    }(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
+    REQUIRE(SyncRun(SendRaw(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
 
     // The refusal arrives first. Asserted so the observation below cannot pass because
     // the connection was closed for some entirely different reason.
@@ -1740,10 +1785,7 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     // ARM TWO: names a verb the responder then never answers. Swept owing an answer.
     auto owed = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(owed.has_value());
-    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
-        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
-        co_return written.has_value();
-    }((*owed).get(), Wire::EncodeFetch("k"))));
+    REQUIRE(SyncRun(SendRaw((*owed).get(), Wire::EncodeFetch("k"))));
 
     // ONE wait for both, bounded and reporting what it waited for. The bound is
     // generous against `HeaderTimeout` plus a sweep interval, because what this case
@@ -1772,4 +1814,177 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     (*silent)->Close();
     (*owed)->Close();
     responder.Hold(false);
+}
+
+TEST_CASE("The explanation grace scales with the verb's own window", "[node][frame][sweep]")
+{
+    // **This shipped wrong once, and the integration case above could not see it.**
+    // The grace was a flat `SweepInterval * 4`, which resolves to five seconds, while
+    // `CompileResponder::RequestTimeout` is `DefaultCompileLeaseTimeout` -- six
+    // hundred. A translation unit that has just outrun a ten-minute grant does not
+    // return inside five seconds, so the deferral expired, the socket was closed, and
+    // the connection found nothing owed when `Answer` finally came back. The fix
+    // delivered its explanation on the cache surface, where the problem is mild, and
+    // silently not at all on the compile surface, which is the one it was written for.
+    //
+    // **A pure function over the window, tested as one.** The alternative is a case
+    // that waits out the difference in wall clock -- and it cannot be cheap, because
+    // the sweep fires at `RequestTimeout` and the grace is derived from that same
+    // number, so discriminating five seconds from a longer grace needs a window above
+    // five seconds and a hold between the two: sixteen seconds or more for one case,
+    // measured through sleeps whose own spread is the thing being measured. The
+    // testing rules here say to split the DECISION out and pin that; this is that
+    // split, and the case above is what asserts the decision is wired in at all.
+    //
+    // Pinned on BOTH sides, because a bound checked in one direction is satisfied by
+    // a function that ignores its argument.
+    CHECK(FrameServer::ExplanationGraceFor(Wire::DefaultCompileLeaseTimeout) == Wire::DefaultCompileLeaseTimeout);
+    CHECK(FrameServer::ExplanationGraceFor(FrameServer::HeaderTimeout) == FrameServer::HeaderTimeout);
+
+    // The floor, and the reason for it: the sweeper's cadence bounds how promptly any
+    // deadline here can be acted on, so a grace under one tick would be a number that
+    // reads like a guarantee and is not one.
+    CHECK(FrameServer::ExplanationGraceFor(std::chrono::milliseconds { 1 }) == FrameServer::SweepInterval);
+    CHECK(FrameServer::ExplanationGraceFor(FrameServer::SweepInterval) == FrameServer::SweepInterval);
+
+    // And the property that makes the whole thing correct rather than merely bigger:
+    // it never answers a number smaller than the window a surface named for itself.
+    for (auto const window: { std::chrono::milliseconds { 0 },
+                              FrameServer::SweepInterval,
+                              FrameServer::HeaderTimeout,
+                              Wire::DefaultCompileLeaseTimeout })
+        CHECK(FrameServer::ExplanationGraceFor(window) >= window);
+
+    // The flat constant this replaced, named as a value rather than as a symbol, so
+    // this case keeps failing if somebody reintroduces it under another name.
+    CHECK(FrameServer::ExplanationGraceFor(Wire::DefaultCompileLeaseTimeout) > std::chrono::milliseconds { 5'000 });
+}
+
+TEST_CASE("A peer swept inside the surface is told why, and one swept on the socket is not", "[node][frame][sweep]")
+{
+    // **Issue #523, and the two arms are the design rather than a coincidence.**
+    //
+    // A swept connection used to get a bare TCP close, which a peer cannot tell from a
+    // crash, a network drop or a refusal it never received -- three causes with three
+    // different remedies arriving as one silence. The obvious repair is for the
+    // sweeper to write the refusal itself, and it is worse than the silence: the
+    // socket is owned by `ServeConnection`'s coroutine frame and the tracker holds a
+    // bare pointer, so a `co_await` on it in the sweeper holds that pointer across a
+    // suspension the connection can complete and destroy through. That is a
+    // use-after-free rather than a race, and no amount of write-interlocking touches
+    // it -- which is why the sweeper here never writes at all.
+    //
+    // What it does instead is ask where the connection is parked, and the two arms are
+    // the two answers. They share one endpoint, one sweeper, one window and one
+    // `AwaitingAnswer` phase, so the difference between them cannot be explained by
+    // the harness -- it is exactly "was the coroutine inside the responder, or on the
+    // socket". Either arm alone proves nothing: arm one alone would pass an
+    // implementation that wrote a refusal from anywhere, and arm two alone would pass
+    // the old unconditional close.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+
+    // The answer window, shortened so both arms cost a sweep interval rather than a
+    // lease timeout. The responder owns this number in production too, so shortening
+    // it exercises the real mechanism rather than a test seam.
+    responder.PlaceRequestTimeout(50ms);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const sweepsBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+    auto const toldBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
+
+    BlockingConnector connector;
+
+    // ARM ONE: a whole FETCH, so the connection reaches `Answer` and parks there. The
+    // responder is held, so the sweep finds this connection inside the surface with
+    // its write side idle.
+    auto inSurface = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(inSurface.has_value());
+    REQUIRE(SyncRun(SendRaw((*inSurface).get(), Wire::EncodeFetch("k"))));
+
+    // ARM TWO: a header and NOT the body it declares. The connection decodes the
+    // header, passes every gate, arms the same `AwaitingAnswer` window and then parks
+    // in the payload read -- on the socket, where nothing but the close can reach it.
+    auto const truncated = Wire::EncodeFetch("dribbled");
+    REQUIRE(truncated.size() > Wire::RequestHeaderSize);
+    auto onSocket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(onSocket.has_value());
+    REQUIRE(
+        SyncRun(SendRaw((*onSocket).get(),
+                        std::vector<std::byte> {
+                            truncated.begin(), truncated.begin() + static_cast<std::ptrdiff_t>(Wire::RequestHeaderSize) })));
+
+    // Arm one must actually be INSIDE the responder before the sweep, or it is arm two
+    // in disguise. Bounded, and it says which stage it was waiting for.
+    auto const entered = std::chrono::steady_clock::now() + 30s;
+    while (responder.Entered() < 1 && std::chrono::steady_clock::now() < entered)
+        std::this_thread::sleep_for(10ms);
+    REQUIRE(responder.Entered() >= 1);
+
+    // Then both arms are swept. Bounded, generous against the sweep interval, and
+    // asserting only that both were seen -- never how fast.
+    auto const deadline = std::chrono::steady_clock::now() + 60s;
+    auto sweeps = sweepsBefore;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        sweeps = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+        if (sweeps >= sweepsBefore + 2)
+            break;
+        std::this_thread::sleep_for(50ms);
+    }
+    INFO("answer-deadline sweeps: " << sweeps << " (was " << sweepsBefore << ")");
+    REQUIRE(sweeps == sweepsBefore + 2);
+
+    // Released only now, so `Answer` returns AFTER the sweep. This is the instant the
+    // whole design is about: the connection is holding a perfectly good reply and owes
+    // its peer a refusal, and exactly one of them may reach the socket.
+    responder.Hold(false);
+
+    // ARM ONE's whole byte stream, to EOF. `ReadOneReply` would not do: it stops at
+    // the first frame, so it cannot see a second one spliced in behind -- and "the
+    // reply parsed" is precisely the assertion an interleaved write passes.
+    auto const received = SyncRun(ReadUntilPeerCloses((*inSurface).get(), 64ULL * 1024ULL));
+    REQUIRE_FALSE(received.empty());
+
+    auto const header = Wire::DecodeReplyHeader(received);
+    REQUIRE(header.has_value());
+    CHECK(ErrorOf(received) == Wire::ErrorCode::RequestDeadlineExceeded);
+
+    // **The byte-level interleaving assertion.** Everything received is accounted for
+    // by one frame: nothing precedes it, and nothing follows. A sweeper that wrote
+    // while the connection was about to, or a connection that wrote both the refusal
+    // and the reply it was holding, lands here as a length that is not this one.
+    CHECK(received.size() == Wire::ReplyHeaderSize + Unwrap(header).payloadLength);
+
+    // And stated the other way round, because a size can agree by accident: the reply
+    // `HoldableResponder` produced is a MISS, and its bytes appear nowhere at all.
+    auto const heldReply = Wire::EncodeReply(Wire::Status::Miss, {});
+    CHECK(std::ranges::search(received, heldReply).empty());
+
+    // Routed to the surface rather than encoded by the endpoint, which is the same
+    // division of labour every other refusal in that loop obeys (#447).
+    CHECK(responder.LastEndpointRefusal() == EndpointRefusal::AnswerDeadline);
+
+    // ARM TWO gets the close and nothing else, and that is the deliberate half of the
+    // design rather than a shortfall. A peer parked on the socket is woken only by the
+    // close, and the close is the write side gone -- so "explainable" means "parked
+    // inside the surface", not "has named a verb". Asserted so that a later change
+    // cannot quietly start writing here from somewhere that does not own the socket.
+    auto const silence = SyncRun(ReadUntilPeerCloses((*onSocket).get(), 64ULL * 1024ULL));
+    CHECK(silence.empty());
+
+    // One sweep was explained and one was not, so the two rows differ by exactly one.
+    // Checked as equality rather than as "rose": an implementation that told both
+    // peers, or neither, satisfies a `>`.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == toldBefore + 1);
+
+    (*inSurface)->Close();
+    (*onSocket)->Close();
 }

@@ -401,6 +401,33 @@ enum class ErrorCode : std::uint8_t
     ///
     /// Transient by construction: the walk either completes or the node exits.
     WorkerToolchainSurveyInFlight = 0x1C,
+
+    /// The request outran the window the surface allows for answering it.
+    ///
+    /// The server gave up, and it says so rather than hanging up. Until #523 this
+    /// was a bare TCP close, which a peer cannot tell from a crash, a network drop
+    /// or a refusal it never received -- three causes with three different remedies,
+    /// arriving as one silence.
+    ///
+    /// **Emphatically NOT `EndpointBusy`.** That one says this node is momentarily
+    /// full and the same request will very likely be served in a moment, so a client
+    /// retries and an operator raises a local bound. This one says the request was
+    /// admitted, worked on, and abandoned on time -- for a compile, a translation
+    /// unit that outlived its lease grant, which is a question about the timeout and
+    /// never about this worker's speed. An operator does opposite things about them,
+    /// which is what separates every code in this range from its neighbours.
+    ///
+    /// A refusal a client answers by compiling locally, like the rest of this range.
+    /// Deployed launchers need no new arm to do that: they special-case `NotLeader`
+    /// and `UnknownLease` and treat every other code as a generic rejection, so this
+    /// is additive for clients built before it existed.
+    ///
+    /// **Only a peer parked in the SURFACE can receive it.** A peer swept while the
+    /// connection is parked on the socket -- dribbling a header, dribbling a declared
+    /// payload -- is still ended by the close, because the close is the only thing
+    /// that ends a parked read and it is the write side gone. See
+    /// `FrameServer::CloseOverdue`.
+    RequestDeadlineExceeded = 0x1D,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -933,6 +960,9 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::WorkerToolchainSurveyInFlight,
                       .name = "worker-toolchain-survey-in-flight",
                       .defaultMessage = "this worker is still identifying its toolchains" },
+    ErrorDescriptor { .code = ErrorCode::RequestDeadlineExceeded,
+                      .name = "request-deadline-exceeded",
+                      .defaultMessage = "this request outran the window this surface allows" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
