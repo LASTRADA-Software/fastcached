@@ -306,6 +306,14 @@ namespace
                 // wire says. This arm now differs from the one above in BOTH, which is
                 // the shape `SurfaceRefusal` is for -- a row is the refusal, not the
                 // code, so sharing one never implied sharing the other.
+                //
+                // #483 predicted this change would "turn these two arms into a table",
+                // and it did not, so the prediction is answered rather than deleted.
+                // Nothing is left to tabulate: the arms now share no field at all, the
+                // code is already the single named enumerator both servers spell, and
+                // the counter must stay per-surface. A table of two rows differing in
+                // every column is the switch that is already here, spelled less
+                // directly.
                 co_return co_await ReplyRefused(socket,
                                                 metrics,
                                                 { .code = Wire::ErrorCode::ForeignValueGeneration,

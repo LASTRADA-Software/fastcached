@@ -77,7 +77,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x02` | unknown-opcode | The opcode is not one this build knows. |
 | `0x03` | malformed-frame | The fields do not exactly fill the declared payload. |
 | `0x04` | payload-too-large | The declared payload exceeds the session cap. |
-| `0x05` | malformed-value | A STORE payload is not a compile value at all — it does not decode. Narrower than it looks: a value that decodes and names a generation this build does not implement is `foreign-value-generation` (`0x1e`), not this. |
+| `0x05` | malformed-value | A STORE payload is not a compile value at all — it does not decode. Narrower than it looks: a value that decodes and names a generation this build does not implement is `foreign-value-generation`, not this. |
 | `0x06` | *(reserved)* | Never sent. Was `canonicalization-failed`, for a failure `PathCanon` could not produce; removed in issues #59/#69. The number is burnt so it is never reused with a different meaning. |
 | `0x07` | storage-write-failed | The cache engine refused the write. |
 | `0x08` | unauthenticated | A credential is required and has not been accepted on this connection. |
@@ -102,7 +102,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x1b` | lease-expired | An authentic lease, presented past its expiry and the clock-skew slack. Not a capacity statement — a worker's slots bound what it runs, the expiry bounds how long a *captured* token is worth replaying. |
 | `0x1c` | worker-toolchain-survey-in-flight | The worker is still identifying its toolchains and serves nothing yet. Distinct from `fingerprint-mismatch`: that one says this worker serves a different toolchain, this one says the same request will succeed shortly. Reachable only by dialling a compile port directly — a node registers nothing until its survey finishes, so the scheduler does not offer it. |
 | `0x1d` | request-deadline-exceeded | The request was admitted and outran the window this surface allows for answering it. Not `endpoint-busy`, which says the node is momentarily full and to come back: this one says the work was abandoned on time, and for a compile it is a question about the lease timeout rather than about the worker. Sent only when the server can still reach the client — a peer swept while the connection is parked on the socket gets the close alone. |
-| `0x1e` | foreign-value-generation | A STORE whose value *is* a compile value, well formed, written under a canonicalization generation this build does not implement. Emphatically not `malformed-value`, which says the bytes are not a compile value at all: this one is the normal, expected answer to a *newer* peer during a rolling upgrade, and reporting it as malformed tells an operator their cache is damaged when the fleet is merely mixed. The message names both generations, and that is the whole diagnostic. Answered by the daemon and by a node's cache tier, which count it separately. |
+| `0x1e` | foreign-value-generation | A STORE whose value *is* a compile value, well formed, written under a canonicalization generation this build does not implement. Emphatically not `malformed-value`, which says the bytes are not a compile value at all: this one is the normal, expected answer to a *newer* peer during a rolling upgrade, and reporting it as malformed tells an operator their cache is damaged when the fleet is merely mixed. The message names both generations, and that is the whole diagnostic. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -448,8 +448,11 @@ both generations in the message, and a fetch is a miss the launcher reports
 under its own `--show-stats` reason rather than as a malformed value. That code
 is the point rather than a detail: the refusal is what a *healthy* fleet does
 midway through a rolling upgrade, and answering it as `malformed-value` told an
-operator their cache was damaged — the same conflation `.agent/rules/storage.md`
-forbids on disk between `Corrupt` and `UnsupportedFormatVersion`. Refusing
+operator their cache was damaged — the same conflation the storage layer already
+avoids on disk, where a store written by another build is
+`UnsupportedFormatVersion` and never `Corrupt`, because the code is what
+monitoring reads and `Corrupt` is what makes somebody delete a healthy cache.
+Refusing
 costs the hits of one upgrade window; the alternative costs every consumer that
 replays those paths into its dependency graph, where no edit in its own checkout
 can invalidate them.

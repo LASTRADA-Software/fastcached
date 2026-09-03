@@ -186,6 +186,13 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
     // actually talks to, and `MalformedValue` told it the cache was damaged while the
     // fleet was merely mid-rollout. Same conflation `.agent/rules/storage.md` forbids
     // on disk between `Corrupt` and `UnsupportedFormatVersion`.
+    //
+    // The other half of the pair is the case immediately above: absence of the
+    // negative is not the positive, so "a foreign generation is refused" needs
+    // "opaque bytes are NOT" beside it, or a change that refused everything it could
+    // not canonicalize would satisfy this one on its own. On this tier that companion
+    // is a different KIND of answer rather than a different code, which is why it is
+    // its own case and is not restated here.
     CHECK(ErrorOf(stored) == Wire::ErrorCode::ForeignValueGeneration);
 
     // Refused means nothing was written. A `Miss` rather than the bytes coming back
@@ -194,22 +201,6 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
 
     // Counted, per this tier's own classification rule: the baseline is zero, so a
     // rise is a real event and it is the only view of what refusing costs.
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration) == 1);
-
-    // The other half of the pair, in this case rather than only in the sibling above,
-    // because absence of the negative is not the positive: a change that refused
-    // EVERYTHING it could not canonicalize would satisfy every assertion so far. On
-    // this tier the contrast is not a different code but a different KIND of answer --
-    // opaque bytes are stored, and only a foreign generation is refused. The sibling
-    // test owns the fetch-back; what is asserted here is that the two outcomes stay
-    // different at all.
-    auto const opaque = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "k-opaque-contrast",
-                                                                                       .prefetchGroup = {},
-                                                                                       .srcRoot = "/src",
-                                                                                       .buildTree = "/build",
-                                                                                       .value = Bytes("not-a-value") })));
-    CHECK(StatusOf(opaque) == Wire::Status::Ok);
-    CHECK(ErrorOf(opaque) == std::nullopt);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration) == 1);
 }
 

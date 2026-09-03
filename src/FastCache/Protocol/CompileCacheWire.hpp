@@ -232,7 +232,12 @@ enum class ErrorCode : std::uint8_t
     UnknownOpcode = 0x02,
     MalformedFrame = 0x03,  ///< Fields do not exactly fill the declared payload.
     PayloadTooLarge = 0x04, ///< Declared payload exceeds the session's cap.
-    MalformedValue = 0x05,  ///< STORE payload is not a decodable compile-value.
+    /// STORE payload is not a compile value AT ALL -- it does not decode.
+    ///
+    /// Narrower than "this build cannot decode it", which would also cover a value
+    /// of a generation this build does not implement: that is
+    /// `ForeignValueGeneration`, and keeping the two apart is the whole of #544.
+    MalformedValue = 0x05,
 
     // 0x06 is RETIRED and must never be reassigned -- see `RetiredErrorCodes`
     // below, which makes that a build failure rather than a hope. It was
