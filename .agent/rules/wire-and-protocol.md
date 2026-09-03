@@ -1262,3 +1262,24 @@ consequence rather than a precaution.
 
 ## Open work
 
+- **[#712](https://github.com/LASTRADA-Software/fastcached/issues/712)** —
+  `TlsSocket::WaitReadable` cannot report EOF, so the EOF arm above never fires for a
+  TLS client. It defers to the raw socket, and a well-behaved TLS peer closes with a
+  `close_notify` RECORD and then FIN: the raw peek sees bytes, answers `>0`, and a
+  cleanly-closing `BLOCK 0` client still parks. Over TLS that is the ORDINARY close,
+  not a corner, so #673's fix does not reach TLS clients at all. Code-read, not
+  measured. It is the gap #677 deferred when it wrote "TlsSocket delegates".
+- **[#710](https://github.com/LASTRADA-Software/fastcached/issues/710)** —
+  `RunBlockingRead` arms a fresh `ArmDisconnect` per loop iteration and cancels none,
+  so a wait resolved by the data or timeout arm leaves the previous trampoline parked
+  in `WaitReadable`, against the socket's single read-op slot. Predates #673 and is
+  unchanged by it. Same family as
+  [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) and deliberately
+  not folded into it: #663 is the shared slot, this is one caller misusing it.
+- **[#711](https://github.com/LASTRADA-Software/fastcached/issues/711)** — three
+  comment blocks in `src/apps/fastcache-compile-node/` still state the pre-#671
+  doctrine and the pre-#677 socket behaviour. Listed here rather than only with the
+  compile surface because what they contradict is the EOF rule above, and because one
+  of them is the stated reason that surface takes "the opposite rule" — a contrast
+  that no longer exists.
+

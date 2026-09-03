@@ -648,7 +648,8 @@ namespace
     /// with the same pending byte immediately, which is a spin, not a watch.
     /// `RunBlockingRead` arms a fresh one per iteration, so a wait that resumes and
     /// re-registers is watched again; a wait that stays parked with bytes pending is
-    /// not.
+    /// not. That per-iteration arming cancels nothing and predates this arm, which is
+    /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710).
     ///
     /// **Two cases it therefore does not cover**, both stated rather than left to be
     /// discovered:
@@ -660,7 +661,8 @@ namespace
     ///    as bytes and answers `>0`. So the arm declines and a TLS `BLOCK 0` client
     ///    closing cleanly still parks. Code-read, not measured. Reporting EOF through
     ///    a TLS socket needs the record decrypted, which is a decision for that
-    ///    layer, not something to soften here.
+    ///    layer, not something to soften here —
+    ///    [#712](https://github.com/LASTRADA-Software/fastcached/issues/712).
     /// @param waiter The waiter to resolve on disconnect (kept alive here).
     /// @param socket The connection socket to watch for closure.
     DetachedTask ArmDisconnect(std::shared_ptr<StreamWaiter> waiter, ISocket* socket)
