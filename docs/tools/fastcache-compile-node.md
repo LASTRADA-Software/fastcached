@@ -88,7 +88,7 @@ The surfaces, and what each is for:
 
 Three things on that table are easy to get wrong and expensive to get wrong:
 
-- **Discovery is UDP.** Five TCP rules and one wrong one leaves a beacon that
+- **Discovery is UDP.** Three TCP rules and one wrong one leaves a beacon that
   reaches nobody, and that presents as a fleet that never forms rather than as a
   firewall mistake.
 - **`--discovery`'s address is where beacons are *sent*, not where they are heard.**

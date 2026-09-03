@@ -657,7 +657,7 @@ node surface — an inherited descriptor cannot be adopted onto the reactor yet,
 activated worker is refused at startup rather than left listening on nothing — and
 that `--discovery`'s address is where beacons are *sent* while its sockets bind the
 wildcard. [The node's own page](../tools/fastcache-compile-node.md#every-port-it-opens)
-carries the full six-surface table.
+carries the full four-surface table.
 
 The three shapes below are the *deployments*, in the order fleets tend to grow into
 them — what to open for each machine's role, rather than what a given command line
