@@ -42,6 +42,10 @@ class KqueueSocket final: public ISocket
                                             std::shared_ptr<void const> keepAlive = {}) override;
     [[nodiscard]] IoAwaitable WaitReadable() override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::ShutdownWrite
+    void ShutdownWrite() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;

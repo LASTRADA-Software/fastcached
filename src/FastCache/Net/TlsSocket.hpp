@@ -63,6 +63,16 @@ class TlsSocket final: public ISocket
     [[nodiscard]] IoAwaitable WaitReadable() override;
     [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::ShutdownWrite
+    ///
+    /// Delegated to the raw transport, and **no `close_notify` is sent** -- for the
+    /// same reason `Close()` sends none: flushing a TLS alert needs an *awaited*
+    /// write and this signature cannot do one. So the peer sees a transport-level
+    /// half-close on a stream that is still cryptographically open, which is what a
+    /// caller wants here and is not a graceful TLS shutdown.
+    void ShutdownWrite() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override;
     /// Forward the peer address of the wrapped transport so `--log-source`
     /// works identically for TLS and plaintext connections.

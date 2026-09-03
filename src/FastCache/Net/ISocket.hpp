@@ -246,6 +246,37 @@ class ISocket
     /// NetErrorCode::BadFileHandle.
     virtual void Close() noexcept = 0;
 
+    /// Close this socket's WRITE half, leaving the read half open, so the peer
+    /// observes EOF while this side can still receive.
+    ///
+    /// **What EOF means on this wire, decided once**
+    /// ([#671](https://github.com/LASTRADA-Software/fastcached/issues/671)):
+    ///
+    /// > EOF means *"this peer has finished sending"*. A server answers everything
+    /// > already determined, and abandons anything still pending.
+    ///
+    /// So a half-close is a statement about INPUT, not a departure: replies the peer
+    /// is already owed still arrive, and only work that has not happened yet is given
+    /// up. `.agent/rules/wire-and-protocol.md` carries the derivation and the
+    /// measurement it rests on; do not re-decide it here.
+    ///
+    /// **Why the interface has it at all.** It did not, and the absence is what made
+    /// the question unanswerable: `InMemorySocket` declared one privately and every
+    /// consumer was a test, so no production client could half-close and the
+    /// disagreement between this tree's surfaces was unreachable from inside the
+    /// repository. A rule nothing can express is a rule nothing can be held to.
+    ///
+    /// **The default does nothing, and that is for FAKES.** Every transport this
+    /// library hands out overrides it; a scripted test double that has no write half
+    /// to close has nothing to do here, and making it pure virtual would reach into
+    /// five test files across three lanes to say so. A no-op costs a peer the early
+    /// EOF -- it learns at the eventual `Close()` instead -- which delays a
+    /// notification rather than falsifying one.
+    ///
+    /// Idempotent, and not a `Close()`: reads keep working, and `IsClosed()` stays
+    /// false. A caller that wants both calls both.
+    virtual void ShutdownWrite() noexcept {}
+
     /// @return true if Close() has been called or the peer has closed and a
     /// Read has observed EOF. Used by Connection to break its loop.
     [[nodiscard]] virtual bool IsClosed() const noexcept = 0;

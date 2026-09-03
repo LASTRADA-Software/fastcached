@@ -42,6 +42,10 @@ class EpollSocket final: public ISocket
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::ShutdownWrite
+    void ShutdownWrite() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;

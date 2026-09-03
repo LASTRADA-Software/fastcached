@@ -59,6 +59,14 @@ struct Observation
     /// Bytes a follow-up `Read` returned, for the case that asserts the peek consumed
     /// nothing.
     std::atomic<std::size_t> readBack { 0 };
+
+    /// Whether the observer should write a reply once it has seen the peer's EOF.
+    ///
+    /// Plain, not atomic: set before the task is started and never touched again.
+    bool replyAfterEof { false };
+
+    /// Whether that reply was accepted by the socket.
+    std::atomic<bool> replySent { false };
 };
 
 /// Accept one connection, wait for readability, and publish what came back.
@@ -98,6 +106,16 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
         std::array<std::byte, 8> buf {};
         if (auto const got = co_await socket->Read(std::span<std::byte> { buf }); got.has_value())
             out->readBack.store(*got, std::memory_order_relaxed);
+    }
+
+    // Answering AFTER the peer's EOF, which is the wire's rule made executable: a
+    // half-close says the peer has finished sending, not that it has gone, so a reply
+    // it is already owed must still reach it.
+    if (out->replyAfterEof)
+    {
+        std::array<std::byte, 3> const owed { std::byte { 'o' }, std::byte { 'w' }, std::byte { 'e' } };
+        if ((co_await socket->Write(std::span<std::byte const> { owed })).has_value())
+            out->replySent.store(true, std::memory_order_relaxed);
     }
 
     out->resolved.store(true, std::memory_order_release);
@@ -249,4 +267,78 @@ TEST_CASE("WaitReadable reports zero when EOF is already pending before it is ca
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
     CHECK(observed.count.load(std::memory_order_relaxed) == 0);
+}
+
+TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][waitreadable][halfclose]")
+{
+    // **The wire's rule, executable.** `ISocket::ShutdownWrite` exists so a peer can
+    // say "I have finished sending" without saying "I have gone", and the rule
+    // (`.agent/rules/wire-and-protocol.md`) is that a server answers what it already
+    // owes such a peer. This is that sentence as a test: the server sees EOF -- count
+    // `0`, the #677 contract -- and its reply still arrives.
+    //
+    // It is also the first production use of `ShutdownWrite` in this tree. Until now
+    // only `InMemorySocket` had one and every caller was a test, which is exactly why
+    // the question could not be settled from inside the repository.
+    FastCache::SteadyClock clock;
+    FastCache::PlatformReactor reactor { clock };
+    auto listener = FastCache::PlatformListener::Bind(reactor, "127.0.0.1", 0);
+    REQUIRE(listener);
+    auto const port = listener->BoundPort();
+    REQUIRE(port != 0);
+
+    Observation observed;
+    observed.replyAfterEof = true;
+    ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
+
+    std::vector<std::byte> received;
+    std::jthread client { [port, &observed, &received] {
+        FastCache::BlockingConnector connector;
+        auto socket = FastCache::SyncRun(
+            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        if (!socket.has_value())
+            return;
+
+        (void) WaitForFlag(observed.arming);
+        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+
+        // **Half-close, not close.** The read half stays open, which is the whole
+        // point: a `Close()` here would make the assertion below unreachable.
+        (*socket)->ShutdownWrite();
+        REQUIRE_FALSE((*socket)->IsClosed()); // a half-close is not a close
+
+        // **Bounded, and it is what keeps a missing fix a FAILURE rather than a
+        // hang.** With no `ShutdownWrite` on the transport the interface default is a
+        // no-op, so the server never sees EOF, never resolves, and never stops its
+        // reactor -- and a test that hangs reports nothing at all. Waiting here and
+        // closing anyway lets the server unpark, the reactor return, and the
+        // assertions below say what was actually wrong.
+        if (!WaitForFlag(observed.resolved))
+        {
+            (*socket)->Close();
+            return;
+        }
+
+        received = FastCache::SyncRun([](FastCache::ISocket* s) -> FastCache::Task<std::vector<std::byte>> {
+            std::array<std::byte, 8> buf {};
+            auto const got = co_await s->Read(std::span<std::byte> { buf });
+            if (!got.has_value() || *got == 0)
+                co_return std::vector<std::byte> {};
+            co_return std::vector<std::byte> { buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(*got) };
+        }((*socket).get()));
+        (*socket)->Close();
+    } };
+
+    reactor.Run();
+    client.join();
+
+    REQUIRE(observed.resolved.load(std::memory_order_acquire));
+    REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
+
+    // The server saw "finished sending", spelled as the #677 count.
+    CHECK(observed.count.load(std::memory_order_relaxed) == 0);
+
+    // And the peer, which had closed only its write half, still got its answer.
+    CHECK(observed.replySent.load(std::memory_order_relaxed));
+    CHECK(received.size() == 3);
 }

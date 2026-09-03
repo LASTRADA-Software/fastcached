@@ -285,6 +285,12 @@ IoAwaitable TlsSocket::WriteVectored(std::span<std::span<std::byte const> const>
     return awaitable;
 }
 
+void TlsSocket::ShutdownWrite() noexcept
+{
+    if (_raw)
+        _raw->ShutdownWrite();
+}
+
 void TlsSocket::Close() noexcept
 {
     // Deliberately no SSL_shutdown / close_notify: Close() is a synchronous

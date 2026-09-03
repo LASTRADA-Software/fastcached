@@ -376,6 +376,12 @@ EpollSocket::~EpollSocket()
     EpollSocket::Close();
 }
 
+void EpollSocket::ShutdownWrite() noexcept
+{
+    if (!_closed)
+        Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_fd));
+}
+
 void EpollSocket::Close() noexcept
 {
     if (_closed)
