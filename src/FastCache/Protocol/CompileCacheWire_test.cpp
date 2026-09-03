@@ -56,6 +56,16 @@ TEST_CASE("The wire constants have their specified byte values")
     CHECK(static_cast<std::uint8_t>(Status::Miss) == 0x00);
     CHECK(static_cast<std::uint8_t>(Status::Ok) == 0x01);
     CHECK(static_cast<std::uint8_t>(Status::Error) == 0x02);
+
+    // The BYTE, not the symbol. A constant on this wire carries two facts -- its
+    // name and its value -- and a peer built from another revision of this header
+    // agrees about only the second. Every in-tree caller spells the enumerator, so a
+    // consistent renumbering leaves the whole suite green while every deployed
+    // launcher reads a different refusal, and nobody here can recompile them. Pinned
+    // for the newest code because that is the one an author is about to move; the
+    // older neighbours are pinned by `RetiredErrorCodes` and by the peers already
+    // running.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::RequestDeadlineExceeded) == 0x1D);
 }
 
 TEST_CASE("EncodeFetch emits the specified bytes exactly")

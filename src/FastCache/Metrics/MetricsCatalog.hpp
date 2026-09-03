@@ -584,6 +584,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "translation unit outliving its lease grant, so a rise is a question "
               "about the lease timeout rather than about this worker.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FrameDeadlineRefusalsSent,
+      .prometheusName = "fastcache_frame_deadline_refusals_sent_total",
+      .help = "Swept connections whose peer was sent a frame saying why. A second "
+              "event, not a restatement of answer_deadline_sweeps: only a connection "
+              "parked inside the surface can be told, because a connection parked on "
+              "the socket is ended by the close and the close is the write side gone. "
+              "The gap between the two is how many swept peers were left to infer it.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

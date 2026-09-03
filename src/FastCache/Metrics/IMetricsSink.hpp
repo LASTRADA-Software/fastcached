@@ -799,6 +799,28 @@ class IMetricsSink
         /// speed. See the issue linked from `FrameServer::CloseOverdue`.
         FrameAnswerDeadlineSweeps,
 
+        /// Swept connections whose peer was told, in a frame, why it was swept.
+        ///
+        /// A second tally of a second event, never a redefinition of the row above:
+        /// that one counts the sweep, this one counts a refusal that went out. Both
+        /// are events that happened, so zero is the truth about a node that swept
+        /// nothing -- what is being modelled here is not an absence.
+        ///
+        /// **It cannot equal `FrameAnswerDeadlineSweeps` and is not meant to.** A
+        /// refusal can only be written by the connection itself, from the one place
+        /// that owns the write side, and only a connection parked INSIDE the
+        /// responder can be reached that way. One parked on the socket -- dribbling a
+        /// header, dribbling a declared payload -- is ended by the close, which is the
+        /// write side gone; it is swept, counted above, and told nothing. The gap
+        /// between the two rows is therefore a real quantity: how many swept peers
+        /// were left to infer it, which is the state #523 set out to shrink and did
+        /// not set out to eliminate.
+        ///
+        /// A peer that had already hung up also lands in the gap: the refusal is
+        /// written, the write fails, and nothing is counted. That is right -- this row
+        /// says a peer was TOLD, and a frame nobody received told nobody.
+        FrameDeadlineRefusalsSent,
+
         Last,
     };
 

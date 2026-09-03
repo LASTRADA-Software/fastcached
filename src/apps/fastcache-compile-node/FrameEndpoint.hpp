@@ -68,6 +68,27 @@ enum class EndpointRefusal : std::uint8_t
     /// #447 it answered `Unauthenticated` on the wire and moved nothing at all.
     CredentialRejected,
 
+    /// The surface was still answering when the verb's own window ran out.
+    ///
+    /// **The one refusal here that is decided by a clock rather than by a frame**,
+    /// and the only one the connection writes on its own initiative rather than in
+    /// answer to something the peer just sent. `FrameServer::CloseOverdue` decides
+    /// it; `ServeConnection` writes it, from the one place that owns the write side.
+    ///
+    /// Reachable only for a connection parked INSIDE the responder. A peer swept
+    /// while the connection is parked on the socket -- dribbling a header, dribbling
+    /// a declared payload -- is ended by the close, because the close is the only
+    /// thing that ends a parked read and it is the write side gone. See
+    /// `FrameServer::CloseOverdue` for why that asymmetry is the design rather than
+    /// a shortfall ([#523](https://github.com/LASTRADA-Software/fastcached/issues/523)).
+    ///
+    /// **Counted by the ENDPOINT, not by the surface**, which is why every responder
+    /// answers it through `Cc::RefuseWithoutCounter`. The deadline is the endpoint's
+    /// fact: `FrameAnswerDeadlineSweeps` already tallies the sweep and
+    /// `FrameDeadlineRefusalsSent` tallies how many of those peers were told why.
+    /// Three per-surface copies of one endpoint fact would be three things to drift.
+    AnswerDeadline,
+
     /// The count. See `Core/EnumTable.hpp`.
     Last,
 };
@@ -95,10 +116,26 @@ inline constexpr EnumTable<EndpointRefusal, EndpointRefusalCode> EndpointRefusal
     { .refusal = EndpointRefusal::InFlightBudget, .code = CompileCacheWire::ErrorCode::EndpointBusy },
     { .refusal = EndpointRefusal::CredentialMalformed, .code = CompileCacheWire::ErrorCode::MalformedFrame },
     { .refusal = EndpointRefusal::CredentialRejected, .code = CompileCacheWire::ErrorCode::Unauthenticated },
+    { .refusal = EndpointRefusal::AnswerDeadline, .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded },
 } };
 
 static_assert(RowsInEnumeratorOrder(EndpointRefusalCodes, &EndpointRefusalCode::refusal),
               "EndpointRefusalCodes must hold one row per EndpointRefusal, in enumerator order");
+
+/// Why no surface counts `EndpointRefusal::AnswerDeadline`, stated once for all three.
+///
+/// Beside the enumerator rather than in any one responder, exactly as
+/// `EndpointRefusalCodes` is: this is a property of the refusal, not of the surface
+/// that happens to answer it. Three surfaces stating one fact separately is three
+/// sentences that agree today, and the divergence would be invisible.
+///
+/// The deadline belongs to the ENDPOINT. It decides the sweep and it already carries
+/// both halves: `FrameAnswerDeadlineSweeps` for the sweep, and
+/// `FrameDeadlineRefusalsSent` for the peer that was told why. A surface counting it
+/// again would be a third tally of one event, summed by whoever met two of them first.
+inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
+    "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
+    "refusal-sent row; a per-surface copy would be a third tally of one event";
 
 /// The wire code @p refusal is answered with.
 /// @param refusal Any enumerator but `Last`.
@@ -513,6 +550,30 @@ class FrameServer
     /// a guarantee and is not one. So a refused socket outlives its answer by at most
     /// two ticks, against the six a served request may take.
     static constexpr std::chrono::milliseconds RefusalTimeout { SweepInterval };
+
+    /// How long a swept-but-not-closed connection is given to come back and explain
+    /// itself before it is closed after all.
+    ///
+    /// A connection swept while parked INSIDE the responder is not closed: closing it
+    /// there wakes nothing (`IFrameResponder::RequestTimeout` says why) and only
+    /// destroys the write side the refusal has to leave by. It is marked instead, and
+    /// the connection writes its own refusal when `Answer` returns.
+    ///
+    /// **This is what keeps that deferral from being unbounded.** `Answer` is an
+    /// interface, so nothing here can promise it returns at all -- a wedged responder
+    /// would otherwise hold the descriptor for the life of the process, where the old
+    /// unconditional close released it. When this expires the sweeper closes as it
+    /// always did, so the fix can only ever cost this much promptness and never the
+    /// property it replaced.
+    ///
+    /// A constant rather than a flag, deliberately. Its only correct value is "long
+    /// enough that a responder about to return is not cut off, short enough that a
+    /// wedged one is not indulged", which is a property of this mechanism and not of
+    /// a site's workload -- and a knob invites tuning a number that describes nothing
+    /// an operator can observe. Four sweep intervals: the sweeper's cadence is the
+    /// floor on how promptly any deadline here can be acted on, so anything under one
+    /// would be a number that reads like a guarantee and is not one.
+    static constexpr std::chrono::milliseconds ExplanationGrace { SweepInterval * 4 };
 
     /// @param io The loop this server accepts and answers on.
     /// @param listener Bound listener; must outlive the run.

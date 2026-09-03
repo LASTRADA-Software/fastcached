@@ -93,8 +93,17 @@ namespace
     /// One row per `EndpointRefusal`, in enumerator order.
     struct EndpointRefusalRow
     {
-        EndpointRefusal refusal;   ///< Which endpoint decision this describes.
-        Cc::SurfaceRefusal answer; ///< What the client is told, and what the operator sees rise.
+        EndpointRefusal refusal; ///< Which endpoint decision this describes.
+
+        /// What the client is told and what the operator sees rise, or nothing where
+        /// this surface deliberately counts none.
+        std::optional<Cc::SurfaceRefusal> answer;
+
+        /// Why nothing is counted, for a row whose `answer` is `nullopt`; empty
+        /// otherwise. On the row rather than at the call site, for the reason
+        /// `Detail::SchedulerEndpointRefusal` states: a reason written once beside the
+        /// lookup is correct only while exactly one row needs one.
+        std::string_view rationale;
     };
 
     /// Which refusal each endpoint-decided outcome answers with on this surface.
@@ -108,10 +117,23 @@ namespace
         { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy },
         { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential },
         { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::RejectedCredential },
+        { .refusal = EndpointRefusal::AnswerDeadline,
+          .answer = std::nullopt,
+          .rationale = AnswerDeadlineIsTheEndpointsRationale },
     } };
 
     static_assert(RowsInEnumeratorOrder(EndpointRefusalTable, &EndpointRefusalRow::refusal),
                   "EndpointRefusalTable must hold one row per EndpointRefusal, in enumerator order");
+
+    // Every row states exactly one of the two things a refusal can assert, for the
+    // reason the cache and scheduler tables do: a row asserting neither passes a guard
+    // that short-circuits on the absent counter, and ships the new refusal uncounted
+    // and unexplained.
+    static_assert(std::ranges::all_of(EndpointRefusalTable,
+                                      [](EndpointRefusalRow const& row) {
+                                          return row.answer.has_value() != !row.rationale.empty();
+                                      }),
+                  "every endpoint refusal row must state either a counted answer or a rationale, not both");
 
     // The rows above are CONVERTED from `CompileRefusal`, which already pairs a code
     // with a counter -- the rulebook's instruction rather than restating the pair. What
@@ -120,7 +142,7 @@ namespace
     // lives.
     static_assert(std::ranges::all_of(EndpointRefusalTable,
                                       [](EndpointRefusalRow const& row) {
-                                          return row.answer.code == ErrorCodeFor(row.refusal);
+                                          return !row.answer.has_value() || row.answer->code == ErrorCodeFor(row.refusal);
                                       }),
                   "a converted row must answer the code `ErrorCodeFor` names for its refusal");
 } // namespace
@@ -148,7 +170,10 @@ std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal re
                                                               std::uint8_t /*opRaw*/,
                                                               std::string_view detail) const
 {
-    return Cc::Refuse(_metrics, EndpointRefusalTable[static_cast<std::size_t>(refusal)].answer, detail);
+    auto const& row = EndpointRefusalTable[static_cast<std::size_t>(refusal)];
+    if (!row.answer.has_value())
+        return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal), .rationale = row.rationale }, detail);
+    return Cc::Refuse(_metrics, *row.answer, detail);
 }
 
 Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)

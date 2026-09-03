@@ -139,6 +139,40 @@ struct TrackedConnection
     /// connections were swept. Caught by the two-arm case, which read 5 against an
     /// expected 1.
     bool swept { false };
+
+    /// Whether `ServeConnection` is parked INSIDE the responder right now.
+    ///
+    /// **The whole of #523 turns on this one bit**, because it is what separates the
+    /// two things a sweep can find. A connection parked on the SOCKET -- dribbling a
+    /// header, dribbling a declared payload, pushing out a reply -- is woken only by
+    /// the close, and the close is the write side gone; there is no way to explain
+    /// anything to it. A connection parked in the responder is not waiting on this
+    /// socket at all: the close wakes nothing (`IFrameResponder::RequestTimeout` says
+    /// so at length), the write side is idle, and the coroutine will come back on its
+    /// own. So exactly there, and nowhere else, the sweep can be a MESSAGE to the
+    /// connection instead of an act on its socket.
+    ///
+    /// Set and cleared only around `co_await responder.Answer(...)`, under the same
+    /// mutex `CloseOverdue` reads it beneath. It is therefore true only while the
+    /// phase is `AwaitingAnswer`; the phase still decides the counter, because that is
+    /// a statement about which WINDOW expired rather than about where the coroutine
+    /// was standing.
+    bool inResponder { false };
+
+    /// Whether this connection has been swept and still owes its peer the reason.
+    ///
+    /// Set by the sweep that chose to defer instead of closing; taken and cleared by
+    /// the connection when `Answer` returns, which is the only place it can be acted
+    /// on. Its presence is also what `deferredCloseAt` below is measured against.
+    bool owedExplanation { false };
+
+    /// When a deferred close happens anyway.
+    ///
+    /// `Answer` is an interface and nothing here can promise it returns, so a
+    /// deferral with no bound would hold a descriptor for the life of the process
+    /// where the old unconditional close released it. Meaningful only while
+    /// `owedExplanation` is set. See `FrameServer::ExplanationGrace`.
+    TimePoint deferredCloseAt {};
 };
 
 struct FrameServer::State
@@ -235,6 +269,50 @@ struct FrameServer::State
             }
     }
 
+    /// Record that this connection has entered, or left, the responder.
+    ///
+    /// Called on both sides of `co_await responder.Answer(...)` and nowhere else.
+    /// While it is set, `CloseOverdue` will defer rather than close -- see
+    /// `TrackedConnection::inResponder` for why that is the one state where a sweep
+    /// can be a message instead of an act on the socket.
+    /// @param socket The tracked socket.
+    /// @param inside Whether the connection is now inside the responder.
+    void MarkInResponder(ISocket* socket, bool inside)
+    {
+        std::scoped_lock const guard { mutex };
+        for (auto& entry: open)
+            if (entry.socket == socket)
+                entry.inResponder = inside;
+    }
+
+    /// Leave the responder, and learn whether a sweep deferred to this connection.
+    ///
+    /// One call and one lock rather than a clear followed by a query, so nothing can
+    /// run between them. Nothing could anyway -- both this and the sweeper live on the
+    /// one reactor thread and there is no suspension point between `Answer` resuming
+    /// and this line -- but a two-step version would make that a property of the
+    /// caller's statement order rather than of this function.
+    ///
+    /// Taking it also CLEARS the obligation, which is what keeps
+    /// `CloseExpiredDeferrals` from closing the socket underneath the refusal this
+    /// return value is about to cause.
+    /// @param socket The tracked socket.
+    /// @return True when this connection was swept and still owes its peer a reason.
+    [[nodiscard]] bool LeaveResponder(ISocket* socket)
+    {
+        std::scoped_lock const guard { mutex };
+        for (auto& entry: open)
+            if (entry.socket == socket)
+            {
+                entry.inResponder = false;
+                if (!entry.owedExplanation)
+                    return false;
+                entry.owedExplanation = false;
+                return true;
+            }
+        return false;
+    }
+
     /// Deregister a socket. Must happen before its owner destroys it.
     void Untrack(ISocket* socket)
     {
@@ -242,23 +320,46 @@ struct FrameServer::State
         std::erase_if(open, [socket](auto const& entry) { return entry.socket == socket; });
     }
 
-    /// Close every socket past its deadline, and COUNT each by why.
+    /// Sweep every socket past its deadline: COUNT each by why, then either close it
+    /// or hand the decision to the connection that owns its write side.
     ///
-    /// **A close is all this can do, and the counter is what makes it legible.**
-    /// A named refusal reply would be better and is not available here: this socket's
-    /// write side belongs to `ServeConnection`, which is parked in a read or awaiting
-    /// a responder that is about to write. A sweeper that wrote would interleave two
-    /// writers on one socket and splice a refusal into somebody's answer -- the
-    /// crossed-reply hazard reached from the output side. Closing is also what
-    /// UNBLOCKS the parked coroutine, so here the diagnosis and the remedy are one
-    /// act. Replacing the close is
-    /// [#523](https://github.com/LASTRADA-Software/fastcached/issues/523), which has
-    /// to supply its own way to end that read.
+    /// **This sweeper never writes to a socket, and that is a rule about ownership
+    /// rather than about interleaving.** The obvious repair for the silence -- have
+    /// the sweeper send a refusal before closing -- is not merely racy, it is a
+    /// use-after-free: the socket is owned by `ServeConnection`'s coroutine frame
+    /// (`std::unique_ptr<ISocket> owned`) and this table holds a bare pointer, so a
+    /// `co_await socket->Write(...)` here would hold that pointer across a suspension
+    /// the connection can complete and destroy through. No amount of write-interlocking
+    /// fixes that, which is why a lock is a second bug rather than a fix. The
+    /// interleaving hazard is real too -- a refusal spliced into somebody's answer is
+    /// the crossed-reply failure of `.agent/rules/distributed-compilation.md` reached
+    /// from the output side -- but it is the weaker of the two arguments and the one
+    /// that looks negotiable.
     ///
-    /// Until then the counters are the whole instrument, which is why they are two
-    /// and not one: see `SweepPhase`.
+    /// **So the sweep asks where the connection is parked, and there are two answers.**
+    ///
+    /// Parked ON THE SOCKET -- dribbling a header, dribbling a declared payload,
+    /// pushing out a reply. Nothing but the close ends a parked read, and the close is
+    /// the write side gone, so there is no way to explain anything. It is closed, as it
+    /// always was. A peer here has either named no verb at all or is misbehaving with
+    /// one, which is the slow-loris shape rather than the long-compile shape.
+    ///
+    /// Parked INSIDE THE RESPONDER. The close wakes nothing at all here
+    /// (`IFrameResponder::RequestTimeout` states this at length: the compile runs to
+    /// completion, hops home, and its `WriteAll` fails), so the close is not the
+    /// mechanism it looks like -- it is purely destructive, costing the peer its
+    /// explanation and buying one descriptor, while the connection SLOT is held by the
+    /// coroutine frame either way. So the entry is marked and left open, and the
+    /// connection writes its own named refusal when `Answer` returns, from the one
+    /// place that owns the write side. Exactly one writer, structurally rather than by
+    /// agreement ([#523](https://github.com/LASTRADA-Software/fastcached/issues/523)).
+    ///
+    /// The counters are unchanged in meaning: `SweepPhase` says which WINDOW expired,
+    /// which is a different question from where the coroutine was standing, and
+    /// `FrameDeadlineRefusalsSent` -- moved by the connection, not here -- says how
+    /// many of the swept were told why.
     /// @param now The reactor's current time.
-    /// @return How many were closed in each phase.
+    /// @return How many were swept in each phase, closed and deferred alike.
     SweepTally CloseOverdue(TimePoint now)
     {
         std::vector<TrackedConnection> overdue;
@@ -269,14 +370,16 @@ struct FrameServer::State
                 {
                     // Marked HERE, under the same lock that found it, so a second
                     // sweeper turn cannot collect the same entry before this one has
-                    // closed it.
+                    // been acted on.
                     entry.swept = true;
+                    entry.owedExplanation = entry.inResponder;
+                    entry.deferredCloseAt = now + FrameServer::ExplanationGrace;
                     overdue.push_back(entry);
                 }
         }
 
         SweepTally tally;
-        // Closed outside the lock: `Close` completes a parked read by resuming its
+        // Acted on outside the lock: `Close` completes a parked read by resuming its
         // coroutine inline, and that coroutine calls `Untrack`, which takes this
         // same mutex.
         for (auto const& entry: overdue)
@@ -289,9 +392,41 @@ struct FrameServer::State
             seen += 1;
             metrics.Increment(entry.phase == SweepPhase::AwaitingRequest ? IMetricsSink::Counter::FrameRequestDeadlineSweeps
                                                                          : IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
-            entry.socket->Close();
+            if (!entry.owedExplanation)
+                entry.socket->Close();
         }
         return tally;
+    }
+
+    /// Close the connections that were left open to explain themselves and did not.
+    ///
+    /// The bound on the deferral above. `Answer` is an interface and nothing here can
+    /// promise it returns, so a responder that wedges would otherwise hold a
+    /// descriptor for the life of the process where the old unconditional close
+    /// released it -- a small regression, but a real one, and the sort that is
+    /// invisible until a machine runs out of descriptors.
+    ///
+    /// Nothing is counted here. The sweep that deferred already counted it; this is
+    /// the same connection reaching its second deadline, not a second sweep of it, and
+    /// a row that rose twice for one connection is exactly the defect
+    /// `TrackedConnection::swept` exists to prevent one level up.
+    /// @param now The reactor's current time.
+    /// @return How many deferrals ran out of grace.
+    std::size_t CloseExpiredDeferrals(TimePoint now)
+    {
+        std::vector<ISocket*> expired;
+        {
+            std::scoped_lock const guard { mutex };
+            for (auto& entry: open)
+                if (entry.owedExplanation && entry.deferredCloseAt <= now)
+                {
+                    entry.owedExplanation = false;
+                    expired.push_back(entry.socket);
+                }
+        }
+        for (auto* socket: expired)
+            socket->Close();
+        return expired.size();
     }
 
     /// Close the listener and every open connection. Reactor thread only.
@@ -741,7 +876,53 @@ namespace
                 // consults an upstream -- and that suspends rather than blocking
                 // every other connection on this loop, which is the whole reason
                 // this task exists separately from the accept loop.
+                //
+                // Bracketed by the two marks, and this is the ONLY place either is
+                // touched. While the mark is set, a sweep that finds this connection
+                // overdue defers instead of closing, because here -- and only here --
+                // the coroutine is not parked on the socket, so the close would wake
+                // nothing while destroying the write side a refusal has to leave by.
+                state->MarkInResponder(socket.get(), true);
                 auto const reply = co_await state->responder.Answer(frame, peer);
+
+                // **The one place a deferred sweep is observed, and deliberately one.**
+                // A check at each of this loop's write sites would be a rule to
+                // remember at six places and at the seventh somebody adds; here it is a
+                // consequence of where the mark can be set at all. The refusal is
+                // written from the same statement sequence every other reply is, so
+                // "exactly one writer" is structural rather than agreed.
+                if (state->LeaveResponder(socket.get()))
+                {
+                    // Named, with the number that explains it -- for the reason the
+                    // in-flight refusal names both figures. "Too slow" without the
+                    // window tells an operator nothing about which timeout to raise,
+                    // and for a compile the answer is always the lease grant rather
+                    // than this worker.
+                    //
+                    // Encoded and counted by the SURFACE, exactly as every other
+                    // refusal in this loop is; the endpoint owns WHEN and the surface
+                    // owns WHAT. `EndpointRefusal::AnswerDeadline` is the one row every
+                    // surface answers without a counter, because the deadline is the
+                    // endpoint's own fact and the endpoint counts both halves of it.
+                    auto const window = state->responder.RequestTimeout(decoded->opRaw);
+                    if (co_await WriteAll(
+                            socket.get(),
+                            state->responder.EndpointRefusalReply(
+                                EndpointRefusal::AnswerDeadline,
+                                decoded->opRaw,
+                                std::format("{} allows {} ms to answer this verb", state->what, window.count()))))
+                        // Counted only when it went OUT. A peer that had already hung
+                        // up was told nothing, and a row saying otherwise would make
+                        // the gap between this and the sweep row mean something else.
+                        state->metrics.Increment(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
+
+                    // And then it ends, whether or not the refusal landed. This
+                    // connection has been swept; the answer it was holding is not
+                    // owed to anybody any more, and continuing the loop would serve
+                    // a second request on a connection the sweeper has written off.
+                    break;
+                }
+
                 if (reply.empty())
                     break; // `IFrameResponder::Answer` documents an empty reply as
                            // "close without answering", which is only ever right
@@ -841,13 +1022,31 @@ namespace
             // and could not answer in time -- and a line carrying only their sum
             // cannot be read for either. The counters carry the same split for anyone
             // scraping rather than reading logs.
-            if (auto const swept = state->CloseOverdue(state->io.Reactor().Clock().Now()); swept.Total() != 0)
+            auto const now = state->io.Reactor().Clock().Now();
+            if (auto const swept = state->CloseOverdue(now); swept.Total() != 0)
                 state->logger.Logf(LogLevel::Debug,
                                    "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed",
                                    state->what,
                                    swept.Total(),
                                    swept.awaitingRequest,
                                    swept.awaitingAnswer);
+
+            // Run AFTER the sweep, on the same instant. A deferral created a moment
+            // ago cannot expire in the same turn, and running this first would only
+            // ever act on entries the previous turn left -- which is the same set,
+            // one interval later. Ordered this way the two read as one pass over one
+            // clock reading rather than as two schedules to reason about.
+            //
+            // Logged at Warning and not Debug, because unlike a sweep this is not
+            // routine: it says a responder did not come back within the grace, which
+            // is a wedged answer rather than a slow one.
+            if (auto const abandoned = state->CloseExpiredDeferrals(now); abandoned != 0)
+                state->logger.Logf(LogLevel::Warn,
+                                   "{}: closed {} swept connection(s) that never came back to explain themselves; "
+                                   "a responder has been inside an answer for over {} ms past its deadline",
+                                   state->what,
+                                   abandoned,
+                                   FrameServer::ExplanationGrace.count());
         }
         state->loopsAlive.fetch_sub(1, std::memory_order_acq_rel);
         state->io.NoteLoopFinished();
