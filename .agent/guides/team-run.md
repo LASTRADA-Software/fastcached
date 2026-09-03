@@ -384,6 +384,68 @@ in-lane) or **reports it to the manager** with file:line and a failure scenario.
 files the issue and schedules it. Nothing is silently deferred and nothing is silently
 widened.
 
+## Reporting to the manager
+
+A report is a set of claims about state, and every one of them decays. Three shapes
+turned up in a single evening's run, all from careful sessions, none of them a
+coding mistake.
+
+### A plan you were told becomes a status you assert
+
+The manager said it *would* enqueue a pull request behind another. A lane wrote that
+down as a plan, correctly -- and then put it in a status table, where a plan reads as
+a fact. It re-copied that row into two further reports, across two intervening
+messages saying the enqueue had not happened, and never re-checked. The row was never
+true; it described an intention.
+
+**Nothing about a table's format records whether a cell is a plan or a state**, so the
+rule is that a status line about somebody else's state is either re-read before it is
+written, or it is not written. Usually the re-readable form needs nobody's word:
+`git merge-base --is-ancestor <head> origin/master` answers "has it merged" with no
+API call, no rate limit and no message from the manager.
+
+That failure is worse than a stale reading, which is at least true when taken.
+
+### A count that disagrees with its own enumeration
+
+A lane reported "six files changed" one clause after writing "the registration I
+flagged, and four under `src/apps/fastcache-cc/`" -- which, with the two it had
+already named, is seven. The tree said seven. Nothing was wrong with the branch.
+
+The same shape had already cost the run an hour that evening: a lane reported **eleven
+required contexts green**, and four of the eleven names were wrong. The required set
+has eleven members, so the cardinality agreed perfectly with a set assembled from what
+looked important. A correct count over the wrong set is indistinguishable from a
+correct audit, and every check run against it passes.
+
+**Recount from the enumeration; never carry a number alongside a list.** And read the
+required set from the ruleset each time -- iterating what reported cannot reveal what
+is missing, and neither can counting:
+
+```sh
+gh api repos/<owner>/<repo>/rulesets/<id>   --jq '.rules[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context'
+```
+
+### True when taken, stale when stated
+
+"One failure, the rest building" was honest at the moment of sampling and wrong by the
+time it was read -- two more legs had gone red in between, and the condition *"among
+the rows that had settled"* was dropped. The manager made the same mistake an hour
+later in the other direction, reading three workflow runs as `queued` and concluding
+the runner pool was starved, when one of them was seventeen jobs green with two left.
+
+So a CI report carries **settled, unsettled and failed as three numbers with the time
+of the sample**, absent as its own outcome, and no verdict. And it comes from
+enumerating `/actions/runs/<id>/jobs`: a run's own `status` field is not a summary of
+its jobs and can lag them by fifteen minutes.
+
+### Hand over the checkable form, not the answer
+
+The manager's half of this. Naming the master SHA rather than saying "it merged", and
+pointing at the ruleset query rather than listing the contexts, both let a lane find
+something an assertion would have hidden. A report is only as good as what the
+reporter could independently check, so give them the means rather than the conclusion.
+
 ## Verification expectations
 
 Reproduce the finding **first**. Several tickets came out of a review pass and are
