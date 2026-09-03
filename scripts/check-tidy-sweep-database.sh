@@ -71,6 +71,14 @@ Fail() { echo "  FAIL: $*" >&2; problems=$((problems + 1)); }
 # Indentation is the discriminator, and it is reliable because this is the
 # repository's own workflow: a job key is two spaces, a step's `- name:` is six,
 # its `run:` eight, and a folded scalar's continuation ten.
+#
+# It deliberately carries NO `/^[ \t]*#/ { next }` rule, which both sibling
+# walkers (`check-merge-queue-contexts.sh`, `check-gated-jobs.sh`) do have. Inside
+# a `>-` block scalar a `#` is literal shell payload, not a YAML comment, so
+# skipping those lines would silently truncate the very `run:` body being read --
+# and a truncated command still compares as a command. Stated because the omission
+# looks like an inconsistency, and tidying the three walkers into agreement is
+# exactly how it would get "fixed" back into a defect.
 ExtractWorkflowConfigure() {
     awk -v job="$2" -v step="$3" '
         /^jobs:[ \t]*$/                  { inJobs = 1; next }
