@@ -162,152 +162,54 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "dist-compile E2E FAILED: $*" >&2; exit 1; }
+# The shared helpers: `fail`, `free_port`, `wait_for_port`, `wait_for_log`,
+# `wait_for_registration`, `stop_and_require_exit` and `http_get` (#449, #451).
+#
+# This file kept its own seven, and it is the file the duplication had already
+# cost something in: three of its waits once matched the bare word `registered`,
+# which `0 of 1 toolchain(s) registered` matches too, so they returned for a
+# worker the scheduler had turned away. #445 corrected those into a
+# `wait_for_registration` -- and a corrected wait sitting in one fixture is the
+# cause reproduced while the instance is fixed, so it is the LIBRARY's now.
+#
+# Two behavioural differences travel in with the shared versions and both are
+# fixes this file wanted:
+#
+#   * `fail` raised inside `$( ... )` stops the RUN. The copy that lived here
+#     called `exit 1`, which ends the command substitution's subshell only --
+#     and `free_port` and `wait_for_counter` are both called that way, so a
+#     drawn-port exhaustion or a counter that never moved stopped the script
+#     only because `set -e` happened to notice the assignment's status.
+#   * `http_get` keeps a final chunk with no trailing newline. `read` returns
+#     non-zero on one, so the copy here dropped it; that is latent only because
+#     the endpoints this file reads happen to end in a newline, and
+#     `fleet-dashboard-e2e`'s copy had already been bitten by it.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "dist-compile E2E" "$workdir"
+
+# How long a bounded wait in this fixture may take.
+#
+# 30 seconds, and the number is chosen to be no STRICTER than what this file has
+# been running under rather than to be a fresh measurement. Every wait here was
+# `for _ in $(seq 1 100); do ...; sleep 0.2; done`: a hundred polls of a fifth of
+# a second each, which is at least 20 s and is more than that on a machine too
+# loaded to poll at the assumed rate -- exactly the reading `_e2e_verdict` now
+# prints as `the loop overran its own budget`. A clock bound of 20 would
+# therefore be a tightening, and tightening a bound is not part of a conversion;
+# 30 keeps the intended twenty with room for the polling overhead the old loop
+# allowed silently.
+#
+# It is deliberately not `fleet-dashboard-e2e`'s 240. That fixture pays for a
+# cold include-tree walk before its node binds; here the walk is already warm by
+# the time any node starts, because `--print-toolchain-fingerprint` below walks
+# the same tree first.
+e2e_wait_seconds 30
 
 # Statistics are per-user state; keep this run out of the developer's real log.
 export XDG_STATE_HOME="${workdir}/state"
 export FASTCACHE_VERBOSE=1
 
 # --- helpers ----------------------------------------------------------------
-
-# Find a port nothing is listening on.
-#
-# A connect probe, not a bind probe: bind-then-close leaves the port in TIME_WAIT
-# on some systems, and the caller is about to hand it to a *different* process
-# anyway, so the only question this can honestly answer is "is anything answering
-# here right now". Racy in principle; the test is RUN_SERIAL and the range is
-# wide, and the alternative — four hard-coded ports — races with every other
-# smoke test in the suite rather than only with itself.
-#
-# Ports already handed out THIS RUN are remembered and skipped. Without that, the
-# only question asked is "is anything listening", and nothing is listening on a
-# port issued a moment ago whose server has not bound yet -- so two calls could
-# return the same number and the second process to start died with
-# `bind(...) failed: 98`. This fixture draws every port it needs before binding
-# any of them, which is exactly the window that makes it reachable: rare enough
-# to read as an unrelated flake, and it did.
-#
-# The ledger is a FILE rather than a variable because every call site is a command
-# substitution, and a subshell's assignment is gone the moment it exits -- which
-# is how a first attempt at this fixed nothing at all. It lives under `workdir`,
-# so the existing cleanup takes it away.
-#
-# The range stops BELOW the kernel's ephemeral port range, which is the half a
-# connect probe cannot cover. A port can be the local endpoint of an OUTBOUND
-# connection -- ESTABLISHED or TIME_WAIT -- with nothing listening on it, so the
-# probe says "free" and the `bind()` that follows still fails with EADDRINUSE.
-# The ledger does not help either: that port was never issued by this fixture.
-#
-# CI caught exactly that: `bind(127.0.0.1:33174) failed: 98` for case 6's daemon,
-# started after five cases' worth of launcher and probe connections had consumed
-# ephemeral ports. 33174 is inside Linux's default `ip_local_port_range` of
-# 32768-60999, which the old draw of 20000-39999 overlapped by its top 7232
-# numbers -- worse than one draw in three.
-#
-# 20000-31999 is below that floor and below macOS's 49152, and 12000 numbers is
-# ample for a fixture that draws a dozen. A machine that lowered the sysctl below
-# 32000 would need this to move with it, and
-# `cat /proc/sys/net/ipv4/ip_local_port_range` is the check.
-free_port() {
-    local port ledger="${workdir}/.issued-ports"
-    local floor=20000 ceiling=32000
-    for _ in $(seq 1 200); do
-        port=$(( floor + RANDOM % (ceiling - floor) ))
-        if grep -qx "$port" "$ledger" 2>/dev/null; then
-            continue
-        fi
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-            echo "$port" >> "$ledger"
-            echo "$port"
-            return 0
-        fi
-    done
-    fail "could not find a free port"
-}
-
-# GET one path off a worker's admin endpoint and echo the whole response.
-#
-# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
-# tests nothing on the machine that lacks it, and this needs no more than one
-# request. Every read is bounded with `read -t`: the endpoint closes the
-# connection itself (`Connection: close`), so a healthy server ends the loop on
-# its own -- and a WEDGED one, which is exactly the state this probe exists to
-# detect, would otherwise hang the suite instead of failing it.
-# @param 1 port
-# @param 2 path
-http_get() {
-    local port="$1" path="$2" line="" body=""
-    exec 3<>"/dev/tcp/127.0.0.1/${port}" || return 1
-    printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$path" >&3
-    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
-    exec 3<&-
-    printf '%s' "$body"
-}
-
-# Block until something answers on a port, or the process behind it dies.
-#
-# Waiting on the listener rather than sleeping a fixed amount: a cold CI runner
-# takes noticeably longer to get there than a warm developer machine, and a fixed
-# sleep is either flaky or slow.
-#
-# The host is a parameter with a loopback default rather than the constant it used
-# to be, because the membership mode binds its workers on an address that is NOT
-# loopback -- and probing 127.0.0.1 for a listener bound to 192.168.x.y reports
-# "never listened" about a process that is listening perfectly well somewhere else.
-# A default keeps every existing caller reading as it did.
-#
-# @param 1 port
-# @param 2 pid
-# @param 3 what it is, for the message
-# @param 4 the log to dump when it does not come up
-# @param 5 host to probe; defaults to 127.0.0.1
-wait_for_port() {
-    local port="$1" pid="$2" what="$3" logfile="$4" host="${5:-127.0.0.1}"
-    for _ in $(seq 1 100); do
-        if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then return 0; fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$logfile" >&2
-            fail "${what} exited before it started listening"
-        fi
-        sleep 0.2
-    done
-    cat "$logfile" >&2
-    fail "${what} never listened on ${host}:${port}"
-}
-
-# Wait for a line to appear in a log, the way `wait_for_port` waits for a listener.
-#
-# A bound port does NOT mean a process has finished announcing itself. Every tier
-# here binds its listener and logs what it bound *afterwards*, because the message
-# names the endpoint and the endpoint is not known until the bind returns. So a
-# `grep` run straight after `wait_for_port` is a race -- and one that widens
-# exactly where it is least welcome: under a sanitizer, or with the log on a slow
-# filesystem, the gap between the two stops being instant. It reported "node did
-# not start its scheduler" about a node that started its scheduler perfectly well
-# a millisecond later, and it did so in roughly half of full-suite runs while
-# passing every time the test was run alone.
-#
-# Liveness is checked as `wait_for_port` checks it, so a process that dies is
-# reported as having died rather than as never having got round to it. Two of the
-# three hand-written poll loops this replaces did not check that at all.
-#
-# @param 1 the text to wait for
-# @param 2 pid
-# @param 3 what it is, for the message
-# @param 4 the log to watch
-wait_for_log() {
-    local marker="$1" pid="$2" what="$3" logfile="$4"
-    for _ in $(seq 1 100); do
-        if grep -q "$marker" "$logfile"; then return 0; fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$logfile" >&2
-            fail "${what} exited before logging: ${marker}"
-        fi
-        sleep 0.2
-    done
-    cat "$logfile" >&2
-    fail "${what} never logged: ${marker}"
-}
 
 # What every worker this fixture starts is told its drain may take, and what every
 # wait for one to stop is bounded by. ONE number, which is the whole of #380.
@@ -343,30 +245,64 @@ stop_bound_seconds=$(( worker_drain_seconds + 5 ))
 # made the old single 15 wrong in the first place.
 daemon_stop_seconds=5
 
-# Stop a process and require it to actually exit, within a bound.
+# The pid of the process the last `start_node` started, and the only way it is
+# handed back.
 #
-# `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
-# is handled but the process never finishes stopping -- which is a real failure
-# mode and was a real bug: the worker installs a SIGTERM handler, and if its
-# accept loop cannot be woken the handler sets a flag nobody comes back to read.
-# A test that hangs reports less than a test that fails, so this bounds the wait
-# and says what it was waiting for.
+# A function that PRINTED its pid would have to be called in a command
+# substitution, and the whole spawn would then happen in a subshell: the
+# background process would be that subshell's child rather than this shell's, so
+# `wait` could not reap it, `kill -0` would be racing a pid this shell does not
+# own, and the `pids` array cleanup depends on would be discarded at the closing
+# paren. `fail` inside such a substitution ends the run correctly and would still
+# hand the caller an empty pid on the way past.
+started_pid=""
+
+# And the log that node writes, so a caller that wants to dump it on a later
+# failure need not respell the tag.
+started_log=""
+
+# Start one compile node, and wait for it to be listening.
 #
-# @param 1 pid
-# @param 2 what it is, for the message
-# @param 3 seconds to allow; every caller passes `$stop_bound_seconds`, which is
-#          derived from the drain the process was actually started with
-stop_and_require_exit() {
-    local pid="$1" what="$2" seconds="$3"
-    kill "$pid" >/dev/null 2>&1 || true
-    local deadline=$(( seconds * 5 ))
-    for _ in $(seq 1 "$deadline"); do
-        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
-        sleep 0.2
-    done
-    kill -9 "$pid" >/dev/null 2>&1 || true
-    wait "$pid" 2>/dev/null || true
-    fail "${what} did not exit within ${seconds}s of being asked to stop"
+# THE recipe this fixture inlined at ten sites (#451). What was actually repeated
+# is not the flags -- those are what each case is ABOUT and they stay at the call
+# sites -- but the six lines around them: name a log under `$workdir`, background
+# the process, capture `$!`, append it to `pids` so cleanup reaps it, and wait for
+# the port with the right host and the right log. Every one of those is a place a
+# copy can be silently short, and two of them already were: a node whose pid never
+# reached `pids` is a worker still holding its port after the run, and a wait given
+# the wrong log dumps a file that explains nothing.
+#
+# The invariant flags are the three no case varies: the drain this fixture states
+# rather than inherits (#380), the cluster key that makes every dispatch here a
+# SIGNED one (#282), and the bind, which is also what is advertised -- a node that
+# advertised something else would be describing an endpoint the lease MAC then
+# covers and no client can reach.
+#
+# Everything else is a flag the caller passes, INCLUDING the cache tier and the log
+# level. Neither gets a default here, because a default plus an override is the
+# same flag twice and which one wins is then the option table's overwrite order --
+# a fixture asserting a property it never states. `--cache-memory=0` in particular
+# is what turns a tier OFF, so a node that silently kept one would race for
+# `fastcache-cc`'s default port with every other node in the run.
+#
+# @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message about
+#          this node, so a reader handed a failure can find the log without a
+#          mapping from one to the other
+# @param 2 host to bind, advertise and probe
+# @param 3 port to bind, advertise and probe
+# @param 4.. every flag that differs between the nodes this fixture starts
+start_node() {
+    local tag="$1" host="$2" port="$3"
+    shift 3
+    local log="${workdir}/${tag}.log" pid=""
+    "$node" "$stated_drain" --cluster-key-file="$cluster_key" \
+        --listen-node="${host}:${port}" --advertise="${host}:${port}" \
+        ${@+"$@"} > "$log" 2>&1 &
+    pid=$!
+    started_pid="$pid"
+    started_log="$log"
+    pids+=("$pid")
+    wait_for_port "$host" "$port" "$pid" "$tag" "$log"
 }
 
 # Write a translation unit whose content is unique to the caller.
@@ -464,7 +400,7 @@ metric_value() {
 # @param 2 the Prometheus series name
 worker_counter() {
     local port="$1" name="$2" body=""
-    body="$(http_get "$port" /metrics)" || return 1
+    body="$(http_get 127.0.0.1 "$port" /metrics)" || return 1
     metric_value "$body" "$name"
 }
 
@@ -509,24 +445,6 @@ wait_for_counter() {
     [[ "$answered" == "1" ]] || fail "${what} never answered a /metrics request within ${seconds}s"
     [[ -n "$value" ]] || fail "${what} exports no ${name} series"
     fail "${what} never reached ${name} >= ${floor} within ${seconds}s; last reading ${value}"
-}
-
-# Wait until a node's heartbeat round was ACCEPTED by its scheduler.
-#
-# Never the bare word `registered`: the summary line is logged after every round
-# whatever the outcome, so `0 of 1 toolchain(s) registered` matches it too and a
-# wait built on it returns for a worker the scheduler turned away. That matters
-# most where scheduler-side admission is itself under test, and it is a silent
-# pass everywhere else -- the failure surfaces two steps later as a dispatch fault.
-#
-# Every node this fixture starts serves exactly one toolchain, so the accepted
-# count is always `1 of 1`.
-#
-# @param 1 pid
-# @param 2 what it is, for the message
-# @param 3 the log to watch
-wait_for_registration() {
-    wait_for_log "1 of 1 toolchain(s) registered" "$1" "$2" "$3"
 }
 
 # Slots enough that background CPU cannot withdraw all of them.
@@ -703,7 +621,7 @@ if [[ "$mode" == "membership" ]]; then
         > "${workdir}/mem-daemon.log" 2>&1 &
     mem_daemon_pid=$!
     pids+=("$mem_daemon_pid")
-    wait_for_port "$mem_cache_port" "$mem_daemon_pid" "membership daemon" "${workdir}/mem-daemon.log"
+    wait_for_port 127.0.0.1 "$mem_cache_port" "$mem_daemon_pid" "membership daemon" "${workdir}/mem-daemon.log"
     export FASTCACHE_ADDR="127.0.0.1:${mem_cache_port}"
 
     proj="${workdir}/memproj"
@@ -723,37 +641,24 @@ if [[ "$mode" == "membership" ]]; then
     # reached from a non-loopback address too. The client dials it at $lan_address,
     # and so does the worker when it registers.
     #
-    # The pid of the process the last `start_membership_*` call started, and the
-    # only way it is handed back. A function that PRINTED its pid would have to be
-    # called in a command substitution, and `fail` inside one of those ends the
-    # subshell rather than the run -- so a start that failed would hand its caller
-    # an empty pid and carry on.
-    started_pid=""
-
-    # And the port that worker bound, for the same reason. Leg 3 dials the listener
-    # leg 1 compiled on, so it has to be able to name it.
+    # The port the last `start_membership_worker` bound. `start_node` hands back
+    # `started_pid` and `started_log` for the reason its own header gives; the port
+    # is this mode's addition, because leg 3 dials the listener leg 1 compiled on
+    # and so has to be able to name it.
     started_port=""
 
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch (`--listen-node`) port
     start_membership_scheduler() {
-        local tag="$1" dispatch="$2" own_port="" pid=""
-        # Its own worker surface's port is drawn here rather than by the caller: no
-        # assertion in either leg names it, and a port nothing reads is scaffolding
-        # the reader has to carry to the end of the block to find out.
-        own_port="$(free_port)"
-        "$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" \
-            --serve-scheduler --listen-node="${lan_address}:${dispatch}" \
+        local tag="$1" dispatch="$2" pid=""
+        start_node "$tag" "$lan_address" "$dispatch" \
+            "$no_local_cache" \
+            --serve-scheduler \
             --fleet-member="$lan_address" \
             --scheduler="${lan_address}:${dispatch}" \
-            --advertise="${lan_address}:${dispatch}" \
-            --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
-            > "${workdir}/${tag}.log" 2>&1 &
-        pid=$!
-        started_pid="$pid"
-        pids+=("$pid")
-        wait_for_port "$dispatch" "$pid" "${tag} scheduler" "${workdir}/${tag}.log" "$lan_address"
-        wait_for_log "scheduling for the fleet" "$pid" "${tag} scheduler" "${workdir}/${tag}.log"
+            --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug
+        pid="$started_pid"
+        wait_for_log "scheduling for the fleet" "$pid" "$tag" "$started_log"
     }
 
     # Start a worker bound on this host's non-loopback address.
@@ -783,28 +688,27 @@ if [[ "$mode" == "membership" ]]; then
     # @param 4 the cache-tier flag: `--cache-memory=<n>`, or `$no_local_cache` for none
     # @param 5.. the membership flags under test, if any
     start_membership_worker() {
-        local tag="$1" dispatch="$2" admin="$3" tier="$4" port="" pid=""
+        local tag="$1" dispatch="$2" admin="$3" tier="$4" port="" pid="" log=""
         shift 4
         # As above: the compile port is the worker's own business, since the client
         # is told where to dial by the lease rather than by this fixture.
         port="$(free_port)"
-        "$node" "$stated_drain" "$tier" --cluster-key-file="$cluster_key" \
+        start_node "$tag" "$lan_address" "$port" \
+            "$tier" \
             --scheduler="${lan_address}:${dispatch}" \
-            --listen-node="${lan_address}:${port}" --advertise="${lan_address}:${port}" \
             --admin-listen="$admin" \
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
-            ${@+"$@"} > "${workdir}/${tag}.log" 2>&1 &
-        pid=$!
-        started_pid="$pid"
+            ${@+"$@"}
+        pid="$started_pid"
+        log="$started_log"
         started_port="$port"
-        pids+=("$pid")
-        # Bind and registration are waited for separately, because a stall in one is
-        # a different fault from a stall in the other and a fixture that folds them
-        # cannot say which happened.
-        wait_for_port "$port" "$pid" "${tag} worker" "${workdir}/${tag}.log" "$lan_address"
-        wait_for_log "compile node ready" "$pid" "${tag} worker" "${workdir}/${tag}.log"
-        wait_for_registration "$pid" "${tag} worker" "${workdir}/${tag}.log"
-        wait_for_port "$admin" "$pid" "${tag} worker admin endpoint" "${workdir}/${tag}.log"
+        # Bind, readiness, registration and the admin surface are waited for
+        # separately, because a stall in one is a different fault from a stall in
+        # another and a fixture that folds them cannot say which happened. The bind
+        # is `start_node`'s; the three below are this worker's own.
+        wait_for_log "compile node ready" "$pid" "$tag" "$log"
+        wait_for_registration "$pid" "$tag" "$log"
+        wait_for_port 127.0.0.1 "$admin" "$pid" "${tag} admin endpoint" "$log"
     }
 
     # --- leg 1: the address is a member, and the compile is served ---------------
@@ -856,7 +760,7 @@ if [[ "$mode" == "membership" ]]; then
     # and would not be the clean control leg 2 is measured against.
     admit_completed="$(wait_for_counter "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
         "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log")"
-    admit_metrics="$(http_get "$admit_admin_port" /metrics)" \
+    admit_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
     # Absent is not zero, and here it would read as one: an empty string compares
@@ -941,7 +845,7 @@ if [[ "$mode" == "membership" ]]; then
     # so the counters are the only place they are told apart.
     tier_hits="$(wait_for_counter "$admit_admin_port" fastcache_node_cache_hits_total 1 \
         "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log")"
-    tier_metrics="$(http_get "$admit_admin_port" /metrics)" \
+    tier_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
     # Absent is not zero. A worker with no tier exports no such series, and an empty
@@ -994,7 +898,7 @@ if [[ "$mode" == "membership" ]]; then
     # exactly as the old 1 -> 2 did. The baseline is ASSERTED to be zero rather than
     # merely recorded: a worker already refusing this address for some other reason
     # would otherwise be indistinguishable from one refusing the compile.
-    refuse_metrics_before="$(http_get "$refuse_admin_port" /metrics)" \
+    refuse_metrics_before="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
     refuse_before="$(metric_value "$refuse_metrics_before" fastcache_worker_jobs_refused_not_a_member_total)"
     # Absent is not zero: an unexported series would read as an empty string here and
@@ -1042,7 +946,7 @@ if [[ "$mode" == "membership" ]]; then
         $(( refuse_before + 1 )) "$refuse_worker_pid" \
         "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
         "${workdir}/mem-refuse-worker.log")"
-    refuse_metrics="$(http_get "$refuse_admin_port" /metrics)" \
+    refuse_metrics="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
     refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"
     [[ -n "$refuse_completed" ]] \
@@ -1073,7 +977,7 @@ cache_port="$(free_port)"
     > "${workdir}/daemon.log" 2>&1 &
 daemon_pid=$!
 pids+=("$daemon_pid")
-wait_for_port "$cache_port" "$daemon_pid" "daemon" "${workdir}/daemon.log"
+wait_for_port 127.0.0.1 "$cache_port" "$daemon_pid" "daemon" "${workdir}/daemon.log"
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
@@ -1091,16 +995,13 @@ export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 # scheduler CAN also take work is the point of the architecture; it is simply not
 # what these cases are measuring.
 dispatch_port="$(free_port)"
-sched_worker_port="$(free_port)"
 
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${dispatch_port}" --fleet-open \
+start_node "scheduler" 127.0.0.1 "$dispatch_port" \
+    "$no_local_cache" \
+    --serve-scheduler --fleet-open \
     --scheduler="127.0.0.1:${dispatch_port}" \
-    --advertise="127.0.0.1:${dispatch_port}" \
-    --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug \
-    > "${workdir}/scheduler.log" 2>&1 &
-scheduler_pid=$!
-pids+=("$scheduler_pid")
-wait_for_port "$dispatch_port" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
+    --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug
+scheduler_pid="$started_pid"
 
 wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
 
@@ -1108,14 +1009,12 @@ wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}
 
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --listen-node="127.0.0.1:${worker_port}" --advertise="127.0.0.1:${worker_port}" \
+start_node "worker" 127.0.0.1 "$worker_port" \
+    "$no_local_cache" \
+    --scheduler="127.0.0.1:${dispatch_port}" \
     --admin-listen="$worker_admin_port" \
-    --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug \
-    > "${workdir}/worker.log" 2>&1 &
-worker_pid=$!
-pids+=("$worker_pid")
-wait_for_port "$worker_port" "$worker_pid" "worker" "${workdir}/worker.log"
+    --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug
+worker_pid="$started_pid"
 
 # Registration is the worker's own outbound step and completes after it listens,
 # so the port being up is not enough to start dispatching against.
@@ -1149,9 +1048,9 @@ wait_for_registration "$worker_pid" "worker" "${workdir}/worker.log"
 # that is simultaneously doing its job -- it runs on its own thread beside the
 # accept loop, and "it constructs" and "it answers while the worker is busy" are
 # different claims.
-wait_for_port "$worker_admin_port" "$worker_pid" "worker admin endpoint" "${workdir}/worker.log"
+wait_for_port 127.0.0.1 "$worker_admin_port" "$worker_pid" "worker admin endpoint" "${workdir}/worker.log"
 
-health="$(http_get "$worker_admin_port" /healthz)" \
+health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" \
     || fail "worker admin endpoint refused a connection on ${worker_admin_port}"
 [[ "$health" == *"200 OK"* ]] \
     || { printf '%s\n' "$health" >&2; fail "worker /healthz did not answer 200"; }
@@ -1160,7 +1059,7 @@ health="$(http_get "$worker_admin_port" /healthz)" \
 # and zero -- `fastcached_items 0` states an empty unbounded cache as a fact, and
 # a dashboard reads it as one. This is the assertion that would fail if
 # `MetricsSnapshot::storage` stopped being optional.
-before="$(http_get "$worker_admin_port" /metrics)"     || fail "worker admin endpoint refused a /metrics request"
+before="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)"     || fail "worker admin endpoint refused a /metrics request"
 [[ "$before" == *"fastcache_worker_jobs_completed_total"* ]] \
     || { printf '%s\n' "$before" >&2; fail "worker /metrics carries no worker counters"; }
 [[ "$before" == *"fastcache_node_logical_cores"* ]] \
@@ -1229,7 +1128,7 @@ echo "   served from the cache on the second compile"
 # incremented in a unit test and by nothing on the real path is the defect the
 # catalog exists to prevent, one layer up: it exports a permanent zero, which
 # reads as "distribution is not happening" rather than as "nobody wired this".
-after="$(http_get "$worker_admin_port" /metrics)"     || fail "worker admin endpoint stopped answering after serving a compile"
+after="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)"     || fail "worker admin endpoint stopped answering after serving a compile"
 completed="$(metric_value "$after" fastcache_worker_jobs_completed_total)"
 [[ -n "$completed" && "$completed" -ge 1 ]] \
     || { printf '%s\n' "$after" >&2; fail "worker completed a compile but its jobs counter did not move"; }
@@ -1252,31 +1151,27 @@ echo "== case 3: fingerprint isolation"
 # worker, which is exactly what this case must not have.
 iso_cache_port="$(free_port)"
 iso_dispatch_port="$(free_port)"
-iso_sched_worker_port="$(free_port)"
 "$fastcached" --listen="127.0.0.1:${iso_cache_port}" \
     --log-level=info > "${workdir}/iso-daemon.log" 2>&1 &
 iso_daemon_pid=$!
 pids+=("$iso_daemon_pid")
-wait_for_port "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
+wait_for_port 127.0.0.1 "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
 
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${iso_dispatch_port}" --fleet-open \
+start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
+    "$no_local_cache" \
+    --serve-scheduler --fleet-open \
     --scheduler="127.0.0.1:${iso_dispatch_port}" \
-    --advertise="127.0.0.1:${iso_dispatch_port}" \
     --toolchain="also-not-the-compiler-this-client-uses=${compiler}" \
-    --slots=1 --log-level=debug > "${workdir}/iso-scheduler.log" 2>&1 &
-iso_scheduler_pid=$!
-pids+=("$iso_scheduler_pid")
-wait_for_port "$iso_dispatch_port" "$iso_scheduler_pid" "isolation scheduler" "${workdir}/iso-scheduler.log"
+    --slots=1 --log-level=debug
+iso_scheduler_pid="$started_pid"
 
 iso_worker_port="$(free_port)"
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${iso_dispatch_port}" \
-    --listen-node="127.0.0.1:${iso_worker_port}" --advertise="127.0.0.1:${iso_worker_port}" \
-    --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug \
-    > "${workdir}/iso-worker.log" 2>&1 &
-iso_worker_pid=$!
-pids+=("$iso_worker_pid")
-wait_for_port "$iso_worker_port" "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
-wait_for_registration "$iso_worker_pid" "isolation worker" "${workdir}/iso-worker.log"
+start_node "iso-worker" 127.0.0.1 "$iso_worker_port" \
+    "$no_local_cache" \
+    --scheduler="127.0.0.1:${iso_dispatch_port}" \
+    --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug
+iso_worker_pid="$started_pid"
+wait_for_registration "$iso_worker_pid" "iso-worker" "${workdir}/iso-worker.log"
 
 write_source "${proj}/three.cpp" "casethree"
 "$compiler" -std=c++17 -O1 -c "${proj}/three.cpp" -o "${proj}/build/three-ref.o" \
@@ -1355,35 +1250,31 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
 cap_dispatch_port="$(free_port)"
-cap_sched_worker_port="$(free_port)"
 "$fastcached" --listen="127.0.0.1:${cap_cache_port}" \
     --log-level=info > "${workdir}/cap-daemon.log" 2>&1 &
 cap_daemon_pid=$!
 pids+=("$cap_daemon_pid")
-wait_for_port "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
+wait_for_port 127.0.0.1 "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
 
 # The scheduler node names a toolchain nothing here compiles with, deliberately.
 # Every node is both a peer and a possible scheduler, so it always registers as a
 # worker too -- and a second MATCHING worker would give this fleet two slots when
 # the whole point of the case is that it has one.
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --serve-scheduler --listen-node="127.0.0.1:${cap_dispatch_port}" --fleet-open \
+start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
+    "$no_local_cache" \
+    --serve-scheduler --fleet-open \
     --scheduler="127.0.0.1:${cap_dispatch_port}" \
-    --advertise="127.0.0.1:${cap_dispatch_port}" \
     --toolchain="not-the-compiler-under-test=${compiler}" \
-    --slots=1 --log-level=debug > "${workdir}/cap-scheduler.log" 2>&1 &
-cap_scheduler_pid=$!
-pids+=("$cap_scheduler_pid")
-wait_for_port "$cap_dispatch_port" "$cap_scheduler_pid" "capacity scheduler" "${workdir}/cap-scheduler.log"
+    --slots=1 --log-level=debug
+cap_scheduler_pid="$started_pid"
 
 cap_worker_port="$(free_port)"
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${cap_dispatch_port}" \
-    --listen-node="127.0.0.1:${cap_worker_port}" --advertise="127.0.0.1:${cap_worker_port}" \
-    --toolchain="${compiler}" --slots=1 --log-level=debug \
-    > "${workdir}/cap-worker.log" 2>&1 &
-cap_worker_pid=$!
-pids+=("$cap_worker_pid")
-wait_for_port "$cap_worker_port" "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
-wait_for_registration "$cap_worker_pid" "capacity worker" "${workdir}/cap-worker.log"
+start_node "cap-worker" 127.0.0.1 "$cap_worker_port" \
+    "$no_local_cache" \
+    --scheduler="127.0.0.1:${cap_dispatch_port}" \
+    --toolchain="${compiler}" --slots=1 --log-level=debug
+cap_worker_pid="$started_pid"
+wait_for_registration "$cap_worker_pid" "cap-worker" "${workdir}/cap-worker.log"
 
 cap_pids=()
 for i in 1 2 3 4; do
@@ -1481,13 +1372,36 @@ echo "== case 8: a worker exits on SIGTERM"
 # `graceful-stop-only`, so a corpse under that name is inert. Loosening case 12 to
 # accept a local fallback would have deleted the #236 assertion it exists for.
 stop_port="$(free_port)"
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --listen-node="127.0.0.1:${stop_port}" --advertise="127.0.0.1:${stop_port}" \
-    --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info \
-    > "${workdir}/stop-worker.log" 2>&1 &
-stop_worker_pid=$!
-pids+=("$stop_worker_pid")
-wait_for_port "$stop_port" "$stop_worker_pid" "shutdown worker" "${workdir}/stop-worker.log"
+start_node "stop-worker" 127.0.0.1 "$stop_port" \
+    "$no_local_cache" \
+    --scheduler="127.0.0.1:${dispatch_port}" \
+    --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info
+stop_worker_pid="$started_pid"
+
+# READY, not merely BOUND, and this line is the whole of it.
+#
+# A bound port is not a worker that can be gracefully stopped: since #365 the node
+# binds FIRST and logs `compile node ready` afterwards, so `wait_for_port`
+# returning leaves a window in which the listener answers and the shutdown path is
+# not yet in place. A TERM inside that window kills the process outright, and the
+# case then reports "the worker did not report a graceful stop" about a worker
+# that was never asked to.
+#
+# This case has always had that hole and has been passing on its own polling
+# latency. Measured here, with a fork-free probe of the worker's log taken
+# immediately before the signal: three runs of the pre-#451 fixture read
+# `DBG-AT-KILL=READY` three times, and the converted one read `NOTREADY` on every
+# run whose port answered on the FIRST probe and `READY` on every run that needed
+# a second. The old per-fixture `wait_for_port` opened its loop with
+# `for _ in $(seq 1 100)` and probed before the node had bound, so it always slept
+# once -- and that accidental 200 ms was what the assertion below was resting on.
+# `wait_until` does its setup before probing and does not oversleep, which is a
+# better wait that removes the luck; it did not create the hole, it exposed it.
+#
+# So the fix is the stage rather than the delay, which is `.agent/rules/testing.md`
+# on #365: wait for what the line MEANS. A `sleep` here would restore the same luck
+# with a number attached to it.
+wait_for_log "compile node ready" "$stop_worker_pid" "stop-worker" "$started_log"
 
 stop_and_require_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds"
 
@@ -1510,18 +1424,19 @@ echo "== case 9: a local hit never reaches the shared cache"
 # revalidated a hit against the upstream, would fail the third compile; one that
 # genuinely holds the object serves it with nothing listening upstream.
 cache_node_port="$(free_port)"
-cache_node_worker="$(free_port)"
 cache_upstream_port="$(free_port)"
 
 "$fastcached" --listen="127.0.0.1:${cache_upstream_port}" --log-level=info     > "${workdir}/tier-upstream.log" 2>&1 &
 tier_upstream_pid=$!
 pids+=("$tier_upstream_pid")
-wait_for_port "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
+wait_for_port 127.0.0.1 "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
 
-"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${cache_node_port}" --cache-memory=64m     --upstream="127.0.0.1:${cache_upstream_port}"     --scheduler="127.0.0.1:${dispatch_port}"     --advertise="127.0.0.1:${cache_node_port}"     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug     > "${workdir}/tier-node.log" 2>&1 &
-tier_node_pid=$!
-pids+=("$tier_node_pid")
-wait_for_port "$cache_node_port" "$tier_node_pid" "cache node" "${workdir}/tier-node.log"
+start_node "tier-node" 127.0.0.1 "$cache_node_port" \
+    --cache-memory=64m \
+    --upstream="127.0.0.1:${cache_upstream_port}" \
+    --scheduler="127.0.0.1:${dispatch_port}" \
+    --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug
+tier_node_pid="$started_pid"
 
 write_source "${proj}/nine.cpp" "casenine"
 "$compiler" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine-ref.o"     || fail "the case 9 reference compile failed"
@@ -1568,14 +1483,20 @@ echo "   a hit was served with the shared cache stopped, and the object is right
 echo "== case 10: a worker sizes itself from its node class"
 
 sizing_port="$(free_port)"
-"$node" "$stated_drain" "$no_local_cache" --cluster-key-file="$cluster_key" --scheduler="127.0.0.1:${dispatch_port}" \
-    --listen-node="127.0.0.1:${sizing_port}" --advertise="127.0.0.1:${sizing_port}" \
+start_node "sizing" 127.0.0.1 "$sizing_port" \
+    "$no_local_cache" \
+    --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="self-sizing=${compiler}" \
-    --node-class=dedicated --reserve-cores=0 --log-level=debug \
-    > "${workdir}/sizing.log" 2>&1 &
-sizing_pid=$!
-pids+=("$sizing_pid")
-wait_for_port "$sizing_port" "$sizing_pid" "self-sizing worker" "${workdir}/sizing.log"
+    --node-class=dedicated --reserve-cores=0 --log-level=debug
+sizing_pid="$started_pid"
+
+# Waited for, then read. A one-shot `sed` straight after `wait_for_port` is the
+# race `wait_for_log`'s own header describes -- a bound port does not mean a
+# process has finished announcing itself -- and it is the same hole case 8 above
+# was measured falling into. It differs only in what it costs: there the fixture
+# signalled a worker that was not ready, here it would report "the worker did not
+# report a derived slot count" about a worker that logs it a millisecond later.
+wait_for_log "slot(s) as a dedicated node" "$sizing_pid" "sizing" "$started_log"
 
 # The count itself depends on the runner, so what is asserted is that it is a
 # positive number and that the class reached the worker -- not a fixed value, which
@@ -1616,15 +1537,16 @@ stop_and_require_exit "$sizing_pid" "the self-sizing worker" "$stop_bound_second
 echo "== case 11: a black-holed upstream does not stall a second client"
 
 blackhole_node_port="$(free_port)"
-blackhole_worker_port="$(free_port)"
 
 # `--scheduler` is required whenever a worker surface is configured -- a worker
 # nothing knows about serves nobody, and the node refuses to start rather than
 # looking healthy. It points at the scheduler this run already has.
-"$node" "$stated_drain" --cluster-key-file="$cluster_key" --listen-node="127.0.0.1:${blackhole_node_port}" --cache-memory=64m     --upstream="192.0.2.1:6674"     --scheduler="127.0.0.1:${dispatch_port}"     --advertise="127.0.0.1:${blackhole_node_port}"     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info     > "${workdir}/blackhole-node.log" 2>&1 &
-blackhole_node_pid=$!
-pids+=("$blackhole_node_pid")
-wait_for_port "$blackhole_node_port" "$blackhole_node_pid" "black-hole node" "${workdir}/blackhole-node.log"
+start_node "blackhole-node" 127.0.0.1 "$blackhole_node_port" \
+    --cache-memory=64m \
+    --upstream="192.0.2.1:6674" \
+    --scheduler="127.0.0.1:${dispatch_port}" \
+    --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info
+blackhole_node_pid="$started_pid"
 
 write_source "${proj}/eleven_a.cpp" "caseelevena"
 write_source "${proj}/eleven_b.cpp" "caseelevenb"

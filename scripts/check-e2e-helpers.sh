@@ -300,6 +300,56 @@ run_case() {
         echo "wait_for_log returned on the marker"
         ;;
 
+    # --- `wait_for_registration` waits on the ACCEPTED count ------------------
+    #
+    # #449 in one line. A compile node logs its heartbeat summary after every
+    # round WHATEVER the outcome, so a wait on the bare word `registered` also
+    # matches `0 of 1 toolchain(s) registered` -- the line a node logs when the
+    # scheduler TURNED IT AWAY. Three waits in `dist-compile-e2e.sh` were built
+    # that way; they returned for a worker that was not in the fleet, the fixture
+    # proceeded against a fleet it believed was formed, and nothing failed. The
+    # property under test was simply not being tested.
+    #
+    # BOTH directions, because neither half means anything alone. A wait whose
+    # marker matched nothing at all would pass `refuses-zero` and fail
+    # `accepted`; a wait loosened back to the bare word would pass `accepted` and
+    # fail `refuses-zero`. Only the pair pins the marker.
+    #
+    # The marker is not spelled out in the assertions either -- the row below
+    # matches the text `wait_for_registration` puts in its own message, which is
+    # `E2eRegisteredMarker`. A case that restated the string would agree with
+    # itself whatever the function waited for.
+    registration-accepted)
+        log="${scratch}/register.log"
+        echo "0 of 1 toolchain(s) registered" > "$log"
+        ( sleep 0.4; echo "1 of 1 toolchain(s) registered" >> "$log" ) >/dev/null 2>&1 &
+        writer=$!
+        sleep 5 >/dev/null 2>&1 &
+        holder=$!
+        wait_for_registration "$holder" "the staged node" "$log" 5
+        wait "$writer" 2>/dev/null || true
+        kill "$holder" 2>/dev/null || true
+        echo "wait_for_registration returned on the accepted round"
+        ;;
+
+    # And the discriminating half: a node that is refused every round, forever.
+    # The log GROWS the whole time, which is what makes this the shape a loosened
+    # marker cannot survive -- there is a matching-ish line available at every
+    # poll and the wait still has to expire.
+    registration-refuses-zero)
+        log="${scratch}/refused.log"
+        : > "$log"
+        ( n=0
+          while [ "$n" -lt 25 ]; do
+              echo "0 of 1 toolchain(s) registered" >> "$log"
+              sleep 0.2
+              n=$(( n + 1 ))
+          done ) >/dev/null 2>&1 &
+        chatty=$!
+        wait_for_registration "$chatty" "a node the scheduler turned away" "$log" 2
+        echo "BUG: the wait returned for a round that was refused"
+        ;;
+
     # --- `run_bounded` -------------------------------------------------------
     #
     # The helper that exists because `cluster-e2e.sh` bounded its probe with a
@@ -768,6 +818,8 @@ cases=(
     "wait-timeout-no-log|1|no log was watched|!BUG:"
     "wait-nothing-watched|1|No process was watched|to listen on 127.0.0.1:|!BUG:"
     "wait-for-log|0|wait_for_log returned on the marker"
+    "registration-accepted|0|wait_for_registration returned on the accepted round"
+    "registration-refuses-zero|1|to log: 1 of 1 toolchain(s) registered|!BUG:"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
@@ -991,6 +1043,139 @@ EOF
         failures=$(( failures + 1 ))
     fi
 done
+
+# --- no script keeps its own copy of a shared helper ------------------------
+#
+# The other half of #449, and the half a conversion cannot enforce on its own.
+# Folding seven copies into one file says nothing about the EIGHTH, which is
+# written by somebody who has never opened this file. `dist-compile-e2e.sh` WAS
+# that eighth for two tickets -- #449 deferred it, #451 finished it -- and while
+# it waited, its private `http_get` went on dropping a body with no trailing
+# newline that another copy had already learnt to keep.
+#
+# What is scanned is a NAME COLLISION: a `scripts/*.sh` that defines a function
+# the library already defines has a second implementation of it, whatever the
+# body says. That is exact in one direction and blind in the other, and the
+# blindness is said here rather than left to be found: a helper reimplemented
+# under a DIFFERENT name is invisible to this. `migrate-storage-e2e.sh` spells
+# `free_port` as `port`, drawing from 40000-59999 -- entirely inside Linux's
+# default ephemeral range, which is the `bind(...) failed: 98` the shared one
+# moved to 20000-31999 to avoid (#628). No regex over shell can see that, which
+# is what the allowlist's per-row reasons are for.
+#
+# The names are READ from the library rather than restated here. A second copy of
+# the list is not a cross-check, it is a second thing to be wrong -- and wrong in
+# the silent direction, because a helper ADDED to the library would simply never
+# be scanned for.
+echo "== no script keeps its own copy of a shared helper"
+
+# Every function the library defines, at column zero. The nested predicates
+# inside `wait_for_port` and `wait_for_log` are indented and are deliberately not
+# in this set: they are locals in all but name, and a fixture will not collide
+# with one by accident.
+_library_helper_names() {
+    grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)' "$library" | sed 's/()$//'
+}
+
+# Definitions of those names in one script, at ANY indentation. A fixture's
+# helpers are not all at column zero -- `dist-compile-e2e.sh` defines two inside
+# its `--case membership` block -- so anchoring at column zero would read a
+# nested copy as absent, which is the direction that fails silently.
+_helper_redefinitions() {
+    local script="$1" name=""
+    for name in $helper_names; do
+        grep -nE "^[[:space:]]*${name}\(\)" "$script" | sed "s/^/${name}: /" || true
+    done
+}
+
+helper_names="$(_library_helper_names)"
+
+# Both scans, asserted non-empty before either verdict is read. Two empty lists
+# agree perfectly: a `_library_helper_names` that matched nothing would report
+# every script clean, and so would a glob that found no scripts.
+ran=$(( ran + 1 ))
+helper_name_count="$(printf '%s\n' "$helper_names" | grep -c . || true)"
+if [ "$helper_name_count" -lt 1 ]; then
+    echo "FAIL helper-scan: read ${helper_name_count} function names out of ${library}." >&2
+    echo "     With no names there is nothing to scan for and every script reads clean." >&2
+    failures=$(( failures + 1 ))
+fi
+
+# The canary, both directions. A scan that has never been seen to fire is a scan
+# reporting PASS over a set in which nothing could fail.
+canary_dir="$(mktemp -d)"
+# Written with `printf` and not a heredoc, which is the one place this scan
+# differs from the `timeout` one above. Heredoc text is still text in THIS file,
+# and this scan reads whole scripts rather than command positions -- so a staged
+# `fail() { ... }` at column zero is a genuine hit against `check-e2e-helpers.sh`
+# itself. Observed: the first run of this block failed on its own canary.
+#
+# The `timeout` scan answers that with an allowlist row for this file, and that
+# row costs it the ability to see a real invocation here. This one does not need
+# to pay that: every line below begins with `printf` in the source, so there is
+# no definition here to find and no blind spot to exempt.
+{
+    printf '%s\n' 'fail() { echo "a private copy"; exit 1; }'
+    printf '%s\n' '    wait_for_port() { :; }'
+} > "${canary_dir}/must-catch.sh"
+# The negative half stays a heredoc, because none of it is a definition of a
+# library name -- that being exactly what it is staged to demonstrate.
+cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
+. "$(dirname "$0")/lib/e2e-common.sh"
+dash_get() { http_get 127.0.0.1 "$1" "$2"; }
+probe_hostname() { hostname -I 2>/dev/null; }
+# fail() { }
+CANARY
+ran=$(( ran + 1 ))
+caught="$(_helper_redefinitions "${canary_dir}/must-catch.sh" | grep -c . || true)"
+if [ "$caught" -ne 2 ]; then
+    echo "FAIL helper-scan-canary: the scan caught ${caught} of 2 staged copies," >&2
+    echo "     so it cannot be trusted to have found none in the real scripts" >&2
+    _helper_redefinitions "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+fi
+ran=$(( ran + 1 ))
+spurious="$(_helper_redefinitions "${canary_dir}/must-not-catch.sh")"
+if [ -n "$spurious" ]; then
+    echo "FAIL helper-scan-canary: the scan fired on a script that defines no copy" >&2
+    printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
+    failures=$(( failures + 1 ))
+fi
+rm -rf "$canary_dir"
+
+# One row per exemption, `basename:reason`, matched per row -- a single scalar
+# could hold only ONE row however many were appended to it. Each row names why,
+# and the two that are defects name the ISSUE, so an exclusion cannot rot into
+# folklore and closing the ticket has an obvious row to delete.
+helper_copy_allowed="local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it.
+launcher-replay-e2e.sh:#627. Its 'fail' carries the '[ \"\${BASHPID:-\$\$}\" = \"\$top_pid\" ]' guard the bash-3.2 table below bans by name -- correct on bash 4, silently inert on macOS 3.2, where a 'fail' inside ( ... ) then ends only the subshell.
+migrate-storage-e2e.sh:#628. Its 'fail' is the ordinary private copy; the sharper defect is its 'port', which this NAME scan cannot see -- see the header above."
+scanned=0
+for script in "${source_dir}"/scripts/*.sh; do
+    base="$(basename "$script")"
+    exempt=0
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        case "$row" in "${base}:"*) exempt=1 ;; esac
+    done <<EOF
+${helper_copy_allowed}
+EOF
+    [ "$exempt" -eq 0 ] || continue
+    scanned=$(( scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_helper_redefinitions "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL helper-scan: ${base} defines its own copy of a shared helper." >&2
+        echo "     Source scripts/lib/e2e-common.sh and delete the copy (#449, #451)." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        failures=$(( failures + 1 ))
+    fi
+done
+ran=$(( ran + 1 ))
+if [ "$scanned" -lt 1 ]; then
+    echo "FAIL helper-scan: the glob matched no scripts, so every one of them 'passed'." >&2
+    failures=$(( failures + 1 ))
+fi
 
 if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then
     echo "== the helpers, against a real listener"

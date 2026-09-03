@@ -993,13 +993,3 @@ else has this shape, and would I have seen it fail?"
   scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
   `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
   has been copied wrong before.
-- **[#451](https://github.com/LASTRADA-Software/fastcached/issues/451)** —
-  `scripts/dist-compile-e2e.sh` still carries its own `free_port`, `wait_for_port`,
-  `wait_for_log`, `http_get`, `fail` and `stop_and_require_exit`, and inlines the
-  node start recipe about ten times. Held back from #449 deliberately: #445 was in
-  the merge queue rewriting the same helpers, and taking a hand-merge risk in the
-  one file where a wrongly-merged wait is silent is the wrong trade at any conflict
-  probability. When it lands, `wait_for_registration` — #445's corrected `1 of 1
-  toolchain(s) registered` wait — **moves into** `lib/e2e-common.sh` rather than
-  being written an eighth time, and that file's `http_get` takes the shared one's
-  final-chunk fix rather than keeping its own version of the bug.
