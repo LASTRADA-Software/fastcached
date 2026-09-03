@@ -197,15 +197,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
     with a SPACE is not mapped at all, the rules being spliced into a space-separated
     flags string. `ctest -R debug-prefix-map-rules`.
-  - A DISPATCHED compile carries the REPLACEMENT, never the rule: the flag's left-hand
-    side is a path on the CLIENT, so `RemoteCompileArgs` goes on dropping it and
-    `CompileRequest::compileDir` travels instead, the worker pairing it with its own
-    working directory — which is what `DW_AT_comp_dir` is there, NOT the scratch
-    directory #506 named. Empty means map nothing, or a build that asked for nothing
-    gets a directory neither machine has; it cannot ride in `args`, which refuse a path
-    separator; and a worker that cannot spell the rule REFUSES, since an object whose
-    comp_dir disagrees under one key is the ticket itself. Read `comp_dir`, never
-    compare objects.
+  - A DISPATCHED compile carries the client's DIRECTORY and its REPLACEMENT, never the
+    rule — a rule's left-hand side is a path on the WORKER, so `RemoteCompileArgs` goes
+    on dropping the flag and `CompileRequest::compileDir`/`compileDirReplacement` travel
+    instead. The worker maps BOTH candidates: gcc's `-fworking-directory` is implicit
+    under `-g` and puts the CLIENT's directory in the preprocessed text, which the
+    compile adopts, while clang leaves the WORKER's showing — so mapping only its own
+    fixes clang and leaves gcc recording an unmapped path, which no object comparison
+    can see. And it is the node's WORKING directory, not the scratch directory #506
+    named. Empty means map nothing (a build that asked for nothing must not get a
+    directory neither machine has), half a pair is refused, it cannot ride in `args`
+    (which refuse a path separator, and `:` is a path character), and a worker that
+    cannot spell the rules REFUSES. Read `comp_dir`, never compare objects.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

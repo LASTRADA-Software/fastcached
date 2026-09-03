@@ -1284,42 +1284,61 @@ stops being one — the same confound that cost #493 a re-run.
   separator, clang at the first. The launcher follows gcc. Reachable only when a
   mapped root itself contains a separator, and it costs a MISS rather than a
   mis-serve — the head the launcher isolates lies under no root either way.
-- **A dispatched compile carries the REPLACEMENT, never the rule**
-  ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)). The flag's
-  left-hand side is a path on the CLIENT, so forwarding it would hand a worker a
-  rule matching nothing there — `RemoteCompileArgs` dropping it is right and stays.
-  What travels is `CompileRequest::compileDir`, the spelling the client's own rules
-  give the client's working directory, and the worker pairs it with its own. That
-  makes the replacement token a contract both ends share rather than a convention
-  each machine picks, which is the decision this was open on.
+- **A dispatched compile carries the DIRECTORY AND ITS REPLACEMENT, never the rule**
+  ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)). A worker needs
+  a rule whose left-hand side is a path on the WORKER, which the client has never
+  seen — so `RemoteCompileArgs` dropping the flag is right and stays, and
+  `CompileRequest::compileDir` plus `compileDirReplacement` travel instead. That makes
+  the replacement a contract both ends share rather than a convention each machine
+  picks, which is the decision this was open on.
+  - **BOTH candidate directories are mapped, because WHICH one the object records is
+    the DRIVER's answer.** gcc's `-fworking-directory` is implicit under `-g` and
+    emits a line marker naming the preprocessing directory, which the worker's compile
+    adopts; clang emits none. Measured on gcc 14.2.0 and clang 20.1.2, reading
+    `DW_AT_comp_dir` off the worker's object: `g++ -E -g` records the CLIENT's
+    directory, while `g++ -E` and `clang++ -E`/`-E -g` record the WORKER's. Mapping
+    only the worker's own fixes clang and leaves gcc recording the client's UNMAPPED
+    path — which no object comparison can see. The first implementation of this ticket
+    did exactly that, passed every unit test, and was caught only by reading
+    `comp_dir` end to end. Removing the mapping fails both drivers naming DIFFERENT
+    directories, which is the asymmetry itself.
   - **It is the node's WORKING directory, not its scratch directory** — the ticket
     said scratch and was wrong, so "map the scratch dir" fixes nothing.
     `CompileJobRunner::Run` spawns with absolute source and object paths and never
-    chdirs, and `IProcessRunner` has no directory parameter, so `DW_AT_comp_dir` is
-    whatever directory the node service was started in.
+    chdirs, and `IProcessRunner` has no directory parameter, so the worker-side
+    candidate is whatever directory the node service was started in.
   - **Empty means map nothing, and that is the whole argument against a worker-side
     constant.** A worker that mapped anyway would hand a build that asked for
     nothing an object naming a directory neither machine has — the same asymmetry,
     pointing the other way. It is a test, not a branch.
   - **It cannot ride in `args`.** `IsAcceptableJobArgument` refuses any argument
-    body carrying a path separator, deliberately, and a replacement is routinely
-    `./sub` or a `..` chain. Weakening that rule to carry a debug token would be
-    paying a security-shaped price for a debug-info fix.
-  - **A worker that cannot honour it REFUSES.** Its own directory containing an `=`
+    body carrying a path separator, deliberately, and both halves are full of them.
+    Weakening that rule to carry a debug token would be paying a security-shaped
+    price for a debug-info fix.
+  - **A HALF-filled pair is refused**, never read as "maps nothing": an empty
+    replacement maps a real directory to nothing and an empty directory maps
+    everything, and neither missing half is guessable.
+  - **`:` is a path character here.** A Windows absolute path begins `C:\`, and a
+    GNU-layout driver on Windows — mingw, or plain clang — is an ordinary client.
+    Leaving `:` out of the safe set refused every such client's own directory before
+    the driver family was even consulted, so the refusal named the wrong end of the
+    fleet.
+  - **A worker that cannot honour it REFUSES.** Either directory containing an `=`
     (gcc splits at the last, clang at the first — measured: `/tmp/l506b/eq=sign`
     mapped to `.` gives `.` on gcc 14 and `sign=.=sign` on clang 20, a WRONG
     compilation directory rather than a missing one), or a driver with no such flag.
-    Silently skipping the rule returns an object whose compilation directory
+    Silently skipping the rules returns an object whose compilation directory
     disagrees with a locally built one under the same key, which is this ticket.
   - **The client's model of the flag is the DRIVER's, and it was measured**: the
     last matching rule wins, a longer directory keeps its tail, and the match is a
     BYTE prefix — `/tmp/work=X` against `/tmp/worker` gives `Xer` on both drivers.
     Modelling it at component boundaries reads better and predicts a replacement
     neither compiler writes.
-  - **Covered by `CompileCorrelation`**, on that header's own rule: the client knows
-    it before sending and the runner observes it, because it becomes an argument on
-    the line that is spawned. Uncovered, a crossed reply is a wrong `DW_AT_comp_dir`
-    under a correct key — this ticket, one layer down.
+  - **Both halves are covered by `CompileCorrelation`**, on that header's own rule:
+    the client knows them before sending and the runner observes them, because they
+    become the two halves of the arguments on the line that is spawned. Uncovered, a
+    crossed reply is a wrong `DW_AT_comp_dir` under a correct key — this ticket, one
+    layer down.
   - The `#line` markers still carry the client's paths, so a dispatched object's
     line table names the producing checkout's headers. On gcc that already matches a
     local compile's; on clang the unit's own `DW_AT_name` is the worker's scratch
@@ -1330,7 +1349,9 @@ stops being one — the same confound that cost #493 a re-run.
     green. `dist-compile-e2e --case suite` case 13 runs the launcher from a
     directory the worker is not in — a case compiled in the worker's own directory
     passes with the fix reverted — and asserts the value rather than only the
-    agreement, because two readers that both return nothing agree perfectly.
+    agreement, because two readers that both return nothing agree perfectly. It is
+    the only case in that fixture that opens the debug records, and it is what
+    caught the worker-directory-only design that every unit test had accepted.
 - **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
   hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
   module is included from a `project()` that lists CXX first — so the first run

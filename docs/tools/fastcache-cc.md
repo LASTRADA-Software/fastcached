@@ -616,12 +616,26 @@ driver as two arguments and every compile would fail. The configure says so.
 
 **A dispatched compile records the same compilation directory a local one does.**
 The flag itself is never forwarded — it is a path-valued argument, and
-`RemoteCompileArgs` drops every one of those, correctly: its left-hand side names a
-directory on *your* machine and would match nothing on a worker. What travels
-instead is the **replacement**, and the worker pairs it with the directory its own
-compiler will run in. So a fleet-built object and a locally built one both record
-`.`, and a debugger resolves sources the same way whichever produced the object in
-your cache.
+`RemoteCompileArgs` drops every one of those, correctly: a worker needs a rule whose
+left-hand side is a path on the *worker*, which your machine has never seen. What
+travels instead is your own compile directory and what your mapping spells it as, and
+the worker builds the rules. So a fleet-built object and a locally built one both
+record `.`, and a debugger resolves sources the same way whichever produced the object
+in your cache.
+
+The worker maps **two** directories, both to your replacement, because which one a
+dispatched object records is a fact about the driver rather than about the fleet.
+Measured, reading `DW_AT_comp_dir`:
+
+| the preprocess line | what the worker's object records |
+| --- | --- |
+| `g++ -E` | the worker's directory |
+| `g++ -E -g` | **your** directory |
+| `clang++ -E`, `clang++ -E -g` | the worker's directory |
+
+gcc's `-fworking-directory` is implicit under `-g`: it puts a line marker naming the
+preprocessing directory into the text, and the worker's compile adopts it. clang emits
+no such marker. Mapping both candidates gives one answer either way.
 
 Two consequences worth knowing:
 
@@ -629,11 +643,10 @@ Two consequences worth knowing:
   fleet then records the *worker's* directory, exactly as it did before — which is
   the honest answer, because there is no directory your build would rather see.
 - **A worker that cannot honour the mapping refuses the job** rather than returning
-  an object that disagrees, and your compile runs locally. That happens when the
-  worker's own directory contains an `=` (gcc and clang split `<from>=<to>` at
-  opposite ends, so no unambiguous rule exists) or when its driver has no path-map
-  switch at all. It shows up as a `rejected argument` refusal on the worker's
-  metrics and costs one local compile.
+  an object that disagrees, and your compile runs locally. That happens when either
+  directory contains an `=` (gcc and clang split `<from>=<to>` at opposite ends, so no
+  unambiguous rule exists) or when the worker's driver has no path-map switch at all.
+  It shows up as a refusal on the worker's metrics and costs one local compile.
 
 The `#line` markers a worker is sent still carry the dispatching machine's paths,
 so a dispatched object's line table names the producing checkout's headers. That
