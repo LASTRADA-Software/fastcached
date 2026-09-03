@@ -485,10 +485,7 @@ TEST_CASE("DefaultConfigPath: a candidate with no base variable is used verbatim
 {
     auto const* const absolute = FindCandidateIf([](ConfigCandidate const& c) { return c.baseVar.empty(); });
     if (absolute == nullptr)
-    {
-        SUCCEED("this platform resolves every location from the environment");
-        return;
-    }
+        SKIP("this platform resolves every location from the environment, so no row is used verbatim");
 
     FakeProbe const probe; // Deliberately empty: the row must not consult it.
     REQUIRE(ExpandConfigCandidate(*absolute, probe, App)
@@ -516,10 +513,7 @@ TEST_CASE("DefaultConfigPath: SystemConfigPath reports the variable it could not
     REQUIRE(systemRow != nullptr);
 
     if (systemRow->baseVar.empty())
-    {
-        SUCCEED("this platform's machine-wide location is a compiled-in absolute path and cannot fail");
-        return;
-    }
+        SKIP("this platform's machine-wide location is a compiled-in absolute path, so there is no expansion to fail");
 
     FakeProbe probe;
     probe.SetAllBaseVars();
@@ -700,10 +694,7 @@ TEST_CASE("SystemConfigPathProbe: readability means an ordinary file this accoun
 TEST_CASE("SystemConfigPathProbe: a file this account may not read is not readable", "[config][probe]")
 {
     if (::geteuid() == 0)
-    {
-        SUCCEED("running as root, for whom the permission bits are advisory");
-        return;
-    }
+        SKIP("running as root, for whom the permission bits are advisory, so unreadability cannot be arranged");
 
     FastCache::SystemConfigPathProbe const probe;
     TempDir const dir { "unreadable" };
@@ -768,10 +759,7 @@ TEST_CASE("SystemConfigPathProbe: a file only administrators can replace is trus
 #endif
 
     if (!probe.IsReadableFile(wellKnown))
-    {
-        SUCCEED("no readable /etc/hosts equivalent on this machine");
-        return;
-    }
+        SKIP("no readable /etc/hosts equivalent on this machine");
 
     REQUIRE(probe.IsTrustedSystemLocation(wellKnown));
 }

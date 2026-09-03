@@ -82,10 +82,7 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
     // callers already handle.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -133,10 +130,7 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
     // out loud: the daemon kept working, and only the children were affected.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -156,10 +150,7 @@ TEST_CASE("A connected pair still round-trips bytes", "[net][socket]")
     // cannot distinguish from the success it is looking for.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));

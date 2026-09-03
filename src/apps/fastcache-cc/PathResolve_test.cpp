@@ -127,15 +127,13 @@ TEST_CASE("Two spellings of one directory resolve to the same answer")
     auto const link = scratch.Root() / "link";
     std::filesystem::create_directory_symlink(real, link, ec);
     if (ec)
-        SUCCEED("this host does not permit creating symlinks; nothing to compare");
-    else
-    {
-        auto const resolver = MakePathResolver();
-        auto const viaReal = resolver->Resolve(file.string());
-        auto const viaLink = resolver->Resolve((link / "inc" / "h1.h").string());
-        CHECK(viaReal == viaLink);
-        CHECK(SameFile(viaReal, file.string()));
-    }
+        SKIP("this host does not permit creating symlinks; nothing to compare");
+
+    auto const resolver = MakePathResolver();
+    auto const viaReal = resolver->Resolve(file.string());
+    auto const viaLink = resolver->Resolve((link / "inc" / "h1.h").string());
+    CHECK(viaReal == viaLink);
+    CHECK(SameFile(viaReal, file.string()));
 }
 
 TEST_CASE("A root's own final component is resolved, unlike a file's")
@@ -152,12 +150,10 @@ TEST_CASE("A root's own final component is resolved, unlike a file's")
     auto const link = scratch.Root() / "link";
     std::filesystem::create_directory_symlink(real, link, ec);
     if (ec)
-        SUCCEED("this host does not permit creating symlinks; nothing to compare");
-    else
-    {
-        auto const resolver = MakePathResolver();
-        CHECK(resolver->ResolveDirectory(link.string()) == resolver->ResolveDirectory(real.string()));
-    }
+        SKIP("this host does not permit creating symlinks; nothing to compare");
+
+    auto const resolver = MakePathResolver();
+    CHECK(resolver->ResolveDirectory(link.string()) == resolver->ResolveDirectory(real.string()));
 }
 
 TEST_CASE("Resolution is memoized per directory, not per path")
