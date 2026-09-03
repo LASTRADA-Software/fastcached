@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -474,6 +475,74 @@ TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::MalformedValue);
     CHECK(replies.at(1).status == Wire::Status::Miss);
+}
+
+TEST_CASE("A foreign value generation and a malformed value are refused by DIFFERENT codes",
+          "[compile-cache][handler]")
+{
+    // #544. Both arms in ONE case on purpose. The property is that the two codes
+    // DIFFER, and a pair split across two cases asserts only that each is whatever it
+    // is -- which both still are under a change that collapses them back into one
+    // code. Absence of the negative is not the positive, so the malformed arm is here
+    // as the thing the collapse would take back, not as decoration.
+    //
+    // The conflation this closes is the one `.agent/rules/storage.md` records for
+    // `Corrupt` against `UnsupportedFormatVersion`, met on the wire instead of on
+    // disk: a launcher at generation N against a server at N+1 is a fleet MID-UPGRADE
+    // and nothing is damaged, but the remedy an operator reaches for on a cache
+    // reporting malformed values is to wipe it.
+
+    // A value a launcher of the NEXT generation would have written: encoded through
+    // the real encoder, so the framing is honest, then stamped one generation on. What
+    // separates it from the junk arm below is the layout, not the leading byte.
+    CompileValue produced;
+    produced.objectBlob = { std::byte { 0x01 } };
+    produced.textRegions.push_back(
+        { .grammar = Grammar::ShowIncludes, .bytes = "Note: including file: /src/inc/a.hpp\n" });
+    auto foreign = EncodeCompileValue(produced);
+    REQUIRE_FALSE(foreign.empty());
+    REQUIRE(static_cast<std::uint8_t>(foreign.front()) == CompileValueVersion);
+    constexpr auto NextGeneration = static_cast<std::uint8_t>(CompileValueVersion + 1);
+    foreign.front() = std::byte { NextGeneration };
+
+    CcFixture foreignFixture;
+    auto const foreignStore = Wire::EncodeStore(Wire::StoreRequest { .key = "k-foreign",
+                                                                    .prefetchGroup = "",
+                                                                    .srcRoot = "/src",
+                                                                    .buildTree = "/build",
+                                                                    .value = std::span<std::byte const> { foreign } });
+    auto const foreignReplies =
+        SplitReplies(ExchangeWith(foreignFixture, Concat({ foreignStore, FetchFrame("k-foreign") }), SessionContext {}));
+    REQUIRE(foreignReplies.size() == 2);
+    auto const foreignError = ErrorOf(foreignReplies.at(0));
+    REQUIRE(foreignError.present);
+    CHECK(foreignError.code == Wire::ErrorCode::ForeignValueGeneration);
+
+    // The message is the whole of the operator's diagnostic, so it names BOTH
+    // generations rather than restating the code in words.
+    CHECK(foreignError.message == ForeignGenerationMessage(NextGeneration));
+
+    // Refused means nothing was written. A miss rather than the bytes coming back is
+    // what says the value was not stored uncanonicalized -- which is the harm the
+    // refusal exists to prevent, not a side effect of it.
+    CHECK(foreignReplies.at(1).status == Wire::Status::Miss);
+
+    // The companion. Bytes that are not a compile value at all keep `MalformedValue`,
+    // whose meaning this ticket deliberately leaves alone.
+    CcFixture junkFixture;
+    auto const junk = std::vector<std::byte> { std::byte { 0xEE }, std::byte { 0xEE } };
+    auto const junkStore = Wire::EncodeStore(Wire::StoreRequest { .key = "k-junk",
+                                                                 .prefetchGroup = "",
+                                                                 .srcRoot = "/src",
+                                                                 .buildTree = "/build",
+                                                                 .value = std::span<std::byte const> { junk } });
+    auto const junkError = ErrorOf(SoleReply(Exchange(junkFixture, junkStore)));
+    REQUIRE(junkError.present);
+    CHECK(junkError.code == Wire::ErrorCode::MalformedValue);
+
+    // Stated as its own assertion rather than left to be inferred from the two above:
+    // this is the one that fails if a later change gives both arms one code again.
+    CHECK(foreignError.code != junkError.code);
 }
 
 TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][handler][version]")
