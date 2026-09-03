@@ -39,10 +39,7 @@ TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise"
     constexpr std::uint16_t Port = 19287;
     auto listener = BlockingListener::Bind("127.0.0.1", Port);
     if (!listener || !listener->IsBound())
-    {
-        SUCCEED("could not bind test port; skipping");
-        return;
-    }
+        SKIP("could not bind the test port on this host");
     // Poll accept() so Shutdown() is observed and the server jthread joins on
     // every platform — POSIX does not unblock a parked accept() on Close(), so
     // without this the test would hang on Linux at scope exit.
@@ -79,10 +76,7 @@ TEST_CASE("HttpHealthProbe rejects a non-200 response whose body contains \" 200
     constexpr std::uint16_t Port = 19290;
     auto listener = BlockingListener::Bind("127.0.0.1", Port);
     if (!listener || !listener->IsBound())
-    {
-        SUCCEED("could not bind test port; skipping");
-        return;
-    }
+        SKIP("could not bind the test port on this host");
     listener->SetTimeouts(std::chrono::milliseconds { 100 }, std::chrono::seconds { 5 });
 
     auto const respond500 = [](IListener* l) -> Task<void> {
@@ -121,10 +115,7 @@ TEST_CASE("HttpHealthProbe times out (not hangs) against an accept-but-silent pe
     constexpr std::uint16_t Port = 19289;
     auto listener = BlockingListener::Bind("127.0.0.1", Port);
     if (!listener || !listener->IsBound())
-    {
-        SUCCEED("could not bind test port; skipping");
-        return;
-    }
+        SKIP("could not bind the test port on this host");
     listener->SetTimeouts(std::chrono::milliseconds { 100 }, std::chrono::seconds { 5 });
 
     std::jthread acceptor { [&listener](std::stop_token const& stop) {

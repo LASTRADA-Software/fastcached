@@ -238,10 +238,7 @@ TEST_CASE("RecvExactly gives up on a peer that accepts and then goes silent", "[
     // a build-stopping dependency.
     auto listener = BlockingListener::Bind("127.0.0.1", 0);
     if (listener == nullptr || !listener->IsBound())
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     constexpr auto IoTimeout = 300ms;
     auto client = SyncRun(ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, IoTimeout));
@@ -268,10 +265,7 @@ TEST_CASE("A socket with a timeout armed still transfers normally", "[net][tcpcl
     // everywhere, and the case above would still pass.
     auto listener = BlockingListener::Bind("127.0.0.1", 0);
     if (listener == nullptr || !listener->IsBound())
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     auto client = SyncRun(ConnectTcp("127.0.0.1", listener->BoundPort(), 2s, 5s));
     REQUIRE(client.has_value());

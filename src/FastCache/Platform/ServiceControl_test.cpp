@@ -132,7 +132,11 @@ TEST_CASE("ServiceControl: install/uninstall are unsupported without a superviso
     // Deliberately not called here: on Windows and macOS these really do
     // register a service, which a unit test must not do to the host. The
     // scripts/macos-service-e2e.sh and the Windows MSI path cover them.
-    SUCCEED("InstallService is exercised by the platform end-to-end paths");
+    //
+    // Skipped rather than passed. Nothing here observes the property, and a
+    // green result claiming otherwise is what #685 is about -- "covered by
+    // another test" is a reason to skip this one, never a reason to pass it.
+    SKIP("install/uninstall are exercised by the platform end-to-end paths, not by this unit test");
 #endif
 }
 

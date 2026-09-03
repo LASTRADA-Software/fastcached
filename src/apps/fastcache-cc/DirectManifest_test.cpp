@@ -1123,10 +1123,12 @@ TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's voca
     if (ec)
     {
         // Symlink creation needs a privilege or developer mode on Windows. The rule
-        // is unconditional; only this way of demonstrating it is not.
+        // is unconditional; only this way of demonstrating it is not -- which is
+        // exactly why the case is SKIPPED here rather than passed. A `SUCCEED` would
+        // report that the rule holds on every host that cannot make a link, which is
+        // the one set of hosts where nothing checked it (#685).
         std::filesystem::remove_all(base);
-        SUCCEED("symlinks unavailable on this host");
-        return;
+        SKIP("symlinks unavailable on this host");
     }
 
     // The layout names the root through the symlink; the cwd arrives resolved.

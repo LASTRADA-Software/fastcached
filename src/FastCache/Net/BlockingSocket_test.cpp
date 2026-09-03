@@ -82,10 +82,7 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
     // callers already handle.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -133,10 +130,7 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
     // out loud: the daemon kept working, and only the children were affected.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -156,10 +150,7 @@ TEST_CASE("A connected pair still round-trips bytes", "[net][socket]")
     // cannot distinguish from the success it is looking for.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -197,8 +188,15 @@ TEST_CASE("Suppression is either armed on the socket or carried in the send flag
     // which is why the case above needs kilobytes to provoke it. A regression test
     // that only sometimes sees the signal is the thing this repository already
     // records as worth nothing, so this pins the invariant the fix restored.
+    // Both arms assert, and the `SO_NOSIGPIPE` one is not symmetry for tidiness: ZERO is
+    // the answer this case exists to pin. `MSG_NOSIGNAL` may well be DEFINED on a macOS
+    // SDK new enough to declare it, while `CMAKE_OSX_DEPLOYMENT_TARGET` lets the binary
+    // run on an older kernel -- and a flag the kernel does not know fails the send. So
+    // widening this arm to `MSG_NOSIGNAL` is the exact regression, and until #685 it
+    // would have been reported as a pass: the arm said `SUCCEED("SO_NOSIGPIPE arms the
+    // descriptor here")`, which observed nothing at all.
     #if defined(SO_NOSIGPIPE)
-    SUCCEED("SO_NOSIGPIPE arms the descriptor here, so a raw sender needs no extra flag");
+    CHECK(Detail::NoSignalSendFlags() == 0);
     #else
     CHECK(Detail::NoSignalSendFlags() == MSG_NOSIGNAL);
     #endif

@@ -93,10 +93,7 @@ TEST_CASE("A connector reaches a listener that is up", "[net][connector]")
 {
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
     auto const socket = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
@@ -121,10 +118,7 @@ TEST_CASE("A dial that cannot succeed fails within its timeout", "[net][connecto
     // fails, quickly, and says which of the two happened.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
     auto const port = listener->BoundPort();
     listener.reset();
 
@@ -173,17 +167,11 @@ TEST_CASE("A dead first candidate does not condemn the host", "[net][connector]"
     // healthy peer is reported down for a reason that is about this machine.
     auto listener = BindEphemeral();
     if (listener == nullptr)
-    {
-        SUCCEED("no loopback listener available on this host");
-        return;
-    }
+        SKIP("no loopback listener available on this host");
 
     auto dead = BindEphemeral();
     if (dead == nullptr)
-    {
-        SUCCEED("no second loopback listener available on this host");
-        return;
-    }
+        SKIP("no second loopback listener available on this host");
     auto const deadPort = dead->BoundPort();
     dead.reset();
 

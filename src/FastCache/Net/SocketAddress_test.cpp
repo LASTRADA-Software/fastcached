@@ -333,11 +333,7 @@ TEST_CASE("BindAndListen forces dual-stack (IPV6_V6ONLY=0) on an IPv6 wildcard b
     FakeAddressResolver resolver { std::vector { MakeV6Endpoint("::", 0) } };
     auto bound = FastCache::Detail::BindAndListen(resolver, "::", 0, /*backlog*/ 16, /*extraTypeFlags*/ 0);
     if (!bound.has_value())
-    {
-        // No usable IPv6 stack in this environment — nothing to assert.
-        SUCCEED("IPv6 unavailable; skipping dual-stack assertion");
-        return;
-    }
+        SKIP("IPv6 unavailable in this environment, so the dual-stack bind could not be made");
     REQUIRE(bound->family == AF_INET6);
 
     int v6only = 1;

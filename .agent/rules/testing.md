@@ -930,6 +930,84 @@ and ctest printed `***Failed` **for the very same run** (#499).
   code — `file(GLOB_RECURSE)` recurses from the base directory and treats only the
   last component as a pattern, so `src/*/CMakeLists.txt` does not mean one level down.
 
+## A `SUCCEED` where the case could not RUN is a false GREEN
+
+The converse of the rule above, and the direction nobody investigates. `SUCCEED("...")`
+records a **passing assertion**, so a case that bails out because its environment could
+not be arranged reports a pass for a property nothing established (#685).
+
+**`SUCCEED` is right when the case RAN and there was nothing to assert. It is wrong when
+the case could not run.** That is the whole distinction, and `SKIP("reason")` is the
+whole fix — it exits 4, every `catch_discover_tests` registration carries
+`SKIP_RETURN_CODE 4`, and ctest scores it as skipped.
+
+- **It fires where coverage is already thinnest.** All twenty-one sites converted for
+  #685 were environment-conditional: no loopback listener, no IPv6 stack, no symlink
+  privilege on a Windows agent, running as root, a test port already bound. Those are
+  precisely the runs on which a green is least justified and most believed — a
+  constrained CI runner reports the same colour as a full one, and nothing distinguishes
+  them.
+- **The four states again.** Skipped, absent, unstarted and failed. A case that could not
+  run is *skipped*, and rendering it as *passed* collapses two of them at exactly the
+  layer that decides whether anybody looks.
+- **A comment does not stop it, because it spread by IMITATION.**
+  `DirectManifest_test.cpp` carried the idiom under a comment that was *correct* — it
+  said the rule being demonstrated is unconditional, which is the reason the `SUCCEED`
+  was wrong — and the next test written was copied from it, comment and all. The
+  argument was there to be read and was not the thing being copied.
+- **What a check can see, and what it cannot.** `ctest -R succeed-not-skip` fires on two
+  signals: a `SUCCEED` whose next statement is a bare `return` — on the following line or
+  on its own, since `if (!ready) { SUCCEED("x"); return; }` is the same defect written in
+  one — and a message in skip vocabulary, "unavailable", "could not", "privilege",
+  "exercised by", held as a table with one row per phrase. A silent bail-out with a
+  message in neither vocabulary and no `return` is invisible to it, and so is a `SUCCEED`
+  sitting between two block comments on one line, because CMake's regex engine is greedy
+  and strips from the first `/*` to the last `*/`. Those limits are stated in the script
+  rather than papered over: the check closes the door the defect came through, and this
+  rule covers the rest.
+- **A check that refuses its own documentation has no escape hatch.** This rule is
+  written out in prose that quotes the idiom, and test files cite it in comments. The
+  scan therefore strips `//` comments and tracks `/* ... */` blocks across lines — a
+  leading-`//` test is not enough, because a block written without leading stars carries
+  whole paragraphs and its body is exactly what a historic note looks like. A contributor
+  tripped by that could make the build green only by rewording the comment.
+- **A `SUCCEED` that NAMES a mechanism reads like an assertion about it, and is not one.**
+  `BlockingSocket_test.cpp`'s `SO_NOSIGPIPE` arm said "SO_NOSIGPIPE arms the descriptor
+  here, so a raw sender needs no extra flag" and observed nothing — while the checkable
+  fact was one line away, `NoSignalSendFlags() == 0`, and is the fact the case exists for:
+  `MSG_NOSIGNAL` may be *defined* by a macOS SDK while `CMAKE_OSX_DEPLOYMENT_TARGET` lets
+  the binary run on an older kernel, and a flag the kernel does not know fails the send.
+  Widening that arm is the exact regression, and it would have reported a pass. It was
+  classified as legitimate twice — in the ticket and by the sweep — and only review caught
+  it, by reading the code rather than the message. **The two signals a check can see do
+  not reach this shape**: no bail-out `return`, no skip vocabulary. Which is why the rule
+  is the thing that must be internalised and the check is only the door the defect came
+  through.
+- **"Covered by another test" is a reason to SKIP, never a reason to pass.**
+  `ServiceControl_test.cpp` deliberately does not call `InstallService` on Windows and
+  macOS — a unit test must not register a service on the host — and said so in a
+  `SUCCEED`. The end-to-end scripts really do cover it; *this* case still observed
+  nothing.
+- **Inconclusive is refused, not passed.** A `SUCCEED` the check cannot read to a closing
+  parenthesis on one line is reported as its own outcome. A site it could not read is not
+  a site it cleared.
+- **The guard is shown failing on every direction it claims**
+  (`ctest -R succeed-not-skip-selftest`): thirteen synthetic trees, one verdict each, and
+  each refusal asserted by the phrase naming *that* refusal — so a mutation that reddens
+  everything fails the selftest instead of looking thorough. Measured against six mutants:
+  removing each of the bail-out, one-line, block-comment and deleted-file guards reddens
+  exactly its own case, emptying the vocabulary reddens the message-driven ones, and
+  refusing everything reddens all seven cases that assert silence. Seven of the thirteen
+  exist only to assert the check stays **quiet** — on `SUCCEED()` with no message, on a
+  `SUCCEED` that ends a case, and on the idiom quoted in a comment of either kind.
+- **A fixture that could not be STAGED says so.** The selftest's git cases build a real
+  repository, and under a long scratch path `git add` failed with "Filename too long" —
+  the tree then had no index, the check fell back to the directory walk, and two verdicts
+  came back wrong for a reason that had nothing to do with the check. Every git command
+  the fixture runs is checked, and a case that could not be arranged reports *that*,
+  naming what git said. The scratch directory is also the root rather than a directory
+  inside it, which is one long path component fewer.
+
 ## A leader-pinned command goes to whoever leads NOW
 
 `$leader_endpoint` is derived by whichever section of `cluster-e2e.sh` needed it
