@@ -214,7 +214,20 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     the client's: `/` is the shipped unit's working directory and `/=.` rewrites every
     absolute path in the object — measured, a `comp_dir` of `.tmp/…/client` and system
     headers reading `.usr/include/...`, worse than the bug. Read `comp_dir`, never
-    compare objects.
+    compare objects. **And the directory each end predicts from is `$PWD`, not
+    `getcwd(3)`** — `CompilerWorkingDirectory`, on both sides. Both drivers record, and
+    byte-compare `<from>` against, `PWD` when it is absolute and names the SAME directory
+    as `.` (a `stat` test, so `equivalent`), falling back to `getcwd(3)` for unset, a
+    different real directory, a nonexistent path or a relative one. `current_path()` IS
+    `getcwd(3)`, so the first fix matched nothing on any build reached through a symlink,
+    sent no pair, and left the dispatched object unmapped — the ticket surviving its own
+    fix, every counter normal, green on Linux because `/tmp` is not a link while macOS's
+    `$TMPDIR` sits under one. Not canonicalizing both sides: that is MORE permissive than
+    the driver and manufactures the disagreement in the other direction. Case 13 runs at
+    two spellings, each with its own source or the second replays the first's object.
+    A dispatched object showing the CLIENT's directory is gcc's `-fworking-directory`
+    residue, NOT proof it came from no worker — one fault, two residues, which is the
+    second independent reason one candidate was never enough.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

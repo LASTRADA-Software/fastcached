@@ -1302,6 +1302,31 @@ stops being one — the same confound that cost #493 a re-run.
     did exactly that, passed every unit test, and was caught only by reading
     `comp_dir` end to end. Removing the mapping fails both drivers naming DIFFERENT
     directories, which is the asymmetry itself.
+  - **And that directory is `$PWD`, not `getcwd(3)`** — asked through
+    `CompilerWorkingDirectory`, on both sides. Both drivers report `DW_AT_comp_dir`, and
+    byte-compare every `<from>` against, the `PWD` variable when it is ABSOLUTE and names
+    the SAME directory as `.`; `getcwd(3)` only when it is not. Measured, gcc 14 and
+    clang 20 identical, cwd `/tmp/l506f/build` reached as `/tmp/l506f-link/build`: the
+    link spelling is recorded verbatim, while unset, a different real directory, a
+    nonexistent path and a relative path each fall back to `/tmp/l506f/build`. So it is a
+    `stat` comparison, not a spelling one — `std::filesystem::equivalent`. And the
+    discriminating case: a rule written with the RESOLVED spelling matches NOTHING, so
+    this cannot be answered by canonicalizing both sides and comparing identities. That
+    is more permissive than the driver and would send a worker a mapping the local
+    compile never applied, manufacturing the disagreement in the other direction.
+    `current_path()` is `getcwd(3)`, so the first implementation matched nothing on any
+    build reached through a link, sent no pair, and left the dispatched object unmapped —
+    this ticket surviving its own fix, with every counter normal. macOS meets it because
+    `/var` is a symlink and `$TMPDIR` is under one; Linux `/tmp` is not, which is why it
+    reached master green. Case 13 therefore runs at TWO spellings, and each compiles its
+    own source or the second is served the first's cached object and never dispatches.
+  - **The residue identifies the DRIVER, not the origin.** A dispatched object recording
+    the CLIENT's directory does not mean it came from no worker: that is gcc's
+    `-fworking-directory` marker being adopted, measured with `DISPATCHED to` in the same
+    log. clang leaves the WORKER's showing for the identical fault. So macOS and Linux
+    print different directories for one defect, which is a SECOND reason mapping a single
+    candidate could never have held — either one breaks it alone. What discriminates is
+    the launcher's spelling against its resolved form, never which directory appeared.
   - **It is the node's WORKING directory, not its scratch directory** — the ticket
     said scratch and was wrong, so "map the scratch dir" fixes nothing.
     `CompileJobRunner::Run` spawns with absolute source and object paths and never

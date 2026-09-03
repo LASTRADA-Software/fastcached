@@ -637,8 +637,17 @@ gcc's `-fworking-directory` is implicit under `-g`: it puts a line marker naming
 preprocessing directory into the text, and the worker's compile adopts it. clang emits
 no such marker. Mapping both candidates gives one answer either way.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
+- **A build reached through a symlink is mapped correctly**, and that takes care. Both
+  drivers record — and match `-fdebug-prefix-map` against — `$PWD` when it is absolute
+  and names the same directory as `.`, falling back to `getcwd(3)` otherwise. So if you
+  `cd` to a build through a link, your rule spells the link and the driver agrees, while
+  the resolved path matches nothing. The launcher predicts from the same value your
+  compiler will use, so the dispatched object and the local one still agree. It is worth
+  stating because getting it wrong is invisible: the mapping simply never travels, the
+  fleet-built object keeps an absolute path, and nothing reports a problem. macOS is
+  where this shows up first — `/var` is a symlink, so anything under `$TMPDIR` is.
 - **If your build passes no mapping, a worker adds none.** An object built on the
   fleet then records the *worker's* directory, exactly as it did before — which is
   the honest answer, because there is no directory your build would rather see.
