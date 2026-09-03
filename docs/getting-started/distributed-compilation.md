@@ -509,6 +509,8 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_envelope_malformed_total` | A payload envelope that did not parse: a version skew, or something on the port that is not this protocol. |
 | `fastcache_worker_jobs_refused_envelope_corrupt_total` | Bytes that parsed and then did not expand to their declared size. The one refusal here that implicates the **transport**. |
 | `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by this cluster. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating signed leases, which is told apart by whether the rise tracks a rollout. |
+| `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | An **authentic** lease was signed by a different fleet. Never sum it with `..._unauthorized_total` beside it: that one is a bad signature, this one is a good signature from somebody else. A rise here is a provisioning mistake — two sites built from one copied `--cluster-key-file` — and the fix is a second key, not a firewall. |
+| `fastcache_worker_jobs_refused_lease_stale_epoch_total` | An **authentic** lease named a scheduler term that is no longer current: a grant minted before an election and spent after it. Zero on a fleet that is not electing, so a sustained rise means leadership is moving and grants are outliving it. Do not sum it with `..._wrong_cluster_total` either — they share a wire code and nothing else, and they send you to opposite places. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
 | `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
@@ -518,11 +520,27 @@ The refusals are split by reason for the same reason the scheduler's two are:
 a full worker and a misconfigured one are different problems with different
 fixes, and one number covering both tells you neither.
 
-The three `..._lease_*` counters move only on a node that holds
+The five `..._lease_*` counters move only on a node that holds
 `--cluster-key-file`. Without one a worker cannot check a signature, and it says so
 at startup rather than leaving these at zero and looking healthy — a node that
 another machine could dial is refused outright without the key
 ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)).
+
+Four of them share the wire code `lease-unauthorized`, because a client's answer to
+all four is the same — compile it locally — and a code it does not recognise would be
+worse than one it does. **Your** answer is different for each, which is why they are
+four series rather than one: a bad signature is a security question, a good signature
+from another fleet is a provisioning one, a superseded term is an election, and an
+expired lease is usually a clock.
+
+`..._lease_stale_epoch_total` could not rise at all before
+[#421](https://github.com/LASTRADA-Software/fastcached/issues/421). A worker had no
+way to learn which term was current — the only term it ever saw was the one inside
+the token it was checking — so the series was exported and permanently zero. It now
+learns the term from the heartbeat reply, and from any authentic grant naming a later
+one. A worker whose heartbeat is stale still refuses nothing: only a grant naming an
+**older** term than the worker has seen is turned away, so a machine that is merely
+behind accepts the new leader's grants and catches up from them.
 
 The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,

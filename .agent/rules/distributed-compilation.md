@@ -687,6 +687,56 @@ Consequences that are each load-bearing:
   own slot accounting and its in-flight byte budget, never the lease. Anything built
   on "an unexpired lease implies the scheduler still holds capacity" is built on a
   guarantee that does not exist.
+- **The term check is ONE-SIDED, and that is what stops it causing the outage it
+  prevents.** A grant carries the Raft term it was issued under, inside the MAC since
+  #322 — but the scheduler was the only thing that could enforce it, and the scheduler
+  is not where a replayed grant is spent. #421 gave the worker a channel: the
+  **heartbeat reply** states the term, and any authentic grant naming a later one
+  states it too. What matters is the comparison. A grant from a term **below** what
+  the worker has learned came from a deposed scheduler and is refused; one from a term
+  **above** it is accepted, and adopted. Refusing the second direction is the obvious
+  reading, is what `MustEqual` would have spelled, and would have made a worker that
+  missed a single heartbeat reject the new leader — the fleet ceasing to distribute
+  for one heartbeat interval after every election, which is worse than the replay
+  window it closes and is the failure the check exists to prevent, produced by the
+  check. Under the one-sided rule **a worker's own staleness can never cause a
+  refusal**, which is why the availability trade the ticket expected to have to make
+  does not exist. It is this file's caching principle in another setting: staleness is
+  safe to hold when it fails closed and self-heals, and adopting forward is the
+  self-healing half.
+- **Adoption happens after the MAC verified, never before.** The grant is a learning
+  channel precisely because `VerifyLeaseToken` authenticates before it reports on any
+  claim. Reading a term off a *refused* token would let anybody who can reach the port
+  push a worker's expectation arbitrarily high and make it refuse every honest grant
+  afterwards — a denial of service built out of the anti-replay measure. Same ordering
+  rule as the oracle argument above, reached from the other end.
+- **Never-learned is a state, not a term value.** `StandaloneSchedulerTerm` is
+  literally `0` — the term of a node leading alone — and its own declaration warns
+  that "a literal at a call site is exactly how somebody later reads it as unknown and
+  starts treating it as one". So `KnownSchedulerTerm` carries a flag beside the
+  number, and a worker that has learned term 0 is checking while one that has learned
+  nothing is not. A worker that refused before its first heartbeat could not
+  cold-start and every restart would be an outage, so *accept everything* is the right
+  answer in that state and `LeaseEpochCheck::NotKnownHere` stays a real answer.
+- **The term rides the HEARTBEAT reply because REGISTER's has no room, and "no room"
+  is stronger than "exact arity".** A node's version rides REGISTER's nested capacity
+  record for the usual reason — that record is extensible and the top level is not.
+  The REGISTER *reply* is a different thing again: its entire payload **is** the
+  worker id, read whole by every deployed launcher (`WorkerProtocol.cpp`,
+  `Wire::AsStringView(outcome.value)`), so there is no field structure to extend at
+  all. The heartbeat reply was empty and its client read nothing from it, which makes
+  adding bytes additive in both directions — an old scheduler sends none, a new one
+  sends eight an old worker ignores. Check what a reply's client actually READS before
+  concluding a field will fit.
+- **A reply that states nothing and a reply this build cannot read are different
+  answers.** `SchedulerTermState` is `NotStated` / `Stated` / `Unreadable`, not an
+  `optional`, even though the worker learns nothing in two of the three: an empty
+  payload is every scheduler predating #421 and is ordinary mid-rollout, while a
+  payload of the wrong width is two builds disagreeing and is worth a line. Folded
+  into one value, the rollout case hides the other permanently. And the width is
+  **strict** for the reason `DecodeU32Field` is: reading the first eight bytes of
+  something this build does not understand would invent a term, and here that is a
+  number the worker then refuses authentic grants against.
 - **A scheduler with no `--cluster-key-file` signs nothing, and says so.** Refusing
   to schedule without a key would break every single-machine install, which is what
   most people run; doing it quietly is the failure class this repository keeps
