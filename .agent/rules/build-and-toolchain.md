@@ -2036,6 +2036,28 @@ been built on the first.
 
 ## Open work
 
+- **[#589](https://github.com/LASTRADA-Software/fastcached/issues/589)** — the sweep
+  now reports which files produced no code (#466), and that is the half that only
+  *reports*: a green job's log is not read. Nothing asserts that a file guarded out
+  here is compiled with its guard **active** somewhere, so the syntax error that
+  started #466 could recur and every required check would still be green. The check
+  is over **guards**, not platforms — `TlsContext_test.cpp` and `TlsSocket_test.cpp`
+  are gated on a build OPTION, not an OS — and its union is over
+  **(leg × configuration)**, never over legs: a leg that builds with an option off
+  has run without covering anything that option gates. It is a different instrument
+  over the CI matrix, not a deeper `tidy-sweep.sh`, which by construction sees one
+  configuration and cannot know what the macOS or Windows legs compile.
+- **[#605](https://github.com/LASTRADA-Software/fastcached/issues/605)** —
+  `PreprocessArgv` re-parses the whole compile database once per translation unit,
+  a second and looser lookup rule for a question `PlanUnits` already answers.
+  The cost is the smaller half (14.1 s of CPU a sweep against 141 ms batched, ~0.3%
+  of wall clock); the correctness half is that the plan row splits with
+  `${unit#*$'\t'}`, which strips through the **first** tab, so a third column folds
+  into `$file`, the lookup misses, and the unit is classified from a command that is
+  not its own with nothing reporting. The row shape is fixed before the batching, and
+  a batched pass is accepted only on identical classifications over the real
+  database — a 100× speedup that moves one verdict is a regression, because the
+  verdicts are the entire job.
 - **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
   entry in `.tsan-suppressions`: `AdminEndpoint` closes its listener from the main
   thread while its own accept thread is still inside `Accept()`. Removing the entry
