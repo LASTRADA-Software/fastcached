@@ -525,6 +525,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_started_total` | Jobs accepted. |
 | `fastcache_worker_jobs_completed_total` | Jobs that ran to an exit code — including a **non-zero** one, which is the client's answer rather than a worker failure. |
 | `fastcache_worker_compile_milliseconds_total` | Compile wall time. Divide by `..._jobs_completed_total` for the mean; both are counters, so a rate over a window gives you the current one. |
+| `fastcache_worker_jobs_abandoned_client_gone_total` | The client had **disconnected** before the object could be written back, so it was not sent. The compile still counts in `..._jobs_completed_total` — it ran and this machine paid for it, and only the delivery found nobody there. A rise is a client-side story: cancelled builds, `Ctrl-C`, a CI runner reclaimed mid-job. What it saves is the transfer; the CPU is spent either way until [#661](https://github.com/LASTRADA-Software/fastcached/issues/661). A client that half-closes its write side after sending and still waits for its object is read as gone and counted here — nothing shipped in this project does that, but a third-party client speaking the protocol over a raw socket could. |
 | `fastcache_worker_jobs_refused_no_slot_total` | This worker is **full**. Pair it with the scheduler's `..._no_capacity_total`. |
 | `fastcache_worker_jobs_refused_unknown_fingerprint_total` | Somebody is dispatching a toolchain this worker does not have. |
 | `fastcache_worker_jobs_refused_rejected_argument_total` | A command line carrying something that could name a file. |

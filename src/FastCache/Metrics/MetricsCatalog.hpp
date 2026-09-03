@@ -189,6 +189,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Total wall time spent compiling. Divide by jobs_completed_total, or "
               "take rate() of both, for the average compile.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsAbandonedClientGone,
+      .prometheusName = "fastcache_worker_jobs_abandoned_client_gone_total",
+      .help = "Compiles whose client had disconnected before the object could be "
+              "written back. The compile itself still counts in jobs_completed_total "
+              "-- the compiler ran and this machine paid for it; only the delivery "
+              "found nobody there. Never a refusal: nothing was declined and no reply "
+              "was sent.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint,
       .prometheusName = "fastcache_worker_jobs_refused_unknown_fingerprint_total",
       .help = "Jobs refused because no compiler here matches the client's "

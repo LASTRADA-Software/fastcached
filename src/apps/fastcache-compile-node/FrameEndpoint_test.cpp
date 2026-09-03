@@ -5,6 +5,7 @@
 
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <format>
 #include <future>
@@ -217,6 +219,44 @@ struct Fleet
     return reply;
 }
 
+/// How long a case waits for something the reactor still owes it.
+///
+/// Bounded, and every use says what it waited for -- `.agent/rules/testing.md`.
+/// Generous against a loaded box on purpose: nothing here is a timing property, so a
+/// case that needed this tight would be measuring the machine rather than the code.
+constexpr auto WatchWait = 15s;
+
+/// Wait until @p ready holds, or give up.
+///
+/// Through `DrainWithin` rather than a spin of its own, because that is the one bounded
+/// wait in this tree and the reason is exactly the trap here: counting the sleeps it
+/// ASKED for states a ceiling and enforces `actual / requested` times it, and on Windows
+/// a 5 ms request costs about 15 ms -- so a hand-rolled `3000 x 5ms` reads as 15 s and
+/// waits nearer 45. `DrainWithin` reads a clock instead. Blocking is right here: this
+/// runs on the Catch2 thread, never on a reactor.
+/// @param ready What is being waited for; called until it answers true.
+/// @return True when it happened inside `WatchWait`, false when it never did.
+template <std::predicate Predicate>
+[[nodiscard]] bool WaitFor(Predicate ready)
+{
+    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = WatchWait, .poll = 5ms })
+           == DrainResult::Drained;
+}
+
+/// A reply too large to be handed to the kernel in one go.
+///
+/// Sized past any plausible loopback send buffer plus receive window, because what it
+/// has to guarantee is that `WriteAll` SUSPENDS -- a case that needs an interleaving
+/// inside the write has no way to place it otherwise, and a reply that happened to fit
+/// would make that case pass while testing the instant before the write instead.
+constexpr std::size_t BigReplyBytes = 8 * 1024 * 1024;
+
+/// Most bytes a case will accumulate while reading a peer out to EOF.
+///
+/// Far above any reply these cases produce, because what it guards is a server that
+/// never stops talking rather than a reply that is larger than expected.
+constexpr std::size_t ReadRestLimit = BigReplyBytes + (64 * 1024);
+
 /// One connection, held open across several requests.
 ///
 /// What `Exchange` cannot express: the heartbeat loop and `Cc::Exchange` both send
@@ -243,6 +283,41 @@ class Conversation
                 co_return std::vector<std::byte> {};
             co_return co_await ReadOneReply(peer);
         }(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    }
+
+    /// Send one frame and do NOT wait for its reply.
+    ///
+    /// What `Send` cannot express: a client that pipelines, and a client that walks
+    /// away while the server is still answering. Both are #662's subject.
+    /// @param frame The request, header included.
+    /// @return True when the whole frame went out.
+    [[nodiscard]] bool SendOnly(std::span<std::byte const> frame)
+    {
+        return SyncRun(SendRaw(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    }
+
+    /// Read one reply that a previous `SendOnly` is owed.
+    /// @return The reply, or empty when the peer closed without answering.
+    [[nodiscard]] std::vector<std::byte> ReadReply()
+    {
+        return SyncRun(ReadOneReply(_socket.get()));
+    }
+
+    /// Read whatever else the server sends, until it closes.
+    /// @return Every remaining byte, or empty when the limit was hit first.
+    [[nodiscard]] std::vector<std::byte> ReadRest()
+    {
+        return SyncRun(ReadUntilPeerCloses(_socket.get(), ReadRestLimit));
+    }
+
+    /// Hang up now, rather than at the end of the case.
+    ///
+    /// This is a client VANISHING: the server is mid-answer and has written nothing,
+    /// so what reaches it is a readable edge that turns out to be EOF.
+    void CloseNow()
+    {
+        if (_socket)
+            _socket->Close();
     }
 
     ~Conversation()
@@ -526,6 +601,8 @@ class HoldableResponder final: public IFrameResponder
         while (_held.load(std::memory_order_acquire))
             co_await FastCache::SleepFor(*_reactor, std::chrono::milliseconds { 1 });
         _answered.fetch_add(1, std::memory_order_acq_rel);
+        if (auto const size = _replyPayloadBytes.load(std::memory_order_acquire); size != 0)
+            co_return Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(size, std::byte { 0x5A }));
         co_return Wire::EncodeReply(Wire::Status::Miss, {});
     }
 
@@ -682,6 +759,25 @@ class HoldableResponder final: public IFrameResponder
         return _ownBudget.load(std::memory_order_acquire);
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// Off by default, so every case written before #662 keeps asserting what it did
+    /// -- including the ones that serve a second request on one connection, which a
+    /// watch would end. A case that turns it on is standing in for `CompileResponder`.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _watchPeer.load(std::memory_order_acquire)
+                   ? std::optional { IMetricsSink::Counter::WorkerJobsAbandonedClientGone }
+                   : std::nullopt;
+    }
+
+    /// Watch, or stop watching, for a peer that goes away mid-answer.
+    /// @param watch What `PeerWatchCounter` should answer.
+    void WatchPeerWhileAnswering(bool watch) noexcept
+    {
+        _watchPeer.store(watch, std::memory_order_release);
+    }
+
     /// Claim, or stop claiming, that this surface accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -713,6 +809,18 @@ class HoldableResponder final: public IFrameResponder
         if (!_sawEntry.load(std::memory_order_acquire))
             return std::nullopt;
         return _inFlightAtEntry.load(std::memory_order_acquire);
+    }
+
+    /// Answer with a payload of @p bytes rather than an empty `Miss`.
+    ///
+    /// The point is not the status but the SIZE: `WriteAll` only suspends once the
+    /// peer's receive window and this side's send buffer are full, and a case that
+    /// needs a request to arrive *during* the reply write cannot arrange it against a
+    /// five-byte answer. Zero restores the empty `Miss` every other case expects.
+    /// @param bytes Payload length, or 0 for the default miss.
+    void ReplyPayloadBytes(std::size_t bytes) noexcept
+    {
+        _replyPayloadBytes.store(bytes, std::memory_order_release);
     }
 
     void Hold(bool held) noexcept
@@ -826,10 +934,12 @@ class HoldableResponder final: public IFrameResponder
     mutable std::atomic<int> _refusedOp { -1 };
     std::atomic<std::size_t> _entered { 0 };
     std::atomic<std::size_t> _answered { 0 };
+    std::atomic<std::size_t> _replyPayloadBytes { 0 };
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     std::size_t _concurrent { 8 };
     std::size_t _budget { 0 };
     std::atomic<bool> _ownBudget { false };
+    std::atomic<bool> _watchPeer { false };
     FrameEndpoint const* _endpoint { nullptr };
     std::atomic<std::size_t> _inFlightAtEntry { 0 };
     /// Separate from the figure, because zero is a legitimate reading and "never
@@ -1987,4 +2097,242 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
 
     (*inSurface)->Close();
     (*onSocket)->Close();
+}
+
+TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
+{
+    // Issue #662. The worker compiles to completion, encodes the object and writes it
+    // into a socket nobody is reading -- 84 MB of it for one translation unit (#223).
+    // Nothing here observed the disconnect, because this loop is not reading while a
+    // responder answers.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // The client walks away with the answer still running. That is the whole subject:
+    // a cancelled build, a Ctrl-C, a CI runner reclaimed mid-job.
+    client.CloseNow();
+    responder.Hold(false);
+
+    // Waited for: the abandoned delivery to be recorded. A failure here IS the bug --
+    // the reply went into a dead socket and nothing anywhere said so.
+    REQUIRE(WaitFor([&fleet, before] {
+        return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1;
+    }));
+
+    // **And the compile still completed.** Two facts, two rows, on purpose: the
+    // compiler ran and this machine paid for it, and only the handover found nobody
+    // there. Folded, an abandoned delivery would read as a compile that never happened.
+    CHECK(responder.Answered() == 1);
+}
+
+TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")
+{
+    // **The clause that stops the fix being a worse bug than the one it closes**, and
+    // it is red twice over. A readable edge is EOF *or* pending data:
+    // `EpollSocket::WaitReadable` probes with `recv(MSG_PEEK)` and reports readiness
+    // for `got >= 0`, and IOCP's zero-byte `WSARecv` cannot separate the two either.
+    // So this fails against a watcher that reads the bytes and drops them, AND against
+    // one that calls any readable edge a disconnect and discards a good object.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("first-request-key-with-a-non-empty-payload")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the first answer to begin
+
+    // Arrives while the watch is armed and the loop is inside the responder. These are
+    // the bytes the watcher takes in order to tell EOF from data, and they must come
+    // back to the one reader allowed to parse this stream.
+    REQUIRE(client.SendOnly(Fetch("second-request-key-with-a-non-empty-payload")));
+    responder.Hold(false);
+
+    CHECK_FALSE(client.ReadReply().empty());
+
+    // Waited for: the pipelined request to reach the responder. If it never does, the
+    // watcher either consumed it or the connection was ended out from under it.
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 2; }));
+
+    // Read to EOF and account for every byte, rather than parsing one reply: the
+    // connection ends after this one, and "a reply parsed" cannot tell a delivered
+    // answer from a prefix that happened to look right.
+    auto const rest = client.ReadRest();
+    INFO("bytes after the first reply: " << rest.size());
+    CHECK(rest.size() == Wire::ReplyHeaderSize);
+
+    // Nothing was abandoned: the peer was there throughout and proved it.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+TEST_CASE("A watched answer to a client that simply waits is delivered whole", "[node][frame][peerwatch]")
+{
+    // The control for the mechanism, and not decoration: both cases above assert that
+    // something HAPPENS, and an implementation that broke every watched connection
+    // would satisfy the first of them. Same surface, same watch, and a client doing the
+    // ordinary thing -- which is what a real launcher does, since it sends its request
+    // and then waits out the entire remote compile in one read.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const request = Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes");
+    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    responder.Hold(false);
+    REQUIRE(client.wait_for(WatchWait) == std::future_status::ready); // waited for: the reply
+
+    auto const reply = client.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(Unwrap(Wire::DecodeReplyHeader(reply)).status == Wire::Status::Miss);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+TEST_CASE("A surface that asks for no peer watch keeps its connection across requests", "[node][frame][peerwatch]")
+{
+    // The control for the CONCESSION rather than the mechanism. A watch that is armed
+    // and does not fire ends the connection -- a parked `WaitReadable` has no
+    // cancellation but `Close()` -- and the cache surface must not pay that, because it
+    // is the surface where a peer genuinely stays attached across requests (#176).
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    // Left off, which is what `PeerWatchCounter` answers for every surface but the
+    // compile one.
+    responder.Hold(false);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    CHECK_FALSE(client.Send(Fetch("first-key-on-a-connection-that-is-kept")).empty());
+    CHECK_FALSE(client.Send(Fetch("second-key-on-the-same-connection")).empty());
+    CHECK(responder.Entered() == 2);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+TEST_CASE("A socket this node closed itself is not filed as a client that walked away", "[node][frame][peerwatch][sweep]")
+{
+    // **An absence must not be counted as an event.** A peer watch cannot tell the two
+    // apart on its own: a wait cancelled by our own `Close()` and a peer that hung up
+    // both reach the watcher as "the socket is finished". So a sweeper closing a
+    // wedged responder past its grace -- and, by the same route, a shutdown closing
+    // everything -- would file every in-flight compile under a row documented as a
+    // CLIENT-side story, and an operator restarting a node would read it as a fleet
+    // losing its clients.
+    //
+    // The client here does the opposite of the vanishing one above: it stays connected
+    // and silent for the whole case. Anything the abandoned row counts is therefore
+    // this node's own teardown, which is exactly what it must not count.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+
+    // Shortened so the deferral and its grace both cost sweep intervals rather than a
+    // lease timeout. The responder owns this number in production too, so shortening
+    // it exercises the real mechanism rather than a test seam.
+    responder.PlaceRequestTimeout(50ms);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // Waited for: this node's own sweeper to run out of grace and close the socket.
+    // Empty because nothing was ever written here -- the responder is still held, so
+    // the connection has no reply and no refusal to send.
+    auto const silence = client.ReadRest();
+    CHECK(silence.empty());
+
+    // And only now does the answer come back, to a socket this node closed itself.
+    responder.Hold(false);
+    REQUIRE(WaitFor([&responder] { return responder.Answered() == 1; })); // waited for: the answer to return
+
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+TEST_CASE("A request pipelined while a watched reply is being written is still served", "[node][frame][peerwatch]")
+{
+    // **The ordering half of the watch, and the one a small reply cannot reach.** The
+    // sibling case above puts the second request inside `Answer`; this one puts it
+    // inside `WriteAll`, which is a different instant and was the defect: settling the
+    // watch BEFORE the write reads "still parked", and the bytes the watcher goes on to
+    // pull during the write are then dropped. The next `ReadExactly` starts mid-frame,
+    // decodes a foreign magic, and closes a connection whose peer did nothing wrong.
+    //
+    // Nothing about it is timing: the reply is larger than any send buffer, so the write
+    // cannot finish until this client reads -- and this client sends its second request
+    // first. The interleaving is placed by the client's own order of operations.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.ReplyPayloadBytes(BigReplyBytes);
+    responder.Hold(false);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("first-request-whose-reply-will-not-fit-in-one-write")));
+
+    // Waited for: the answer to be produced. The write is now under way and cannot
+    // complete, because nothing on this side has read a byte of it yet.
+    REQUIRE(WaitFor([&responder] { return responder.Answered() == 1; }));
+
+    // Sent INTO that stalled write.
+    REQUIRE(client.SendOnly(Fetch("second-request-arriving-inside-the-first-reply")));
+
+    auto const first = client.ReadReply();
+    REQUIRE(first.size() == Wire::ReplyHeaderSize + BigReplyBytes);
+    CHECK(Unwrap(Wire::DecodeReplyHeader(first)).status == Wire::Status::Ok);
+
+    // Waited for: the pipelined request to reach the responder. Dropped, it never does.
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 2; }));
+    CHECK_FALSE(client.ReadReply().empty());
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
 }

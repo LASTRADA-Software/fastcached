@@ -152,6 +152,22 @@ class NamedResponder final: public IFrameResponder
         return _ownBudget;
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// Settable per fake, because what `MergedResponder` must do with this is ROUTE
+    /// it -- the same reason `HoldsOwnByteBudget` above is settable.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _watchPeer;
+    }
+
+    /// Name the counter this fake's abandoned deliveries belong to, or none.
+    /// @param counter What `PeerWatchCounter` should answer.
+    void SetPeerWatchCounter(std::optional<IMetricsSink::Counter> counter) noexcept
+    {
+        _watchPeer = counter;
+    }
+
     /// Claim, or stop claiming, that this fake accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -202,6 +218,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxOpen { 8 };
     std::size_t _maxInFlight { 4096 };
     bool _ownBudget { false };
+    std::optional<IMetricsSink::Counter> _watchPeer {};
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like
@@ -313,6 +330,32 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
 
     CHECK(cache.Answered().size() == 2);
     CHECK(scheduler.Answered().size() == 4);
+}
+
+TEST_CASE("A peer watch is routed to the surface whose work it would abandon", "[node][merged-responder][peerwatch]")
+{
+    // Assert the wiring. The counter a watch raises belongs to the surface whose work
+    // was abandoned, and nothing but this router carries it there -- a fold, or a
+    // constant, would file every surface's abandoned deliveries under whichever one
+    // happened to arm a watch, and the endpoint could not tell.
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    NamedResponder compile { "compile" };
+    compile.SetPeerWatchCounter(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    MergedResponder responder { &cache, &scheduler, &compile };
+
+    CHECK(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Compile))
+          == std::optional { IMetricsSink::Counter::WorkerJobsAbandonedClientGone });
+
+    // And the surfaces that answer from memory are not watched: a watch that is armed
+    // and does not fire ends the connection, which is what the cache surface must not
+    // pay (#176).
+    CHECK_FALSE(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+    CHECK_FALSE(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+
+    // A verb nobody owns is not watched. It is unreachable -- `RefusePeer` has already
+    // refused it -- and not-watching is the answer that changes nothing.
+    CHECK_FALSE(responder.PeerWatchCounter(0xEE).has_value());
 }
 
 TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE admitted",

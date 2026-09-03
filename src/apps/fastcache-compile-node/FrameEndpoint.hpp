@@ -523,6 +523,100 @@ class IFrameResponder
     /// @param opRaw The third header byte, as received; not necessarily a known verb.
     /// @return True when the owner of @p opRaw charges the request's bytes itself.
     [[nodiscard]] virtual bool HoldsOwnByteBudget(std::uint8_t opRaw) const noexcept = 0;
+
+    /// Whether a peer that disconnects while @p opRaw is being answered should be
+    /// noticed before the answer is written, and where that is recorded.
+    ///
+    /// **Only worth asking where the answer is long.** A cache round trip is answered
+    /// out of memory, so a client cannot realistically vanish inside one and the write
+    /// that would discover it is the very next statement. A COMPILE runs for seconds
+    /// to minutes, and today nothing observes the disconnect at all: the worker
+    /// compiles to completion, encodes the object, and writes it into a socket nobody
+    /// is reading -- 84 MB of it for a single translation unit, measured at #223.
+    ///
+    /// A surface that answers `true` gets a read-only watcher for the duration of the
+    /// answer. **It never writes**, which is what keeps `ServeConnection`'s
+    /// exactly-one-writer property structural rather than a rule somebody has to
+    /// remember; see the loop's own note where the reply is written.
+    ///
+    /// ## The lifetime property, and why it is a property rather than a line of code
+    ///
+    /// The watcher parks in `ISocket::WaitReadable`, and **a parked wait can only be
+    /// cancelled by `Close()`** -- there is no other cancellation on the interface. So
+    /// a watch that was armed and did not fire ends the connection after that reply,
+    /// because the alternative is to issue the loop's next `Read` while the watcher is
+    /// still parked. That is not merely undefined: `EpollSocket::Read` and
+    /// `WaitReadable` share one read-op slot and each begins by nulling the parked
+    /// awaitable, so the second arm drops the first coroutine's resume handle and
+    /// leaks its frame, silently and permanently, with no assertion and no log
+    /// (`IocpSocket` has the same shape;
+    /// [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) is about
+    /// making that loud rather than leaving it as prose in another file).
+    ///
+    /// Stated here as the *reason* rather than left at the close itself, because an
+    /// undocumented lifetime change is how the next reader "fixes" it back into the
+    /// leak.
+    ///
+    /// ## It is unobservable today, and here is the check that would falsify that
+    ///
+    /// `Cc::RunOneExchange` is documented as "once per verb" (`ReactorExchange.hpp`)
+    /// and dials fresh on every call, so **no client in this tree reuses a compile
+    /// connection** -- the launcher pipelines AUTH and COMPILE into one connection and
+    /// then closes it. The cost of this concession is therefore currently zero.
+    ///
+    /// If someone adds connection reuse, the check is exactly that sentence: does any
+    /// client send a second request on a connection that carried a COMPILE? The moment
+    /// one does, it pays one extra connect per compile -- which is a fair price for
+    /// not double-arming the slot above, but it must not be a mystery. A concession
+    /// justified by a fact about the tree has to name the fact, or it stops being
+    /// justified the moment the fact changes and nobody notices.
+    ///
+    /// ## What EOF is taken to mean, and the case that reading costs
+    ///
+    /// **A peer that has sent FIN is treated as gone, and that is a decision rather
+    /// than a deduction.** EOF says the peer closed its WRITE side; whether its read
+    /// side is still open is not observable from here, and the only way to find out is
+    /// to write -- which is the cost this exists to avoid. So a half-close, where a
+    /// client says "I will send nothing more" and still waits for its reply, is read
+    /// here as a client that left: its object is not written and the counter names it
+    /// as abandoned.
+    ///
+    /// The opposite rule is taken one directory away, and states its reason:
+    /// `RedisResp`'s `ArmDisconnect` counts only a socket ERROR as a disconnect,
+    /// because on a surface whose loop still owns the reader, mere readability may be
+    /// a pipelined command or exactly this half-close. That rule cannot be taken here:
+    /// a killed client surfaces as EOF and not as an error -- which is the whole case
+    /// this watch is for -- so requiring an error would detect essentially nothing.
+    ///
+    /// **The check that would falsify the trade-off**: does any client half-close after
+    /// sending? None in this tree can. `ISocket` has no `ShutdownWrite` at all --
+    /// `InMemorySocket` declares one, and its forty-odd users are tests standing in for
+    /// "the client is done sending" over the in-memory transport, never a production
+    /// socket. A third-party client speaking `0xFC` over a raw socket could, and would
+    /// lose distribution silently while this counter blamed it. If one ever does, the
+    /// answer is not to soften the rule -- it is that EOF-without-close needs a meaning
+    /// this wire agrees on, in one place, for both surfaces.
+    ///
+    /// ## Why it answers a COUNTER rather than a bool
+    ///
+    /// An abandoned delivery is an event on the SURFACE, not on the endpoint: the
+    /// endpoint owns when the question is asked and the surface owns what it means,
+    /// which is the same split every refusal in this loop already makes. A bool would
+    /// leave the endpoint incrementing `fastcache_worker_jobs_*` for whichever surface
+    /// happened to arm a watch, so the day a second one does it would file its events
+    /// under the worker's name and nothing would say so.
+    ///
+    /// So a surface that wants the watch names the row its abandoned deliveries belong
+    /// to, and `std::nullopt` is "do not watch" -- the only two answers there are.
+    ///
+    /// Pure virtual for the reason every ceiling above is: a surface that says nothing
+    /// would inherit an answer, and here the inherited answer would silently change
+    /// when this connection ends.
+    ///
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return The counter to raise when the peer is found gone, or nullopt not to
+    ///         watch @p opRaw at all.
+    [[nodiscard]] virtual std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t opRaw) const noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.
@@ -608,6 +702,15 @@ class FrameServer
     /// a guarantee and is not one. So a refused socket outlives its answer by at most
     /// two ticks, against the six a served request may take.
     static constexpr std::chrono::milliseconds RefusalTimeout { SweepInterval };
+
+    /// How often a connection ending under a parked watch re-reads that watch.
+    ///
+    /// Short, because it is pure teardown latency on this side: the peer already has
+    /// its answer, and the ordinary client hangs up within one step. Here rather than
+    /// beside the loop it drives, so it sits with `RefusalTimeout` above, which is the
+    /// ceiling that actually bounds that wait -- two halves of one bound in two files
+    /// is how they come to disagree.
+    static constexpr std::chrono::milliseconds GracefulCloseStep { 5 };
 
     /// How long a swept-but-not-closed connection is given to come back and explain
     /// itself before it is closed after all.
