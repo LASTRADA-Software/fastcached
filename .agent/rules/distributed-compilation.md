@@ -672,6 +672,32 @@ Consequences that are each load-bearing:
   serial rather than replacing it, which is what keeps that component pure — no key,
   no wall clock, no crypto in the thing whose whole job is a deterministic unit
   test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
+- **One seam signs with the pre-shared key, and the domain label is a required
+  parameter rather than a string each caller remembers.**
+  `Cluster/ClusterSigning.hpp` carries `SigningDomain` and a `SigningDomainTable` row
+  per construction, so there is no argument to pass a bare label to and a fourth signer
+  cannot be written against `HmacSha256` directly. The same key MACs discovery proofs
+  and lease tokens, so a construction that omits its domain is a credential valid on the
+  other surface — which is the failure the label existed to prevent and which two
+  hand-rolled constructions could only prevent by both remembering to (#402).
+- **That consolidation changed the discovery proof wire, and
+  `DiscoveryWire::CurrentVersion` deliberately did NOT move.** The proof message gains
+  `fastcache-discovery-v1` as a leading length-prefixed field, so every proof tag differs
+  from a pre-#402 build's and a node on an older build cannot prove the key. Lease token
+  messages are byte-for-byte unchanged: `fastcache-lease-v1` was already the leading
+  field, and a test pins that against the pre-seam construction written out as a literal
+  rather than against the code that produces it — "the tests still pass" cannot show it,
+  because the tests moved with the code.
+
+  Leaving the version alone is deliberate and is the load-bearing half. What changed is
+  the MAC *input*, not the datagram grammar, so bumping it would misdescribe the format.
+  It is also the better of the two failures: an older node reaches the proof step and is
+  logged `discovery: <node> at <endpoint> failed to prove the cluster key`, where an
+  unsupported version is silently dropped by `ClassifyDatagram` and presents as peers
+  seen and never admitted — the same silence `--discovery-reply-port` exists to prevent.
+  Loud beats silent; a cluster that quietly will not form while every node looks healthy
+  is the shape that costs a day. The obvious counter-proposal — "we changed the MAC, so
+  bump the version" — is what this paragraph is here to answer.
 - **The MAC is verified BEFORE any other claim is reported on, and the expiry is not
   a capacity bound.** Checking the plaintext endpoint first would be cheaper and
   would turn a diagnostic into an oracle: `EndpointMismatch` and `Expired` are only
