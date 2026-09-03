@@ -175,15 +175,92 @@ endforeach()
 # the script: scripts/coverage.sh reads the percentage out of llvm-cov's JSON
 # summary with it, at the very end, so a missing interpreter would otherwise
 # surface only after the entire suite, the merge and both exports had run.
-find_program(PYTHON3_PATH
-    NAMES python3
-    DOC "python3, used by scripts/coverage.sh to read llvm-cov's JSON summary")
-
-if(NOT PYTHON3_PATH)
-    message(FATAL_ERROR
-        "[Coverage] python3 not found. scripts/coverage.sh needs it to extract the coverage "
-        "percentage from llvm-cov's JSON summary.")
+#
+# So the interpreter is located by something that RUNS it. `find_program(NAMES
+# python3)` returns the first name match on PATH and never executes it, which
+# makes the gate above test the wrong property -- not "is there a python3" but
+# "is there one that runs" -- and an unrunnable path then reaches the `coverage`
+# target and fails at the end of the run, which is the exact outcome the
+# paragraph above says this gate prevents. Reproduced on Linux against a
+# `python3` that cannot exec: the old spelling baked it in and configure
+# SUCCEEDED. `find_package(Python3 COMPONENTS Interpreter)` validates by running
+# the interpreter, so here that failure becomes a configure-time refusal.
+#
+# The two `find_program` calls above obey the same rule the long way -- each runs
+# `--version` and refuses on a mismatch -- because there is no `find_package` for
+# llvm-profdata. For Python there is one, so the call IS the obedience. It does
+# NOT follow that every `find_program` in this tree is wrong: `cmake/Version.cmake`
+# uses one for git deliberately, because it runs before `project()` and
+# `find_package` has no toolchain to stand on there. The rule, its measurement and
+# its reasoned exceptions live in `.agent/rules/build-and-toolchain.md` and are not
+# restated here.
+#
+# Nor is the Windows alias that makes the rule sharp reachable here: `ENABLE_COVERAGE`
+# refuses WIN32 about 140 lines above. What IS reachable on this file's platforms is
+# any `python3` found by name that cannot run -- a dangling symlink, a venv shim
+# whose interpreter was removed, a wrapper naming an uninstalled toolchain.
+#
+# And what the swap buys on those platforms is VALIDATION, not a better search:
+# measured, FindPython stops at the first name match and does not go on to a working
+# interpreter later on PATH. So this trades a late failure for an early one, which is
+# the trade the gate above exists to make -- and the refusal has to name
+# `-DPython3_EXECUTABLE=`, or it strands somebody who does have an interpreter.
+#
+# QUIET plus an explicit check rather than REQUIRED, so the diagnostic below
+# survives.
+#
+# WHERE ELSE PYTHON IS LOCATED, because #568 is a two-authors-of-one-fact problem
+# and its next failure is a third author arriving quietly. Four sites; the
+# acceptance clause allows a differing one that says why:
+#
+#   cmake/Coverage.cmake             find_package  -- validates
+#   src/tests/CMakeLists.txt         find_package  -- validates
+#   scripts/tidy-sweep.sh            command -v    -- does not
+#   scripts/launcher-replay-e2e.sh   command -v    -- does not
+#
+# Named by file and by call, never by line: a line number in a comment goes false
+# silently. The two shell fixtures differ for a reason rather than by accident --
+# shell has no validating equivalent, and both run only under bash on the POSIX
+# legs. Nothing ENFORCES this set (#607), so it is four names and not a claim that
+# they are the only ones.
+#
+# `scripts/coverage.sh` is where python is used and locates none: it is handed
+# `--python3` from here. One lookup, passed down, is the shape to keep.
+# `PYTHON3_PATH` is retired by #568 and read by nothing. ABOVE the lookup, not
+# below it: the operator who set it did so BECAUSE PATH had no usable python3, so
+# below the refusal they hit the fatal and never learn the flag is dead or what
+# replaced it -- the one migration this block exists for is the one it missed. Unset so that residue in
+# an existing build tree warns once and is gone, while a `-D` somebody is still
+# passing warns every time -- which separates habit from leftover without having
+# to tell them apart. WARNING and not FATAL_ERROR, because inert residue must not
+# break the re-configure of a tree that was fine; and not `message(DEPRECATION)`,
+# the obvious CMake-native answer, because that is silenced by
+# `-Wno-deprecated` and this exists to stop a setting being believed in silence.
+if(DEFINED PYTHON3_PATH)
+    unset(PYTHON3_PATH CACHE)
+    message(WARNING
+        "[Coverage] PYTHON3_PATH is set and is no longer read by anything (#568). The "
+        "interpreter is located with find_package(Python3), which validates it by running "
+        "it; point -DPython3_EXECUTABLE=... at a specific interpreter instead. The stale "
+        "entry has been dropped from the cache.")
 endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# `Python3_Interpreter_FOUND`, never `Python3_EXECUTABLE`: FindPython leaves the
+# latter naming the candidate it just REJECTED (measured), so the tidier spelling
+# passes and hands the target the interpreter this change exists to keep out.
+if(NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR
+        "[Coverage] no Python 3 interpreter found that RUNS. scripts/coverage.sh needs one "
+        "to extract the coverage percentage from llvm-cov's JSON summary.\n"
+        "Note the wording, because `which python3` answering is not a contradiction: a "
+        "`python3` found by name that cannot execute -- a dangling symlink, a venv shim "
+        "whose interpreter is gone -- is correctly not accepted. FindPython stops at the "
+        "FIRST match on PATH and does not go on to a working interpreter later in it, so "
+        "if you have one, name it: -DPython3_EXECUTABLE=/path/to/python3")
+endif()
+
 
 message(STATUS "[Coverage] Clang ${COVERAGE_CLANG_MAJOR} source-based instrumentation enabled")
 
@@ -228,7 +305,7 @@ function(fastcached_add_coverage_targets)
             --source-dir "${CMAKE_SOURCE_DIR}"
             --llvm-profdata "${LLVM_PROFDATA_PATH}"
             --llvm-cov "${LLVM_COV_PATH}"
-            --python3 "${PYTHON3_PATH}"
+            --python3 "${Python3_EXECUTABLE}"
             -- ${objects}
         COMMENT "Running the test suite under instrumentation and rendering the coverage report"
         VERBATIM
