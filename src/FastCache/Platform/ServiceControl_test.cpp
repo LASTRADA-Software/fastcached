@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -22,40 +23,86 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
-/// The `ServiceSpec` the daemon would register for @p cfg.
+/// @p cfg as it would arrive from a command line that NAMED every setting.
+///
+/// A registration carries what the operator typed, not what differs from a
+/// default (#349), so a case whose premise is "the operator ran
+/// `--install-service` with these flags" has to say so. Every explicit bit is
+/// set by walking `CliOptions()` rather than by listing them here: a new flag
+/// joins these fixtures by adding its row, and cannot be left out of them by
+/// omission.
+///
+/// Cases about what a registration says when the operator named NOTHING pass a
+/// default-constructed `CliResult` instead, which is the other half of the same
+/// property.
+/// @param cfg The configuration values to carry.
+/// @return A parse result holding @p cfg with every flag marked as typed.
+[[nodiscard]] FastCache::CliResult AsTyped(FastCache::Config const& cfg)
+{
+    FastCache::CliResult typed {};
+    typed.config = cfg;
+    for (auto const& spec: FastCache::CliOptions())
+        if (spec.explicitBit != nullptr)
+            typed.*spec.explicitBit = true;
+    return typed;
+}
+
+/// The `ServiceSpec` the daemon would register for @p cli.
 ///
 /// These cases are about which *flags* survive a round trip into a
 /// supervisor, which is unchanged; what moved is that the platform half now
 /// speaks `ServiceSpec` rather than the daemon's `Config`. Routing through
 /// `MakeDaemonServiceSpec` keeps each case asking its original question.
 /// @param exePath Executable to register.
+/// @param cli Command-line parse to bake in.
+/// @return The spec.
+[[nodiscard]] FastCache::ServiceSpec SpecFor(std::filesystem::path const& exePath, FastCache::CliResult const& cli)
+{
+    return FastCache::MakeDaemonServiceSpec(exePath, cli);
+}
+
+/// The spec for an invocation that named every one of @p cfg's settings.
+/// @param exePath Executable to register.
 /// @param cfg Configuration to bake in.
 /// @return The spec.
 [[nodiscard]] FastCache::ServiceSpec SpecFor(std::filesystem::path const& exePath, FastCache::Config const& cfg)
 {
-    return FastCache::MakeDaemonServiceSpec(exePath, cfg);
+    return SpecFor(exePath, AsTyped(cfg));
 }
 
-/// The command line the SCM would be launched with for @p cfg.
+/// The command line the SCM would be launched with for @p cli.
+/// @param exePath Executable to register.
+/// @param cli Command-line parse to bake in.
+/// @return The fully-quoted command line.
+[[nodiscard]] std::string CommandLineFor(std::filesystem::path const& exePath, FastCache::CliResult const& cli)
+{
+    return FastCache::BuildServiceCommandLine(SpecFor(exePath, cli));
+}
+
+/// The command line for an invocation that named every one of @p cfg's settings.
 /// @param exePath Executable to register.
 /// @param cfg Configuration to bake in.
 /// @return The fully-quoted command line.
 [[nodiscard]] std::string CommandLineFor(std::filesystem::path const& exePath, FastCache::Config const& cfg)
 {
-    return FastCache::BuildServiceCommandLine(SpecFor(exePath, cfg));
+    return CommandLineFor(exePath, AsTyped(cfg));
 }
 } // namespace
 
-TEST_CASE("ServiceControl: default config yields a minimal command line", "[platform][service]")
+TEST_CASE("ServiceControl: a command line that named nothing registers nothing", "[platform][service]")
 {
-    FastCache::Config const cfg {};
-    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
+    // The other half of #349's property. A registration carries what the operator
+    // NAMED, so an invocation that named no setting registers no flag -- and the
+    // next start re-derives every one of them exactly as this one did, including
+    // the host-derived ones.
+    FastCache::CliResult const cli {};
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cli);
     REQUIRE(cmd == "\"fastcached\" --daemon --service-name=FastCached");
 }
 
 TEST_CASE("ServiceControl: the executable path is always quoted", "[platform][service]")
 {
-    FastCache::Config const cfg {};
+    FastCache::CliResult const cfg {};
     auto const cmd = CommandLineFor(std::filesystem::path { "C:/Program Files/fastcached.exe" }, cfg);
     REQUIRE(cmd.starts_with("\"C:/Program Files/fastcached.exe\" --daemon"));
 }
@@ -76,9 +123,13 @@ TEST_CASE("ServiceControl: non-default scalar flags are baked in", "[platform][s
     REQUIRE(cmd.contains("--storage-shards=4"));
 }
 
-TEST_CASE("ServiceControl: flags left at their default are omitted", "[platform][service]")
+TEST_CASE("ServiceControl: a flag the operator never named is omitted", "[platform][service]")
 {
-    FastCache::Config const cfg {};
+    // Not "flags left at their default", which is what this used to assert and is
+    // the wrong question: `--max-memory` at its default may be a value the operator
+    // typed, and #349 is what dropping it costs. What is omitted is what was never
+    // named.
+    FastCache::CliResult const cfg {};
     auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
     REQUIRE(!cmd.contains("--port="));
     REQUIRE(!cmd.contains("--bind="));
@@ -163,7 +214,7 @@ TEST_CASE("ServiceControl: launchd argv never carries --daemon", "[platform][ser
     // it spawned; a job that double-forks is reaped immediately as "exited",
     // so the service silently never runs.
     FastCache::Config const cfg {};
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::find(argv, "--daemon") == argv.end());
 
     auto const plist = PlistFor(cfg, ServiceScope::User);
@@ -176,14 +227,14 @@ TEST_CASE("ServiceControl: argv keeps values unquoted", "[platform][service][lau
     // Windows command line needs would reach the daemon as part of the value.
     FastCache::Config cfg {};
     cfg.serviceName = "My Cache";
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::find(argv, "--service-name=My Cache") != argv.end());
 }
 
 TEST_CASE("ServiceControl: argv element 0 is the executable", "[platform][service][launchd]")
 {
     FastCache::Config const cfg {};
-    auto const argv = BuildServiceArgv(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(argv.front() == "/opt/fastcached/bin/fastcached");
 }
 
@@ -192,7 +243,7 @@ TEST_CASE("ServiceControl: an unset path flag is omitted rather than absolutized
     // Absolutizing first would turn the empty default into the caller's working
     // directory and pin the service to whatever shell registered it.
     FastCache::Config const cfg {};
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--storage="); }));
     REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--config="); }));
 }
@@ -476,7 +527,7 @@ TEST_CASE("ServiceControl: security-relevant flags reach the supervisor", "[plat
     cfg.pidfile = "/var/run/fastcached.pid";
     cfg.notifyKeyspaceEvents = "KEA";
 
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     auto const has = [&argv](std::string_view flag) {
         return std::ranges::find(argv, flag) != argv.end();
     };
@@ -512,7 +563,7 @@ TEST_CASE("ServiceControl: every listener is re-emitted", "[platform][service]")
     cfg.binds = { { .address = "127.0.0.1", .port = 11211, .tls = false },
                   { .address = "0.0.0.0", .port = 11212, .tls = true } };
 
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::find(argv, "--listen=127.0.0.1:11211") != argv.end());
     REQUIRE(std::ranges::find(argv, "--listen-tls=0.0.0.0:11212") != argv.end());
 }
@@ -525,7 +576,7 @@ TEST_CASE("ServiceControl: a password is never written into the launch arguments
     FastCache::Config cfg {};
     cfg.requirePass = "hunter2";
 
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.contains("hunter2"); }));
 
     auto const plist = PlistFor(cfg, ServiceScope::System);
@@ -566,14 +617,14 @@ TEST_CASE("ServiceControl: an IPv6 listener round-trips through its own parser",
     cfg.binds = { { .address = "::", .port = 11211, .tls = false },
                   { .address = "2001:db8::1", .port = 11212, .tls = true } };
 
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::find(argv, "--listen=[::]:11211") != argv.end());
     REQUIRE(std::ranges::find(argv, "--listen-tls=[2001:db8::1]:11212") != argv.end());
 
     // An IPv4 address has no brackets to gain, and adding them would be just as
     // wrong: the bracketed grammar demands a literal.
     cfg.binds = { { .address = "127.0.0.1", .port = 11211, .tls = false } };
-    auto const v4 = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const v4 = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(std::ranges::find(v4, "--listen=127.0.0.1:11211") != v4.end());
 }
 
@@ -595,7 +646,7 @@ TEST_CASE("ServiceControl: a TLS listener's kind survives the registration", "[p
     cfg.binds = { { .address = "127.0.0.1", .port = 6674, .tls = false },
                   { .address = "127.0.0.1", .port = 6679, .tls = true } };
 
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, EmitDaemonFlag::No);
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     CHECK(std::ranges::find(argv, "--listen=127.0.0.1:6674") != argv.end());
     CHECK(std::ranges::find(argv, "--listen-tls=127.0.0.1:6679") != argv.end());
     // And the TLS endpoint is not ALSO emitted as a plain listener, which would open
@@ -745,7 +796,7 @@ TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "
     cfg.tlsKeyPath = "key.pem";
 
     auto const argv =
-        FastCache::BuildServiceArgv(std::filesystem::path { "fastcached" }, cfg, FastCache::EmitDaemonFlag::Yes);
+        FastCache::BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), FastCache::EmitDaemonFlag::Yes);
 
     for (auto const& spec: FastCache::CliOptions())
     {
@@ -777,44 +828,55 @@ TEST_CASE("ServiceControl: every registration rule gates an install", "[platform
 
 TEST_CASE("ServiceControl: the timestamp switch registers whichever spelling produces the value", "[platform][service]")
 {
-    // **Issue #507, and the four combinations are the case.** `emitSwitchIfSet` emits
-    // the POSITIVE flag whenever a value differs from its default, which spells "on".
-    // That is right while every default is false and inverted the moment one is not:
-    // with `logTimestamps` defaulting true under macOS (#496), an operator's explicit
-    // `--no-log-timestamps` differs from the default and was registered as
+    // **Issue #507, and the four combinations are the case.** The emitter used to
+    // emit the POSITIVE flag whenever a value differed from its default, which spells
+    // "on". That is right while every default is false and inverted the moment one is
+    // not: with `logTimestamps` defaulting true under macOS (#496), an operator's
+    // explicit `--no-log-timestamps` differed from the default and was registered as
     // `--log-timestamps`. The thing they turned off, turned back on, at every boot,
     // silently -- a registration replays its command line forever.
     //
     // Neither half alone is visible. On a false default the old emitter is correct,
     // so a case run only there passes under the bug; and with only one value driven,
     // the wrong spelling is still A spelling and "something was emitted" holds. The
-    // defect lives in the COMBINATION, so the case drives both values against both
-    // defaults, and does it against the pure decision rather than against
-    // `BuildServiceArgv` -- a host runs one default and cannot be asked for the
-    // other.
+    // defect lived in the COMBINATION, so the case drives both values, and does it
+    // against the pure decision rather than against `BuildServiceArgv`.
+    //
+    // The second axis is now PROVENANCE rather than the platform default (#349), and
+    // that strictly widens what is asserted: the row `--log-timestamps` on a
+    // true-defaulting host used to register nothing at all -- correct output for the
+    // moment, and a pin the next build could move, since `DefaultLogTimestamps` is
+    // exactly the compile-time constant #496 changed. A host now runs one default and
+    // no longer needs to be asked for the other, because no default is consulted.
     struct Combination
     {
-        bool value;    ///< What the operator configured.
-        bool fallback; ///< What the platform would do if the registration said nothing.
+        bool value;    ///< What the operator asked for.
+        bool wasTyped; ///< Whether they named the switch at all.
         std::string_view expected;
     };
 
-    // "" is the registration having nothing to say: the default already produces the
-    // value, so a flag would be noise that pins a decision the operator never made.
+    // "" is the registration having nothing to say, and under provenance that is
+    // exactly one thing: the operator named no switch, so the next start decides it
+    // the same way this one did.
     constexpr auto Combinations = std::to_array<Combination>({
-        { .value = true, .fallback = false, .expected = "log-timestamps" },
-        { .value = false, .fallback = false, .expected = "" },
-        // The macOS half. The second row is the one that was wrong.
-        { .value = true, .fallback = true, .expected = "" },
-        { .value = false, .fallback = true, .expected = "no-log-timestamps" },
+        { .value = true, .wasTyped = true, .expected = "log-timestamps" },
+        { .value = false, .wasTyped = true, .expected = "no-log-timestamps" },
+        { .value = true, .wasTyped = false, .expected = "" },
+        { .value = false, .wasTyped = false, .expected = "" },
     });
 
     for (auto const& c: Combinations)
     {
-        INFO("value: " << c.value << " fallback: " << c.fallback);
-        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.fallback);
+        INFO("value: " << c.value << " wasTyped: " << c.wasTyped);
+        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.wasTyped);
         CHECK(spelling.value_or("") == c.expected);
     }
+
+    // A one-sided switch has no spelling for "off", so an explicit false registers
+    // nothing rather than a bare `--`. Unreachable from argv -- `--metrics` can only
+    // set true -- which is why it is asserted here rather than left to be discovered.
+    CHECK(!FastCache::SwitchSpellingFor("metrics", {}, false, true).has_value());
+    CHECK(FastCache::SwitchSpellingFor("metrics", {}, true, true).value_or("") == "metrics");
 
     // And the round trip, because a spelling is only correct if the daemon reading it
     // back arrives at the value that produced it. Both directions, through the
@@ -822,8 +884,8 @@ TEST_CASE("ServiceControl: the timestamp switch registers whichever spelling pro
     // contract and a test that only inspected the string could not see them disagree.
     for (auto const& c: Combinations)
     {
-        INFO("value: " << c.value << " fallback: " << c.fallback);
-        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.fallback);
+        INFO("value: " << c.value << " wasTyped: " << c.wasTyped);
+        auto const spelling = FastCache::SwitchSpellingFor("log-timestamps", "no-log-timestamps", c.value, c.wasTyped);
         if (!spelling.has_value())
             continue;
 
@@ -835,5 +897,93 @@ TEST_CASE("ServiceControl: the timestamp switch registers whichever spelling pro
         // Provenance travels too: a value the operator named must read as named on
         // the far side, or the next registration cannot tell it from a default.
         CHECK(parsed->logTimestampsExplicit);
+    }
+}
+
+TEST_CASE("ServiceControl: a pinned --max-memory equal to the host default is registered", "[platform][service]")
+{
+    // **Issue #349, end to end through the real parser.** `--max-memory` defaults to
+    // a quarter of host RAM clamped to [512m, 8g], so on a 32 GiB machine the daemon
+    // reports 8 GiB and the operator pins exactly that. Under a value comparison the
+    // pin IS the default, so nothing was registered and the service re-derived its
+    // budget from RAM at every start: add memory, or resize the VM, and the pinned
+    // budget silently moved -- for precisely the operator who bothered to pin it.
+    //
+    // Spelled in bytes because that is a spelling `ParseMaxMemory` accepts on every
+    // host; the point is the coincidence with the default, not the suffix.
+    auto const pin = std::format("--max-memory={}", FastCache::DefaultMaxMemoryBytes());
+    auto const args = std::array<char const*, 2> { "--install-service", pin.c_str() };
+    auto const parsed = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(parsed.has_value());
+
+    // The premise: this really is the value the daemon would have chosen anyway, so
+    // no value comparison anywhere can tell it from silence.
+    REQUIRE(parsed->config.maxMemoryBytes == FastCache::DefaultMaxMemoryBytes());
+    REQUIRE(parsed->maxMemoryBytesExplicit);
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, *parsed, EmitDaemonFlag::No);
+    CHECK(std::ranges::contains(argv, pin));
+}
+
+TEST_CASE("ServiceControl: every flag the operator can name survives at its default value", "[platform][service]")
+{
+    // **The mechanical half of #349, and it is mechanical on purpose.** The daemon's
+    // table carries thirty-one explicit bits and `BuildServiceArgv` emits every one of
+    // them; fixing the row that was caught would leave the other thirty with the same
+    // shape, which is how this defect reached a second binary in the first place. So
+    // the guard walks the table: for each row that records provenance, the one shape a
+    // value comparison cannot distinguish from silence -- named, at its default -- must
+    // still reach the supervisor. A new row cannot regress by omission.
+    //
+    // A switch is driven through its own `apply`, which is what typing it does. Its
+    // default is the value it cannot express, so "named, at its default" is not a
+    // reachable shape for one, and asserting it would be asserting a contradiction.
+    // That also covers both timestamp spellings on both platform defaults, which the
+    // coverage sweep below cannot express at all.
+    constexpr auto NotRegistrable = std::to_array<std::pair<std::string_view, std::string_view>>({
+        // Never emitted at all: launch arguments are world-readable, so the secret is
+        // refused rather than baked in. InlineCredentialRejection reports it.
+        { "--requirepass", "refused rather than registered; see InlineCredentialRejection" },
+        // The empty string is the DEFAULT of all three and is the flag's own way of
+        // saying "off", so there is no pin to lose -- and emitting `--storage=` would
+        // absolutize the installing shell's working directory into the registration,
+        // which is worse than the drop. "an unset path flag is omitted rather than
+        // absolutized" asserts that directly.
+        { "--storage", "an explicitly empty path names nothing; emitting it would register the installer's cwd" },
+        { "--tls-cert", "an explicitly empty path names nothing" },
+        { "--tls-key", "an explicitly empty path names nothing" },
+    });
+
+    for (auto const& spec: FastCache::CliOptions())
+    {
+        if (spec.explicitBit == nullptr)
+            continue;
+        if (std::ranges::any_of(NotRegistrable, [&spec](auto const& row) { return row.first == spec.primary; }))
+            continue;
+
+        INFO("flag: " << spec.primary);
+        FastCache::CliResult cli {};
+        // A valueless flag's effect IS typing it; a value flag keeps its default,
+        // which is the coincidence #349 is about.
+        if (spec.arity == FastCache::Arity::None && spec.apply != nullptr)
+            REQUIRE(spec.apply(cli, {}).has_value());
+        cli.*spec.explicitBit = true;
+
+        auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cli, EmitDaemonFlag::No);
+        // FlagMatches is the parser's own rule for "this token names that flag", so
+        // the guard cannot drift from what the daemon will accept back.
+        CHECK(std::ranges::any_of(argv,
+                                  [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); }));
+    }
+
+    // The exclusion list is not allowed to grow silently into the whole table: every
+    // row on it must still BE a row, so a flag that is renamed or retired takes its
+    // excuse with it rather than leaving a line nothing reads.
+    for (auto const& row: NotRegistrable)
+    {
+        INFO("excluded flag: " << row.first);
+        CHECK(std::ranges::any_of(FastCache::CliOptions(), [&row](auto const& spec) {
+            return spec.primary == row.first && spec.explicitBit != nullptr;
+        }));
     }
 }

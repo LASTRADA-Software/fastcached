@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
@@ -187,23 +188,44 @@ struct ServiceSpec
 
 /// Describe the running daemon as a service to register.
 ///
-/// The daemon's half of the seam: it owns `Config`, so it is what turns one into
-/// a `ServiceSpec`. `fastcache-compile-node` has its own equivalent over its own
-/// configuration type.
+/// The daemon's half of the seam: it owns `CliResult`, so it is what turns one
+/// into a `ServiceSpec`. `fastcache-compile-node` has its own equivalent over its
+/// own configuration type.
+///
+/// Takes the **parse**, not the configuration, for the reason `BuildServiceArgv`
+/// does: which flags a registration carries is decided by what the operator
+/// typed, and only a `CliResult` knows that.
 ///
 /// @param exePath Absolute path to the fastcached executable.
-/// @param cfg Effective configuration to embed in the launch arguments.
+/// @param cli The command-line parse to embed in the launch arguments.
 /// @return The spec a supervisor is registered from.
-[[nodiscard]] ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config const& cfg);
+[[nodiscard]] ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResult const& cli);
 
 /// Build the argument vector a service supervisor launches fastcached with.
 ///
 /// Element 0 is @p exePath; the rest are `--flag=value` tokens, one for every
-/// @p cfg field that differs from a default-constructed Config, plus
+/// flag @p cli records the operator as having **named**, plus
 /// `--service-name=<name>` and — depending on @p daemonFlag — `--daemon`.
 /// Path-bearing flags (`--storage`, `--config`) are made absolute because a
 /// service does not inherit the installing shell's working directory, so a
 /// relative path captured at install time would resolve elsewhere at start.
+///
+/// **Provenance, never value.** This took a `Config` and emitted a flag whose
+/// value differed from a default-constructed one, which drops any pin that
+/// happens to equal the default — and a default derived from the HOST is not a
+/// constant. `--max-memory` defaults to a quarter of RAM, so on a 32 GiB machine
+/// `--install-service --max-memory=8g` registered no `--max-memory` at all, and
+/// the service re-derived its budget from RAM at every start: add memory and the
+/// pinned budget silently moved, for precisely the operator who bothered to pin
+/// it ([#349](https://github.com/LASTRADA-Software/fastcached/issues/349)). Every
+/// other row was safe only because its default is a compile-time constant, which
+/// `logTimestamps` also was until #496 made it platform-dependent — so the rule
+/// is applied to the whole table rather than to the row that was caught.
+///
+/// A `CliResult` and not a `Config` because that is where the provenance lives,
+/// and the signature is the guard: the rule that a registration replays the
+/// **command line** and never the merged file cannot be obeyed by a function
+/// that was only ever handed the merge's output.
 ///
 /// Values are returned **unquoted**: quoting is a property of a flat command
 /// line, not of an argv array, and launchd's `ProgramArguments` must receive
@@ -215,11 +237,11 @@ struct ServiceSpec
 /// Pure and platform-independent so it can be unit-tested on every platform.
 ///
 /// @param exePath Absolute path to the fastcached executable.
-/// @param cfg Effective configuration to embed in the launch arguments.
+/// @param cli The command-line parse to embed in the launch arguments.
 /// @param daemonFlag Whether to emit `--daemon`.
 /// @return Argument vector, `exePath` first.
 [[nodiscard]] std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
-                                                        Config const& cfg,
+                                                        CliResult const& cli,
                                                         EmitDaemonFlag daemonFlag);
 
 /// Build the command line the Windows Service Control Manager (SCM) will launch
@@ -367,31 +389,39 @@ struct ServiceSpec
                                                         ServiceScope scope,
                                                         std::filesystem::path const& home);
 
-/// Which spelling of a two-sided switch a registration must carry, if either.
+/// Which spelling of a switch a registration must carry, if any.
 ///
-/// **Extracted so it can be tested against both platform defaults**, which is the
-/// only way to see the defect it was written for. `emitSwitchIfSet` emits the
-/// POSITIVE flag whenever the value differs from the default, which says "on" --
+/// **Extracted so the decision is assertable on every platform**, which is the only
+/// way to see the defect it was written for. It used to compare @p value against the
+/// platform default and emit the POSITIVE flag when they differed, which says "on" --
 /// correct while the default is false everywhere, and inverted once it is not. With
 /// `logTimestamps` defaulting true under macOS (#496), an operator's explicit
-/// `--no-log-timestamps` differs from that default and was registered as
+/// `--no-log-timestamps` differed from that default and was registered as
 /// `--log-timestamps`: the thing they turned off, turned back on, at every boot and
 /// silently, because a registration replays its command line forever.
 ///
-/// Only a flag whose default is platform-dependent needs this. `--log-source` and
-/// `--log-everything` default false everywhere, so "differs" still means "on" for
-/// them and `emitSwitchIfSet` stays right -- do not unify the two.
+/// It now asks **provenance** instead (#349), which is a stronger answer to the same
+/// question: an operator who names a switch gets the spelling that produces the value
+/// they asked for, whatever the platform would otherwise have done. A switch nobody
+/// named is not registered, so the next start re-derives it exactly as this one did.
+///
+/// This is the one place both kinds of switch are decided. The old comment here said
+/// not to unify them, and it was right while the rule was a value comparison: the
+/// two-sided switch needed a platform default that the one-sided switches did not.
+/// Provenance consults no default at all, so the only thing left separating them is
+/// *whether a negative spelling exists* -- an argument, not a second rule.
 ///
 /// @param onFlag Flag name, without dashes, that sets the value true.
-/// @param offFlag Flag name, without dashes, that sets it false.
-/// @param value What this configuration holds.
-/// @param fallback What the value would be if the registration said nothing.
-/// @return The flag name to emit, or nullopt when the default already produces
-///         @p value and the registration has nothing to say.
+/// @param offFlag Flag name, without dashes, that sets it false; empty when the
+///        switch has no negative spelling.
+/// @param value What the operator asked for.
+/// @param wasTyped Whether the operator named this switch at all.
+/// @return The flag name to emit, or nullopt when nothing was named -- or when
+///         @p value is false and there is no spelling that says so.
 [[nodiscard]] std::optional<std::string_view> SwitchSpellingFor(std::string_view onFlag,
                                                                 std::string_view offFlag,
                                                                 bool value,
-                                                                bool fallback) noexcept;
+                                                                bool wasTyped) noexcept;
 
 /// Fill in the per-scope path arguments the operator left unset.
 ///
