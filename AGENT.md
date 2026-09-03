@@ -260,6 +260,22 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   a credential for every worker that trusts the key. Fields length-prefixed, never
   joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
   proofs.
+- The PSK signs through ONE seam and the domain is a required PARAMETER, never a string
+  a caller remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its
+  `SigningDomainTable`, so there is no argument to pass a bare label to. A construction
+  that omits its domain label is a credential valid on the *other* surface — the same key
+  MACs discovery proofs and lease tokens — and this is what stops a fourth signer being
+  written against `HmacSha256` directly (#402).
+- That change moved the discovery proof wire and **`DiscoveryWire::CurrentVersion`
+  deliberately did not move**. The proof gains `fastcache-discovery-v1` as a leading
+  length-prefixed field, so every tag differs from a pre-#402 build's; lease messages are
+  byte-for-byte unchanged, `fastcache-lease-v1` having already been the leading field.
+  What changed is the MAC *input*, not the datagram grammar, and bumping the version
+  would misdescribe the format. It is also the better failure: an older node reaches the
+  proof step and is logged `failed to prove the cluster key`, where an unsupported
+  version is dropped by `ClassifyDatagram` and presents as peers seen and never admitted.
+  Loud beats silent. "We changed the MAC, so bump the version" is the tempting
+  correction, and it is wrong.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.
