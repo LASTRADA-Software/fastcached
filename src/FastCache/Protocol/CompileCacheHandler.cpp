@@ -149,6 +149,12 @@ namespace
     /// The sink is a pointer because `SessionContext::metrics` is one; the guard lives
     /// in `Cc::Refuse`'s own overload rather than here, so no call site in this file
     /// says anything about nullability.
+    /// The row travels BY VALUE, not by reference. A coroutine copies its parameters
+    /// into the frame and a reference parameter does not survive the first suspend
+    /// point -- and every caller here passes a braced temporary, which is the shape
+    /// that dangles. `SurfaceRefusal` is two enumerators, so there is nothing to save
+    /// by borrowing. `cppcoreguidelines-avoid-reference-coroutine-parameters` says so
+    /// too, and only under clang-tidy: gcc built this without a word.
     /// @param socket Client socket.
     /// @param metrics Where the refusal is recorded, or null when nothing collects.
     /// @param refusal Which refusal, as one row.
@@ -156,7 +162,7 @@ namespace
     /// @return true when the whole reply reached the socket.
     [[nodiscard]] Task<bool> ReplyRefused(ISocket* socket,
                                           IMetricsSink* metrics,
-                                          Cc::SurfaceRefusal const& refusal,
+                                          Cc::SurfaceRefusal refusal,
                                           std::string message)
     {
         auto const frame = Cc::Refuse(metrics, refusal, message);
@@ -210,7 +216,7 @@ namespace
     /// @param refusal Which refusal, and why nothing rises for it.
     /// @param message Detail; the code's default message is used when empty.
     /// @return true when the whole reply reached the socket.
-    [[nodiscard]] Task<bool> ReplyUncounted(ISocket* socket, Cc::UncountedRefusal const& refusal, std::string message)
+    [[nodiscard]] Task<bool> ReplyUncounted(ISocket* socket, Cc::UncountedRefusal refusal, std::string message)
     {
         auto const frame = Cc::RefuseWithoutCounter(refusal, message);
         co_return co_await WriteAll(socket, frame);
