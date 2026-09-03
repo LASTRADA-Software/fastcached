@@ -442,9 +442,17 @@ enum class ErrorCode : std::uint8_t
     /// `UnsupportedFormatVersion` and `Corrupt`. `MalformedValue` says the bytes are
     /// not a compile value at all, which is a statement about a broken or mismatched
     /// CLIENT. This one says the bytes *are* a compile value, well formed, written
-    /// under a canonicalization spec newer than this server's -- which during a
+    /// under a canonicalization spec that is not this server's -- which during a
     /// rolling upgrade is a **normal and expected** condition and says nothing is
     /// wrong with anybody.
+    ///
+    /// **Either direction**, and the older one is the case actually in the field.
+    /// `DecodeCompileValue` refuses any `version != CompileValueVersion`, so this
+    /// fires for a producer behind this server exactly as for one ahead of it; #547
+    /// bumped `CompileValueVersion` to 2, so what a gen-2 server meets is gen-1
+    /// launchers. An operator sent looking for a *newer* machine would be hunting the
+    /// wrong half of the fleet, which is why the message states both numbers rather
+    /// than a direction.
     ///
     /// The code is what monitoring sees, and the remedies diverge: a rise in
     /// malformed values sends an operator looking for a broken client, or -- worse,

@@ -244,9 +244,22 @@ std::vector<std::byte> StoreFrame(StoreFields const& fields,
 
 /// Bytes that are not a compile value at all.
 ///
-/// Named because two cases need the same "not a compile value" input and the choice
-/// is not arbitrary: no generation this build implements is `0xEE`, so the value is
-/// refused at its very first byte rather than somewhere inside a length field.
+/// Named because two cases need the same "not a compile value" input and because
+/// what makes these two bytes qualify is **not** the leading `0xEE`. Since #483
+/// `DecodeCompileValue` runs `DecodeAfterGeneration` BEFORE it judges the version
+/// byte -- a leading byte that is not ours is on its own no evidence of another
+/// generation, and reading it that way once called every opaque blob foreign. So a
+/// well-framed payload behind `0xEE` decodes as `ForeignGeneration`, not as this.
+///
+/// What qualifies here is the LAYOUT: two bytes cannot hold the `u32` object length
+/// that must follow the generation, so the frame does not hold together behind the
+/// leading byte and `DecodeCompileValue` answers `NotACompileValue`.
+///
+/// That distinction is load-bearing rather than pedantic. Making this payload "more
+/// realistic" by putting a well-formed blob behind `0xEE` would silently turn the
+/// junk arm into a second foreign-generation arm, and re-pointing its expectation to
+/// match would delete the guard against the opposite collapse that the case exists
+/// to hold.
 [[nodiscard]] std::vector<std::byte> NotACompileValueBytes()
 {
     return { std::byte { 0xEE }, std::byte { 0xEE } };
@@ -529,9 +542,16 @@ TEST_CASE("A foreign value generation and a malformed value are refused by DIFFE
     //
     // The conflation this closes is the one `.agent/rules/storage.md` records for
     // `Corrupt` against `UnsupportedFormatVersion`, met on the wire instead of on
-    // disk: a launcher at generation N against a server at N+1 is a fleet MID-UPGRADE
-    // and nothing is damaged, but the remedy an operator reaches for on a cache
-    // reporting malformed values is to wipe it.
+    // disk: two machines at different generations are a fleet MID-UPGRADE and nothing
+    // is damaged, but the remedy an operator reaches for on a cache reporting
+    // malformed values is to wipe it.
+    //
+    // The value below is stamped one generation FORWARD because that is the direction
+    // a test can synthesise honestly -- it is this build's own framing, restamped.
+    // The refusal itself is direction-neutral (`DecodeCompileValue` refuses any
+    // `version != CompileValueVersion`), and since #547 took the byte to 2 the
+    // direction actually in the field is the other one: gen-1 launchers against gen-2
+    // servers. Nothing here should be read as making this a newer-peer-only answer.
     CcFixture fix;
 
     // A value a launcher of the NEXT generation would have written: encoded through
