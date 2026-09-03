@@ -928,7 +928,8 @@ namespace
         return watch;
     }
 
-    /// Whether the peer has already gone, asked before the reply is written.
+    /// Whether the peer has already gone, asked before the reply is written -- and if
+    /// so, record it.
     ///
     /// **The one question worth asking BEFORE the reply**, and the only one: the other
     /// two answers a watch can carry -- still parked, and woke with a pipelined request
@@ -940,11 +941,29 @@ namespace
     /// better without the framing around it. **It touches no write side** -- it yields,
     /// reads two flags and answers -- so the loop remains the only writer, structurally
     /// rather than by agreement.
-    /// @param reactor The loop this connection runs on; never null.
-    /// @param watch The watch, shared so it cannot die under the yield.
+    /// **It records the abandonment as well as reporting it**, and that is deliberate:
+    /// the decision and the counter are one fact, and split across a helper and its call
+    /// site they were a nested condition in the loop that owns neither.
+    /// @param state The server state, for the counter and the local-close question.
+    /// @param socket The connection, to ask whether THIS node closed it.
+    /// @param watch The watch, shared so it cannot die under the yield; may be null.
+    /// @param hadReply Whether there was an answer to deliver at all.
     /// @return True when the peer went before the answer was ready.
-    Task<bool> PeerAlreadyGone(IReactor* reactor, std::shared_ptr<PeerWatch const> watch)
+    Task<bool> AbandonIfPeerGone(FrameServer::State* state,
+                                 ISocket const* socket,
+                                 std::shared_ptr<PeerWatch const> watch,
+                                 bool hadReply)
     {
+        // **Both arms end the connection without writing, which is why they are one
+        // question.** An empty reply is `IFrameResponder::Answer`'s way of saying "close
+        // without answering" -- only ever right when the peer is not speaking this
+        // protocol at all -- and a peer that has gone is not owed the answer either.
+        // They are counted differently and acted on identically, so the counting stays
+        // below and the decision is asked once.
+        if (!hadReply)
+            co_return true;
+
+        auto* const reactor = &state->io.Reactor();
         if (watch == nullptr)
             co_return false; // Not watching: nothing was learned, so nothing is claimed.
 
@@ -960,7 +979,17 @@ namespace
         // arrive.
         if (!watch->finished)
             co_await ResumeOn { *reactor };
-        co_return watch->gone;
+        if (!watch->gone)
+            co_return false;
+
+        // Counted only when there was something to deliver AND when a CLIENT is what
+        // went: an empty reply means the surface had already decided to close, and a
+        // socket this process closed -- a sweep past the grace, a shutdown -- reaches
+        // the watcher looking exactly like a peer that hung up. Filing either would put
+        // this node's own teardowns in a row documented as a client-side story.
+        if (hadReply && !state->ClosedLocally(socket))
+            state->metrics.Increment(watch->counter);
+        co_return true;
     }
 
     /// Settle a watch once the reply has been written, and say what to do next.
@@ -1368,17 +1397,11 @@ namespace
                 // shutdown -- reaches the watcher looking exactly like a peer that hung
                 // up. Filing either would put this node's own teardowns in a row
                 // documented as a client-side story.
-                if (co_await PeerAlreadyGone(&state->io.Reactor(), watch))
-                {
-                    if (!reply.empty() && !state->ClosedLocally(socket.get()))
-                        state->metrics.Increment(watch->counter);
+                // Nothing to deliver, or nobody left to deliver it to -- see
+                // `AbandonIfPeerGone`, which carries both arms and counts them apart.
+                if (co_await AbandonIfPeerGone(state, socket.get(), watch, !reply.empty()))
                     break;
-                }
 
-                if (reply.empty())
-                    break; // `IFrameResponder::Answer` documents an empty reply as
-                           // "close without answering", which is only ever right
-                           // when the peer is not speaking this protocol at all.
                 if (!co_await WriteAll(socket.get(), reply))
                     break;
 
