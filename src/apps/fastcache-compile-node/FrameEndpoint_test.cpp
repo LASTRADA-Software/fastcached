@@ -5,6 +5,7 @@
 
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <format>
 #include <future>
@@ -217,6 +219,36 @@ struct Fleet
     return reply;
 }
 
+/// How long a case waits for something the reactor still owes it.
+///
+/// Bounded, and every use says what it waited for -- `.agent/rules/testing.md`.
+/// Generous against a loaded box on purpose: nothing here is a timing property, so a
+/// case that needed this tight would be measuring the machine rather than the code.
+constexpr auto WatchWait = 15s;
+
+/// Wait until @p ready holds, or give up.
+///
+/// Through `DrainWithin` rather than a spin of its own, because that is the one bounded
+/// wait in this tree and the reason is exactly the trap here: counting the sleeps it
+/// ASKED for states a ceiling and enforces `actual / requested` times it, and on Windows
+/// a 5 ms request costs about 15 ms -- so a hand-rolled `3000 x 5ms` reads as 15 s and
+/// waits nearer 45. `DrainWithin` reads a clock instead. Blocking is right here: this
+/// runs on the Catch2 thread, never on a reactor.
+/// @param ready What is being waited for; called until it answers true.
+/// @return True when it happened inside `WatchWait`, false when it never did.
+template <std::predicate Predicate>
+[[nodiscard]] bool WaitFor(Predicate ready)
+{
+    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = WatchWait, .poll = 5ms })
+           == DrainResult::Drained;
+}
+
+/// Most bytes a case will accumulate while reading a peer out to EOF.
+///
+/// Far above any reply these cases produce, because what it guards is a server that
+/// never stops talking rather than a reply that is larger than expected.
+constexpr std::size_t ReadRestLimit = 64 * 1024;
+
 /// One connection, held open across several requests.
 ///
 /// What `Exchange` cannot express: the heartbeat loop and `Cc::Exchange` both send
@@ -253,9 +285,7 @@ class Conversation
     /// @return True when the whole frame went out.
     [[nodiscard]] bool SendOnly(std::span<std::byte const> frame)
     {
-        return SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<bool> {
-            co_return (co_await peer->Write(std::span<std::byte const> { request })).has_value();
-        }(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+        return SyncRun(SendRaw(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
     }
 
     /// Read one reply that a previous `SendOnly` is owed.
@@ -269,7 +299,7 @@ class Conversation
     /// @return Every remaining byte, or empty when the limit was hit first.
     [[nodiscard]] std::vector<std::byte> ReadRest()
     {
-        return SyncRun(ReadUntilPeerCloses(_socket.get(), 64 * 1024));
+        return SyncRun(ReadUntilPeerCloses(_socket.get(), ReadRestLimit));
     }
 
     /// Hang up now, rather than at the end of the case.
@@ -2045,33 +2075,6 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     (*inSurface)->Close();
     (*onSocket)->Close();
 }
-
-namespace
-{
-
-/// How long a case waits for a reply the reactor still owes it.
-///
-/// Bounded, and every use below says what it waited for -- `.agent/rules/testing.md`.
-/// Generous against a loaded box on purpose: nothing here is a timing property, so a
-/// case that needed this tight would be measuring the machine instead of the code.
-constexpr auto WatchWait = 15s;
-
-/// Spin until @p ready holds, or give up.
-/// @param ready What is being waited for; called until it answers true.
-/// @return True when it happened inside the bound, false when it never did.
-template <typename Predicate>
-[[nodiscard]] bool WaitFor(Predicate ready)
-{
-    for (auto spin = 0; spin < 3000; ++spin)
-    {
-        if (ready())
-            return true;
-        std::this_thread::sleep_for(5ms);
-    }
-    return ready();
-}
-
-} // namespace
 
 TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
 {

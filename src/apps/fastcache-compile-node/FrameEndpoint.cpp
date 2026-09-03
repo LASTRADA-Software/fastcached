@@ -718,7 +718,7 @@ namespace
         /// A pipelined request, in whole or in part. They are handed back rather than
         /// consumed because the loop's `ByteReader` is the only thing that may parse
         /// this stream -- see `ServeConnection`, which primes them.
-        std::vector<std::byte> pulled;
+        std::vector<std::byte> pulled {};
     };
 
     /// How much a watcher takes when the socket turns out to have data on it.
@@ -727,15 +727,6 @@ namespace
     /// and the loop's own reader collects it a moment later. This buffer exists to
     /// answer one question -- EOF or data -- not to read a request.
     constexpr std::size_t PeerWatchProbeBytes = 512;
-
-    /// How often a connection ending under a parked watch re-reads that watch.
-    ///
-    /// Short, because it is pure teardown latency on this side and the peer already
-    /// has its answer; the ceiling that matters is `FrameServer::RefusalTimeout`, which
-    /// bounds the whole wait. Nothing is measured against this, so it needs no
-    /// justification beyond being small enough not to matter and large enough not to
-    /// spin.
-    constexpr std::chrono::milliseconds GracefulCloseStep { 5 };
 
     /// Watch for the peer going away while a responder answers.
     ///
@@ -1076,16 +1067,6 @@ namespace
                 if (state->responder.HoldsOwnByteBudget(decoded->opRaw))
                     bytes.Release();
 
-                // Awaited: answering may reach the network -- the cache surface
-                // consults an upstream -- and that suspends rather than blocking
-                // every other connection on this loop, which is the whole reason
-                // this task exists separately from the accept loop.
-                //
-                // Bracketed by the two marks, and this is the ONLY place either is
-                // touched. While the mark is set, a sweep that finds this connection
-                // overdue defers instead of closing, because here -- and only here --
-                // the coroutine is not parked on the socket, so the close would wake
-                // nothing while destroying the write side a refusal has to leave by.
                 // **Armed only when the reader holds nothing, and that is what makes
                 // priming the pulled bytes ordering-safe.** `PrimeWith` prepends, so
                 // handing it bytes read AFTER something already buffered would put the
@@ -1105,6 +1086,16 @@ namespace
                     WatchPeer(socket, watch);
                 }
 
+                // Awaited: answering may reach the network -- the cache surface
+                // consults an upstream -- and that suspends rather than blocking
+                // every other connection on this loop, which is the whole reason
+                // this task exists separately from the accept loop.
+                //
+                // Bracketed by the two marks, and this is the ONLY place either is
+                // touched. While the mark is set, a sweep that finds this connection
+                // overdue defers instead of closing, because here -- and only here --
+                // the coroutine is not parked on the socket, so the close would wake
+                // nothing while destroying the write side a refusal has to leave by.
                 state->EnterResponder(socket.get());
                 auto const reply = co_await state->responder.Answer(frame, peer);
 
@@ -1154,10 +1145,13 @@ namespace
 
                     if (watch->gone)
                     {
-                        // The object is NOT written. This is the waste #223 measured
-                        // at 84 MB for one translation unit, going to a client that
-                        // had already given up -- and until now nothing here observed
-                        // it, because the loop is not reading while a compile runs.
+                        // The object is not WRITTEN. It has still been compiled and
+                        // encoded -- `Answer` returned it -- so what this saves is the
+                        // transfer, which #223 measured at 84 MB for one translation
+                        // unit going to a client that had already given up. Saving the
+                        // CPU as well needs a cancellable process seam (#661). Until
+                        // now nothing here observed the disconnect at all, because the
+                        // loop is not reading while a compile runs.
                         //
                         // Counted only when there was something to deliver. An empty
                         // reply means the surface had already decided to close, and
@@ -1183,48 +1177,48 @@ namespace
                     break;
 
                 // **A watch still parked ends the connection, and the `break` IS the
-                // cancellation**: it falls through to the `socket->Close()` below,
-                // which is the only thing on `ISocket` that can retrieve a coroutine
-                // parked in `WaitReadable`.
-                //
-                // The alternative is to loop round and issue the next `Read` while the
-                // watcher is still parked, and that is not merely undefined -- `Read`
-                // and `WaitReadable` share one read-op slot and each begins by nulling
-                // the parked awaitable, so the second arm drops the first coroutine's
-                // resume handle and leaks its frame, silently, per request, on both
-                // epoll and IOCP. `IFrameResponder::PeerWatchCounter` carries the whole
-                // argument, including why this costs nothing against any client in
-                // this tree and what check would falsify that.
+                // cancellation**: it falls through to the `socket->Close()` below, the
+                // only thing on `ISocket` that can retrieve a coroutine parked in
+                // `WaitReadable`. Looping round instead would arm a `Read` over that
+                // parked wait and silently leak its frame;
+                // `IFrameResponder::PeerWatchCounter` carries the derivation and the
+                // measurement.
                 if (watch && !watch->finished)
                 {
                     // **Closing straight away loses the reply that was just written**,
-                    // and it is measured rather than feared: the pipelined-request case
-                    // received the first answer and then ZERO further bytes, because a
+                    // and that is measured rather than feared: the pipelined case
+                    // received its first answer and then ZERO further bytes, because a
                     // close over a socket with I/O still pending is abortive and takes
-                    // the buffered reply with it. That is the same hazard
-                    // `RefuseAtCapacity` documents from the other direction -- a peer
-                    // that never saw the refusal it was sent, only a reset.
+                    // the buffered reply with it. `RefuseAtCapacity` documents the same
+                    // hazard from the other direction -- a peer that saw a reset instead
+                    // of the refusal it had been sent.
                     //
                     // So the peer is given the chance to take the answer and hang up,
                     // and the watcher is what observes it doing so: the client's FIN is
-                    // a readable edge, which is precisely what this coroutine is parked
-                    // on. When it fires, the close below is graceful and the frame is
-                    // already unwound.
+                    // a readable edge, which is exactly what this coroutine is parked
+                    // on. The ordinary client -- `Cc::RunOneExchange`, which reads its
+                    // reply and closes -- is gone within one step.
                     //
-                    // Polled in short steps rather than waited on, for the reason
-                    // `InterruptibleSleepUntil` gives for the same shape: a wait that
-                    // parks a second frame on the timer wheel leaves it there after the
-                    // wait has ended. Bounded by `RefusalTimeout`, and for its reason --
-                    // the peer has its answer already and has only to read it, which is
-                    // a round trip rather than a request. A peer that dawdles past that
-                    // is closed on anyway, which is exactly what happened before this
-                    // block existed.
+                    // Polled rather than woken, for the reason `NextWakeStep` states:
+                    // `IReactor::Schedule` cannot be cancelled, so a wait that must also
+                    // be woken by something else sleeps in steps and re-reads, leaving
+                    // nothing parked behind it. The loop is inlined rather than
+                    // delegated to `InterruptibleSleepUntil` for the reason that header
+                    // gives for its three siblings; the arithmetic is the part they
+                    // share, and it is shared here.
                     //
-                    // It costs the CLIENT nothing: the reply went out at the `WriteAll`
-                    // above, and this waits only to make the hang-up orderly.
-                    auto const until = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
-                    while (!watch->finished && state->io.Reactor().Clock().Now() < until)
-                        co_await SleepFor(state->io.Reactor(), GracefulCloseStep);
+                    // Bounded by `RefusalTimeout`, and for its reason: the peer has its
+                    // answer and has only to read it, which is a round trip rather than
+                    // a request. One that dawdles past that is closed on anyway, which
+                    // is exactly what happened before this block existed. It costs the
+                    // CLIENT nothing either way -- the reply went out at the `WriteAll`
+                    // above, and this only makes the hang-up orderly.
+                    auto& reactor = state->io.Reactor();
+                    auto const until = reactor.Clock().Now() + FrameServer::RefusalTimeout;
+                    while (!watch->finished && reactor.Clock().Now() < until)
+                        co_await SleepUntil { .reactor = &reactor,
+                                              .deadline = NextWakeStep(
+                                                  reactor.Clock().Now(), until, FrameServer::GracefulCloseStep) };
                     break;
                 }
             }

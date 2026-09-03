@@ -714,6 +714,15 @@ class FrameServer
     /// flag and no new virtual -- the value comes from a question the endpoint
     /// already asks at the point it arms the answer window.
     ///
+    /// How often a connection ending under a parked watch re-reads that watch.
+    ///
+    /// Short, because it is pure teardown latency on this side: the peer already has
+    /// its answer, and the ordinary client hangs up within one step. Here rather than
+    /// beside the loop it drives, so it sits with `RefusalTimeout`, which is the
+    /// ceiling that actually bounds that wait -- two halves of one bound in two files
+    /// is how they come to disagree.
+    static constexpr std::chrono::milliseconds GracefulCloseStep { 5 };
+
     /// A pure function over the window rather than arithmetic inlined at the sweep,
     /// so the magnitude can be pinned on both sides without a case that waits out a
     /// wall-clock spread the instrument's own noise is comparable to.
