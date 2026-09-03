@@ -70,6 +70,23 @@ set(vslangScanRoots
 # prose is not counted and a genuine assignment cannot hide behind whitespace.
 set(vslangAssignmentPattern "\\.name[ \t]*=[ \t]*\"VSLANG\"")
 
+# The named helpers that wrap an English request, and how many times each NAME may
+# appear in its file -- its definition plus its permitted call sites.
+#
+# Counting assignments alone leaves the cheapest route to the defect wide open, and
+# it is the route the header's own "put the variable on the compile too" edit would
+# actually take: `RunCaptureSplitInEnglish` already exists, so routing the real
+# compile spawn through it needs NO new assignment. The census stays at one, this
+# check stays green, and every diagnostic the developer reads is anglicized. Pinning
+# the identifier count is what closes that -- a second call is a third occurrence.
+#
+# Found by review rather than by this check, which is the part worth keeping: a
+# guard written against one route does not cover a second route to the same place
+# merely because the same variable is at the end of it.
+set(vslangEnglishEntryPoints
+    "src/apps/fastcache-cc/main.cpp|RunCaptureSplitInEnglish|2|its definition, plus the single preprocess-probe call (#692)"
+)
+
 set(missingRoots "")
 set(unexpectedSites "")
 set(wrongCounts "")
@@ -87,7 +104,7 @@ foreach(root IN LISTS vslangScanRoots)
     # what `check-glob-traversals` refuses (#502) and what caught this scan on its
     # first run.
     file(GLOB_RECURSE rootFiles LIST_DIRECTORIES false "${resolvedRoot}/*")
-    list(FILTER rootFiles INCLUDE REGEX "\.(cpp|hpp)$")
+    list(FILTER rootFiles INCLUDE REGEX "[.](cpp|hpp)$")
     list(APPEND scanFiles ${rootFiles})
 endforeach()
 
@@ -150,12 +167,39 @@ foreach(row IN LISTS vslangAllowedSites)
     string(REPLACE "|" ";" rowFields "${row}")
     list(GET rowFields 0 rowPath)
     list(GET rowFields 2 rowReason)
-    if(NOT IS_ABSOLUTE "${FASTCACHED_SOURCE_DIR}/${rowPath}" AND NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${rowPath}")
+    # `EXISTS` alone. The earlier spelling also required the joined path NOT to be
+    # absolute, which it always is -- so this arm could never fire, and a renamed
+    # file was reported as "stopped asking for English", sending the reader hunting
+    # for a deleted assignment inside a file that is no longer there.
+    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${rowPath}")
         list(APPEND missingRoots "  ${rowPath}: named in the allow table and not present")
         continue()
     endif()
     if(NOT "${rowPath}" IN_LIST seenAllowed)
         list(APPEND silentSites "  ${rowPath}: sets VSLANG nowhere -- ${rowReason}")
+    endif()
+endforeach()
+
+# --- the English helpers are called exactly where the table says --------------
+set(extraEnglishCalls "")
+foreach(row IN LISTS vslangEnglishEntryPoints)
+    string(REPLACE "|" ";" rowFields "${row}")
+    list(GET rowFields 0 helperPath)
+    list(GET rowFields 1 helperName)
+    list(GET rowFields 2 helperAllowed)
+    list(GET rowFields 3 helperReason)
+
+    set(resolvedHelper "${FASTCACHED_SOURCE_DIR}/${helperPath}")
+    if(NOT EXISTS "${resolvedHelper}")
+        list(APPEND missingRoots "  ${helperPath}: named in the English-helper table and not present")
+        continue()
+    endif()
+
+    file(STRINGS "${resolvedHelper}" helperLines REGEX "${helperName}")
+    list(LENGTH helperLines helperCount)
+    if(NOT helperCount EQUAL helperAllowed)
+        list(APPEND extraEnglishCalls
+             "  ${helperPath}: ${helperName} appears ${helperCount} time(s), expected ${helperAllowed} -- ${helperReason}")
     endif()
 endforeach()
 
@@ -171,6 +215,7 @@ set(vslangReportSections
     "missingRoots|The scan table names somewhere that is not there"
     "unexpectedSites|VSLANG set outside a probe"
     "wrongCounts|A probe site's assignment count moved"
+    "extraEnglishCalls|An English-request helper is reached from somewhere new"
     "silentSites|A probe site stopped asking for English"
 )
 

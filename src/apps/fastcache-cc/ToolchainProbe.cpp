@@ -768,10 +768,26 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     // pick the wrong probe flag.
     //
     // Best effort by nature: `cl` falls back to whatever language pack IS installed
-    // when 1033 is absent, so a machine can still answer in another language. It is
-    // then exactly as consistent with itself as it was before this -- one identity of
-    // its own, sharing with nobody -- which is the acceptance clause about a driver
-    // that ignores `VSLANG` not being made worse by it.
+    // when 1033 is absent, so a machine can still answer in another language.
+    //
+    // What that leaves is stated rather than smoothed over, because the comfortable
+    // version of this sentence is wrong. It is NOT true that such a host is "as
+    // consistent with itself as before": before this, two hosts sharing a UI language
+    // matched each other. An estate whose machines differ only in which packs are
+    // INSTALLED -- German UI throughout, en-US present on some -- now splits into an
+    // English identity and a German one that share no cache entry and match nothing
+    // in the fleet. That is #200's own symptom, newly introduced for exactly that
+    // shape of estate, and it is the cost of collapsing the much commoner split
+    // between whole machines.
+    //
+    // And unlike the `/showIncludes` twin, this path has NO detector. There the
+    // launcher can see that a request did not take, because it parses the answer and
+    // `Cc::CarriesUnreadableIncludeNotes` reports notes it could not read. A banner
+    // is one opaque line: nothing here can tell "this is English" from "this is a
+    // language that happens to be shaped like the last one", short of a second probe
+    // spawn per compile to compare against. So the residual case is silent by
+    // construction -- recorded here because a cost nobody wrote down is a cost the
+    // next reader will assume was never paid.
     std::array<EnvironmentAssignment, 1> const english { {
         { .name = "VSLANG", .value = "1033" },
     } };
