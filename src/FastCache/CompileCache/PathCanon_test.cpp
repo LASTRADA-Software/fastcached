@@ -319,6 +319,54 @@ TEST_CASE("A drive-relative root still makes a Windows layout, and still canonic
     CHECK(token == "<SRCROOT>/a.hpp");
 }
 
+TEST_CASE("An empty consuming root leaves the token standing rather than guessing a path")
+{
+    // Both directions of one root, because the pair is the property: the producing
+    // side has always answered "under no root" for an empty one, and until #547 the
+    // consuming side answered it by prefixing a separator -- inventing an absolute
+    // path out of no root at all. Fixing the separator alone would have replaced that
+    // with a RELATIVE path, which is worse: it resolves against whatever directory
+    // the process is in and can name a different real file, silently, where a
+    // surviving token is refused by `Cc::MissingReplayedDependency` before anything
+    // is written.
+    //
+    // Not reachable from the launcher, which refuses an empty root before a layout
+    // exists. It is asserted because `Localize` takes a `Layout` from whoever hands
+    // it one, and because a rule with one end implemented is not a rule.
+    Layout const none { .sourceRoot = "", .buildTree = "" };
+
+    CHECK(PathCanon::Canonicalize("/home/dev/proj/inc/a.hpp", none) == "/home/dev/proj/inc/a.hpp");
+    CHECK(PathCanon::Localize("<SRCROOT>/inc/a.hpp", none) == "<SRCROOT>/inc/a.hpp");
+    CHECK(PathCanon::Localize("<BUILDTREE>/gen/cfg.hpp", none) == "<BUILDTREE>/gen/cfg.hpp");
+
+    // One empty root does not disturb the other: the source root still localizes.
+    Layout const halfEmpty { .sourceRoot = "/srv/ci/checkout", .buildTree = "" };
+    CHECK(PathCanon::Localize("<SRCROOT>/inc/a.hpp", halfEmpty) == "/srv/ci/checkout/inc/a.hpp");
+    CHECK(PathCanon::Localize("<BUILDTREE>/gen/cfg.hpp", halfEmpty) == "<BUILDTREE>/gen/cfg.hpp");
+}
+
+TEST_CASE("A trailing separator on a root adds no depth, so it cannot win the tie-break")
+{
+    // `/x/proj` and `/x/proj/` name one directory. Comparing raw sizes let the second
+    // beat the first by that byte alone, so a layout spelling its two roots
+    // differently sent every path to <BUILDTREE> -- and a consumer with a real
+    // out-of-source layout then replayed a path that does not exist.
+    Layout const sameDirectory { .sourceRoot = "/x/proj", .buildTree = "/x/proj/" };
+    CHECK(PathCanon::Canonicalize("/x/proj/a.cpp", sameDirectory) == "<BUILDTREE>/a.cpp");
+
+    Layout const swapped { .sourceRoot = "/x/proj/", .buildTree = "/x/proj" };
+    CHECK(PathCanon::Canonicalize("/x/proj/a.cpp", swapped) == "<BUILDTREE>/a.cpp");
+
+    // Which is the tie-break's own documented answer for two roots of equal depth,
+    // and now the SAME answer whichever way the two are spelled -- the point being
+    // that spelling stopped deciding it, not that the winner changed.
+
+    // And a genuinely nested build tree still wins on depth, untrimmed or not.
+    Layout const nested { .sourceRoot = "/x/proj/", .buildTree = "/x/proj/build/" };
+    CHECK(PathCanon::Canonicalize("/x/proj/inc/a.hpp", nested) == "<SRCROOT>/inc/a.hpp");
+    CHECK(PathCanon::Canonicalize("/x/proj/build/gen/cfg.hpp", nested) == "<BUILDTREE>/gen/cfg.hpp");
+}
+
 // ---------------------------------------------------------------------------
 // RewritePaths: the same grammars, driven by a caller's own transform. The
 // launcher needs this to reconcile a driver's spelling of a path (an 8.3 short

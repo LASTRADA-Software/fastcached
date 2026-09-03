@@ -70,11 +70,13 @@ namespace
         /// A `STORE` whose value names a canonicalization generation this build does
         /// not implement.
         ///
-        /// **Counted**, and the ground matters because the obvious one does not hold.
-        /// "`CompileValueVersion` has never moved, so the baseline is zero" is true
-        /// today and expires exactly when this counter starts doing work — it argues
-        /// for the series from the absence of the thing it counts, and a future author
-        /// copying it would carry that mistake to the next arm.
+        /// **Counted**, and the ground matters because the obvious one did not hold.
+        /// "`CompileValueVersion` has never moved, so the baseline is zero" argued for
+        /// the series from the absence of the thing it counts, and it expired exactly
+        /// when this counter started doing work: #547 bumped the byte to 2, so
+        /// generation-1 values are in the field and a rollout across that bump is the
+        /// first thing this series ever sees. It stood for one generation and then
+        /// said nothing, which is why the ground below is the one that is written down.
         ///
         /// The ground that survives a bump: **a converged fleet produces none.** That
         /// is what separates it from the `AUTH` arm below, which a correctly

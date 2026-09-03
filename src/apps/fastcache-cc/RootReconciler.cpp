@@ -17,12 +17,18 @@ std::string WithoutTrailingSeparator(std::string root)
     // IsWindowsRoot's, and for the same reason: without the letter check, any
     // three-byte string whose middle byte is a colon reads as a drive root.
     //
-    // Nothing under a bare root canonicalizes anyway -- IsSegmentPrefix wants a
-    // separator AFTER the root, and a bare root IS its separator -- so exempting
-    // one costs that configuration nothing it had. It is exempt because trimming
-    // would be worse: "C:\" would become "C:", which flips the separator style
-    // JoinLocalized derives from it, and "/" would become empty, which is a
-    // prefix of nothing at all.
+    // A bare root is exempt because trimming would be worse: "C:\" would become
+    // "C:", which flips the separator style JoinLocalized derives from it, and "/"
+    // would become empty, which is a prefix of nothing at all.
+    //
+    // This carried a second justification until #547 -- "nothing under a bare root
+    // canonicalizes anyway, so exempting one costs that configuration nothing it
+    // had" -- which was an accurate description of a DEFECT rather than a reason to
+    // be comfortable. It was true: IsSegmentPrefix demanded a separator AFTER the
+    // root and a bare root is its own, so every path under one was judged to lie
+    // outside both roots and the stored value kept that machine's absolute paths.
+    // The clause is gone with the defect; the exemption above stands on its own and
+    // always did.
     auto const isBareRoot = [&root]() {
         if (root.size() <= 1)
             return true;
