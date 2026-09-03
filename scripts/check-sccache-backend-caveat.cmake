@@ -26,6 +26,17 @@
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-sccache-backend-caveat.cmake
 #
+# Optionally, and all three only affect what this reports about ITSELF -- never
+# the verdict, which is a property of the source tree alone:
+#
+#   -DFASTCACHED_SCAN_BUDGET_SECONDS=<n>    the wall-clock budget to report
+#                                           headroom against. Omitted, the cost
+#                                           is reported with no headroom line.
+#   -DFASTCACHED_SCAN_NARRATE_AFTER=<n>     start narrating progress once the
+#                                           scan has been running this long.
+#   -DFASTCACHED_SCAN_PROGRESS_EVERY=<n>    how often, in files, to consider
+#                                           narrating.
+#
 # Exit codes: 0 = every recommendation carries its caveat. 1 = at least one does not.
 
 # A `cmake -P` script has no `cmake_minimum_required`, so every policy is unset
@@ -150,10 +161,67 @@ set(FastCachedSccacheExemptPaths
     "scripts/sccache-smoke.sh|A harness that drives a real sccache against a real daemon to prove the memcached text, memcached binary and RESP2 wire formats are all detected. It sets the variables to exercise the daemon, not to advise anyone to."
     "scripts/sccache-smoke.ps1|The Windows half of the same harness."
     "scripts/check-sccache-backend-caveat.cmake|This check. Its own marker table has to spell the variables out."
+    "scripts/check-sccache-backend-caveat-selftest.cmake|This check's selftest. It synthesises a tree containing one recommendation carrying its caveat, so the marker is test DATA -- and it is deliberately written out in full rather than assembled from fragments, because a file that dodged this scan by spelling the variable in halves is exactly the hole the scan exists to close. It was caught by this check on its first ctest run, which is the mechanism working."
     "src/FastCache/Config/CliParser.cpp|The daemon's `--help`, whose sccache examples DO carry the caveat -- as a row of UsageFooters. It is owned by the `--help qualifies its sccache examples with the MSVC caveat` case in CliParser_test.cpp, which asserts the same three elements against the RENDERED usage string and additionally that the caveat reads after the examples. See the note on FastCachedSccacheJudgedGlobs above for why a source scan is the weaker of the two."
     "docs/snippets/sccache-backend-caveat.md|The caveat itself, which names the variables in the header telling an author what this check requires. Judging it would have it satisfy itself, which is a check that cannot fail."
     ".github/workflows/build.yml|Names the variable in a comment explaining why the Windows sccache assertion must be read BEFORE ctest -- the `sccache-smoke-*` tests restart the sccache server with it, zeroing the statistics -- and the smoke jobs themselves invoke the harness that sets it. That is the workflow driving the daemon, never advising anyone to build that way, which is the same ground as the sccache-smoke rows above. It is also YAML, where a caveat could only be a comment: this check cannot tell a comment stating the caveat from a comment merely mentioning the variable, so a green result here would prove nothing about what the file says. Owned by .agent/rules/build-and-toolchain.md, which states the caveat in full at the passage that comment refers to, and which this check does judge."
 )
+
+# ---------------------------------------------------------------------------
+# What this check COSTS, which is a quantity under conditions and not a number.
+#
+# The scan is 800-odd individual file reads and essentially no compute. Measured
+# on WSL2 9p (`/mnt/d`) on 2026-09-03: 4.3 s wall against 0.14 s user and 0.26 s
+# sys, so 91% of the run is spent waiting on the filesystem bridge and the rest
+# is rounding. That is the entire cost model -- per FILE, and set by the
+# filesystem rather than by anything this script decides.
+#
+# Three figures for this one check were live in the tree at once (#479): the
+# registration comment in src/tests/CMakeLists.txt said 0.2-0.5 s and "still far
+# inside the timeout", a quiet bridged checkout measures ~4.5 s, and two lanes
+# measured 53-57 s against a 60 s ceiling while several gates ran at once. Two
+# orders of magnitude, and none of the three carried its conditions -- so each
+# read as a fact about this check when all three are facts about a filesystem.
+#
+# The fix is therefore NOT a fourth number. This check measures itself and says
+# so on every run, green included, so the margin is an observation somebody can
+# act on rather than a claim written once and never re-taken. AGENT.md, under
+# "Caching an expensive repeated answer": record a table of conditions, not a
+# number; a spread states its own uncertainty and forces a citer to pick a row.
+#
+#   <highest ms/file this band covers, or `unbounded`>|<name>|<the conditions, and whether the per-file figure was measured or derived>
+#
+# Ceilings ascend and the last row is the catch-all. These are bands, not
+# thresholds: nothing fails for landing in one. They exist so a reader of a slow
+# run is told which of three known situations they are in instead of being left
+# to re-time the check by hand, which is what #479 cost two lanes in one day.
+#
+# Each row says whether its per-file cost was MEASURED or DERIVED, because a
+# handoff is a citation and only the sending end can make that distinction --
+# AGENT.md again. Two of these three rows are wall times somebody else recorded,
+# divided by a corpus count taken here; a reader who assumes all three were
+# observed the same way will trust the widest one most, and it is the softest.
+set(FastCachedSccacheScanCostBands
+    "2|native|A filesystem reached directly -- ext4, or NTFS from a Windows cmake. DERIVED: 0.47 s reported in #479 for this class of work, over a corpus of this size. Not measured here."
+    "20|bridged|WSL2 9p -- the WSL1 mechanism the older notes in this tree call DrvFs -- with the machine otherwise quiet. MEASURED: 4.0-5.1 s over this corpus across four checkouts on one machine, load average 0.6-0.9, 2026-09-03, of which 0.4 s was user+sys and the rest was wait."
+    "unbounded|bridged and contended|The same bridge while several lanes build and run ctest at once. DERIVED: two lanes each timed 53-57 s twice on 2026-09-03 (#479). The per-file figure is that divided by a corpus count taken separately, on a machine state that could not afterwards be reproduced. It is the least directly observed row here and the one a slow run is most likely to land in."
+)
+
+# When to start narrating progress, in seconds, and how often to consider it, in
+# files.
+#
+# A fast run says nothing: a progress line per hundred files would be nine lines
+# of noise on every green native run, and noise is how the useful line stops
+# being read. A run that is ALREADY slow narrates, because that is the only way
+# the reader of a `ctest` TIMEOUT learns which kind of failure they are looking
+# at. ctest captures the output of a test it kills, so the last narration line
+# survives the kill and says `still scanning -- 400 of 837 ... 65 ms/file`.
+#
+# The threshold sits above the bridged-and-quiet band's whole run so an ordinary
+# WSL checkout stays silent, and far below any plausible ceiling so a contended
+# one has narrated several times before anything kills it.
+set(FastCachedSccacheScanNarrateAfterSeconds 10)
+set(FastCachedSccacheScanProgressEvery 100)
 
 # ---------------------------------------------------------------------------
 
@@ -166,6 +234,94 @@ endif()
 if(NOT IS_DIRECTORY "${FASTCACHED_SOURCE_DIR}")
     message(FATAL_ERROR "'${FASTCACHED_SOURCE_DIR}' is not a directory. Is it the source root?")
 endif()
+
+# The two narration settings are overridable so the selftest can drive the slow
+# path in milliseconds instead of waiting for a filesystem to be slow. Nothing
+# here can change the VERDICT -- it is a property of the source tree alone -- so
+# an override can only make this check noisier or quieter about itself.
+#
+# There is deliberately no default for the budget, which is why it starts empty
+# rather than appearing beside the two settings above. It is the number ctest
+# enforces as this test's TIMEOUT, and a default here would be a second copy of
+# it that drifts -- the shape of the defect this whole section exists to close.
+# Run standalone with no budget, the cost is reported with no headroom line,
+# which is honest: nothing was enforcing one.
+set(scanBudgetSeconds "")
+
+#   <-D name>|<the variable it sets>|<lowest accepted value>|<what it is, for the refusal>
+#
+# A table because all three are validated identically and getting one wrong is
+# silent: **CMake's numeric comparisons are FALSE for a non-number**, so a value
+# like `60s` passes every `LESS`/`LESS_EQUAL` guard written against it and
+# reaches `math()` hundreds of lines later, where it surfaces as an arithmetic
+# error naming a line number instead of naming the flag. Under this test's
+# `FAIL_REGULAR_EXPRESSION` that reddens the check with a message about
+# expression parsing. So the shape is asserted before the value is used, once,
+# for every knob -- and a fourth knob is a row rather than a fourth spelling.
+#
+# No field may contain a '|' or a ';'.
+set(FastCachedSccacheScanKnobs
+    "FASTCACHED_SCAN_NARRATE_AFTER|FastCachedSccacheScanNarrateAfterSeconds|0|the number of seconds a run must already have taken before it starts narrating progress"
+    "FASTCACHED_SCAN_PROGRESS_EVERY|FastCachedSccacheScanProgressEvery|1|the number of files between progress checkpoints. It is the modulus the checkpoint divides by, so 0 is a division by zero rather than a way to turn narration off -- raise FASTCACHED_SCAN_NARRATE_AFTER for that"
+    "FASTCACHED_SCAN_BUDGET_SECONDS|scanBudgetSeconds|1|the wall-clock budget headroom is reported against. Omit it entirely to run with no budget and no headroom line, which is how it is switched off"
+)
+foreach(row IN LISTS FastCachedSccacheScanKnobs)
+    string(REPLACE "|" ";" knobFields "${row}")
+    list(LENGTH knobFields knobFieldCount)
+    if(NOT knobFieldCount EQUAL 4)
+        message(FATAL_ERROR
+            "FastCachedSccacheScanKnobs row split into ${knobFieldCount} field(s) where 4 are "
+            "wanted -- a '|' or a ';' has got into a field: ${row}")
+    endif()
+    list(GET knobFields 0 knobName)
+    list(GET knobFields 1 knobVariable)
+    list(GET knobFields 2 knobMinimum)
+    list(GET knobFields 3 knobMeaning)
+
+    if(NOT DEFINED ${knobName})
+        continue()
+    endif()
+    set(knobValue "${${knobName}}")
+
+    if(NOT knobValue MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "${knobName} is '${knobValue}', which is not a whole number. It is ${knobMeaning}.")
+    endif()
+    if(knobValue LESS ${knobMinimum})
+        message(FATAL_ERROR
+            "${knobName} is ${knobValue} and its lowest accepted value is ${knobMinimum}. It is "
+            "${knobMeaning}.")
+    endif()
+    set(${knobVariable} "${knobValue}")
+endforeach()
+
+# `string(TIMESTAMP)` is the only clock a `cmake -P` script has. Script mode has
+# no high-resolution timer, and spawning a subprocess to borrow one would cost
+# more on the filesystem this exists to characterise than the thing it measures.
+#
+# Whole seconds is coarse against a 4 s run and ample against the question
+# actually being asked, which is which BAND the filesystem is in: the native and
+# contended bands are two orders of magnitude apart, and no rounding closes that.
+#
+# @param outVar Set to the current wall time in whole seconds since the epoch.
+function(fastcached_wall_seconds outVar)
+    string(TIMESTAMP nowSeconds "%s")
+    set(${outVar} "${nowSeconds}" PARENT_SCOPE)
+endfunction()
+
+# CMake honours SOURCE_DATE_EPOCH by returning it from EVERY `string(TIMESTAMP)`
+# call, so with that variable set in the environment every interval this script
+# measures is exactly zero -- and a zero interval is indistinguishable from an
+# instant run. An instrument that cannot report its own blindness is worse than
+# no instrument, so the freeze is detected once, here, and carried as its own
+# outcome. It is never allowed to present as speed. Four states, not two:
+# .agent/rules/metrics-and-observability.md.
+set(clockFrozen FALSE)
+if(DEFINED ENV{SOURCE_DATE_EPOCH})
+    set(clockFrozen TRUE)
+endif()
+
+fastcached_wall_seconds(runStartSeconds)
 
 # Split one '|'-separated row into the variables named in ARGN, the last of which
 # takes whatever remains -- so only the final field may contain a '|', which is
@@ -234,6 +390,97 @@ function(fastcached_split_lines content linesOut)
     set(${linesOut} "${lines}" PARENT_SCOPE)
 endfunction()
 
+# Every cost band row parses, checked HERE rather than where a row is selected.
+#
+# The selection loop stops at the FIRST matching row, so a malformed row after it
+# is never visited -- and the rows most likely to be malformed are the last ones,
+# because that is where a new band goes. The contended row was written with a ';'
+# in it and the defect was exactly that shape: CMake split the element in two,
+# the loop matched and broke on the truncated half, and the only symptom was a
+# conditions sentence that stopped mid-way. Nothing failed, and nothing could
+# have. The rule was already written down for FastCachedSccacheBackendMarkers
+# 200 lines above and did not carry itself to a new table, which is why this is a
+# check rather than a second comment.
+#
+# The last row must also be the catch-all, or a per-file cost above every listed
+# ceiling matches nothing and renders as `the '' band` -- an empty string in the
+# shape of an answer.
+#
+# Every clause here is a way to get a WRONG BAND rather than no band, which is
+# the worse direction: CMake's numeric comparisons are FALSE for anything
+# non-numeric, so a ceiling typed `2O` instead of `20` never matches, and the run
+# is silently reported under the NEXT row's name and conditions. A row inserted
+# out of order does the same, because the loop takes the first match. Neither
+# fails, and both hand the reader a specific, confident, wrong answer.
+set(bandRowIndex 0)
+set(previousCeiling "")
+list(LENGTH FastCachedSccacheScanCostBands bandRowCount)
+foreach(row IN LISTS FastCachedSccacheScanCostBands)
+    math(EXPR bandRowIndex "${bandRowIndex} + 1")
+    set(bandWhere "FastCachedSccacheScanCostBands row ${bandRowIndex} of ${bandRowCount}")
+
+    string(FIND "${row}" "|" firstSeparator)
+    if(firstSeparator EQUAL -1)
+        message(FATAL_ERROR
+            "${bandWhere} contains no '|' at all, so it is a fragment rather than a row: '${row}'. "
+            "A ';' anywhere in a row splits the CMake list in two and truncates it silently. No "
+            "row may contain one.")
+    endif()
+    fastcached_row_fields("${row}" bandCeiling bandRowName bandRowConditions)
+
+    if(bandRowIndex EQUAL bandRowCount)
+        if(NOT bandCeiling STREQUAL "unbounded")
+            message(FATAL_ERROR
+                "The last ${bandWhere} has ceiling '${bandCeiling}' where it must be the word "
+                "`unbounded`. That row is the catch-all: without it a per-file cost above every "
+                "listed ceiling matches no band and is reported as an empty name.")
+        endif()
+    else()
+        if(NOT bandCeiling MATCHES "^[0-9]+$")
+            message(FATAL_ERROR
+                "${bandWhere} has ceiling '${bandCeiling}', which is not a whole number. CMake's "
+                "numeric comparisons are FALSE for a non-number, so this row would never match and "
+                "every run belonging to it would be reported under the next row's conditions -- a "
+                "confident wrong answer rather than a missing one. Only the last row may be "
+                "`unbounded`.")
+        endif()
+        # Nested rather than `... AND NOT bandCeiling GREATER ${previousCeiling}`:
+        # on the first row `previousCeiling` is empty, and `if()` expands every
+        # argument BEFORE it evaluates any of them, so the guard's own AND left
+        # `GREATER` with nothing after it and CMake refused the whole condition.
+        # There is no short-circuit to rely on at that level.
+        if(NOT previousCeiling STREQUAL "")
+            if(NOT bandCeiling GREATER ${previousCeiling})
+                message(FATAL_ERROR
+                    "${bandWhere} has ceiling ${bandCeiling} after ${previousCeiling}. Ceilings "
+                    "must ascend strictly: selection takes the FIRST row whose ceiling is not "
+                    "exceeded, so a row placed after a wider one is unreachable and its runs are "
+                    "labelled with the wider row's name and conditions.")
+            endif()
+        endif()
+        set(previousCeiling "${bandCeiling}")
+    endif()
+endforeach()
+
+# A bound this check can reach without ever having narrated is the bare timeout
+# #479 is about. The narration is what makes a kill say WHICH kind of failure it
+# was, so a budget must leave room for narration to have happened first -- twice
+# the threshold, so at least one whole narration window fits inside it. Stated in
+# two comments before this; a relationship the design rests on is worth more than
+# prose in the file that depends on it.
+if(NOT scanBudgetSeconds STREQUAL "")
+    math(EXPR narrationRoom "${FastCachedSccacheScanNarrateAfterSeconds} * 2")
+    if(scanBudgetSeconds LESS ${narrationRoom})
+        message(FATAL_ERROR
+            "FASTCACHED_SCAN_BUDGET_SECONDS is ${scanBudgetSeconds}s and narration does not start "
+            "until ${FastCachedSccacheScanNarrateAfterSeconds}s, so a run killed at that budget "
+            "could be killed having explained nothing -- which is the bare timeout this check's "
+            "narration exists to replace. The budget must be at least twice the narration "
+            "threshold. Lower FastCachedSccacheScanNarrateAfterSeconds or raise the budget in "
+            "src/tests/CMakeLists.txt, and keep them moving together.")
+    endif()
+endif()
+
 set(markerLiterals "")
 foreach(row IN LISTS FastCachedSccacheBackendMarkers)
     fastcached_row_fields("${row}" markerLiteral markerReason)
@@ -298,6 +545,13 @@ fastcached_globs_to_regex("${FastCachedSccacheJudgedGlobs}" judgedRegex)
 
 set(judgedFiles "")
 set(missingRoots "")
+# The walk is timed separately because the split between walking and reading is
+# what says whether a slow run is traversal cost or read cost -- it was 43% of
+# the run when this was measured. It is DECORATIVE: no decision reads it, the
+# band and the headroom are both taken from the whole-run figure, and at
+# whole-second resolution a ~2 s walk prints as 1 s or 2 s. Reported as evidence,
+# never quoted as a quantity.
+fastcached_wall_seconds(walkStartSeconds)
 foreach(row IN LISTS FastCachedSccacheScanRoots)
     fastcached_row_fields("${row}" scanRoot scanRootReason)
     set(rootPath "${FASTCACHED_SOURCE_DIR}/${scanRoot}")
@@ -328,9 +582,32 @@ foreach(row IN LISTS FastCachedSccacheScanRoots)
         list(APPEND missingRoots
             "  ${scanRoot}\n      is named in the scan table but is neither a file nor a directory. It is scanned because: ${scanRootReason}")
     endif()
+
+    # The walk narrates per ROOT, which is as fine-grained as it can be: a
+    # `file(GLOB_RECURSE)` is one uninterruptible call, so the blind window is
+    # one root's traversal and cannot be made smaller without reintroducing the
+    # per-pattern traversals #502 removed. Without this the whole walk -- 43% of
+    # the run when measured -- was a window in which a kill carried nothing,
+    # which is the bare timeout this narration exists to replace, surviving
+    # inside the fix for it.
+    if(NOT clockFrozen)
+        fastcached_wall_seconds(rootWalkSeconds)
+        math(EXPR walkElapsed "${rootWalkSeconds} - ${runStartSeconds}")
+        if(walkElapsed GREATER_EQUAL ${FastCachedSccacheScanNarrateAfterSeconds})
+            list(LENGTH scanFiles walkedSoFar)
+            message(
+                "sccache backend caveat: still walking -- ${walkedSoFar} candidate(s) after "
+                "${walkElapsed}s, having just finished '${scanRoot}'. Nothing has been READ yet, so "
+                "this is directory traversal cost. This check cannot wedge -- it walks, reads and "
+                "exits -- so a run this slow is the filesystem.")
+        endif()
+    endif()
 endforeach()
 list(REMOVE_DUPLICATES scanFiles)
 list(SORT scanFiles)
+fastcached_wall_seconds(walkEndSeconds)
+math(EXPR walkSeconds "${walkEndSeconds} - ${walkStartSeconds}")
+list(LENGTH scanFiles scanCount)
 
 # ---------------------------------------------------------------------------
 # Every marker occurrence in a judged file must be followed, inside the window, by
@@ -339,8 +616,43 @@ set(violations "")
 set(unjudgeable "")
 set(recommendingFiles "")
 set(markerHits 0)
+set(filesVisited 0)
+set(filesRead 0)
+set(bytesRead 0)
+set(narrated FALSE)
 
 foreach(scanFile IN LISTS scanFiles)
+    math(EXPR filesVisited "${filesVisited} + 1")
+
+    # Narrate, but only once the run is ALREADY slow. See
+    # FastCachedSccacheScanNarrateAfterSeconds for why a fast run stays silent
+    # and why this line is the whole answer to a `ctest` TIMEOUT on this check.
+    #
+    # `%` rather than a countdown so the checkpoint is a property of the file
+    # index rather than of a second counter that could fall out of step with it.
+    math(EXPR sinceCheckpoint "${filesVisited} % ${FastCachedSccacheScanProgressEvery}")
+    if(sinceCheckpoint EQUAL 0 AND NOT clockFrozen)
+        fastcached_wall_seconds(checkpointSeconds)
+        math(EXPR elapsedSeconds "${checkpointSeconds} - ${runStartSeconds}")
+        if(elapsedSeconds GREATER_EQUAL ${FastCachedSccacheScanNarrateAfterSeconds})
+            math(EXPR checkpointMsPerFile "${elapsedSeconds} * 1000 / ${filesVisited}")
+            math(EXPR projectedSeconds "${elapsedSeconds} * ${scanCount} / ${filesVisited}")
+            set(narrated TRUE)
+            # A plain message(), never message(WARNING): src/tests/CMakeLists.txt
+            # sets this test's FAIL_REGULAR_EXPRESSION to "CMake Error|CMake
+            # Warning", so the obvious way to say "this filesystem is slow" is
+            # the one output that turns a passing check red. Whoever next wants
+            # to make this louder will reach for WARNING first; this is why not.
+            message(
+                "sccache backend caveat: still scanning -- ${filesVisited} of ${scanCount} file(s) "
+                "after ${elapsedSeconds}s, about ${checkpointMsPerFile} ms/file, so the whole scan "
+                "needs roughly ${projectedSeconds}s at this rate. This check does no compute worth "
+                "measuring and cannot wedge -- it reads N files and exits -- so a run this slow is "
+                "the filesystem, not a hang. See FastCachedSccacheScanCostBands in "
+                "${CMAKE_CURRENT_LIST_FILE} for which band that per-file cost lands in.")
+        endif()
+    endif()
+
     file(RELATIVE_PATH relativeFile "${FASTCACHED_SOURCE_DIR}" "${scanFile}")
 
     list(FIND exemptPaths "${relativeFile}" exemptPosition)
@@ -349,9 +661,24 @@ foreach(scanFile IN LISTS scanFiles)
     endif()
 
     # Cheap whole-file test first: splitting a file into lines is the expensive
-    # part, and almost none of them name a marker at all. Measured, this is what
-    # keeps the check at a fifth of a second rather than over a second.
+    # part, and almost none of them name a marker at all. Measured on a native
+    # filesystem, this is what keeps that part at a fifth of a second rather than
+    # over a second -- a figure about CMake's list handling, not about the I/O,
+    # which is what dominates the run everywhere else and is reported separately
+    # at the end of this file.
     file(READ "${scanFile}" content)
+    math(EXPR filesRead "${filesRead} + 1")
+
+    # `string(LENGTH)` over a string ALREADY IN MEMORY, and never `file(SIZE)`:
+    # that is a stat across the very bridge this check exists to characterise,
+    # so it would trade a few microseconds of counting for another millisecond
+    # of filesystem wait per file -- roughly 300x the wrong way, in the one loop
+    # where that matters. Measured A/B against the pre-instrumentation script on
+    # WSL2 9p, three alternating runs each: 3.79 s mean before, 3.88 s after,
+    # inside a 0.57 s run-to-run spread. The whole instrument costs less than one
+    # quantization step of the ms/file figure it prints.
+    string(LENGTH "${content}" contentBytes)
+    math(EXPR bytesRead "${bytesRead} + ${contentBytes}")
     set(namesAMarker FALSE)
     foreach(markerLiteral IN LISTS markerLiterals)
         string(FIND "${content}" "${markerLiteral}" markerPosition)
@@ -470,6 +797,107 @@ foreach(scanFile IN LISTS scanFiles)
     endforeach()
 endforeach()
 
+# ---------------------------------------------------------------------------
+# What this run cost, printed on EVERY run -- green, red, fast or slow -- and
+# printed HERE, before the verdict, so a failing run carries it too.
+#
+# This is what replaces the assertion this check used to be described by in its
+# own registration: `~0.2-0.5 s ... still far inside the timeout`. That sentence
+# was true where it was written, wrong by an order of magnitude on a bridged
+# checkout, and structurally incapable of ever falsifying itself. A margin
+# nobody re-measures stops being a margin silently; an observation printed on
+# every run cannot. It states the finding and stops -- no remedy is suggested,
+# because an instrument cannot know whether the remedy is the thing in dispute.
+fastcached_wall_seconds(runEndSeconds)
+math(EXPR runSeconds "${runEndSeconds} - ${runStartSeconds}")
+math(EXPR bytesReadKiB "${bytesRead} / 1024")
+
+if(clockFrozen)
+    # Not a fast run. Its own outcome, never folded into the timings: with
+    # SOURCE_DATE_EPOCH set every interval this script can take reads as exactly
+    # zero, which would otherwise present as the best possible filesystem.
+    message(
+        "sccache backend caveat: walked ${scanCount} candidate(s) and read ${filesRead} "
+        "(${bytesReadKiB} KiB). Cost NOT MEASURED: SOURCE_DATE_EPOCH is set in the environment "
+        "and CMake returns it from every string(TIMESTAMP) call, so every interval this check "
+        "can time reads as zero. Unset it to measure. Progress narration is off for the same "
+        "reason -- it has no clock to decide on.")
+elseif(scanCount EQUAL 0)
+    # Nothing to divide by. The vacuity refusal below is what actually acts on
+    # this; saying it here keeps the cost line from reporting a per-file figure
+    # over no files, which is a number with no subject.
+    message("sccache backend caveat: no candidate files under the scanned roots, so there is no per-file cost to report.")
+else()
+    math(EXPR msPerFile "${runSeconds} * 1000 / ${scanCount}")
+
+    # Which band that lands in. The ceilings ascend and the last row is the
+    # catch-all, so this loop always selects -- and if a later edit breaks that
+    # invariant it is refused below rather than rendering `the '' band`, which is
+    # an instrument quietly reporting nothing in the shape of an answer.
+    set(bandName "")
+    set(bandConditions "")
+    foreach(row IN LISTS FastCachedSccacheScanCostBands)
+        fastcached_row_fields("${row}" bandCeiling rowBandName rowBandConditions)
+        # Two `if`s rather than one `OR`: the catch-all row's ceiling is a WORD,
+        # and handing a word to LESS_EQUAL is a hard error the moment anything
+        # evaluates it. Not worth resting on short-circuit order.
+        set(inBand FALSE)
+        if(bandCeiling STREQUAL "unbounded")
+            set(inBand TRUE)
+        elseif(msPerFile LESS_EQUAL ${bandCeiling})
+            set(inBand TRUE)
+        endif()
+        if(inBand)
+            set(bandName "${rowBandName}")
+            set(bandConditions "${rowBandConditions}")
+            break()
+        endif()
+    endforeach()
+
+    if(bandName STREQUAL "")
+        message(FATAL_ERROR
+            "${msPerFile} ms/file matched no row of FastCachedSccacheScanCostBands, so this check "
+            "cannot say which of its known conditions it is running under. The last row's ceiling "
+            "must be the word `unbounded` -- it is the catch-all, and without it a cost above every "
+            "listed ceiling renders as an empty band name, which reads like an answer and is not "
+            "one. The table is in ${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
+
+    # Headroom, and only against the number ctest actually enforces. Run
+    # standalone with no budget there is nothing to report headroom against, and
+    # inventing a default here would be the second copy of the bound that this
+    # whole section exists to prevent.
+    if(scanBudgetSeconds STREQUAL "")
+        # One argument, deliberately. `set(var "a" "b")` builds a LIST, and
+        # expanding it splices a bare `;` into the sentence -- which is what this
+        # line did until it was read back. `message()` concatenates its arguments
+        # and `set()` does not, and the two look identical at the call site.
+        set(headroom "No budget was given, so no headroom is reported -- nothing was enforcing one. src/tests/CMakeLists.txt passes the number ctest enforces.")
+    else()
+        math(EXPR budgetUsedPercent "${runSeconds} * 100 / ${scanBudgetSeconds}")
+        set(headroom "That is ${budgetUsedPercent}% of the ${scanBudgetSeconds}s budget ctest enforces on this check.")
+    endif()
+
+    # A run slow enough to have deserved narration that produced none is a run a
+    # kill would have left unexplained -- which is the whole failure #479 is
+    # about, reappearing one level up. It happens when the checkpoint interval is
+    # wider than the corpus: no ordinary run meets that, a trimmed scan table
+    # would, and nothing else would ever say so.
+    if(runSeconds GREATER_EQUAL ${FastCachedSccacheScanNarrateAfterSeconds} AND NOT narrated)
+        string(APPEND headroom
+            " This run passed the ${FastCachedSccacheScanNarrateAfterSeconds}s narration threshold and "
+            "narrated nothing, so a timeout here would have carried no explanation: "
+            "${FastCachedSccacheScanProgressEvery} file(s) between checkpoints against "
+            "${scanCount} candidate(s).")
+    endif()
+
+    message(
+        "sccache backend caveat: walked ${scanCount} candidate(s) in ${walkSeconds}s and read "
+        "${filesRead} of them (${bytesReadKiB} KiB); ${runSeconds}s wall in total, about "
+        "${msPerFile} ms/file. That is the '${bandName}' band: ${bandConditions} ${headroom}")
+endif()
+
+# ---------------------------------------------------------------------------
 # A check that scanned nothing passes, which is the one failure mode a rule like
 # this must not be allowed to have. sccache renaming its variables, or the scan
 # roots being restructured, would both land here.

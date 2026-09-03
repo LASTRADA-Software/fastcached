@@ -19,16 +19,66 @@ determinism rests on.
   not go green on a DrvFs checkout, a supported working environment (#502). Walk once
   and `list(FILTER ... INCLUDE REGEX)` the result; **never raise the timeout**, because
   a budget raised to accommodate a redundancy hides the redundancy.
+- **That last clause is scoped to the redundancy, and the redundancy is gone.** Read
+  unqualified it forbids the fix to #479, so it has to say what it was about. After the
+  walk-once change there is one traversal per root and what remains is *irreducible* I/O:
+  837 files read individually, ~12 MB, of which `src/` is 633 because a non-prose file
+  naming a backend variable has to be forced into the exemption table rather than passing
+  silently. There is no fat left for a larger budget to hide, so
+  `sccache-backend-caveat`'s bound was raised to 180 s **and** — the part that matters —
+  the check now MEASURES itself and prints the cost, the band and the headroom on every
+  run. A bound may grow only beside an instrument that reports the margin it is spending;
+  a number alone drifts back into the same state and nobody sees it happen.
+- **Three figures for one check, all honestly taken, none carrying its conditions — that
+  was the actual defect in #479.** The registration comment asserted `~0.2-0.5 s ... still
+  far inside the timeout`; a quiet WSL 9p checkout measures ~4.5 s; two lanes measured
+  53-57 s against the 60 s ceiling while several gates ran at once. Two orders of
+  magnitude, and each read as a fact about the check when all three are facts about a
+  **filesystem**. The oldest and most confident of them had nothing that could ever
+  falsify it. Replacing an assertion with an observation is the fix; the timeout number is
+  incidental to it. The bands and their conditions live in
+  `FastCachedSccacheScanCostBands` — point at it, never copy a number out of it — and each
+  row says whether its per-file figure was **measured or derived**, because two of the
+  three are somebody else's wall time divided by a corpus count taken separately.
+- **A bound on a check that cannot wedge is a backstop, not a deadline**, and conflating
+  the two is what produced a 60 s ceiling this check spends 7% of on a quiet machine and
+  95% of under ordinary lane load. `sccache-backend-caveat` opens no socket, spawns no
+  subprocess, waits on nothing and has no unbounded loop — it reads N files and exits — so
+  there is no hang for a wall clock to catch here, and the only thing it can catch is a
+  filesystem slower than the widest measured band, which is a condition rather than a
+  defect. Do not tighten it as though tightening a real deadline. It is defensible **only
+  while a run going long says so**: the check narrates its measured per-file cost past
+  `FastCachedSccacheScanNarrateAfterSeconds` — per scan root while walking, per hundred
+  files while reading — and ctest captures the output of a test it kills, so a kill
+  arrives with its reason attached. The one window it cannot narrate inside is a single
+  `file(GLOB_RECURSE)`, which is uninterruptible and cannot be subdivided without
+  reintroducing the per-pattern traversals #502 removed. The threshold and the bound
+  cannot drift apart quietly either: the script **refuses** a budget below twice the
+  threshold, because a run killed before narration could start is a bare timeout again —
+  the signal that cannot say which kind of failure it was. `ctest -R sccache-backend-caveat-selftest` drives it, including the two negative
+  directions that rot silently: narration ABSENT at defaults, and `SOURCE_DATE_EPOCH`
+  reported as a frozen clock rather than as `0 ms/file`, which is an instrument measuring
+  nothing while reporting the best possible filesystem.
 - **Read that figure with its conditions, or it misleads in both directions.** The cost
   is per `stat` on a filesystem where each crosses a translation layer, so it is
   invisible on CI and on ext4 and it varies with page-cache warmth:
 
   | check | standalone | single gate | two lanes | budget |
   |---|---|---|---|---|
-  | `sccache-backend-caveat` | 78.7 s | 60.0 s (timeout) | -- | 60 s |
+  | `sccache-backend-caveat`, before #502 | 78.7 s | 60.0 s (timeout) | -- | 60 s |
+  | `sccache-backend-caveat`, after #502 | 4.0-5.1 s | -- | **53-57 s** (#479, three or four lanes) | 180 s |
   | `byte-order-qualifier` | 19.6 s | 28.6 s | **60.9 s** | 60 s |
   | `worker-refusals-counted` | 5.5 s | 9.7 s | -- | 60 s |
   | `net-boundary` | 4.0 s | 8.6 s | -- | 60 s |
+
+  The two `sccache-backend-caveat` rows are the same check on the same filesystem with
+  the redundant traversals removed in between, and they are the argument for reading the
+  column headings: **standalone fell 16x and the contended figure did not follow it**,
+  because what the walk-once change removed was traversals and what remains is 837
+  individual file reads over a bridge. Do not read either row as the cost of that check;
+  read the one whose conditions you are in, which is what the header row is for. The
+  53-57 s column is the one figure here neither lane could afterwards reproduce, the
+  machine having gone quiet — so it is DERIVED conditions, recorded as such.
 
   One traversal of `src/` is **2.09 s** (stable to 16 ms over five runs), and
   38 x 2.09 = 79 s predicted 78.7 s measured -- the model is falsifiable, which is what
@@ -1537,8 +1587,12 @@ makes it anyway and says so there.
   The user time is the number that settles it: the two builds did **the same
   compute**, to within 1.5%. Everything the bridge costs is spent waiting on the
   filesystem, which is also why the header walk — pure I/O, no compute — is the
-  worst ratio of the four, and why `sccache-backend-caveat` times out on `/mnt/d`
-  without anything being broken.
+  worst ratio of the four, and why the hygiene checks that read every file under
+  `src/` cost an order of magnitude more there than on ext4 without anything being
+  broken. This passage used to say `sccache-backend-caveat` **times out** on
+  `/mnt/d`; after #502 and #479 it does not — measured 3.8–5.1 s and ~4 ms/file on
+  this bridge, a few percent of its budget — and it now prints that figure on every
+  run rather than leaving anyone to infer it from here.
 
   This is not a preference, because there is a second, harder reason: a
   **Windows-created worktree is unreadable by WSL git at all** — its `.git` file

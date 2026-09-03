@@ -16,10 +16,17 @@
 # effectively free, which is why this is invisible on CI and on ext4.
 #
 #     check                     standalone   single gate   two lanes   budget
-#     sccache-backend-caveat        78.7s        60.0s       (timeout)    60s
 #     byte-order-qualifier          19.6s        28.6s          60.9s     60s
 #     worker-refusals-counted        5.5s         9.7s              -     60s
 #     net-boundary                   4.0s         8.6s              -     60s
+#
+# The `sccache-backend-caveat` row that used to head that table has been removed
+# rather than refreshed. It moved twice — 78.7 s before #502, 4.0–5.1 s standalone
+# after it, and 53–57 s under three or four concurrent lanes (#479) — and a copy
+# here would be a fourth place holding a figure for one check, which is the defect
+# #479 was filed about. `.agent/rules/build-and-toolchain.md` carries the rows with
+# their conditions, and that check now MEASURES and prints its own cost on every
+# run. Read it there, or read what the check itself just said.
 #
 # **Read the conditions, not the number.** A future reader who measures
 # `byte-order-qualifier` single-gate gets 28.6 s and concludes it is comfortable. It
