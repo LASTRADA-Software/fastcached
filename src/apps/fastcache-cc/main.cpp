@@ -954,14 +954,6 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
     return out.good();
 }
 
-/// The deadlines this invocation runs every cache exchange under.
-/// @param cfg The launcher's configuration.
-/// @return The budget.
-[[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
-{
-    return Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.ioTimeout };
-}
-
 /// The deadlines this invocation runs a dispatch under.
 ///
 /// The scheduler's control verbs take the cache's budget, because they are the same
@@ -970,19 +962,33 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// compiler has finished, so the client sits in one read for the whole compile and
 /// the cache's ten seconds abandoned every translation unit worth distributing
 /// (#223).
+///
+/// The derivation itself is `Cc::DispatchBudgetsFor`, and it is there rather than
+/// here for one reason: this file is in no test target, so a budget built here is
+/// unreadable by anything. That is how the compile leg's keepalive was dropped for
+/// every shipped launcher -- see that function's note.
 /// @param cfg The launcher's configuration.
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    // The compile budget is the ordinary one with its TOTAL replaced, rather than a
-    // second field-by-field construction: only the total differs, so a third field
-    // on `ExchangeBudget` must not need wiring into two places to reach dispatch.
-    // Derived from the SAME value the control leg gets, not from a second call, so
-    // the two cannot drift apart in anything but the total.
-    auto const control = BudgetOf(cfg);
-    auto compile = control;
-    compile.total = cfg.dispatchTimeout;
-    return Cc::DispatchBudgets { .control = control, .compile = compile };
+    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs {
+        .connect = cfg.connectTimeout, .controlTotal = cfg.ioTimeout, .compileTotal = cfg.dispatchTimeout });
+}
+
+/// The deadlines this invocation runs every cache exchange under.
+///
+/// The dispatch's CONTROL budget, taken rather than built a second time. The two are
+/// the same conversation -- a short reply out of a daemon's or a scheduler's own
+/// tables -- and saying so once is what the comment this replaced was reaching for
+/// when it derived the control leg from this call instead. Either direction is one
+/// producer; this one is the direction that leaves `Cc::DispatchBudgetsFor` the only
+/// place a budget is assembled, so a field added to `ExchangeBudget` cannot reach the
+/// cache legs and miss the dispatch legs or the reverse.
+/// @param cfg The launcher's configuration.
+/// @return The budget.
+[[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
+{
+    return DispatchBudgetsOf(cfg).control;
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.

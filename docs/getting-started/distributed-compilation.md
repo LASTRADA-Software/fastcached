@@ -408,35 +408,36 @@ means waiting on a lease the scheduler has already reclaimed.
 The launcher is one process per translation unit, so this is a **runtime**
 setting — export a new value and the next compile uses it. Nothing reloads and
 nothing restarts. Raise it if a single translation unit legitimately compiles for
-longer than ten minutes; lower it only knowing that it is a flat ceiling, so it is
-also how long a genuinely dead worker takes to be noticed.
+longer than ten minutes. Lowering it buys you nothing against a dead worker, for
+the reason in the next box.
 
-!!! warning "A dead worker is now noticed in ten minutes, not ten seconds"
+!!! note "A vanished worker is noticed in seconds, not at the deadline"
 
-    This is the price of the fix above, and it is a real regression: the deadline
-    went up sixtyfold, and a flat deadline cannot tell a worker that is *still
-    compiling* from one that is *gone*. If a worker's machine vanishes mid-job —
-    powered off, cable pulled, VPN dropped, laptop suspended — the client blocks
-    that build slot for the full `FASTCACHE_DISPATCH_TIMEOUT_MS` before falling
-    back. On a `-j16` build a handful of those is a stalled build.
+    A flat deadline cannot tell a worker that is *still compiling* from one that is
+    *gone*, so it is not asked to. The compile exchange dials with TCP keepalive
+    armed: if a worker's machine vanishes mid-job — powered off, cable pulled, VPN
+    dropped, laptop suspended — the connection is declared dead after about
+    **16 seconds** on Linux and macOS and about **30 seconds** on Windows,
+    regardless of `FASTCACHE_DISPATCH_TIMEOUT_MS`. The client then hands the lease
+    back and compiles locally, so nothing is lost and the key is **not** pinned for
+    the scheduler's lease timeout.
 
-    Nothing is lost and nothing hangs forever: the client hands the lease back and
-    compiles locally, so the build completes and the key is **not** pinned for the
-    scheduler's lease timeout. But it is slow, and it looks like the fleet made the
-    build hang.
+    The Windows figure is not a typo: the OS fixes the probe count at 10 and offers
+    no way to set it.
 
-    Two things narrow it. Lower `FASTCACHE_DISPATCH_TIMEOUT_MS` if you know your
-    slowest translation unit — the floor is that unit, not this default. And
-    separating "still working" from "gone" properly needs the worker to say so
-    periodically, which is a wire change tracked as
+    What keepalive cannot see is a machine that is *up* while the worker process
+    makes no progress — the kernel answers the probes, so only the flat deadline
+    bounds that case. Separating it from a slow compile needs the worker to say
+    periodically that it is still there, which is a wire change tracked as
     [#245](https://github.com/LASTRADA-Software/fastcached/issues/245).
 
 !!! warning "What a client that runs out of budget costs the fleet"
 
-    The worker is never told. It finishes the compile and writes back an object
-    nobody reads, so that CPU is spent twice and `worker_jobs_completed_total`
-    still counts the job. That is also #245: a worker that learns its client is
-    gone can abandon the compile and free the slot.
+    The worker notices the client has gone and skips writing the object back, so
+    the transfer is not paid for. The compile itself still runs to completion, so
+    that CPU is spent twice and `fastcache_worker_jobs_completed_total` still counts
+    the job; `fastcache_worker_jobs_abandoned_client_gone_total` counts the delivery
+    that was skipped.
 
 !!! note "`FASTCACHE_TOKEN` against a node is accepted and ignored"
 

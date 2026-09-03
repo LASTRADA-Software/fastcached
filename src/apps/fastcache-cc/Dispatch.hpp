@@ -87,13 +87,20 @@ class IEndpointExchange
 /// well past a minute, and a ceiling sized for the average reintroduces exactly the
 /// defect above, further out.
 ///
-/// **The cost is stated rather than absorbed.** This is also how long a genuinely
-/// dead worker goes unnoticed — a machine powered off, unplugged or suspended
-/// mid-compile — and against the ten seconds a dispatch used to get that is sixty
-/// times slower, which on a parallel build is a handful of stalled slots. A flat
-/// ceiling cannot separate that from a slow compile; splitting them needs the worker
-/// to say it is still there, so the idle bound can be seconds while the total stays
-/// long. That is a wire change tracked as #245.
+/// **The cost was stated rather than absorbed, and most of it has since been paid.**
+/// A flat ceiling cannot tell a slow compile from a dead peer, so this number used to
+/// be how long a genuinely dead worker went unnoticed as well — sixty times slower
+/// than the ten seconds a dispatch used to get, which on a parallel build is a
+/// handful of stalled slots. That half is keepalive's now: the compile leg dials with
+/// it armed (`DispatchBudgetsFor`), so a machine powered off, unplugged, suspended or
+/// cut off mid-compile is noticed in ~16 s on Linux and macOS and ~30 s on Windows,
+/// with this total untouched.
+///
+/// What is left is the narrow case keepalive cannot reach: a host whose kernel
+/// answers the probes while the worker process makes no progress toward a reply.
+/// Nothing below the protocol can see that, so separating it from a slow compile
+/// needs the worker to say it is still there — an idle bound of seconds against a
+/// total that stays long. That is a wire change tracked as #245.
 ///
 /// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
 /// process per translation unit, so the variable IS the runtime knob: the next
@@ -128,7 +135,69 @@ struct DispatchBudgets
     /// decompressed length is the one figure in a reply that decides an allocation
     /// before any of it is validated.
     std::size_t maxDecompressedBytes { DefaultMaxDecompressedBytes };
+
+    /// Field-by-field equality, for the reason `ExchangeBudget`'s own says.
+    [[nodiscard]] friend constexpr bool operator==(DispatchBudgets const&, DispatchBudgets const&) = default;
 };
+
+/// The launcher's three timeout knobs, named.
+///
+/// A struct rather than three `std::chrono::milliseconds` parameters, for the reason
+/// `ExchangeBudget` gives about two of them: same type, adjacent, and a reader at the
+/// call site cannot tell a transposition from the intended order. Three is worse than
+/// two, and the only PRODUCTION call site is in `main.cpp`, which is in **no test
+/// target** -- so a swap of `controlTotal` and `compileTotal` there would compile, hand
+/// the compile leg the cache's ten seconds, restore #223 in full, and nothing in this
+/// tree could observe it. Designated initializers put the names back at the call site.
+struct DispatchBudgetKnobs
+{
+    /// Ceiling on opening either connection, name resolution included.
+    std::chrono::milliseconds connect { ExchangeBudget {}.connect };
+
+    /// Ceiling on a LEASE or RELEASE round trip.
+    std::chrono::milliseconds controlTotal { ExchangeBudget {}.total };
+
+    /// Ceiling on the whole COMPILE exchange.
+    std::chrono::milliseconds compileTotal { DefaultDispatchTotal };
+};
+
+/// The budgets a dispatch runs under, built from the launcher's three knobs.
+///
+/// **One producer, because the compile leg differs from the control leg in TWO
+/// fields and not one.** It was derived in `main.cpp` by copying the control budget
+/// and replacing its total, on the stated reasoning that only the total differs —
+/// which was true when it was written and stopped being true when the compile leg
+/// gained `keepAlive` (#247). The copy silently overwrote `KeepAlive::Yes` with the
+/// control leg's `No`, so no shipped launcher has ever armed keepalive on the one
+/// exchange it exists for, and a worker whose host vanished still cost the full
+/// `FASTCACHE_DISPATCH_TIMEOUT_MS`. Nothing could see it: the default member
+/// initializer above was the only statement of the intent, `main.cpp` is in no test
+/// target, and the docs described the unarmed behaviour, so code and prose agreed
+/// by accident.
+///
+/// So the derivation lives here, where a test reads it, and it *names* each field on
+/// which the two legs differ instead of inheriting the rest by copy. A fourth field
+/// that must differ is a line in this function -- and, because naming them leaves the
+/// intent written twice, the `static_assert` below is what stops the two copies from
+/// drifting the way #247's did.
+/// @param knobs The launcher's three timeouts, named.
+/// @return Both budgets.
+[[nodiscard]] constexpr DispatchBudgets DispatchBudgetsFor(DispatchBudgetKnobs const& knobs) noexcept
+{
+    return DispatchBudgets {
+        .control = ExchangeBudget { .connect = knobs.connect, .total = knobs.controlTotal, .keepAlive = KeepAlive::No },
+        .compile = ExchangeBudget { .connect = knobs.connect, .total = knobs.compileTotal, .keepAlive = KeepAlive::Yes },
+    };
+}
+
+/// The compile leg's intent is now written twice -- here, which production uses, and
+/// `DispatchBudgets`'s own default member initializers, which every test that takes
+/// the default argument uses. Two independent statements of one rule is what #247 was,
+/// so they are held against each other rather than left to agree by inspection: a
+/// field added to the type's initializers and forgotten here fails the build instead
+/// of shipping a launcher that dials with it unset.
+static_assert(DispatchBudgetsFor(DispatchBudgetKnobs {}) == DispatchBudgets {},
+              "DispatchBudgetsFor must reproduce DispatchBudgets' own defaults, field for field");
 
 /// How a dispatch attempt ended.
 ///

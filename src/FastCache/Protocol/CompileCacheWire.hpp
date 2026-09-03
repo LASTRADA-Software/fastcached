@@ -801,8 +801,10 @@ inline constexpr std::size_t MaxControlPayload = 64 * 1024;
 ///
 /// Sized for "longer than any single translation unit anybody compiles". The cost of
 /// too short is duplicated work; the cost of too long is one key not being
-/// distributed while a dead worker goes unnoticed -- which is a real cost, stated on
-/// `DefaultDispatchTotal` and split properly only by #245's liveness signal.
+/// distributed while a worker that is up but making no progress goes unnoticed. A
+/// dead HOST is not in that trade any more -- the compile leg dials with keepalive
+/// armed -- so what is left is the narrow row #245's liveness signal closes. Stated
+/// on `DefaultDispatchTotal`.
 inline constexpr std::chrono::milliseconds DefaultCompileLeaseTimeout { 600'000 };
 
 /// Every opcode this build understands.

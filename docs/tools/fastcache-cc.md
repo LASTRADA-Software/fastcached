@@ -729,14 +729,18 @@ Two things this is **not**:
 - A dispatched compile exceeding `FASTCACHE_DISPATCH_TIMEOUT_MS` is abandoned by
   the client, which hands the lease back and compiles locally — so the build still
   succeeds and the key is not pinned for the scheduler's lease timeout. The
-  **worker** does not learn about it: it runs the compile to completion and writes
-  back an object nobody reads, so that CPU is spent twice.
-- **That deadline is also how long a genuinely dead worker goes unnoticed**, and it
-  is ten minutes rather than the ten seconds a dispatch used to get. A flat ceiling
-  cannot separate a worker that is still compiling from one whose machine has
-  vanished, so sizing it for the slowest legitimate translation unit — which is the
-  only safe choice — makes hard-failure detection sixty times slower. Both halves
-  are what a periodic progress frame from the worker would close
+  **worker** notices the client has gone and skips writing the object back, so the
+  transfer is not paid for; the compile itself still runs to completion, so that CPU
+  is spent twice.
+- **That deadline is no longer how long a dead worker goes unnoticed.** The compile
+  exchange dials with TCP keepalive armed, so a worker whose machine has vanished —
+  powered off, unplugged, suspended, or cut off — is noticed in about 16 seconds on
+  Linux and macOS and about 30 seconds on Windows, whatever the deadline is set to.
+  Raising `FASTCACHE_DISPATCH_TIMEOUT_MS` for a slow translation unit therefore does
+  not make hard-failure detection slower.
+- What keepalive cannot see is a worker whose machine answers while the process
+  makes no progress: the kernel replies to the probes, so only the flat deadline
+  bounds it. Closing that needs a periodic liveness frame from the worker
   ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
 
 ## Measured behaviour

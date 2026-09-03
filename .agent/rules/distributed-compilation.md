@@ -541,20 +541,46 @@ Consequences that are each load-bearing:
     capacity for is thrown away. The two cannot be `static_assert`ed together — the
     launcher deliberately does not link the library the scheduler lives in — so moving
     either means moving both.
-  - **A flat deadline cannot tell "still working" from "gone", so raising it is a
-    REGRESSION as well as a fix, and it is stated rather than absorbed.** The same
-    number is how long a legitimate compile may take and how long a genuinely dead
-    worker goes unnoticed, and it went from ten seconds to ten minutes -- sixty times
-    slower to notice a machine that was powered off, unplugged or suspended
-    mid-compile, which on a `-j16` build is a handful of slots and a build that looks
-    hung. Sizing for the slow compile is nonetheless the only choice available while
-    the worker sends nothing mid-compile: sizing for the dead worker is the defect
-    above, reintroduced. Splitting the two needs a periodic progress frame from the
-    worker so the IDLE bound can be seconds while the TOTAL stays long, which is a
-    wire change (#245). A cheaper partial mitigation exists and is not in the
-    launcher's reach: TCP keepalive with real intervals on the dispatch socket
-    detects a dead HOST in under a minute, but the option has to be armed where the
-    native handle is (`Net/`), not where the budget is chosen.
+  - **A flat deadline cannot tell "still working" from "gone", so the second question
+    is answered somewhere else and NOT by the number.** The same value used to be how
+    long a legitimate compile may take and how long a genuinely dead worker goes
+    unnoticed, and it went from ten seconds to ten minutes -- sixty times slower to
+    notice a machine powered off, unplugged or suspended mid-compile, which on a
+    `-j16` build is a handful of slots and a build that looks hung. Sizing for the
+    slow compile is nonetheless the only choice the *number* has: sizing for the dead
+    worker is the defect above, reintroduced. TCP keepalive with real intervals on
+    the dispatch socket answers the dead HOST in ~16 s (Linux, macOS) or ~30 s
+    (Windows) with the total untouched (#247), and what is left for a periodic
+    progress frame (#245) is the one row keepalive cannot reach: a kernel that
+    answers the probes while the process makes no progress.
+    - **A budget derived by copying another budget drops the field that made them
+      different, and nothing here could see it.** `DispatchBudgetsOf` built the
+      compile budget as `auto compile = control; compile.total = ...`, reasoning in a
+      comment directly above that "only the total differs" -- true when written, false
+      the moment #247 put `KeepAlive::Yes` on the compile leg without touching
+      `main.cpp`. Every shipped launcher dialled unarmed, so keepalive was present,
+      correct and unreachable, and the ten-minute dead-worker figure stayed true by
+      accident. Three things had to be absent at once for that: `main.cpp` is in **no
+      test target**, so the only production producer of these budgets could not be
+      read by a test; the type's default member initializer was the sole statement of
+      the intent and had no reader; and `Dispatch_test.cpp` asserted against
+      `DispatchBudgets const defaults` -- the TYPE's defaults, which were right and
+      which production bypassed. So: the derivation lives beside the type as
+      `DispatchBudgetsFor`, it NAMES every field on which the two legs differ instead
+      of inheriting the rest, and the test reads the production derivation rather than
+      the default. A `<field> = <value>` written in a struct definition is a claim; it
+      is only a rule once something reads it.
+
+      Naming the fields leaves the intent written **twice** -- in `DispatchBudgetsFor`,
+      which production uses, and in `DispatchBudgets`'s own default member
+      initializers, which every caller taking the default argument uses -- which is
+      the defect's own shape one level up. So they are `static_assert`ed equal through
+      a **defaulted** `operator==`, never a hand-written one: a field added to
+      `ExchangeBudget` joins that comparison by itself, where a spelled-out comparison
+      would go on agreeing about the fields it still mentions. And the knobs travel as
+      a named struct, because three adjacent `std::chrono::milliseconds` parameters
+      transposed at a call site in `main.cpp` -- which is in no test target -- hands
+      the compile leg the cache's ten seconds and restores #223 in full, silently.
   - **Zero means UNBOUNDED, and the arithmetic alone says the opposite.** A zero total
     puts the deadline at `Now()`, so every exchange dies on the reactor's next turn —
     a knob documented as "turn the ceiling off" that turns the *cache* off instead,
@@ -2299,6 +2325,22 @@ only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
 
+- **[#245](https://github.com/LASTRADA-Software/fastcached/issues/245)** — a periodic
+  liveness frame from the worker, so an IDLE bound of seconds can sit under a TOTAL
+  that stays long. Its scope is now much smaller than the issue text, and two of its
+  own premises no longer hold. The wasted-object half is #662/#669's, taken with no
+  wire change; the dead-HOST half is #247's keepalive, once the launcher actually
+  arms it. What remains is one row — a machine whose kernel answers the probes while
+  the worker process makes no progress toward a reply — and it is worth measuring
+  against the alternative before a frame is designed, since a wedged *compiler* is
+  #239's deadline and a healthy reactor would pulse straight through it. The issue
+  also asserts that "`CompileCacheWire`'s framing already lets a receiver step over a
+  frame it does not know", which makes it shippable into a mixed fleet; that property
+  is **request-side only**. A reply carries a status byte and a length and no kind,
+  `DecodeReplyHeader` hard-rejects a status outside `{Miss, Ok, Error}`, and the
+  launcher turns that rejection into a transport failure — so a deployed launcher
+  meeting a progress frame abandons the compile rather than degrading. Any design
+  starts by costing the negotiation that premise assumed away.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was

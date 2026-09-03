@@ -2,6 +2,8 @@
 #include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
+#include <FastCache/Net/KeepAlive.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
@@ -427,6 +429,56 @@ TEST_CASE("A slow cache does not get the compile's minutes", "[dispatch]")
     // hair. A default sized just above the worst one anybody has measured is the
     // same defect one release later, so the assertion is about the MARGIN.
     CHECK(DefaultDispatchTotal >= std::chrono::minutes { 5 });
+}
+
+TEST_CASE("The compile leg is dialled with keepalive and the control legs are not", "[dispatch][keepalive]")
+{
+    // The case above reads `DispatchBudgets const defaults;` -- the TYPE's defaults --
+    // and that is exactly why this defect survived. Production never used them: the
+    // launcher built the compile budget by copying the control budget and replacing
+    // its total, which overwrote `KeepAlive::Yes` with `No`, and the derivation lived
+    // in `main.cpp`, which is in no test target. So the default member initializer was
+    // the only statement of the intent and nothing read it, while the docs described
+    // the unarmed behaviour and agreed with the code by accident.
+    //
+    // This case reads the PRODUCTION derivation instead. Keepalive is what answers
+    // "how fast is a dead worker noticed" without shortening the deadline back into
+    // #223 -- ~16 s on Linux and macOS, ~30 s on Windows, against the ten minutes the
+    // flat total gives. Without it the mechanism merged for #247 is present, correct
+    // and unreachable.
+    constexpr std::chrono::milliseconds Connect { 1'000 };
+    constexpr std::chrono::milliseconds ControlTotal { 10'000 };
+    constexpr std::chrono::milliseconds CompileTotal { 600'000 };
+    static_assert(ControlTotal != CompileTotal, "the totals must differ, or a swap passes on symmetry");
+
+    auto const budgets = DispatchBudgetsFor(
+        DispatchBudgetKnobs { .connect = Connect, .controlTotal = ControlTotal, .compileTotal = CompileTotal });
+
+    CHECK(budgets.compile.keepAlive == KeepAlive::Yes);
+    CHECK(budgets.control.keepAlive == KeepAlive::No);
+    // The totals reach the legs they were named for. Asserted here as well, because a
+    // derivation that arms keepalive correctly and swaps the deadlines is the same
+    // function getting the same job wrong.
+    CHECK(budgets.control.total == ControlTotal);
+    CHECK(budgets.compile.total == CompileTotal);
+    CHECK(budgets.control.connect == Connect);
+    CHECK(budgets.compile.connect == Connect);
+
+    // And it survives the trip to the exchange. Asserting the struct alone would let
+    // a dispatch that hands the control budget to the worker pass, which is #223 in
+    // the other direction and is the mistake this file already has a case for.
+    std::vector<std::string> const args { "-O2" };
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJ"));
+
+    REQUIRE(Dispatch(fleet, Request(args), budgets).Ran());
+
+    // Lease, compile, release.
+    REQUIRE(fleet.Budgets().size() == 3);
+    CHECK(fleet.Budgets()[0].keepAlive == KeepAlive::No);
+    CHECK(fleet.Budgets()[1].keepAlive == KeepAlive::Yes);
+    CHECK(fleet.Budgets()[2].keepAlive == KeepAlive::No);
 }
 
 TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")
