@@ -994,7 +994,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // because `IProcessRunner` spawns with no directory of its own and every path here
     // is absolute. It is one of the TWO directories a dispatched object can record; the
     // other is the client's, which gcc puts inside the preprocessed text under `-g`.
-    // See `WorkerPrefixMapRule` for the measurements and for why both are mapped.
+    // See `WorkerPrefixMapRules` for the measurements and for why both are mapped.
     if (!job.compileDir.empty() || !job.compileDirReplacement.empty())
     {
         // The `error_code` overload, so a filesystem that cannot answer is a refusal
