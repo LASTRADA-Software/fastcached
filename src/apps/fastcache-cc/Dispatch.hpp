@@ -162,6 +162,11 @@ enum class DispatchStatus : std::uint8_t
     /// the object, which would be a wrong object under a correct key — the failure
     /// this whole mechanism exists to make impossible.
     Mismatched,
+    /// The enumerator count, so a table over this enum takes its extent from the
+    /// enum itself rather than from a literal. See `Core/EnumTable.hpp`: a length
+    /// anchored on an enumerator by name is a guard that fires only when nothing is
+    /// wrong. Never a status a `DispatchResult` carries.
+    Last,
 };
 
 /// The result of one dispatch attempt.

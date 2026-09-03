@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Stats.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
 #include <algorithm>
@@ -13,6 +14,8 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -108,6 +111,124 @@ namespace
         return ec ? std::filesystem::path {} : dir;
     }
 
+    /// How one `DispatchOutcome` is written to the log and rendered in the report.
+    ///
+    /// A row rather than a switch per question: the log token, the report label, the
+    /// colour and the two classifications are five facts that have to move together,
+    /// and a state added with only three of them filled in is exactly the
+    /// half-registration this tree keeps paying for. The two byte-wide members sit
+    /// together at the end, which is this tree's layout rule wherever a struct mixes
+    /// them with pointers.
+    struct DispatchRow
+    {
+        std::string_view token; ///< The stable log token, written and parsed back.
+        std::string_view label; ///< How the terminal and HTML reports name this state.
+        /// Which palette entry colours it. A member pointer rather than a colour per
+        /// branch, so the renderer stays one loop over the table.
+        std::string_view StatsPalette::* tone;
+        DispatchOutcome outcome {};
+        /// Whether reaching this state means the FLEET was asked for a worker.
+        /// `Dispatched` is rated against the sum of these, so a build that mostly
+        /// hit the cache does not read as a fleet that mostly refused.
+        bool askedTheFleet {};
+        /// Whether this state is evidence that distribution is configured at all.
+        ///
+        /// `Unknown` and `NotConfigured` are not, and that is what makes "render no
+        /// distribution section" the right answer for a machine with no fleet:
+        /// absent is not zero, and a launcher that never distributes must not be
+        /// reported as one that failed to.
+        bool distributes {};
+    };
+
+    constexpr EnumTable<DispatchOutcome, DispatchRow> DispatchTable { {
+        DispatchRow { .token = "UNKNOWN",
+                      .label = "unknown",
+                      .tone = &StatsPalette::neutral,
+                      .outcome = DispatchOutcome::Unknown,
+                      .askedTheFleet = false,
+                      .distributes = false },
+        DispatchRow { .token = "NOT_CONFIGURED",
+                      .label = "no scheduler",
+                      .tone = &StatsPalette::neutral,
+                      .outcome = DispatchOutcome::NotConfigured,
+                      .askedTheFleet = false,
+                      .distributes = false },
+        DispatchRow { .token = "NOT_ATTEMPTED",
+                      .label = "not attempted",
+                      .tone = &StatsPalette::neutral,
+                      .outcome = DispatchOutcome::NotAttempted,
+                      .askedTheFleet = false,
+                      .distributes = true },
+        DispatchRow { .token = "REFUSED",
+                      .label = "refused here",
+                      .tone = &StatsPalette::neutral,
+                      .outcome = DispatchOutcome::Refused,
+                      .askedTheFleet = false,
+                      .distributes = true },
+        DispatchRow { .token = "DECLINED",
+                      .label = "fleet declined",
+                      .tone = &StatsPalette::neutral,
+                      .outcome = DispatchOutcome::Declined,
+                      .askedTheFleet = true,
+                      .distributes = true },
+        DispatchRow { .token = "UNREACHABLE",
+                      .label = "unreachable",
+                      .tone = &StatsPalette::bad,
+                      .outcome = DispatchOutcome::Unreachable,
+                      .askedTheFleet = true,
+                      .distributes = true },
+        DispatchRow { .token = "MISMATCHED",
+                      .label = "crossed reply",
+                      .tone = &StatsPalette::bad,
+                      .outcome = DispatchOutcome::Mismatched,
+                      .askedTheFleet = true,
+                      .distributes = true },
+        DispatchRow { .token = "DISPATCHED",
+                      .label = "dispatched",
+                      .tone = &StatsPalette::good,
+                      .outcome = DispatchOutcome::Dispatched,
+                      .askedTheFleet = true,
+                      .distributes = true },
+    } };
+    static_assert(RowsInEnumeratorOrder(DispatchTable, &DispatchRow::outcome),
+                  "DispatchTable must hold exactly one row per DispatchOutcome, in enumerator order");
+    // Asking the fleet is only possible where a fleet was configured, so the two
+    // columns are ordered rather than independent. Asserted rather than derived
+    // because they answer different questions -- `Refused` and `NotAttempted`
+    // distribute without ever asking -- and a row that got the pair backwards would
+    // rate `Dispatched` against a denominator including compiles nobody sent.
+    static_assert(std::ranges::all_of(DispatchTable,
+                                      [](DispatchRow const& row) { return !row.askedTheFleet || row.distributes; }),
+                  "a state that asked the fleet is necessarily one where distribution was configured");
+
+    /// @param outcome The dispatch outcome. @return Its row.
+    [[nodiscard]] constexpr DispatchRow const& DispatchRowFor(DispatchOutcome outcome) noexcept
+    {
+        return DispatchTable[static_cast<std::size_t>(outcome)];
+    }
+
+    /// Widest label in the table, so the report's column alignment is derived from
+    /// the data rather than counted by eye and silently broken by a longer state.
+    [[nodiscard]] consteval std::size_t WidestDispatchLabel()
+    {
+        std::size_t widest = 0;
+        for (auto const& row: DispatchTable)
+            widest = (std::max)(widest, row.label.size());
+        return widest;
+    }
+    constexpr std::size_t DispatchLabelWidth = WidestDispatchLabel();
+
+    /// Decode a log line's dispatch token.
+    /// @param token The token as written.
+    /// @return The state it names, or `Unknown` for anything this build does not
+    ///         recognise — a token from a LATER build says nothing this one can
+    ///         report on, and guessing at it would be a claim about a fleet.
+    [[nodiscard]] DispatchOutcome ParseDispatchOutcome(std::string_view token)
+    {
+        auto const found = std::ranges::find(DispatchTable, token, &DispatchRow::token);
+        return found != DispatchTable.end() ? found->outcome : DispatchOutcome::Unknown;
+    }
+
     /// Per-group tallies folded from the log.
     struct Tally
     {
@@ -136,9 +257,39 @@ namespace
         /// Fall-back reason -> count, so an "unavailable" figure is actionable.
         std::map<std::string, std::uint64_t> reasons;
 
+        /// One counter per `DispatchOutcome`, indexed by the enumerator itself.
+        ///
+        /// An array rather than a named member per state: every consumer wants the
+        /// whole vocabulary at once — the report walks it, and both "does this
+        /// machine distribute at all" and "what fraction of what we asked for came
+        /// back" are subset sums over it — so a member each would be eight places to
+        /// forget when a ninth state is added.
+        EnumTable<DispatchOutcome, std::uint64_t> dispatch {};
+
+        /// Dispatch fall-back reason -> count, kept apart from `reasons` above
+        /// because a fleet failure and a cache failure are fixed in different
+        /// places; see `Record::dispatchDetail`.
+        std::map<std::string, std::uint64_t> dispatchReasons;
+
         [[nodiscard]] std::uint64_t Total() const noexcept
         {
             return hits + misses + uncacheable + unavailable;
+        }
+
+        /// Sum the per-state dispatch counters whose row has @p column set.
+        ///
+        /// One function taking the column rather than one per question: the two
+        /// callers differ by a single member, which is the copy-paste this project's
+        /// guidelines name outright.
+        /// @param column Which classification of `DispatchRow` selects a state.
+        /// @return The total across every selected state.
+        [[nodiscard]] std::uint64_t DispatchTotal(bool DispatchRow::* column) const noexcept
+        {
+            std::uint64_t total = 0;
+            for (auto const& row: DispatchTable)
+                if (row.*column)
+                    total += dispatch[static_cast<std::size_t>(row.outcome)];
+            return total;
         }
     };
 
@@ -191,6 +342,14 @@ namespace
             record.directHit = fields[9] == "1";
         if (fields.size() >= 11)
             record.timestampUnixSeconds = ParseUnsigned(fields[10]);
+        // The dispatch axis is the newest pair of columns. A line without them
+        // leaves `dispatch` at `Unknown`, which is the point: a pre-upgrade record
+        // is silent about distribution, and reading that silence as `NotConfigured`
+        // would turn a missing column into a claim that the operator has no fleet.
+        if (fields.size() >= 12)
+            record.dispatch = ParseDispatchOutcome(fields[11]);
+        if (fields.size() >= 13)
+            record.dispatchDetail = std::string { fields[12] };
         return record;
     }
 
@@ -211,6 +370,36 @@ namespace
             start = end + 1;
         }
         return fields;
+    }
+
+    /// Rank a name -> count tally most-frequent first.
+    ///
+    /// Five call sites want exactly this — the cache's fall-back reasons, the
+    /// dispatch axis's, and the never-cached attribution, each in both reports — and
+    /// it was written out at each of them.
+    /// @param counts The tally.
+    /// @return The pairs, descending by count.
+    [[nodiscard]] std::vector<std::pair<std::string, std::uint64_t>> RankedByCount(
+        std::map<std::string, std::uint64_t> const& counts)
+    {
+        std::vector<std::pair<std::string, std::uint64_t>> ranked { counts.begin(), counts.end() };
+        std::ranges::sort(ranked, [](auto const& a, auto const& b) { return a.second > b.second; });
+        return ranked;
+    }
+
+    /// Left-align `text` in `width` columns.
+    ///
+    /// So the distribution section's labels line up against a width derived from the
+    /// table, rather than each call site padding a literal by eye — which is how a
+    /// label added later silently breaks the alignment of every line above it.
+    /// @param text The label. @param width The column width.
+    /// @return The padded label, unchanged when it is already at least that wide.
+    [[nodiscard]] std::string PadRight(std::string_view text, std::size_t width)
+    {
+        std::string out { text };
+        if (out.size() < width)
+            out.append(width - out.size(), ' ');
+        return out;
     }
 
     /// Render a percentage with one decimal, guarding the empty case.
@@ -325,6 +514,58 @@ namespace
             << " p95=" << FormatMs(Percentile(sorted, 0.95)) << " max=" << FormatMs(high) << '\n';
     }
 
+    /// Render the distribution axis — or nothing at all.
+    ///
+    /// **Nothing at all is the load-bearing half.** A launcher with no scheduler
+    /// configured never distributes, and printing "dispatched: 0 (0.0% of 0)" for it
+    /// would be an absence rendered as a total failure — the defect `NoUpstream`'s
+    /// honest `false` produced when a node with no shared cache reported a 100%
+    /// upstream failure rate. So the section appears only once some record came from
+    /// a launcher that had a fleet to ask, and a pre-upgrade line is not such a
+    /// record: `Unknown` is silence about dispatch, not evidence of none.
+    ///
+    /// Records that carry no fleet — `Unknown` and `NotConfigured` — are left out of
+    /// both the listing and the denominators rather than reported as zeroes, so a
+    /// log spanning the day an operator first set `FASTCACHE_SCHEDULER` describes
+    /// the fleet from the compiles that actually had one.
+    /// @param out Report stream.
+    /// @param tally The folded records.
+    /// @param palette Colours, or the empty palette for plain output.
+    void AppendDispatchLines(std::ostringstream& out, Tally const& tally, StatsPalette const& palette)
+    {
+        if (tally.DispatchTotal(&DispatchRow::distributes) == 0)
+            return;
+
+        auto const asked = tally.DispatchTotal(&DispatchRow::askedTheFleet);
+        out << "  distribution\n";
+        for (auto const& row: DispatchTable)
+        {
+            if (!row.distributes)
+                continue;
+            auto const count = tally.dispatch[static_cast<std::size_t>(row.outcome)];
+            // A zero state is dropped rather than printed: with this many of them,
+            // listing every zero buries the one or two an operator came to read.
+            // `Dispatched` is the deliberate exception -- a fleet that dispatched
+            // NOTHING is precisely the case this section exists to make visible, and
+            // omitting its line would read as "no data" rather than as "none".
+            if (count == 0 && row.outcome != DispatchOutcome::Dispatched)
+                continue;
+            out << "    " << PadRight(row.label, DispatchLabelWidth) << ": "
+                << Colorize(std::to_string(count), palette.*row.tone, palette.reset);
+            if (row.outcome == DispatchOutcome::Dispatched)
+                out << "  (" << Percent(count, asked) << " of " << asked << " asked of the fleet)";
+            out << '\n';
+        }
+
+        if (!tally.dispatchReasons.empty())
+        {
+            out << "    why distribution did not help\n";
+            for (auto const& [reason, count]: RankedByCount(tally.dispatchReasons))
+                out << "      " << Colorize(std::to_string(count) + "x", palette.bad, palette.reset) << "  " << reason
+                    << '\n';
+        }
+    }
+
     void AppendTallyLines(std::ostringstream& out, Tally const& tally, StatsPalette const& palette)
     {
         // Rate the cache against the compiles it could actually serve. Dividing by
@@ -350,11 +591,11 @@ namespace
         if (!tally.reasons.empty())
         {
             out << "  fall-back reasons\n";
-            std::vector<std::pair<std::string, std::uint64_t>> ranked { tally.reasons.begin(), tally.reasons.end() };
-            std::ranges::sort(ranked, [](auto const& a, auto const& b) { return a.second > b.second; });
-            for (auto const& [reason, count]: ranked)
+            for (auto const& [reason, count]: RankedByCount(tally.reasons))
                 out << "    " << Colorize(std::to_string(count) + "x", palette.bad, palette.reset) << "  " << reason << '\n';
         }
+
+        AppendDispatchLines(out, tally, palette);
 
         if (!tally.hitMs.empty() || !tally.missMs.empty())
         {
@@ -388,6 +629,15 @@ std::string_view ToStringView(Outcome outcome) noexcept
             break;
     }
     return "UNAVAILABLE";
+}
+
+std::string_view ToStringView(DispatchOutcome outcome) noexcept
+{
+    // Read off the same table the parser searches, so a token cannot be written in
+    // one spelling and read back in another -- which is a whole axis of the report
+    // silently reading as `Unknown` while every test that checks one direction
+    // passes.
+    return DispatchRowFor(outcome).token;
 }
 
 std::filesystem::path StateDirectory()
@@ -431,6 +681,10 @@ void AppendRecord(Record const& record)
     line += record.directHit ? "1" : "0";
     line += FieldSeparator;
     line += std::to_string(record.timestampUnixSeconds);
+    line += FieldSeparator;
+    line += ToStringView(record.dispatch);
+    line += FieldSeparator;
+    line += Sanitize(record.dispatchDetail);
     line += '\n';
 
 #if defined(_WIN32)
@@ -545,6 +799,14 @@ namespace
                 }
                 if (!record.detail.empty())
                     ++tally->reasons[record.detail];
+
+                // The dispatch axis is folded unconditionally and separately. Every
+                // record lands in exactly one state including `Unknown`, so the
+                // section can tell "no fleet" from "nothing recorded" -- and its
+                // reason goes in its own map, never beside a cache reason.
+                ++tally->dispatch[static_cast<std::size_t>(record.dispatch)];
+                if (!record.dispatchDetail.empty())
+                    ++tally->dispatchReasons[record.dispatchDetail];
             }
 
             // Attribute the never-cached translation units so a permanently
@@ -603,8 +865,7 @@ std::string FormatReport(std::string_view groupFilter, UsageColor color)
     if (!neverCached.empty())
     {
         out << "\nnever cached (" << neverCached.size() << " translation units)\n";
-        std::vector<std::pair<std::string, std::uint64_t>> ranked { neverCached.begin(), neverCached.end() };
-        std::ranges::sort(ranked, [](auto const& a, auto const& b) { return a.second > b.second; });
+        auto const ranked = RankedByCount(neverCached);
         std::size_t shown = 0;
         for (auto const& [source, count]: ranked)
         {
@@ -858,6 +1119,62 @@ namespace
             << R"(</span><span class="card-value">)" << value << "</span></div>";
     }
 
+    /// Render one reason tally as the dashboard's ranked bar list.
+    ///
+    /// Both reason axes render identically; written out per axis, the dispatch one
+    /// would have been the third copy of it in this file.
+    /// @param out Document stream.
+    /// @param reasons Reason -> count.
+    void AppendReasonBars(std::ostringstream& out, std::map<std::string, std::uint64_t> const& reasons)
+    {
+        out << R"(<div class="reasons">)";
+        auto const ranked = RankedByCount(reasons);
+        auto const worst = ranked.empty() ? 0 : ranked.front().second;
+        for (auto const& [reason, count]: ranked)
+        {
+            auto const pct = worst == 0 ? 0.0 : (100.0 * static_cast<double>(count)) / static_cast<double>(worst);
+            out << R"(<div><div class="reason-row"><span>)" << EscapeHtml(reason) << R"(</span><span class="mono">)" << count
+                << R"(&times;</span></div><div class="reason-bar"><div class="reason-fill" style="width:)"
+                << FormatCoord(pct) << R"(%"></div></div></div>)";
+        }
+        out << "</div>";
+    }
+
+    /// Render the dashboard's distribution panel, or nothing at all.
+    ///
+    /// The same rule the terminal report follows and for the same reason: a launcher
+    /// with no scheduler configured gets NO panel, never a panel of zeroes claiming
+    /// its fleet failed every time. See `AppendDispatchLines`, which this mirrors —
+    /// the two walk one table, so a state cannot appear in one report and not the
+    /// other.
+    /// @param out Document stream.
+    /// @param tally The folded records.
+    void AppendDistributionPanel(std::ostringstream& out, Tally const& tally)
+    {
+        if (tally.DispatchTotal(&DispatchRow::distributes) == 0)
+            return;
+
+        auto const asked = tally.DispatchTotal(&DispatchRow::askedTheFleet);
+        auto const dispatched = tally.dispatch[static_cast<std::size_t>(DispatchOutcome::Dispatched)];
+        out << R"(<div class="panel"><div class="panel-title">distribution</div>)"
+            << R"(<div class="headline"><span class="label">dispatched</span><span class="rate">)"
+            << Percent(dispatched, asked) << R"(</span><span class="label">of )" << asked
+            << " asked of the fleet</span></div>";
+        for (auto const& row: DispatchTable)
+        {
+            if (!row.distributes)
+                continue;
+            auto const count = tally.dispatch[static_cast<std::size_t>(row.outcome)];
+            if (count == 0 && row.outcome != DispatchOutcome::Dispatched)
+                continue;
+            out << R"(<div class="never-row"><span>)" << EscapeHtml(row.label) << R"(</span><span>)" << count
+                << "</span></div>";
+        }
+        if (!tally.dispatchReasons.empty())
+            AppendReasonBars(out, tally.dispatchReasons);
+        out << "</div>";
+    }
+
     /// Render one latency histogram section: title, SVG bars, and the
     /// p50/p95/max caption.
     void AppendHistogramSection(std::ostringstream& out, std::string_view title, std::vector<std::uint64_t> const& samples)
@@ -984,20 +1301,11 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     AppendHistogramSection(out, "miss latency", overall.missMs);
     out << "</div>";
 
-    out << R"(<div class="panel"><div class="panel-title">fall-back reasons</div><div class="reasons">)";
-    {
-        std::vector<std::pair<std::string, std::uint64_t>> ranked { overall.reasons.begin(), overall.reasons.end() };
-        std::ranges::sort(ranked, [](auto const& a, auto const& b) { return a.second > b.second; });
-        auto const worst = ranked.empty() ? 0 : ranked.front().second;
-        for (auto const& [reason, count]: ranked)
-        {
-            auto const pct = worst == 0 ? 0.0 : (100.0 * static_cast<double>(count)) / static_cast<double>(worst);
-            out << R"(<div><div class="reason-row"><span>)" << EscapeHtml(reason) << R"(</span><span class="mono">)" << count
-                << R"(&times;</span></div><div class="reason-bar"><div class="reason-fill" style="width:)"
-                << FormatCoord(pct) << R"(%"></div></div></div>)";
-        }
-    }
-    out << "</div></div></div>";
+    out << R"(<div class="panel"><div class="panel-title">fall-back reasons</div>)";
+    AppendReasonBars(out, overall.reasons);
+    out << "</div></div>";
+
+    AppendDistributionPanel(out, overall);
 
     if (byGroup.size() > 1 || (byGroup.size() == 1 && !groupFilter.empty()))
     {
@@ -1026,8 +1334,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     {
         out << R"(<div class="panel"><div class="panel-title">never cached ()" << neverCached.size()
             << " translation units)</div>";
-        std::vector<std::pair<std::string, std::uint64_t>> ranked { neverCached.begin(), neverCached.end() };
-        std::ranges::sort(ranked, [](auto const& a, auto const& b) { return a.second > b.second; });
+        auto const ranked = RankedByCount(neverCached);
         std::size_t shown = 0;
         for (auto const& [source, count]: ranked)
         {

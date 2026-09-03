@@ -121,6 +121,235 @@ TEST_CASE("ToStringView round-trips every outcome token")
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
 }
 
+TEST_CASE("ToStringView round-trips every dispatch token")
+{
+    // Both directions off one table, because a token written in one spelling and
+    // read back in another loses the whole axis silently -- every record would
+    // decode as `Unknown` and the report would say nothing, which is
+    // indistinguishable from a build that never dispatched.
+    CHECK(ToStringView(DispatchOutcome::Unknown) == "UNKNOWN");
+    CHECK(ToStringView(DispatchOutcome::NotConfigured) == "NOT_CONFIGURED");
+    CHECK(ToStringView(DispatchOutcome::NotAttempted) == "NOT_ATTEMPTED");
+    CHECK(ToStringView(DispatchOutcome::Refused) == "REFUSED");
+    CHECK(ToStringView(DispatchOutcome::Declined) == "DECLINED");
+    CHECK(ToStringView(DispatchOutcome::Unreachable) == "UNREACHABLE");
+    CHECK(ToStringView(DispatchOutcome::Mismatched) == "MISMATCHED");
+    CHECK(ToStringView(DispatchOutcome::Dispatched) == "DISPATCHED");
+}
+
+TEST_CASE("AppendRecord round-trips the dispatch axis through ParseLog")
+{
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
+    record.dispatch = DispatchOutcome::Unreachable;
+    record.dispatchDetail = "the fleet could not be reached";
+    AppendRecord(record);
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().dispatch == DispatchOutcome::Unreachable);
+    CHECK(entries.front().dispatchDetail == "the fleet could not be reached");
+    // The cache axis is untouched by any of this: the daemon answered honestly and
+    // the object was compiled locally and stored, so the compile really was a miss.
+    CHECK(entries.front().outcome == Outcome::Miss);
+}
+
+TEST_CASE("A build whose every dispatch failed says so rather than reading as an ordinary miss rate")
+{
+    // The whole of #427. What a launcher pointed at a fleet it cannot reach records
+    // is a run of perfectly honest MISSes -- the cache answered, the local compiler
+    // ran, the object was stored. Before the dispatch axis existed that was the
+    // ENTIRE record: the report showed a normal miss rate and said nothing at all
+    // about distribution unless somebody happened to have FASTCACHE_VERBOSE set.
+    ScopedStateDir const scoped;
+    for (int i = 0; i < 5; ++i)
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
+        record.dispatch = DispatchOutcome::Unreachable;
+        record.dispatchDetail = "the fleet could not be reached";
+        AppendRecord(record);
+    }
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("misses       : 5")); // the cache axis still reads honestly
+    CHECK(report.contains("distribution"));
+    CHECK(report.contains("unreachable"));
+    // Zero dispatched is PRINTED rather than dropped: a fleet that dispatched
+    // nothing is exactly what this section exists to make visible, and an omitted
+    // line would read as "no data" instead of as "none".
+    CHECK(report.contains("dispatched"));
+    CHECK(report.contains("0.0% of 5 asked of the fleet"));
+    CHECK(report.contains("5x  the fleet could not be reached"));
+}
+
+TEST_CASE("A launcher with no scheduler reports no fleet rather than a failed one")
+{
+    // The `NoUpstream` guard, in a new place. An absence counted as an event made a
+    // node with no shared cache report a 100% upstream failure rate; a launcher with
+    // no FASTCACHE_SCHEDULER must not report a 100% dispatch failure rate. It has no
+    // fleet, so the section does not exist for it.
+    ScopedStateDir const scoped;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 100);
+        record.dispatch = DispatchOutcome::NotConfigured;
+        AppendRecord(record);
+    }
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("misses       : 4"));
+    CHECK_FALSE(report.contains("distribution"));
+    CHECK_FALSE(report.contains("asked of the fleet"));
+}
+
+TEST_CASE("A pre-upgrade log line makes no claim about the operator's fleet")
+{
+    // Eleven tab-separated fields: the shape written before the dispatch columns
+    // existed. Decoding the absence as `NotConfigured` would turn a missing column
+    // into an assertion that this machine has no fleet -- and decoding it as any
+    // other state would invent a dispatch that was never recorded. `Unknown` is
+    // neither, so the section stays absent.
+    ScopedStateDir const scoped;
+    auto const path = LogPath();
+    {
+        std::ofstream out { path, std::ios::binary | std::ios::app };
+        out << "MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\n";
+    }
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().dispatch == DispatchOutcome::Unknown);
+    CHECK(entries.front().dispatchDetail.empty());
+    CHECK_FALSE(FormatReport("").contains("distribution"));
+}
+
+TEST_CASE("A dispatch token this build does not know decodes as unknown rather than as a fleet state")
+{
+    // A line written by a LATER build. Guessing at it would be a claim about a fleet
+    // made from a word this build cannot interpret.
+    ScopedStateDir const scoped;
+    auto const path = LogPath();
+    {
+        std::ofstream out { path, std::ios::binary | std::ios::app };
+        out << "MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tQUARANTINED\tsomething new\n";
+    }
+
+    auto const entries = ParseLog("");
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().dispatch == DispatchOutcome::Unknown);
+}
+
+TEST_CASE("A dispatch reason is never ranked beside a cache reason")
+{
+    // Two axes, two lists. A compile can miss the cache AND fail to dispatch, and an
+    // operator fixes those in two different places -- ranked together, a fleet
+    // failure would appear in the list somebody reads to decide whether the daemon
+    // is healthy.
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Unavailable, "main", "a.cpp", 5);
+    record.detail = "connect failed";
+    record.dispatch = DispatchOutcome::Declined;
+    record.dispatchDetail = "the fleet declined this compile";
+    AppendRecord(record);
+
+    auto const report = FormatReport("");
+    auto const cacheHeading = report.find("fall-back reasons");
+    auto const fleetHeading = report.find("why distribution did not help");
+    REQUIRE(cacheHeading != std::string::npos);
+    REQUIRE(fleetHeading != std::string::npos);
+    CHECK(report.find("connect failed") < fleetHeading);
+    CHECK(report.find("the fleet declined this compile") > fleetHeading);
+}
+
+TEST_CASE("A crossed reply is ranked once, not once per axis")
+{
+    // #280's sentence belongs to the CACHE axis, where the rulebook puts it: the
+    // outcome stays an honest MISS carrying that reason. The dispatch axis names the
+    // same event with a state of its own, so it carries no reason -- printing the
+    // identical sentence under two headings of one report reads as two events.
+    ScopedStateDir const scoped;
+    auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
+    record.detail = "a worker answered about a different compile";
+    record.dispatch = DispatchOutcome::Mismatched;
+    AppendRecord(record);
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("crossed reply"));
+    // Exactly one ranking line for it, under the cache heading.
+    auto const first = report.find("1x  a worker answered about a different compile");
+    REQUIRE(first != std::string::npos);
+    CHECK(report.find("1x  a worker answered about a different compile", first + 1) == std::string::npos);
+    CHECK(first < report.find("distribution"));
+}
+
+TEST_CASE("A refusal on this machine is not reported as the fleet declining")
+{
+    // `Refused` never asked the fleet, so it is excluded from the denominator the
+    // dispatch rate is taken over. Counted as an attempt it would blame a fleet for
+    // a command line this launcher would not send in the first place.
+    ScopedStateDir const scoped;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 50);
+        record.dispatch = DispatchOutcome::Refused;
+        record.dispatchDetail = "the command line is not dispatchable";
+        AppendRecord(record);
+    }
+    auto dispatched = MakeRecord(Outcome::Miss, "main", "b.cpp", 900);
+    dispatched.dispatch = DispatchOutcome::Dispatched;
+    AppendRecord(dispatched);
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("refused here"));
+    // One asked, one dispatched: the three refusals are not in the denominator.
+    CHECK(report.contains("100.0% of 1 asked of the fleet"));
+}
+
+TEST_CASE("A dispatched compile the client threw away is still a dispatch, with a reason")
+{
+    // A worker DID run the compiler, which is what `Dispatched` means. The reason is
+    // what says the result was discarded -- and the two together are the only place
+    // a node failing compiles that are fine can be seen at all, because the local
+    // retry succeeds and the build stays green.
+    ScopedStateDir const scoped;
+    for (int i = 0; i < 2; ++i)
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
+        record.dispatch = DispatchOutcome::Dispatched;
+        record.dispatchDetail = "a worker compile failed and was retried locally";
+        AppendRecord(record);
+    }
+
+    auto const report = FormatReport("");
+    CHECK(report.contains("100.0% of 2 asked of the fleet"));
+    CHECK(report.contains("2x  a worker compile failed and was retried locally"));
+}
+
+TEST_CASE("FormatHtmlReport carries the distribution panel only when there is a fleet")
+{
+    ScopedStateDir const scoped;
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
+        record.dispatch = DispatchOutcome::Declined;
+        record.dispatchDetail = "the fleet declined this compile";
+        AppendRecord(record);
+    }
+    auto const withFleet = FormatHtmlReport("");
+    CHECK(withFleet.contains(">distribution<"));
+    CHECK(withFleet.contains("asked of the fleet"));
+    CHECK(withFleet.contains("the fleet declined this compile"));
+
+    REQUIRE(ResetLog());
+    {
+        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 100);
+        record.dispatch = DispatchOutcome::NotConfigured;
+        AppendRecord(record);
+    }
+    auto const withoutFleet = FormatHtmlReport("");
+    CHECK_FALSE(withoutFleet.contains(">distribution<"));
+    CHECK_FALSE(withoutFleet.contains("asked of the fleet"));
+}
+
 TEST_CASE("FormatReport explains an empty log instead of printing zeroes")
 {
     ScopedStateDir const scoped;

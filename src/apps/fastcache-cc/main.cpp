@@ -307,6 +307,20 @@ struct Config
     return c;
 }
 
+/// Whether this launcher has a fleet to ask at all.
+///
+/// One predicate with one spelling, because two call sites ask it and they must
+/// agree: the miss path uses it to decide whether to attempt a dispatch, and the
+/// statistics seed uses it to decide between "no scheduler" and "not attempted".
+/// Answered differently, a launcher would either report a fleet it never had or
+/// stay silent about one it did.
+/// @param cfg The launcher configuration.
+/// @return True when a scheduler endpoint is configured.
+[[nodiscard]] bool DispatchConfigured(Config const& cfg) noexcept
+{
+    return !cfg.schedulerAddr.empty();
+}
+
 /// What this invocation ended up doing, for the statistics log.
 ///
 /// Accumulated as the flow proceeds rather than returned through the call chain,
@@ -323,6 +337,19 @@ struct InvocationRecord
     /// Fall-back reason. Empty on a hit; usually empty on a miss, but see
     /// `ReportCrossedReply` for the one miss that carries one.
     std::string outcomeDetail;
+
+    /// What this invocation did about DISTRIBUTION — a second axis, never a
+    /// refinement of `outcome` above. A dispatch failure and a cache failure are two
+    /// facts about one compile and an operator fixes them in two different places;
+    /// see `Cc::DispatchOutcome`, and #427 for what recording only the first cost.
+    ///
+    /// Seeded in `main()` from whether a scheduler is configured at all, so a
+    /// launcher that never distributes says *no fleet* rather than defaulting into
+    /// a claim about one. `TryRemoteCompile` overwrites it on every path out.
+    Cc::DispatchOutcome dispatch = Cc::DispatchOutcome::Unknown;
+    /// Why distribution did not help, under `RecordFallback`'s fixed-string rule.
+    /// Empty when there is nothing to explain.
+    std::string dispatchDetail;
     std::uint64_t valueBytes = 0; ///< Cached payload size; 0 when nothing moved.
 
     std::uint64_t preprocessMs = 0; ///< Deriving the key (preprocess + compiler id).
@@ -530,6 +557,28 @@ void WarnAndCarryOn(std::string_view reason)
     return std::nullopt;
 }
 
+/// Record what this invocation did about DISTRIBUTION.
+///
+/// A separate recorder from `RecordFallback` rather than a parameter on it, because
+/// the two axes are independent: a compile that missed the cache and then failed to
+/// dispatch has to say BOTH, and a single recorder would make each call overwrite
+/// the other's half. Before this axis existed, every non-answer from `Dispatch`
+/// reached only a verbose-gated `Note` and the record said nothing at all -- so a
+/// fleet in which every dispatch failed produced an ordinary miss rate and total
+/// silence ([#427](https://github.com/LASTRADA-Software/fastcached/issues/427)).
+///
+/// @param outcome What happened, as `--show-stats` buckets it.
+/// @param reason  Why, under `RecordFallback`'s FIXED-string rule and for the same
+///                reason: these are tallied per cause, and `Dispatch` formats a
+///                worker endpoint into its own detail text, which would give one
+///                row per machine in the fleet instead of one per cause. Empty when
+///                there is nothing to explain.
+void RecordDispatch(Cc::DispatchOutcome outcome, std::string_view reason = {})
+{
+    invocation.dispatch = outcome;
+    invocation.dispatchDetail = reason;
+}
+
 /// The fixed reason `--show-stats` tallies a crossed worker reply under.
 ///
 /// Fixed, under `RecordFallback`'s rule: the endpoint and the two digests are what
@@ -570,6 +619,53 @@ void ReportCrossedReply(std::string_view detail)
     invocation.outcomeDetail = CrossedReplyReason;
     std::cerr << "fastcache-cc: " << CrossedReplyReason << " (" << detail
               << "); refusing that object and compiling this translation unit locally\n";
+}
+
+/// How one `Cc::DispatchStatus` is recorded on the statistics' dispatch axis.
+///
+/// A table rather than a `switch`, so a fifth dispatch status is a row and cannot
+/// be added without deciding what an operator reads about it -- which is exactly
+/// how `Mismatched` would otherwise be silently tallied as a network blip.
+///
+/// The reason is FIXED per status and is deliberately NOT `DispatchResult::detail`:
+/// `Dispatch` formats the worker's endpoint into its declined and unreachable
+/// messages, so forwarding that text would produce one tally row per machine in the
+/// fleet rather than one per cause. The endpoint still reaches an operator, on the
+/// verbose line beside the call.
+struct DispatchRecordRow
+{
+    std::string_view reason;      ///< Fixed tally reason; empty when nothing failed.
+    Cc::DispatchStatus status {}; ///< Which status this row describes.
+    Cc::DispatchOutcome outcome {}; ///< How `--show-stats` buckets it.
+};
+
+constexpr EnumTable<Cc::DispatchStatus, DispatchRecordRow> DispatchRecordTable { {
+    DispatchRecordRow { .reason = {},
+                        .status = Cc::DispatchStatus::Compiled,
+                        .outcome = Cc::DispatchOutcome::Dispatched },
+    DispatchRecordRow { .reason = "the fleet declined this compile",
+                        .status = Cc::DispatchStatus::Declined,
+                        .outcome = Cc::DispatchOutcome::Declined },
+    DispatchRecordRow { .reason = "the fleet could not be reached",
+                        .status = Cc::DispatchStatus::Unavailable,
+                        .outcome = Cc::DispatchOutcome::Unreachable },
+    // No reason, and this is the one row where that is a decision rather than the
+    // absence of a failure. `ReportCrossedReply` already puts `CrossedReplyReason`
+    // on the CACHE axis, which #280's rule requires it to -- so a copy here would
+    // print the identical sentence under two headings of one report, and two
+    // rankings of the same event read as two events. The dispatch STATE says it:
+    // `crossed reply` is a line of its own that no other state produces.
+    DispatchRecordRow { .reason = {},
+                        .status = Cc::DispatchStatus::Mismatched,
+                        .outcome = Cc::DispatchOutcome::Mismatched },
+} };
+static_assert(RowsInEnumeratorOrder(DispatchRecordTable, &DispatchRecordRow::status),
+              "DispatchRecordTable must hold exactly one row per DispatchStatus, in enumerator order");
+
+/// @param status The dispatch status. @return Its row.
+[[nodiscard]] constexpr DispatchRecordRow const& RowFor(Cc::DispatchStatus status) noexcept
+{
+    return DispatchRecordTable[static_cast<std::size_t>(status)];
 }
 
 /// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
@@ -1657,6 +1753,10 @@ void RecordManifest(Config const& cfg,
     auto const args = Cc::RemoteCompileArgs(cmd, argv, targetTriple);
     if (!args.has_value())
     {
+        // `Refused`, not `Declined`: the fleet was never asked, so this says nothing
+        // about the fleet and is fixed on this machine. The offending flag varies
+        // per compile and rides the verbose line rather than the tally.
+        RecordDispatch(Cc::DispatchOutcome::Refused, "the command line is not dispatchable");
         Note(std::format("not dispatchable ({}); compiling locally", args.error()));
         return std::nullopt;
     }
@@ -1669,6 +1769,7 @@ void RecordManifest(Config const& cfg,
     auto const preprocessRun = RunCaptureSplit(Cc::DispatchPreprocessCommand(cmd, argv));
     if (preprocessRun.exitCode != 0)
     {
+        RecordDispatch(Cc::DispatchOutcome::Refused, "the dispatch preprocess failed");
         Note("dispatch preprocess failed; compiling locally");
         return std::nullopt;
     }
@@ -1704,6 +1805,10 @@ void RecordManifest(Config const& cfg,
     // sends an operator to look at the fleet. This says which end is wrong.
     if (!identity.Usable())
     {
+        // Also `Refused` and for the reason the comment above gives: sending it
+        // would report as `NoWorker`, which reads as "the fleet has nobody on your
+        // toolchain". The tally must not repeat that misdirection.
+        RecordDispatch(Cc::DispatchOutcome::Refused, "this toolchain has no usable fingerprint");
         Note(std::format("not dispatched ({}); compiling locally", Cc::ExplainDefect(identity.defect).reason));
         return std::nullopt;
     }
@@ -1718,6 +1823,12 @@ void RecordManifest(Config const& cfg,
                                                             .sourceName = cmd.source },
                                       DispatchBudgetsOf(cfg),
                                       cfg.credential);
+    // Recorded from the table before any branch below reads the status, so every
+    // way a dispatch can end is on the axis exactly once -- a `RecordDispatch` per
+    // branch is a branch added later with no accounting, which is the shape #427 is.
+    auto const& dispatchRow = RowFor(outcome.status);
+    RecordDispatch(dispatchRow.outcome, dispatchRow.reason);
+
     if (outcome.status == Cc::DispatchStatus::Mismatched)
     {
         // Not one of the two below, and not reported like them: a worker answering
@@ -1735,6 +1846,15 @@ void RecordManifest(Config const& cfg,
     }
     if (outcome.exitCode != 0)
     {
+        // Still `Dispatched` -- a worker DID run the compiler, which is what that
+        // state means and what `DispatchStatus::Compiled` says in as many words. The
+        // reason is what says the result was thrown away, so the two together are
+        // the only place a node failing compiles that are fine is visible at all:
+        // the build stays green because the local retry succeeds, and the count of
+        // these rising is the signal. Which of the two it was -- broken code or a
+        // broken node -- needs the local retry's verdict, which this function never
+        // sees, so the reason claims neither.
+        RecordDispatch(Cc::DispatchOutcome::Dispatched, "a worker's compile failed and was retried locally");
         Note(std::format(
             "worker {} reported exit {}; recompiling locally to confirm", outcome.workerEndpoint, outcome.exitCode));
         return std::nullopt;
@@ -1745,6 +1865,7 @@ void RecordManifest(Config const& cfg,
     // not there if the write fails.
     if (!WriteFileBytes(cmd.objPath, outcome.object))
     {
+        RecordDispatch(Cc::DispatchOutcome::Dispatched, "the dispatched object could not be written");
         Note("could not write the dispatched object; compiling locally");
         return std::nullopt;
     }
@@ -1754,6 +1875,7 @@ void RecordManifest(Config const& cfg,
     Cc::CompileRun run { .exitCode = 0, .out = outcome.stdoutText, .err = outcome.stderrText };
     if (!cmd.depPath.empty() && !WriteDepFile(cmd.depPath, Cc::RenderDepFile(cmd.objPath, dependencyPaths)))
     {
+        RecordDispatch(Cc::DispatchOutcome::Dispatched, "the depfile for a dispatched compile could not be written");
         Note("could not write the depfile for a dispatched compile; compiling locally");
         return std::nullopt;
     }
@@ -1904,7 +2026,7 @@ void RecordManifest(Config const& cfg,
     // consumer that no longer existed. The paths it cannot re-derive: a worker sees
     // no `#include` at all, so the client writes the dependency record.
     std::vector<std::string> dispatchDependencies;
-    bool const dispatchConfigured = !cfg.schedulerAddr.empty();
+    bool const dispatchConfigured = DispatchConfigured(cfg);
     {
         auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
@@ -2416,6 +2538,15 @@ int main(int argc, char** argv)
 
     Config const cfg = LoadConfig();
     invocation.verbose = cfg.verbose;
+    // Seeded before anything can dispatch, so the axis always says something true.
+    // `NotConfigured` is an ABSENCE, not a failure: a launcher with no scheduler
+    // reported as a failed dispatch would read as a 100% dispatch failure rate
+    // forever -- which is precisely what `NoUpstream`'s honest `false` did to the
+    // node's upstream-store figure. Every path that gets as far as asking overwrites
+    // this; every path that does not leaves "a fleet was configured and this compile
+    // never reached it", which is a different fact again.
+    invocation.dispatch =
+        DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
 
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
@@ -2443,11 +2574,13 @@ int main(int argc, char** argv)
         auto const elapsed = std::chrono::steady_clock::now() - started;
         Cc::AppendRecord({
             .outcome = invocation.outcome,
+            .dispatch = invocation.dispatch,
             .prefetchGroup = cfg.prefetchGroup,
             .source = cmd.source,
             .valueBytes = invocation.valueBytes,
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
             .detail = invocation.outcomeDetail,
+            .dispatchDetail = invocation.dispatchDetail,
             .preprocessMs = invocation.preprocessMs,
             .cacheMs = invocation.cacheMs,
             .directMs = invocation.directMs,
