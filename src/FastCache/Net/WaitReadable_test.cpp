@@ -291,8 +291,15 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     observed.replyAfterEof = true;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
 
+    // Recorded in the client thread, asserted on the main one. A failing Catch2
+    // assertion throws, and thrown out of a `jthread` body that is `std::terminate`
+    // -- measured: staging the half-close as a full `Close()` ended the process with
+    // exit 3 instead of reporting a failed case. The reading still has to happen in
+    // the thread that owns the socket, so what crosses back is the observation.
+    std::atomic<bool> openAfterHalfClose { false };
+
     std::vector<std::byte> received;
-    std::jthread client { [port, &observed, &received] {
+    std::jthread client { [port, &observed, &received, &openAfterHalfClose] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -305,7 +312,7 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
         // **Half-close, not close.** The read half stays open, which is the whole
         // point: a `Close()` here would make the assertion below unreachable.
         (*socket)->ShutdownWrite();
-        REQUIRE_FALSE((*socket)->IsClosed()); // a half-close is not a close
+        openAfterHalfClose.store(!(*socket)->IsClosed(), std::memory_order_relaxed);
 
         // **Bounded, and it is what keeps a missing fix a FAILURE rather than a
         // hang.** With no `ShutdownWrite` on the transport the interface default is a
@@ -334,6 +341,9 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
 
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
+
+    // A half-close is not a close: the client's socket stayed open to read with.
+    CHECK(openAfterHalfClose.load(std::memory_order_relaxed));
 
     // The server saw "finished sending", spelled as the #677 count.
     CHECK(observed.count.load(std::memory_order_relaxed) == 0);
