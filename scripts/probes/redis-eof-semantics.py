@@ -31,12 +31,28 @@ which is the rule: EOF means finished-sending; a server answers what is already
 determined and abandons what is still pending.
 """
 
+import os
 import socket
 import subprocess
 import sys
 import time
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6390
+
+# **Every key is unique per run, and that is load-bearing rather than tidy.**
+# Cases 1, 2 and 5 push values nobody ever pops, so against a server that is not
+# restarted between runs the second run's BLPOP returns instantly from the first
+# run's leftover -- printing "reply delivered" for case 1, which is the OPPOSITE
+# of the recorded observation and of the rule this probe is committed to support.
+# A probe cited as re-runnable that reverses its own verdict on the second run is
+# worse than no citation. Unique names rather than a DEL sweep, because two people
+# running it against one server must not disturb each other either.
+RUN = "%d-%d" % (os.getpid(), time.time_ns() % 1_000_000)
+
+
+def key(name):
+    """A key private to this run. See RUN."""
+    return "eof671-%s-%s" % (name, RUN)
 
 
 def connect():
@@ -107,10 +123,10 @@ def blocked_rows(listing):
 
 
 print("1. BLPOP + HALF-CLOSE, then a push arrives")
-print("   ->", blocking_case("halfclosed-key", half_close=True))
+print("   ->", blocking_case(key("halfclosed"), half_close=True))
 
 print("\n2. BLPOP, NO half-close, then a push arrives   [control]")
-print("   ->", blocking_case("open-key", half_close=False))
+print("   ->", blocking_case(key("open"), half_close=False))
 
 print("\n3. PING + immediate HALF-CLOSE")
 c = connect()
@@ -121,7 +137,7 @@ c.close()
 
 print("\n4. BLPOP + HALF-CLOSE, nothing ever pushed")
 a = connect()
-a.sendall(resp("BLPOP", "lonely-key", "0"))
+a.sendall(resp("BLPOP", key("lonely"), "0"))
 time.sleep(0.4)
 a.shutdown(socket.SHUT_WR)
 print("   ->", read_reply(a, seconds=3.0))
@@ -131,14 +147,14 @@ print("\n5. SET + GET + BLPOP pipelined, then half-close (nothing ever pushed)")
 print("   separates 'answer what is determined, then close' from 'close on EOF, PING")
 print("   only survived by racing the close'")
 c = connect()
-c.sendall(resp("SET", "probe5", "written") + resp("GET", "probe5") + resp("BLPOP", "probe5-block", "0"))
+c.sendall(resp("SET", key("probe5"), "written") + resp("GET", key("probe5")) + resp("BLPOP", key("probe5-block"), "0"))
 c.shutdown(socket.SHUT_WR)
 print("   ->", drain(c))
 c.close()
 
 print("\n6. Is the blocked-and-half-closed client gone from the SERVER's own view?")
 a = connect()
-a.sendall(resp("BLPOP", "probe6-block", "0"))
+a.sendall(resp("BLPOP", key("probe6-block"), "0"))
 time.sleep(0.4)
 before = client_list()
 a.shutdown(socket.SHUT_WR)
@@ -150,7 +166,7 @@ a.close()
 
 print("\n7. Control for 6: a blocked client that does NOT half-close stays")
 b = connect()
-b.sendall(resp("BLPOP", "probe7-block", "0"))
+b.sendall(resp("BLPOP", key("probe7-block"), "0"))
 time.sleep(0.4)
 print("   blocked clients while attached:  ", len(blocked_rows(client_list())))
 b.close()
