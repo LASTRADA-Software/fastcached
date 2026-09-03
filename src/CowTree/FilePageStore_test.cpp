@@ -2,15 +2,21 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <ranges>
+#include <span>
 #include <string>
 #include <vector>
 
 #include <CowTree/Bytes.hpp>
 #include <CowTree/CowTree.hpp>
+#include <CowTree/Errors.hpp>
 #include <CowTree/FilePageStore.hpp>
+#include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 
 // The lock-classifier case below asserts over the platform's own error
 // constants: `errno` values on POSIX, `GetLastError()` values on Windows.
@@ -58,6 +64,102 @@ struct TempFile
     TempFile(TempFile&&) = delete;
     TempFile& operator=(TempFile&&) = delete;
 };
+
+/// Page size the free-list cases below build their store with.
+constexpr std::size_t FreeListPageSize = 4096;
+
+/// Data pages the free-list fixture allocates: 1 and 2 become the chain, 3
+/// stays live so a walk that erased too much is visible as well as one that
+/// erased too little.
+constexpr std::uint64_t FreeListFixturePages = 3;
+
+/// Store `value` little-endian into the first 8 bytes of `page`.
+///
+/// Written out rather than memcpy'd because that is what the walk in
+/// `RecoverExistingFile` decodes: a raw copy would agree with it on a
+/// little-endian host and disagree on every other one.
+/// @param page Destination page buffer; must hold at least 8 bytes.
+/// @param value Next-page id to encode.
+void PutNextLink(std::span<std::byte> page, std::uint64_t value) noexcept
+{
+    for (auto const i: std::views::iota(std::size_t { 0 }, sizeof(value)))
+        page[i] = static_cast<std::byte>((value >> (8 * i)) & 0xFFU);
+}
+
+/// Open -- or reopen -- the free-list fixture's store at `path`.
+///
+/// One options block for both directions, because a seed and a reopen that
+/// disagreed about `pageSize` would not fail: `RecoverExistingFile` takes the
+/// on-disk value and carries on.
+///
+/// `Fsync` rather than the default `Batched`, which buffers `WriteMeta` until
+/// a flush boundary this fixture never reaches -- and the seeded meta has to
+/// be on disk, or the reopen finds no chain to walk.
+/// @param path Filesystem path of the store file.
+/// @return Whatever `FilePageStore::Open` answered.
+auto OpenFreeListStore(std::filesystem::path const& path)
+{
+    CowTree::FilePageStore::Options opts;
+    opts.path = path;
+    opts.pageSize = FreeListPageSize;
+    opts.durability = CowTree::FilePageStore::Durability::Fsync;
+    return CowTree::FilePageStore::Open(opts);
+}
+
+/// Build a store at `path` whose durable meta names a free-list chain rooted
+/// at page 1, and close it. Page 3 is left live.
+///
+/// The chain's shape is the caller's, so a case that wants a damaged one says
+/// so in data rather than patching bytes into the closed file afterwards --
+/// which would mean restating `FilePageStore`'s private data-page offset here,
+/// the very thing the neighbouring sweep in `CowTreeStorage_test.cpp` argues a
+/// fixture must not do.
+///
+/// Both pages are written BEFORE the meta that names `freeRoot`, so this store
+/// walks nothing while it is open -- the injection route is invisible in the
+/// file, which is the same one a patch-the-closed-file route would leave.
+///
+/// It is NOT a file any writer in this tree produces, and that is deliberate
+/// rather than an oversight: `CowTree::CommitTxn` writes
+/// `freeRoot = PageId::None()` unconditionally, so no real store has a chain
+/// at all. The block comment above the cases carries the whole argument.
+/// @param path Filesystem path to create the store at.
+/// @param nextOfOne What page 1 chains to.
+/// @param nextOfTwo What page 2 chains to.
+void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOfOne, CowTree::PageId nextOfTwo)
+{
+    auto const store = OpenFreeListStore(path);
+    REQUIRE(store.has_value());
+
+    for (auto const expected: std::views::iota(std::uint64_t { 1 }, FreeListFixturePages + 1))
+    {
+        auto const id = (*store)->Allocate();
+        REQUIRE(id.has_value());
+        REQUIRE(id->value == expected);
+    }
+
+    std::vector<std::byte> page(FreeListPageSize, std::byte { 0 });
+    PutNextLink(page, nextOfOne.value);
+    REQUIRE((*store)->Write(CowTree::PageId { 1 }, CowTree::BytesView { page.data(), page.size() }).has_value());
+    PutNextLink(page, nextOfTwo.value);
+    REQUIRE((*store)->Write(CowTree::PageId { 2 }, CowTree::BytesView { page.data(), page.size() }).has_value());
+
+    CowTree::Meta meta;
+    meta.pageSize = static_cast<std::uint32_t>(FreeListPageSize);
+    meta.txnId = 1;
+    meta.root = CowTree::PageId::None();
+    meta.freeRoot = CowTree::PageId { 1 };
+    meta.itemCount = 0;
+
+    // Derived, not chosen. `Meta`'s own contract is that the slot matching
+    // `txnId mod 2` holds the most recent commit attempt, and `CommitTxn`
+    // implements exactly this expression -- so a hard-coded slot would seed a
+    // parity no writer produces, and `RecoverExistingFile` would not notice
+    // because it tie-breaks on `txnId` alone. The chain is the only thing
+    // about this file that is meant to be unusual.
+    auto const slot = (meta.txnId % 2 == 0) ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
+    REQUIRE((*store)->WriteMeta(slot, meta).has_value());
+}
 
 } // namespace
 
@@ -501,6 +603,83 @@ TEST_CASE("An empty file that already existed is not blanked into a fresh store"
     auto const store = CowTree::FilePageStore::Open(opts);
     REQUIRE_FALSE(store.has_value());
     REQUIRE(store.error() == CowTree::CowTreeError::CorruptMetas);
+}
+
+// ---------------------------------------------------------------------------
+// The free-list walk at Open.
+//
+// `docs/operations/corrupt-store.md` tells an operator that opening a store
+// "reads the two meta slots, walks the free list, and looks up two reserved
+// keys", and that damage anywhere in that reach refuses the process to start
+// with `Corrupt`. Two of those three are pinned by `CowTreeStorage_test`
+// against an `InMemoryPageStore`; the free-list walk is not reachable from
+// there at all, because it lives in `FilePageStore::RecoverExistingFile` and
+// has no in-memory equivalent (#580). These three cases are that third one,
+// and they need a real file for it.
+//
+// What they are honest about, so nobody reads more into them: the chain is
+// seeded through `FilePageStore`'s own API because nothing else in this tree
+// writes one. `CowTree::CommitTxn` sets `Meta::freeRoot = PageId::None()`
+// unconditionally ("free list is in-memory only for v1"), and
+// `BootstrapNewFile` writes the same, so a store produced by `CowTreeStorage`
+// -- which is every store `fastcached` and `fastcache-compile-node` own --
+// carries an empty chain and the walk terminates on its first test. What
+// these cases pin is therefore the guard itself, on the layout
+// `RecoverExistingFile` is written to read, and not a refusal an operator can
+// reach today.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("An intact free-list chain is walked at Open and its pages are recycled", "[filestore][open][freelist]")
+{
+    TempFile tmp;
+    SeedFreeListChain(tmp.path, CowTree::PageId { 2 }, CowTree::PageId::None());
+
+    auto const store = OpenFreeListStore(tmp.path);
+    REQUIRE(store.has_value());
+
+    // The control direction, and the one that makes the two damage cases below
+    // mean anything: an Open that never walked the chain would leave pages 1
+    // and 2 live and would also, trivially, never refuse. `Read` rejects a page
+    // that is not live, so this says the walk ran and consumed exactly the two
+    // pages the chain named.
+    REQUIRE((*store)->TotalDataPages() == FreeListFixturePages);
+    REQUIRE_FALSE((*store)->Read(CowTree::PageId { 1 }).has_value());
+    REQUIRE_FALSE((*store)->Read(CowTree::PageId { 2 }).has_value());
+    REQUIRE((*store)->Read(CowTree::PageId { 3 }).has_value());
+}
+
+TEST_CASE("A free-list link pointing past the end of the file refuses the store at Open",
+          "[filestore][open][freelist][corrupt]")
+{
+    TempFile tmp;
+    // Page 1 chains to a page the file does not have. This is the shape a
+    // truncated or partially-rewritten store takes, and it is the one an
+    // unguarded walk would follow into a `ReadAt` past the end.
+    SeedFreeListChain(tmp.path, CowTree::PageId { 1'000'000 }, CowTree::PageId::None());
+
+    auto const store = OpenFreeListStore(tmp.path);
+    REQUIRE_FALSE(store.has_value());
+    // `Corrupt`, which `CowTreeStorage::TranslateError` carries out to the
+    // operator as `StorageErrorCode::Corrupt` with `context=FilePageStore::Open`
+    // -- the exact line the operator page quotes. Not `CorruptMetas`: both meta
+    // slots read back fine, and it is the structure beneath them that did not
+    // hold. Not `OutOfRange` or `IoError` either, both of which say the caller
+    // asked for something silly rather than that the store is damaged.
+    REQUIRE(store.error() == CowTree::CowTreeError::Corrupt);
+}
+
+TEST_CASE("A free-list chain that loops refuses the store at Open", "[filestore][open][freelist][corrupt]")
+{
+    TempFile tmp;
+    // Page 2 links back to page 1. Every id in the loop is in range, so the
+    // bounds check above cannot see this one: without the visited set `Open`
+    // never returns and `_freeList` grows without bound, which is an unbounded
+    // answer rather than a wrong one and is why it is a separate case.
+    SeedFreeListChain(tmp.path, CowTree::PageId { 2 }, CowTree::PageId { 1 });
+
+    auto const store = OpenFreeListStore(tmp.path);
+    REQUIRE_FALSE(store.has_value());
+    REQUIRE(store.error() == CowTree::CowTreeError::Corrupt);
 }
 
 #if !defined(_WIN32)
