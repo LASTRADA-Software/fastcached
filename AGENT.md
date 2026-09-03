@@ -376,8 +376,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A manifest naming the TU and no header revalidates forever: `IsToolchainHeader` calls
   every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
   exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
-  reported and none survived; `ValidateManifest` refuses an empty set rather than
-  letting `all_of` pass vacuously.
+  reported and none survived, and (`DepsNotObserved`) when no dependency record was
+  observed at all — a fact the caller STATES through `ReportedDependencies`, never one
+  inferred from an empty vector, since "depends on nothing" and "nothing was observed"
+  are two states one vector renders as one; `ValidateManifest` refuses an empty set
+  rather than letting `all_of` pass vacuously.
 - A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet:
   `Gate()` refuses `Register` as well, so a heartbeat that only LOGGED the redirect kept
   announcing to the demoted node, expired out of the new leader's registry, and every
