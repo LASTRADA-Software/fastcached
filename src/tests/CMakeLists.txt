@@ -1705,11 +1705,29 @@ else()
     endif()
     # Spawns three daemons and several workers and drives real compiles, so it
     # must not race the other server-starting smoke tests for ports or for CPU.
+    #
+    # TIMEOUT 1200, and the number is the fixture's own ceiling plus headroom
+    # rather than a round figure. No warm-run cost is quoted here because none
+    # has been measured for this registration; the ceiling is what the bound has
+    # to clear, and it is arithmetic. Since #451 the script
+    # starts every node through `start_node`, which waits TWICE -- for the bind
+    # and then for `compile node ready` -- so the suite's ten nodes contribute
+    # twenty bounded waits, and `e2e_wait_seconds 30` is what bounds each of
+    # them. With the four standalone `wait_for_port`s, the `scheduling for the
+    # fleet` wait, the three registration waits, the 30 s fingerprint poll and
+    # the four stop bounds, the script can legitimately spend ~905 s waiting on
+    # a runner slow enough that every wait is slow yet none expires.
+    #
+    # A ctest timeout BELOW that is the failure this repository has already paid
+    # for: `dist-compile-e2e ***Timeout 900.10 sec`, in three jobs, naming
+    # nothing. The backstop is for a stall the script cannot see, so it sits
+    # above the script's own ceiling -- and when `e2e_wait_seconds` or the number
+    # of nodes moves, this number moves with it.
     set_tests_properties("dist-compile-e2e" PROPERTIES
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 900
+        TIMEOUT 1200
     )
 
     # The one body of assertions in that fixture that is NOT loopback: it binds a
@@ -1739,9 +1757,10 @@ else()
         # is using -- so a parallel ctest job makes this fail as "not dispatched".
         #
         # TIMEOUT 600 against a ~7 s warm run, which is deliberate and is not slack.
-        # The script bounds every one of its own waits (20 s each, ten of them
-        # across five processes, plus one 10 s counter poll) and every bound names
-        # what it was waiting for. A ctest timeout below the sum of those fires
+        # The script bounds every one of its own waits (30 s each -- `start_node`
+        # waits twice per node since #451, so fifteen of them across five
+        # processes -- plus three 10 s counter polls, which is 480 s) and every
+        # bound names what it was waiting for. A ctest timeout below the sum fires
         # BEFORE the fixture can say which participant never came up, and this
         # repository has already paid for that once -- `dist-compile-e2e ***Timeout
         # 900.10 sec`, in three jobs, naming nothing. It is a backstop for a stall

@@ -555,8 +555,14 @@ or TIME_WAIT, with nothing listening on it, so the probe says "free" and the
 `bind()` still fails with `EADDRINUSE`. A draw of 20000–39999 overlapped Linux's
 default `ip_local_port_range` of 32768–60999 by better than one number in three,
 and `dist-compile-e2e` duly died at `bind(127.0.0.1:33174) failed: 98` in the case
-that runs after five cases' worth of connections. Every fixture now draws
-20000–31999, below that floor and below macOS's 49152.
+that runs after five cases' worth of connections. `lib/e2e-common.sh`'s `free_port`
+draws 20000–31999, below that floor and below macOS's 49152, and every fixture that
+reaches it through the shared helper inherits that. `migrate-storage-e2e.sh` does
+not: it spells the helper `port`, draws 40000–59999, and is therefore entirely
+inside Linux's default ephemeral range
+([#628](https://github.com/LASTRADA-Software/fastcached/issues/628)). A helper
+reimplemented under a different name is invisible to `check-e2e-helpers.sh`'s
+name-collision scan, which is what that scan's allowlist reasons are for.
 
 A fixture that reports "free" from a probe is answering *"is anything answering
 here"*, which is not the same question as *"can I bind here"* — and the gap between
@@ -993,13 +999,14 @@ else has this shape, and would I have seen it fail?"
   scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
   `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
   has been copied wrong before.
-- **[#451](https://github.com/LASTRADA-Software/fastcached/issues/451)** —
-  `scripts/dist-compile-e2e.sh` still carries its own `free_port`, `wait_for_port`,
-  `wait_for_log`, `http_get`, `fail` and `stop_and_require_exit`, and inlines the
-  node start recipe about ten times. Held back from #449 deliberately: #445 was in
-  the merge queue rewriting the same helpers, and taking a hand-merge risk in the
-  one file where a wrongly-merged wait is silent is the wrong trade at any conflict
-  probability. When it lands, `wait_for_registration` — #445's corrected `1 of 1
-  toolchain(s) registered` wait — **moves into** `lib/e2e-common.sh` rather than
-  being written an eighth time, and that file's `http_get` takes the shared one's
-  final-chunk fix rather than keeping its own version of the bug.
+- **[#627](https://github.com/LASTRADA-Software/fastcached/issues/627)** —
+  `launcher-replay-e2e.sh` keeps its own `fail`, carrying the
+  `[ "${BASHPID:-$$}" = "$top_pid" ]` guard the bash-3.2 table above bans by name:
+  correct on bash 4, silently inert on macOS 3.2, where a `fail` inside `( ... )`
+  then ends only the subshell. Allowlisted in `check-e2e-helpers.sh`'s
+  helper-collision scan until it takes the shared `fail`.
+- **[#628](https://github.com/LASTRADA-Software/fastcached/issues/628)** —
+  `migrate-storage-e2e.sh` keeps its own `fail` and, worse, spells `free_port` as
+  `port` and draws 40000–59999, entirely inside Linux's default ephemeral range.
+  The name scan cannot see the second one, which is why its allowlist row says so
+  in prose.

@@ -564,6 +564,46 @@ wait_for_log() {
         "$pid" "$logfile" "$seconds"
 }
 
+# The line a compile node logs when a heartbeat round was ACCEPTED by its
+# scheduler, and the marker `wait_for_registration` below waits on.
+#
+# A named constant rather than a literal inside the function, because it is what
+# the self-test stages both halves of: this text must be reached by
+# `1 of 1 toolchain(s) registered` and must NOT be reached by
+# `0 of 1 toolchain(s) registered`, and a test that spelled the marker out a
+# second time would agree with itself whatever the function does.
+E2eRegisteredMarker="1 of 1 toolchain(s) registered"
+
+# Wait until a node's heartbeat round was ACCEPTED by its scheduler.
+#
+# THE wait #449 is about, and it is here rather than in a fixture for the reason
+# the divergence happened at all. `dist-compile-e2e.sh` matched the bare word
+# `registered` at three sites; the summary line is logged after every heartbeat
+# round whatever the outcome, so `0 of 1 toolchain(s) registered` matches it too
+# and those waits returned for a worker the scheduler had TURNED AWAY. The
+# fixture then proceeded against a fleet it believed was formed, nothing failed,
+# and the property under test was simply not being tested.
+#
+# Correcting that in one fixture and leaving the other copies alone would fix the
+# instance and reproduce the cause, so the corrected wait lives here and there is
+# one of it.
+#
+# WHY THE COUNT IS LITERAL rather than a parameter. `1 of 1` is
+# accepted-of-served, and the fact being waited on is "the scheduler took
+# everything this node offered". Every node these fixtures start serves exactly
+# one toolchain, so the accepted form is `1 of 1`. A fixture that some day starts
+# a node serving two grows a parameter here -- and the parameter is then the
+# ACCEPTED count, never the served one and never zero, because a marker naming
+# zero accepted toolchains is the defect above wearing a parameter.
+#
+# @param 1 pid to watch, or "-"
+# @param 2 what it is, for the messages
+# @param 3 the log to watch
+# @param 4 optional bound in seconds; defaults to `e2e_wait_seconds`
+wait_for_registration() {
+    wait_for_log "$E2eRegisteredMarker" "$1" "$2" "$3" ${4+"$4"}
+}
+
 # Stop a process and require it to actually exit, within a bound.
 #
 # `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
