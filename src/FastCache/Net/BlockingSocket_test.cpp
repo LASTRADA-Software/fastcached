@@ -188,8 +188,15 @@ TEST_CASE("Suppression is either armed on the socket or carried in the send flag
     // which is why the case above needs kilobytes to provoke it. A regression test
     // that only sometimes sees the signal is the thing this repository already
     // records as worth nothing, so this pins the invariant the fix restored.
+    // Both arms assert, and the `SO_NOSIGPIPE` one is not symmetry for tidiness: ZERO is
+    // the answer this case exists to pin. `MSG_NOSIGNAL` may well be DEFINED on a macOS
+    // SDK new enough to declare it, while `CMAKE_OSX_DEPLOYMENT_TARGET` lets the binary
+    // run on an older kernel -- and a flag the kernel does not know fails the send. So
+    // widening this arm to `MSG_NOSIGNAL` is the exact regression, and until #685 it
+    // would have been reported as a pass: the arm said `SUCCEED("SO_NOSIGPIPE arms the
+    // descriptor here")`, which observed nothing at all.
     #if defined(SO_NOSIGPIPE)
-    SUCCEED("SO_NOSIGPIPE arms the descriptor here, so a raw sender needs no extra flag");
+    CHECK(Detail::NoSignalSendFlags() == 0);
     #else
     CHECK(Detail::NoSignalSendFlags() == MSG_NOSIGNAL);
     #endif

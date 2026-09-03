@@ -971,6 +971,18 @@ whole fix — it exits 4, every `catch_discover_tests` registration carries
   leading-`//` test is not enough, because a block written without leading stars carries
   whole paragraphs and its body is exactly what a historic note looks like. A contributor
   tripped by that could make the build green only by rewording the comment.
+- **A `SUCCEED` that NAMES a mechanism reads like an assertion about it, and is not one.**
+  `BlockingSocket_test.cpp`'s `SO_NOSIGPIPE` arm said "SO_NOSIGPIPE arms the descriptor
+  here, so a raw sender needs no extra flag" and observed nothing — while the checkable
+  fact was one line away, `NoSignalSendFlags() == 0`, and is the fact the case exists for:
+  `MSG_NOSIGNAL` may be *defined* by a macOS SDK while `CMAKE_OSX_DEPLOYMENT_TARGET` lets
+  the binary run on an older kernel, and a flag the kernel does not know fails the send.
+  Widening that arm is the exact regression, and it would have reported a pass. It was
+  classified as legitimate twice — in the ticket and by the sweep — and only review caught
+  it, by reading the code rather than the message. **The two signals a check can see do
+  not reach this shape**: no bail-out `return`, no skip vocabulary. Which is why the rule
+  is the thing that must be internalised and the check is only the door the defect came
+  through.
 - **"Covered by another test" is a reason to SKIP, never a reason to pass.**
   `ServiceControl_test.cpp` deliberately does not call `InstallService` on Windows and
   macOS — a unit test must not register a service on the host — and said so in a
