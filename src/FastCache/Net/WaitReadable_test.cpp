@@ -298,8 +298,17 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     // the thread that owns the socket, so what crosses back is the observation.
     std::atomic<bool> openAfterHalfClose { false };
 
+    // The same marshalling, for the same reason. This one reads "the observer had
+    // not resolved before we half-closed", which is what makes the reply below an
+    // answer to the EOF rather than something already in flight -- and asserting it
+    // HERE, on the client thread, is the exact hazard the paragraph above records:
+    // a `REQUIRE` that fires inside a `jthread` body terminates the process instead
+    // of failing the case. The remedy had been applied three lines below it and not
+    // to it.
+    std::atomic<bool> unresolvedBeforeHalfClose { false };
+
     std::vector<std::byte> received;
-    std::jthread client { [port, &observed, &received, &openAfterHalfClose] {
+    std::jthread client { [port, &observed, &received, &openAfterHalfClose, &unresolvedBeforeHalfClose] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -307,7 +316,7 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
             return;
 
         (void) WaitForFlag(observed.arming);
-        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+        unresolvedBeforeHalfClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // **Half-close, not close.** The read half stays open, which is the whole
         // point: a `Close()` here would make the assertion below unreachable.
@@ -341,6 +350,10 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
 
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
+
+    // The observer was still parked when the half-close happened, so the reply below
+    // answers the EOF and is not something that was already on its way.
+    CHECK(unresolvedBeforeHalfClose.load(std::memory_order_relaxed));
 
     // A half-close is not a close: the client's socket stayed open to read with.
     CHECK(openAfterHalfClose.load(std::memory_order_relaxed));
