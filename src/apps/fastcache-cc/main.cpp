@@ -1549,6 +1549,17 @@ void RecordManifest(Config const& cfg,
     // every compile on that machine, and such a manifest revalidates forever and
     // serves its object into any checkout that computes the key (issue #368).
     //
+    // The depfile branch above looks like the exception and is not, which is worth
+    // saying because it is the obvious objection: `ReadDepFile` returning a value
+    // seems to BE the observation, so an empty parse of it could be read as an
+    // honest empty set. It cannot. A GNU depfile lists the translation unit among
+    // its own prerequisites, so a real compile never parses to nothing -- an empty
+    // parse means the file was truncated, half-written or in a shape
+    // `ParseDepFilePaths` does not recognise, which is "I could not read it" again
+    // rather than "there is nothing to read". Both routes into this line therefore
+    // reach it for the same reason, and neither of them can honestly say
+    // `Observed({})`.
+    //
     // Said with a VALUE rather than by returning early, which is what this used to
     // do. That left `BuildManifest` -- a library entry point -- correct only because
     // of a guard one translation unit away that nothing in `DirectManifest.cpp`

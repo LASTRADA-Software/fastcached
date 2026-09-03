@@ -446,7 +446,7 @@ class ReportedDependencies
     /// depends on nothing -- and is accepted. It is not the same value as
     /// `NotObserved()` and must never be spelled to mean it.
     /// @param paths The paths the record named, as the driver spelled them.
-    /// @return Inputs stating that the record was read.
+    /// @return A record stating that the compile's dependencies were read.
     [[nodiscard]] static ReportedDependencies Observed(std::vector<std::string> paths)
     {
         return ReportedDependencies { std::move(paths), true };
@@ -455,7 +455,7 @@ class ReportedDependencies
     /// No dependency record reached the caller: no `/showIncludes` notes, no
     /// depfile, nothing. `BuildManifest` refuses this with
     /// `ManifestFault::DepsNotObserved` rather than recording what it does not know.
-    /// @return Inputs stating that nothing was observed.
+    /// @return A record stating that nothing was observed.
     [[nodiscard]] static ReportedDependencies NotObserved()
     {
         return ReportedDependencies { {}, false };
