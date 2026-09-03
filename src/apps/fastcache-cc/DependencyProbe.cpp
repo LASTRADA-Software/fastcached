@@ -218,7 +218,8 @@ namespace
         // path reaching here is anchored to a working directory any more, whichever
         // branch it came down — which is the case about which the three genuinely do
         // agree (see the header for where they part on the ones that are).
-        if (IsToolchainHeader(path, layout))
+        auto const pathClass = ClassifyAgainstRoots(path, layout);
+        if (pathClass != PathClass::Project)
         {
             // Which of two true things a dropped drive-relative path is REPORTED
             // as, and the root question is what decides. Such a path is anchored to
@@ -238,21 +239,49 @@ namespace
             // — so the root question is asked here instead, and only for the
             // drive-relative path no ordinary build produces at all. The toolchain
             // drop is 476 of a real translation unit's 635 paths and still costs
-            // exactly one root test.
+            // exactly one root test -- `ClassifyAgainstRoots` above, whose answer
+            // also carries the near miss below, so naming that third outcome bought
+            // no extra pass over the path.
             if (driveRelative && !RootToken(path, layout).has_value())
                 return Dropped(PathDisposition::DriveRelative);
+
+            // A root spelled almost right, read off the classification rather than
+            // inferred from two classifiers disagreeing. It used to be the latter:
+            // the classifier matched a root character-wise while `Canonicalize`
+            // matched segment-wise, so `/x/build-other/a.h` fell out of the gap
+            // between them and was reported here by arriving at the bottom of this
+            // function. That gap was a violation of the invariant the three
+            // classifiers exist to keep (issue #562) and is closed; the fault it
+            // happened to name is not, because it is the one root fault of the three
+            // an operator repairs by editing a root rather than by moving a file.
+            // Read off the ONE classification, not asked again afterwards: a marker
+            // match re-examined against the roots reports a vendored tree beside the
+            // source root as a misspelling, which is a healthy layout told to fix a
+            // correct root.
+            if (pathClass == PathClass::NearMissRoot)
+                return Dropped(PathDisposition::Uncanonical);
             return Dropped(PathDisposition::Toolchain);
         }
 
         if (auto token = RootToken(path, layout); token.has_value())
             return { .disposition = PathDisposition::Keyed, .token = *std::move(token) };
 
-        // Under no root, and the two ways to arrive there are different repairs.
-        // `Uncanonical` means the two root tests disagreed: IsToolchainHeader's
-        // prefix match is character-wise and Canonicalize's is segment-wise, so
-        // `/x/build-other/a.h` is project content to the first and under no root to
-        // the second — a root spelled almost right, which folding into "toolchain"
-        // would make indistinguishable from an ordinary system header.
+        // `ClassifyAgainstRoots` called this path rooted and `Canonicalize` then
+        // produced nothing, which the shared rule leaves no way to reach: since
+        // issue #562 both ask `PathCanon`'s segment-boundary test, and the only
+        // remaining difference is the markers, which cannot make a path MORE
+        // rooted (a marker match is `Toolchain`, handled above). Answered
+        // rather than asserted because the alternative to answering is keying a path
+        // with no portable form -- the producing machine's absolute spelling in the
+        // key -- and that is the one outcome here worth being total about.
+        //
+        // Reported as `Uncanonical` rather than as `Toolchain`, and the choice is
+        // the residual's whole value: `toolchain` is 476 of a real TU's 635 paths,
+        // so a path arriving here because the two rules had drifted apart AGAIN
+        // would vanish into the largest bucket in the note. `no canonical form` is
+        // the one line the operator documentation tells a reader to act on, and an
+        // answer that cannot be determined belongs in its own outcome rather than
+        // in the nearest neighbour.
         return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Uncanonical);
     }
 } // namespace

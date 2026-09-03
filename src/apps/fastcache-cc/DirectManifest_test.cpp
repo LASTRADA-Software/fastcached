@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheKey.hpp"
+#include "DependencyProbe.hpp"
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 #include "KeyDigestTestSupport.hpp"
+#include "ReplayGuard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -253,6 +256,171 @@ TEST_CASE("IsToolchainHeader treats a path under no known root as toolchain")
     // stamp is the only representable choice.
     auto const layout = WindowsLayout();
     CHECK(IsToolchainHeader(R"(E:\somewhere\else\foreign.hpp)", layout));
+}
+
+TEST_CASE("A sibling directory extending a root's last segment is under no root, everywhere (issue #562)")
+{
+    // The regression this case exists for, and it is an AGREEMENT rather than an
+    // answer: `IsToolchainHeader` judged "under a root" with a bare `starts_with`
+    // and no segment-boundary check, while `PathCanon::Canonicalize` has always
+    // required the boundary. So under source root `/home/dev/proj` the sibling
+    // `/home/dev/project-x/a.hpp` was project content to one and under no root to
+    // the other -- a violation of the invariant that makes the key filter, the
+    // manifest and the replay guard all judge by the one classifier, which is
+    // exactly so they cannot disagree.
+    //
+    // It failed SAFE (the classifier was the more permissive of the two, so such a
+    // header was hashed and revalidated rather than dropped), which is why nothing
+    // caught it: every other case in this file passes with the bug present. What
+    // does not pass is asking the two predicates the same question and comparing
+    // the ANSWERS, so that is what this asserts -- reinstating the bare
+    // `starts_with` in `IsToolchainHeader` turns the first section red.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+
+    // Not a marker path anywhere in this case, so `IsToolchainHeader` is answering
+    // purely on roots and the two predicates are comparable.
+    auto const rooted = [&layout](std::string_view path) {
+        return FastCache::PathCanon::Canonicalize(path, layout) != path;
+    };
+
+    SECTION("the classifier and the canonicalizer give one answer")
+    {
+        constexpr std::array<std::string_view, 5> paths {
+            "/home/dev/project-x/a.hpp",    // the sibling: the case that used to disagree
+            "/home/dev/proj-generated/b.h", // the same shape against the source root again
+            "/home/dev/proj/build-other/c", // and against the build tree
+            "/home/dev/proj/src/d.hpp",     // ordinary project content
+            "/usr/include/vector",          // ordinary outside-roots content
+        };
+        for (auto const path: paths)
+        {
+            INFO("path: " << path);
+            CHECK(IsToolchainHeader(path, layout) == !rooted(path));
+        }
+    }
+
+    SECTION("the near miss is still named, rather than lost with the bug")
+    {
+        // Agreeing that the path lies outside the roots must not cost the operator
+        // the one root fault they repair by editing a root. It is an outcome of the
+        // classification now instead of falling out of a disagreement.
+        CHECK(ClassifyAgainstRoots("/home/dev/project-x/a.hpp", layout) == PathClass::NearMissRoot);
+        CHECK(ClassifyAgainstRoots("/usr/include/vector", layout) == PathClass::Toolchain);
+        CHECK(ClassifyAgainstRoots("/home/dev/proj/src/d.hpp", layout) == PathClass::Project);
+    }
+
+    SECTION("a vendored tree BESIDE a root is toolchain, not a root spelled almost right")
+    {
+        // The marker scan settles this, and it has to settle it in the SAME answer:
+        // asked as a separate question, a near-miss test sees `.../proj-deps/...`
+        // character-prefixing `/home/dev/proj` with no boundary and calls a perfectly
+        // healthy vcpkg layout a misspelled root -- refusing a manifest over it on
+        // the manifest side and probing it for existence on the replay-guard side,
+        // which discards every hit on a machine whose dependencies sit elsewhere.
+        constexpr std::string_view vendored = "/home/dev/proj-deps/vcpkg_installed/x64-linux/include/fmt/core.h";
+        CHECK(ClassifyAgainstRoots(vendored, layout) == PathClass::Toolchain);
+
+        // The degenerate form of the same mistake: a short source root that happens
+        // to prefix the SDK would otherwise make every Windows header a near miss.
+        FastCache::PathCanon::Layout const shortRoot { .sourceRoot = R"(C:\P)", .buildTree = R"(C:\P\out)" };
+        constexpr std::string_view sdk = R"(C:\Program Files (x86)\Windows Kits\10\include\um\windows.h)";
+        CHECK(ClassifyAgainstRoots(sdk, shortRoot) == PathClass::Toolchain);
+    }
+
+    SECTION("a near miss of one root that is genuinely under the other is project content")
+    {
+        // Why the near miss is decided across the whole layout rather than one root
+        // at a time: a build tree may legitimately be spelled as the source root's
+        // sibling, and a path inside it is then a near miss of one root and correctly
+        // under the other. Calling that a misspelling reports a healthy layout broken.
+        FastCache::PathCanon::Layout const sideBySide { .sourceRoot = "/w/src", .buildTree = "/w/src-other" };
+        CHECK(ClassifyAgainstRoots("/w/src-other/a.hpp", sideBySide) == PathClass::Project);
+    }
+}
+
+TEST_CASE("The key filter, the manifest and the replay guard all place the sibling outside the roots (issue #562)")
+{
+    // The invariant stated one level up, at the three surfaces that consume it. They
+    // already share `IsToolchainHeader`; what they did NOT share was that
+    // classifier's idea of "under a root", which disagreed with the canonicalizer
+    // every one of them then hands the path to. Asserted here as well as at the
+    // predicate because a shared NAME is not shared behaviour -- the rulebook
+    // records that as its own class of defect -- and because a fourth consumer
+    // added later has somewhere to be added.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    constexpr std::string_view sibling = "/home/dev/project-x/a.hpp";
+    constexpr std::string_view project = "/home/dev/proj/src/d.hpp";
+
+    SECTION("the key filter drops it, and says which kind of drop it is")
+    {
+        std::vector<std::string> const raw { std::string { sibling }, std::string { project } };
+        auto const set = KeyDependencySet(std::span<std::string const> { raw }, layout, "/home/dev/proj/build");
+
+        CHECK(set.keyed == std::vector<std::string> { "<SRCROOT>/src/d.hpp" });
+        CHECK(set.Count(PathDisposition::Uncanonical) == 1);
+        CHECK(set.Count(PathDisposition::Toolchain) == 0);
+    }
+
+    SECTION("the manifest refuses over it, naming the root rather than the file")
+    {
+        // A refusal rather than a drop, and it is the one path outside the roots
+        // that is: nothing covers a near miss -- it is a project header the roots
+        // failed to name -- so a manifest without it would revalidate everything
+        // except the file being edited. `OutsideRoots` would send the operator
+        // looking for a missing file instead of at the root they misspelled.
+        auto const refused = CanonicalSourceToken(sibling, layout, "/home/dev/proj/build");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().fault == ManifestFault::Uncanonical);
+        CHECK(DescribeManifestFailure(refused.error()) == std::format("no canonical form: {}", sibling));
+
+        // The contrast that makes the label mean something: a path sharing no
+        // prefix with either root is the ordinary `add_subdirectory(../shared)`
+        // layout, and its remedy is a root that is missing rather than mistyped.
+        auto const elsewhere = CanonicalSourceToken("/elsewhere/shared/t.cpp", layout, "/home/dev/proj/build");
+        REQUIRE_FALSE(elsewhere.has_value());
+        CHECK(elsewhere.error().fault == ManifestFault::OutsideRoots);
+    }
+
+    SECTION("the replay guard still probes it, and states why that is not a disagreement")
+    {
+        // The one deliberate difference, and it is about a different QUESTION rather
+        // than about which paths are outside the roots. The guard skips outside-roots
+        // paths because the toolchain stamp covers them collectively, so a machine
+        // with a different toolchain has a different key and never sees the value at
+        // all. A near miss is covered by nothing, so that argument does not reach it
+        // and skipping it would replay a path naming a file that may not exist here
+        // -- issue #53's non-converging rebuild.
+        auto const notes = std::format("Note: including file: {}\r\n"
+                                       "Note: including file: /usr/include/vector\r\n",
+                                       sibling);
+        std::vector<FastCache::TextRegion> const regions { { .grammar = FastCache::PathCanon::Grammar::ShowIncludes,
+                                                             .bytes = notes } };
+        auto const probed = ReplayedDependencyPaths(regions, layout);
+        CHECK(probed == std::vector<std::string> { std::string { sibling } });
+    }
+
+    SECTION("a vendored tree beside a root stays outside every one of the three")
+    {
+        // The same three surfaces against the path the marker scan claims, because
+        // that is where asking the near-miss question separately went wrong: the
+        // key must still drop it as toolchain rather than as a misspelled root, the
+        // manifest must not refuse over it, and the guard must not probe it.
+        constexpr std::string_view vendored = "/home/dev/proj-deps/vcpkg_installed/x64-linux/include/fmt/core.h";
+
+        std::vector<std::string> const raw { std::string { vendored }, std::string { project } };
+        auto const set = KeyDependencySet(std::span<std::string const> { raw }, layout, "/home/dev/proj/build");
+        CHECK(set.Count(PathDisposition::Toolchain) == 1);
+        CHECK(set.Count(PathDisposition::Uncanonical) == 0);
+
+        auto const refused = CanonicalSourceToken(vendored, layout, "/home/dev/proj/build");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().fault == ManifestFault::OutsideRoots);
+
+        auto const notes = std::format("Note: including file: {}\r\n", vendored);
+        std::vector<FastCache::TextRegion> const regions { { .grammar = FastCache::PathCanon::Grammar::ShowIncludes,
+                                                             .bytes = notes } };
+        CHECK(ReplayedDependencyPaths(regions, layout).empty());
+    }
 }
 
 TEST_CASE("ParseIncludePaths extracts paths and ignores unrelated lines")
@@ -742,10 +910,11 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
 
     SECTION("a source under a root spelled almost right")
     {
-        // `/w/src-other` prefix-matches `/w/src` character-wise, so IsToolchainHeader
-        // calls it project content, while Canonicalize's segment-wise test declines.
-        // Distinct from OutsideRoots precisely because the remedy is: the root is
-        // nearly correct, rather than the file being somewhere else entirely.
+        // `/w/src-other` prefix-matches `/w/src` character-wise while lying under no
+        // root -- which every classifier now agrees about (issue #562) and
+        // `ClassifyAgainstRoots` names as its own outcome. Distinct from OutsideRoots
+        // precisely because the remedy is: the root is nearly correct, rather than
+        // the file being somewhere else entirely.
         auto const built = inputsWith("/w/src-other/t.cpp", {}, "/w/build");
         REQUIRE_FALSE(built.has_value());
         CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Uncanonical, .path = "/w/src-other/t.cpp" });
@@ -804,10 +973,12 @@ TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #
 
     SECTION("one under a root spelled almost right")
     {
-        // `<root>/src-other` prefix-matches the source root character-wise, so
-        // IsToolchainHeader calls it project content, while Canonicalize's
-        // segment-wise test declines. Classified before it is opened, so it need not
-        // exist -- which is what separates this from Unreadable below.
+        // `<root>/src-other` prefix-matches the source root character-wise while
+        // lying under no root, so it is refused as a near miss rather than dropped
+        // the way the rest of the outside-roots content is (issue #562): nothing
+        // covers a project header the roots failed to name. Classified before it is
+        // opened, so it need not exist -- which is what separates this from
+        // Unreadable below.
         auto const stray = (root / "src-other" / "generated.hpp").string();
         auto const built = build({ stray }, root.string());
         REQUIRE_FALSE(built.has_value());

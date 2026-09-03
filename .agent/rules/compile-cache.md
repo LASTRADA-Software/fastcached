@@ -230,6 +230,61 @@ same on both — the same defect with no MSVC anywhere near it.
     them would be machine-specific. The set is sorted and deduplicated because
     `/showIncludes` repeats a header once per inclusion site and emission order is a
     property of the driver.
+    - **Sharing the classifier is not sharing the QUESTION, and the missing half was
+      "under a root".** `IsToolchainHeader` answered it with a bare `starts_with` and no
+      segment-boundary check while `PathCanon::Canonicalize` — which every one of the three
+      then hands the path to — has always required the boundary, so under a source root
+      `/home/dev/proj` the sibling `/home/dev/project-x/a.hpp` was project content to the
+      classifier and under no root to the canonicalizer
+      ([#562](https://github.com/LASTRADA-Software/fastcached/issues/562)). It failed SAFE
+      — `starts_with` only ever classifies *more* paths as project content, so such a header
+      was hashed and revalidated rather than dropped, and the unsafe direction (a project
+      header called toolchain, which revalidates forever) could not be produced by it. What
+      it cost was the invariant this bullet states, and an invariant false in one of three
+      places is not available to reason from in the other two. One
+      `PathCanon::RelateToLayout` now answers it — a `RootRelation` rather
+      than a `bool`, for the reason below — taking NATIVE forms on purpose: `IsSegmentPrefix`
+      sees only comparison
+      forms whose separator is `/`, while `DirectManifest`'s `ToComparable` folds to `\`
+      to match its backslash-spelled toolchain markers, so handing one's comparison form to
+      the other asks for a boundary byte that cannot be there. Do not "unify separator
+      handling" into `IsSegmentPrefix`; its single-separator test is correct for its input
+      domain and a second branch there would be dead.
+      - **The near miss the bug produced is kept, and is now ASKED rather than inferred.**
+        `PathDisposition::Uncanonical` and `ManifestFault::Uncanonical` used to be whatever
+        fell out of the gap between the two predicates. They are the one root fault of the
+        three an operator repairs by editing a *root*, so closing the gap without naming the
+        state would have turned a typo'd root into `outside roots` and sent them looking for
+        a file that is exactly where they put it. `RootRelation::NearMiss` is that question
+        asked directly, and the "under neither" half is load-bearing, since a build tree
+        spelled as the source root's sibling makes a path a near miss of one root and
+        legitimately under the other — which is why `RelateToLayout` answers `Under` before
+        `NearMiss` rather than looping at the call site. The three consumers then agree the
+        path lies outside the roots while still reporting *which* kind of outside.
+      - **And the near miss is READ OFF the classification, never asked afterwards.**
+        `Cc::ClassifyAgainstRoots` returns `Project` / `NearMissRoot` / `Toolchain` in one
+        answer, with the marker scan winning, because a marker match re-examined against the
+        roots is overruled by them: `<root>-deps/vcpkg_installed/.../core.h` character-
+        prefixes `<root>` with no boundary, so a separate near-miss call reported an
+        ordinary vcpkg layout as a misspelled root — refusing every manifest that included
+        it, and probing it in the replay guard so every hit was discarded on a machine whose
+        dependencies sit elsewhere. A short source root (`C:\P`) makes that total: every
+        Windows SDK header becomes a "near miss". Two questions of one path, answered by two
+        calls, is how the second one gets to overrule the first — which is also why there is
+        no `IsNearMissRoot` predicate beside `IsToolchainHeader`: a name shaped like its peer
+        invites a caller to reintroduce exactly that shape.
+      - **The replay guard still probes such a path, and that is a difference of QUESTION,
+        not of predicate.** Its exclusion of outside-roots paths rests on the toolchain stamp
+        covering them collectively, so a machine with a different toolchain has a different
+        key and never sees the value; a near miss is covered by nothing, so the argument does
+        not reach it and skipping it would replay a path naming a file that may be elsewhere
+        here — issue #53 exactly. The manifest REFUSES over one for the mirror reason: a
+        dropped near miss leaves a hit revalidating everything except the header being
+        edited, so it is the only outside-roots path that is a refusal rather than a drop.
+      - **A fourth spelling was looked for and one exists, deliberately.**
+        `NormalizeForLayout`'s helper decides "inside a root" with `weakly_canonical` +
+        `lexically_relative` — filesystem identities rather than spellings, and it needs the
+        TAIL rather than a bool. Different question, stated at the site; not a copy.
     - **The compiler identity that "covers" them is a string a compiler had to say, so
       every driver is asked the one way it answers**
       ([#195](https://github.com/LASTRADA-Software/fastcached/issues/195)). Dropping 476
@@ -636,11 +691,16 @@ same on both — the same defect with no MSVC anywhere near it.
       classifier, and it is one extra root test on a shape no ordinary build produces: the
       toolchain drop, 476 of a real translation unit's 635 paths, still costs exactly one.
     - **`Uncanonical` is a third root-spelling fault that had no name at all.**
-      `IsToolchainHeader`'s prefix match is character-wise and `Canonicalize`'s is
-      segment-wise, so `/x/build-other/a.h` is project content to the first and under no root
-      to the second. A root off by a suffix, and while both counted as "toolchain" it was
-      indistinguishable from an ordinary system header — though it is the one of the three an
-      operator repairs by editing a root.
+      `/x/build-other/a.h` under a `/x/build` root is a root off by a suffix, and while it
+      counted as "toolchain" it was indistinguishable from an ordinary system header — though
+      it is the one of the three an operator repairs by editing a root. It arrived here by
+      accident at first: `IsToolchainHeader`'s prefix match was character-wise and
+      `Canonicalize`'s segment-wise, so such a path fell out of the gap between them. That
+      gap was itself the defect (#562, above) and is closed; the fault survived it by being
+      asked for directly, as `Cc::ClassifyAgainstRoots`'s third outcome. A state produced by
+      an inconsistency and a
+      state produced by a predicate look identical from the outside and are not the same
+      thing to reason about — the first is only ever as reliable as the bug.
     - **The tally counts reported OCCURRENCES**, so it sums to `M` while the keyed set is
       what survived sort-and-deduplicate. `/showIncludes` repeats a header once per inclusion
       site, so the two genuinely differ on every real translation unit and the note's numbers

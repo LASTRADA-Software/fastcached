@@ -344,7 +344,7 @@ for every path that did not reach the key:
 | `toolchain` | Under neither root, or inside a vendored tree. The ordinary bulk of any compile: the compiler identity in the key already covers this content collectively. That identity is the compiler's own **version banner** — `Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64`, `clang version 22.1.3 (…)` — so two MSVC toolsets, or the x86 and x64 driver of one, key apart even though their headers are the same files. |
 | `drive-relative` | A Windows `C:foo` path under neither root. It resolves against that drive's own current directory — per-process state on the producing machine that no cache entry can record. One under a drive-relative *root* is keyed like any other, or counted `toolchain` if it is vendored content. |
 | `unanchored` | Relative, with no working directory to resolve it against. |
-| `no canonical form` | Under a root by character prefix but not by path segment: a root spelled almost right, such as `/x/build-other` against `/x/build`. |
+| `no canonical form` | Under no root, yet a character prefix of one: a root spelled almost right, such as `/x/build-other` against `/x/build`. Fix the root rather than looking for the file. |
 | `empty` | The driver named an empty path. |
 
 `0 of M` with M non-zero is the line to act on, and the reason says which repair.

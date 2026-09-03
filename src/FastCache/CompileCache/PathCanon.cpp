@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <string_view>
@@ -75,6 +76,24 @@ namespace
 
         // Exact match, or the next byte is a separator (segment boundary).
         return pathCmp.size() == rootCmp.size() || pathCmp[rootCmp.size()] == '/';
+    }
+
+    /// The relation between two comparison forms, from one pass of the rule above.
+    ///
+    /// `NearMiss` is defined as the complement of `Under` over the same bytes rather
+    /// than as a second opinion about them, so the two can never disagree about the
+    /// boundary. An empty root is `Outside` of everything: it prefixes every path
+    /// character-wise and is `Under` nothing, so without this it would make every
+    /// path in a layout naming no build tree a near miss of that root.
+    ///
+    /// @param pathCmp Comparison form of the candidate path.
+    /// @param rootCmp Comparison form of a root.
+    /// @return Where the path stands relative to the root.
+    [[nodiscard]] RootRelation RelateFolded(std::string_view pathCmp, std::string_view rootCmp)
+    {
+        if (rootCmp.empty() || !pathCmp.starts_with(rootCmp))
+            return RootRelation::Outside;
+        return IsSegmentPrefix(pathCmp, rootCmp) ? RootRelation::Under : RootRelation::NearMiss;
     }
 
     /// How deep a root reaches, for deciding which of two matching roots is the
@@ -521,6 +540,24 @@ Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
     // begins with one too; both name a fixed location rather than a cwd-relative
     // one, so neither may be resolved against the working directory.
     return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
+}
+
+RootRelation RelateToLayout(std::string_view path, Layout const& layout)
+{
+    // The comparison forms are built here rather than asked of the caller, so that
+    // the boundary byte `IsSegmentPrefix` looks for is the one `ComparisonForm`
+    // guarantees. That pairing is the whole reason this entry point exists: the
+    // launcher's classifier folds separators to BACKSLASH (its toolchain markers
+    // are spelled that way), so handing its comparison form to `IsSegmentPrefix`
+    // would ask for a `/` that cannot be there and answer "not under root" for
+    // every path under every root.
+    std::string const pathCmp = ComparisonForm(path);
+    auto const source = RelateFolded(pathCmp, ComparisonForm(layout.sourceRoot));
+    auto const build = RelateFolded(pathCmp, ComparisonForm(layout.buildTree));
+    // Strongest answer wins, and `Under` outranking `NearMiss` is the whole content
+    // of this function: with a build tree spelled as the source root's sibling, a
+    // path inside it is a near miss of one root and correctly under the other.
+    return std::max(source, build);
 }
 
 std::string Canonicalize(std::string_view absolutePath, Layout const& layout)
