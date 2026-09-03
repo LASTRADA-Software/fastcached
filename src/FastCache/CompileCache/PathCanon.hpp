@@ -138,7 +138,9 @@ enum class RootRelation : std::uint8_t
     Under,    ///< Under the root, on a segment boundary.
 };
 
-/// Where `path` stands in relation to `root`, judged on a **segment boundary**.
+/// Where `path` stands in relation to a layout's two roots, judged on a **segment
+/// boundary**: `Under` if it is under either, else `NearMiss` if it near-misses
+/// either, else `Outside`.
 ///
 /// This is the single definition of "is this path under this root", and it exists
 /// because there was briefly more than one. `Canonicalize` has always asked it
@@ -157,30 +159,20 @@ enum class RootRelation : std::uint8_t
 /// operator repairs by editing a *root*, so closing the gap without naming it would
 /// have sent them looking for a file that is exactly where they put it.
 ///
-/// Both arguments are **native** forms — the spellings a compiler and a build
-/// system emit, mixed separators and mixed case included. Folding them is this
-/// function's job precisely so a caller holding native paths does not fold its own
-/// comparison form and get the boundary byte wrong; `Canonicalize` needs the folded
-/// roots for other reasons and so keeps its own internal spelling of the same test.
+/// The path is a **native** form — the spelling a compiler or a build system emits,
+/// mixed separators and mixed case included — as are the layout's roots. Folding
+/// them is this function's job precisely so a caller holding native paths does not
+/// fold its own comparison form and get the boundary byte wrong; `Canonicalize`
+/// needs the folded roots for other reasons and so keeps its own internal spelling
+/// of the same test.
+///
+/// The strongest relation wins rather than the first root's, and that ORDER is
+/// load-bearing: a build tree spelled as the source root's sibling (`/w/src` and
+/// `/w/src-other`) makes a path both a near miss of one root and legitimately under
+/// the other, and that path is project content rather than a misspelling.
 ///
 /// An empty root relates to nothing: a layout that names no build tree must not
 /// make every path in the world lie under it, nor a near miss of it.
-///
-/// @param path A path in native form.
-/// @param root A layout root in native form.
-/// @return The relation.
-[[nodiscard]] RootRelation RelateToRoot(std::string_view path, std::string_view root);
-
-/// Where `path` stands in relation to a layout's two roots, strongest answer first:
-/// `Under` if it is under either, else `NearMiss` if it near-misses either, else
-/// `Outside`.
-///
-/// Not a loop over `RelateToRoot` at the call site, and the ORDER is why: a build
-/// tree spelled as the source root's sibling (`/w/src` and `/w/src-other`) makes a
-/// path both a near miss of one root and legitimately under the other, and that
-/// path is project content rather than a misspelling. Folding the path once instead
-/// of once per root is the other reason — this is on the launcher's per-dependency
-/// path, which runs a few hundred times per translation unit.
 ///
 /// @param path   A path in native form.
 /// @param layout The roots to relate it to.

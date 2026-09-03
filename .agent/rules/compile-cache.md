@@ -242,7 +242,7 @@ same on both — the same defect with no MSVC anywhere near it.
       header called toolchain, which revalidates forever) could not be produced by it. What
       it cost was the invariant this bullet states, and an invariant false in one of three
       places is not available to reason from in the other two. One
-      `PathCanon::RelateToRoot`/`RelateToLayout` now answers it — a `RootRelation` rather
+      `PathCanon::RelateToLayout` now answers it — a `RootRelation` rather
       than a `bool`, for the reason below — taking NATIVE forms on purpose: `IsSegmentPrefix`
       sees only comparison
       forms whose separator is `/`, while `DirectManifest`'s `ToComparable` folds to `\`
@@ -265,13 +265,14 @@ same on both — the same defect with no MSVC anywhere near it.
         `Cc::ClassifyAgainstRoots` returns `Project` / `NearMissRoot` / `Toolchain` in one
         answer, with the marker scan winning, because a marker match re-examined against the
         roots is overruled by them: `<root>-deps/vcpkg_installed/.../core.h` character-
-        prefixes `<root>` with no boundary, so a separate `IsNearMissRoot` call reported an
+        prefixes `<root>` with no boundary, so a separate near-miss call reported an
         ordinary vcpkg layout as a misspelled root — refusing every manifest that included
         it, and probing it in the replay guard so every hit was discarded on a machine whose
         dependencies sit elsewhere. A short source root (`C:\P`) makes that total: every
         Windows SDK header becomes a "near miss". Two questions of one path, answered by two
-        calls, is how the second one gets to overrule the first. `IsToolchainHeader` and
-        `IsNearMissRoot` remain as readings of the single answer, and it costs no extra pass.
+        calls, is how the second one gets to overrule the first — which is also why there is
+        no `IsNearMissRoot` predicate beside `IsToolchainHeader`: a name shaped like its peer
+        invites a caller to reintroduce exactly that shape.
       - **The replay guard still probes such a path, and that is a difference of QUESTION,
         not of predicate.** Its exclusion of outside-roots paths rests on the toolchain stamp
         covering them collectively, so a machine with a different toolchain has a different

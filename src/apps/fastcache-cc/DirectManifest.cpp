@@ -202,7 +202,7 @@ namespace
                 break;
         }
         // One classification, read three ways -- rather than `IsToolchainHeader` here
-        // and `IsNearMissRoot` again at whichever arm happens to want it, which is how
+        // and a near-miss test again at whichever arm happens to want it, which is how
         // a marker match came to be overruled by a root test run afterwards.
         switch (ClassifyAgainstRoots(resolved, layout))
         {
@@ -341,11 +341,6 @@ PathClass ClassifyAgainstRoots(std::string_view absolutePath, PathCanon::Layout 
 bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& layout)
 {
     return ClassifyAgainstRoots(absolutePath, layout) != PathClass::Project;
-}
-
-bool IsNearMissRoot(std::string_view absolutePath, PathCanon::Layout const& layout)
-{
-    return ClassifyAgainstRoots(absolutePath, layout) == PathClass::NearMissRoot;
 }
 
 std::string HashFileContents(std::string_view absolutePath)
@@ -722,7 +717,6 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
             // is the same correction `PathDisposition::DriveRelative` makes and for
             // the same reason. Canonicalizing IS that question: a token comes out
             // only for a path under a root.
-            //
             //
             // The third fact -- a root spelled almost right -- does NOT arrive here:
             // `ClassifyAgainstRoots` separates it, precisely so that a marker match

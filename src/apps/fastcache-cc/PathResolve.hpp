@@ -12,9 +12,13 @@ namespace FastCache::Cc
 /// Collapses every spelling of one filesystem location to a single one.
 ///
 /// This is the launcher's PATH-IDENTITY seam, and it exists because every root
-/// test in the launcher is a string prefix comparison — `IsToolchainHeader`,
-/// `PathCanon::CanonicalizeOne`, and through them the keyed dependency set and
-/// the replay guard. A comparison form that lowercases and unifies separators
+/// test in the launcher is a comparison of SPELLINGS rather than of filesystem
+/// identities: one rule, `PathCanon`'s segment-boundary prefix test, reached
+/// through `RelateToLayout` by `Cc::ClassifyAgainstRoots` — and so by the keyed
+/// dependency set, the manifest and the replay guard — and through
+/// `CanonicalizeOne` by the token rewrite. (Being ONE rule is issue #562; being a
+/// spelling comparison is what this seam is about, and is unchanged by it.)
+/// A comparison form that lowercases and unifies separators
 /// still cannot tell that `C:\Users\RUNNER~1\p\inc\h.h` and
 /// `C:\Users\runneradmin\p\inc\h.h` are the same file, so a root spelled one way
 /// matches nothing a driver spelling it the other way emits.

@@ -542,20 +542,15 @@ Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
     return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
 }
 
-RootRelation RelateToRoot(std::string_view path, std::string_view root)
+RootRelation RelateToLayout(std::string_view path, Layout const& layout)
 {
     // The comparison forms are built here rather than asked of the caller, so that
     // the boundary byte `IsSegmentPrefix` looks for is the one `ComparisonForm`
-    // guarantees. That pairing is the whole reason this wrapper exists: the
+    // guarantees. That pairing is the whole reason this entry point exists: the
     // launcher's classifier folds separators to BACKSLASH (its toolchain markers
     // are spelled that way), so handing its comparison form to `IsSegmentPrefix`
     // would ask for a `/` that cannot be there and answer "not under root" for
     // every path under every root.
-    return RelateFolded(ComparisonForm(path), ComparisonForm(root));
-}
-
-RootRelation RelateToLayout(std::string_view path, Layout const& layout)
-{
     std::string const pathCmp = ComparisonForm(path);
     auto const source = RelateFolded(pathCmp, ComparisonForm(layout.sourceRoot));
     auto const build = RelateFolded(pathCmp, ComparisonForm(layout.buildTree));

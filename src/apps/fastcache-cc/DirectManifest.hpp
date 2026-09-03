@@ -260,9 +260,9 @@ struct ManifestFailure
 /// which paths those are (issue #562).
 ///
 /// The key filter, the manifest and the replay guard all judge by this function, so
-/// what it means is what all three mean. A caller that also wants to know WHICH
-/// kind of non-project content it has asks `ClassifyAgainstRoots` once instead of
-/// this and `IsNearMissRoot` in turn.
+/// what it means is what all three mean — through `ClassifyAgainstRoots`, whose
+/// three-way answer they take rather than asking this and a second predicate in
+/// turn. Kept as the name the rulebook and this tree's comments are written around.
 ///
 /// @param absolutePath Native-form absolute include path.
 /// @param layout       This build's roots.
@@ -291,25 +291,14 @@ enum class PathClass : std::uint8_t
 /// nested under the build tree is toolchain content however well rooted it is), so
 /// asking "near miss?" separately, of a path a marker had already claimed, reported
 /// `<root>-deps/vcpkg_installed/.../core.h` as a misspelled root and refused a
-/// manifest over it. Both readings below come from this one answer, so a marker can
-/// no longer be overruled by a root test the caller ran afterwards.
+/// manifest over it. There is deliberately no `IsNearMissRoot` predicate beside
+/// `IsToolchainHeader` either: a name shaped like its peer invites a caller to ask
+/// the two in turn, which is that same defect written one call site further out.
 ///
 /// @param absolutePath Native-form absolute path.
 /// @param layout       This build's roots.
 /// @return What the path is to this build.
 [[nodiscard]] PathClass ClassifyAgainstRoots(std::string_view absolutePath, PathCanon::Layout const& layout);
-
-/// Whether an absolute path is a root spelled almost right — `ClassifyAgainstRoots`
-/// read as a predicate.
-///
-/// Reported as `PathDisposition::Uncanonical` on the key side and
-/// `ManifestFault::Uncanonical` on the manifest side; the replay guard probes such
-/// a path rather than skipping it, for the reason stated there.
-///
-/// @param absolutePath Native-form absolute path.
-/// @param layout       This build's roots.
-/// @return True when the path is a near miss of a root, under none, and unmarked.
-[[nodiscard]] bool IsNearMissRoot(std::string_view absolutePath, PathCanon::Layout const& layout);
 
 /// Hash a file's contents for manifest entry comparison. A missing or unreadable
 /// file yields an empty string, which never equals a recorded hash and so forces

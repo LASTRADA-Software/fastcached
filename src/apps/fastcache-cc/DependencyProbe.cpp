@@ -274,7 +274,15 @@ namespace
         // rather than asserted because the alternative to answering is keying a path
         // with no portable form -- the producing machine's absolute spelling in the
         // key -- and that is the one outcome here worth being total about.
-        return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Toolchain);
+        //
+        // Reported as `Uncanonical` rather than as `Toolchain`, and the choice is
+        // the residual's whole value: `toolchain` is 476 of a real TU's 635 paths,
+        // so a path arriving here because the two rules had drifted apart AGAIN
+        // would vanish into the largest bucket in the note. `no canonical form` is
+        // the one line the operator documentation tells a reader to act on, and an
+        // answer that cannot be determined belongs in its own outcome rather than
+        // in the nearest neighbour.
+        return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Uncanonical);
     }
 } // namespace
 

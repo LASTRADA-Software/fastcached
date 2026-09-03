@@ -302,43 +302,39 @@ TEST_CASE("A sibling directory extending a root's last segment is under no root,
     SECTION("the near miss is still named, rather than lost with the bug")
     {
         // Agreeing that the path lies outside the roots must not cost the operator
-        // the one root fault they repair by editing a root. It is asked for by name
-        // now instead of falling out of a disagreement.
-        CHECK(IsNearMissRoot("/home/dev/project-x/a.hpp", layout));
-        CHECK_FALSE(IsNearMissRoot("/usr/include/vector", layout));
-        CHECK_FALSE(IsNearMissRoot("/home/dev/proj/src/d.hpp", layout));
+        // the one root fault they repair by editing a root. It is an outcome of the
+        // classification now instead of falling out of a disagreement.
+        CHECK(ClassifyAgainstRoots("/home/dev/project-x/a.hpp", layout) == PathClass::NearMissRoot);
+        CHECK(ClassifyAgainstRoots("/usr/include/vector", layout) == PathClass::Toolchain);
+        CHECK(ClassifyAgainstRoots("/home/dev/proj/src/d.hpp", layout) == PathClass::Project);
     }
 
     SECTION("a vendored tree BESIDE a root is toolchain, not a root spelled almost right")
     {
-        // The marker scan settles this, and it has to settle it in the same answer:
-        // asked separately, `IsNearMissRoot` sees `.../proj-deps/...` character-
-        // prefixing `/home/dev/proj` with no boundary and calls a perfectly healthy
-        // vcpkg layout a misspelled root -- refusing a manifest over it on the
-        // manifest side and probing it for existence on the replay-guard side, which
-        // discards every hit on a machine whose dependencies sit elsewhere.
+        // The marker scan settles this, and it has to settle it in the SAME answer:
+        // asked as a separate question, a near-miss test sees `.../proj-deps/...`
+        // character-prefixing `/home/dev/proj` with no boundary and calls a perfectly
+        // healthy vcpkg layout a misspelled root -- refusing a manifest over it on
+        // the manifest side and probing it for existence on the replay-guard side,
+        // which discards every hit on a machine whose dependencies sit elsewhere.
         constexpr std::string_view vendored = "/home/dev/proj-deps/vcpkg_installed/x64-linux/include/fmt/core.h";
-        CHECK(IsToolchainHeader(vendored, layout));
-        CHECK_FALSE(IsNearMissRoot(vendored, layout));
         CHECK(ClassifyAgainstRoots(vendored, layout) == PathClass::Toolchain);
 
         // The degenerate form of the same mistake: a short source root that happens
         // to prefix the SDK would otherwise make every Windows header a near miss.
         FastCache::PathCanon::Layout const shortRoot { .sourceRoot = R"(C:\P)", .buildTree = R"(C:\P\out)" };
         constexpr std::string_view sdk = R"(C:\Program Files (x86)\Windows Kits\10\include\um\windows.h)";
-        CHECK(IsToolchainHeader(sdk, shortRoot));
-        CHECK_FALSE(IsNearMissRoot(sdk, shortRoot));
+        CHECK(ClassifyAgainstRoots(sdk, shortRoot) == PathClass::Toolchain);
     }
 
     SECTION("a near miss of one root that is genuinely under the other is project content")
     {
-        // Why `IsNearMissRoot` asks about the whole layout rather than one root: a
-        // build tree may legitimately be spelled as the source root's sibling, and a
-        // path inside it is then a near miss of one root and correctly under the
-        // other. Calling that a misspelling would report a healthy layout as broken.
+        // Why the near miss is decided across the whole layout rather than one root
+        // at a time: a build tree may legitimately be spelled as the source root's
+        // sibling, and a path inside it is then a near miss of one root and correctly
+        // under the other. Calling that a misspelling reports a healthy layout broken.
         FastCache::PathCanon::Layout const sideBySide { .sourceRoot = "/w/src", .buildTree = "/w/src-other" };
-        CHECK_FALSE(IsNearMissRoot("/w/src-other/a.hpp", sideBySide));
-        CHECK_FALSE(IsToolchainHeader("/w/src-other/a.hpp", sideBySide));
+        CHECK(ClassifyAgainstRoots("/w/src-other/a.hpp", sideBySide) == PathClass::Project);
     }
 }
 
@@ -916,7 +912,7 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
     {
         // `/w/src-other` prefix-matches `/w/src` character-wise while lying under no
         // root -- which every classifier now agrees about (issue #562) and
-        // `IsNearMissRoot` is asked about by name. Distinct from OutsideRoots
+        // `ClassifyAgainstRoots` names as its own outcome. Distinct from OutsideRoots
         // precisely because the remedy is: the root is nearly correct, rather than
         // the file being somewhere else entirely.
         auto const built = inputsWith("/w/src-other/t.cpp", {}, "/w/build");

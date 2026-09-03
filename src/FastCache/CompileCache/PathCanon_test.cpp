@@ -54,17 +54,21 @@ TEST_CASE("Root match is on a segment boundary, not a bare prefix")
     CHECK(token == R"(C:\src\other\x.h)");
 }
 
-TEST_CASE("RelateToRoot is the segment-boundary test Canonicalize applies")
+TEST_CASE("RelateToLayout is the segment-boundary test Canonicalize applies")
 {
     // The exported form of the rule the case above pins through Canonicalize, and
     // the reason it is exported: the launcher's `IsToolchainHeader` used to answer
     // this question with a bare `starts_with` and no boundary check, so the two
     // disagreed about a sibling directory whose name merely extends the root's last
     // segment (issue #562). Every assertion here is written twice on purpose --
-    // once against `RelateToRoot`, once against `Canonicalize` -- because what
+    // once against `RelateToLayout`, once against `Canonicalize` -- because what
     // failed was not either answer but the two being DIFFERENT, and a case that
     // checks only one of them passes under the bug.
+    //
+    // `singleRoot` isolates one root's answer, the other being empty and therefore
+    // `Outside` of everything; the layout with two live roots is the case below.
     std::string const root = "/home/dev/proj";
+    Layout const singleRoot { .sourceRoot = root, .buildTree = "" };
     Layout const layout { .sourceRoot = root, .buildTree = "/home/dev/proj/build" };
 
     auto const canonicalizes = [&layout](std::string_view path) {
@@ -74,45 +78,48 @@ TEST_CASE("RelateToRoot is the segment-boundary test Canonicalize applies")
     SECTION("a sibling whose name extends the root's last segment is outside it")
     {
         std::string const sibling = "/home/dev/project-x/a.hpp";
-        CHECK(PathCanon::RelateToRoot(sibling, root) == PathCanon::RootRelation::NearMiss);
+        CHECK(PathCanon::RelateToLayout(sibling, singleRoot) == PathCanon::RootRelation::NearMiss);
         CHECK_FALSE(canonicalizes(sibling));
     }
 
     SECTION("an ordinary path under the root is inside it")
     {
         std::string const inside = "/home/dev/proj/src/a.hpp";
-        CHECK(PathCanon::RelateToRoot(inside, root) == PathCanon::RootRelation::Under);
+        CHECK(PathCanon::RelateToLayout(inside, singleRoot) == PathCanon::RootRelation::Under);
         CHECK(canonicalizes(inside));
     }
 
     SECTION("the root itself is under itself")
     {
-        CHECK(PathCanon::RelateToRoot(root, root) == PathCanon::RootRelation::Under);
+        CHECK(PathCanon::RelateToLayout(root, singleRoot) == PathCanon::RootRelation::Under);
     }
 
     SECTION("a path sharing no prefix is outside, not a near miss")
     {
         // The third state, and the one whose remedy differs: this file is somewhere
         // else entirely, rather than named by a root that is nearly right.
-        CHECK(PathCanon::RelateToRoot("/usr/include/vector", root) == PathCanon::RootRelation::Outside);
+        CHECK(PathCanon::RelateToLayout("/usr/include/vector", singleRoot) == PathCanon::RootRelation::Outside);
         CHECK_FALSE(canonicalizes("/usr/include/vector"));
     }
 
-    SECTION("an empty root relates to nothing")
+    SECTION("empty roots relate to nothing")
     {
         // Not a technicality: an empty root prefixes every path character-wise, so
         // without this a layout naming no build tree would make every path in the
         // world a near miss of it.
-        CHECK(PathCanon::RelateToRoot("/home/dev/proj/a.hpp", "") == PathCanon::RootRelation::Outside);
+        Layout const unset {};
+        CHECK(PathCanon::RelateToLayout("/home/dev/proj/a.hpp", unset) == PathCanon::RootRelation::Outside);
     }
 
     SECTION("separators and case are folded on both sides")
     {
         // The two spellings a real build mixes: CMake exports forward slashes while
         // `cl` emits backslashes.
-        CHECK(PathCanon::RelateToRoot(R"(D:\Project\src\a.hpp)", "D:/Project") == PathCanon::RootRelation::Under);
-        CHECK(PathCanon::RelateToRoot("d:/project/src/a.hpp", R"(D:\Project)") == PathCanon::RootRelation::Under);
-        CHECK(PathCanon::RelateToRoot(R"(D:\Project-x\src\a.hpp)", "D:/Project") == PathCanon::RootRelation::NearMiss);
+        Layout const slashed { .sourceRoot = "D:/Project", .buildTree = "" };
+        Layout const backslashed { .sourceRoot = R"(D:\Project)", .buildTree = "" };
+        CHECK(PathCanon::RelateToLayout(R"(D:\Project\src\a.hpp)", slashed) == PathCanon::RootRelation::Under);
+        CHECK(PathCanon::RelateToLayout("d:/project/src/a.hpp", backslashed) == PathCanon::RootRelation::Under);
+        CHECK(PathCanon::RelateToLayout(R"(D:\Project-x\src\a.hpp)", slashed) == PathCanon::RootRelation::NearMiss);
     }
 }
 
