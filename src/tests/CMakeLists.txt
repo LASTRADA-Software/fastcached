@@ -822,6 +822,46 @@ set_tests_properties("node-surface-docs" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The check above must be SEEN to refuse each thing it claims, and seen to stay
+# quiet on the shape that merely looks like a violation.
+#
+# It is registered because four of that check's rules did not implement what
+# their own comments said -- a digit count claim accepted in silence, a residue
+# rule reading only the leftmost collocation on a line, an invocation-only fence
+# held to the whole table, and only the first of a surface's flags extracted.
+# All four produced a green run, and three were written WITH a comment asserting
+# the opposite. A rule nobody has watched refuse is not a rule.
+#
+# Synthesised trees, never the real source root: mutations go to a copy, so there
+# is no revert step and nothing can be left in the worktree. The pages a count
+# exemption names are staged by READING that table out of the check rather than
+# restating it here -- a second copy would redden this fixture every time an
+# unrelated exemption row is added, which is the maintenance cost that gets a
+# fixture deleted rather than fixed.
+#
+# The baseline case is the load-bearing one. Every refusal is evidence only if
+# the unmutated tree passes; otherwise each case merely re-observes one failure
+# and would go on passing with the rule it names deleted.
+add_test(
+    NAME "node-surface-docs-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/node-surface-docs-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-surface-docs-selftest.cmake"
+)
+set_tests_properties("node-surface-docs-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    # Ten `cmake -P` spawns, each over a synthesised tree of about ten small
+    # files. Measured across three runs on the bridged filesystem this repository
+    # is checked out on: 1.59 s, 2.57 s, 2.42 s, against 1.48-1.60 s for the check
+    # itself over the real 87-page corpus. The spread is the measurement -- a
+    # single figure here would be one draw from it presented as the cost. 120 s is
+    # the backstop the other selftests carry and is well clear of the top of it.
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
 # directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
 # is enforced rather than merely asserted.
