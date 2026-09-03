@@ -243,12 +243,12 @@ struct ReplyFields
 /// @return The correlation an honest worker puts on its reply.
 [[nodiscard]] std::string HonestCorrelation(DispatchRequest const& request)
 {
-    return CompileCorrelation(request.preprocessed,
-                              request.args,
-                              request.fingerprint,
-                              SentSourceName(request.sourceName),
-                              request.compileDir,
-                              request.compileDirReplacement);
+    return CompileCorrelation(CorrelatedCompile { .preprocessed = request.preprocessed,
+                                                  .args = request.args,
+                                                  .fingerprint = request.fingerprint,
+                                                  .sourceName = SentSourceName(request.sourceName),
+                                                  .compileDir = request.compileDir,
+                                                  .compileDirReplacement = request.compileDirReplacement });
 }
 
 /// The reply an HONEST worker sends back for `request`.
@@ -317,7 +317,9 @@ struct ReplyFields
                              .objectKey = "objkey",
                              .args = args,
                              .preprocessed = "int main() { return 0; }",
-                             .sourceName = "a.cpp" };
+                             .sourceName = "a.cpp",
+                             .compileDir = {},
+                             .compileDirReplacement = {} };
 }
 
 } // namespace

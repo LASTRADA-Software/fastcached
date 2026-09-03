@@ -383,9 +383,12 @@ TEST_CASE("Two nodes compiling at once, each on its own claimed root, keep their
         std::vector<std::jthread> threads;
         for (auto const index: std::views::iota(std::size_t { 0 }, OverlappingEchoRunner::Overlap))
             threads.emplace_back([&, index] {
-                auto job = FastCache::Cc::CompileJob {
-                    .fingerprint = "gcc-13", .args = { "-O2" }, .preprocessed = texts.at(index), .sourceName = "a.cpp"
-                };
+                auto job = FastCache::Cc::CompileJob { .fingerprint = "gcc-13",
+                                                       .args = { "-O2" },
+                                                       .preprocessed = texts.at(index),
+                                                       .sourceName = "a.cpp",
+                                                       .compileDir = {},
+                                                       .compileDirReplacement = {} };
                 start.arrive_and_wait();
                 // No Catch2 macro on this thread: the assertion macros are not
                 // thread-safe, so the answer is carried back and checked below.

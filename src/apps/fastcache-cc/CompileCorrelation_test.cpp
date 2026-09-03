@@ -26,7 +26,12 @@ struct Job
 
     [[nodiscard]] std::string Digest() const
     {
-        return CompileCorrelation(preprocessed, args, fingerprint, sourceName, compileDir, compileDirReplacement);
+        return CompileCorrelation(CorrelatedCompile { .preprocessed = preprocessed,
+                                                      .args = args,
+                                                      .fingerprint = fingerprint,
+                                                      .sourceName = sourceName,
+                                                      .compileDir = compileDir,
+                                                      .compileDirReplacement = compileDirReplacement });
     }
 };
 
@@ -102,15 +107,22 @@ TEST_CASE("Each covered input changes the correlation", "[correlation]")
         CHECK(other.Digest() != base);
     }
 
-    SECTION("mapping nothing, against mapping to the current directory")
+    SECTION("the two halves are framed apart, not run together")
     {
-        // The pair that matters most: a client that asked for no mapping and one that
-        // asked for `.` get objects recording different directories, and the empty
-        // spelling must not digest as though the fields were absent.
-        Job other;
-        other.compileDir = "";
-        other.compileDirReplacement = "";
-        CHECK(other.Digest() != base);
+        // Deliberately NOT "mapping nothing against mapping to `.`" -- that is implied
+        // by the two sections above and asserts nothing they do not. What is not
+        // implied is that the pair is framed injectively: a directory of `.` with no
+        // replacement must not digest as a replacement of `.` with no directory, which
+        // is #63's collision one field boundary along.
+        Job left;
+        left.compileDir = "";
+        left.compileDirReplacement = ".";
+
+        Job right;
+        right.compileDir = ".";
+        right.compileDirReplacement = "";
+
+        CHECK(left.Digest() != right.Digest());
     }
 }
 

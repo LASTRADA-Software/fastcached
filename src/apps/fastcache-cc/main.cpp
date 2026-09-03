@@ -1816,6 +1816,21 @@ void RecordManifest(Config const& cfg,
     // that decides the answer, the function that uses it is pure and tested, and an
     // unreadable working directory is simply no mapping.
     //
+    // **Read again here, and deliberately NOT the anchored value `RunCached` already
+    // holds.** That one is put through `AnchorWorkingDirectory`, which re-spells the
+    // resolved cwd in the vocabulary the layout's ROOTS use -- the right answer for
+    // every prefix test in `DirectManifest`, and the wrong one here. What this predicts
+    // is what the DRIVER will do, and the driver runs its `<from>` comparison over
+    // `getcwd(3)`'s RESOLVED answer. On a machine where the two differ (a build under
+    // macOS's `/tmp`, any symlinked `/home`) the build-tree rule spells the configured
+    // root, so the driver's own compare FAILS and the local object's `DW_AT_comp_dir`
+    // is left unmapped. Predicting from the anchored spelling would match, send `.`,
+    // and tell a worker to record `.` for a build whose local objects record an
+    // absolute path -- which is this ticket's asymmetry, manufactured by the fix. The
+    // un-anchored value says "no mapping is in force", which is the truth about that
+    // build. `main.cpp`'s read-once note twelve hundred lines below governs the three
+    // consumers that need the layout's vocabulary; this is a fourth question.
+    //
     // A named value and not a `value_or` temporary: `DispatchRequest` holds views, and
     // this repository has been bitten three times by a value that borrows from
     // something it outlives.

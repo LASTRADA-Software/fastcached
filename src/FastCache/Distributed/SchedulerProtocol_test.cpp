@@ -140,7 +140,9 @@ TEST_CASE("A scheduler answers its own verbs and nothing else", "[distributed][s
                                                                       .args = {},
                                                                       .source = {},
                                                                       .acceptedCodecs = {},
-                                                                      .sourceName = "t.cpp" });
+                                                                      .sourceName = "t.cpp",
+                                                                      .compileDir = {},
+                                                                      .compileDirReplacement = {} });
         CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::DispatchNotPermitted);
     }
 }

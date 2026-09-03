@@ -35,7 +35,7 @@ struct CompileJob
     /// refused.
     ///
     /// Neither is a path this worker opens — they become the two halves of the rules
-    /// `WorkerPrefixMapRule` builds, and reach only the debug records of the object.
+    /// `WorkerPrefixMapRules` builds, and reach only the debug records of the object.
     std::string compileDir;
     std::string compileDirReplacement;
 };
@@ -430,49 +430,6 @@ class CompileJobRunner final: public ICompileJobRunner
 /// @return A file name safe to create inside the scratch directory.
 [[nodiscard]] std::string SafeSourceName(std::string_view sourceName);
 
-/// What a worker decided about the compilation-directory mapping a client asked for.
-///
-/// FOUR outcomes and not an optional, because "the client asked for nothing", "here is
-/// the rule", "this client asked for something this worker will not spell" and "this
-/// worker cannot express a rule for its own directory" are four different answers that
-/// end in three different places -- proceed, proceed with the flag, refuse the client,
-/// refuse as a worker fault. Collapsing the last two would blame a client for a
-/// property of the machine it was sent to.
-enum class PrefixMapOutcome : std::uint8_t
-{
-    /// The client mapped nothing, so the worker maps nothing. The dispatched object
-    /// then records this worker's own directory, exactly as it did before #506 -- which
-    /// is the honest answer, because there is no directory the client would rather see.
-    NotRequested,
-    /// `PrefixMapRule::rules` are the arguments to append.
-    Emit,
-    /// Something the client sent is not one this worker will put on a command line, or
-    /// the pair arrived half filled. A client fault, refused as
-    /// `JobRefusal::RejectedArgument`.
-    RefusedReplacement,
-    /// This worker cannot express the rules at all -- its driver has no such flag, or
-    /// its own working directory cannot be spelled unambiguously inside one. A WORKER
-    /// fault, and refused rather than silently skipped: skipping it would hand back an
-    /// object whose compilation directory disagrees with a locally built one under the
-    /// same key, which is #506 itself.
-    RefusedWorker,
-};
-
-/// A worker's decision about the compilation-directory mapping, and the rules it made.
-struct PrefixMapRule
-{
-    PrefixMapOutcome outcome { PrefixMapOutcome::NotRequested }; ///< What was decided.
-    /// The arguments to append, in order; empty unless `outcome` is `Emit`.
-    ///
-    /// TWO of them, and both are needed: which directory a dispatched object records is
-    /// a fact about the driver rather than about the fleet. See `WorkerPrefixMapRule`.
-    std::vector<std::string> rules;
-    /// Why, for a refusal's `JobError::detail`; empty otherwise. Never carries the
-    /// client's bytes -- `JobError::RejectedArgumentNaming` is the one producer allowed
-    /// to do that, and it is what the caller reaches for.
-    std::string why;
-};
-
 /// The `-fdebug-prefix-map` rules a worker must add so its object records the
 /// compilation directory the CLIENT's own mapping records.
 ///
@@ -536,10 +493,16 @@ struct PrefixMapRule
 /// @param replacement What the client asked that directory to read as; empty when the
 ///        client maps nothing.
 /// @param family This worker's OWN driver family, never anything the client sent.
-/// @return The decision, and the arguments to append when there are any.
-[[nodiscard]] PrefixMapRule WorkerPrefixMapRule(std::string_view workerDirectory,
-                                                std::string_view clientDirectory,
-                                                std::string_view replacement,
-                                                DriverFamily family);
+/// @return The arguments to append -- NONE when the client mapped nothing, which is
+///         success and not a refusal -- or the `JobError` this job is refused with.
+///         The two refusals are told apart at the source rather than by the caller: a
+///         value the client sent is `RejectedArgument` and names the offending half,
+///         a property of this machine is `SpawnFailed`. A caller reconstructing that
+///         from which field is empty names the wrong half whenever the REPLACEMENT was
+///         the offender.
+[[nodiscard]] std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::string_view workerDirectory,
+                                                                                     std::string_view clientDirectory,
+                                                                                     std::string_view replacement,
+                                                                                     DriverFamily family);
 
 } // namespace FastCache::Cc

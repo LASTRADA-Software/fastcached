@@ -187,12 +187,13 @@ namespace
         // the whole ticket. A crossed reply accepted here is a wrong object under a
         // correct key, which is silent, cached, and shared with every other machine
         // that later fetches that key (#280).
-        auto const expected = CompileCorrelation(job.request.preprocessed,
-                                                 job.request.args,
-                                                 job.request.fingerprint,
-                                                 sourceName,
-                                                 job.request.compileDir,
-                                                 job.request.compileDirReplacement);
+        auto const expected =
+            CompileCorrelation(CorrelatedCompile { .preprocessed = job.request.preprocessed,
+                                                   .args = job.request.args,
+                                                   .fingerprint = job.request.fingerprint,
+                                                   .sourceName = sourceName,
+                                                   .compileDir = job.request.compileDir,
+                                                   .compileDirReplacement = job.request.compileDirReplacement });
         if (Wire::AsStringView(result->correlation) != expected)
             return Refused(DispatchStatus::Mismatched,
                            std::format("{} answered about a different compile (expected {}, got {})",

@@ -63,23 +63,38 @@ namespace FastCache::Cc
 /// that rule exists: NUL-terminated pieces let two unrelated inputs digest identically.
 /// The schema tag is the domain separator, so a correlation digest can never equal an
 /// `objkey-v*` or `manifest-v*` blob.
-/// @param preprocessed The translation unit as written to scratch, post-envelope.
-/// @param args The argument vector the runner passed through to the driver -- the
-///        client's slice only, never the compiler path or the scratch paths the worker
-///        appends around it.
-/// @param fingerprint The toolchain the client named.
-/// @param sourceName The base name as the client sent it, before sanitizing.
-/// @param compileDir The client's own compile directory as it sent it, before
-///        validating; empty when the client maps nothing.
-/// @param compileDirReplacement What it asked that directory to read as; empty when the
-///        client maps nothing.
+/// The inputs a correlation covers, named rather than ordered.
+///
+/// A struct because the covered set GROWS -- that is what the rule at the top of this
+/// header is for -- and every field but one is a `std::string_view`. Six positional
+/// parameters, four of them adjacent and same-typed, is a signature where a transposed
+/// pair compiles, digests, and then makes both ends refuse every honest reply while
+/// looking like a fleet that has stopped working. Designated initializers at the three
+/// call sites make that unspellable, and adding the next covered field stops being an
+/// edit to four argument lists.
+///
+/// Views throughout: it is built at the call site and consumed before the statement
+/// ends, and everything it names outlives it there.
+struct CorrelatedCompile
+{
+    /// The translation unit as written to scratch, post-envelope.
+    std::string_view preprocessed;
+    /// The argument vector the runner passed through to the driver -- the client's
+    /// slice only, never the compiler path or the scratch paths the worker appends
+    /// around it.
+    std::span<std::string const> args;
+    std::string_view fingerprint; ///< The toolchain the client named.
+    std::string_view sourceName;  ///< The base name as the client sent it, before sanitizing.
+    /// The client's own compile directory as it sent it, before validating; empty when
+    /// the client maps nothing.
+    std::string_view compileDir;
+    /// What it asked that directory to read as; empty when the client maps nothing.
+    std::string_view compileDirReplacement;
+};
+
+/// @param compile What this correlation covers.
 /// @return The correlation, as 32 lowercase hex characters.
-[[nodiscard]] inline std::string CompileCorrelation(std::string_view preprocessed,
-                                                    std::span<std::string const> args,
-                                                    std::string_view fingerprint,
-                                                    std::string_view sourceName,
-                                                    std::string_view compileDir,
-                                                    std::string_view compileDirReplacement)
+[[nodiscard]] inline std::string CompileCorrelation(CorrelatedCompile const& compile)
 {
     // `fingerprint` is covered because two jobs identical in source, args and name
     // but built for different toolchains have different correct objects, and crossing
@@ -103,13 +118,13 @@ namespace FastCache::Cc
     // `sourceName`, so the client is not made a second author of the worker's
     // validation rule.
     KeyDigest digest { "compile-corr-v2" };
-    digest.Field(fingerprint);
-    digest.Field(sourceName);
-    digest.Field(compileDir);
-    digest.Field(compileDirReplacement);
-    for (auto const& arg: args)
+    digest.Field(compile.fingerprint);
+    digest.Field(compile.sourceName);
+    digest.Field(compile.compileDir);
+    digest.Field(compile.compileDirReplacement);
+    for (auto const& arg: compile.args)
         digest.Item(arg);
-    digest.Field(preprocessed);
+    digest.Field(compile.preprocessed);
     return digest.ToHex();
 }
 

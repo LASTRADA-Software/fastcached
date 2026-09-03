@@ -226,8 +226,14 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
     auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(lease))) == Wire::ErrorCode::DispatchNotPermitted);
 
-    auto const compile = Wire::EncodeCompile(Wire::CompileRequest {
-        .leaseToken = "t", .fingerprint = "gcc-14", .args = {}, .source = {}, .acceptedCodecs = {}, .sourceName = "t.cpp" });
+    auto const compile = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "t",
+                                                                    .fingerprint = "gcc-14",
+                                                                    .args = {},
+                                                                    .source = {},
+                                                                    .acceptedCodecs = {},
+                                                                    .sourceName = "t.cpp",
+                                                                    .compileDir = {},
+                                                                    .compileDirReplacement = {} });
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
 }
 
