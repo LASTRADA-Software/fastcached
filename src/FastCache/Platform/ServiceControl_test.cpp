@@ -234,7 +234,8 @@ TEST_CASE("ServiceControl: argv keeps values unquoted", "[platform][service][lau
 TEST_CASE("ServiceControl: argv element 0 is the executable", "[platform][service][launchd]")
 {
     FastCache::Config const cfg {};
-    auto const argv = BuildServiceArgv(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
+    auto const argv =
+        BuildServiceArgv(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
     REQUIRE(argv.front() == "/opt/fastcached/bin/fastcached");
 }
 

@@ -594,7 +594,11 @@ TEST_CASE("NodeConfig: a system-scope job names an unprivileged account", "[node
     // And not the daemon's: a worker runs a compiler on input from the network
     // while fastcached owns the cache storage, so one account would let a
     // compromised compile rewrite every cached object.
-    auto const daemonSpec = MakeDaemonServiceSpec(std::filesystem::path { "fastcached" }, Config {});
+    // A parse rather than a Config since #349: the daemon registers what the operator
+    // NAMED, so its spec is built from the command line, not from the merged
+    // configuration. This case only reads the account, and a parse that named nothing
+    // is what asks for the default one.
+    auto const daemonSpec = MakeDaemonServiceSpec(std::filesystem::path { "fastcached" }, FastCache::CliResult {});
     CHECK(spec.serviceAccount != daemonSpec.serviceAccount);
 
     // The same decision for the other supervisor. Told nothing, the Windows SCM
