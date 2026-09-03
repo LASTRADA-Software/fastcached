@@ -452,10 +452,10 @@ operator their cache was damaged — the same conflation the storage layer alrea
 avoids on disk, where a store written by another build is
 `UnsupportedFormatVersion` and never `Corrupt`, because the code is what
 monitoring reads and `Corrupt` is what makes somebody delete a healthy cache.
-Refusing
-costs the hits of one upgrade window; the alternative costs every consumer that
-replays those paths into its dependency graph, where no edit in its own checkout
-can invalidate them.
+
+Refusing costs the hits of one upgrade window; the alternative costs every
+consumer that replays those paths into its dependency graph, where no edit in its
+own checkout can invalidate them.
 
 ## The value format
 
