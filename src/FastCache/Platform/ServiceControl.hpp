@@ -86,9 +86,11 @@ enum class WindowsLogonAccount : std::uint8_t
 /// scope rather than principle --
 /// [#349](https://github.com/LASTRADA-Software/fastcached/issues/349) moved the
 /// emission rule and left the shape alone. What keeps the hand-written table
-/// honest meanwhile is the guard, which drives ONE row at a time, so a line
-/// naming the wrong field or the wrong bit fails rather than being covered by a
-/// neighbour.
+/// honest meanwhile is the guard, which drives ONE row at a time and asserts the
+/// emitted token MOVES when that row's own applier runs -- so a line naming
+/// another row's field, or another row's bit, fails rather than being covered by
+/// a neighbour's emission. Presence alone would not catch either: a wrong field
+/// still emits a token under the right spelling.
 struct ServiceSpec
 {
     /// The supervisor's key: the SCM service name, and the stem of the launchd

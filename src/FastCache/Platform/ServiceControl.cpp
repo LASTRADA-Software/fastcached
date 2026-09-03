@@ -253,22 +253,28 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
             argv.push_back(std::format("--{}={}", flag, FlagValue(value)));
     };
 
-    // Path flags test the *captured* value for emptiness and absolutize only
-    // what survives. Absolutizing first would turn an unset path into the
-    // installing process's working directory, silently pinning the service to
-    // whatever shell happened to register it.
+    // A path is absolutized because a service does not inherit the installing
+    // shell's working directory -- but only a NON-EMPTY one, because
+    // `std::filesystem::absolute("")` IS that directory, and absolutizing first
+    // would silently pin the service to whatever shell happened to register it.
     //
-    // Presence rather than provenance, and that is not the defect above: an empty
-    // path is the flag's own way of saying "off", and it is the DEFAULT of every
-    // row reached through here. So there is no pin to lose -- `--storage=` names
-    // nothing, and emitting it would absolutize the installing shell's working
-    // directory into the registration, which is worse than the drop. The audit
-    // that closed #349 records this as why these rows keep a value test.
-    //
-    // Two of them (`--config`, `--pidfile`) carry no explicit bit at all and could
-    // not ask provenance if they wanted to; "named, at its default" is therefore
-    // not a reachable shape for any of them, and the guard drives them with a
-    // VALUE rather than excusing them.
+    // That is a constraint on the absolutizer, and it is **not** a reason to decide
+    // by value. `ParseText` never fails, so `--storage=` is a reachable operator
+    // instruction and a real pin: `--install-service --config=f.yaml --storage=`
+    // against a file carrying `storage_path:` must not come back persisting to
+    // disk at every start. So a path row that records provenance asks it like every
+    // other row, and an explicitly empty value is emitted VERBATIM -- which
+    // round-trips through this project's own parser to the empty value the operator
+    // named.
+    auto const emitPathIfExplicit = [&argv](std::string_view flag, std::string const& value, bool wasTyped) {
+        if (!wasTyped)
+            return;
+        argv.push_back(value.empty() ? std::format("--{}=", flag) : std::format("--{}={}", flag, AbsolutePathArg(value)));
+    };
+
+    // `--config` and `--pidfile` carry no explicit bit at all and so cannot ask.
+    // They keep a presence test, and for them an empty value really does name
+    // nothing there is any way to register.
     auto const emitPathIfSet = [&argv](std::string_view flag, std::string const& value) {
         if (!value.empty())
             argv.push_back(std::format("--{}={}", flag, AbsolutePathArg(value)));
@@ -311,7 +317,7 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
     emitSwitch("log-timestamps", "no-log-timestamps", cfg.logTimestamps, cli.logTimestampsExplicit);
     emitSwitch("log-source", {}, cfg.logSource, cli.logSourceExplicit);
     emitSwitch("log-everything", {}, cfg.logEverything, cli.logEverythingExplicit);
-    emitPathIfSet("storage", cfg.storagePath);
+    emitPathIfExplicit("storage", cfg.storagePath, cli.storagePathExplicit);
     emitIfExplicit("storage-durability", cfg.storageDurability, cli.storageDurabilityExplicit);
     emitIfExplicit("storage-max-value", cfg.storageMaxValueBytes, cli.storageMaxValueBytesExplicit);
     emitIfExplicit("storage-max-disk", cfg.storageMaxDiskBytes, cli.storageMaxDiskBytesExplicit);
@@ -327,8 +333,8 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
     emitIfExplicit("compression-min-bytes", cfg.compressionMinBytes, cli.compressionMinBytesExplicit);
     emitIfExplicit("auth-username", cfg.authUsername, cli.authUsernameExplicit);
     emitSwitch("tls", {}, cfg.tlsEnabled, cli.tlsEnabledExplicit);
-    emitPathIfSet("tls-cert", cfg.tlsCertPath);
-    emitPathIfSet("tls-key", cfg.tlsKeyPath);
+    emitPathIfExplicit("tls-cert", cfg.tlsCertPath, cli.tlsCertPathExplicit);
+    emitPathIfExplicit("tls-key", cfg.tlsKeyPath, cli.tlsKeyPathExplicit);
     emitSwitch("metrics", {}, cfg.metricsEnabled, cli.metricsEnabledExplicit);
     emitIfExplicit("metrics-bind", cfg.metricsBindAddress, cli.metricsBindAddressExplicit);
     emitIfExplicit("metrics-port", cfg.metricsPort, cli.metricsPortExplicit);

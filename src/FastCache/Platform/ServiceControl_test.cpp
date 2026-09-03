@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,7 +15,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -242,11 +242,43 @@ TEST_CASE("ServiceControl: argv element 0 is the executable", "[platform][servic
 TEST_CASE("ServiceControl: an unset path flag is omitted rather than absolutized", "[platform][service][launchd]")
 {
     // Absolutizing first would turn the empty default into the caller's working
-    // directory and pin the service to whatever shell registered it.
-    FastCache::Config const cfg {};
-    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), EmitDaemonFlag::No);
+    // directory and pin the service to whatever shell registered it. "Unset" is a
+    // command line that did not NAME the flag -- which is the only reading that
+    // survives #349, since a path the operator explicitly emptied is an
+    // instruction rather than an absence (the case below).
+    FastCache::CliResult const cli {};
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cli, EmitDaemonFlag::No);
     REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--storage="); }));
     REQUIRE(std::ranges::none_of(argv, [](std::string const& a) { return a.starts_with("--config="); }));
+}
+
+TEST_CASE("ServiceControl: an explicitly emptied path is registered, not absolutized", "[platform][service]")
+{
+    // `ParseText` never fails, so `--storage=` is a reachable instruction and it
+    // means something: with `--config` naming a file that carries `storage_path:`,
+    // a CLI value outranks the file, so the operator has turned persistence OFF.
+    // Deciding this row by presence dropped the flag, let the file win at every
+    // start, and left the daemon persisting to disk -- #349's shape in the rows the
+    // first pass had excused as safe.
+    //
+    // Emitted verbatim, because `std::filesystem::absolute("")` is the installing
+    // shell's working directory: absolutizing here would register a cache location
+    // nobody named.
+    auto const args = std::array<char const*, 2> { "--install-service", "--storage=" };
+    auto const parsed = FastCache::ParseCli(std::span<char const* const> { args });
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->storagePathExplicit);
+    REQUIRE(parsed->config.storagePath.empty());
+
+    auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, *parsed, EmitDaemonFlag::No);
+    CHECK(std::ranges::contains(argv, "--storage="));
+
+    // And it round-trips: the daemon reading that back arrives at the empty value
+    // the operator named, rather than at a directory.
+    auto const replay = std::array<char const*, 1> { "--storage=" };
+    auto const reparsed = FastCache::ParseCli(std::span<char const* const> { replay });
+    REQUIRE(reparsed.has_value());
+    CHECK(reparsed->config.storagePath.empty());
 }
 
 TEST_CASE("ServiceControl: the launchd label is reverse-DNS and lowercased", "[platform][service][launchd]")
@@ -308,8 +340,12 @@ TEST_CASE("ServiceControl: a system job's log directory is its own", "[platform]
 
 TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured service", "[platform][service][launchd]")
 {
-    FastCache::Config const cfg {};
-    auto const spec = SpecFor("fastcached", cfg);
+    // A parse that named NOTHING, which is what "the operator left this unset"
+    // means since #349 -- `AsTyped` would mark `--storage` as named, and a named
+    // `--storage=` is an instruction to persist nowhere, which `WithScopeDefaults`
+    // must then leave alone. That is asserted as its own section below.
+    FastCache::CliResult const cli {};
+    auto const spec = SpecFor("fastcached", cli);
     REQUIRE(!spec.applicationName.empty());
 
     SECTION("a user agent gets a cache under the invoking account's home")
@@ -334,11 +370,29 @@ TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured se
         // A CLI value outranks YAML in Merge, so injecting --storage alongside
         // --config would pin the cache location and make every later storage_path
         // edit a silent no-op.
-        FastCache::Config named {};
-        named.configPath = "/etc/fastcached/fastcached.yaml";
+        FastCache::CliResult named {};
+        named.config.configPath = "/etc/fastcached/fastcached.yaml";
         auto const filled = WithScopeDefaults(SpecFor("fastcached", named), ServiceScope::User, "/Users/jo", {});
 
         REQUIRE(std::ranges::none_of(filled.arguments, [](std::string const& a) { return a.starts_with("--storage="); }));
+    }
+
+    SECTION("an explicitly emptied --storage is not filled back in")
+    {
+        // The other way an operator says "do not persist", and it has to survive the
+        // same way a named path does: `--install-service --storage=` asks for a
+        // memory-only service, and quietly handing it a cache directory would give
+        // them one that persists at every start. `HasArgument` asks the argument
+        // list, so this works for exactly the reason the section above does -- and
+        // only because #349 made the flag reach that list at all.
+        FastCache::CliResult emptied {};
+        emptied.storagePathExplicit = true;
+        auto const filled = WithScopeDefaults(SpecFor("fastcached", emptied), ServiceScope::User, "/Users/jo", {});
+
+        REQUIRE(std::ranges::contains(filled.arguments, "--storage="));
+        REQUIRE(std::ranges::none_of(filled.arguments,
+                                     [](std::string const& a) { return a.starts_with("--storage=") && a.size() > 10; }));
+        REQUIRE(filled.ownedPaths.empty());
     }
 
     SECTION("a system daemon is pointed at the packaged config")
@@ -831,103 +885,197 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
     //
     // **One row at a time**, which is what makes it stronger than the whole-config
     // sweep it replaces. That one drove every field away from its default at once,
-    // so it could not see a line naming the wrong field or the wrong bit -- a
-    // neighbour's emission covered it -- and it could not express the timestamp pair
-    // at all, since a registration carries whichever spelling produces the value and
-    // never both. Per row, both spellings are ordinary cases.
+    // so a line naming a neighbour's field or bit was covered by the neighbour's own
+    // emission; and it could not express the timestamp pair at all, since a
+    // registration carries whichever spelling produces the value and never both.
+    // Per row, both spellings are ordinary cases.
     //
-    // Each row is stimulated the way TYPING it would:
+    // Two assertions per row, and the second is the one presence alone cannot make:
     //
-    //  - a valueless flag runs its own `apply`, which is exactly what typing it does.
-    //    Its default is the value it cannot express, so "named, at its default" is
-    //    not a reachable shape for one;
-    //  - a row named in `DrivenWithAValue` gets one, because its default is EMPTY and
-    //    empty is that flag's own way of saying "off" -- there is nothing to register
-    //    and nothing to lose. Driven rather than excused, so the row is still
-    //    asserted to reach the supervisor;
-    //  - every other row keeps its DEFAULT and is merely named. That is the #349
-    //    shape: the one input no value comparison can tell from silence.
-    struct Stimulus
+    //  - **named, at its default** -- the one input no value comparison can tell
+    //    from silence, which is exactly what #349 was. Skipped for a valueless flag
+    //    (its default is the value it cannot express) and for a row emitted on
+    //    presence (there is nothing to emit until it has a value);
+    //  - **named, carrying a value** -- the flag must reach the supervisor AND the
+    //    emitted token must MOVE. A line reading `emitIfExplicit("metrics-port",
+    //    cfg.port, cli.metricsPortExplicit)` passes a presence test forever: the
+    //    spelling is right, only the field is wrong, and every registration would
+    //    pin the cache port as the metrics port.
+    struct Excuse
     {
         std::string_view flag;   ///< The row this applies to.
-        std::string_view value;  ///< What typing it would supply.
-        std::string_view reason; ///< Why a default cannot serve.
+        std::string_view reason; ///< Why, in the words the code uses.
     };
 
-    constexpr auto DrivenWithAValue = std::to_array<Stimulus>({
-        { .flag = "--config", .value = "fastcached.yaml", .reason = "no explicit bit; emitted on presence" },
-        { .flag = "--pidfile", .value = "fastcached.pid", .reason = "no explicit bit; emitted on presence" },
-        { .flag = "--storage", .value = "cache.cow", .reason = "empty is the flag's own `off`" },
-        { .flag = "--tls-cert", .value = "cert.pem", .reason = "empty is the flag's own `off`" },
-        { .flag = "--tls-key", .value = "key.pem", .reason = "empty is the flag's own `off`" },
-        // Repeatable, and each appends one listener. The role each is spelled back
-        // with is asserted by "a TLS listener's kind survives the registration".
-        { .flag = "--listen", .value = "127.0.0.1:11211", .reason = "repeatable; an empty listener set registers nothing" },
-        { .flag = "--listen-tls",
-          .value = "127.0.0.1:11212",
-          .reason = "repeatable; an empty listener set registers nothing" },
-    });
+    /// A value distinct from the row's own default, so the emitted token has to move.
+    struct Typed
+    {
+        std::string_view flag;  ///< The row this applies to.
+        std::string_view value; ///< What the operator would have typed.
+    };
 
     // The rows a registration must NOT carry. Every one is either not daemon state
     // at all, or is refused outright -- there is no row here excused for being
     // inconvenient to assert.
-    constexpr auto NeverRegistered = std::to_array<Stimulus>({
-        { .flag = "--install-service", .value = {}, .reason = "a service must never re-install itself" },
-        { .flag = "--uninstall-service", .value = {}, .reason = "nor deregister itself" },
-        { .flag = "--service-scope", .value = {}, .reason = "install-time only, and not Config state" },
-        { .flag = "--seed-config", .value = {}, .reason = "an installer step, not daemon state" },
+    constexpr auto NeverRegistered = std::to_array<Excuse>({
+        { .flag = "--install-service", .reason = "a service must never re-install itself" },
+        { .flag = "--uninstall-service", .reason = "nor deregister itself" },
+        { .flag = "--service-scope", .reason = "install-time only, and not Config state" },
+        { .flag = "--seed-config", .reason = "an installer step, not daemon state" },
         // Converting the store is a one-shot act. A registration carrying it would
         // re-run the conversion at every boot, on a store that after the first run
         // has nothing left to convert.
-        { .flag = "--migrate-storage", .value = {}, .reason = "a one-shot verb, not daemon state" },
-        { .flag = "--daemon", .value = {}, .reason = "carried by EmitDaemonFlag, not from Config" },
-        { .flag = "--healthcheck", .value = {}, .reason = "probe and exit, instead of serving" },
-        { .flag = "--help", .value = {}, .reason = "not daemon state" },
-        { .flag = "--version", .value = {}, .reason = "not daemon state" },
+        { .flag = "--migrate-storage", .reason = "a one-shot verb, not daemon state" },
+        { .flag = "--daemon", .reason = "carried by EmitDaemonFlag, not from Config" },
+        { .flag = "--healthcheck", .reason = "probe and exit, instead of serving" },
+        { .flag = "--help", .reason = "not daemon state" },
+        { .flag = "--version", .reason = "not daemon state" },
         // The one Config field with no safe representation in launch arguments: a
         // supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists to
         // keep out. ServiceRegistrationRejection reports the omission instead, and
         // "dropping a password is reported, not silent" asserts that.
-        { .flag = "--requirepass", .value = {}, .reason = "world-readable launch arguments; refused instead" },
+        { .flag = "--requirepass", .reason = "world-readable launch arguments; refused instead" },
     });
 
-    auto const named = [](auto const& table, std::string_view flag) {
-        return std::ranges::find_if(table, [flag](Stimulus const& row) { return row.flag == flag; });
+    // Rows that carry no explicit bit and so cannot be asked whether they were
+    // named. They are emitted on presence, which is sound only because an empty one
+    // of these names nothing a registration could carry -- unlike `--storage`,
+    // which since #349 asks provenance like everything else.
+    constexpr auto RegisteredOnPresence = std::to_array<Excuse>({
+        { .flag = "--config", .reason = "no explicit bit; emitted on presence" },
+        { .flag = "--pidfile", .reason = "no explicit bit; emitted on presence" },
+        { .flag = "--listen", .reason = "repeatable; an empty listener set registers nothing" },
+        { .flag = "--listen-tls", .reason = "repeatable; an empty listener set registers nothing" },
+    });
+
+    // One per value row, and every one differs from that row's default -- which is
+    // what makes "the token moved" mean "this line reads this row's field".
+    constexpr auto TypedValues = std::to_array<Typed>({
+        { .flag = "--config", .value = "fastcached.yaml" },
+        { .flag = "--bind", .value = "0.0.0.0" },
+        { .flag = "--port", .value = "6000" },
+        // Clamped to [512m, 8g], so 128m is below every reachable default.
+        { .flag = "--max-memory", .value = "134217728" },
+        { .flag = "--log-level", .value = "debug" },
+        { .flag = "--auth-username", .value = "operator" },
+        { .flag = "--metrics-bind", .value = "0.0.0.0" },
+        { .flag = "--metrics-port", .value = "9999" },
+        { .flag = "--tls-cert", .value = "cert.pem" },
+        { .flag = "--tls-key", .value = "key.pem" },
+        { .flag = "--listen", .value = "127.0.0.1:11211" },
+        { .flag = "--listen-tls", .value = "127.0.0.1:11212" },
+        { .flag = "--notify-keyspace-events", .value = "KEA" },
+        { .flag = "--storage", .value = "cache.cow" },
+        { .flag = "--storage-durability", .value = "fsync" },
+        { .flag = "--storage-max-value", .value = "4096" },
+        { .flag = "--storage-max-disk", .value = "8192" },
+        { .flag = "--compression", .value = "none" },
+        { .flag = "--compression-level", .value = "9" },
+        { .flag = "--compression-min-bytes", .value = "1024" },
+        { .flag = "--lru-mode", .value = "strict" },
+        { .flag = "--cpu-affinity", .value = "none" },
+        { .flag = "--threads", .value = "5" },
+        { .flag = "--listen-backlog", .value = "64" },
+        { .flag = "--storage-shards", .value = "7" },
+        { .flag = "--expiry-interval", .value = "250" },
+        { .flag = "--expiry-scan", .value = "64" },
+        { .flag = "--pidfile", .value = "fastcached.pid" },
+        { .flag = "--service-name", .value = "MyCache" },
+    });
+
+    // Both lookups answer in VALUES rather than handing back an iterator: a
+    // `std::to_array` iterator is a raw pointer on libstdc++ and libc++ and a class
+    // type on MSVC, so no single spelling of one compiles everywhere.
+    auto const excused = [](auto const& table, std::string_view flag) {
+        return std::ranges::any_of(table, [flag](Excuse const& row) { return row.flag == flag; });
+    };
+    auto const typedValueFor = [&TypedValues](std::string_view flag) -> std::string_view {
+        for (auto const& row: TypedValues)
+            if (row.flag == flag)
+                return row.value;
+        return {};
+    };
+    auto const tokenFor = [](std::vector<std::string> const& argv, std::string_view flag) -> std::string {
+        for (auto const& arg: argv)
+            if (FastCache::FlagMatches(arg, flag))
+                return arg;
+        return {};
+    };
+    auto const registrationFor = [](FastCache::CliResult const& cli) {
+        return BuildServiceArgv(std::filesystem::path { "fastcached" }, cli, EmitDaemonFlag::No);
     };
 
     for (auto const& spec: FastCache::CliOptions())
     {
-        if (named(NeverRegistered, spec.primary) != NeverRegistered.end())
+        if (excused(NeverRegistered, spec.primary))
             continue;
 
         INFO("flag: " << spec.primary);
-        FastCache::CliResult cli {};
         REQUIRE(spec.apply != nullptr);
-        if (auto const driven = named(DrivenWithAValue, spec.primary); driven != DrivenWithAValue.end())
-            REQUIRE(spec.apply(cli, driven->value).has_value());
-        else if (spec.arity == FastCache::Arity::None)
-            REQUIRE(spec.apply(cli, {}).has_value());
-        if (spec.explicitBit != nullptr)
-            cli.*spec.explicitBit = true;
 
-        auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cli, EmitDaemonFlag::No);
-        // FlagMatches is the parser's own rule for "this token names that flag", so
-        // the guard cannot drift from what the daemon will accept back.
-        CHECK(std::ranges::any_of(argv,
-                                  [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); }));
+        // Named, and nothing else touched.
+        FastCache::CliResult named {};
+        if (spec.explicitBit != nullptr)
+            named.*spec.explicitBit = true;
+        auto const atDefault = tokenFor(registrationFor(named), spec.primary);
+        if (spec.arity == FastCache::Arity::Value && !excused(RegisteredOnPresence, spec.primary))
+            CHECK(!atDefault.empty());
+
+        // Named, and carrying what typing it would supply -- for a valueless flag
+        // that is its own `apply`, which is exactly what typing it does.
+        FastCache::CliResult typed {};
+        REQUIRE(spec.apply(typed, typedValueFor(spec.primary)).has_value());
+        if (spec.explicitBit != nullptr)
+            typed.*spec.explicitBit = true;
+        auto const withValue = tokenFor(registrationFor(typed), spec.primary);
+        CHECK(!withValue.empty());
+        // Movement is a value row's question. A valueless flag's `apply` may well
+        // produce the platform default -- `--no-log-timestamps` on a host that
+        // already defaults off emits the same token either way -- so demanding it
+        // there would demand a contradiction on one platform. A wrong FIELD on a
+        // switch is caught above instead: the emission follows the other field, so
+        // no token under this spelling appears at all.
+        if (spec.arity == FastCache::Arity::Value)
+            CHECK(withValue != atDefault);
     }
 
-    // Neither table is allowed to grow silently into the whole option table: every
-    // row on both must still BE a row, so a flag that is renamed or retired takes
-    // its excuse with it rather than leaving a line nothing reads.
-    for (auto const& table:
-         { std::span<Stimulus const> { DrivenWithAValue }, std::span<Stimulus const> { NeverRegistered } })
+    // Every value row needs a stimulus, or the sweep would drive it with an empty
+    // string: some parsers accept that and some refuse it, so a missing entry would
+    // fail somewhere unrelated or silently assert nothing. Asserted here so a new
+    // value flag joins the table rather than tripping over it.
+    for (auto const& spec: FastCache::CliOptions())
+    {
+        if (spec.arity != FastCache::Arity::Value || excused(NeverRegistered, spec.primary))
+            continue;
+        INFO("flag: " << spec.primary);
+        CHECK(!typedValueFor(spec.primary).empty());
+    }
+
+    // And no table is allowed to grow silently into the whole option table: every
+    // row on all three must still BE a row, so a flag that is renamed or retired
+    // takes its excuse with it rather than leaving a line nothing reads.
+    auto const rowsAreLive = [](auto const& table) {
         for (auto const& row: table)
         {
             INFO("listed flag: " << row.flag);
             CHECK(
                 std::ranges::any_of(FastCache::CliOptions(), [&row](auto const& spec) { return spec.primary == row.flag; }));
+        }
+    };
+    rowsAreLive(NeverRegistered);
+    rowsAreLive(RegisteredOnPresence);
+    rowsAreLive(TypedValues);
+
+    // An excuse with no reason is the shape this file exists to refuse: it reads
+    // like a decision and records none.
+    auto const excusesAreReasoned = [](auto const& table) {
+        for (auto const& row: table)
+        {
+            INFO("excused flag: " << row.flag);
             CHECK(!row.reason.empty());
         }
+    };
+    excusesAreReasoned(NeverRegistered);
+    excusesAreReasoned(RegisteredOnPresence);
 }
