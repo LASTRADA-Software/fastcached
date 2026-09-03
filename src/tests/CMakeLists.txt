@@ -903,13 +903,18 @@ if(NOT WIN32)
     #
     # All three moving parts are driven, because two of them decide what the third
     # even sees: the COMPARISON (a changed preset, a dropped `-D`, an added one, a
-    # changed `-D` VALUE, an empty line, and the pre-#454 hand-rolled line itself),
-    # the DOCUMENTATION extractor (fenced blocks, shell headers, an earlier
-    # unrelated `cmake --preset` line that must not be mistaken for the anchor, and
-    # the two ways a line fails to name this database), and the WORKFLOW extractor
-    # (the right job's step among three that all have one, added steps and an `id:`
-    # around it, an unfolded `run:`, and the two renames that must yield the empty
-    # string the main path refuses).
+    # changed `-D` VALUE, an empty line, the pre-#454 hand-rolled line itself, and
+    # the OTHER spelling of each token — `--preset=NAME`, `-D NAME=VALUE` — on both
+    # sides at once, which is the arrangement in which an unrecognised token hides
+    # a disagreement instead of manufacturing one), the DOCUMENTATION extractor
+    # (fenced blocks, shell headers, an earlier unrelated `cmake --preset` line
+    # that must not be mistaken for the anchor, a SECOND copy in the same file,
+    # and the two ways a line fails to name this database), and the WORKFLOW
+    # extractor (the right job's step among three that all have one, added steps
+    # and an `id:` around it, an UNNAMED step after it that must not extend it, a
+    # blank line inside the block scalar that must not truncate it, an unfolded
+    # `run:`, and the two renames that must yield the empty string the main path
+    # refuses).
     add_test(
         NAME "tidy-sweep-database-selftest"
         COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test

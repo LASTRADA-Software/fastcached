@@ -59,8 +59,12 @@
 #
 # ## Usage
 #
-#   scripts/check-tidy-sweep-database.sh              # check the tree
-#   scripts/check-tidy-sweep-database.sh --self-test  # prove the check bites
+#   bash scripts/check-tidy-sweep-database.sh              # check the tree
+#   bash scripts/check-tidy-sweep-database.sh --self-test  # prove the check bites
+#
+# Spelled with `bash` because the file carries no execute bit, exactly as its
+# sibling checks do and as `src/tests/CMakeLists.txt` invokes it. A usage line
+# promising a direct invocation is a usage line that answers `Permission denied`.
 #
 # bash 3.2: macOS still ships a 2007 /bin/bash and this runs in the default ctest
 # set on every platform CI builds. No `mapfile`, no `declare -A`, no `${var^^}`.
@@ -110,6 +114,18 @@ Abort() {
 # and a truncated command still compares as a command. Stated because the omission
 # looks like an inconsistency, and tidying the three walkers into agreement is
 # exactly how it would get "fixed" back into a defect.
+#
+# Two boundaries are load-bearing and neither is the one that looks obvious:
+#
+#   * A STEP ends at the next `- ` item whatever key introduces it, not at the
+#     next `- name:`. An unnamed step -- `- if: failure()` carrying its own
+#     `run:` -- would otherwise still be `pending` from the last `- name:`, and
+#     its command is folded onto the one being read. A `run: cmake --build
+#     --preset …` there yields two preset names and fails a correct tree.
+#   * A BLANK LINE inside a `>-` / `|` scalar is part of the scalar (it folds to
+#     a newline); it does not end it. Ending collection there dropped every
+#     option after the blank, and -- see the paragraph above -- a truncated
+#     command still compares as a command. The body ends at the dedent.
 ExtractWorkflowConfigure() {
     awk -v job="$2" -v step="$3" '
         /^jobs:[ \t]*$/                  { inJobs = 1; next }
@@ -121,11 +137,13 @@ ExtractWorkflowConfigure() {
                                            inJob = (key == job)
                                            next }
         !inJob                           { next }
+        # No `next`: a `- name:` line is also a new step and must fall through
+        # to the rule below, which decides whether THIS one is the wanted step.
+        /^      - /                      { pending = 0; collecting = 0 }
         /^      - name:[ \t]*/           { name = $0
                                            sub(/^      - name:[ \t]*/, "", name)
                                            gsub(/^"|"$/, "", name)
                                            pending = (name == step)
-                                           collecting = 0
                                            next }
         pending && /^        run:[ \t]*/ { collecting = 1
                                            rest = $0
@@ -134,7 +152,7 @@ ExtractWorkflowConfigure() {
                                            # anything else is the body itself.
                                            if (rest !~ /^(>-?|\|-?)$/) printf "%s ", rest
                                            next }
-        collecting && /^[ \t]*$/         { collecting = 0; next }
+        collecting && /^[ \t]*$/         { next }
         collecting && /^          /      { line = $0
                                            sub(/^[ \t]+/, "", line)
                                            printf "%s ", line
@@ -144,11 +162,18 @@ ExtractWorkflowConfigure() {
 }
 
 # ---------------------------------------------------------------------------
-# The documented configure line out of a file that documents one, folded to one
-# line. Anchored on `cmake --preset` plus the sweep's database directory, which
-# together mean this database and nothing else -- the rulebook shows several other
-# `cmake --preset` lines, and an anchor matching those would compare the wrong
-# thing and pass.
+# EVERY documented configure line in a file that documents one, one folded
+# command per output line. Anchored on `cmake --preset` plus the sweep's database
+# directory, which together mean this database and nothing else -- the rulebook
+# shows several other `cmake --preset` lines, and an anchor matching those would
+# compare the wrong thing and pass.
+#
+# Every, not the first: a file that grows a SECOND copy of the line is exactly the
+# drift this check exists for, and stopping at the first would be silent about it
+# -- the same "silence reads identically to complete coverage" failure the header
+# refuses when it scans for sites instead of listing them. A scan that discovers
+# the right files and then reads one line out of each has only moved the blind
+# spot inside the file.
 #
 # Continuation is a trailing backslash. A leading `#` (a script header) or nothing
 # (a fenced markdown block) is stripped either way.
@@ -158,15 +183,16 @@ ExtractDocumentedConfigure() {
             sub(/^[ \t]*#?[ \t]*/, "", s)
             return s
         }
-        !started && /cmake --preset/ && index($0, "-B " dir) { started = 1 }
-        started { line = strip($0)
-                  more = (line ~ /\\$/)
-                  sub(/\\$/, "", line)
-                  # Trim what the backslash left behind, so the folded result is
-                  # single-spaced rather than carrying the wrapping as blanks.
-                  sub(/[ \t]+$/, "", line)
-                  printf "%s ", line
-                  if (!more) exit }
+        !collecting && /cmake --preset/ && index($0, "-B " dir) { collecting = 1 }
+        collecting { line = strip($0)
+                     more = (line ~ /\\$/)
+                     sub(/\\$/, "", line)
+                     # Trim what the backslash left behind, so the folded result
+                     # is single-spaced rather than carrying the wrapping as
+                     # blanks.
+                     sub(/[ \t]+$/, "", line)
+                     folded = (folded == "" ? line : folded " " line)
+                     if (!more) { print folded; folded = ""; collecting = 0 } }
     ' "$1"
 }
 
@@ -212,11 +238,25 @@ DocumentationSites() {
 #
 # Everything else is dropped deliberately -- `cmake`, `-S`, `-B`, `-G`, wrapping
 # and ordering are not the contract.
+#
+# BOTH spellings of each, because a token this does not recognise is a token it
+# drops, and a dropped token is dropped from both sides at once -- which is a
+# check that passes while the two disagree, in the one dimension it exists to
+# compare. `cmake` accepts `--preset=NAME` as well as `--preset NAME`, and
+# `-D NAME=VALUE` as well as `-DNAME=VALUE`; recognising only one spelling of
+# each meant a workflow reformatted to the other could name a different preset,
+# or a different VALUE, and still agree with the documentation.
 NormaliseConfigure() {
     printf '%s\n' "$1" | tr ' \t' '\n\n' | awk '
         $0 == ""            { next }
         takePreset          { print "preset " $0; takePreset = 0; next }
+        takeDefine          { print "-D" $0; takeDefine = 0; next }
         $0 == "--preset"    { takePreset = 1; next }
+        $0 == "-D"          { takeDefine = 1; next }
+        /^--preset=/        { value = $0
+                              sub(/^--preset=/, "", value)
+                              print "preset " value
+                              next }
         /^-D/               { print }
     ' | sort
 }
@@ -277,14 +317,16 @@ SelfTest() {
         fi
     }
 
-    # The comparison: does a documented line agree with CI's?
-    ExpectCompare() {
-        if CompareConfigure "synthetic" "$ci" "$3" >/dev/null 2>&1; then
+    # The comparison: does a documented line agree with CI's? `ExpectCompare`
+    # delegates rather than repeating the call, so the two cannot drift.
+    ExpectComparePair() {
+        if CompareConfigure "synthetic" "$3" "$4" >/dev/null 2>&1; then
             Report "compare '$1'" "$2" agree
         else
             Report "compare '$1'" "$2" differ
         fi
     }
+    ExpectCompare() { ExpectComparePair "$1" "$2" "$ci" "$3"; }
 
     ExpectCompare "identical but for -B and wrapping" agree \
         "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
@@ -303,6 +345,24 @@ SelfTest() {
     # agrees with nothing.
     ExpectCompare "the pre-#454 hand-rolled line" differ \
         "cmake -S . -B ${DatabaseDir} -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
+
+    # The other spelling of each token, on BOTH sides at once -- which is the
+    # only arrangement in which an unrecognised token hides a disagreement
+    # rather than manufacturing one. Recognising `--preset NAME` alone let a
+    # workflow written `--preset=clang-release` agree with documentation written
+    # `--preset=clang-debug`, because neither side contributed a preset at all.
+    ExpectComparePair "a preset spelled --preset=NAME, differing" differ \
+        "cmake --preset=clang-debug -DENABLE_TIDY=OFF" \
+        "cmake --preset=clang-release -B ${DatabaseDir} -DENABLE_TIDY=OFF"
+    ExpectComparePair "a preset spelled --preset=NAME, agreeing" agree \
+        "cmake --preset=clang-debug -DENABLE_TIDY=OFF" \
+        "cmake --preset=clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF"
+    ExpectComparePair "a -D spelled with a space, differing VALUE" differ \
+        "cmake --preset clang-debug -D ENABLE_TIDY=OFF" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -D ENABLE_TIDY=ON"
+    ExpectComparePair "a -D spelled with a space, agreeing" agree \
+        "cmake --preset clang-debug -D ENABLE_TIDY=OFF" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF"
 
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
@@ -341,6 +401,19 @@ Then \`cmake --preset clang-coverage\`.
         "  cmake --preset clang-debug -DENABLE_TIDY=OFF"
     ExpectDocument "a preset line naming a DIFFERENT -B extracts nothing" "" \
         "  cmake --preset clang-debug -B out/build/somewhere-else -DENABLE_TIDY=OFF"
+    # A file carrying the line TWICE yields both, so the second one is compared
+    # rather than shadowed by the first. Stopping at the first occurrence is the
+    # scan's own blind spot moved inside the file.
+    ExpectDocument "a second copy in the same file is extracted too" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF
+cmake --preset clang-debug -B ${DatabaseDir} -DSTALE=YES" \
+        "First, near the top:
+
+    cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF
+
+and again, three hundred lines further down:
+
+    cmake --preset clang-debug -B ${DatabaseDir} -DSTALE=YES"
 
     # -----------------------------------------------------------------------
     # BOTH scan modes, against a synthetic tree. `check-catch-skip-return-code`
@@ -360,9 +433,17 @@ Then \`cmake --preset clang-coverage\`.
         printf '  cmake --preset clang-debug -B %s -DSTALE=YES\n' "$DatabaseDir" \
             > "$tree/.claude/worktrees/other/scripts/tidy-sweep.sh"
         printf '.claude/\n' > "$tree/.gitignore"
+        # `git ls-files` reads the INDEX, so `git add` is the whole setup -- and
+        # no commit means no `commit.gpgsign`, no `core.hooksPath` hook and no
+        # signing key to be missing. Committing here made a developer's ordinary
+        # global config abort the self-test at exit 128 under `set -e`, printing
+        # nothing about what had happened, which is the failure shape this
+        # repository's own testing rules refuse.
         if [[ "$useGit" == git ]]; then
-            ( cd "$tree" && git init -q . && git add -A && \
-              git -c user.email=t@t -c user.name=t commit -qm t ) >/dev/null 2>&1
+            if ! ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1; then
+                Report "scan '$name' setup" "git init + git add to succeed" "they failed"
+                return 0
+            fi
         fi
         got="$( cd "$tree" && DocumentationSites )"
         gotMode="$(printf '%s\n' "$got" | sed -n 's/^mode:\(.*\)/\1/p')"
@@ -432,6 +513,38 @@ Then \`cmake --preset clang-coverage\`.
           -DFASTCACHED_ENABLE_TLS=ON
       - name: "Sweep"
         id: sweep
+        run: scripts/tidy-sweep.sh'
+
+    # An UNNAMED step ends the previous one too. Without that, this fixture read
+    # back as `cmake --preset clang-debug -DENABLE_TIDY=OFF cmake --build
+    # --preset clang-debug`, which normalises to two preset names and fails a
+    # tree whose documentation is perfectly correct.
+    ExpectWorkflow "an unnamed step after it does not extend it" \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF' \
+        'jobs:
+  clang-tidy:
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF
+      - if: failure()
+        run: cmake --build --preset clang-debug'
+
+    # A blank line inside a block scalar folds to a newline; it is not the end of
+    # the scalar. Truncating there silently dropped every option after it, and a
+    # truncated command still compares as a command.
+    ExpectWorkflow "a blank line inside the block scalar does not truncate it" \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF -DFASTCACHED_ENABLE_TLS=ON' \
+        'jobs:
+  clang-tidy:
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF
+
+          -DFASTCACHED_ENABLE_TLS=ON
+
+      - name: "Sweep"
         run: scripts/tidy-sweep.sh'
 
     ExpectWorkflow "an unfolded single-line run:" \
@@ -506,10 +619,29 @@ if [[ "${#sites[@]}" -eq 0 ]]; then
 fi
 
 foundRequired=no
+compared=0
 for site in "${sites[@]}"; do
     [[ "$site" == "$RequiredSite" ]] && foundRequired=yes
-    CompareConfigure "$site" "$CiConfigure" \
-        "$(ExtractDocumentedConfigure "$site" "$DatabaseDir")" || problems=$((problems + 1))
+
+    # Every occurrence in the file, not just the first: see
+    # `ExtractDocumentedConfigure`. A file is one site and can still hold two
+    # copies, and the second is the one that rots.
+    occurrence=0
+    while IFS= read -r documented; do
+        [[ -z "${documented// /}" ]] && continue
+        occurrence=$((occurrence + 1))
+        siteLabel="$site"
+        [[ $occurrence -gt 1 ]] && siteLabel="$site (occurrence $occurrence)"
+        compared=$((compared + 1))
+        CompareConfigure "$siteLabel" "$CiConfigure" "$documented" || problems=$((problems + 1))
+    done < <(ExtractDocumentedConfigure "$site" "$DatabaseDir")
+
+    # The scan found the anchor in this file, so the extractor must have found it
+    # too; reaching here means the two disagree about what a documented line is.
+    # Reported through the same comparison, which owns the sentence for it.
+    if [[ $occurrence -eq 0 ]]; then
+        CompareConfigure "$site" "$CiConfigure" "" || problems=$((problems + 1))
+    fi
 done
 
 if [[ "$foundRequired" != yes ]]; then
@@ -519,4 +651,4 @@ fi
 if [[ $problems -gt 0 ]]; then
     Abort "a local sweep following the documentation would not agree with CI"
 fi
-echo "check-tidy-sweep-database: ${#sites[@]} documented line(s) match the clang-tidy job's Configure step"
+echo "check-tidy-sweep-database: $compared documented line(s) across ${#sites[@]} file(s) match the clang-tidy job's Configure step"
