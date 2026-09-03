@@ -241,11 +241,108 @@ SelfTest() {
     Expect differ "the pre-#454 hand-rolled line" \
         'cmake -S . -B out/build/tidy22 -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
 
+    # -----------------------------------------------------------------------
+    # The WORKFLOW-side extractor, which the cases above do not touch at all.
+    #
+    # It is the half that decides what everything else is compared AGAINST, and
+    # its failure mode is an empty string -- which the main path treats as fatal
+    # precisely because it would otherwise compare nothing against nothing. But
+    # "it returns empty when it should" and "it returns the RIGHT step when there
+    # are several" are different questions, and build.yml really does have a
+    # `Configure` step in more than one job.
+    #
+    # The added steps are not hypothetical: a queued pull request adds an `id:`
+    # and a further step to this very job, so a reader must be able to see that
+    # neither moves the answer.
+    workflowDir="$(mktemp -d)"
+    trap 'rm -rf "$workflowDir"' EXIT
+
+    ExpectWorkflow() {
+        name="$1"; want="$2"; content="$3"
+        printf '%s\n' "$content" > "$workflowDir/wf.yml"
+        got="$(ExtractWorkflowConfigure "$workflowDir/wf.yml" "clang-tidy" "Configure")"
+        # Collapse trailing whitespace: the extractor joins with a trailing space.
+        got="${got%"${got##*[![:space:]]}"}"
+        if [[ "$got" == "$want" ]]; then
+            echo "ok: self-test workflow '$name'"
+        else
+            echo "  FAIL: self-test workflow '$name'" >&2
+            echo "        wanted: [$want]" >&2
+            echo "        got:    [$got]" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    ExpectWorkflow "the clang-tidy job's step, not another job's" \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF' \
+        'jobs:
+  linux:
+    name: "Linux"
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-release -DSOMETHING=ELSE
+  clang-tidy:
+    name: "clang-tidy"
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF
+  windows:
+    name: "Windows"
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset cl-debug'
+
+    ExpectWorkflow "steps and an id: added around it" \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF -DFASTCACHED_ENABLE_TLS=ON' \
+        'jobs:
+  clang-tidy:
+    name: "clang-tidy"
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install build tools"
+        run: sudo apt-get update
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF
+          -DFASTCACHED_ENABLE_TLS=ON
+      - name: "Sweep"
+        id: sweep
+        run: scripts/tidy-sweep.sh'
+
+    ExpectWorkflow "an unfolded single-line run:" \
+        'cmake --preset clang-debug -DENABLE_TIDY=OFF' \
+        'jobs:
+  clang-tidy:
+    steps:
+      - name: "Configure"
+        run: cmake --preset clang-debug -DENABLE_TIDY=OFF'
+
+    # The fatal direction: the job or the step going away must yield EMPTY, which
+    # the main path refuses rather than passing vacuously.
+    ExpectWorkflow "the Configure step renamed away" '' \
+        'jobs:
+  clang-tidy:
+    steps:
+      - name: "Set up"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF'
+
+    ExpectWorkflow "the job renamed away" '' \
+        'jobs:
+  tidy:
+    steps:
+      - name: "Configure"
+        run: >-
+          cmake --preset clang-debug -DENABLE_TIDY=OFF'
+
     if [[ $failures -gt 0 ]]; then
         echo "check-tidy-sweep-database --self-test: $failures case(s) wrong" >&2
         exit 1
     fi
-    echo "check-tidy-sweep-database --self-test: the comparison bites on every case"
+    echo "check-tidy-sweep-database --self-test: the comparison and the workflow extraction both bite"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
