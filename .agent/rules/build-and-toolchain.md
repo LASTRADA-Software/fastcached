@@ -2389,6 +2389,17 @@ been built on the first.
   a batched pass is accepted only on identical classifications over the real
   database — a 100× speedup that moves one verdict is a regression, because the
   verdicts are the entire job.
+- **[#607](https://github.com/LASTRADA-Software/fastcached/issues/607)** — #568 made the
+  two CMake sites agree on the lookup that RUNS the interpreter, and `cmake/Coverage.cmake`
+  names the four places python is located and which two do not validate. **Nothing reads
+  that comment.** A third `find_program(NAMES python3)` passes every check in the tree and
+  the comment goes false silently, which is #568's own divergence one level up. A check
+  would be a glob over `**/*.cmake` and `**/CMakeLists.txt` and never a file list (#492),
+  a general needle rather than the exact line removed, and it must express
+  `cmake/Version.cmake` as a REASONED exception — its `find_program` for git is
+  deliberate, because the module is included before `project()` where `find_package` has
+  no toolchain — or the check fails a correct file. Roughly 3x the diff it protects, so it
+  is recorded rather than urgent.
 - **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
   entry in `.tsan-suppressions`: `AdminEndpoint` closes its listener from the main
   thread while its own accept thread is still inside `Accept()`. Removing the entry
