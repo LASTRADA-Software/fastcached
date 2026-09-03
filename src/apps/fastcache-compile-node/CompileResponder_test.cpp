@@ -10,6 +10,7 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -753,6 +754,41 @@ class IdleListener final: public IListener
     return capacity.InFlight() == 0;
 }
 
+/// Wait until `counter` reaches `expected`, then report what it holds.
+///
+/// **A counter is written by the thread that did the work, not by the one that sees
+/// the result, and nothing orders those two.** `FrameDeadlineRefusalsSent` is
+/// incremented on the reactor thread *after* `co_await WriteAll` resumes
+/// (`FrameEndpoint.cpp`); a case reading it has been woken by the reply BYTES
+/// arriving, which is the earlier event. Sampling the counter there asserts a
+/// happens-before the code does not provide -- and `Windows-cl-release` was red on
+/// master for three runs running because of it, while the refusal itself arrived
+/// correctly every time (#699). Release scheduling merely loses the race more often;
+/// widening the window by 300 ms reproduces it on any build.
+///
+/// **It returns the VALUE, not a bool.** A genuine regression then still prints the
+/// expansion that names it -- `0 == 1` where the refusal was never counted, `2 == 1`
+/// on a double count -- where a bare `false` would say only that something timed out
+/// and would make a real defect and a slow machine look identical.
+///
+/// Bounded through `DrainWithin`, the tree's one bounded drain, rather than by a
+/// hand-rolled loop: that function's own note records the accumulate-the-nominal-poll
+/// defect shipping twice, both times in a copy citing the implementation it had
+/// reimplemented. And never by a fixed sleep -- the case below records a sleep being
+/// wrong here twice, in both directions.
+/// @param metrics Where the counter lives.
+/// @param counter Which counter to wait on.
+/// @param expected The value to wait for.
+/// @return The counter's value once it reached `expected`, or as the ceiling elapsed.
+[[nodiscard]] std::uint64_t CounterReaching(IMetricsSink const& metrics,
+                                            IMetricsSink::Counter counter,
+                                            std::uint64_t expected)
+{
+    (void) DrainWithin([&metrics, counter, expected] { return metrics.Read(counter) < expected; },
+                       DrainBound { .ceiling = std::chrono::seconds { 30 }, .poll = std::chrono::milliseconds { 5 } });
+    return metrics.Read(counter);
+}
+
 /// The worker, the responder and the router a merged-surface case drives.
 ///
 /// Held together because their declaration ORDER is load-bearing and silently so: the
@@ -914,11 +950,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // sweep has observed this connection -- and the release then happens promptly
     // inside the grace rather than at a guessed offset from it. Bounded, and it says
     // what it waited for.
-    auto const sweptBy = std::chrono::steady_clock::now() + std::chrono::seconds { 30 };
-    while (fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0
-           && std::chrono::steady_clock::now() < sweptBy)
-        std::this_thread::sleep_for(std::chrono::milliseconds { 10 });
-    REQUIRE(fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 1);
+    REQUIRE(CounterReaching(fix.metrics, IMetricsSink::Counter::FrameAnswerDeadlineSweeps, 1) == 1);
     worker.runner.Release();
 
     // The window the RESPONDER named is what expired, and the client is told which
@@ -932,7 +964,12 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     REQUIRE(Unwrap(header).status == Wire::Status::Error);
     REQUIRE(Unwrap(header).payloadLength != 0);
     CHECK(static_cast<Wire::ErrorCode>(swept[Wire::ReplyHeaderSize]) == Wire::ErrorCode::RequestDeadlineExceeded);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == 1);
+    // Waited for, not sampled, and for the same reason the sweep above is: this thread
+    // was woken by the bytes, and the tally is written afterwards on the reactor's.
+    // The assertion ABOVE is what proves the refusal happened at all -- it holds the
+    // wire code the client actually received -- so this one is free to be about the
+    // count alone. See `CounterReaching`.
+    CHECK(CounterReaching(fix.metrics, IMetricsSink::Counter::FrameDeadlineRefusalsSent, 1) == 1);
 
     // And the worker still paid in full: the compiler ran and the object was produced,
     // for an answer nobody receives. That is the half #523 did NOT change and this case
