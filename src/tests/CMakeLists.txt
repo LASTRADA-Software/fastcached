@@ -210,6 +210,20 @@ set_tests_properties("script-check-warning-canary" PROPERTIES
 # property is inert in exactly the way all thirteen were. Derived from this file
 # rather than from a list restated in the checker -- a second copy of the set is
 # not a cross-check, it is a second thing to be wrong.
+#
+# TWO rules over that one derived set, and this comment named only the first
+# until #497 added the second:
+#
+#   * every registration carries FAIL_REGULAR_EXPRESSION, so ctest can hear it
+#     fail at all;
+#   * every script behind one declares `cmake_minimum_required`, because script
+#     mode sets no policies -- so `if(... IN_LIST ...)` errors out on CMake 3.28
+#     and answers on 4.x, and `if(TRUE)` is FALSE on 3.28 and true on 4.x. The
+#     check's own header carries the measurements.
+#
+# Both are properties of a registration that reading it cannot reveal, which is
+# why they are asserted rather than remembered -- and why a comment here that
+# describes half of what the check does is the same defect in miniature.
 add_test(
     NAME "script-check-signals"
     COMMAND ${CMAKE_COMMAND}

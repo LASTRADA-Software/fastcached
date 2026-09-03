@@ -17,4 +17,7 @@
 # check happened to have something to say that day.
 #
 # Same idea as iterator-debug-canary: a program that must die.
+
+cmake_minimum_required(VERSION 3.28)
+
 message(FATAL_ERROR "script-check-canary: this failure is the point; if you are reading it as a test FAILURE, the FAIL_REGULAR_EXPRESSION mechanism has stopped working")

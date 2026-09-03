@@ -21,4 +21,7 @@
 # `CMake Error` and trip the other half of the alternation, so the canary would
 # stay green even if the warning branch were deleted -- proving nothing and
 # looking like proof.
+
+cmake_minimum_required(VERSION 3.28)
+
 message(WARNING "script-check-warning-canary: this warning is the point; if you are reading it as a test FAILURE, the CMake Warning half of FAIL_REGULAR_EXPRESSION has stopped working")

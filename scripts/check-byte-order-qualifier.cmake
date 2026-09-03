@@ -67,11 +67,11 @@
 
 # Under CMP0007 OLD, `list()` DISCARDS empty elements -- every blank line in every
 # file scanned here -- so a reported line number would be off by however many
-# blank lines precede it. Guarded by `if(POLICY ...)` so a CMake that has retired
-# the policy still runs this.
-if(POLICY CMP0007)
-    cmake_policy(SET CMP0007 NEW)
-endif()
+# blank lines precede it. The declaration below sets CMP0007 along with every
+# other policy of that vintage; it replaced a hand-set `if(POLICY CMP0007)`
+# block, which covered only the one trap somebody had already met.
+
+cmake_minimum_required(VERSION 3.28)
 
 # ---------------------------------------------------------------------------
 # The names. `htonll`/`ntohll` are included although this tree does not use them
