@@ -114,9 +114,13 @@ namespace
     /// `PrePayloadDecision` is a wire enum shared with the launcher and states no
     /// count, which is why its lookup has to stay a switch.
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusalTable { {
-        { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy },
-        { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential },
-        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::RejectedCredential },
+        // `.rationale` is spelled out as empty on every counted row rather than left to
+        // default. Clang and GCC reject the omission under this project's pedantic
+        // flags (`-Wmissing-designated-field-initializers`) and MSVC does not say a
+        // word, so the three rows below built clean on Windows and failed four CI legs.
+        { .refusal = EndpointRefusal::InFlightBudget, .answer = CompileRefusal::EndpointBusy, .rationale = {} },
+        { .refusal = EndpointRefusal::CredentialMalformed, .answer = CompileRefusal::MalformedCredential, .rationale = {} },
+        { .refusal = EndpointRefusal::CredentialRejected, .answer = CompileRefusal::RejectedCredential, .rationale = {} },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },

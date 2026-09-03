@@ -252,12 +252,17 @@ namespace Detail
           .answer = std::nullopt,
           .rationale = "the byte budget says this surface is momentarily full, which the peer sees and retries; summed "
                        "into a security series it is what makes that series unreadable" },
+        // `.rationale` empty and SAID so, for the reason the compile surface's table
+        // spells it: clang and GCC refuse the omission under this project's pedantic
+        // flags and MSVC accepts it silently.
         { .refusal = EndpointRefusal::CredentialMalformed,
           .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::MalformedFrame,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed } },
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed },
+          .rationale = {} },
         { .refusal = EndpointRefusal::CredentialRejected,
           .answer = Cc::SurfaceRefusal { .code = CompileCacheWire::ErrorCode::Unauthenticated,
-                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected } },
+                                         .counter = IMetricsSink::Counter::SchedulerCredentialsRejected },
+          .rationale = {} },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
