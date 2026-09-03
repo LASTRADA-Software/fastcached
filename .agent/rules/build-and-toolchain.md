@@ -1724,6 +1724,22 @@ makes it anyway and says so there.
   `sort` collates case-insensitively and the assertions fail on a developer's
   machine while passing on a runner's `C.UTF-8`.
 
+  And the sharper form of the same failure, because the canary above does **not**
+  catch it: **the tool can run, exit 0, and have analysed nothing.** Every guard in
+  this paragraph asks whether clang-tidy *executed*; none asks whether it had any
+  check enabled while it did. `--checks=-*,clang-diagnostic-c2y-extensions` selects
+  no check at all in clang-tidy 22 — `clang-diagnostic-*` is a **filter over compiler
+  diagnostics, not a check that can be enabled by a glob** — so a sweep spelled that
+  way reports `0 findings` for every translation unit, with a successful exit status,
+  a proven-executable binary and a database that parses. Measured while investigating
+  #454: six full sweeps across four compile databases, all reading zero, all
+  worthless. The only thing that exposed it was a deliberately planted finding that
+  *also* read zero. So a `--checks` expression narrowed for speed is itself an
+  instrument, and it is calibrated the way every other instrument here is — plant a
+  finding the expression must report, and watch it report it, before believing a run
+  of zeroes. `Error: no checks enabled` on stderr is the tell, and `--quiet` plus a
+  `grep` hides it.
+
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
   padding than an optimal field order would give, and `NodeConfig` is almost entirely
