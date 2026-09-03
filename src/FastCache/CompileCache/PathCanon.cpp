@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/PathCanon.hpp>
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <string_view>
@@ -75,6 +76,24 @@ namespace
 
         // Exact match, or the next byte is a separator (segment boundary).
         return pathCmp.size() == rootCmp.size() || pathCmp[rootCmp.size()] == '/';
+    }
+
+    /// The relation between two comparison forms, from one pass of the rule above.
+    ///
+    /// `NearMiss` is defined as the complement of `Under` over the same bytes rather
+    /// than as a second opinion about them, so the two can never disagree about the
+    /// boundary. An empty root is `Outside` of everything: it prefixes every path
+    /// character-wise and is `Under` nothing, so without this it would make every
+    /// path in a layout naming no build tree a near miss of that root.
+    ///
+    /// @param pathCmp Comparison form of the candidate path.
+    /// @param rootCmp Comparison form of a root.
+    /// @return Where the path stands relative to the root.
+    [[nodiscard]] RootRelation RelateFolded(std::string_view pathCmp, std::string_view rootCmp)
+    {
+        if (rootCmp.empty() || !pathCmp.starts_with(rootCmp))
+            return RootRelation::Outside;
+        return IsSegmentPrefix(pathCmp, rootCmp) ? RootRelation::Under : RootRelation::NearMiss;
     }
 
     /// How deep a root reaches, for deciding which of two matching roots is the
@@ -523,7 +542,7 @@ Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
     return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
 }
 
-bool IsUnderRoot(std::string_view path, std::string_view root)
+RootRelation RelateToRoot(std::string_view path, std::string_view root)
 {
     // The comparison forms are built here rather than asked of the caller, so that
     // the boundary byte `IsSegmentPrefix` looks for is the one `ComparisonForm`
@@ -532,20 +551,18 @@ bool IsUnderRoot(std::string_view path, std::string_view root)
     // are spelled that way), so handing its comparison form to `IsSegmentPrefix`
     // would ask for a `/` that cannot be there and answer "not under root" for
     // every path under every root.
-    return IsSegmentPrefix(ComparisonForm(path), ComparisonForm(root));
+    return RelateFolded(ComparisonForm(path), ComparisonForm(root));
 }
 
-bool IsRootNearMiss(std::string_view path, std::string_view root)
+RootRelation RelateToLayout(std::string_view path, Layout const& layout)
 {
     std::string const pathCmp = ComparisonForm(path);
-    std::string const rootCmp = ComparisonForm(root);
-    // The character-wise half is spelled here and the boundary half is not: both
-    // answers come from the one `IsSegmentPrefix`, so "near miss" is defined as the
-    // complement of "under root" over the same bytes rather than as a second
-    // opinion about them. An empty root prefixes everything character-wise and is
-    // under-root to nothing, which would make every path in a layout naming no
-    // build tree a near miss of it.
-    return !rootCmp.empty() && pathCmp.starts_with(rootCmp) && !IsSegmentPrefix(pathCmp, rootCmp);
+    auto const source = RelateFolded(pathCmp, ComparisonForm(layout.sourceRoot));
+    auto const build = RelateFolded(pathCmp, ComparisonForm(layout.buildTree));
+    // Strongest answer wins, and `Under` outranking `NearMiss` is the whole content
+    // of this function: with a build tree spelled as the source root's sibling, a
+    // path inside it is a near miss of one root and correctly under the other.
+    return std::max(source, build);
 }
 
 std::string Canonicalize(std::string_view absolutePath, Layout const& layout)

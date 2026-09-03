@@ -53,7 +53,7 @@ namespace
         // A surviving canonical token means LocalizeRegion left this span alone.
         if (path.front() == '<')
             return false;
-        // Classified first: IsToolchainHeader reports every path outside the roots
+        // Anchored first: the root classifier reports every path outside the roots
         // as toolchain, a relative one included, so asking it first would silently
         // skip all of them.
         switch (PathCanon::AnchorForLayout(path, layout))
@@ -84,24 +84,37 @@ namespace
                 break;
         }
         // A near miss of a root is checked, and it is the one path outside the roots
-        // that is. The exclusion above rests on a REASON rather than on the word
-        // "outside": a path out here is toolchain or system content, which the
-        // toolchain stamp covers collectively, so a machine that has a different one
-        // has a different key and never sees this value at all. A root spelled
+        // that is. The exclusion the header states rests on a REASON rather than on
+        // the word "outside": a path out here is toolchain or system content, which
+        // the toolchain stamp covers collectively, so a machine that has a different
+        // one has a different key and never sees this value at all. A root spelled
         // almost right is outside the roots and covered by nothing -- it is a
         // project header the roots failed to name -- so the stamp argument does not
         // reach it, and skipping it would replay a path naming a file that may be
         // somewhere else entirely on this machine, which is issue #53 exactly.
+        //
+        // Which is also why the question is `ClassifyAgainstRoots` rather than a
+        // near-miss test run beside the toolchain one: a MARKED path is stamp-covered
+        // wherever it sits, so a vendored tree that happens to sit beside the source
+        // root (`<root>-deps/vcpkg_installed/...`) must stay skipped. Asked
+        // separately it would be probed, and every hit carrying it discarded on a
+        // machine whose dependencies are installed elsewhere.
         //
         // This is a difference from the key filter's treatment of the same path,
         // stated here because the two questions differ: the key asks what is safe to
         // HASH (a machine-specific path, so it is dropped), and this asks what this
         // machine is answerable for EXISTING (a project header, so it is probed).
         // What they no longer differ about is which paths are outside the roots at
-        // all -- one `PathCanon::IsUnderRoot` decides that for both (issue #562).
-        if (IsNearMissRoot(path, layout))
-            return true;
-        return !IsToolchainHeader(path, layout);
+        // all -- one `PathCanon` rule decides that for both (issue #562).
+        switch (ClassifyAgainstRoots(path, layout))
+        {
+            case PathClass::Project:
+            case PathClass::NearMissRoot:
+                return true;
+            case PathClass::Toolchain:
+                break;
+        }
+        return false;
     }
 } // namespace
 

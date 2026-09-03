@@ -218,7 +218,8 @@ namespace
         // path reaching here is anchored to a working directory any more, whichever
         // branch it came down — which is the case about which the three genuinely do
         // agree (see the header for where they part on the ones that are).
-        if (IsToolchainHeader(path, layout))
+        auto const pathClass = ClassifyAgainstRoots(path, layout);
+        if (pathClass != PathClass::Project)
         {
             // Which of two true things a dropped drive-relative path is REPORTED
             // as, and the root question is what decides. Such a path is anchored to
@@ -238,22 +239,26 @@ namespace
             // — so the root question is asked here instead, and only for the
             // drive-relative path no ordinary build produces at all. The toolchain
             // drop is 476 of a real translation unit's 635 paths and still costs
-            // exactly one root test.
+            // exactly one root test -- `ClassifyAgainstRoots` above, whose answer
+            // also carries the near miss below, so naming that third outcome bought
+            // no extra pass over the path.
             if (driveRelative && !RootToken(path, layout).has_value())
                 return Dropped(PathDisposition::DriveRelative);
 
-            // A root spelled almost right, asked as its own question rather than
+            // A root spelled almost right, read off the classification rather than
             // inferred from two classifiers disagreeing. It used to be the latter:
-            // `IsToolchainHeader` matched a root character-wise while `Canonicalize`
+            // the classifier matched a root character-wise while `Canonicalize`
             // matched segment-wise, so `/x/build-other/a.h` fell out of the gap
             // between them and was reported here by arriving at the bottom of this
             // function. That gap was a violation of the invariant the three
             // classifiers exist to keep (issue #562) and is closed; the fault it
             // happened to name is not, because it is the one root fault of the three
             // an operator repairs by editing a root rather than by moving a file.
-            // Explicit is also cheaper to reason about: it now says what it means
-            // instead of meaning whatever two predicates happen to disagree about.
-            if (IsNearMissRoot(path, layout))
+            // Read off the ONE classification, not asked again afterwards: a marker
+            // match re-examined against the roots reports a vendored tree beside the
+            // source root as a misspelling, which is a healthy layout told to fix a
+            // correct root.
+            if (pathClass == PathClass::NearMissRoot)
                 return Dropped(PathDisposition::Uncanonical);
             return Dropped(PathDisposition::Toolchain);
         }
@@ -261,10 +266,11 @@ namespace
         if (auto token = RootToken(path, layout); token.has_value())
             return { .disposition = PathDisposition::Keyed, .token = *std::move(token) };
 
-        // `IsToolchainHeader` called this path rooted and `Canonicalize` then
-        // produced nothing, which the shared predicate leaves no way to reach: since
-        // issue #562 both ask `PathCanon::IsUnderRoot`, and the only remaining
-        // difference is the markers, which cannot make a path MORE rooted. Answered
+        // `ClassifyAgainstRoots` called this path rooted and `Canonicalize` then
+        // produced nothing, which the shared rule leaves no way to reach: since
+        // issue #562 both ask `PathCanon`'s segment-boundary test, and the only
+        // remaining difference is the markers, which cannot make a path MORE
+        // rooted (a marker match is `Toolchain`, handled above). Answered
         // rather than asserted because the alternative to answering is keying a path
         // with no portable form -- the producing machine's absolute spelling in the
         // key -- and that is the one outcome here worth being total about.

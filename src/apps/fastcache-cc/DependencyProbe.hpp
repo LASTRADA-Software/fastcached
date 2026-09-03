@@ -97,7 +97,7 @@ enum class PathDisposition : std::uint8_t
     Uncanonical,   ///< Under no root, and yet a character-wise prefix match for one —
                    ///< `/x/build-other/a.h` against a `/x/build` root. A root spelled
                    ///< almost right, which is the one of these three an operator
-                   ///< repairs by editing a root. Asked by name (`Cc::IsNearMissRoot`)
+                   ///< repairs by editing a root. Read off `Cc::ClassifyAgainstRoots`
                    ///< since issue #562; before that it was what fell out of the gap
                    ///< between two root tests that disagreed.
     Last,          ///< Not a disposition, and has no row: the table's length.

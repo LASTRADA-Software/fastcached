@@ -125,7 +125,20 @@ enum class Grammar : std::uint8_t
 /// @return True when either root is Windows-shaped.
 [[nodiscard]] bool IsWindowsLayout(Layout const& layout) noexcept;
 
-/// True when `path` lies under `root`, judged on a **segment boundary**.
+/// Where a path stands in relation to a root.
+///
+/// A reason rather than a `bool`, because the middle state is what the caller most
+/// needs to say out loud: it is a root spelled almost right, repaired by editing a
+/// root rather than by moving a file.
+enum class RootRelation : std::uint8_t
+{
+    Outside,  ///< No relation: not even a character-wise prefix match.
+    NearMiss, ///< A character-wise prefix of the root, but not on a segment
+              ///< boundary — `/home/dev/project-x/a.hpp` against `/home/dev/proj`.
+    Under,    ///< Under the root, on a segment boundary.
+};
+
+/// Where `path` stands in relation to `root`, judged on a **segment boundary**.
 ///
 /// This is the single definition of "is this path under this root", and it exists
 /// because there was briefly more than one. `Canonicalize` has always asked it
@@ -139,38 +152,40 @@ enum class Grammar : std::uint8_t
 /// available anywhere. The bug is the missing boundary check, so the fix is that
 /// there is one place the check can be missing from.
 ///
+/// `NearMiss` is that bug's only survivor and is deliberate: the state used to fall
+/// out of the gap between the two predicates, and it is the one root fault an
+/// operator repairs by editing a *root*, so closing the gap without naming it would
+/// have sent them looking for a file that is exactly where they put it.
+///
 /// Both arguments are **native** forms — the spellings a compiler and a build
 /// system emit, mixed separators and mixed case included. Folding them is this
 /// function's job precisely so a caller holding native paths does not fold its own
 /// comparison form and get the boundary byte wrong; `Canonicalize` needs the folded
 /// roots for other reasons and so keeps its own internal spelling of the same test.
 ///
-/// An empty root matches nothing: a layout that names no build tree must not make
-/// every path in the world lie under it.
+/// An empty root relates to nothing: a layout that names no build tree must not
+/// make every path in the world lie under it, nor a near miss of it.
 ///
 /// @param path A path in native form.
 /// @param root A layout root in native form.
-/// @return True when the root prefixes the path on a segment boundary.
-[[nodiscard]] bool IsUnderRoot(std::string_view path, std::string_view root);
+/// @return The relation.
+[[nodiscard]] RootRelation RelateToRoot(std::string_view path, std::string_view root);
 
-/// True when `path` character-wise prefix-matches `root` and yet does **not** lie
-/// under it — `/home/dev/project-x/a.hpp` against a `/home/dev/proj` root.
+/// Where `path` stands in relation to a layout's two roots, strongest answer first:
+/// `Under` if it is under either, else `NearMiss` if it near-misses either, else
+/// `Outside`.
 ///
-/// A root spelled almost right. This is the state the missing boundary check used
-/// to produce silently, and it is named here rather than deleted with the bug: it
-/// is the one root fault an operator repairs by editing a *root*, and folding it
-/// into "under no root" would send them looking for a file that is exactly where
-/// they put it. What changes is that it is now asked, so every classifier can agree
-/// the path lies outside the roots while still reporting *which* kind of outside it
-/// is (issue #562).
+/// Not a loop over `RelateToRoot` at the call site, and the ORDER is why: a build
+/// tree spelled as the source root's sibling (`/w/src` and `/w/src-other`) makes a
+/// path both a near miss of one root and legitimately under the other, and that
+/// path is project content rather than a misspelling. Folding the path once instead
+/// of once per root is the other reason — this is on the launcher's per-dependency
+/// path, which runs a few hundred times per translation unit.
 ///
-/// Mutually exclusive with `IsUnderRoot` by construction — a path is under a root,
-/// or a near miss of it, or unrelated to it — and takes the same native forms.
-///
-/// @param path A path in native form.
-/// @param root A layout root in native form.
-/// @return True when the root prefixes the path without a segment boundary.
-[[nodiscard]] bool IsRootNearMiss(std::string_view path, std::string_view root);
+/// @param path   A path in native form.
+/// @param layout The roots to relate it to.
+/// @return The strongest relation to either root.
+[[nodiscard]] RootRelation RelateToLayout(std::string_view path, Layout const& layout);
 
 /// What a path a compiler emitted is anchored to — the property that decides
 /// whether another machine can make sense of it.

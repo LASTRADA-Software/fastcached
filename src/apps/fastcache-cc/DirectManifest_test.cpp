@@ -309,6 +309,27 @@ TEST_CASE("A sibling directory extending a root's last segment is under no root,
         CHECK_FALSE(IsNearMissRoot("/home/dev/proj/src/d.hpp", layout));
     }
 
+    SECTION("a vendored tree BESIDE a root is toolchain, not a root spelled almost right")
+    {
+        // The marker scan settles this, and it has to settle it in the same answer:
+        // asked separately, `IsNearMissRoot` sees `.../proj-deps/...` character-
+        // prefixing `/home/dev/proj` with no boundary and calls a perfectly healthy
+        // vcpkg layout a misspelled root -- refusing a manifest over it on the
+        // manifest side and probing it for existence on the replay-guard side, which
+        // discards every hit on a machine whose dependencies sit elsewhere.
+        constexpr std::string_view vendored = "/home/dev/proj-deps/vcpkg_installed/x64-linux/include/fmt/core.h";
+        CHECK(IsToolchainHeader(vendored, layout));
+        CHECK_FALSE(IsNearMissRoot(vendored, layout));
+        CHECK(ClassifyAgainstRoots(vendored, layout) == PathClass::Toolchain);
+
+        // The degenerate form of the same mistake: a short source root that happens
+        // to prefix the SDK would otherwise make every Windows header a near miss.
+        FastCache::PathCanon::Layout const shortRoot { .sourceRoot = R"(C:\P)", .buildTree = R"(C:\P\out)" };
+        constexpr std::string_view sdk = R"(C:\Program Files (x86)\Windows Kits\10\include\um\windows.h)";
+        CHECK(IsToolchainHeader(sdk, shortRoot));
+        CHECK_FALSE(IsNearMissRoot(sdk, shortRoot));
+    }
+
     SECTION("a near miss of one root that is genuinely under the other is project content")
     {
         // Why `IsNearMissRoot` asks about the whole layout rather than one root: a
@@ -380,6 +401,29 @@ TEST_CASE("The key filter, the manifest and the replay guard all place the sibli
                                                              .bytes = notes } };
         auto const probed = ReplayedDependencyPaths(regions, layout);
         CHECK(probed == std::vector<std::string> { std::string { sibling } });
+    }
+
+    SECTION("a vendored tree beside a root stays outside every one of the three")
+    {
+        // The same three surfaces against the path the marker scan claims, because
+        // that is where asking the near-miss question separately went wrong: the
+        // key must still drop it as toolchain rather than as a misspelled root, the
+        // manifest must not refuse over it, and the guard must not probe it.
+        constexpr std::string_view vendored = "/home/dev/proj-deps/vcpkg_installed/x64-linux/include/fmt/core.h";
+
+        std::vector<std::string> const raw { std::string { vendored }, std::string { project } };
+        auto const set = KeyDependencySet(std::span<std::string const> { raw }, layout, "/home/dev/proj/build");
+        CHECK(set.Count(PathDisposition::Toolchain) == 1);
+        CHECK(set.Count(PathDisposition::Uncanonical) == 0);
+
+        auto const refused = CanonicalSourceToken(vendored, layout, "/home/dev/proj/build");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().fault == ManifestFault::OutsideRoots);
+
+        auto const notes = std::format("Note: including file: {}\r\n", vendored);
+        std::vector<FastCache::TextRegion> const regions { { .grammar = FastCache::PathCanon::Grammar::ShowIncludes,
+                                                             .bytes = notes } };
+        CHECK(ReplayedDependencyPaths(regions, layout).empty());
     }
 }
 

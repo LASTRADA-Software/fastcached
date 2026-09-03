@@ -241,8 +241,10 @@ same on both — the same defect with no MSVC anywhere near it.
       was hashed and revalidated rather than dropped, and the unsafe direction (a project
       header called toolchain, which revalidates forever) could not be produced by it. What
       it cost was the invariant this bullet states, and an invariant false in one of three
-      places is not available to reason from in the other two. One `PathCanon::IsUnderRoot`
-      now answers it, taking NATIVE forms on purpose: `IsSegmentPrefix` sees only comparison
+      places is not available to reason from in the other two. One
+      `PathCanon::RelateToRoot`/`RelateToLayout` now answers it — a `RootRelation` rather
+      than a `bool`, for the reason below — taking NATIVE forms on purpose: `IsSegmentPrefix`
+      sees only comparison
       forms whose separator is `/`, while `DirectManifest`'s `ToComparable` folds to `\`
       to match its backslash-spelled toolchain markers, so handing one's comparison form to
       the other asks for a boundary byte that cannot be there. Do not "unify separator
@@ -253,11 +255,23 @@ same on both — the same defect with no MSVC anywhere near it.
         fell out of the gap between the two predicates. They are the one root fault of the
         three an operator repairs by editing a *root*, so closing the gap without naming the
         state would have turned a typo'd root into `outside roots` and sent them looking for
-        a file that is exactly where they put it. `Cc::IsNearMissRoot` asks it directly —
-        under neither root, yet a character-wise prefix of one — and the "under neither" half
-        is load-bearing, since a build tree spelled as the source root's sibling makes a path
-        a near miss of one root and legitimately under the other. The three consumers then
-        agree the path lies outside the roots while still reporting *which* kind of outside.
+        a file that is exactly where they put it. `RootRelation::NearMiss` is that question
+        asked directly, and the "under neither" half is load-bearing, since a build tree
+        spelled as the source root's sibling makes a path a near miss of one root and
+        legitimately under the other — which is why `RelateToLayout` answers `Under` before
+        `NearMiss` rather than looping at the call site. The three consumers then agree the
+        path lies outside the roots while still reporting *which* kind of outside.
+      - **And the near miss is READ OFF the classification, never asked afterwards.**
+        `Cc::ClassifyAgainstRoots` returns `Project` / `NearMissRoot` / `Toolchain` in one
+        answer, with the marker scan winning, because a marker match re-examined against the
+        roots is overruled by them: `<root>-deps/vcpkg_installed/.../core.h` character-
+        prefixes `<root>` with no boundary, so a separate `IsNearMissRoot` call reported an
+        ordinary vcpkg layout as a misspelled root — refusing every manifest that included
+        it, and probing it in the replay guard so every hit was discarded on a machine whose
+        dependencies sit elsewhere. A short source root (`C:\P`) makes that total: every
+        Windows SDK header becomes a "near miss". Two questions of one path, answered by two
+        calls, is how the second one gets to overrule the first. `IsToolchainHeader` and
+        `IsNearMissRoot` remain as readings of the single answer, and it costs no extra pass.
       - **The replay guard still probes such a path, and that is a difference of QUESTION,
         not of predicate.** Its exclusion of outside-roots paths rests on the toolchain stamp
         covering them collectively, so a machine with a different toolchain has a different
@@ -682,7 +696,8 @@ same on both — the same defect with no MSVC anywhere near it.
       accident at first: `IsToolchainHeader`'s prefix match was character-wise and
       `Canonicalize`'s segment-wise, so such a path fell out of the gap between them. That
       gap was itself the defect (#562, above) and is closed; the fault survived it by being
-      asked for directly, `Cc::IsNearMissRoot`. A state produced by an inconsistency and a
+      asked for directly, as `Cc::ClassifyAgainstRoots`'s third outcome. A state produced by
+      an inconsistency and a
       state produced by a predicate look identical from the outside and are not the same
       thing to reason about — the first is only ever as reliable as the bug.
     - **The tally counts reported OCCURRENCES**, so it sums to `M` while the keyed set is
