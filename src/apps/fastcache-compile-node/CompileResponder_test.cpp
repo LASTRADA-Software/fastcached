@@ -10,10 +10,12 @@
 #include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/ThreadPoolExecutor.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -738,19 +740,72 @@ class IdleListener final: public IListener
 /// @return Whether the in-flight count reached zero.
 [[nodiscard]] bool DrainedWithin(CompileCapacity const& capacity, std::chrono::milliseconds bound)
 {
-    // Against a real deadline, not by accumulating the NOMINAL poll: a 5 ms
-    // `sleep_for` returns in about 15 ms on Windows, so counting the requested
-    // interval made this bound roughly three times what it claimed -- a figure that
-    // reads like five seconds and is not.
-    constexpr auto Poll = std::chrono::milliseconds { 5 };
-    auto const deadline = std::chrono::steady_clock::now() + bound;
-    while (std::chrono::steady_clock::now() < deadline)
+    // Through `DrainWithin` rather than a loop of its own. This was a hand-rolled one,
+    // correct about the thing it warned of -- measuring a real deadline rather than
+    // accumulating the NOMINAL poll, since a 5 ms `sleep_for` costs ~15 ms on Windows
+    // and a counted bound is three times what it reads as -- and that is precisely the
+    // defect `DrainWithin` was extracted to stop being rewritten. Its note records the
+    // bug shipping twice, both times in a copy citing the implementation it had
+    // reimplemented. A file arguing that in one helper while hand-rolling the next is
+    // how the third copy gets written.
+    return DrainWithin([&capacity] { return capacity.InFlight() != 0; },
+                       DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
+           == DrainResult::Drained;
+}
+
+/// Wait until `counter` reaches `expected`, then report what it holds.
+///
+/// **A counter is written by the thread that did the work, not by the one that sees
+/// the result, and nothing orders those two.** `FrameDeadlineRefusalsSent` is
+/// incremented on the reactor thread *after* `co_await WriteAll` resumes
+/// (`FrameEndpoint.cpp`); a case reading it has been woken by the reply BYTES
+/// arriving, which is the earlier event. Sampling the counter there asserts a
+/// happens-before the code does not provide -- and `Windows-cl-release` was red on
+/// master for three runs running because of it, while the refusal itself arrived
+/// correctly every time (#699). Release scheduling merely loses the race more often;
+/// widening the window by 300 ms reproduces it on any build.
+///
+/// **It returns the VALUE, not a bool**, so a genuine regression still prints the
+/// expansion that names it -- `0 == 1` where the refusal was never counted -- rather
+/// than a bare `false` that says only that something timed out. It does NOT promise to
+/// catch a double count: the drain returns the moment the counter reaches `expected`,
+/// so a second increment arriving after that is missed exactly as the old immediate
+/// sample missed it. Only one that has already landed is caught, which is incidental
+/// and is written down here so nobody later relies on it.
+///
+/// **And a wait that ran out says so**, because otherwise this helper reintroduces the
+/// thing it exists to prevent one level up: a refusal that is never counted and a
+/// machine slower than the ceiling both return `0` after 30 s and both print `0 == 1`.
+/// This instrument cannot separate those two, so on `Ceiling` it says which reading it
+/// is -- and says that it cannot tell them apart -- rather than reporting the nearest
+/// neighbour. `UNSCOPED_INFO` and not `INFO`, because a scoped message dies with this
+/// function and would never reach the assertion that consumes the value.
+///
+/// Bounded through `DrainWithin`, the tree's one bounded drain, and never by a fixed
+/// sleep -- the case below records a sleep being wrong here twice, in both directions.
+/// @param metrics Where the counter lives.
+/// @param counter Which counter to wait on.
+/// @param expected The value to wait for.
+/// @return The counter's value once it reached `expected`, or as the ceiling elapsed.
+[[nodiscard]] std::uint64_t CounterReaching(IMetricsSink const& metrics,
+                                            IMetricsSink::Counter counter,
+                                            std::uint64_t expected)
+{
+    constexpr auto Ceiling = std::chrono::seconds { 30 };
+    auto const drained = DrainWithin([&metrics, counter, expected] { return metrics.Read(counter) < expected; },
+                                     DrainBound { .ceiling = Ceiling, .poll = std::chrono::milliseconds { 5 } });
+    if (drained == DrainResult::Ceiling)
     {
-        if (capacity.InFlight() == 0)
-            return true;
-        std::this_thread::sleep_for(Poll);
+        // Named from the catalog rather than as a number, so the line says the series
+        // an operator would grep for instead of an enumerator ordinal that moves.
+        auto const* const row = DescriptorOf(counter);
+        UNSCOPED_INFO("CounterReaching: waited " << Ceiling.count() << "s for "
+                                                 << (row != nullptr ? row->prometheusName : "an unnamed counter")
+                                                 << " to reach " << expected
+                                                 << " and it did not. INCONCLUSIVE: a value that is never written and "
+                                                    "a machine slower than the ceiling read identically here.");
     }
-    return capacity.InFlight() == 0;
+    return metrics.Read(counter);
 }
 
 /// The worker, the responder and the router a merged-surface case drives.
@@ -914,11 +969,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // sweep has observed this connection -- and the release then happens promptly
     // inside the grace rather than at a guessed offset from it. Bounded, and it says
     // what it waited for.
-    auto const sweptBy = std::chrono::steady_clock::now() + std::chrono::seconds { 30 };
-    while (fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0
-           && std::chrono::steady_clock::now() < sweptBy)
-        std::this_thread::sleep_for(std::chrono::milliseconds { 10 });
-    REQUIRE(fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 1);
+    REQUIRE(CounterReaching(fix.metrics, IMetricsSink::Counter::FrameAnswerDeadlineSweeps, 1) == 1);
     worker.runner.Release();
 
     // The window the RESPONDER named is what expired, and the client is told which
@@ -932,7 +983,12 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     REQUIRE(Unwrap(header).status == Wire::Status::Error);
     REQUIRE(Unwrap(header).payloadLength != 0);
     CHECK(static_cast<Wire::ErrorCode>(swept[Wire::ReplyHeaderSize]) == Wire::ErrorCode::RequestDeadlineExceeded);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == 1);
+    // Waited for, not sampled, and for the same reason the sweep above is: this thread
+    // was woken by the bytes, and the tally is written afterwards on the reactor's.
+    // The assertion ABOVE is what proves the refusal happened at all -- it holds the
+    // wire code the client actually received -- so this one is free to be about the
+    // count alone. See `CounterReaching`.
+    CHECK(CounterReaching(fix.metrics, IMetricsSink::Counter::FrameDeadlineRefusalsSent, 1) == 1);
 
     // And the worker still paid in full: the compiler ran and the object was produced,
     // for an answer nobody receives. That is the half #523 did NOT change and this case
