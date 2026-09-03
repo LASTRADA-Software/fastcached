@@ -271,7 +271,17 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
         impl->readOp.awaitable = nullptr;
         impl->readOp.readPeekOnly = false;
         impl->UpdateInterest();
-        peekAwaitable->Complete(IoResult { std::size_t { 1 } });
+
+        // **Peeked HERE, not just on the synchronous path.** EPOLLIN says readable and
+        // says nothing about which kind, so completing a flat `1` here reported "data
+        // pending" for a peer that had gone -- the one case a parked waiter is usually
+        // waiting to hear about. The syscall is the same one the synchronous arm above
+        // already makes, on an fd the kernel has just told us is ready.
+        std::array<std::byte, 1> probe {};
+        auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
+        // A negative peek is a spurious wake-up or an error the caller's own `Read`
+        // will surface properly; reporting "data" keeps that path unchanged.
+        peekAwaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
         return;
     }
 
@@ -482,7 +492,10 @@ IoAwaitable EpollSocket::WaitReadable()
     std::array<std::byte, 1> probe {};
     auto const got = ::recv(_fd, probe.data(), probe.size(), MSG_PEEK);
     if (got >= 0)
-        return IoAwaitable { IoResult { std::size_t { 1 } } };
+        // The count it measured, rather than a flat 1: `0` is EOF and `1` is data
+        // pending. See `ISocket::WaitReadable` for why that distinction is the
+        // contract and not a hint.
+        return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };
     if (errno != EAGAIN && errno != EINTR)
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 

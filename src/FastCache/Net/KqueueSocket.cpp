@@ -255,7 +255,16 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
         impl->readOp.readBuffer = {};
         impl->readOp.readPeekOnly = false;
         impl->UpdateInterest();
-        awaitable->Complete(IoResult { std::size_t { 1 } });
+
+        // **Peeked HERE, not only on the synchronous path.** The filter says readable
+        // and says nothing about which kind, so a flat `1` reported "data pending" for
+        // a peer that had gone -- the one thing a parked waiter is usually waiting to
+        // hear. Same syscall the synchronous arm already makes, on an fd just reported
+        // ready. A negative peek is a spurious wake or an error the caller's own `Read`
+        // will surface, so it keeps the old answer.
+        std::array<std::byte, 1> probe {};
+        auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
+        awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
         return;
     }
     auto buf = impl->readOp.readBuffer;
@@ -467,7 +476,9 @@ IoAwaitable KqueueSocket::WaitReadable()
     std::array<std::byte, 1> probe {};
     auto const got = ::recv(_fd, probe.data(), probe.size(), MSG_PEEK);
     if (got >= 0)
-        return IoAwaitable { IoResult { std::size_t { 1 } } };
+        // The count it measured, rather than a flat 1: `0` is EOF and `1` is data
+        // pending. See `ISocket::WaitReadable`.
+        return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };
     if (errno != EAGAIN && errno != EINTR)
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 

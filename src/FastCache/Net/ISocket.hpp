@@ -202,13 +202,31 @@ class ISocket
     /// on either an incoming client command OR a delivered message and cannot
     /// afford to block in `Read` while messages queue.
     ///
-    /// The default resolves immediately as "readable" (IoResult{1}): for
-    /// blocking and in-memory transports the subsequent `Read` either returns
-    /// data or blocks/sees EOF inline, so treating the socket as always-ready is
-    /// correct and the subscribe loop simply falls through to `Read`. The
-    /// reactor-driven sockets override it to arm EPOLLIN/equivalent and resolve
-    /// only on actual readiness, so a parked subscriber consumes no CPU.
-    /// @return Awaitable resolving when readable (the result count is advisory).
+    /// **The count says WHICH kind of readable, and it is not advisory.**
+    ///
+    ///   - `0`  the peer has closed its write side. A `Read` here returns EOF.
+    ///   - `>0` bytes are pending. A `Read` here returns some of them.
+    ///
+    /// It used to be documented as advisory, and it was: `EpollSocket` and
+    /// `KqueueSocket` answered `1` whatever their `recv(MSG_PEEK)` had just
+    /// measured, and `IocpSocket` completed with the byte count of a ZERO-byte
+    /// `WSARecv`, which is `0` however much data is waiting. So the same call
+    /// reported opposite numbers on Windows and Linux for the same event, and
+    /// "advisory" is what let that stand
+    /// ([#677](https://github.com/LASTRADA-Software/fastcached/issues/677)).
+    ///
+    /// The kernel draws the distinction, the probe already computes it, and only
+    /// the reporting threw it away -- which is why making it mean something is a
+    /// correction rather than a design decision. What a CALLER should do about EOF
+    /// is a separate question and deliberately not settled here
+    /// ([#671](https://github.com/LASTRADA-Software/fastcached/issues/671)).
+    ///
+    /// **The default answers `1`, and that is the fail-safe direction.** A transport
+    /// that cannot tell must not claim EOF: a false `>0` costs one `Read` that
+    /// discovers the truth, while a false `0` tells a caller its peer is gone. For
+    /// blocking and in-memory transports the subsequent `Read` either returns data or
+    /// sees EOF inline, so always-ready remains correct for them.
+    /// @return Awaitable resolving when readable; `0` means EOF, `>0` means data.
     [[nodiscard]] virtual IoAwaitable WaitReadable()
     {
         return IoAwaitable { IoResult { std::size_t { 1 } } };

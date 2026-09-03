@@ -155,6 +155,15 @@ struct IocpSocket::Impl
         /// rather than a bare nanosecond figure, since the number alone does not
         /// say whether it matters.
         std::shared_ptr<Impl> inFlight {};
+
+        /// Whether this read op is a `WaitReadable` probe rather than a real read.
+        ///
+        /// **The completion cannot tell.** A zero-byte `WSARecv` fires on readability
+        /// and reports `bytes == 0` whether the socket holds a megabyte or has been
+        /// closed, so `Dispatch` was completing "0 bytes" for both -- which is how this
+        /// platform came to report the opposite number from the POSIX ones for the same
+        /// event (#677). Mirrors `EpollSocket`'s `readPeekOnly`.
+        bool readPeekOnly { false };
     };
 
     Op readOp;
@@ -179,12 +188,30 @@ struct IocpSocket::Impl
         op->writeBufs.clear();
         op->writeKeepAlive.reset();
 
+        auto const wasPeek = std::exchange(op->readPeekOnly, false);
+
         if (!awaitable)
             return;
-        if (err == 0)
-            awaitable->Complete(IoResult { static_cast<std::size_t>(bytes) });
-        else
+        if (err != 0)
+        {
             awaitable->Complete(std::unexpected(MakeWsaError(static_cast<int>(err), op->isWrite ? "WSASend" : "WSARecv")));
+            return;
+        }
+        if (!wasPeek)
+        {
+            awaitable->Complete(IoResult { static_cast<std::size_t>(bytes) });
+            return;
+        }
+
+        // **A zero-byte receive completes with zero bytes whatever is waiting**, so the
+        // distinction has to be measured here rather than read off `bytes`. One
+        // `MSG_PEEK` on a socket the kernel has just reported readable, consuming
+        // nothing -- the same thing the POSIX sockets do inline. A negative peek is a
+        // spurious readiness or an error the caller's own `Read` will surface, so it
+        // keeps the old answer.
+        char probe = 0;
+        auto const peeked = ::recv(keepAlive->native, &probe, 1, MSG_PEEK);
+        awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
     }
 
     Impl(IocpReactor& r, SOCKET s):
@@ -276,6 +303,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
 
     auto& op = _impl->readOp;
     op.awaitable = nullptr; // populated by the suspend callback below
+    op.readPeekOnly = false;
     op.completion.overlapped = OVERLAPPED {};
 
     WSABUF wsaBuf;
@@ -305,10 +333,12 @@ IoAwaitable IocpSocket::WaitReadable()
 
     // Zero-byte WSARecv: a documented Winsock idiom for "wake when data is
     // pending without consuming a byte". The completion fires when the socket
-    // is readable (data, EOF, or error); we report 1 to signal readiness. The
-    // caller is expected to issue a real Read next.
+    // is readable (data, EOF, or error) and carries `bytes == 0` in every one of
+    // those cases, so `Dispatch` peeks to tell them apart -- see `Op::readPeekOnly`.
+    // The caller is expected to issue a real Read next.
     auto& op = _impl->readOp;
     op.awaitable = nullptr;
+    op.readPeekOnly = true;
     op.completion.overlapped = OVERLAPPED {};
 
     WSABUF wsaBuf;
