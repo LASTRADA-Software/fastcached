@@ -232,7 +232,12 @@ enum class ErrorCode : std::uint8_t
     UnknownOpcode = 0x02,
     MalformedFrame = 0x03,  ///< Fields do not exactly fill the declared payload.
     PayloadTooLarge = 0x04, ///< Declared payload exceeds the session's cap.
-    MalformedValue = 0x05,  ///< STORE payload is not a decodable compile-value.
+    /// STORE payload is not a compile value AT ALL -- it does not decode.
+    ///
+    /// Narrower than "this build cannot decode it", which would also cover a value
+    /// of a generation this build does not implement: that is
+    /// `ForeignValueGeneration`, and keeping the two apart is the whole of #544.
+    MalformedValue = 0x05,
 
     // 0x06 is RETIRED and must never be reassigned -- see `RetiredErrorCodes`
     // below, which makes that a build failure rather than a hope. It was
@@ -428,6 +433,49 @@ enum class ErrorCode : std::uint8_t
     /// that ends a parked read and it is the write side gone. See
     /// `FrameServer::CloseOverdue`.
     RequestDeadlineExceeded = 0x1D,
+
+    /// The value a STORE carried is a compile value of a **generation this build
+    /// does not implement**.
+    ///
+    /// **Emphatically NOT `MalformedValue`**, and the split is the one
+    /// `.agent/rules/storage.md` already draws on disk between
+    /// `UnsupportedFormatVersion` and `Corrupt`. `MalformedValue` says the bytes are
+    /// not a compile value at all, which is a statement about a broken or mismatched
+    /// CLIENT. This one says the bytes *are* a compile value, well formed, written
+    /// under a canonicalization spec that is not this server's -- which during a
+    /// rolling upgrade is a **normal and expected** condition and says nothing is
+    /// wrong with anybody.
+    ///
+    /// **Either direction**, and the older one is the case actually in the field.
+    /// `DecodeCompileValue` refuses any `version != CompileValueVersion`, so this
+    /// fires for a producer behind this server exactly as for one ahead of it; #547
+    /// bumped `CompileValueVersion` to 2, so what a gen-2 server meets is gen-1
+    /// launchers. An operator sent looking for a *newer* machine would be hunting the
+    /// wrong half of the fleet, which is why the message states both numbers rather
+    /// than a direction.
+    ///
+    /// The code is what monitoring sees, and the remedies diverge: a rise in
+    /// malformed values sends an operator looking for a broken client, or -- worse,
+    /// and the reason the disk rule exists -- to wipe a cache that is perfectly
+    /// healthy. The remedy here is to finish the rollout or roll it back. A fleet is
+    /// permanently mid-upgrade ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)),
+    /// so this is not an exotic state.
+    ///
+    /// Refused rather than stored, and neither server on this wire has a choice about
+    /// that: storing it would mean storing text this build cannot rewrite -- the
+    /// producing checkout's absolute paths, under a key every machine computes, which
+    /// is exactly what `CanonicalStoredValue` exists to prevent
+    /// ([#483](https://github.com/LASTRADA-Software/fastcached/issues/483)).
+    ///
+    /// The two surfaces answering it keep **separate counters**, because a shared code
+    /// is not a shared event: `SurfaceRefusal`'s row is the refusal, not the code.
+    ///
+    /// A refusal a client answers by compiling locally, like the rest of this range.
+    /// Deployed launchers need no new arm: they special-case `NotLeader` and
+    /// `UnknownLease` and treat every other code as a generic rejection, so this is
+    /// additive for clients built before it existed -- which is the whole point, since
+    /// the clients that meet it are by definition of another generation.
+    ForeignValueGeneration = 0x1E,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -963,6 +1011,14 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::RequestDeadlineExceeded,
                       .name = "request-deadline-exceeded",
                       .defaultMessage = "this request outran the window this surface allows" },
+    // The default names no generation, because the generations are what an operator
+    // acts on and neither of them is known here. Both surfaces send
+    // `ForeignGenerationMessage`, which states them; this sentence is what a caller
+    // that supplies none falls back to.
+    ErrorDescriptor { .code = ErrorCode::ForeignValueGeneration,
+                      .name = "foreign-value-generation",
+                      .defaultMessage = "stored value names a canonicalization generation this build does not "
+                                        "implement" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.

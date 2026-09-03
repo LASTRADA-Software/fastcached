@@ -62,10 +62,20 @@ TEST_CASE("The wire constants have their specified byte values")
     // agrees about only the second. Every in-tree caller spells the enumerator, so a
     // consistent renumbering leaves the whole suite green while every deployed
     // launcher reads a different refusal, and nobody here can recompile them. Pinned
-    // for the newest code because that is the one an author is about to move; the
+    // for the newest codes because those are the ones an author is about to move; the
     // older neighbours are pinned by `RetiredErrorCodes` and by the peers already
     // running.
     CHECK(static_cast<std::uint8_t>(ErrorCode::RequestDeadlineExceeded) == 0x1D);
+    CHECK(static_cast<std::uint8_t>(ErrorCode::ForeignValueGeneration) == 0x1E);
+
+    // `MalformedValue` is pinned here as the one exception to "older neighbours are
+    // pinned by the peers already running", because #544 made this PAIR load-bearing
+    // rather than the codes individually: a foreign generation and bytes that are not
+    // a compile value are now different facts with different operator remedies, and
+    // the only thing separating them for a peer built elsewhere is that these two
+    // bytes differ. Asserting the codes differ would not catch a renumbering that
+    // moved both.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::MalformedValue) == 0x05);
 }
 
 TEST_CASE("EncodeFetch emits the specified bytes exactly")

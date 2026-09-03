@@ -97,8 +97,14 @@ namespace
         /// — find the machine that is out of step, finish or roll back — and it is the
         /// only view of what #483's decision costs, since refusing buys correctness by
         /// giving up hits and the launcher reports only a miss.
+        ///
+        /// The CODE is its own, and this surface needed it more than the daemon did
+        /// (#544). It was `MalformedValue`, which told a launcher its cache was
+        /// damaged while the fleet was merely mid-rollout — and since #229 a node IS
+        /// the shared cache, so this is the surface a launcher actually talks to and
+        /// therefore where that wrong reading was reached.
         constexpr Cc::SurfaceRefusal ForeignGeneration {
-            .code = Wire::ErrorCode::MalformedValue,
+            .code = Wire::ErrorCode::ForeignValueGeneration,
             .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
         };
 

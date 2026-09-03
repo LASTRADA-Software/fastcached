@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -203,6 +204,33 @@ struct StoreFields
     std::string_view buildTree;
 };
 
+/// Build a STORE frame around an already-encoded value.
+///
+/// The raw-bytes half of `StoreFrame`, for the cases whose whole point is a value
+/// that is NOT a well-formed current-generation `CompileValue` -- junk bytes, and a
+/// value stamped with a generation this build does not implement. Those cannot be
+/// expressed as a `CompileValue`, so the typed overload cannot serve them.
+///
+/// It exists rather than three inline `Wire::EncodeStore` calls because that is
+/// exactly what `StoreFields` was introduced to prevent: `srcRoot` and `buildTree`
+/// are both `std::string_view`, so transposing them at a call site compiles
+/// silently, and a named field cannot be transposed.
+/// @param fields The four string fields.
+/// @param value Value bytes, already encoded (or deliberately not a valid encoding).
+/// @param version Wire version to encode at.
+/// @return The framed STORE request.
+std::vector<std::byte> RawStoreFrame(StoreFields const& fields,
+                                     std::span<std::byte const> value,
+                                     Wire::WireVersion version = Wire::CurrentVersion)
+{
+    return Wire::EncodeStore(Wire::StoreRequest { .key = fields.key,
+                                                  .prefetchGroup = fields.prefetchGroup,
+                                                  .srcRoot = fields.srcRoot,
+                                                  .buildTree = fields.buildTree,
+                                                  .value = value },
+                             version);
+}
+
 /// Build a STORE frame through the shared wire module, so these tests exercise
 /// the same encoder the launcher ships rather than a second implementation that
 /// could agree with the handler while both disagree with the client.
@@ -211,12 +239,30 @@ std::vector<std::byte> StoreFrame(StoreFields const& fields,
                                   Wire::WireVersion version = Wire::CurrentVersion)
 {
     auto const encoded = EncodeCompileValue(value);
-    return Wire::EncodeStore(Wire::StoreRequest { .key = fields.key,
-                                                  .prefetchGroup = fields.prefetchGroup,
-                                                  .srcRoot = fields.srcRoot,
-                                                  .buildTree = fields.buildTree,
-                                                  .value = std::span<std::byte const> { encoded } },
-                             version);
+    return RawStoreFrame(fields, encoded, version);
+}
+
+/// Bytes that are not a compile value at all.
+///
+/// Named because two cases need the same "not a compile value" input and because
+/// what makes these two bytes qualify is **not** the leading `0xEE`. Since #483
+/// `DecodeCompileValue` runs `DecodeAfterGeneration` BEFORE it judges the version
+/// byte -- a leading byte that is not ours is on its own no evidence of another
+/// generation, and reading it that way once called every opaque blob foreign. So a
+/// well-framed payload behind `0xEE` decodes as `ForeignGeneration`, not as this.
+///
+/// What qualifies here is the LAYOUT: two bytes cannot hold the `u32` object length
+/// that must follow the generation, so the frame does not hold together behind the
+/// leading byte and `DecodeCompileValue` answers `NotACompileValue`.
+///
+/// That distinction is load-bearing rather than pedantic. Making this payload "more
+/// realistic" by putting a well-formed blob behind `0xEE` would silently turn the
+/// junk arm into a second foreign-generation arm, and re-pointing its expectation to
+/// match would delete the guard against the opposite collapse that the case exists
+/// to hold.
+[[nodiscard]] std::vector<std::byte> NotACompileValueBytes()
+{
+    return { std::byte { 0xEE }, std::byte { 0xEE } };
 }
 
 /// Build a FETCH frame.
@@ -462,10 +508,9 @@ TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-
     // message desynchronised any connection that carried a second command.
     CcFixture fix;
 
-    // A STORE whose value is not a decodable compile-value.
-    auto const junk = std::vector<std::byte> { std::byte { 0xEE }, std::byte { 0xEE } };
-    auto const badStore = Wire::EncodeStore(Wire::StoreRequest {
-        .key = "k", .prefetchGroup = "", .srcRoot = "", .buildTree = "", .value = std::span<std::byte const> { junk } });
+    // A STORE whose value is not a compile value at all.
+    auto const junk = NotACompileValueBytes();
+    auto const badStore = RawStoreFrame({ .key = "k", .prefetchGroup = "", .srcRoot = "", .buildTree = "" }, junk);
 
     auto const replies = SplitReplies(ExchangeWith(fix, Concat({ badStore, FetchFrame("anything") }), SessionContext {}));
 
@@ -474,6 +519,83 @@ TEST_CASE("A refused STORE is drainable without knowing the command", "[compile-
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::MalformedValue);
     CHECK(replies.at(1).status == Wire::Status::Miss);
+}
+
+TEST_CASE("A foreign value generation and a malformed value are refused by DIFFERENT codes", "[compile-cache][handler]")
+{
+    // #544. Both arms in ONE case, and driven down ONE connection, because the
+    // property is a difference and a difference needs both halves in view.
+    //
+    // Which collapse each arm catches, since neither catches both. The foreign
+    // assertion catches a collapse back onto `MalformedValue` -- the state this
+    // ticket found. The junk assertion catches the opposite collapse, where a later
+    // change routes everything it cannot canonicalize to the new code; nothing else
+    // in this file would notice that, and it is the easier mistake to make now that
+    // the new code exists. That is why the junk arm is here and not left to the case
+    // above: absence of the negative is not the positive.
+    //
+    // There is deliberately no `foreignError.code != junkError.code` line. It cannot
+    // fail while the two assertions below pass -- two distinct enumerators are
+    // distinct -- so it would read as the guard while guarding nothing. The renumbering
+    // it looks like it covers is covered where it can be: the BYTE pins in
+    // `CompileCacheWire_test.cpp`.
+    //
+    // The conflation this closes is the one `.agent/rules/storage.md` records for
+    // `Corrupt` against `UnsupportedFormatVersion`, met on the wire instead of on
+    // disk: two machines at different generations are a fleet MID-UPGRADE and nothing
+    // is damaged, but the remedy an operator reaches for on a cache reporting
+    // malformed values is to wipe it.
+    //
+    // The value below is stamped one generation FORWARD because that is the direction
+    // a test can synthesise honestly -- it is this build's own framing, restamped.
+    // The refusal itself is direction-neutral (`DecodeCompileValue` refuses any
+    // `version != CompileValueVersion`), and since #547 took the byte to 2 the
+    // direction actually in the field is the other one: gen-1 launchers against gen-2
+    // servers. Nothing here should be read as making this a newer-peer-only answer.
+    CcFixture fix;
+
+    // A value a launcher of the NEXT generation would have written: encoded through
+    // the real encoder, so the framing is honest, then stamped one generation on. What
+    // separates it from the junk arm is the LAYOUT, not the leading byte.
+    CompileValue produced;
+    produced.objectBlob = { std::byte { 0x01 } };
+    produced.textRegions.push_back({ .grammar = Grammar::ShowIncludes, .bytes = "Note: including file: /src/inc/a.hpp\n" });
+    auto foreign = EncodeCompileValue(produced);
+    REQUIRE_FALSE(foreign.empty());
+    REQUIRE(static_cast<std::uint8_t>(foreign.front()) == CompileValueVersion);
+    constexpr auto NextGeneration = static_cast<std::uint8_t>(CompileValueVersion + 1);
+    foreign.front() = std::byte { NextGeneration };
+
+    // Both refusals and then a FETCH, on one connection: each refusal declares its own
+    // length, so a client that reads only headers stays in sync across both of them.
+    auto const replies = SplitReplies(ExchangeWith(
+        fix,
+        Concat(
+            { RawStoreFrame({ .key = "k-foreign", .prefetchGroup = "", .srcRoot = "/src", .buildTree = "/build" }, foreign),
+              RawStoreFrame({ .key = "k-junk", .prefetchGroup = "", .srcRoot = "/src", .buildTree = "/build" },
+                            NotACompileValueBytes()),
+              FetchFrame("k-foreign") }),
+        SessionContext {}));
+    REQUIRE(replies.size() == 3);
+
+    auto const foreignError = ErrorOf(replies.at(0));
+    REQUIRE(foreignError.present);
+    CHECK(foreignError.code == Wire::ErrorCode::ForeignValueGeneration);
+
+    // The message is the whole of the operator's diagnostic, so it names BOTH
+    // generations rather than restating the code in words.
+    CHECK(foreignError.message == ForeignGenerationMessage(NextGeneration));
+
+    // The companion: bytes that are not a compile value at all keep `MalformedValue`,
+    // whose meaning this ticket deliberately leaves alone.
+    auto const junkError = ErrorOf(replies.at(1));
+    REQUIRE(junkError.present);
+    CHECK(junkError.code == Wire::ErrorCode::MalformedValue);
+
+    // Refused means nothing was written. A miss rather than the bytes coming back is
+    // what says the value was not stored uncanonicalized -- which is the harm the
+    // refusal exists to prevent, not a side effect of it.
+    CHECK(replies.at(2).status == Wire::Status::Miss);
 }
 
 TEST_CASE("A wire version change mid-connection is rejected", "[compile-cache][handler][version]")

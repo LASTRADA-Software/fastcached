@@ -293,23 +293,30 @@ namespace
                 // stores that fail for no stated reason, and this reply is the only
                 // place a client of the DAEMON can see that the fleet is merely mixed.
                 //
-                // The CODE is still `MalformedValue`, and that is wrong in the way
-                // `.agent/rules/storage.md` records for `Corrupt` against
+                // The CODE is its own (#544). It was `MalformedValue`, which was wrong
+                // in the way `.agent/rules/storage.md` records for `Corrupt` against
                 // `UnsupportedFormatVersion` -- the obvious remedy for a cache
-                // reported damaged is to wipe it. Its own wire code and counter row
-                // are #544, which depends on this change rather than being part of
-                // it, and which is what turns these two arms into a table.
+                // reported damaged is to wipe it, and a fleet mid-rollout is the one
+                // state where that reading is both most likely and most expensive.
                 //
-                // COUNTED, and its own counter rather than the one above: these two
-                // arms answer the same wire code for opposite reasons -- a client
-                // writing something that is not a compile value at all, against a
-                // fleet midway through a rolling upgrade. Summed, neither is readable.
-                // #544 gives this arm a code of its own; the counter did not have to
-                // wait for that, and separating them now is what makes #544 a rename
-                // rather than a re-triage.
+                // COUNTED, and its own counter as well as its own code. The two are
+                // separate facts and were separated in separate changes: #483 split
+                // the counter while both arms still answered one code, because two
+                // opposite events summed into one series are unreadable whatever the
+                // wire says. This arm now differs from the one above in BOTH, which is
+                // the shape `SurfaceRefusal` is for -- a row is the refusal, not the
+                // code, so sharing one never implied sharing the other.
+                //
+                // #483 predicted this change would "turn these two arms into a table",
+                // and it did not, so the prediction is answered rather than deleted.
+                // Nothing is left to tabulate: the arms now share no field at all, the
+                // code is already the single named enumerator both servers spell, and
+                // the counter must stay per-surface. A table of two rows differing in
+                // every column is the switch that is already here, spelled less
+                // directly.
                 co_return co_await ReplyRefused(socket,
                                                 metrics,
-                                                { .code = Wire::ErrorCode::MalformedValue,
+                                                { .code = Wire::ErrorCode::ForeignValueGeneration,
                                                   .counter = IMetricsSink::Counter::CacheStoresRefusedForeignGeneration },
                                                 ForeignGenerationMessage(canonical.generation))
                     ? Next::Continue

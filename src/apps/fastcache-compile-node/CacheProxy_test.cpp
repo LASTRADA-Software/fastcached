@@ -180,7 +180,20 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
 
     auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
         .key = "k-foreign", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = foreign })));
-    CHECK(ErrorOf(stored) == Wire::ErrorCode::MalformedValue);
+
+    // #544: its own code, not `MalformedValue`. This surface is where that mattered
+    // most -- since #229 a node IS the shared cache, so it is the server a launcher
+    // actually talks to, and `MalformedValue` told it the cache was damaged while the
+    // fleet was merely mid-rollout. Same conflation `.agent/rules/storage.md` forbids
+    // on disk between `Corrupt` and `UnsupportedFormatVersion`.
+    //
+    // The other half of the pair is the case immediately above: absence of the
+    // negative is not the positive, so "a foreign generation is refused" needs
+    // "opaque bytes are NOT" beside it, or a change that refused everything it could
+    // not canonicalize would satisfy this one on its own. On this tier that companion
+    // is a different KIND of answer rather than a different code, which is why it is
+    // its own case and is not restated here.
+    CHECK(ErrorOf(stored) == Wire::ErrorCode::ForeignValueGeneration);
 
     // Refused means nothing was written. A `Miss` rather than the bytes coming back
     // is what says the verbatim arm was not taken.
