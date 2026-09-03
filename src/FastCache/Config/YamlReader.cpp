@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
@@ -437,6 +438,21 @@ namespace
     [[nodiscard]] std::expected<void, ConfigError> ApplyEntry(
         Config& cfg, std::string const& key, YAML::Node const& valueNode, std::filesystem::path const& path, unsigned line)
     {
+        // **The accepted key set is DECLARED, and this is where the declaration is
+        // enforced.** Asked before the ladder rather than after it, so "the reader
+        // accepts a key nothing declares" is impossible by construction instead of
+        // something a scan has to go looking for -- which is what
+        // `ConfigReloader::ValidateImmutable` needs, since a key it cannot see is a
+        // live-wired setting a reload changes silently
+        // ([#406](https://github.com/LASTRADA-Software/fastcached/issues/406)).
+        //
+        // The converse -- a declared key with no arm below -- only a real parse can
+        // answer, so `CliOptions_test` feeds every declared key through this reader
+        // and requires it to be accepted. Neither direction alone is the property:
+        // one list agreeing with itself proves nothing.
+        if (!ConfigFileAcceptsKey(key))
+            return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
+
         /// `bind`: interface address to listen on. Free-form string; left to
         /// the OS resolver. Examples: "127.0.0.1", "0.0.0.0", "::".
         if (key == "bind")
@@ -682,6 +698,10 @@ namespace
             cfg.listenBacklog = raw;
             return {};
         }
+        // Unreachable for any key the gate above admitted, because that would be a
+        // key this reader declares and does not handle -- which `CliOptions_test`
+        // fails on. Kept as the honest answer rather than an assertion: a declared
+        // key that silently did nothing is the failure the gate exists to prevent.
         return std::unexpected(MakeError(ConfigErrorCode::UnknownKey, path, key, "unrecognised key", line));
     }
 

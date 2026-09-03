@@ -11,11 +11,29 @@
 # Reloadable on SIGHUP: log_level, max_memory, requirepass, auth_username,
 # notify_keyspace_events.
 #
-# NOT reloadable — changing any of these and running `systemctl reload` makes
-# the daemon REJECT the whole reload and keep its previous configuration
-# (the reason is logged to the journal). Use `systemctl restart` instead:
-# bind, port, listeners, storage_path, storage_shards, storage_durability,
-# storage_max_value, threads, active_expiry_interval_ms, active_expiry_scan.
+# EVERY OTHER setting in this file is NOT reloadable. Changing one and running
+# `systemctl reload` makes the daemon REJECT the whole reload and keep its
+# previous configuration, naming every setting that could not be applied (the
+# reason is logged to the journal). Use `systemctl restart` instead.
+#
+# The five above are the complete list rather than the interesting part of one:
+# they are exactly the settings something re-applies at runtime. Everything else
+# is baked into an object built at startup -- a bound socket, a loaded
+# certificate, a shard layout, the reactor pinning -- so accepting it would leave
+# the daemon reporting a configuration it is not running.
+#
+# A reload re-reads THIS FILE and nothing else -- not the command line, not the
+# environment. So a setting that is in force because you passed a flag or set
+# FASTCACHED_METRICS_PORT, and that this file does not mention, reads to the
+# reload as a setting being changed back to its default: `systemctl reload`
+# refuses and names it.
+#
+# The remedy is to WRITE THAT VALUE INTO THIS FILE. It is not `systemctl
+# restart`, which starts a daemon with the same mismatch, and it is not removing
+# the flag, which changes what the daemon does. For example, a drop-in carrying
+# `--metrics-port=9300` needs `metrics_port: 9300` here as well; until it has
+# one, every reload refuses naming `metrics_port` and your `log_level:` change
+# never applies either, because a reload is applied whole or not at all.
 #
 # Command-line flags override this file. Add them with a drop-in:
 #   systemctl edit fastcached

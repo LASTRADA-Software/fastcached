@@ -9,6 +9,7 @@
 // one flag touches only its own tracker" could not be stated at all.
 #include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -22,6 +23,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
 
@@ -282,4 +285,78 @@ TEST_CASE("a flag before --help is still applied", "[config][cli][options]")
     REQUIRE(parsed.has_value());
     CHECK(parsed->outcome == CliOutcome::ShowHelp);
     CHECK(parsed->config.port == 4321);
+}
+
+TEST_CASE("every key a configuration file may carry is one the reader handles", "[config][cli][options][reload]")
+{
+    // **The forward half of the accepted-key set, and it needs a real parse.**
+    // `ApplyEntry` refuses anything `ConfigFileAcceptsKey` does not declare, which
+    // makes "the reader accepts an undeclared key" impossible; nothing in that
+    // arrangement notices the opposite mistake -- a key DECLARED here with no arm
+    // in the reader. Such a key would pass the gate, fall through the ladder, and
+    // read to an operator as a setting that is in force
+    // ([#406](https://github.com/LASTRADA-Software/fastcached/issues/406)).
+    //
+    // The value is deliberately arbitrary. What is asked is whether the reader has
+    // an arm for the key at all, and only the fall-through answers `UnknownKey` --
+    // a value an arm rejects gives `TypeMismatch` or `OutOfRange`, which is an arm
+    // doing its job.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-declared-keys" };
+
+    // Neither source may be empty: two empty lists agree perfectly, and this case
+    // would then pass by finding nothing on either side. `ConfigFileSettings()`
+    // merges them, so both are named here rather than inferred from the merge.
+    REQUIRE(!CliOptions().empty());
+    REQUIRE(!YamlOnlySettings().empty());
+    REQUIRE(ConfigFileSettings().size() > YamlOnlySettings().size());
+
+    // One path, rewritten per key: 34 file creations prove nothing 34 rewrites do
+    // not, and `INFO` already says which key failed. `ScratchDirectory::Write`
+    // rather than a bare `ofstream`, because it THROWS on a failed write -- a
+    // silently unwritten file makes `ReadYamlConfig` answer `FileNotFound`, which
+    // this case's assertion accepts, so every key would pass by finding nothing.
+    for (auto const& setting: ConfigFileSettings())
+    {
+        INFO("key: " << setting.key);
+        scratch.Write("declared.yaml", std::format("{}: 1\n", setting.key));
+        auto const read = ReadYamlConfig(scratch / "declared.yaml");
+        CHECK((read.has_value() || read.error().code != ConfigErrorCode::UnknownKey));
+    }
+}
+
+TEST_CASE("a key no row and no YAML-only entry declares is refused", "[config][cli][options][reload]")
+{
+    // The gate's own direction. A key a file carries and nothing reads is a
+    // setting an operator believes is in force forever, which is why an unknown
+    // key is refused rather than ignored. `memory_compression` is in the case to
+    // pin that a YAML-only entry really does reach the reader, so the refusals
+    // below are the gate rather than an accident of the ladder.
+    CHECK(ConfigFileAcceptsKey("port"));
+    CHECK(ConfigFileAcceptsKey("memory_compression"));
+    CHECK_FALSE(ConfigFileAcceptsKey("prot"));
+    CHECK_FALSE(ConfigFileAcceptsKey(""));
+    // A FLAG spelling is not a key: the two vocabularies are separate on purpose,
+    // and a reader accepting both would document neither.
+    CHECK_FALSE(ConfigFileAcceptsKey("--port"));
+    CHECK_FALSE(ConfigFileAcceptsKey("storage"));
+}
+
+TEST_CASE("every setting a file can carry can be compared", "[config][cli][options][reload]")
+{
+    // `UnreloadableChanges` calls `setting.same` unconditionally for an immutable
+    // setting, so a null one there is a crash rather than a missed guard. The
+    // option-table half cannot happen -- `yamlKey.empty() == (same == nullptr)` is
+    // a static_assert beside the table -- but the merge is what a caller sees, and
+    // a merge that dropped a comparator would satisfy that assertion perfectly.
+    //
+    // "A reloadable row is one a file can carry" is NOT restated here: it is the
+    // fourth static_assert beside the table, and a runtime copy of a compile-time
+    // fact only tells you the build you are running already passed.
+    REQUIRE(!ConfigFileSettings().empty());
+    for (auto const& setting: ConfigFileSettings())
+    {
+        INFO("key: " << setting.key);
+        CHECK_FALSE(setting.key.empty());
+        CHECK(setting.same != nullptr);
+    }
 }

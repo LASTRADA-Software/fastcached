@@ -101,6 +101,70 @@ struct CliResult
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<OptionSpec<CliResult> const> CliOptions() noexcept;
 
+/// A setting a configuration FILE can carry that no command-line flag can.
+///
+/// **Every entry here is a defect, named rather than hidden.** A setting reachable
+/// from a file and not from argv is two mechanisms for one thing — the shape
+/// `TableIsWellFormed`'s own comment says the `yamlKey` column exists to remove —
+/// and it cannot be registered as a service either, because `--install-service`
+/// replays a command line. Closing that is
+/// [#623](https://github.com/LASTRADA-Software/fastcached/issues/623), which gives
+/// each of these a row and deletes this list.
+///
+/// Until then they still have to be answered for, because they are live-wired and
+/// a reload that accepted one would leave the running daemon disagreeing with the
+/// configuration that claims to describe it. That is what `same` is for: it is the
+/// *same* comparator type the option table's own column carries, so `ValidateImmutable`
+/// walks the two lists with one rule rather than two. There is no reloadability
+/// column, because there is nothing to decide — a setting nothing re-applies at
+/// runtime is immutable, and a fourth entry that were genuinely reloadable would
+/// have to earn a subscriber in `main.cpp` first.
+struct YamlOnlySetting
+{
+    std::string_view key;        ///< The YAML key, which is what a refusal names.
+    std::string_view reason;     ///< Why no option row answers for it.
+    SameFieldFn<CliResult> same; ///< Whether two configurations agree about this setting.
+};
+
+/// Every setting a file can carry that `CliOptions()` cannot express.
+///
+/// Exposed only so a test can state that this list is not empty. Everything that
+/// asks what a FILE can carry asks `ConfigFileSettings()` instead — see there.
+/// @return The list; empty once #623 lands.
+[[nodiscard]] std::span<YamlOnlySetting const> YamlOnlySettings() noexcept;
+
+/// One setting a configuration file can carry, whatever declares it.
+struct ConfigFileSetting
+{
+    std::string_view key {};                  ///< The YAML key, which is what a refusal names.
+    Reloadable reloadable { Reloadable::No }; ///< Whether a reload may apply a change to it.
+    SameFieldFn<CliResult> same { nullptr };  ///< Whether two configurations agree about it.
+};
+
+/// Every setting a configuration file can carry, from both places that declare one.
+///
+/// **One accessor rather than two lists every caller remembers to walk.** The
+/// accepted key set is the option table's `yamlKey` column PLUS
+/// `YamlOnlySettings()`, and three consumers need it — the reader's gate, the
+/// reload check, and the test that connects them. A caller that walked only
+/// `CliOptions()` would be right about most settings and silently blind to the
+/// rest, which is
+/// [#406](https://github.com/LASTRADA-Software/fastcached/issues/406)'s own failure
+/// shape one level up. So the split is not visible here, and #623 deletes a
+/// *source* rather than a walk in every consumer.
+/// @return The merged set, option rows first, in table order. Never empty.
+[[nodiscard]] std::span<ConfigFileSetting const> ConfigFileSettings() noexcept;
+
+/// Whether a configuration file may carry @p key at its top level.
+///
+/// `YamlReader` asks this BEFORE its own dispatch, so "the reader accepts a key
+/// nothing declares" is impossible by construction rather than scanned for. The
+/// other direction, "a declared key the reader does not handle", is asserted by
+/// `CliOptions_test`, because only a real parse can answer it.
+/// @param key The top-level key read from the file.
+/// @return True when some setting answers to it.
+[[nodiscard]] bool ConfigFileAcceptsKey(std::string_view key) noexcept;
+
 /// Parse `argv[1..argc-1]` into a Config, driven by `CliOptions()`.
 /// @param args argv slice excluding the program name itself.
 /// @return Parsed CliResult on success; ConfigError on failure.

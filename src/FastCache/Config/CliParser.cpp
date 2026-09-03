@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace FastCache
@@ -314,79 +315,109 @@ namespace
           .operand = "=<addr>",
           .apply = AssignFrom<&Config::bindAddress, ParseBindAddress>(),
           .explicitBit = &CliResult::bindAddressExplicit,
-          .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)" },
+          .description = "bind address: IPv4/IPv6 literal or hostname; '::' is dual-stack (default 127.0.0.1)",
+          .yamlKey = "bind",
+          .same = FieldEq<&Config::bindAddress>() },
         { .primary = "--port",
           .arity = Arity::Value,
           .operand = "=<num>",
           .apply = AssignFrom<&Config::port, ParsePort>(),
           .explicitBit = &CliResult::portExplicit,
-          .description = "TCP port (default {port}); every protocol is auto-detected on it" },
+          .description = "TCP port (default {port}); every protocol is auto-detected on it",
+          .yamlKey = "port",
+          .same = FieldEq<&Config::port>() },
         { .primary = "--max-memory",
           .arity = Arity::Value,
           .operand = "=<size>",
           .apply = AssignFrom<&Config::maxMemoryBytes, ParseMaxMemory>(),
           .explicitBit = &CliResult::maxMemoryBytesExplicit,
           .description = "in-memory budget; k/m/g = KiB/MiB/GiB or N% of host RAM\n"
-                         "(default 25% of RAM, within 512m-8g)" },
+                         "(default 25% of RAM, within 512m-8g)",
+          .yamlKey = "max_memory",
+          .reloadable = Reloadable::Yes,
+          .same = FieldEq<&Config::maxMemoryBytes>() },
         { .primary = "--log-level",
           .arity = Arity::Value,
           .operand = "=<level>",
           .apply = AssignFrom<&Config::logLevel, ParseLogLevel>(),
           .explicitBit = &CliResult::logLevelExplicit,
-          .description = "trace|debug|info|warn|error|fatal (default info)" },
+          .description = "trace|debug|info|warn|error|fatal (default info)",
+          .yamlKey = "log_level",
+          .reloadable = Reloadable::Yes,
+          .same = FieldEq<&Config::logLevel>() },
         { .primary = "--requirepass",
           .arity = Arity::Value,
           .operand = "=<secret>",
           .apply = AssignFrom<&Config::requirePass, ParseText>(),
           .explicitBit = &CliResult::requirePassExplicit,
           .description = "require clients to authenticate with this shared secret (default: no auth)\n"
-                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth" },
+                         "redis: AUTH; memcached binary: SASL PLAIN; memcached text has no auth",
+          .yamlKey = "requirepass",
+          .reloadable = Reloadable::Yes,
+          .same = FieldEq<&Config::requirePass>() },
         { .primary = "--auth-username",
           .arity = Arity::Value,
           .operand = "=<name>",
           .apply = AssignFrom<&Config::authUsername, ParseText>(),
           .explicitBit = &CliResult::authUsernameExplicit,
-          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')" },
+          .description = "username for the AUTH <user> <pass> / SASL PLAIN form (default 'default')",
+          .yamlKey = "auth_username",
+          .reloadable = Reloadable::Yes,
+          .same = FieldEq<&Config::authUsername>() },
         { .primary = "--metrics",
           .apply = SetTrue<&Config::metricsEnabled>(),
           .explicitBit = &CliResult::metricsEnabledExplicit,
-          .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)" },
+          .description = "serve Prometheus /metrics and /healthz on a dedicated HTTP port (default off)",
+          .yamlKey = "metrics",
+          .same = FieldEq<&Config::metricsEnabled>() },
         { .primary = "--metrics-bind",
           .arity = Arity::Value,
           .operand = "=<addr>",
           .apply = AssignFrom<&Config::metricsBindAddress, ParseText>(),
           .explicitBit = &CliResult::metricsBindAddressExplicit,
-          .description = "bind address for the metrics endpoint (default 127.0.0.1)" },
+          .description = "bind address for the metrics endpoint (default 127.0.0.1)",
+          .yamlKey = "metrics_bind",
+          .same = FieldEq<&Config::metricsBindAddress>() },
         { .primary = "--metrics-port",
           .arity = Arity::Value,
           .operand = "=<num>",
           .apply = AssignFrom<&Config::metricsPort, ParsePort>(),
           .explicitBit = &CliResult::metricsPortExplicit,
-          .description = "TCP port for the metrics endpoint (default {metrics-port})" },
+          .description = "TCP port for the metrics endpoint (default {metrics-port})",
+          .yamlKey = "metrics_port",
+          .same = FieldEq<&Config::metricsPort>() },
         { .primary = "--tls",
           .apply = SetTrue<&Config::tlsEnabled>(),
           .explicitBit = &CliResult::tlsEnabledExplicit,
           .description = "terminate TLS on the cache port (default off; needs a build with OpenSSL\n"
-                         "and both --tls-cert and --tls-key)" },
+                         "and both --tls-cert and --tls-key)",
+          .yamlKey = "tls",
+          .same = FieldEq<&Config::tlsEnabled>() },
         { .primary = "--tls-cert",
           .arity = Arity::Value,
           .operand = "=<path>",
           .apply = AssignFrom<&Config::tlsCertPath, ParseText>(),
           .explicitBit = &CliResult::tlsCertPathExplicit,
-          .description = "PEM certificate (chain) file for --tls / --listen-tls" },
+          .description = "PEM certificate (chain) file for --tls / --listen-tls",
+          .yamlKey = "tls_cert",
+          .same = FieldEq<&Config::tlsCertPath>() },
         { .primary = "--tls-key",
           .arity = Arity::Value,
           .operand = "=<path>",
           .apply = AssignFrom<&Config::tlsKeyPath, ParseText>(),
           .explicitBit = &CliResult::tlsKeyPathExplicit,
-          .description = "PEM private key file for --tls / --listen-tls" },
+          .description = "PEM private key file for --tls / --listen-tls",
+          .yamlKey = "tls_key",
+          .same = FieldEq<&Config::tlsKeyPath>() },
         { .primary = "--listen",
           .arity = Arity::Value,
           .operand = "=<host:port>",
           .apply = AppendFrom<&Config::binds, ParseListen<PlainListener>>(),
           .description = "additional plaintext listener; repeatable. Use [::1]:{port} for IPv6 literals.\n"
                          "When given, supersedes --bind/--port — every endpoint must be listed.\n"
-                         "Also how to keep serving legacy clients: add their port here." },
+                         "Also how to keep serving legacy clients: add their port here.",
+          .yamlKey = "listeners",
+          .same = FieldEq<&Config::binds>() },
         { .primary = "--listen-tls",
           .arity = Arity::Value,
           .operand = "=<host:port>",
@@ -400,13 +431,18 @@ namespace
           .explicitBit = &CliResult::notifyKeyspaceEventsExplicit,
           .description = "redis-style keyspace-event flag string; empty = off (default).\n"
                          "K=__keyspace, E=__keyevent, g=generic (del/expire/persist),\n"
-                         "$=string (set/incr*), x=expired, e=evicted, A=alias for g$xe" },
+                         "$=string (set/incr*), x=expired, e=evicted, A=alias for g$xe",
+          .yamlKey = "notify_keyspace_events",
+          .reloadable = Reloadable::Yes,
+          .same = FieldEq<&Config::notifyKeyspaceEvents>() },
         { .primary = "--log-timestamps",
           .apply = SetTrue<&Config::logTimestamps>(),
           .explicitBit = &CliResult::logTimestampsExplicit,
           .description = "prefix every log line with an ISO 8601 UTC timestamp\n"
                          "(default: on under macOS, where nothing else stamps a\n"
-                         "service's output; off elsewhere)" },
+                         "service's output; off elsewhere)",
+          .yamlKey = "log_timestamps",
+          .same = FieldEq<&Config::logTimestamps>() },
         // The negative spelling, and it exists because the DEFAULT is now
         // platform-dependent (#496, #507). While the default was false everywhere,
         // `--log-timestamps` alone could express every reachable state and this flag
@@ -432,24 +468,32 @@ namespace
         { .primary = "--log-source",
           .apply = SetTrue<&Config::logSource>(),
           .explicitBit = &CliResult::logSourceExplicit,
-          .description = "prefix every connection log line with the client IP (default off)" },
+          .description = "prefix every connection log line with the client IP (default off)",
+          .yamlKey = "log_source",
+          .same = FieldEq<&Config::logSource>() },
         { .primary = "--log-everything",
           .apply = SetTrue<&Config::logEverything>(),
           .explicitBit = &CliResult::logEverythingExplicit,
           .description = "include keepalive/admin commands (PING, HELLO, ...) in the trace command log, not just "
-                         "keyspace data operations (default off)" },
+                         "keyspace data operations (default off)",
+          .yamlKey = "log_everything",
+          .same = FieldEq<&Config::logEverything>() },
         { .primary = "--storage",
           .arity = Arity::Value,
           .operand = "=<path>",
           .apply = AssignFrom<&Config::storagePath, ParseText>(),
           .explicitBit = &CliResult::storagePathExplicit,
-          .description = "persist cache to a CoW-tree file (default: in-memory only)" },
+          .description = "persist cache to a CoW-tree file (default: in-memory only)",
+          .yamlKey = "storage_path",
+          .same = FieldEq<&Config::storagePath>() },
         { .primary = "--storage-durability",
           .arity = Arity::Value,
           .operand = "=<mode>",
           .apply = AssignFrom<&Config::storageDurability, ParseStorageDurability>(),
           .explicitBit = &CliResult::storageDurabilityExplicit,
-          .description = "fsync|batched|none for --storage (default batched)" },
+          .description = "fsync|batched|none for --storage (default batched)",
+          .yamlKey = "storage_durability",
+          .same = FieldEq<&Config::storageDurability>() },
         { .primary = "--storage-max-value",
           .arity = Arity::Value,
           .operand = "=<size>",
@@ -457,33 +501,43 @@ namespace
           .explicitBit = &CliResult::storageMaxValueBytesExplicit,
           .description = "per-value byte cap for --storage; k/m/g suffixes accepted (default 256m).\n"
                          "also raises the wire frame-payload cap, so compile caches storing\n"
-                         "large object files need this set above their biggest object" },
+                         "large object files need this set above their biggest object",
+          .yamlKey = "storage_max_value",
+          .same = FieldEq<&Config::storageMaxValueBytes>() },
         { .primary = "--storage-max-disk",
           .arity = Arity::Value,
           .operand = "=<size>",
           .apply = AssignFrom<&Config::storageMaxDiskBytes, ParseStorageMaxDisk>(),
           .explicitBit = &CliResult::storageMaxDiskBytesExplicit,
           .description = "cap the on-disk (L2) tier for --storage; the CoW tree evicts its LRU tail to fit "
-                         "(default 0 = unbounded). k/m/g suffixes accepted" },
+                         "(default 0 = unbounded). k/m/g suffixes accepted",
+          .yamlKey = "storage_max_disk",
+          .same = FieldEq<&Config::storageMaxDiskBytes>() },
         { .primary = "--compression",
           .arity = Arity::Value,
           .operand = "=<codec>",
           .apply = AssignFrom<&Config::compression, ParseCompression>(),
           .explicitBit = &CliResult::compressionExplicit,
           .description = "on-disk value codec for --storage: none|lz4|zstd (default zstd)\n"
-                         "reads always return plaintext; each record decodes by its own tag" },
+                         "reads always return plaintext; each record decodes by its own tag",
+          .yamlKey = "compression",
+          .same = FieldEq<&Config::compression>() },
         { .primary = "--compression-level",
           .arity = Arity::Value,
           .operand = "=<N>",
           .apply = AssignFrom<&Config::compressionLevel, ParseCompressionLevel>(),
           .explicitBit = &CliResult::compressionLevelExplicit,
-          .description = "codec effort level for --compression (1..22; default 3, zstd)" },
+          .description = "codec effort level for --compression (1..22; default 3, zstd)",
+          .yamlKey = "compression_level",
+          .same = FieldEq<&Config::compressionLevel>() },
         { .primary = "--compression-min-bytes",
           .arity = Arity::Value,
           .operand = "=<size>",
           .apply = AssignFrom<&Config::compressionMinBytes, ParseCompressionMinBytes>(),
           .explicitBit = &CliResult::compressionMinBytesExplicit,
-          .description = "skip compression for values smaller than this; k/m/g accepted (default 256)" },
+          .description = "skip compression for values smaller than this; k/m/g accepted (default 256)",
+          .yamlKey = "compression_min_bytes",
+          .same = FieldEq<&Config::compressionMinBytes>() },
         { .primary = "--lru-mode",
           .arity = Arity::Value,
           .operand = "=<mode>",
@@ -491,27 +545,35 @@ namespace
           .explicitBit = &CliResult::lruRecencyExplicit,
           .description = "approximate|strict in-memory LRU recency (default approximate)\n"
                          "approximate: same-shard reads run concurrently (faster);\n"
-                         "strict: exact LRU order, reads serialise per shard" },
+                         "strict: exact LRU order, reads serialise per shard",
+          .yamlKey = "lru_mode",
+          .same = FieldEq<&Config::lruRecency>() },
         { .primary = "--cpu-affinity",
           .arity = Arity::Value,
           .operand = "=<mode>",
           .apply = AssignFrom<&Config::cpuAffinity, ParseCpuAffinity>(),
           .explicitBit = &CliResult::cpuAffinityExplicit,
           .description = "none|per-core reactor thread pinning (default per-core)\n"
-                         "per-core: pin each reactor to its own core (multi-reactor only)" },
+                         "per-core: pin each reactor to its own core (multi-reactor only)",
+          .yamlKey = "cpu_affinity",
+          .same = FieldEq<&Config::cpuAffinity>() },
         { .primary = "--threads",
           .arity = Arity::Value,
           .operand = "=<N>",
           .apply = AssignFrom<&Config::workerThreads, ParseThreads>(),
           .explicitBit = &CliResult::workerThreadsExplicit,
           .description = "number of independent pinned reactors to run (default hardware_concurrency);\n"
-                         "each is a single-threaded event loop, so this is the server's across-core parallelism" },
+                         "each is a single-threaded event loop, so this is the server's across-core parallelism",
+          .yamlKey = "threads",
+          .same = FieldEq<&Config::workerThreads>() },
         { .primary = "--listen-backlog",
           .arity = Arity::Value,
           .operand = "=<N>",
           .apply = AssignFrom<&Config::listenBacklog, ParseListenBacklog>(),
           .explicitBit = &CliResult::listenBacklogExplicit,
-          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)" },
+          .description = "::listen() backlog depth (default 511; clamped to the kernel's SOMAXCONN)",
+          .yamlKey = "listen_backlog",
+          .same = FieldEq<&Config::listenBacklog>() },
         { .primary = "--storage-shards",
           .arity = Arity::Value,
           .operand = "=<N>",
@@ -520,7 +582,9 @@ namespace
           .description = "shard storage into N partitions for write parallelism\n"
                          "default: 1 (single-file mode) when --storage names a regular file,\n"
                          "min(16, hardware_concurrency) otherwise;\n"
-                         "when N>1 and --storage is set, --storage must be a directory" },
+                         "when N>1 and --storage is set, --storage must be a directory",
+          .yamlKey = "storage_shards",
+          .same = FieldEq<&Config::storageShards>() },
         { .primary = "--expiry-interval",
           .arity = Arity::Value,
           .operand = "=<ms>",
@@ -529,14 +593,18 @@ namespace
           .description = "how often to sweep for entries whose TTL has lapsed (default 1000; 0 disables).\n"
                          "without it expiry is purely access-driven, so a key nobody touches again is\n"
                          "never reclaimed and fires no `expired` keyspace event.\n"
-                         "backs off while there is nothing to reclaim" },
+                         "backs off while there is nothing to reclaim",
+          .yamlKey = "active_expiry_interval_ms",
+          .same = FieldEq<&Config::activeExpiryIntervalMs>() },
         { .primary = "--expiry-scan",
           .arity = Arity::Value,
           .operand = "=<N>",
           .apply = AssignFrom<&Config::activeExpiryScanBudget, ParseExpiryScan>(),
           .explicitBit = &CliResult::activeExpiryScanBudgetExplicit,
           .description = "entries one expiry sweep examines per shard before resuming next time\n"
-                         "(default 512); the bound on how long a sweep holds a shard's lock" },
+                         "(default 512); the bound on how long a sweep holds a shard's lock",
+          .yamlKey = "active_expiry_scan",
+          .same = FieldEq<&Config::activeExpiryScanBudget>() },
         { .primary = "--daemon",
           .apply = SetTrue<&Config::daemon>(),
           .description = "daemonize (POSIX) / run under the Windows SCM (used by the installed service)" },
@@ -608,6 +676,183 @@ namespace
     static_assert(TableIsWellFormed<CliResult>(Options),
                   "CLI option table is malformed: a row is undocumented, a value flag has no operand, "
                   "a row does nothing, or a spelling is claimed twice");
+
+    /// Every row a configuration FILE may not carry, with the reason it may not.
+    ///
+    /// Two kinds live here and they are not the same objection. A **one-shot verb**
+    /// is a decision taken once, and a file read at every start would replay it
+    /// forever. The rest **describe how this process was started**, so reading them
+    /// out of the file the start already found is circular.
+    ///
+    /// A named list rather than a bare absence, because absence cannot be told from
+    /// omission: a new flag that simply forgot its key looks exactly like a flag
+    /// deliberately kept out of files, and the difference is the whole of #406 —
+    /// a setting an operator can put in a file and nothing guards.
+    constexpr auto NotInAConfigFile = std::to_array<std::pair<std::string_view, std::string_view>>({
+        { "--config", "names the file being read; reading it back out of that file is circular" },
+        { "--listen-tls", "the `listeners:` key carries `tls` per entry, so one key spells both flags" },
+        { "--no-log-timestamps", "argv's only way to say `off`; the file's `log_timestamps` says it with `false`" },
+        { "--daemon", "describes how this process was started, not what it serves" },
+        { "--install-service", "a one-shot verb; a file would re-register at every start" },
+        { "--uninstall-service", "a one-shot verb; a file would deregister at every start" },
+        { "--service-scope", "install-time only, and not Config state at all" },
+        { "--migrate-storage", "a one-shot verb; a file would re-run the conversion at every start" },
+        { "--healthcheck", "a one-shot verb: probe and exit, instead of serving" },
+        { "--seed-config", "a one-shot installer step, and it INSTALLS the file this would come from" },
+        { "--pidfile", "describes how this process was started (POSIX daemon mode only)" },
+        { "--service-name", "names the registration this process runs under, not what it serves" },
+        { "--help", "a one-shot verb" },
+        { "--version", "a one-shot verb" },
+    });
+
+    /// Whether some option row is spelled @p flag.
+    ///
+    /// The three assertions below are all "walk one table against another", and
+    /// written inline that is a nested lambda each time. Named, each assertion reads
+    /// as the sentence it is checking.
+    /// @param flag The primary spelling to look for.
+    /// @return True when a row claims it.
+    [[nodiscard]] constexpr bool IsOptionRow(std::string_view flag) noexcept
+    {
+        return std::ranges::any_of(Options, [flag](OptionSpec<CliResult> const& spec) { return spec.primary == flag; });
+    }
+
+    /// Whether some option row answers to the configuration-file key @p key.
+    /// @param key The YAML key to look for.
+    /// @return True when a row claims it.
+    [[nodiscard]] constexpr bool SomeRowClaimsKey(std::string_view key) noexcept
+    {
+        return std::ranges::any_of(Options, [key](OptionSpec<CliResult> const& spec) { return spec.yamlKey == key; });
+    }
+
+    /// Whether @p flag is excused from carrying a key, with a reason given.
+    /// @param flag The primary spelling to look for.
+    /// @return True when `NotInAConfigFile` names it and says why.
+    [[nodiscard]] constexpr bool IsExcusedFromConfigFile(std::string_view flag) noexcept
+    {
+        return std::ranges::any_of(
+            NotInAConfigFile, [flag](auto const& excluded) { return excluded.first == flag && !excluded.second.empty(); });
+    }
+
+    /// A row is reachable from a file, or it is on the list above saying why not.
+    ///
+    /// **Both directions**, because each catches a different mistake: a row with
+    /// neither a key nor a reason is a flag whose author never answered the
+    /// question, and a reason naming a row that HAS a key is a list that has gone
+    /// stale and is now vouching for coverage it does not provide.
+    static_assert(std::ranges::all_of(Options,
+                                      [](OptionSpec<CliResult> const& spec) {
+                                          return spec.yamlKey.empty() == IsExcusedFromConfigFile(spec.primary);
+                                      }),
+                  "every option row either carries a yamlKey or is listed in NotInAConfigFile with its reason");
+    static_assert(std::ranges::all_of(NotInAConfigFile,
+                                      [](auto const& excluded) {
+                                          return !excluded.second.empty() && IsOptionRow(excluded.first);
+                                      }),
+                  "every NotInAConfigFile entry must name a real row and carry a reason");
+
+    /// A row a file can carry is a row a reload can be asked to change, so it needs
+    /// a comparator; a row a file cannot carry has nothing to compare.
+    ///
+    /// This is the guard #406 was missing. `ValidateImmutable` walks the settings a
+    /// file can carry and can only see a row that brought a `same`, so a row that
+    /// forgets one is invisible to it — which is not a refused reload but a
+    /// **silently accepted** one, publishing a snapshot the running daemon
+    /// disagrees with. Adding a flag a file can carry and no comparator therefore
+    /// has to be a build failure, not a runtime surprise.
+    static_assert(std::ranges::all_of(Options,
+                                      [](OptionSpec<CliResult> const& spec) {
+                                          return spec.yamlKey.empty() == (spec.same == nullptr);
+                                      }),
+                  "a row with a yamlKey needs a FieldEq comparator, and a row without one must not have it");
+
+    /// A reloadable row is one a FILE can carry, and something is reloadable.
+    ///
+    /// `UnreloadableChanges` excuses a row for two independent reasons — it may
+    /// change, or nothing can change it — so a row that was reloadable and
+    /// unreachable would be excused for the wrong one and nothing would say which.
+    /// The second clause is not decoration: with nothing reloadable, every other
+    /// assertion about this column holds vacuously.
+    static_assert(std::ranges::all_of(Options,
+                                      [](OptionSpec<CliResult> const& spec) {
+                                          return spec.reloadable != Reloadable::Yes || !spec.yamlKey.empty();
+                                      })
+                      && std::ranges::any_of(Options,
+                                             [](OptionSpec<CliResult> const& spec) {
+                                                 return spec.reloadable == Reloadable::Yes;
+                                             }),
+                  "a reloadable row must be one a file can carry, and something must be reloadable");
+
+    /// Settings a file can carry that no flag can. See `YamlOnlySetting`.
+    constexpr auto YamlOnly = std::to_array<YamlOnlySetting>({
+        { .key = "memory_compression",
+          .reason = "no --memory-compression flag exists yet (#623)",
+          .same = FieldEq<&Config::memoryCompression>() },
+        { .key = "memory_compression_level",
+          .reason = "no --memory-compression-level flag exists yet (#623)",
+          .same = FieldEq<&Config::memoryCompressionLevel>() },
+        { .key = "memory_compression_min_bytes",
+          .reason = "no --memory-compression-min-bytes flag exists yet (#623)",
+          .same = FieldEq<&Config::memoryCompressionMinBytes>() },
+    });
+
+    /// An entry here is the option table's gap, so it must not overlap it, and it
+    /// must carry the comparator that is the only reason it is written down.
+    static_assert(std::ranges::all_of(YamlOnly,
+                                      [](YamlOnlySetting const& entry) {
+                                          return !entry.key.empty() && !entry.reason.empty() && entry.same != nullptr
+                                                 && !SomeRowClaimsKey(entry.key);
+                                      }),
+                  "a YAML-only setting must name a key no option row claims, and carry a reason and a comparator");
+
+    /// How many settings a configuration file can carry.
+    /// @return The option rows with a key, plus the settings no flag can express.
+    [[nodiscard]] consteval std::size_t ConfigFileSettingCount() noexcept
+    {
+        auto const keyed =
+            std::ranges::count_if(Options, [](OptionSpec<CliResult> const& spec) { return !spec.yamlKey.empty(); });
+        return static_cast<std::size_t>(keyed) + YamlOnly.size();
+    }
+
+    /// The two declarations merged, at compile time.
+    ///
+    /// `consteval` and an array rather than a lazily built `std::vector`: the
+    /// accessor is `noexcept`, and a function-local static that allocates makes that
+    /// a lie the first time it is called. It also removes the initialisation
+    /// entirely — the merged set is in `.rodata` beside the two tables it is built
+    /// from.
+    /// @return Every setting a file can carry, option rows first, in table order.
+    [[nodiscard]] consteval std::array<ConfigFileSetting, ConfigFileSettingCount()> MakeConfigFileSettings()
+    {
+        std::array<ConfigFileSetting, ConfigFileSettingCount()> merged {};
+        // An index rather than an iterator, and the reason is portability rather
+        // than taste: `std::array::begin()` is a raw pointer on libstdc++ and a
+        // class type in MSVC's debug STL, so no one spelling satisfies both --
+        // clang-tidy's `readability-qualified-auto` demands `auto*`, which MSVC
+        // then refuses to compile.
+        std::size_t next = 0;
+        for (auto const& spec: Options)
+            if (!spec.yamlKey.empty())
+                merged[next++] = { .key = spec.yamlKey, .reloadable = spec.reloadable, .same = spec.same };
+        // No reloadability to decide for these: a setting nothing re-applies at
+        // runtime is immutable, which is why `YamlOnlySetting` carries no column.
+        for (auto const& entry: YamlOnly)
+            merged[next++] = { .key = entry.key, .reloadable = Reloadable::No, .same = entry.same };
+        return merged;
+    }
+
+    constexpr auto FileSettings = MakeConfigFileSettings();
+
+    /// The merge is exact, or a caller sees fewer settings than are declared.
+    ///
+    /// A dropped entry would satisfy every assertion above — those are about the two
+    /// SOURCES — while leaving the reload blind to whatever fell out, which is this
+    /// whole ticket's shape one level up.
+    static_assert(std::ranges::all_of(FileSettings,
+                                      [](ConfigFileSetting const& setting) {
+                                          return !setting.key.empty() && setting.same != nullptr;
+                                      }),
+                  "every merged config-file setting must carry a key and a comparator");
 
     /// The config locations `--help` lists, one per line, indented under the
     /// description column. Read straight off the table the lookup itself walks,
@@ -700,6 +945,25 @@ namespace
 std::span<OptionSpec<CliResult> const> CliOptions() noexcept
 {
     return Options;
+}
+
+std::span<YamlOnlySetting const> YamlOnlySettings() noexcept
+{
+    return YamlOnly;
+}
+
+std::span<ConfigFileSetting const> ConfigFileSettings() noexcept
+{
+    return FileSettings;
+}
+
+bool ConfigFileAcceptsKey(std::string_view key) noexcept
+{
+    // Never the empty string: a row with no `yamlKey` would otherwise answer to a
+    // key nobody can spell, which is the kind of accident that reads as coverage.
+    if (key.empty())
+        return false;
+    return std::ranges::any_of(ConfigFileSettings(), [key](ConfigFileSetting const& setting) { return setting.key == key; });
 }
 
 std::expected<std::uint16_t, ConfigError> ParsePort(std::string_view sv)

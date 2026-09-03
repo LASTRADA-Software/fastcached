@@ -10,6 +10,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -40,11 +42,11 @@ namespace FastCache
 ///   the same order, so "the command line wins" stays a question of which loop ran
 ///   second rather than a per-field merge.
 /// - **`ImmutabilityCheck`** — whether the candidate may replace the live snapshot.
-///   The node derives this from a **column of its option table**; the daemon still
-///   uses a hand-written ladder, which is
-///   [#406](https://github.com/LASTRADA-Software/fastcached/issues/406) and is
-///   deliberately untouched here. One reloader with two strategies is honest and
-///   temporary; two reloaders would not be.
+///   Both executables now derive this from a **column of their own option table**
+///   ([#406](https://github.com/LASTRADA-Software/fastcached/issues/406) closed the
+///   daemon's hand-written ladder), so the strategy varies only in which table it
+///   reads. One reloader with two tables is one mechanism; two reloaders would not
+///   be.
 ///
 /// ## Declined, never half-applied
 ///
@@ -154,11 +156,61 @@ class ConfigReloaderOf
     std::vector<Subscriber> _subscribers;
 };
 
-/// The daemon's reloader: `Config`, read from YAML, guarded by its own ladder.
+/// The refusal a reload answers with when something immutable changed.
+///
+/// Shared rather than written per executable: the join and the `ConfigError` it
+/// builds take no table and no configuration type, so there was nothing left to
+/// vary — and two independently written copies had already drifted on the sentence
+/// they say. `fastcache-compile-node` still builds its own
+/// (`NodeConfig.cpp`'s `ValidateNodeReloadable`) and should adopt this.
+///
+/// @param changed The settings that may not change, in the order they were found.
+/// @return An `ImmutableChanged` error naming the first and listing them all.
+[[nodiscard]] ConfigError ImmutableChangedError(std::span<std::string_view const> changed);
+
+/// Every setting a candidate configuration changes that cannot take effect live.
+///
+/// **EVERY one, never the first.** A reload that reports one unreloadable setting
+/// and stops sends the operator round the same loop per setting: they fix it, save,
+/// and are refused again for the next. The whole answer in one refusal is the
+/// difference between a diagnosis and a guessing game.
+///
+/// Driven by `ConfigFileSettings()`, which is the option table's own `yamlKey`,
+/// `reloadable` and `same` columns plus the settings that table cannot express — so
+/// a row added tomorrow is covered without touching this, and a row that forgets its
+/// comparator does not compile.
+///
+/// **The domain is what a FILE can express, and that is not an approximation of
+/// "every field".** The daemon's reload candidate is `ReadYamlConfig(path)` and is
+/// never re-merged with argv, so a field no key can set — `configPath`, `daemon`,
+/// `pidfile`, `serviceName` — sits at its default in every candidate. Guarding those
+/// would refuse *every* reload: `--daemon`, which the systemd unit passes, would
+/// alone be enough. Do not "complete" this by walking rows with no key.
+/// **What widening the guarded set costs, stated rather than discovered.** The
+/// candidate is built from the file alone, so a setting that is in force because
+/// somebody passed a flag — or set `FASTCACHED_METRICS_PORT`, which `main.cpp`
+/// applies after the merge — and that the file does not mention arrives here as a
+/// setting being changed back to its default. The reload is then refused, by name,
+/// until the file carries that value too. That was already true of the ten settings
+/// the old ladder guarded (`--port` with no `port:` has always refused); this makes
+/// it true of every setting a file can carry, which is a wider surface for one
+/// underlying defect: **the candidate is not built the way the live configuration
+/// was built.** Fixing that is
+/// [#622](https://github.com/LASTRADA-Software/fastcached/issues/622) — argv and the
+/// environment fallback are the same half of it — and it is what would change this
+/// domain. Refusing is the right answer until then: publishing instead is the
+/// split-brain the whole function exists to prevent.
+///
+/// @param previous What the daemon is running with.
+/// @param candidate What the file now says.
+/// @return The YAML keys that changed and may not, table order first. Empty means
+///         the candidate may be published.
+[[nodiscard]] std::vector<std::string_view> UnreloadableChanges(Config const& previous, Config const& candidate);
+
+/// The daemon's reloader: `Config`, read from YAML, guarded by its option table.
 ///
 /// A named type rather than an alias so every existing construction site keeps its
-/// two-argument shape, and so the daemon's immutability rule stays where it is —
-/// converting that ladder to a column is #406, not this.
+/// two-argument shape.
 class ConfigReloader final: public ConfigReloaderOf<Config>
 {
   public:
@@ -167,9 +219,12 @@ class ConfigReloader final: public ConfigReloaderOf<Config>
     ConfigReloader(Config initial, std::filesystem::path configPath);
 
     /// The daemon's immutability rule. Exposed so its tests can drive it directly.
+    ///
+    /// A thin shape over `UnreloadableChanges` because the reloader speaks errors and
+    /// the table speaks keys; the list is joined into one sentence naming all of them.
     /// @param previous The live configuration.
     /// @param candidate What the file now says.
-    /// @return Nothing, or which field may not change at runtime.
+    /// @return Nothing, or which settings may not change at runtime.
     [[nodiscard]] static std::expected<void, ConfigError> ValidateImmutable(Config const& previous, Config const& candidate);
 };
 

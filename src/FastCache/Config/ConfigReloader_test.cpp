@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/YamlReader.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <string>
+#include <string_view>
 
 #include <tests/ScratchPath.hpp>
 
@@ -125,7 +130,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_path (regression fo
     auto const result = reloader.Reload();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
-    REQUIRE(result.error().field == "storage");
+    REQUIRE(result.error().field == "storage_path");
     // Live snapshot still names a.cow.
     REQUIRE(reloader.Current()->storagePath == "/tmp/a.cow");
 }
@@ -154,7 +159,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[conf
     auto const result = reloader.Reload();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
-    REQUIRE(result.error().field == "storage-durability");
+    REQUIRE(result.error().field == "storage_durability");
 }
 
 TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "[config][reload][regression]")
@@ -188,7 +193,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "
     auto const result = reloader.Reload();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
-    REQUIRE(result.error().field == "expiry-interval");
+    REQUIRE(result.error().field == "active_expiry_interval_ms");
     REQUIRE(reloader.Current()->activeExpiryIntervalMs == FastCache::DefaultActiveExpiryIntervalMs);
 
     // The scan budget is its own field and its own rejection, so a change to it
@@ -201,7 +206,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "
     auto const scanResult = reloader.Reload();
     REQUIRE_FALSE(scanResult.has_value());
     REQUIRE(scanResult.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
-    REQUIRE(scanResult.error().field == "expiry-scan");
+    REQUIRE(scanResult.error().field == "active_expiry_scan");
 }
 
 TEST_CASE("ConfigReloader::Reload rejects changes to listeners (binds vector)", "[config][reload][regression]")
@@ -239,6 +244,98 @@ TEST_CASE("ConfigReloader::Reload rejects changes to listeners (binds vector)", 
     // Live snapshot still names the single original listener.
     REQUIRE(reloader.Current()->binds.size() == 1);
     REQUIRE(reloader.Current()->binds.front().port == 11730);
+}
+
+namespace
+{
+
+/// One live-wired setting, and the single YAML line that changes it.
+///
+/// Every row names a setting `main.cpp` consumes exactly once at startup, so a
+/// reload that accepted it would leave `reloader.Current()` describing something
+/// the running daemon is not doing.
+struct LiveWiredSetting
+{
+    std::string_view key;    ///< The YAML key, which is what the refusal must name.
+    std::string_view before; ///< The value the daemon started with.
+    std::string_view after;  ///< The value an operator saved over it.
+};
+
+/// Seven settings the issue measured as live-wired and unguarded, plus the one the
+/// option table cannot reach at all.
+///
+/// The last row is the sharper case: `memory_compression_min_bytes` has no CLI
+/// flag, so a guard built only from the flag table would leave it through while
+/// reading as complete.
+///
+/// Values only, never whole lines: a row spelling its key three times can name one
+/// key in `key` and a different one in the file it writes, and the case would then
+/// assert against a setting it is not testing.
+constexpr auto LiveWired = std::to_array<LiveWiredSetting>({
+    { .key = "tls_cert", .before = "a.pem", .after = "b.pem" },
+    { .key = "tls_key", .before = "a.key", .after = "b.key" },
+    { .key = "metrics_bind", .before = "127.0.0.1", .after = "0.0.0.0" },
+    { .key = "metrics", .before = "true", .after = "false" },
+    { .key = "cpu_affinity", .before = "per-core", .after = "none" },
+    { .key = "listen_backlog", .before = "511", .after = "128" },
+    { .key = "storage_max_disk", .before = "1m", .after = "2m" },
+    { .key = "memory_compression_min_bytes", .before = "4096", .after = "8192" },
+});
+
+} // namespace
+
+TEST_CASE("ConfigReloader: a live-wired setting is refused and the previous value survives", "[config][reload][regression]")
+{
+    // **Issue #406.** `ValidateImmutable` was a hand-written ladder of ten
+    // comparisons with nothing keeping it in step with the settings a file can
+    // carry, so every setting below reloaded silently: the snapshot took the new
+    // value while the socket, the certificate, the reactor pinning and the L1
+    // codec went on being what startup built them as.
+    //
+    // The live snapshot is seeded by READING the `before` file rather than by
+    // hand, because the daemon's reload candidate is the file ALONE -- it is never
+    // re-merged with argv. Seeding any other way would leave the two disagreeing
+    // on fields this case is not about, and the refusal would then name one of
+    // those instead.
+    for (auto const& setting: LiveWired)
+    {
+        INFO("setting: " << setting.key);
+
+        auto const contents = [&setting](std::string_view value) {
+            return std::format("max_memory: 1024\n{}: {}\n", setting.key, value);
+        };
+        auto const path = WriteYaml(std::string { setting.key }, contents(setting.before));
+        auto const read = FastCache::ReadYamlConfig(path);
+        REQUIRE(read.has_value());
+        auto initial = *read;
+        initial.configPath = path.string();
+        FastCache::ConfigReloader reloader { initial, path };
+
+        bool published = false;
+        reloader.Subscribe([&published](auto const& /*prev*/, auto const& /*next*/) { published = true; });
+
+        {
+            std::ofstream out { path, std::ios::trunc };
+            out << contents(setting.after);
+        }
+
+        auto const result = reloader.Reload();
+        CHECK_FALSE(result.has_value());
+        if (!result.has_value())
+        {
+            CHECK(result.error().code == FastCache::ConfigErrorCode::ImmutableChanged);
+            // The key the operator EDITED, not the flag they did not type.
+            CHECK(result.error().field == setting.key);
+        }
+        // Asserted on the surviving CONFIGURATION, not only on the refusal: a check
+        // that reports a refusal and publishes anyway is the same split-brain
+        // wearing a diagnostic. Whole-struct, because `Config::operator==` catches a
+        // field the row is not about being published too -- and because a per-row
+        // predicate would be the row's own `before` value transcribed a second time,
+        // which can go green while asserting something the file never said.
+        CHECK(*reloader.Current() == initial);
+        CHECK_FALSE(published);
+    }
 }
 
 TEST_CASE("ConfigReloader: Reload with no config path returns FileNotFound", "[config][reload]")
