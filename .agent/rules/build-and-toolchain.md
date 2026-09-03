@@ -2076,6 +2076,32 @@ instruments nothing still compiles, still runs the suite and still writes a repo
 every signal an author would check says it worked. Same reasoning as the sanitizer entry
 above, which had already been found in exactly that state.
 
+**And "a missing `python3`" means one that does not RUN, which is not what the obvious
+lookup asks** (#568). `find_program(NAMES python3)` returns the first name match on PATH
+and never executes it; `find_package(Python3 COMPONENTS Interpreter)` validates by running
+it. Measured, one tree, one configure: `find_program` selected a **0-byte** Windows App
+Execution Alias — a reparse point Windows puts on PATH that refuses to execute when no
+Store package backs it — while a real **171744-byte** interpreter sat further along the
+same PATH. So it is a SELECTION difference and not only a validation one, and it bites on
+a machine where Python IS installed. Reproduced end to end on Linux with a `python3` that
+cannot exec: the old spelling put it in the `coverage` target's command line and configure
+SUCCEEDED, which is exactly the late failure the gate exists to prevent, let through
+because the gate tested presence rather than function. Guard on
+`Python3_Interpreter_FOUND` and never `Python3_EXECUTABLE` — FindPython leaves the latter
+naming the candidate it just rejected, so the tidier spelling restores the bug.
+
+The rule generalises as *a tool the build will EXECUTE is located by something that
+executes it*, and it has **reasoned exceptions that must not be "fixed"**. `find_package`
+needs a toolchain, so `cmake/Version.cmake` cannot use one — it runs before `project()`,
+and says so. Where no validating find module exists, validate by running: the two
+`llvm-*` lookups in `cmake/Coverage.cmake` do, and `cmake/Packaging.cmake` and
+`cmake/portable/ClangTidy.cmake` do not, which is unexamined rather than decided. The two
+shell fixtures that locate python (`scripts/tidy-sweep.sh`,
+`scripts/launcher-replay-e2e.sh`) use `command -v`, which does not run it either; shell
+has no validating equivalent and both run only on the POSIX legs. **Nothing enforces any
+of this** — it is four names in a comment, not a closed set — which is
+[#607](https://github.com/LASTRADA-Software/fastcached/issues/607).
+
 **The CI job publishes and gates on nothing.** `coverage` in `build.yml` reports the
 figure to the job summary, uploads the HTML, and pushes lcov to Codecov once
 `CODECOV_TOKEN` exists; both Codecov statuses are `informational`. The long-term target

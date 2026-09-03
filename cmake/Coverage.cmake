@@ -176,71 +176,71 @@ endforeach()
 # summary with it, at the very end, so a missing interpreter would otherwise
 # surface only after the entire suite, the merge and both exports had run.
 #
-# THE RULE (#568): a tool this build will EXECUTE is located by something that
-# executes it. The two `find_program` calls above obey it the long way -- each
-# runs `--version` and refuses on a mismatch -- because there is no
-# `find_package` for llvm-profdata. For Python there is one, so this is the whole
-# obedience:
+# So the interpreter is located by something that RUNS it. `find_program(NAMES
+# python3)` returns the first name match on PATH and never executes it, which
+# makes the gate above test the wrong property -- not "is there a python3" but
+# "is there one that runs" -- and an unrunnable path then reaches the `coverage`
+# target and fails at the end of the run, which is the exact outcome the
+# paragraph above says this gate prevents. Reproduced on Linux against a
+# `python3` that cannot exec: the old spelling baked it in and configure
+# SUCCEEDED. `find_package(Python3 COMPONENTS Interpreter)` validates by running
+# the interpreter, so here that failure becomes a configure-time refusal.
 #
-#   `find_package(Python3 COMPONENTS Interpreter)` VALIDATES by running the
-#   interpreter. `find_program(NAMES python3)` returns the first name match on
-#   PATH and never runs it.
+# The two `find_program` calls above obey the same rule the long way -- each runs
+# `--version` and refuses on a mismatch -- because there is no `find_package` for
+# llvm-profdata. For Python there is one, so the call IS the obedience. It does
+# NOT follow that every `find_program` in this tree is wrong: `cmake/Version.cmake`
+# uses one for git deliberately, because it runs before `project()` and
+# `find_package` has no toolchain to stand on there. The rule, its measurement and
+# its reasoned exceptions live in `.agent/rules/build-and-toolchain.md` and are not
+# restated here.
 #
-# That is not a style preference, and this gate is the reason. Windows carries an
-# App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`: a ZERO-BYTE
-# reparse point named `python3.exe` which, when its backing Store package is
-# absent, is found on PATH and then refuses to execute. Measured on a developer
-# host in this project, against one tree, in one configure:
-#
-#   find_program(NAMES python3)  -> ...\WindowsApps\python3.exe        0 bytes
-#   find_package(Python3 ...)    -> ...\python3.13.exe            171744 bytes
-#
-# So a presence check over a `find_program` result passes, bakes an unrunnable
-# path into the `coverage` target's command line, and fails at the end of the run
-# -- which is precisely the outcome the paragraph above says this gate exists to
-# prevent. The gate was testing for the wrong property: not "is there a python3"
-# but "is there one that RUNS".
-#
-# The two platforms reject it differently, and both are fine here. Measured:
-# on Windows FindPython knows the alias and steps OVER it to a real interpreter;
-# on Linux (CMake 3.28) it stops at the first candidate, fails to run it, and
-# reports not-found. Either way the unrunnable path does not reach the target --
-# on Linux the outcome is this gate firing at CONFIGURE time, which is the whole
-# point of the paragraph above.
+# Nor is the Windows alias that makes the rule sharp reachable here: `ENABLE_COVERAGE`
+# refuses WIN32 about 140 lines above. What IS reachable on this file's platforms is
+# any `python3` found by name that cannot run -- a dangling symlink, a venv shim
+# whose interpreter was removed, a wrapper naming an uninstalled toolchain.
 #
 # QUIET plus an explicit check rather than REQUIRED, so the diagnostic below
-# survives; `src/tests/CMakeLists.txt` spells its own Python lookup the same way
-# for the same reason, and those two sites are the whole of it.
+# survives.
+#
+# WHERE ELSE PYTHON IS LOCATED, because #568 is a two-authors-of-one-fact problem
+# and its next failure is a third author arriving quietly. Four sites; the
+# acceptance clause allows a differing one that says why:
+#
+#   cmake/Coverage.cmake             find_package  -- validates
+#   src/tests/CMakeLists.txt         find_package  -- validates
+#   scripts/tidy-sweep.sh            command -v    -- does not
+#   scripts/launcher-replay-e2e.sh   command -v    -- does not
+#
+# Named by file and by call, never by line: a line number in a comment goes false
+# silently. The two shell fixtures differ for a reason rather than by accident --
+# shell has no validating equivalent, and both run only under bash on the POSIX
+# legs. Nothing ENFORCES this set (#607), so it is four names and not a claim that
+# they are the only ones.
+#
+# `scripts/coverage.sh` is where python is used and locates none: it is handed
+# `--python3` from here. One lookup, passed down, is the shape to keep.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
-# `Python3_Interpreter_FOUND` and never `Python3_EXECUTABLE`, which is the one
-# way to write this that looks tidier and restores the bug. When FindPython
-# rejects a candidate it leaves `Python3_EXECUTABLE` SET to the path it rejected:
-# measured here, against a `python3` first on PATH that cannot execute,
-# `Python3_Interpreter_FOUND` was FALSE while `Python3_EXECUTABLE` still named
-# the broken file. Testing the path would pass, and the target below would be
-# handed exactly the interpreter this whole change exists to keep out of it.
+# `Python3_Interpreter_FOUND`, never `Python3_EXECUTABLE`: FindPython leaves the
+# latter naming the candidate it just REJECTED (measured), so the tidier spelling
+# passes and hands the target the interpreter this change exists to keep out.
 if(NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR
-        "[Coverage] no Python 3 interpreter found. scripts/coverage.sh needs one to extract "
-        "the coverage percentage from llvm-cov's JSON summary. Note that this asks for an "
-        "interpreter that RUNS: a `python3` on PATH which cannot execute -- a Windows App "
-        "Execution Alias with no Store package behind it is the one that happens -- is "
-        "correctly not found here.")
+        "[Coverage] no Python 3 interpreter found that RUNS. scripts/coverage.sh needs one "
+        "to extract the coverage percentage from llvm-cov's JSON summary. Note the wording: "
+        "a `python3` on PATH that cannot execute -- a dangling symlink, a venv shim whose "
+        "interpreter is gone -- is found by name and is correctly not accepted here, so "
+        "`which python3` answering is not a contradiction.")
 endif()
 
-# `PYTHON3_PATH` was this file's own spelling for the lookup above until #568, and
-# is now read by nothing. Two ways that still bites: a build tree configured
-# before the change carries the cache entry as residue, and a script or a habit
-# can still pass `-DPYTHON3_PATH=...`, which would now be accepted in silence and
-# have no effect. A setting somebody believes is in force is worse than one that
-# was refused.
-#
-# Dropping the entry is what makes this proportionate rather than noisy, and it
-# separates the two cases without having to tell them apart: residue warns once
-# and is gone, while a `-D` passed again warns again, because the person is still
-# passing it. A WARNING and not a FATAL_ERROR -- inert residue must not break a
-# re-configure of a tree that was fine.
+# `PYTHON3_PATH` is retired by #568 and read by nothing. Unset so that residue in
+# an existing build tree warns once and is gone, while a `-D` somebody is still
+# passing warns every time -- which separates habit from leftover without having
+# to tell them apart. WARNING and not FATAL_ERROR, because inert residue must not
+# break the re-configure of a tree that was fine; and not `message(DEPRECATION)`,
+# the obvious CMake-native answer, because that is silenced by
+# `-Wno-deprecated` and this exists to stop a setting being believed in silence.
 if(DEFINED PYTHON3_PATH)
     unset(PYTHON3_PATH CACHE)
     message(WARNING
