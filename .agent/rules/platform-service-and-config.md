@@ -374,6 +374,44 @@ readable and silently ignored. Every rule below has already been one of them.
   install time and a node that should follow a memory upgrade or a moved default
   silently does not.
 
+  **The paragraph above was written before the code it governs obeyed it**, and the
+  daemon did the opposite for as long as it existed
+  ([#349](https://github.com/LASTRADA-Software/fastcached/issues/349)): every one of
+  `BuildServiceArgv`'s thirty-one provenance-bearing flags was emitted by value
+  comparison, `--max-memory` following host RAM among them. A rule nothing checks
+  cannot make code fail, which is the general finding — and it is why the fix landed
+  the mechanical guard here too rather than the one line the ticket named.
+
+  Two things about the daemon's shape that the node's does not have to answer. Its
+  parse result is a `CliResult` **wrapping** a `Config`, so the bits are not on the
+  configuration at all — `BuildServiceArgv` and `MakeDaemonServiceSpec` therefore take
+  the **parse**. Moving the bits onto `Config` instead would have been worse than a
+  wider signature: `Config` is what the YAML merge fills and what `ConfigReloader`
+  compares, and `FileOptions` sets an `explicitBit` too, so a key in a file would have
+  become a flag baked into a registration — the precise thing "registers the
+  command-line-only parse" forbids. Taking the parse is also the guard, since a
+  function handed only the merge's output cannot obey a rule about the command line.
+
+  And the daemon's audit moved the whole table rather than the two rows that could
+  lose a pin today. Twenty-two of its rows were safe only because their default is a
+  **compile-time constant** — which is exactly what `logTimestamps` was until #496
+  made it platform-dependent, at which point `--no-log-timestamps` began registering
+  nothing on a host that defaults it off. "Safe because the default happens to be a
+  constant" is a property of this build, not of the flag; the two other safe shapes
+  (a sentinel `0` meaning *follow the host*, and a one-sided switch whose default is
+  the value it cannot express) are properties of the flag and stay safe. So on the
+  daemon `emitIfSet` is gone entirely, and one `emitSwitch` serves both kinds of
+  switch: the two were separate because a value comparison needs a platform default
+  for the two-sided one, and provenance consults no default at all.
+
+  What keeps a value comparison on the daemon is a path flag whose default is
+  **empty** — the same shape as the node's `--cache-dir` above, and here the reason is
+  sharper than "no address to arrive at without asking": emitting `--storage=` would
+  absolutize the *installing shell's working directory* into the registration, which
+  is worse than the drop. Those rows are excluded from the mechanical guard by name,
+  each with its reason, and the guard asserts every excluded spelling is still a real
+  row so an excuse cannot outlive the flag it excuses.
+
   A flag needs no bit when its default is **empty**. There is then no address to
   arrive at without asking, so every failure on it is unconditionally fatal —
   `--admin-listen` and `--cache-dir` are that shape, and the asymmetry with
