@@ -120,12 +120,14 @@ struct CallerContext
     /// asymmetry is why this is a different call from `CapacityFields`, which decided
     /// nothing about who is admitted.
     ///
-    /// The pre-auth path pays one small allocation it did not before, because
-    /// `RefusePeer` is handed a `std::string_view` and has no owned string to move
-    /// from. That is **not** the class of thing #285 hardens against: what that
-    /// change protects is buffering an attacker-*sized* payload before admission, and
-    /// a fixed copy of a peer host, against a request that has already cost a
-    /// syscall, is not an amplifier.
+    /// The pre-auth path copies where it used to borrow, because `RefusePeer` is
+    /// handed a `std::string_view` and has no owned string to move from. It is not
+    /// usually an ALLOCATION: any IPv4 or loopback host fits libstdc++'s 15-character
+    /// SSO buffer, so the malloc arrives only for long hosts, which in practice means
+    /// IPv6. Either way it is **not** the class of thing #285 hardens against -- what
+    /// that change protects is buffering an attacker-*sized* payload before
+    /// admission, and a fixed-width copy of a peer host, behind a request that has
+    /// already cost a syscall, is not an amplifier.
     std::string peerId {};
 };
 

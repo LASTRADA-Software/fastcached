@@ -530,9 +530,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   when every consumer reads it in scope AND something depends on not copying
   (`CodecEnvelopeView`, whose `Identity` path must not gain a second copy of a
   preprocessed TU). One clause false is not a tie — `CallerContext` satisfied the
-  first and its measurement killed the second (an owned peer id is 4.6 ns against a
-  1.4-2.0 us `Register`, 0.24%), so the rule selected OWN. The encode side goes on
-  borrowing its inputs either way.
+  first and its measurement killed the second, so the rule selected OWN; the figures
+  are on the type in `SchedulerService.hpp` and are deliberately not repeated here.
+  The encode side goes on borrowing its inputs either way.
 - **What the borrowed field DECIDES outranks the arithmetic.** A wrong
   `CapacityFields` is a wrong number; a wrong `CallerContext::peerId` is a membership
   decision read from freed memory, because that field is the kernel's peer host and
