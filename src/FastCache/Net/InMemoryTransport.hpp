@@ -114,6 +114,19 @@ class InMemorySocket: public ISocket
     /// read the response back.
     void ShutdownWrite() noexcept;
 
+    /// @copydoc ISocket::WaitReadable
+    ///
+    /// **Overridden so the condition is expressible at all.** Inheriting the
+    /// always-ready default meant every in-memory exercise of a `WaitReadable` caller
+    /// got `IoResult{1}` whatever the pipe was doing -- so a peer that had gone and a
+    /// peer with a request waiting were the same observation, and no assertion could
+    /// separate them. That is why the disagreement between the three real sockets
+    /// survived: the transport the tests use could not see it either (#677).
+    ///
+    /// Resolves immediately in both directions, exactly as the default did, so no
+    /// caller gains a suspension point it did not have.
+    [[nodiscard]] IoAwaitable WaitReadable() override;
+
   private:
     static void OnInboundProgress(void* state) noexcept;
 

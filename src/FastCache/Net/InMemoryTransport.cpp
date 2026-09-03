@@ -91,6 +91,24 @@ void InMemorySocket::ShutdownWrite() noexcept
         _outbound->CloseWrite();
 }
 
+IoAwaitable InMemorySocket::WaitReadable()
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(
+            NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // EOF is drained AND write-closed, which is the same pair `Read` uses to decide it
+    // has reached the end -- taken from the inbound pipe, since that is the direction
+    // this socket reads from.
+    if (_inbound && _inbound->Buffered() == 0 && _inbound->IsWriteClosed())
+        return IoAwaitable { IoResult { std::size_t { 0 } } };
+
+    // Anything else reports data, which is the default's answer and the fail-safe one:
+    // a caller that reads and finds nothing has lost a syscall, where a caller wrongly
+    // told EOF has lost its peer.
+    return IoAwaitable { IoResult { std::size_t { 1 } } };
+}
+
 IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
 {
     if (_closed)
