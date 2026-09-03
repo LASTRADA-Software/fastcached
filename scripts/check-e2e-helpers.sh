@@ -352,6 +352,90 @@ run_case() {
         echo "BUG: the wait returned for a round that was refused"
         ;;
 
+    # --- `wait_for_node_ready` waits past the BIND ---------------------------
+    #
+    # #634. Since #365 a node binds FIRST and logs `compile node ready`
+    # afterwards, so `wait_for_port` returning is strictly weaker than "the node
+    # is serving". What had been covering that was an ACCIDENT: the old
+    # per-fixture helper probed before the node had bound, so its first probe
+    # always failed and it always slept 200 ms. `wait_until` does its setup before
+    # probing and does not oversleep, so on a run where the port answers on the
+    # first probe there is no sleep at all and the caller's next statement runs
+    # inside the window.
+    #
+    # BOTH directions, because neither half means anything alone -- and here they
+    # catch a loosened helper by DIFFERENT mechanisms, which is the reason to keep
+    # both rather than a symmetry for its own sake. Measured against a
+    # `wait_for_node_ready` written as `wait_for_port "$@"`:
+    #
+    #   * this case still EXITS 0 under that bug, so the status cannot see it. It
+    #     is caught only by the assertion that the marker is PRESENT when the wait
+    #     returns -- which is why the case reads the log rather than reporting
+    #     that the wait came back.
+    #   * `refuses-bound-only` below is caught by the status and not by any
+    #     output.
+    #
+    # Each alone passes the broken helper. The pair does not.
+    #
+    # The marker is `E2eNodeReadyMarker`'s, reached through the helper rather than
+    # spelled again here, for the reason `E2eRegisteredMarker` records: a test that
+    # wrote the text a second time would agree with itself whatever the function
+    # does.
+    node-ready-waits-for-marker)
+        log="${scratch}/ready.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_node "$p" 1 "$log" >/dev/null 2>&1 &
+        staged=$!
+        # THE BIND IS STAGED FIRST, and that is the point rather than setup.
+        #
+        # #634's condition is "a run where the port answers on the FIRST probe",
+        # which is when `wait_until` sleeps nothing and the caller's next statement
+        # lands inside the window. Waiting the port out here is what puts the
+        # helper's own port wait into exactly that state, so the case exercises the
+        # condition the ticket is about instead of whichever one the machine
+        # happens to produce.
+        #
+        # It also stops the budget below from being spent on the wrong thing: perl
+        # takes about a second to start and bind, and a combined budget tight
+        # enough to keep `refuses-bound-only` quick expires in the PORT wait rather
+        # than the marker wait -- which is this case passing for a reason that has
+        # nothing to do with what it tests. Measured: with a 2s budget and no
+        # staging, the verdict read "gave up waiting ... to listen on", not "to
+        # log".
+        wait_for_port 127.0.0.1 "$p" "$staged" "the staged node" "$log" 15
+        wait_for_node_ready 127.0.0.1 "$p" "$staged" "the staged node" "$log" 15
+        # THE assertion, and it is on the marker rather than on having returned:
+        # a helper loosened back to the bind also RETURNS here, and exits 0, so the
+        # status cannot tell the two apart and only this can.
+        case "$(<"$log")" in
+            *"compile node ready"*) echo "wait_for_node_ready returned with the node serving" ;;
+            *) echo "BUG: it returned while the node had only bound" ;;
+        esac
+        kill "$staged" 2>/dev/null || true
+        ;;
+
+    # And the discriminating half: a node that binds and NEVER finishes starting.
+    # The port answers for the whole budget, so there is a satisfied `wait_for_port`
+    # available at every poll and the wait still has to EXPIRE. A helper loosened
+    # back to the bind returns immediately and fails this by its exit status.
+    node-ready-refuses-bound-only)
+        log="${scratch}/never.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_node "$p" never "$log" >/dev/null 2>&1 &
+        staged=$!
+        # Staged for the reason the case above gives, and here it is also what
+        # makes the budget mean what it says: the 2s below must be spent waiting
+        # for a MARKER that never comes, not waiting for perl to bind. The
+        # required text in the table (`to log: ...`) is what pins that -- an
+        # expiry in the port wait says `to listen on` and fails the row, so this
+        # cannot quietly go back to timing the wrong thing.
+        wait_for_port 127.0.0.1 "$p" "$staged" "a node that never finishes starting" "$log" 15
+        wait_for_node_ready 127.0.0.1 "$p" "$staged" "a node that never finishes starting" "$log" 2
+        echo "BUG: the wait returned for a node that had only bound"
+        ;;
+
     # --- `run_bounded` -------------------------------------------------------
     #
     # The helper that exists because `cluster-e2e.sh` bounded its probe with a
@@ -669,6 +753,44 @@ _selftest_listener() {
     ' "$1" "$2" "$3"
 }
 
+# A stand-in for a compile node: BINDS first, then logs `compile node ready`
+# after a delay -- or never, when the delay is `never`.
+#
+# The shape is the node's and not an approximation of it. Since #365 a node binds
+# and logs that line afterwards, so a stand-in that logged first would stage the
+# one ordering the helper is not about, and both cases below would pass whatever
+# the helper did.
+#
+# It holds the port open afterwards, because `wait_for_node_ready` polls the log
+# with the process still under liveness watch: a stand-in that exited once it had
+# written the marker would be reported as having DIED rather than as ready, which
+# is a different verdict and a passing test for the wrong reason.
+#
+# Perl for the listener, for the reason the other socket cases give: nc's listen
+# flags differ between the BSD, GNU and OpenBSD builds and one of those is on
+# every platform CI runs, but never the same one.
+#
+# @param 1 port
+# @param 2 seconds to wait before logging the marker, or `never`
+# @param 3 the log to write it to
+_selftest_node() {
+    perl -e '
+        use strict; use warnings; use IO::Socket::INET;
+        my ($port, $delay, $logfile) = @ARGV;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => $port,
+            Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+        if ($delay ne "never") {
+            sleep $delay;
+            open(my $log, ">>", $logfile) or die $!;
+            print $log "compile node ready on 127.0.0.1:$port, advertising ...
+";
+            close $log;
+        }
+        sleep 30;
+    ' "$1" "$2" "$3"
+}
+
 # ---------------------------------------------------------------------------
 # The driver
 # ---------------------------------------------------------------------------
@@ -844,6 +966,8 @@ socket_cases=(
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
+    "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
+    "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
 )
 
 echo "== the helpers, in real shells"

@@ -297,32 +297,24 @@ started_port=""
 # is what turns a tier OFF, so a node that silently kept one would race for
 # `fastcache-cc`'s default port with every other node in the run.
 #
-# BOUND IS NOT READY, and that is why there are two waits here rather than one.
-#
-# Since #365 a node binds FIRST and logs `compile node ready` afterwards, so a
-# caller that only waited for the port got a listener that answers and a process
-# still finishing its startup. Case 8 was measured falling into that window: five
-# runs of the pre-#451 fixture reported `READY` at the moment it signalled the
-# worker, and the converted one reported `NOTREADY` on every run whose port
-# answered on the FIRST probe -- the old per-fixture `wait_for_port` opened with
-# `for _ in $(seq 1 100)` and probed before the node had bound, so it always
-# failed once and slept 200 ms, and that accidental 200 ms was what the graceful
-# stop rested on. `wait_until` does its setup before probing and does not
-# oversleep; it exposed a hole it did not create.
+# BOUND IS NOT READY, which is `wait_for_node_ready`'s whole subject and is why
+# this waits through that rather than through `wait_for_port` (#451, #634). Case 8
+# was measured falling into the window: five runs of the pre-#451 fixture reported
+# `READY` at the moment it signalled the worker, and the converted one reported
+# `NOTREADY` on every run whose port answered on the FIRST probe.
 #
 # HERE and not at the case that was caught, because a first failure masks its
 # identical siblings: case 9's `tier-node` and case 11's `blackhole-node` are
 # compiled against immediately after their bind and had exactly the same hole, and
-# fixing only the observed site relocates a flake rather than removing it.
-# `compile node ready` is one unconditional line every node logs, the scheduler
-# tier included, so there is no node this can hang on.
+# fixing only the observed site relocates a flake rather than removing it. The
+# marker is one unconditional line every node logs, the scheduler tier included,
+# so there is no node this can hang on.
 #
-# It stays a SECOND wait rather than being folded into the first, because a stall
-# before the bind and a stall between the bind and readiness are different faults;
-# `wait_until` names the predicate that expired, so the two remain two verdicts.
-# Registration is deliberately NOT here -- some nodes are started to hold a port
-# and a cache tier and never join a fleet -- and stays at the call sites that want
-# it.
+# The reasoning for the pairing -- why it is two waits and not one, and what the
+# second establishes -- is in the library beside the helper, and is deliberately
+# not restated here. Registration is NOT part of it: some nodes are started to
+# hold a port and a cache tier and never join a fleet, so it stays at the call
+# sites that want it.
 #
 # @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message about
 #          this node, so a reader handed a failure can find the log without a
@@ -342,8 +334,7 @@ start_node() {
     started_log="$log"
     started_port="$port"
     pids+=("$pid")
-    wait_for_port "$host" "$port" "$pid" "$tag" "$log"
-    wait_for_log "compile node ready" "$pid" "$tag" "$log"
+    wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 
 # Write a translation unit whose content is unique to the caller.

@@ -604,6 +604,60 @@ wait_for_registration() {
     wait_for_log "$E2eRegisteredMarker" "$1" "$2" "$3" ${4+"$4"}
 }
 
+# The line a compile node logs once it is SERVING, and the marker
+# `wait_for_node_ready` below waits on.
+#
+# A named constant for the reason `E2eRegisteredMarker` above is one: the
+# self-test stages both halves of this text, and a test that spelled the marker
+# out a second time would agree with itself whatever the function does.
+E2eNodeReadyMarker="compile node ready"
+
+# Wait until a compile node is SERVING, not merely bound.
+#
+# BOUND IS NOT READY. Since #365 a node binds FIRST and logs this line
+# afterwards, so `wait_for_port` returning has been strictly weaker than "the
+# node is ready" ever since, and every assertion placed straight after one has
+# been resting on the gap being small rather than on the property it needs.
+#
+# What kept that safe was an ACCIDENT, and #449 removed it without anything being
+# able to notice. The old per-fixture helper opened `for _ in $(seq 1 100)` and
+# probed before the node had bound, so its first probe always failed and it
+# always slept 200 ms. `wait_until` does its setup before probing and does not
+# oversleep: on a run where the port answers on the FIRST probe it proceeds with
+# no sleep at all, and the assertion then runs inside the window. Measured on the
+# `cluster-e2e` n4 shape, that window is single-digit milliseconds -- ample, since
+# what has to fit inside it is a shell reaching its next statement.
+#
+# So this is TWO waits and not one, and they stay two on purpose: a stall before
+# the bind and a stall between the bind and readiness are different faults, and
+# `wait_until` names the predicate that expired, so the two remain two verdicts.
+#
+# WHAT THE SECOND WAIT BUYS, concretely. Between the bind and this line the node
+# starts the reactor thread that ACCEPTS on the ports it has already bound -- its
+# own comment reads "a client that dials the instant a port is bound must not
+# find a listener nobody is accepting on" -- brings up its registrars and its
+# heartbeat, and installs its stop handlers. A fixture that signals a node inside
+# that window is signalling one that has not installed a handler yet, which is
+# what #451 found; a fixture that dials one is dialling a listener nobody is
+# accepting on.
+#
+# Registration is deliberately NOT here. Some nodes are started to hold a port and
+# a cache tier and never join a fleet, so that stays `wait_for_registration` at the
+# call sites that want it.
+#
+# @param 1 host
+# @param 2 port
+# @param 3 pid to watch, or "-"
+# @param 4 what it is, for the messages
+# @param 5 the log to watch -- required, unlike `wait_for_port`'s, because the
+#          marker is read out of it and there is nothing to wait on without it
+# @param 6 optional bound in seconds; defaults to `e2e_wait_seconds`
+wait_for_node_ready() {
+    local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
+    wait_for_port "$host" "$port" "$pid" "$what" "$logfile" ${6+"$6"}
+    wait_for_log "$E2eNodeReadyMarker" "$pid" "$what" "$logfile" ${6+"$6"}
+}
+
 # Stop a process and require it to actually exit, within a bound.
 #
 # `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal

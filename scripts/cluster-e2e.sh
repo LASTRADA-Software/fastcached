@@ -395,7 +395,13 @@ start_node() {
         --log-level=info \
         > "$log" 2>&1 &
     pids+=("$!")
-    wait_for_port 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${id}" "$log"
+    # Ready, not merely bound (#634). Nothing this function's own callers assert
+    # needs it -- `find_leader` below is a bounded retry loop and heals a node that
+    # is still starting -- but this is the recipe the n4 start below repeats, and
+    # THAT one asserts immediately. Fixing only the site that asserts would leave
+    # the two copies of one recipe disagreeing about what they establish, and the
+    # next assertion placed after this one would inherit the weaker of them.
+    wait_for_node_ready 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${id}" "$log"
 }
 
 for index in 0 1 2; do
@@ -870,7 +876,14 @@ scheduler_ports+=("$(free_port)")
     > "${workdir}/n4.log" 2>&1 &
 pids+=("$!")
 node_logs[3]="${workdir}/n4.log"
-wait_for_port 127.0.0.1 "${scheduler_ports[3]}" "$!" "n4" "${workdir}/n4.log"
+# Ready, not merely bound, and here it is load-bearing (#634). The very next
+# statement asks n4 `--cluster-status` and asserts on its REFUSAL, so a node that
+# has bound and is not yet serving satisfies the assertion without the property
+# ever being observed -- and so does the `$ProbeTimedOut` a bounded probe answers
+# with, which also fails to contain `known settings:`. A negative assertion cannot
+# tell "it does not lead" from "it could not answer", so what it rests on has to
+# be established before it, not by it.
+wait_for_node_ready 127.0.0.1 "${scheduler_ports[3]}" "$!" "n4" "${workdir}/n4.log"
 
 # It is running and it leads nothing, which is the first half of the property: a
 # node waiting to be admitted must not have formed a cluster of its own. Asked of

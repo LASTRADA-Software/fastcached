@@ -216,7 +216,19 @@ tls_args=()
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!
 
-wait_for_port 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
+# Ready, not merely bound (#634). The next statement dials this very port and
+# requires a 200 out of it, and the admin surface is BOUND before the loop that
+# accepts on it starts -- `nodeIo.Start()` runs after both surfaces have bound,
+# precisely so "a client that dials the instant a port is bound must not find a
+# listener nobody is accepting on". `wait_for_port` returns at the bind, which is
+# the wrong side of that.
+#
+# Every assertion here fails LOUDLY rather than silently if it lands early -- an
+# unanswered request is an empty body, not a wrong one -- so this buys a flake
+# removed rather than a false pass. That is worth saying plainly, because it is
+# a weaker claim than the n4 site in `cluster-e2e` and should not be read as the
+# same one.
+wait_for_node_ready 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
 
 # ---------------------------------------------------------------- 2. /metrics
 # First, because it is the assertion that protects every existing deployment: the
