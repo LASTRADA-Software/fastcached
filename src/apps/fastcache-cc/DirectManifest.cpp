@@ -751,6 +751,22 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
 
 std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs const& inputs, PathCanon::Layout const& layout)
 {
+    // Asked FIRST, before the TU is even resolved, because it is the one refusal
+    // that is about the compile rather than about a path: nothing was reported, so
+    // there is nothing to classify and the manifest that would come out asserts the
+    // TU alone -- which revalidates forever and serves its object into any checkout
+    // that computes the key (issue #368). This used to be the caller's judgement,
+    // spelled as an `includes.empty()` return in `RecordManifest` one translation
+    // unit away, which left `BuildManifest` correct only because of a guard nothing
+    // in this file could see (issue #512). It is asked here now, and the caller
+    // merely states what it saw.
+    //
+    // `WasObserved()`, never `Paths().empty()`: an observed record naming no path is
+    // the honest header-free translation unit, and refusing it would be the same
+    // trade `NoProjectDeps` deliberately does not make.
+    if (!inputs.reportedDependencies.WasObserved())
+        return std::unexpected(ManifestFailure { .fault = ManifestFault::DepsNotObserved, .path = inputs.sourcePath });
+
     DirectManifest manifest { .toolchainStamp = inputs.toolchainStamp, .objectKey = inputs.objectKey, .entries = {} };
 
     // The TU first, and its absence is fatal rather than merely thin. A manifest
@@ -779,7 +795,7 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     // refusal below.
     std::size_t recorded = 0;
 
-    for (auto const& rawPath: inputs.includePaths)
+    for (auto const& rawPath: inputs.reportedDependencies.Paths())
     {
         auto const resolved = ResolveAgainst(rawPath, inputs.workingDirectory, layout);
         switch (ClassifyResolved(resolved, layout))
@@ -843,7 +859,15 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     // preprocess and the alternative is a wrong object. `recorded`, not
     // `entries.size()`: the TU is always entry one (issue #49 / #51), so a size
     // test would be asking a question about the source rather than the headers.
-    if (!inputs.includePaths.empty() && recorded == 0)
+    //
+    // The first clause survives and its meaning has narrowed to what it always
+    // should have been. It used to carry two jobs: "some paths were reported" and,
+    // by inference, "the empty set I am about to accept is an honest one" -- the
+    // second of which this function had no way to know and which was in fact
+    // guaranteed a translation unit away (issue #512). `DepsNotObserved` above now
+    // answers that, so all this clause still says is that an OBSERVED record naming
+    // no path leaves nothing to drop, and a refusal about dropping does not apply.
+    if (!inputs.reportedDependencies.Paths().empty() && recorded == 0)
         return std::unexpected(ManifestFailure { .fault = ManifestFault::NoProjectDeps, .path = inputs.sourcePath });
 
     // Deduplicate then sort: `/showIncludes` repeats a header once per inclusion

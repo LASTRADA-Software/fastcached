@@ -90,11 +90,13 @@ enum class DirectError : std::uint8_t
 /// refusal can be *named*, because it is the only account a translation unit that
 /// silently never caches ever gets (issue #68).
 ///
-/// Five rather than the two the refusal paths happen to have, and the split is the
+/// More of them than the refusal paths happen to have, and the split is the
 /// point: each names a different thing to go and fix. `Unanchored` is a working
 /// directory, `OutsideRoots` is a layout, `ToolchainLike` is a TU somewhere nobody
 /// expected to compile from, `Uncanonical` is a root spelled almost right,
-/// `Unreadable` is a file. `PathDisposition` in DependencyProbe.hpp draws
+/// `Unreadable` is a file, `NoProjectDeps` is a root that covers none of the headers
+/// the compile named, `DepsNotObserved` is a compile that named none.
+/// `PathDisposition` in DependencyProbe.hpp draws
 /// the same lines for the key's dependency set, for the same reason (issue #105) —
 /// separate because a manifest's outcomes are not a key's: there is no `Keyed` and
 /// no `Toolchain` here, since a toolchain header is dropped rather than refused,
@@ -121,7 +123,17 @@ enum class ManifestFault : std::uint8_t
     NoProjectDeps, ///< The compile reported dependencies and every one of them was
                    ///< dropped as toolchain, so the manifest would revalidate the TU
                    ///< and nothing else -- and would keep doing so forever.
-    Last,          ///< Not a fault, and has no row: the table's length.
+
+    /// No dependency record reached the caller at all, so nothing whatever is known
+    /// about what this TU includes. Split from `NoProjectDeps` because the two send
+    /// an operator to opposite places: that one is a root that fails to cover the
+    /// headers the compile named, this one is a compile that named none -- a GNU
+    /// driver invoked without `-MD`/`-MF`, or a `/showIncludes` stream that carried
+    /// no notes. Both would otherwise record the same hollow manifest, and only one
+    /// of them is fixed by editing the build's flags.
+    DepsNotObserved,
+
+    Last, ///< Not a fault, and has no row: the table's length.
 };
 
 /// One row per fault: the enumerator, and the word the note uses for it.
@@ -153,6 +165,7 @@ inline constexpr EnumTable<ManifestFault, FaultRow> FaultTable { {
     { .fault = ManifestFault::Uncanonical, .label = "no canonical form" },
     { .fault = ManifestFault::Unreadable, .label = "unreadable" },
     { .fault = ManifestFault::NoProjectDeps, .label = "every reported dependency was dropped as toolchain" },
+    { .fault = ManifestFault::DepsNotObserved, .label = "the compile produced no dependency record" },
 } };
 
 static_assert(RowsInEnumeratorOrder(FaultTable, &FaultRow::fault),
@@ -395,6 +408,90 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// @return Every non-phony rule target, in emission order, with duplicates kept.
 [[nodiscard]] std::vector<std::string> ParseDepFileTargets(std::string_view depFileText);
 
+/// What a compile said about its own dependencies -- INCLUDING whether it said
+/// anything at all.
+///
+/// A bare `std::vector<std::string>` cannot carry that. "This TU depends on no
+/// headers" and "no dependency record reached us" both arrive as an empty vector,
+/// and they are opposite facts: the first makes a manifest naming the TU alone
+/// CORRECT, the second makes the same manifest a claim about files nobody looked
+/// at, which revalidates forever and serves its object into any checkout that
+/// computes the key (issue #368, issue #512). Two states rendered identically is
+/// this project's four-states rule, and the seam it lands on here is the one whose
+/// consequence is #368's mechanism.
+///
+/// The distinction is therefore CARRIED rather than inferred. `BuildManifest` used
+/// to ask `!includePaths.empty()`, which is sound only while every caller's empty
+/// set is honest -- and that was true only because of a guard in `RecordManifest`,
+/// one translation unit away and invisible from `DirectManifest.cpp`. A function
+/// whose correctness depends on a fact its signature cannot express is one a third
+/// caller silently breaks.
+///
+/// **The default constructor is deleted, and that is the load-bearing part.**
+/// `ManifestInputs` is filled in with designated initializers, where an omitted
+/// member is value-initialized in silence -- so a member that could be default
+/// constructed would make this question skippable, and a question you can skip is
+/// the inference it replaced wearing a type. Deleting it makes omission a compile
+/// error, which is the only form of the guard a new caller cannot walk past.
+class ReportedDependencies
+{
+  public:
+    /// Deleted so `ManifestInputs` cannot be built without answering the question;
+    /// see the note above, which is the whole reason this is a class.
+    ReportedDependencies() = delete;
+
+    /// A dependency record was read, and these are the paths it named.
+    ///
+    /// An EMPTY vector here is a positive statement -- the compile was asked and
+    /// depends on nothing -- and is accepted. It is not the same value as
+    /// `NotObserved()` and must never be spelled to mean it.
+    /// @param paths The paths the record named, as the driver spelled them.
+    /// @return Inputs stating that the record was read.
+    [[nodiscard]] static ReportedDependencies Observed(std::vector<std::string> paths)
+    {
+        return ReportedDependencies { std::move(paths), true };
+    }
+
+    /// No dependency record reached the caller: no `/showIncludes` notes, no
+    /// depfile, nothing. `BuildManifest` refuses this with
+    /// `ManifestFault::DepsNotObserved` rather than recording what it does not know.
+    /// @return Inputs stating that nothing was observed.
+    [[nodiscard]] static ReportedDependencies NotObserved()
+    {
+        return ReportedDependencies { {}, false };
+    }
+
+    /// Whether a dependency record was read at all.
+    /// @return True when these paths came from a record, however short.
+    [[nodiscard]] bool WasObserved() const noexcept
+    {
+        return _observed;
+    }
+
+    /// The reported paths. Empty for `NotObserved()`, and legitimately empty for an
+    /// `Observed()` compile that depends on nothing -- ask `WasObserved()` to tell
+    /// those apart, never `empty()`.
+    /// @return The paths as the driver spelled them.
+    [[nodiscard]] std::vector<std::string> const& Paths() const noexcept
+    {
+        return _paths;
+    }
+
+    [[nodiscard]] friend bool operator==(ReportedDependencies const&, ReportedDependencies const&) = default;
+
+  private:
+    /// @param paths    The reported paths.
+    /// @param observed Whether a record was read.
+    ReportedDependencies(std::vector<std::string> paths, bool observed):
+        _paths { std::move(paths) },
+        _observed { observed }
+    {
+    }
+
+    std::vector<std::string> _paths;
+    bool _observed;
+};
+
 /// Everything one compile contributes to its manifest.
 ///
 /// A struct rather than six positional arguments, for the reason `Cc::KeyInputs`
@@ -405,20 +502,23 @@ struct ManifestInputs
     /// The translation unit's own source path, exactly as the command line spelled
     /// it — relative or absolute.
     ///
-    /// Separate from `includePaths`, and mandatory, because a manifest that does
+    /// Separate from `reportedDependencies`, and mandatory, because a manifest that does
     /// not name its TU revalidates everything except the file being compiled:
     /// neither `/showIncludes` nor a GNU depfile's rule target names the primary
     /// source, so editing a `.cpp` body while leaving every header untouched would
     /// be invisible to ValidateManifest and a stale object replayed forever
-    /// (issue #49 / issue #51). It used to be appended to `includePaths` by the
+    /// (issue #49 / issue #51). It used to be appended to the dependency list by the
     /// caller, which made the invariant a comment rather than something
     /// BuildManifest could enforce — and left it to be silently dropped when it was
     /// spelled relatively (issue #57).
     std::string sourcePath;
 
-    /// The dependency paths the compile reported, as the driver spelled them:
-    /// `/showIncludes` notes or a GNU depfile's dependency list.
-    std::vector<std::string> includePaths;
+    /// What the compile said about its dependencies — `/showIncludes` notes or a
+    /// GNU depfile's dependency list — and whether it said anything at all.
+    ///
+    /// Not a bare vector: see `ReportedDependencies`, whose whole subject is why
+    /// the second half of that cannot be inferred from the first (issue #512).
+    ReportedDependencies reportedDependencies;
 
     /// The directory the compile ran in, used to resolve every relative path above.
     ///
@@ -579,8 +679,23 @@ struct ManifestInputs
 /// nothing about the sources.
 ///
 /// Deliberately `empty()` and not "fewer than two": a manifest holding only the TU is
-/// what a translation unit including nothing legitimately records, and after
-/// `BuildManifest`'s `NoProjectDeps` refusal it is the only way one gets written.
+/// what a translation unit including nothing legitimately records, and `BuildManifest`
+/// will write one for an `Observed()` record that named no path.
+///
+/// **No production caller reaches that**, and the reason is worth having here rather
+/// than only at the caller. `RecordManifest` cannot tell "this TU includes nothing"
+/// from "I could not read the record": a localized `cl` prints a translated note
+/// prefix that `IncludeNoteMarker` does not match, so a parse yielding nothing is
+/// ambiguous on exactly the machines where it would matter most. It therefore says
+/// `NotObserved()` and is refused. So every manifest this launcher writes names at
+/// least one header, and a TU-only one arriving at this predicate came from
+/// somewhere else -- a decoded store, an older or foreign producer.
+///
+/// Which is why tightening this to refuse a TU-only manifest stays available as
+/// defence in depth, and why issue #512 did NOT do it: that is a consumer-side
+/// question about a manifest carrying no provenance, and #512 moved the produce-side
+/// question into `ReportedDependencies` instead. The two do not substitute for each
+/// other. See `.agent/rules/compile-cache.md` under Accepted trade-offs.
 /// @param manifest The manifest to judge.
 /// @return True when it has no entries.
 [[nodiscard]] bool ManifestAssertsNothing(DirectManifest const& manifest) noexcept;

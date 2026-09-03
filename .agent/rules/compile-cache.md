@@ -1603,24 +1603,45 @@ without reopening the argument:
   reaching the validator would revalidate on the TU hash alone and serve its
   recorded object into any checkout that computes the key, which is
   [#368](https://github.com/LASTRADA-Software/fastcached/issues/368).
-  It cannot currently be built. `RecordManifest` refuses on THREE producer-side
-  guards, and the first is the one that closes this shape:
-  `includes.empty()` (`apps/fastcache-cc/main.cpp`, after the depfile fallback —
-  "no dependency record at all means no manifest"), `UnreadablePaths` when a
-  reported path is not readable as text (`47ee5e5`), and `NoProjectDeps` when paths
-  were reported and every one dropped (`4739f54`). The first two are invisible from
-  `DirectManifest.cpp`, which is why reasoning about `BuildManifest` alone gets this
-  wrong — it has exactly one non-test caller and the caller is where two of the
-  three guards live.
+  It cannot currently be built. Three producer-side guards refuse it, and two of the
+  three now live at the seam rather than one translation unit away:
+  `DepsNotObserved` when no dependency record was observed at all, `NoProjectDeps`
+  when paths were reported and every one dropped (`4739f54`) — both in
+  `BuildManifest` — and `UnreadablePaths` in `RecordManifest` when a reported path is
+  not readable as text (`47ee5e5`).
+  The first of those was `RecordManifest`'s own `includes.empty()` early return until
+  [#512](https://github.com/LASTRADA-Software/fastcached/issues/512), and moving it is
+  what that issue was for. **"No dependencies" and "dependencies not observed" are
+  different states that an empty `std::vector<std::string>` renders identically**, and
+  `BuildManifest` used to tell them apart by inferring honesty from
+  `!includePaths.empty()` — sound only because of a guard nothing in
+  `DirectManifest.cpp` could see. So the FOUR states are: deps observed and some
+  project ones survived (a manifest); observed, some reported, none survived
+  (`NoProjectDeps`); observed and none reported (an honest TU-only manifest); and not
+  observed (`DepsNotObserved`). The last two were the collapsed pair. `ManifestInputs`
+  now carries a `ReportedDependencies` whose **default constructor is deleted**, so a
+  new caller cannot omit the answer — designated initializers value-initialize an
+  omitted member in silence, which is how a defaulted field would have made the guard
+  decorative.
+  The third state has **no producer**, and that is a finding rather than an oversight:
+  `RecordManifest` cannot separate "there is nothing to read" from "I could not read
+  it", because `IncludeNoteMarker` is the literal English `"Note: including file:"`
+  and a localized `cl` prints notes it does not match
+  ([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). It therefore
+  answers `NotObserved()`. The type puts the judgement where the knowledge is.
   **So the accepted cost is the asymmetry, not a live hole**: the defence is
   entirely on the produce side, and the validator would accept a hollow manifest
   that arrived any other way — decoded from a store written by an older or foreign
   producer, for instance. Tightening `ManifestAssertsNothing` to refuse a TU-only
-  manifest is the defence-in-depth fix, and it is cheap; what is NOT acceptable is
+  manifest is the defence-in-depth fix, and it is cheap; #512 did not do it and did
+  not make it unnecessary — that is a CONSUMER-side question about a manifest
+  carrying no provenance, and #512 moved the PRODUCE-side one into the type. The two
+  do not substitute for each other. What is NOT acceptable is
   removing any of the three producer guards on the belief that the validator would
   catch it. `DirectManifest_test.cpp`'s two cross-checkout cases characterize the
   validator's current answer and say in-place that they must change if it is
-  tightened.
+  tightened; the `Observed({})` they build is a lie the fixture tells deliberately
+  and says so, since no honest caller spells that state.
 - MurmurHash3 is not collision-resistant against an adversary. Accepted because
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust

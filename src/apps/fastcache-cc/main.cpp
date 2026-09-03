@@ -1509,20 +1509,6 @@ void RecordManifest(Config const& cfg,
         if (auto const depText = ReadDepFile(cmd))
             includes = Cc::ParseDepFilePaths(*depText);
 
-    // No dependency record at all means no manifest. A manifest built from the
-    // source alone revalidates the source alone, so a hit against it replays an
-    // object built from headers nobody re-checked: edit a header, leave the .cpp
-    // untouched, and the stale object is served forever with a zero exit code.
-    // That is what a GNU compile with no `-MD`/`-MF` produces — neither stream
-    // carries notes and there is no depfile to read — and it is the one shape
-    // where recording nothing (a permanent direct-mode miss, resolved by the
-    // ordinary preprocessed key) is strictly better than recording something.
-    if (includes.empty())
-    {
-        NoteNoManifest("the compile reported no dependencies");
-        return;
-    }
-
     // Reconciled here rather than trusted from the caller. The captured streams
     // arrive already reconciled, but the depfile read above comes straight off
     // disk — and resolution is memoized and idempotent, so guaranteeing this
@@ -1550,13 +1536,35 @@ void RecordManifest(Config const& cfg,
     // revalidates every header and not the file being compiled (issue #49 /
     // issue #51). BuildManifest refuses outright when it cannot record the TU,
     // which is what makes that a precondition rather than a comment here.
+    //
+    // Whether a dependency record reached us AT ALL is stated rather than left to be
+    // inferred from the vector being empty, and this function is the only place that
+    // knows. Nothing came back means we DID NOT OBSERVE the dependencies, not that
+    // there are none: the two are different states and an empty vector renders them
+    // identically (issue #512). This function genuinely cannot tell them apart --
+    // a GNU compile with no `-MD`/`-MF` produces no depfile and no notes, and so
+    // does an MSVC compile whose notes carry a prefix `Cc::IncludeNoteMarker` does
+    // not match, which is every note a localized `cl` prints. Reading the second as
+    // "this TU includes nothing" would record a manifest asserting the TU alone on
+    // every compile on that machine, and such a manifest revalidates forever and
+    // serves its object into any checkout that computes the key (issue #368).
+    //
+    // Said with a VALUE rather than by returning early, which is what this used to
+    // do. That left `BuildManifest` -- a library entry point -- correct only because
+    // of a guard one translation unit away that nothing in `DirectManifest.cpp`
+    // could see. Now the caller states what it observed and the seam decides, so the
+    // refusal is named (`DepsNotObserved`), names the source path, and a second
+    // caller cannot omit it: `ReportedDependencies` has no default constructor, so
+    // there is no way to leave the question unanswered.
     auto const reported = includes.size();
-    auto const manifest = Cc::BuildManifest({ .sourcePath = resolvedSource,
-                                              .includePaths = std::move(includes),
-                                              .workingDirectory = workingDirectoryText,
-                                              .toolchainStamp = toolchainStamp,
-                                              .objectKey = std::string { objectKeyForPointer } },
-                                            layout);
+    auto const manifest = Cc::BuildManifest(
+        { .sourcePath = resolvedSource,
+          .reportedDependencies = includes.empty() ? Cc::ReportedDependencies::NotObserved()
+                                                   : Cc::ReportedDependencies::Observed(std::move(includes)),
+          .workingDirectory = workingDirectoryText,
+          .toolchainStamp = toolchainStamp,
+          .objectKey = std::string { objectKeyForPointer } },
+        layout);
     if (!manifest.has_value())
     {
         // One path and one reason, the shape the replay guard's STALE HIT note uses
