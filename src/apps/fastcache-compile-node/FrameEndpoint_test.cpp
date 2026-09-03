@@ -1961,7 +1961,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // by one frame: nothing precedes it, and nothing follows. A sweeper that wrote
     // while the connection was about to, or a connection that wrote both the refusal
     // and the reply it was holding, lands here as a length that is not this one.
-    CHECK(received.size() == Wire::ReplyHeaderSize + header->payloadLength);
+    CHECK(received.size() == Wire::ReplyHeaderSize + Unwrap(header).payloadLength);
 
     // And stated the other way round, because a size can agree by accident: the reply
     // `HoldableResponder` produced is a MISS, and its bytes appear nowhere at all.

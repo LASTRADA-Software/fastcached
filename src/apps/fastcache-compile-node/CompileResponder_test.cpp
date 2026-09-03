@@ -917,8 +917,8 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     REQUIRE_FALSE(swept.empty());
     auto const header = Wire::DecodeReplyHeader(swept);
     REQUIRE(header.has_value());
-    REQUIRE(header->status == Wire::Status::Error);
-    REQUIRE(header->payloadLength != 0);
+    REQUIRE(Unwrap(header).status == Wire::Status::Error);
+    REQUIRE(Unwrap(header).payloadLength != 0);
     CHECK(static_cast<Wire::ErrorCode>(swept[Wire::ReplyHeaderSize]) == Wire::ErrorCode::RequestDeadlineExceeded);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == 1);
 
