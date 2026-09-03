@@ -235,7 +235,7 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
 
     auto const ask = [&](std::string_view peer) {
         return service.Lease(
-            CallerContext { .membership = cluster.Classify(peer), .peerId = peer },
+            CallerContext { .membership = cluster.Classify(peer), .peerId = std::string { peer } },
             FastCache::CompileCacheWire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
     };
 

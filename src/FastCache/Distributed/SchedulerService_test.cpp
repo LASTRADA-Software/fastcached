@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -30,10 +31,10 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A caller the fleet has admitted.
-constexpr CallerContext Insider { .membership = Membership::Member, .peerId = "peer-1" };
+CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1" };
 
 /// A caller that holds no membership -- the leech this policy exists for.
-constexpr CallerContext Outsider { .membership = Membership::Outsider, .peerId = "stranger" };
+CallerContext const Outsider { .membership = Membership::Outsider, .peerId = "stranger" };
 
 /// A worker offering one slot of the given toolchain.
 [[nodiscard]] WorkerRegistration OneSlot(std::string_view fingerprint, std::string_view endpoint)
@@ -1190,4 +1191,58 @@ TEST_CASE("A scheduler with no cluster key says so, once", "[distributed][schedu
     auto const second = fleet.service.Lease(Insider, Ask("gcc-14", "obj-2"));
     REQUIRE(second.status == Wire::Status::Ok);
     CHECK(fleet.logger.Snapshot().empty());
+}
+
+TEST_CASE("A caller context outlives the storage its peer id came from", "[distributed][scheduler][caller]")
+{
+    // #395. `CallerContext::peerId` was a `std::string_view` in a type whose name
+    // promised nothing, so a context could legally outlive the bytes it described.
+    // This is the property that a view cannot have and an owner cannot lack.
+    //
+    // **The ticket concluded no test could guard this, and that was an arrangement
+    // problem rather than an impossibility.** Two things decide whether the defect
+    // is observable, and the ticket had one of them:
+    //
+    //   - **How it is READ.** Constructed and consumed in ONE expression --
+    //     `Consume(Context(peer))` -- nothing dangles at any size, because a
+    //     by-value parameter lives to the end of the full expression. A test written
+    //     that way passes under the bug. So this one STORES the context, lets the
+    //     source go, and reads afterwards, which is what a request path does.
+    //
+    //   - **How LONG the peer id is**, and this decides which check fires rather
+    //     than merely whether one does. Measured on libstdc++, gcc, ASan:
+    //       "127.0.0.1"  (9 chars) sits in the SSO buffer -> stack-use-after-scope,
+    //                    visible only with ASan's stack poisoning.
+    //       the id below (36 chars) is heap -> heap-use-after-free, caught with NO
+    //                    special options at all.
+    //     Every peer in this suite was short, which is why the suite stayed green
+    //     with the defect in place.
+    //
+    // The long id is not a stressed payload. It is what `getpeername()` reports on
+    // any IPv6 deployment, so the case that exposes this is the ORDINARY one -- the
+    // fleet just happens to have been tested on v4 loopback.
+    constexpr std::string_view LongPeer = "2001:db8:85a3:8d3:1319:8a2e:370:7348";
+    static_assert(LongPeer.size() > 15, "must exceed libstdc++'s SSO capacity, or this tests the wrong failure mode");
+
+    std::optional<CallerContext> caller;
+    {
+        std::string peer { LongPeer };
+        caller = CallerContext { .membership = Membership::Member, .peerId = peer };
+    }
+
+    // Claim the freed storage, which a real request path does constantly. Without
+    // it the bytes often read back intact and the case passes under the defect --
+    // the same reason #366's rule says the sizes are load-bearing.
+    std::vector<std::string> churn;
+    for ([[maybe_unused]] auto const index: std::views::iota(0, 64))
+        churn.emplace_back(LongPeer.size(), 'x');
+
+    // The whole of the property, and the line the sanitizer reports on when the
+    // field borrows. Nothing follows it: a `Leading` fixture and a `Register` stood
+    // here, and they re-asserted that a member registers -- which this file already
+    // covers several times -- while contributing nothing to whether the case fails
+    // without the fix. Why the field MATTERS is worth saying and is said above; it
+    // is not worth a second read of it dressed as an assertion.
+    REQUIRE(caller.has_value());
+    CHECK(caller->peerId == LongPeer);
 }

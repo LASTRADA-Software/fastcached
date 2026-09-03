@@ -27,7 +27,7 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A caller the fleet has admitted.
-constexpr Distributed::CallerContext Insider { .membership = Distributed::Membership::Member, .peerId = "peer-1" };
+Distributed::CallerContext const Insider { .membership = Distributed::Membership::Member, .peerId = "peer-1" };
 
 /// A cluster whose answers a test scripts.
 ///
@@ -337,7 +337,7 @@ TEST_CASE("A non-member may not change what the fleet believes", "[node][cluster
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
 
-    constexpr Distributed::CallerContext Stranger { .membership = Distributed::Membership::Outsider, .peerId = "stranger" };
+    Distributed::CallerContext const Stranger { .membership = Distributed::Membership::Outsider, .peerId = "stranger" };
 
     auto const reply = fixture.Ask(Ask(ClusterAction::Set, "upstream", "x"), Stranger);
     CHECK(StatusOf(reply) == Wire::Status::Error);

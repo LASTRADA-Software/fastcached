@@ -523,15 +523,33 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
   `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one
   member becomes a view. A `*View` type borrows and says so; anything else owns. It
-  has happened twice (`CapacityFields`, then `CompileResult`/`CodecEnvelope`). Which
-  shape to pick is per type: OWN when the result outlives the buffer in practice
+  has happened three times (`CapacityFields`, then `CompileResult`/`CodecEnvelope`,
+  then `CallerContext`). Which shape to pick is per type, and the test is a
+  CONJUNCTION: OWN when the result outlives the buffer in practice
   (`CompileResultFields`, held across statements by `Dispatch`), stay a named `*View`
-  when every consumer reads it in scope and something depends on not copying
+  when every consumer reads it in scope AND something depends on not copying
   (`CodecEnvelopeView`, whose `Identity` path must not gain a second copy of a
-  preprocessed TU). The encode side goes on borrowing its inputs either way. A
-  regression test for this needs a payload of REAL SIZE: at four bytes the freed
-  block reads back correctly and ASan reports nothing, so the sizes are load-bearing
-  and must say so.
+  preprocessed TU). One clause false is not a tie — `CallerContext` satisfied the
+  first and its measurement killed the second, so the rule selected OWN; the figures
+  are on the type in `SchedulerService.hpp` and are deliberately not repeated here.
+  The encode side goes on borrowing its inputs either way.
+- **What the borrowed field DECIDES outranks the arithmetic.** A wrong
+  `CapacityFields` is a wrong number; a wrong `CallerContext::peerId` is a membership
+  decision read from freed memory, because that field is the kernel's peer host and
+  admission is judged from it. Where the two mistakes are not commensurable — a trust
+  boundary against nanoseconds — own it and do not bother weighing the copy.
+- A regression test for the above needs a payload of REAL SIZE **and** the right
+  ARRANGEMENT, and #395 nearly went untested for want of the second. Read inline
+  (`Use(Make(x))`) nothing dangles at any size, because a by-value parameter lives to
+  the end of the full expression — so the obvious test passes under the bug. STORE
+  the value, drop the source, churn the freed storage, then read. Size then decides
+  WHICH check fires rather than whether one does: inside libstdc++'s 15-char SSO
+  buffer it is `stack-use-after-scope`, visible only with ASan's stack poisoning;
+  past it the buffer is heap and it is `heap-use-after-free`, caught with no options
+  at all. At four bytes the freed block reads back correctly and nothing reports
+  anything. Pick a size that is REAL rather than large — a 36-char IPv6 peer is what
+  `getpeername` returns on any v6 deployment — and `static_assert` it, so nobody
+  shortens it back into uselessness.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.

@@ -98,7 +98,37 @@ struct CallerContext
     /// It can legitimately be empty -- `FormatPeerAddress` answers that for a peer
     /// whose family is unknown or whose `getpeername` failed -- so anything reading
     /// it must decide what an unnameable caller means rather than assume a host.
-    std::string_view peerId {};
+    ///
+    /// **Owned, not a view, and this struct is deliberately not named `*View`**
+    /// ([#395](https://github.com/LASTRADA-Software/fastcached/issues/395)). It was a
+    /// `std::string_view` in a type whose name promised nothing, which is the third
+    /// instance of #366's rule after `CapacityFields` and
+    /// `CompileResult`/`CodecEnvelope`: **a `*View` type borrows and says so;
+    /// anything else owns.**
+    ///
+    /// The rule leaves the choice per type -- own when the result outlives the
+    /// buffer, stay a named view when every consumer reads it in scope AND something
+    /// depends on not copying. Both clauses have to hold to keep a view, and the
+    /// second does not. Measured against a real `Register` round trip, gcc-release,
+    /// three runs: one owned 36-character peer id costs **4.5-4.7 ns** against
+    /// **1.4-2.0 us**, which is **0.23-0.34%**. Nothing here depends on not copying.
+    ///
+    /// And the two mistakes are not commensurable. A wrong view is a **membership
+    /// decision read from freed memory** -- this field is the kernel's peer host and
+    /// the admission decision is made from it, so the failure mode is a trust
+    /// boundary evaluated against garbage. A wrong copy is four nanoseconds. That
+    /// asymmetry is why this is a different call from `CapacityFields`, which decided
+    /// nothing about who is admitted.
+    ///
+    /// The pre-auth path copies where it used to borrow, because `RefusePeer` is
+    /// handed a `std::string_view` and has no owned string to move from. It is not
+    /// usually an ALLOCATION: any IPv4 or loopback host fits libstdc++'s 15-character
+    /// SSO buffer, so the malloc arrives only for long hosts, which in practice means
+    /// IPv6. Either way it is **not** the class of thing #285 hardens against -- what
+    /// that change protects is buffering an attacker-*sized* payload before
+    /// admission, and a fixed-width copy of a peer host, behind a request that has
+    /// already cost a syscall, is not an amplifier.
+    std::string peerId {};
 };
 
 /// What the scheduler decided, in the vocabulary of the wire but not yet on it.

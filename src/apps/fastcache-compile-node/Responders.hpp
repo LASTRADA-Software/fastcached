@@ -18,7 +18,9 @@
 #include <cstdint>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <WorkerProtocol.hpp>
@@ -290,7 +292,7 @@ class SchedulerResponder final: public IFrameResponder
     /// allocation and no round trip is a legitimate thing to be.
     [[nodiscard]] Task<std::vector<std::byte>> Answer(std::span<std::byte const> frame, std::string peer) override
     {
-        co_return _protocol.Answer(frame, Context(peer));
+        co_return _protocol.Answer(frame, Context(std::move(peer)));
     }
 
     /// @copydoc IFrameResponder::RefusePeer
@@ -306,7 +308,7 @@ class SchedulerResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(std::string_view peer,
                                                                    std::uint8_t /*opRaw*/) const override
     {
-        return _protocol.RefusePeer(Context(peer));
+        return _protocol.RefusePeer(Context(std::string { peer }));
     }
 
     /// @copydoc IFrameResponder::AuthRequired
@@ -449,15 +451,31 @@ class SchedulerResponder final: public IFrameResponder
     /// One place the peer becomes a `CallerContext`, so the classification behind an
     /// early refusal is by construction the classification the verb would have got.
     ///
-    /// @param peer The caller's peer host. BORROWED: `CallerContext::peerId` is a
-    ///             `std::string_view`, so this must outlive the returned context --
-    ///             which is why the parameter is a view over the caller's storage
-    ///             rather than a `std::string` this function owns. Taking it by value
-    ///             compiles, moves, and returns a view into a parameter destroyed at
-    ///             the closing brace.
-    [[nodiscard]] Distributed::CallerContext Context(std::string_view peer) const
+    /// By value and moved, which is the shape #395 was filed about. It was never a
+    /// use-after-free on either production path -- the old view pointed into the
+    /// coroutine frame's own `std::string` here, and into `FrameEndpoint`'s
+    /// connection-lifetime peer at the refusal site, both of which outlived the
+    /// context. It was a hazard the TYPE invited and the next author would have
+    /// taken, which is what that ticket is about and why nothing shipped broken.
+    ///
+    /// `CallerContext::peerId` owns now, so there is no parameter for the returned
+    /// context to point into, and a caller already holding a `std::string` hands it
+    /// over rather than having it copied.
+    ///
+    /// `Classify` is called before the move for READABILITY, not for correctness:
+    /// `[dcl.init.list]/4` sequences a braced-init-list's clauses in written order,
+    /// so `{ .membership = Classify(peer), .peerId = std::move(peer) }` would have
+    /// been well-defined too. Verified on gcc and clang rather than reasoned about,
+    /// because an earlier draft of this comment asserted the opposite. Do not carry
+    /// "aggregate initialisers are unsequenced" anywhere else -- it is false, and
+    /// function ARGUMENTS, which are indeterminately sequenced, are the rule that
+    /// gets misremembered into it.
+    ///
+    /// @param peer The caller's peer host, taken over by the returned context.
+    [[nodiscard]] Distributed::CallerContext Context(std::string peer) const
     {
-        return Distributed::CallerContext { .membership = _membership.Classify(peer), .peerId = peer };
+        auto membership = _membership.Classify(peer);
+        return Distributed::CallerContext { .membership = membership, .peerId = std::move(peer) };
     }
 
     Distributed::SchedulerProtocol& _protocol;

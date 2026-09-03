@@ -927,6 +927,39 @@ Every rule below has already been a bug.
     that uses short literals is a test that cannot fail -- which is how it would be
     written by anybody tidying one up. The sizes in
     `CompileCacheWire_test.cpp` are load-bearing and say so.
+  - **It happened a THIRD time, and the per-type question is a CONJUNCTION.**
+    `Distributed::CallerContext::peerId` was a `std::string_view` in a type whose
+    name promised nothing
+    ([#395](https://github.com/LASTRADA-Software/fastcached/issues/395)). Ask both
+    halves -- does every consumer read it in scope, AND does something depend on this
+    not copying -- because one clause false is not a tie. This type satisfied the
+    first, and measuring the second killed it: the figures live on `CallerContext`
+    itself, in `SchedulerService.hpp`, and are not restated here so there is one row
+    to read and one place to correct.
+
+    **What the borrowed field DECIDES outranks that arithmetic**, and it is what
+    settled this one. A wrong `CapacityFields` is a wrong number. A wrong `peerId` is
+    a **membership decision read from freed memory** -- it is the kernel's peer host
+    and admission is judged from it -- so the two mistakes are not commensurable and
+    the nanoseconds do not get a vote. Where a borrowed field feeds a trust boundary,
+    own it and skip the benchmark.
+  - **A correctly-SIZED regression test in the wrong ARRANGEMENT still reports
+    nothing**, which is the half of the size rule above that #395 nearly died of. Its
+    ticket concluded the defect could not be tested at all, and the reason was
+    arrangement rather than impossibility:
+    - Constructed and read in ONE expression -- `Use(Make(x))` -- **nothing dangles
+      at any size**, because a by-value parameter lives to the end of the full
+      expression. That is how a test gets written, and it passes under the defect.
+    - STORE the value, drop the source, churn the freed storage, then read. Now the
+      size decides *which* check fires rather than whether one does: inside
+      libstdc++'s 15-character SSO buffer it is `stack-use-after-scope`, visible only
+      with ASan's stack poisoning, and past it the buffer is on the heap and it is
+      `heap-use-after-free`, caught with no ASan options at all.
+
+    So pick a size that is REAL rather than merely large, and `static_assert` it: the
+    36-character peer in `SchedulerService_test.cpp` is what `getpeername` returns on
+    any IPv6 deployment, which makes the case that exposes this the ORDINARY one --
+    the suite had simply only ever been run against v4 loopback.
   - **A deleted overload IS probeable, but only from a dependent context**, and
     getting this wrong is easy. `static_assert(!requires { Decode(Encode(x)) })`
     written at namespace scope with concrete types is a **hard error** on MSVC,
@@ -1061,17 +1094,3 @@ consequence rather than a precaution.
 
 ## Open work
 
-- [#395](https://github.com/LASTRADA-Software/fastcached/issues/395) —
-  `Distributed::CallerContext` borrows without saying so: its `peerId` is a
-  `std::string_view`, the type is not named `*View`, and it is built inline at its
-  call sites, so the lifetime obligation is invisible exactly where a caller has to
-  honour it. The third instance of the borrow rule above (after `CapacityFields` and
-  `CompileResult`/`CodecEnvelope`), found when #394 factored the two construction
-  sites into one helper and wrote it the obvious way — a by-value parameter moved
-  into the aggregate, which returns a view into a parameter destroyed at the closing
-  brace. Master is correct only because every author so far happened to hold a view
-  already. **It cannot be tested**: with the defect restored the whole node suite
-  passes under ASan with `detect_stack_use_after_return=1`, because the peer strings
-  fit the SSO buffer and nothing reuses that stack memory. Unobservable and real is
-  what the naming rule exists for, so the fix is the name or the ownership, not a
-  regression test.
