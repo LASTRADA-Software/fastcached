@@ -1302,6 +1302,27 @@ stops being one — the same confound that cost #493 a re-run.
     did exactly that, passed every unit test, and was caught only by reading
     `comp_dir` end to end. Removing the mapping fails both drivers naming DIFFERENT
     directories, which is the asymmetry itself.
+  - **A model of a driver that is MORE PERMISSIVE than the driver produces WRONG
+    AGREEMENT, which is worse than the disagreement it replaces.** This is the general
+    rule and the two below are its instances; both were arrived at independently while
+    fixing the same ticket, which is why it is written as a pattern rather than as two
+    fixes. A model that is too NARROW costs a miss — the mapping does not travel, the
+    object keeps an absolute path, and the two ends disagree visibly. A model that is
+    too WIDE tells a worker to apply a mapping the local compile did not, so both
+    objects are confidently mapped, to different things, under one key. The asymmetry
+    is the whole point: err narrow.
+      - Matching the rule's root against the working directory by FILESYSTEM IDENTITY
+        (canonicalize both, compare) rather than by the byte prefix the driver
+        implements. Measured: `-fdebug-prefix-map=/tmp/l506f/build=.` against a cwd
+        reached as `/tmp/l506f-link/build` leaves `DW_AT_comp_dir` UNMAPPED, so
+        identity-matching would have mapped where the driver does not.
+      - Deciding whether `PWD` is usable with `std::filesystem::path::is_absolute()`
+        rather than a leading `/`. Same test on POSIX, strictly wider on a Windows
+        layout, where it admits `D:/work` and `\\host\share` and NEITHER Windows
+        driver consults `PWD` for either — libiberty's `getpwd()` gates on `*p == '/'`,
+        and LLVM does the `PWD` dance only in `Unix/Path.inc`. A MinGW client would
+        have predicted a spelling its own compiler never uses. Read, not measured: no
+        Windows GNU-layout driver was available, and the table below is Linux.
   - **And that directory is `$PWD`, not `getcwd(3)`** — asked through
     `CompilerWorkingDirectory`, on both sides. Both drivers report `DW_AT_comp_dir`, and
     byte-compare every `<from>` against, the `PWD` variable when it is ABSOLUTE and names

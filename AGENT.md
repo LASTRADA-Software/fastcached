@@ -227,7 +227,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     two spellings, each with its own source or the second replays the first's object.
     A dispatched object showing the CLIENT's directory is gcc's `-fworking-directory`
     residue, NOT proof it came from no worker — one fault, two residues, which is the
-    second independent reason one candidate was never enough.
+    second independent reason one candidate was never enough. **And a model of a driver
+    that is MORE PERMISSIVE than the driver produces WRONG AGREEMENT** — two objects
+    confidently mapped to different things under one key — which is worse than the
+    visible disagreement it replaces, so err NARROW. Both wide models turned up while
+    fixing this one ticket: matching by filesystem identity rather than the byte prefix,
+    and `path::is_absolute()` rather than a leading `/`.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
