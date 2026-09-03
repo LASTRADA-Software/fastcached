@@ -2079,7 +2079,7 @@ above, which had already been found in exactly that state.
 **And "a missing `python3`" means one that does not RUN, which is not what the obvious
 lookup asks** (#568). `find_program(NAMES python3)` returns the first name match on PATH
 and never executes it; `find_package(Python3 COMPONENTS Interpreter)` validates by running
-it. Measured, one tree, one configure: `find_program` selected a **0-byte** Windows App
+it. Measured on Windows with CMake 4.3.1, one tree, one configure: `find_program` selected a **0-byte** Windows App
 Execution Alias — a reparse point Windows puts on PATH that refuses to execute when no
 Store package backs it — while `find_package` produced a real **171744-byte** interpreter.
 **Attach the right mechanism to that second half**, because the obvious reading of it is
