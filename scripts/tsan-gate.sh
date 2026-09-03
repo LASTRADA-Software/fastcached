@@ -102,7 +102,7 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # the gate keeps its own `fatal`, which annotates for GitHub Actions where the
 # library's `fail` does not.
 # shellcheck source=lib/e2e-common.sh
-source "${REPO_ROOT}/scripts/lib/e2e-common.sh"
+. "${REPO_ROOT}/scripts/lib/e2e-common.sh"
 
 # The scope. One row per binary: the executable, and the Catch2 tag expression it
 # is run with (empty means the whole binary). Adding a concurrency-bearing target
@@ -174,6 +174,13 @@ export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressio
 # into a file rather than a pipe, so a surviving writer cannot block the read
 # that follows it.
 TargetTimeoutSeconds="${FASTCACHE_TSAN_TIMEOUT:-900}"
+
+# The canary's own bound, which is much tighter because the canary is a few
+# milliseconds of deliberate race and nothing else -- there is no suite behind it
+# that could legitimately grow. Named rather than written into the call, so the
+# refusal can quote the bound it actually enforced and so `--self-test` can drive
+# the expiry without waiting a minute for it.
+CanaryTimeoutSeconds=60
 
 # Annotate only where a workflow will render it. Every other script in this repo
 # prints a plain prefixed failure (`cluster-e2e.sh`, `compile-cache-e2e.sh`,
@@ -383,7 +390,7 @@ AssertCanaryFires() {
     # write here. Its outcome is per RUN and must be read before anything else
     # bounds anything, which is why it is taken on the next line rather than
     # where it is used.
-    canary_out="$(run_bounded 60 "$path")" || canary_rc=$?
+    canary_out="$(run_bounded "$CanaryTimeoutSeconds" "$path")" || canary_rc=$?
     outcome="$(e2e_bound_outcome)"
 
     # Both bound outcomes are refused BEFORE the race is looked for, and that
@@ -393,7 +400,7 @@ AssertCanaryFires() {
     # evidence that nothing here can be concluded, and this gate exists to refuse
     # exactly that substitution.
     if [[ "$outcome" == "exceeded" ]]; then
-        fatal "tsan-canary did not finish within 60s and was killed, so whether the
+        fatal "tsan-canary did not finish within ${CanaryTimeoutSeconds}s and was killed, so whether the
     sanitizer reports is UNKNOWN -- which this gate refuses rather than reads as
     either answer. The canary races on its own global and exits; a hang is the
     runtime or the machine, not the race. Output so far:
@@ -709,36 +716,62 @@ STUB
     # set beside the cases above, on every platform CI builds.
     #
     # @param 1 case name
-    # @param 2 the bound, in seconds
-    # @param 3 how to stage the target: `runnable` or `absent`
-    # @param 4 the shell a `runnable` target runs
-    # @param 5.. text the output must contain; a leading `!` means must NOT
+    # @param 2 which caller to drive: `target` or `canary`
+    # @param 3 the bound, in seconds
+    # @param 4 how to stage the artefact: `runnable` or `absent`
+    # @param 5 the shell a `runnable` artefact runs
+    # @param 6.. text the output must contain; a leading `!` means must NOT
     BoundCase() {
-        local name="$1" seconds="$2" staging="$3" body="$4"; shift 4
-        local out rc=0 target="staged-target"
+        local name="$1" driver="$2" seconds="$3" staging="$4" body="$5"; shift 5
+        local out rc=0 artefact
+        # One switch, two columns: which artefact the driver reaches for, and how
+        # it is called. `AssertCanaryFires` names `tsan-canary` itself while
+        # `RunTarget` is handed a name, so staging follows the driver rather than
+        # the case -- and asking that twice is how the two would drift apart.
+        local invoke=()
+        case "$driver" in
+            canary) artefact="tsan-canary";   invoke=(AssertCanaryFires) ;;
+            target) artefact="staged-target"; invoke=(RunTarget "staged-target" "") ;;
+            *)      echo "  FAIL ${name}: unknown driver '${driver}'" >&2
+                    failures=$(( failures + 1 )); return ;;
+        esac
+
         BUILD_DIR="${scratch}/bound-${name}"
         mkdir -p "${BUILD_DIR}/target"
         if [[ "$staging" == "runnable" ]]; then
-            printf '%s\n' '#!/bin/sh' "$body" > "${BUILD_DIR}/target/${target}"
-            chmod +x "${BUILD_DIR}/target/${target}"
+            printf '%s\n' '#!/bin/sh' "$body" > "${BUILD_DIR}/target/${artefact}"
+            chmod +x "${BUILD_DIR}/target/${artefact}"
         fi
         TargetTimeoutSeconds="$seconds"
-        out="$(RunTarget "$target" "" 2>&1)" || rc=$?
+        CanaryTimeoutSeconds="$seconds"
+        out="$("${invoke[@]}" 2>&1)" || rc=$?
         Expect "$name" 1 "$rc" "$out" "$@"
     }
 
     echo
-    echo "== RunTarget, against a staged bound"
+    echo "== the bound's outcomes, against staged artefacts"
 
-    BoundCase "bound-124-is-not-a-timeout" 30 runnable 'exit 124' \
+    BoundCase "bound-124-is-not-a-timeout" target 30 runnable 'exit 124' \
         "failed (exit 124) without a ThreadSanitizer report" \
         "!did not finish within"
 
-    # A real wait, and the only one in this fixture: a bound proven by a stub that
+    # Real waits, and the only ones in this fixture: a bound proven by a stub that
     # reports "expired" is a bound nobody has watched expire. One second plus
-    # `run_bounded`'s two-second TERM grace, well inside the 60s ctest budget.
-    BoundCase "bound-expiry-is-refused-by-name" 1 runnable 'sleep 30' \
+    # `run_bounded`'s two-second TERM grace each, well inside the 60s ctest budget.
+    BoundCase "bound-expiry-is-refused-by-name" target 1 runnable 'sleep 30' \
         "did not finish within 1s and was killed"
+
+    # THE CANARY'S EXPIRY, which is a hole this change closes rather than a
+    # branch it merely adds. `AssertCanaryFires` decides "the sanitizer is live"
+    # from a non-zero status plus the words `data race` in the output -- and a
+    # canary that reports its race and THEN hangs satisfies both. It would have
+    # licensed the entire suite on the strength of a run nobody could conclude
+    # anything from. So the staged canary here does exactly that, and the bound
+    # outcome has to be read BEFORE the grep for the refusal to happen at all.
+    BoundCase "canary-expiry-outranks-a-reported-race" canary 1 runnable \
+        'echo "WARNING: ThreadSanitizer: data race"; sleep 30' \
+        "did not finish within 1s and was killed" \
+        "!the sanitizer is live"
 
     # The third bound outcome, which is neither a slow start nor a clean run.
     #
@@ -752,8 +785,12 @@ STUB
     # `AssertInstrumented` has found it and read its objects before `RunTarget`
     # runs -- so the refusal keeps saying so, and this case exercises the branch
     # rather than that sentence.
-    BoundCase "bound-unstartable-is-refused-by-name" 30 absent '' \
+    BoundCase "bound-unstartable-is-refused-by-name" target 30 absent '' \
         "could not be executed, so this target tested NOTHING"
+
+    BoundCase "canary-unstartable-is-refused-by-name" canary 30 absent '' \
+        "could not be executed, so nothing proves the" \
+        "!the sanitizer is live"
 
     rm -rf "$scratch"
     echo
