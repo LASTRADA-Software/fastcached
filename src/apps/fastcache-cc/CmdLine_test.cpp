@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CmdLine.hpp"
 
+#include <FastCache/Platform/EnvironmentTestUtils.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <expected>
+#include <filesystem>
 #include <iterator>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache::Cc;
@@ -1142,4 +1146,322 @@ TEST_CASE("A module interface unit is never dispatched, whatever the driver")
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().contains("BMI"));
     }
+}
+
+// --- MappedCompileDirectory --------------------------------------------------
+
+TEST_CASE("MappedCompileDirectory answers nothing when the build maps nothing")
+{
+    // The load-bearing case, and the whole argument against the worker choosing a
+    // token of its own: a build that asked for no mapping must get back an object
+    // recording no invented directory. Nothing here is what carries that to the
+    // worker (#506).
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-o", "a.o", "-O2", "-g" };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory answers nothing when no rule reaches this directory")
+{
+    // A rule mapping the SOURCE tree says nothing about a working directory outside
+    // it. Reporting its replacement anyway would have the worker record a directory
+    // this compile never records.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/src=../.." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory reads the build-tree rule this project emits")
+{
+    // The shape `_fc_debug_prefix_map_rules` produces: source rule first, build-tree
+    // rule last, the working directory being the build tree. Measured on gcc 14 and
+    // clang 20, such a compile records `.` as its `DW_AT_comp_dir`.
+    std::vector<std::string> const argv {
+        "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/src=../../..", "-fdebug-prefix-map=/home/ci/out/build/x=."
+    };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/out/build/x");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).replacement == ".");
+    // The directory travels beside it, because a worker needs both halves of a rule.
+    CHECK(Unwrap(mapped).directory == "/home/ci/out/build/x");
+}
+
+TEST_CASE("MappedCompileDirectory follows the LAST matching rule, not the first")
+{
+    // Both drivers honour the last match -- measured, two rules over one directory
+    // giving the second replacement. Not a detail: `_fc_debug_prefix_map_rules` emits
+    // the source rule first and the build-tree rule last SO THAT the build tree wins,
+    // so a first-match model would predict the source rule's replacement for every
+    // build this project does.
+    std::vector<std::string> const argv {
+        "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci=A", "-fdebug-prefix-map=/home/ci=B"
+    };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).replacement == "B");
+}
+
+TEST_CASE("MappedCompileDirectory keeps the tail below a mapped root")
+{
+    // A recursive make runs the compiler in a subdirectory of the build tree, so the
+    // rule matches a PREFIX and the remainder survives. Measured: `/root=.` with a
+    // working directory of `/root/sub/deeper` gives `./sub/deeper` on both drivers.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build=." };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build/sub/deeper");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).replacement == "./sub/deeper");
+    CHECK(Unwrap(mapped).directory == "/home/ci/build/sub/deeper");
+}
+
+TEST_CASE("MappedCompileDirectory matches a BYTE prefix, as the drivers do")
+{
+    // Not a path prefix. Measured on gcc 14 and clang 20:
+    // `-fdebug-prefix-map=/tmp/work=X` against a working directory of `/tmp/worker`
+    // yields `Xer`. Modelling it as a component-boundary match would read better and
+    // would make this client predict a replacement neither compiler writes, which is
+    // exactly the disagreement the field exists to end.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/tmp/work=X" };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/tmp/worker");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).replacement == "Xer");
+}
+
+TEST_CASE("MappedCompileDirectory splits a rule where GCC splits it")
+{
+    // The launcher follows gcc, which cuts `<from>=<to>` at the LAST separator, so a
+    // mapped root containing one still isolates the whole root. `MatchPathValueFlag`
+    // owns that rule; this asserts it is the rule reaching the replacement too.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/a=b/build=." };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/a=b/build");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).replacement == ".");
+}
+
+TEST_CASE("MappedCompileDirectory reports a rule that maps a root to nothing")
+{
+    // `-fdebug-prefix-map=<builddir>=` is a standard reproducible-build spelling and it
+    // IS a mapping: the local object records an empty compilation directory. So the
+    // directory travels with an empty replacement, and the worker must treat that as a
+    // mapping rather than as half a pair -- refusing it there cost such a build
+    // distribution entirely.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build=" };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).directory == "/home/ci/build");
+    CHECK(Unwrap(mapped).replacement.empty());
+}
+
+TEST_CASE("MappedCompileDirectory ignores a rule with no replacement")
+{
+    // `-fdebug-prefix-map=/abs` is malformed and the driver says so; it maps nothing,
+    // so it must not read as a mapping to the empty string -- which would travel as
+    // "this client maps nothing" and be indistinguishable from a build with no rule at
+    // all, while meaning something different.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build" };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory reads no rule on an MSVC line")
+{
+    // `/` introduces an option under a Windows layout, and the prefix-map row is
+    // GNU-only because neither COFF driver honours such a flag. A line carrying the
+    // spelling anyway must not make this client promise a mapping its own compiler
+    // will not perform.
+    std::vector<std::string> const argv { "cl.exe", "/c", "a.cpp", "-fdebug-prefix-map=C:/ci/build=." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Msvc, "C:/ci/build").has_value());
+}
+
+// --- CompilerWorkingDirectory ------------------------------------------------
+
+TEST_CASE("CompilerWorkingDirectory falls back to the resolved directory in every unusable case")
+{
+    // Each row was measured against gcc 14 and clang 20 -- see the table on the
+    // declaration -- and each one is a spelling the driver ignored, leaving
+    // `DW_AT_comp_dir` at getcwd(3)'s answer. A test that only covered the symlink case
+    // would let this function trust any `PWD` at all, which is the shape that puts a
+    // directory nothing is in on the wire.
+    //
+    // **Every row here must reach the guard it names.** Two of them did not: written
+    // against a `/tmp/real/build` that does not exist on the test host, they fell back
+    // through `equivalent`'s ERROR path whichever guard was deleted, so the relative-PWD
+    // rule and the empty-directory rule were both asserted by rows that could not fail.
+    // The directories are real now, and the two rows that turn on a guard are separated
+    // out below.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-cwdfallback" };
+    auto const& base = scratch.Path();
+    std::filesystem::create_directories(base / "build");
+    std::filesystem::create_directories(base / "other");
+    auto const physical = (base / "build").string();
+
+    CHECK(CompilerWorkingDirectory(physical, "") == physical);
+    CHECK(CompilerWorkingDirectory(physical, "/nonexistent/xyz") == physical);
+
+    // A real, absolute directory that is simply not this one. `equivalent` succeeds and
+    // answers false, so this is the only row that exercises the identity test itself.
+    CHECK(CompilerWorkingDirectory(physical, (base / "other").string()) == physical);
+
+    std::filesystem::remove_all(base);
+}
+
+TEST_CASE("CompilerWorkingDirectory consults PWD only for a POSIX-rooted spelling")
+{
+    // The guard, asserted with no filesystem and no symlink privilege, because the
+    // symlink cases above cannot run everywhere and this rule holds everywhere.
+    //
+    // `path::is_absolute()` is the same test on POSIX and strictly MORE permissive on a
+    // Windows layout: it admits `D:/work` and `\\host\share`, for neither of which does
+    // any Windows driver read `PWD`. Predicting from one would send a worker a mapping
+    // the local compile never applied -- #506's asymmetry, rebuilt by its own fix. Rows
+    // that cannot exist on the running platform are still meaningful: the question is
+    // what the SPELLING is, and these strings carry it.
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "D:/other/build") == "/tmp/real/build");
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "//host/share/build") == "/tmp/real/build");
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "C:build") == "/tmp/real/build");
+}
+
+TEST_CASE("CompilerWorkingDirectory refuses a relative PWD that names this very directory")
+{
+    // The row this replaces could not fail. `equivalent` resolves a RELATIVE path
+    // against the calling process's own working directory, so the input that reaches
+    // the rooted-path guard has to be relative AND name the same directory as
+    // `physicalDirectory` -- which means this process's cwd, and nothing else.
+    //
+    // Without the guard, `equivalent(".", cwd)` is true and the function returns `"."`
+    // as a compilation directory. That is not merely wrong, it is the one answer that
+    // would be accepted by the byte-prefix test downstream against a relative rule and
+    // then sent to a worker. Measured, both drivers ignore a relative `PWD`.
+    std::error_code ec;
+    auto const cwd = std::filesystem::current_path(ec);
+    REQUIRE_FALSE(ec);
+
+    CHECK(CompilerWorkingDirectory(cwd.string(), ".") == cwd.string());
+    CHECK(CompilerWorkingDirectory(cwd.string(), "") == cwd.string());
+}
+
+TEST_CASE("CompilerWorkingDirectory has no answer without a physical directory")
+{
+    // Also a guard that a `/tmp/real/build` row could not reach: with the empty-physical
+    // half deleted, `equivalent(pwd, "")` errors and the fallback returns `""` anyway,
+    // so the assertion held either way. An EXISTING `PWD` is what separates them --
+    // the guard must fire before the identity test can succeed against nothing.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-cwdempty" };
+    auto const& base = scratch.Path();
+    std::filesystem::create_directories(base);
+
+    CHECK(CompilerWorkingDirectory("", base.string()).empty());
+
+    std::filesystem::remove_all(base);
+}
+
+TEST_CASE("CompilerWorkingDirectory reads PWD from the environment through its one-argument form")
+{
+    // The overload BOTH call sites use, and it had no test: every other case drives the
+    // two-argument form. Its two parameters are `std::string_view`, so a swapped pair or
+    // the wrong variable name in the wrapper is type-checked, silent, and would leave
+    // the launcher predicting a directory from nothing.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-cwdenv" };
+    auto const& base = scratch.Path();
+    std::filesystem::create_directories(base / "real" / "build");
+
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(base / "real", base / "link", ec);
+    if (ec)
+    {
+        std::filesystem::remove_all(base);
+        SKIP("symlinks unavailable on this host, so PWD cannot be made to differ from the resolved path");
+    }
+
+    auto const physical = (base / "real" / "build").string();
+    auto const logical = (base / "link" / "build").string();
+
+    {
+        FastCache::Testing::ScopedEnv const pwd { "PWD", logical };
+#if defined(_WIN32)
+        // A Windows layout spells this `C:\...`, which carries a root NAME, and no
+        // Windows driver consults `PWD` -- libiberty's `getpwd()` gates on a leading
+        // `/` and LLVM does the `PWD` dance only in `Unix/Path.inc`. So the honest
+        // expectation here is the RESOLVED directory, and asserting it is what stops
+        // the guard being loosened to `is_absolute()` by someone reading only the
+        // POSIX case.
+        CHECK(CompilerWorkingDirectory(physical) == physical);
+#else
+        CHECK(CompilerWorkingDirectory(physical) == logical);
+#endif
+    }
+    {
+        // And a `PWD` naming somewhere else is ignored on every platform, so the
+        // wrapper cannot be passing the variable through unread.
+        FastCache::Testing::ScopedEnv const pwd { "PWD", (base / "real").string() };
+        CHECK(CompilerWorkingDirectory(physical) == physical);
+    }
+
+    std::filesystem::remove_all(base);
+}
+
+TEST_CASE("CompilerWorkingDirectory keeps the symlinked spelling a driver reports")
+{
+    // #506's macOS failure, in one call. `current_path()` is getcwd(3) and resolves
+    // every link, while both drivers report and prefix-match `$PWD` when it names the
+    // same directory -- so on a build reached through a link the rule on the line
+    // spells the link, the resolved cwd does not match it, and the client concludes
+    // that a build which maps perfectly well maps nothing. It then sends no mapping and
+    // the dispatched object keeps the WORKER's directory while the local one is `.`.
+    //
+    // The same arrangement as `AnchorWorkingDirectory`'s test, and for the same reason:
+    // macOS's `/var` is a symlink, so `$TMPDIR` is where CI meets this.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-logicalcwd" };
+    auto const& base = scratch.Path();
+    std::filesystem::create_directories(base / "real" / "build");
+
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(base / "real", base / "link", ec);
+    if (ec)
+    {
+        // Symlinks need a privilege or developer mode on Windows. The rule is
+        // unconditional; only this way of demonstrating it is not -- so this is SKIPPED
+        // and not a pass. `SUCCEED` here would report green for the one property the
+        // change exists to establish, on every host that cannot make a link.
+        // `catch_discover_tests` carries `SKIP_RETURN_CODE 4`, so ctest scores it as a
+        // skip rather than as a failure.
+        std::filesystem::remove_all(base);
+        SKIP("symlinks unavailable on this host");
+    }
+
+    auto const physical = (base / "real" / "build").string();
+    auto const logical = (base / "link" / "build").string();
+    REQUIRE(physical != logical);
+
+    // The whole point: a different spelling of the same directory is KEPT -- on a
+    // POSIX layout. A Windows one carries a root name, no Windows driver reads `PWD`,
+    // and the resolved directory is then the right answer; see the one-argument case
+    // above for why that is a rule rather than a limitation.
+#if defined(_WIN32)
+    CHECK(CompilerWorkingDirectory(physical, logical) == physical);
+#else
+    CHECK(CompilerWorkingDirectory(physical, logical) == logical);
+#endif
+
+    // A real directory that is not this one is not kept -- the driver checks identity
+    // rather than existence, and `equivalent` is that check.
+    std::filesystem::create_directories(base / "real" / "decoy");
+    CHECK(CompilerWorkingDirectory(physical, (base / "real" / "decoy").string()) == physical);
+
+    // And end to end through the consumer, which is where the bug actually bit: the
+    // build's rule names the directory the way the shell reached it, so the resolved
+    // spelling matches nothing and the pair never travels. This half is POSIX-only
+    // because the mechanism is -- see above -- and a Windows `-fdebug-prefix-map` is
+    // a GNU-layout driver on a host whose drivers do not read `PWD`.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-g", "-fdebug-prefix-map=" + logical + "=." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, physical).has_value());
+
+#if !defined(_WIN32)
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, CompilerWorkingDirectory(physical, logical));
+    REQUIRE(mapped.has_value());
+    // `Unwrap`, not `mapped->`: the pinned clang-tidy reports a bare `operator->` as
+    // `bugprone-unchecked-optional-access` whatever the `REQUIRE` one line above
+    // established, and neither MSVC nor GCC says a word about it.
+    auto const& pair = FastCache::Testing::Unwrap(mapped);
+    CHECK(pair.directory == logical);
+    CHECK(pair.replacement == ".");
+#endif
+
+    std::filesystem::remove_all(base);
 }

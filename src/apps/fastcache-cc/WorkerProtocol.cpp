@@ -353,18 +353,25 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     _metrics.Increment(IMetricsSink::Counter::WorkerJobsStarted);
     auto const startedAt = std::chrono::steady_clock::now();
 
-    auto const outcome = _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
-                                                .args = DecodeArgs(fields->args),
-                                                // NOT `auto const source` above, for the reason
-                                                // `CodecEnvelope` records: `*std::move(x)` on a
-                                                // `const expected` is a `T const&&`, which binds
-                                                // to the COPY constructor with no diagnostic.
-                                                .preprocessed = *std::move(source),
-                                                // Sanitized where it becomes a path, not here: the
-                                                // runner is what creates the file, so the check
-                                                // belongs beside the creation rather than at each
-                                                // caller that might forget it.
-                                                .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
+    auto const outcome =
+        _jobs.Run(CompileJob { .fingerprint = std::string { fingerprint },
+                               .args = DecodeArgs(fields->args),
+                               // NOT `auto const source` above, for the reason
+                               // `CodecEnvelope` records: `*std::move(x)` on a
+                               // `const expected` is a `T const&&`, which binds
+                               // to the COPY constructor with no diagnostic.
+                               .preprocessed = *std::move(source),
+                               // Sanitized where it becomes a path, not here: the
+                               // runner is what creates the file, so the check
+                               // belongs beside the creation rather than at each
+                               // caller that might forget it.
+                               .sourceName = std::string { Wire::AsStringView(fields->sourceName) },
+                               // Validated where it becomes a command-line argument, for the
+                               // same reason `sourceName` is sanitized where it becomes a path:
+                               // the runner is what spells it, so the check belongs beside the
+                               // spelling rather than at each caller that might forget it.
+                               .compileDir = std::string { Wire::AsStringView(fields->compileDir) },
+                               .compileDirReplacement = std::string { Wire::AsStringView(fields->compileDirReplacement) } });
     if (!outcome.has_value())
     {
         // The refusal's detail rides the reply message, so a client's local fallback

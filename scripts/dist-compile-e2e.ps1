@@ -1196,6 +1196,24 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         }
         Write-Host "   the fleet compiled it with the cache unreachable, and said so"
 
+        # --- no compilation-directory case here, and that is a DECISION ------
+        #
+        # The POSIX fixture's case 13 asserts that a dispatched object and a local
+        # one record the same `DW_AT_comp_dir` (#506). There is deliberately no
+        # counterpart on this platform, and the omission is written down rather
+        # than left as an absence: absent and skipped are different states, and an
+        # unexplained gap is how somebody comes to add a case that cannot pass.
+        #
+        # Neither COFF driver has a path-map switch that reaches the records in
+        # question. `cl` has none at all, and `-ffile-prefix-map` does not remap
+        # clang-cl's CodeView `S_OBJNAME` or the `-cc1` line it embeds -- measured
+        # under #203, where an object built with it still differed cross-root by
+        # the same 23 bytes. So `WorkerPrefixMapRule` refuses an MSVC-family worker
+        # outright rather than pretending, and there is no value for a case here to
+        # assert. `.agent/rules/compile-cache.md` records that residue as an
+        # accepted cost of cross-checkout sharing on this platform.
+        Write-Host "== no case 13 here: neither COFF driver has a path-map switch (see #203, #506)"
+
         Stop-Spawned
     }
 

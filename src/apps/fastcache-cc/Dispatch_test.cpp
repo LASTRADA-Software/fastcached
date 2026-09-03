@@ -243,7 +243,12 @@ struct ReplyFields
 /// @return The correlation an honest worker puts on its reply.
 [[nodiscard]] std::string HonestCorrelation(DispatchRequest const& request)
 {
-    return CompileCorrelation(request.preprocessed, request.args, request.fingerprint, SentSourceName(request.sourceName));
+    return CompileCorrelation(CorrelatedCompile { .preprocessed = request.preprocessed,
+                                                  .args = request.args,
+                                                  .fingerprint = request.fingerprint,
+                                                  .sourceName = SentSourceName(request.sourceName),
+                                                  .compileDir = request.compileDir,
+                                                  .compileDirReplacement = request.compileDirReplacement });
 }
 
 /// The reply an HONEST worker sends back for `request`.
@@ -312,7 +317,9 @@ struct ReplyFields
                              .objectKey = "objkey",
                              .args = args,
                              .preprocessed = "int main() { return 0; }",
-                             .sourceName = "a.cpp" };
+                             .sourceName = "a.cpp",
+                             .compileDir = {},
+                             .compileDirReplacement = {} };
 }
 
 } // namespace
@@ -707,6 +714,53 @@ TEST_CASE("The worker is told what to call its scratch file, and not where it ca
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
     CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "Widget.cpp");
+}
+
+TEST_CASE("The worker is told what this compile records as its compilation directory", "[dispatch]")
+{
+    // The client cannot send a RULE -- its left-hand side would have to be a path on
+    // the worker -- so it sends the replacement its own mapping produces and the worker
+    // supplies its own left-hand side. Without this field a dispatched object records
+    // the worker's directory under the key a locally mapped one uses (#506).
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.compileDir = "/home/ci/build";
+    request.compileDirReplacement = "./sub";
+    fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
+
+    REQUIRE(Dispatch(fleet, request).Ran());
+
+    auto const& toWorker = fleet.SentTo(std::string { Worker });
+    auto const compile =
+        Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
+    REQUIRE(compile.has_value());
+    CHECK(Wire::AsStringView(Unwrap(compile).compileDir) == "/home/ci/build");
+    CHECK(Wire::AsStringView(Unwrap(compile).compileDirReplacement) == "./sub");
+}
+
+TEST_CASE("A reply about a compile mapped somewhere else is refused", "[dispatch][correlation]")
+{
+    // The compilation-directory replacement satisfies the correlation's own rule --
+    // the client knows it before sending, and the runner observes it, because it
+    // becomes an argument on the line that is spawned -- so two jobs differing only in
+    // it are two jobs with different correct objects. Uncovered, a crossed reply here
+    // is an object with the wrong `DW_AT_comp_dir` under a correct key, which is #506
+    // reappearing underneath its own fix.
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, GrantReply());
+    std::vector<std::string> const args { "-O2" };
+    auto request = Request(args);
+    request.compileDir = "/home/ci/build";
+    request.compileDirReplacement = ".";
+
+    auto elsewhere = request;
+    elsewhere.compileDirReplacement = "./other";
+    fleet.Serve(std::string { Worker }, CompileReply(elsewhere, "OBJ"));
+
+    auto const outcome = Dispatch(fleet, request);
+    CHECK(outcome.status == DispatchStatus::Mismatched);
 }
 
 TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dispatch]")

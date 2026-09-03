@@ -137,7 +137,9 @@ struct Fixture
                                                       .args = {},
                                                       .source = enveloped,
                                                       .acceptedCodecs = { Wire::IdentityCodec },
-                                                      .sourceName = "a.cpp" });
+                                                      .sourceName = "a.cpp",
+                                                      .compileDir = {},
+                                                      .compileDirReplacement = {} });
 }
 
 /// The status a reply frame carries.
@@ -397,7 +399,9 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
                                                                   .args = {},
                                                                   .source = enveloped,
                                                                   .acceptedCodecs = { Wire::IdentityCodec },
-                                                                  .sourceName = "a.cpp" });
+                                                                  .sourceName = "a.cpp",
+                                                                  .compileDir = {},
+                                                                  .compileDirReplacement = {} });
 
     // A compile already in flight, spelled as the reservation one would be holding.
     auto const held = capacity.TryTakeBytes(Held);

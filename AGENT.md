@@ -197,8 +197,41 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
     with a SPACE is not mapped at all, the rules being spliced into a space-separated
     flags string. `ctest -R debug-prefix-map-rules`.
-  - A DISPATCHED compile is not covered ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)):
-    `RemoteCompileArgs` drops every path-valued flag.
+  - A DISPATCHED compile carries the client's DIRECTORY and its REPLACEMENT, never the
+    rule — a rule's left-hand side is a path on the WORKER, so `RemoteCompileArgs` goes
+    on dropping the flag and `CompileRequest::compileDir`/`compileDirReplacement` travel
+    instead. The worker maps BOTH candidates: gcc's `-fworking-directory` is implicit
+    under `-g` and puts the CLIENT's directory in the preprocessed text, which the
+    compile adopts, while clang leaves the WORKER's showing — so mapping only its own
+    fixes clang and leaves gcc recording an unmapped path, which no object comparison
+    can see. And it is the node's WORKING directory, not the scratch directory #506
+    named. Empty means map nothing (a build that asked for nothing must not get a
+    directory neither machine has) and the DIRECTORY is what says so, never the
+    replacement — an empty replacement is a real reproducible-build spelling. It cannot
+    ride in `args` (which refuse a path separator, and `:` is a path character), and a
+    worker that cannot spell the rules REFUSES. **A prefix-map rule appends the
+    unmatched tail**, so the worker's own rule is DROPPED when its directory contains
+    the client's: `/` is the shipped unit's working directory and `/=.` rewrites every
+    absolute path in the object — measured, a `comp_dir` of `.tmp/…/client` and system
+    headers reading `.usr/include/...`, worse than the bug. Read `comp_dir`, never
+    compare objects. **And the directory each end predicts from is `$PWD`, not
+    `getcwd(3)`** — `CompilerWorkingDirectory`, on both sides. Both drivers record, and
+    byte-compare `<from>` against, `PWD` when it is absolute and names the SAME directory
+    as `.` (a `stat` test, so `equivalent`), falling back to `getcwd(3)` for unset, a
+    different real directory, a nonexistent path or a relative one. `current_path()` IS
+    `getcwd(3)`, so the first fix matched nothing on any build reached through a symlink,
+    sent no pair, and left the dispatched object unmapped — the ticket surviving its own
+    fix, every counter normal, green on Linux because `/tmp` is not a link while macOS's
+    `$TMPDIR` sits under one. Case 13 runs at
+    two spellings, each with its own source or the second replays the first's object.
+    A dispatched object showing the CLIENT's directory is gcc's `-fworking-directory`
+    residue, NOT proof it came from no worker — one fault, two residues, which is the
+    second independent reason one candidate was never enough. **And a model of a driver
+    that is MORE PERMISSIVE than the driver produces WRONG AGREEMENT** — two objects
+    confidently mapped to different things under one key — which is worse than the
+    visible disagreement it replaces, so err NARROW. Both wide models turned up while
+    fixing this one ticket: matching by filesystem identity rather than the byte prefix,
+    and `path::is_absolute()` rather than a leading `/`.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

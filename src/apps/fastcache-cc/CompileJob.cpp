@@ -608,6 +608,7 @@ namespace
         // The shape rule, composed inside the prefix rather than deleted with it.
         return !body.contains('/') && !body.contains('\\');
     }
+
 } // namespace
 
 JobError JobError::RejectedArgumentNaming(std::string_view argument)
@@ -706,6 +707,160 @@ std::string SafeSourceName(std::string_view sourceName)
     if (!IsSafeStem(stem))
         return std::string { DefaultStem } + std::string { safeExtension };
     return std::string { stem } + std::string { safeExtension };
+}
+
+std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::string_view workerDirectory,
+                                                                       std::string_view clientDirectory,
+                                                                       std::string_view replacement,
+                                                                       DriverFamily family)
+{
+    // No directory is the client saying it maps nothing, and it is the ONE case that
+    // must not become a refusal or a worker-chosen default: a worker that mapped anyway
+    // would hand a build that asked for nothing an object naming a directory neither
+    // machine has. No rules, and no error.
+    //
+    // An empty REPLACEMENT is not that case. `-fdebug-prefix-map=<builddir>=` maps a
+    // root to nothing and is a standard reproducible-build spelling, so the directory
+    // alone is what says whether a mapping is in force. The reverse -- a replacement
+    // with no directory -- is genuinely half a rule and is refused: it would map
+    // everything.
+    if (clientDirectory.empty() && replacement.empty())
+        return std::vector<std::string> {};
+    if (clientDirectory.empty())
+        return std::unexpected(JobError { .reason = JobRefusal::RejectedArgument,
+                                          .detail = "a compilation-directory replacement needs the directory it "
+                                                    "replaces" });
+
+    // ONE ceiling, and the two-number version it replaces was wrong about which value
+    // it was bounding.
+    //
+    // The reasoning was "a replacement is a relative path a build tree produces, a
+    // directory is an absolute one", so 256 against 4096. That is true of a RULE's
+    // `<to>` and false of what actually arrives here. `MappedCompileDirectory` sends
+    // `<to>` plus the working directory's tail past the matched prefix:
+    //
+    //     .replacement = <to> + workingDirectory.substr(match->value.size())
+    //
+    // so its length tracks the DIRECTORY, not the rule. Mapping at a shallow prefix is
+    // standard reproducible-build practice -- `-fdebug-prefix-map=/home/ci=.` -- and a
+    // deep enough build directory under one then derives a replacement past 256 bytes
+    // while the directory itself is unremarkable. Every COMPILE for that build was then
+    // refused, the client fell back to compiling locally, and the build stopped
+    // distributing entirely. The refusal also blamed a client ARGUMENT for a value this
+    // side derived from one.
+    //
+    // 4096 for both, because the question these guard is command-line length rather
+    // than filesystem length: neither value is ever opened, and the replacement cannot
+    // exceed its directory by more than the rule's own `<to>`. A value at the ceiling
+    // is still spelled into `-fdebug-prefix-map=<from>=<to>` well inside every
+    // platform's argument limit.
+    constexpr std::size_t MaxRuleValue = 4096;
+    if (replacement.size() > MaxRuleValue)
+        return std::unexpected(JobError::RejectedArgumentNaming(replacement));
+    if (clientDirectory.size() > MaxRuleValue)
+        return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
+
+    // Read off the table BEFORE anything is validated against it, so which families
+    // accept the flag, how it is spelled and what separates `<from>` from `<to>` stay
+    // one fact -- and so the separator check below can ask the ROW rather than rely on
+    // an alphabet that happens to omit today's separator. A family with no row is a
+    // worker that cannot honour the request at all.
+    auto const row = std::ranges::find_if(PathValueFlags(), [family](PathValueFlag const& candidate) {
+        return candidate.role == PathValueRole::PrefixMap && Overlaps(candidate.families, family);
+    });
+    if (row == PathValueFlags().end())
+        return std::unexpected(
+            JobError { .reason = JobRefusal::SpawnFailed,
+                       .detail = "this worker's driver family has no path-mapping switch, so a dispatched object "
+                                 "cannot record the compilation directory the client asked for" });
+
+    // The shape rule, spelled the way `IsSafeStem` above spells its own: an explicit
+    // alphabet read from a capturing lambda, and no `<cctype>`. `std::isalnum` is
+    // locale-dependent, which is the exact hazard the note under `IsSafeStem` records
+    // for `std::tolower` -- a rule that answers differently on two workers is how one
+    // machine refuses what the next accepts.
+    //
+    // Two things are why this is not `IsSafeStem` itself. Bytes at or above 0x80 are
+    // ALLOWED, because none of these ever becomes a path here and a build directory
+    // with a non-ASCII component is ordinary; and `/`, `\`, `:` are allowed, which a
+    // name that becomes a file must refuse. `:` because a Windows absolute path begins
+    // `C:\` and a GNU-layout driver on Windows is an ordinary client -- without it,
+    // such a client's own directory was refused before the driver family was even
+    // consulted, so the refusal named the wrong end of the fleet.
+    //
+    // The row's own separator is excluded HERE rather than left to the alphabet, so
+    // the guard cannot fail open when the table grows: `CmdLine.hpp` names the row it
+    // expects next -- `-fprofile-prefix-map`, a `<path>:<something>` spelling -- and
+    // `:` is in that alphabet. gcc cuts `<from>=<to>` at the last separator and clang
+    // at the first, so a value carrying one is a rule the two drivers read differently
+    // (measured: `/tmp/l506b/eq=sign` mapped to `.` gives `.` on gcc 14 and
+    // `sign=.=sign` on clang 20 -- a WRONG compilation directory, not a missing one).
+    constexpr std::string_view Allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./\\:_-+~";
+    auto const unspellable = [&](char c) {
+        return c == row->valueTailSeparator || (static_cast<unsigned char>(c) < 0x80 && !Allowed.contains(c));
+    };
+
+    // ALL THREE values, and the two halves are attributed differently on purpose: a
+    // value the client sent is the CLIENT's fault, this worker's own directory is the
+    // WORKER's. Blaming a client for a property of the machine it was sent to sends an
+    // operator to the wrong end of the fleet.
+    if (std::ranges::any_of(clientDirectory, unspellable))
+        return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
+    if (std::ranges::any_of(replacement, unspellable))
+        return std::unexpected(JobError::RejectedArgumentNaming(replacement));
+    if (workerDirectory.empty() || workerDirectory.size() > MaxRuleValue
+        || std::ranges::any_of(workerDirectory, unspellable))
+        return std::unexpected(
+            JobError { .reason = JobRefusal::SpawnFailed,
+                       .detail = "this worker's own compile directory cannot be spelled inside a mapping rule, so no "
+                                 "unambiguous rule exists" });
+
+    auto const ruleFor = [&](std::string_view directory) {
+        // The separator appears twice -- once joining the flag to its value, once
+        // inside that value -- and this spells both from the row's own
+        // `valueTailSeparator`. That is one character for every row the table can
+        // currently hold, and it is an assumption rather than a fact, so
+        // `CompileJob_test` pins the join DIRECTLY. Re-parsing what this emits does not
+        // pin it: `StripJoinSeparator` accepts every character in `JoinSeparators` by
+        // design, so a rule joined with `:` parses back with the same head and the same
+        // tail. All five of that guard's assertions passed with this line broken.
+        return std::format(
+            "{}{}{}{}{}", row->spelling, row->valueTailSeparator, directory, row->valueTailSeparator, replacement);
+    };
+
+    // **The worker's own rule is DROPPED when it would also match the client's
+    // directory**, and that is not a nicety -- it is the difference between a mapped
+    // object and a corrupted one.
+    //
+    // A prefix-map rule appends the unmatched tail, so `<from>` = `/` rewrites
+    // `/home/ci/build` to `.home/ci/build` and `/usr/include/...` to `.usr/include/...`
+    // -- every absolute path in the object. And `/` is the production value: the shipped
+    // `fastcache-compile-node.service` sets no `WorkingDirectory=`, so systemd starts
+    // the node in `/`, and `PosixDaemonHost` calls `chdir("/")` on the daemonize path.
+    //
+    // Measured on gcc 14.2.0, node in `/`, both rules present with this one last:
+    // `DW_AT_comp_dir` came back `.tmp/l506d/client` and every system header read
+    // `.usr/include/...`. That is a WRONG object under a correct key -- strictly worse
+    // than the unmapped directory #506 is about.
+    //
+    // Dropping it rather than refusing the job is deliberate. The client's rule still
+    // lands, so the gcc case -- where the compile adopts the CLIENT's directory from the
+    // preprocessed text -- is fully mapped: measured, `comp_dir` is `.`. What is left
+    // is clang on such a node, whose object keeps the worker's directory, which is
+    // exactly the pre-#506 state rather than a new defect. Refusing instead would cost
+    // every dispatched compile on every node installed from the shipped unit, to buy a
+    // case that is no worse than it was.
+    //
+    // The real repair is a `WorkingDirectory=` in the unit, which is packaging.
+    if (clientDirectory.starts_with(workerDirectory))
+        return std::vector<std::string> { ruleFor(clientDirectory) };
+
+    // BOTH, to the same replacement. Which directory the object records is the driver's
+    // answer rather than the fleet's -- gcc under `-g` puts the CLIENT's into the
+    // preprocessed text and the compile adopts it, clang leaves this worker's showing --
+    // so mapping both gives one answer either way. The worker's own goes LAST, and by
+    // the guard above it cannot contain the client's directory, so the order is free.
+    return std::vector<std::string> { ruleFor(clientDirectory), ruleFor(workerDirectory) };
 }
 
 CompileJobRunner::CompileJobRunner(IProcessRunner& runner,
@@ -845,9 +1000,57 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     }
 
     std::vector<std::string> argv;
-    argv.reserve(job.args.size() + 5);
+    argv.reserve(job.args.size() + 7);
     argv.push_back(compiler);
     argv.insert(argv.end(), job.args.begin(), job.args.end());
+    // AFTER the client's arguments, because both GNU drivers honour the LAST matching
+    // rule -- so a build that carried a prefix-map of its own could not override the
+    // rules this exists to add. Before `-c` and the paths below, which is cosmetic;
+    // flag order against the input is not significant to either driver.
+    //
+    // `current_path()` is this worker's own fact and is asked for at the leaf that
+    // already does the filesystem work: the compiler inherits THIS process's directory,
+    // because `IProcessRunner` spawns with no directory of its own and every path here
+    // is absolute. It is one of the TWO directories a dispatched object can record; the
+    // other is the client's, which gcc puts inside the preprocessed text under `-g`.
+    // See `WorkerPrefixMapRules` for the measurements and for why both are mapped.
+    if (!job.compileDir.empty() || !job.compileDirReplacement.empty())
+    {
+        // The `error_code` overload, so a filesystem that cannot answer is a refusal
+        // rather than an exception thrown on a worker thread. Asked only when a mapping
+        // was requested: it is a syscall, and a fleet that maps nothing must not pay it
+        // once per job.
+        //
+        // `SpawnFailed` on the precedent above -- "this worker is broken, compile it
+        // elsewhere" -- which is the client's cue to compile locally and get the object
+        // it actually wanted. Silently skipping the rules would instead return an object
+        // whose compilation directory disagrees with a locally built one under the same
+        // key, which is #506 itself.
+        std::error_code cwdError;
+        auto const compileDirectory = std::filesystem::current_path(cwdError);
+        if (cwdError)
+            return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed,
+                                              .detail = "this worker cannot read its own working directory, so a "
+                                                        "dispatched object cannot record the compilation directory "
+                                                        "the client asked for" });
+
+        // Through `CompilerWorkingDirectory` for the same reason the client's side is:
+        // the rule this builds has to match what the compiler about to be spawned will
+        // report, and that is `$PWD` rather than `getcwd(3)` whenever the two name one
+        // directory. A node whose working directory is reached through a symlink would
+        // otherwise emit a rule its own driver never matches, and the object would keep
+        // the worker's absolute path with every counter reading normal. The
+        // measurements are on `CompilerWorkingDirectory`; the child inherits this
+        // process's environment, so the `PWD` read here is the one it will see.
+        auto rules = WorkerPrefixMapRules(
+            CompilerWorkingDirectory(compileDirectory.string()), job.compileDir, job.compileDirReplacement, family);
+        if (!rules.has_value())
+            // Whichever fault it was, named where it was decided: the refusal knows
+            // which of the two values it refused, where a caller reconstructing that
+            // from emptiness would name the wrong half.
+            return std::unexpected(rules.error());
+        argv.insert(argv.end(), std::make_move_iterator(rules->begin()), std::make_move_iterator(rules->end()));
+    }
     // The compile action and the output are the worker's to name, which is why the
     // client's `RemoteCompileArgs` dropped both rather than passing them through.
     //
@@ -875,10 +1078,13 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // against. Taken from `argv`'s own client slice rather than from `job.args` again,
     // so anything that ever edits the vector between here and the spawn is followed
     // rather than described. See `CompileCorrelation` (#280).
-    auto const correlation = CompileCorrelation(job.preprocessed,
-                                                std::span<std::string const> { argv }.subspan(1, job.args.size()),
-                                                job.fingerprint,
-                                                job.sourceName);
+    auto const correlation =
+        CompileCorrelation(CorrelatedCompile { .preprocessed = job.preprocessed,
+                                               .args = std::span<std::string const> { argv }.subspan(1, job.args.size()),
+                                               .fingerprint = job.fingerprint,
+                                               .sourceName = job.sourceName,
+                                               .compileDir = job.compileDir,
+                                               .compileDirReplacement = job.compileDirReplacement });
 
     auto run = _runner.RunCaptureSplit(argv);
     if (run.exitCode == NotSpawned)

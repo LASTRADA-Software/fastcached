@@ -199,6 +199,12 @@ struct DispatchRequest
     /// name travels -- see `Dispatch`, which takes it -- because that is what a
     /// compiler records in the object and the worker has no use for the rest.
     std::string_view sourceName;
+    /// The directory this client's own compile runs in, and what its own
+    /// `-fdebug-prefix-map` rules spell that as -- from `MappedCompileDirectory`. Both
+    /// empty when the build maps nothing, which is what tells the worker to map nothing
+    /// either.
+    std::string_view compileDir;
+    std::string_view compileDirReplacement;
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.

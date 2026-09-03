@@ -2,10 +2,13 @@
 #include "CmdLine.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
 #include <array>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -1280,6 +1283,106 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
     for (auto const& flag: *preprocessedInput)
         out.emplace_back(flag);
     return out;
+}
+
+std::string CompilerWorkingDirectory(std::string_view physicalDirectory, std::string_view environmentPwd)
+{
+    if (environmentPwd.empty() || physicalDirectory.empty())
+        return std::string { physicalDirectory };
+
+    // Both sides through `PathFromNarrowText`: `PWD` is text some other process wrote,
+    // so on a host where a `char` is not UTF-8 it can be bytes `std::filesystem::path`'s
+    // narrow constructor throws on, before any `error_code` overload runs. A spelling
+    // this host cannot read is one no comparison can be made about, which is the
+    // fallback answer anyway.
+    auto const logical = PathFromNarrowText(environmentPwd);
+    auto const physical = PathFromNarrowText(physicalDirectory);
+    if (!logical.has_value() || !physical.has_value())
+        return std::string { physicalDirectory };
+
+    // POSIX-ROOTED first, and not merely as an optimisation: `equivalent` resolves a
+    // relative path against this process's own working directory, so `PWD=build` inside
+    // `.../build` compares EQUAL and would be returned as a compilation directory that
+    // is not absolute. Measured: `PWD=relative/bits` fell back on both drivers.
+    //
+    // A leading `/` and NOT `path::is_absolute()`, which is the same test on POSIX and
+    // strictly more permissive on a Windows layout -- it admits `D:/work` and
+    // `\\host\share`, and NEITHER Windows driver consults `PWD` for either. libiberty's
+    // `getpwd()`, which is where gcc's `DW_AT_comp_dir` comes from, gates on
+    // `*p == '/'` before it stats anything; LLVM does the `PWD` dance only in
+    // `Unix/Path.inc`, its Windows path being `GetCurrentDirectoryW` with no `PWD` in
+    // it. So modelling this as `is_absolute()` would make a MinGW client predict a
+    // spelling its own compiler never uses, send a mapping the local compile did not
+    // apply, and rebuild #506's asymmetry under a correct key.
+    //
+    // **Read rather than measured** -- the five-row table on the declaration is Linux,
+    // and no Windows GNU-layout driver was available to run it against. Stated
+    // separately because a reader cannot recover the difference and would otherwise
+    // inherit it as measurement. An MSYS-style `/d/work` still reaches the `stat` here
+    // and still falls back, because that spelling resolves for the shell and not for
+    // the driver -- so the two agree by the check below rather than by this one.
+    if (!logical->has_root_directory() || logical->has_root_name())
+        return std::string { physicalDirectory };
+
+    // `equivalent`, not a string compare: the question is whether `PWD` names the SAME
+    // directory, which is what the driver asks and what a symlink makes different from
+    // spelling the same. It returns false on error and it is the only filesystem call
+    // here; a directory that cannot be stat'd falls back like everything else.
+    std::error_code ec;
+    if (!std::filesystem::equivalent(*logical, *physical, ec) || ec)
+        return std::string { physicalDirectory };
+
+    // `PWD` VERBATIM rather than `logical->string()`, because the driver's comparison is
+    // over the bytes it was handed and `path` may re-spell separators on a Windows
+    // layout. What this returns is compared byte-for-byte one call later.
+    return std::string { environmentPwd };
+}
+
+std::string CompilerWorkingDirectory(std::string_view physicalDirectory)
+{
+    auto const pwd = ReadEnvironmentVariable("PWD");
+    return CompilerWorkingDirectory(physicalDirectory, pwd.has_value() ? std::string_view { *pwd } : std::string_view {});
+}
+
+std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
+                                                       DriverFamily family,
+                                                       std::string_view workingDirectory)
+{
+    auto const introducers = IntroducersOf(family);
+
+    // The LAST match wins, so the loop records rather than returns. Measured on gcc
+    // 14 and clang 20, two rules over one directory: the second replacement is what
+    // `DW_AT_comp_dir` holds. It is also what `_fc_debug_prefix_map_rules` relies on
+    // -- it emits the source rule first and the build-tree rule last precisely so the
+    // build tree wins -- so a first-match model here would predict the source rule's
+    // replacement and disagree with every object this project builds.
+    std::optional<MappedCompileDir> mapped;
+    for (auto const& arg: argv)
+    {
+        auto const match = MatchPathValueFlag(arg, introducers, family);
+        // A rule whose value carries no tail is `-fdebug-prefix-map=/abs` with no
+        // replacement, which the driver rejects; it maps nothing, so it is skipped
+        // here rather than treated as a mapping to the empty string.
+        if (!match.has_value() || match->flag.role != PathValueRole::PrefixMap || match->valueTail.empty())
+            continue;
+
+        // A BYTE prefix, deliberately, because that is what both drivers implement:
+        // `-fdebug-prefix-map=/tmp/work=X` rewrites a working directory of
+        // `/tmp/worker` to `Xer` on gcc and on clang alike. Requiring a separator
+        // boundary would read better and would make this client predict a replacement
+        // its own compiler does not write.
+        if (!workingDirectory.starts_with(match->value))
+            continue;
+
+        // `valueTail` carries the separator, so the replacement is what follows it. The
+        // directory travels beside it because a worker needs BOTH left-hand sides: gcc
+        // under `-g` puts this directory into the preprocessed text and the worker's
+        // object then adopts it, while clang leaves the worker's own showing.
+        mapped = MappedCompileDir { .directory = std::string { workingDirectory },
+                                    .replacement = std::string { match->valueTail.substr(1) }
+                                                   + std::string { workingDirectory.substr(match->value.size()) } };
+    }
+    return mapped;
 }
 
 std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv)

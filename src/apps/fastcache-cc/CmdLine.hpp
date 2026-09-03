@@ -766,6 +766,111 @@ struct ParsedCommand
                                                                                      std::span<std::string const> argv,
                                                                                      std::string_view targetTriple);
 
+/// The working directory a COMPILER will report, which is not `getcwd(3)`'s answer.
+///
+/// Both GNU drivers take their `DW_AT_comp_dir` — and therefore the string they run
+/// every `-fdebug-prefix-map` comparison against — from `$PWD` when it is usable, and
+/// from `getcwd(3)` only when it is not. The two differ whenever the build was reached
+/// through a symlink, because the shell keeps the spelling it was given while
+/// `getcwd(3)` resolves every link. `std::filesystem::current_path()` is `getcwd(3)`,
+/// so predicting a driver's behaviour from it is wrong on exactly those machines.
+///
+/// **Measured**, gcc 14 and clang 20, cwd `/tmp/l506f/build` reached as
+/// `/tmp/l506f-link/build`, both drivers identical:
+///
+/// | `PWD`                          | recorded `DW_AT_comp_dir` |
+/// |--------------------------------|---------------------------|
+/// | `/tmp/l506f-link/build`        | `/tmp/l506f-link/build`   |
+/// | unset                          | `/tmp/l506f/build`        |
+/// | a different real directory     | `/tmp/l506f/build`        |
+/// | a path that does not exist     | `/tmp/l506f/build`        |
+/// | a relative path                | `/tmp/l506f/build`        |
+///
+/// So the rule is: absolute, and naming the same directory as `.`. That is a `stat`
+/// comparison rather than a spelling one, which is what `std::filesystem::equivalent`
+/// is, and every other case falls back. This is libiberty's `getpwd()`, which is where
+/// gcc gets it; clang was measured to agree rather than read.
+///
+/// A rule written with the resolved spelling does **not** match — measured, same
+/// arrangement: `-fdebug-prefix-map=/tmp/l506f/build=.` left `DW_AT_comp_dir` at
+/// `/tmp/l506f-link/build`, unmapped. So this cannot be answered by canonicalizing both
+/// sides and comparing filesystem identities: that is more permissive than the driver,
+/// and it would send a worker a mapping the local compile did not apply — manufacturing
+/// [#506](https://github.com/LASTRADA-Software/fastcached/issues/506)'s disagreement in
+/// the other direction. The driver does a byte compare against one particular spelling,
+/// so this returns that spelling and lets `MappedCompileDirectory` go on doing a byte
+/// compare too.
+///
+/// @param physicalDirectory `std::filesystem::current_path()`'s answer.
+/// @param environmentPwd The `PWD` variable's value; empty when it is unset, the two
+///        being one answer here because both fall back.
+/// @return The directory a compiler spawned here will report and match against.
+[[nodiscard]] std::string CompilerWorkingDirectory(std::string_view physicalDirectory, std::string_view environmentPwd);
+
+/// `CompilerWorkingDirectory` reading `PWD` from this process's environment.
+///
+/// The overload exists so no call site has to remember the pairing — the two consumers
+/// (the client predicting its own compile, the worker predicting the one it is about to
+/// spawn) each read `current_path()` and would each have to remember to read `PWD`
+/// beside it. The two-argument form above is what the tests drive.
+///
+/// @param physicalDirectory `std::filesystem::current_path()`'s answer.
+/// @return The directory a compiler spawned here will report and match against.
+[[nodiscard]] std::string CompilerWorkingDirectory(std::string_view physicalDirectory);
+
+/// A client's own compilation directory and what its mapping spells that as.
+///
+/// The two travel together or not at all: a replacement with no directory is half a
+/// rule, and both halves come out of one computation.
+struct MappedCompileDir
+{
+    std::string directory;   ///< The directory the client's own compile runs in.
+    std::string replacement; ///< What the client's own `-fdebug-prefix-map` rules spell it as.
+};
+
+/// How this client's own compile spells its **compilation directory**, and the
+/// directory it spells.
+///
+/// A compiler with debug info on records the directory it ran in — DWARF's
+/// `DW_AT_comp_dir` — and that appears on no command line, so no cache key can
+/// relativize it. `RemoteCompileArgs` drops every path-valued flag, the prefix-map row
+/// included, so a worker received no mapping and a dispatched object recorded a
+/// directory a locally mapped one does not, under the same key
+/// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
+///
+/// The flag itself cannot be forwarded: a worker needs a rule whose left-hand side is a
+/// path on the WORKER, which this machine has never seen. So this pair travels and the
+/// worker builds the rules — **both** of them, because which directory a dispatched
+/// object records is a fact about the driver rather than about the fleet. The
+/// measurements are on `CompileRequest::compileDir`.
+///
+/// ## The rule this models is the driver's, and it was measured
+///
+/// gcc 14 and clang 20 agree on all three points that matter here, and the third is
+/// where an intuition would have gone wrong:
+///
+///   - the **last** matching rule wins, not the first (two rules mapping one directory
+///     to `A` then `B` give `B`);
+///   - a longer directory keeps its tail (`/root=.` with a working directory of
+///     `/root/sub/deeper` gives `./sub/deeper`);
+///   - the match is a **byte prefix and not a path prefix** — `/tmp/work=X` against a
+///     working directory of `/tmp/worker` gives `Xer`, on both drivers. So no
+///     separator boundary is imposed here either: modelling the flag more sensibly
+///     than the compiler implements it would make the client predict a replacement the
+///     compiler never writes, which is exactly the disagreement this exists to end.
+///
+/// @param argv The original full invocation, as the build system wrote it.
+/// @param family The client driver's family, so `/I` is not read as a flag on POSIX.
+/// @param workingDirectory The directory the client's own compile runs in, spelled the
+///        way that compile will spell it — `CompilerWorkingDirectory`, never
+///        `current_path()`, which is a different string on a symlinked build.
+/// @return The directory and its replacement, or nullopt when no rule on the line
+///         governs that directory — which is the honest answer for a build that maps
+///         nothing, and the answer the worker must be given so it maps nothing either.
+[[nodiscard]] std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
+                                                                     DriverFamily family,
+                                                                     std::string_view workingDirectory);
+
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
                                                          std::string_view dependencyProbePath = {});

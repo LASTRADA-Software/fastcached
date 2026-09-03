@@ -899,7 +899,9 @@ inline constexpr std::array OpTable {
                    .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
-                   .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
+                   // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName,
+                   // compileDir, compileDirReplacement
+                   .fieldCount = 8,
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
@@ -2236,6 +2238,53 @@ struct CompileRequest
     /// is a string from the network that becomes a path, so the two checks are the
     /// same pair as the argument filter's.
     std::string_view sourceName;
+    /// The directory the CLIENT's own compile runs in, and what its own
+    /// `-fdebug-prefix-map` rules spell that directory as. Both empty when the client
+    /// maps nothing; a half-filled pair is malformed and a worker refuses it.
+    ///
+    /// A compiler with debug info on records the directory it ran in -- DWARF's
+    /// `DW_AT_comp_dir` -- and that appears on no command line, so nothing in the cache
+    /// key can distinguish two producers by it. #203 closed that for a local compile by
+    /// appending mapping rules; a worker was sent none, so a dispatched object recorded
+    /// a directory a locally mapped one does not, under the same key
+    /// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
+    ///
+    /// **WHICH directory a dispatched object records depends on the driver, so both
+    /// travel.** Measured on gcc 14.2.0 and clang 20.1.2, one translation unit each way,
+    /// reading `DW_AT_comp_dir`:
+    ///
+    /// | preprocess line | what the worker's object records |
+    /// | --- | --- |
+    /// | `g++ -E` | the WORKER's directory |
+    /// | `g++ -E -g` | the CLIENT's directory |
+    /// | `clang++ -E`, `clang++ -E -g` | the WORKER's directory |
+    ///
+    /// gcc's `-fworking-directory` is implicit under `-g`: it emits a line marker naming
+    /// the preprocessing directory, and the worker's compile adopts that as its
+    /// compilation directory. clang emits no such marker. So a worker maps BOTH
+    /// candidates to the replacement and gets the same answer either way. Mapping only
+    /// its own directory fixes clang and leaves gcc recording the client's UNMAPPED
+    /// path -- which no object comparison can see and reading `comp_dir` can.
+    ///
+    /// The client cannot send a finished rule for the worker's half, which is a path it
+    /// has never seen. And neither half can ride in `args`: `IsAcceptableJobArgument`
+    /// refuses any argument body carrying a path separator, deliberately, and both are
+    /// full of them.
+    ///
+    /// **Empty means the client asked for no mapping, and the worker must then add
+    /// none.** A worker that mapped to a token of its own would hand a client that
+    /// requested nothing an object recording a directory neither machine has -- the same
+    /// asymmetry #506 is about, pointing the other way.
+    ///
+    /// Neither is a path the worker opens; both reach only the debug records of the
+    /// object. They are still peer text that ends up on a command line, so the worker
+    /// bounds them and restricts their characters before spelling them. On gcc under
+    /// `-g` the client's directory is already inside the preprocessed payload, so this
+    /// tells a worker nothing it was not being told anyway.
+    std::string_view compileDir;
+    /// What the client's own mapping spells `compileDir` as -- `.` for the rules
+    /// `cmake/portable/CompileCache.cmake` emits. Empty exactly when `compileDir` is.
+    std::string_view compileDirReplacement;
 };
 
 /// The same, as views into a received payload.
@@ -2247,6 +2296,11 @@ struct CompileView
     std::span<std::byte const> source;     ///< Still enveloped; decode with DecodeCodecEnvelope.
     CodecList acceptedCodecs;              ///< What the client can decode.
     std::span<std::byte const> sourceName; ///< Base name to give the scratch file; sanitize before use.
+    /// The client's own compile directory and what its mapping spells it as; both
+    /// empty when the client maps nothing. Bound and restrict them before either
+    /// reaches a command line.
+    std::span<std::byte const> compileDir;
+    std::span<std::byte const> compileDirReplacement;
 };
 
 /// Frame a REGISTER request.
@@ -2791,7 +2845,9 @@ struct ClusterAdmitView
                                    request.args,
                                    request.source,
                                    std::span<std::byte const> { codecs },
-                                   AsBytes(request.sourceName) });
+                                   AsBytes(request.sourceName),
+                                   AsBytes(request.compileDir),
+                                   AsBytes(request.compileDirReplacement) });
 }
 
 /// Split a COMPILE payload.
@@ -2807,7 +2863,9 @@ struct ClusterAdmitView
                          .args = (*fields)[2],
                          .source = (*fields)[3],
                          .acceptedCodecs = DecodeCodecList((*fields)[4]),
-                         .sourceName = (*fields)[5] };
+                         .sourceName = (*fields)[5],
+                         .compileDir = (*fields)[6],
+                         .compileDirReplacement = (*fields)[7] };
 }
 
 /// What a scheduler answers a LEASE with, on success.

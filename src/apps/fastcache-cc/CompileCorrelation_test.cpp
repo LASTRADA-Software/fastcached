@@ -14,17 +14,24 @@ using namespace FastCache::Cc;
 namespace
 {
 
-/// The four covered inputs, so a case can vary exactly one of them.
+/// The six covered inputs, so a case can vary exactly one of them.
 struct Job
 {
     std::string preprocessed { "int main(){return 0;}" };
     std::vector<std::string> args { "-O2", "-DNDEBUG" };
     std::string fingerprint { "gcc-14-x86_64-linux-gnu" };
     std::string sourceName { "tu.cpp" };
+    std::string compileDir { "/home/ci/build" };
+    std::string compileDirReplacement { "." };
 
     [[nodiscard]] std::string Digest() const
     {
-        return CompileCorrelation(preprocessed, args, fingerprint, sourceName);
+        return CompileCorrelation(CorrelatedCompile { .preprocessed = preprocessed,
+                                                      .args = args,
+                                                      .fingerprint = fingerprint,
+                                                      .sourceName = sourceName,
+                                                      .compileDir = compileDir,
+                                                      .compileDirReplacement = compileDirReplacement });
     }
 };
 
@@ -80,6 +87,42 @@ TEST_CASE("Each covered input changes the correlation", "[correlation]")
         Job other;
         other.sourceName = "other.cpp";
         CHECK(other.Digest() != base);
+    }
+
+    SECTION("the compilation directory")
+    {
+        // It becomes the left-hand side of a `-fdebug-prefix-map` argument on the line
+        // the worker spawns, so two jobs differing only here produce objects whose
+        // `DW_AT_comp_dir` differs -- #506's own defect, and crossing the replies would
+        // reintroduce it underneath the fix.
+        Job other;
+        other.compileDir = "/home/ci/other";
+        CHECK(other.Digest() != base);
+    }
+
+    SECTION("its replacement")
+    {
+        Job other;
+        other.compileDirReplacement = "./sub";
+        CHECK(other.Digest() != base);
+    }
+
+    SECTION("the two halves are framed apart, not run together")
+    {
+        // Deliberately NOT "mapping nothing against mapping to `.`" -- that is implied
+        // by the two sections above and asserts nothing they do not. What is not
+        // implied is that the pair is framed injectively: a directory of `.` with no
+        // replacement must not digest as a replacement of `.` with no directory, which
+        // is #63's collision one field boundary along.
+        Job left;
+        left.compileDir = "";
+        left.compileDirReplacement = ".";
+
+        Job right;
+        right.compileDir = ".";
+        right.compileDirReplacement = "";
+
+        CHECK(left.Digest() != right.Digest());
     }
 }
 

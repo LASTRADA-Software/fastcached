@@ -504,13 +504,39 @@ TEST_CASE("Every dispatch verb round-trips its fields")
                                                           .args = args,
                                                           .source = source,
                                                           .acceptedCodecs = { 1 },
-                                                          .sourceName = "Widget.cpp" });
+                                                          .sourceName = "Widget.cpp",
+                                                          .compileDir = "/home/ci/build",
+                                                          .compileDirReplacement = "./sub" });
         auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l1");
         CHECK(std::ranges::equal(Unwrap(decoded).args, args));
         CHECK(std::ranges::equal(Unwrap(decoded).source, source));
         CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
+        CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
+        // The compilation-directory pair, which is what lets a dispatched object
+        // record the directory the client's own compile records (#506).
+        CHECK(AsStringView(Unwrap(decoded).compileDir) == "/home/ci/build");
+        CHECK(AsStringView(Unwrap(decoded).compileDirReplacement) == "./sub");
+    }
+
+    SECTION("COMPILE, from a client that maps nothing")
+    {
+        // Empty is a VALUE here rather than an absent field: it says the client asked
+        // for no mapping, which is what stops the worker inventing one. `SplitFields`
+        // is exact, so this also pins that an empty last field still makes seven.
+        auto const frame = EncodeCompile(CompileRequest { .leaseToken = "l1",
+                                                          .fingerprint = "gcc-13-abc",
+                                                          .args = {},
+                                                          .source = {},
+                                                          .acceptedCodecs = { 1 },
+                                                          .sourceName = "Widget.cpp",
+                                                          .compileDir = {},
+                                                          .compileDirReplacement = {} });
+        auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).compileDir.empty());
+        CHECK(Unwrap(decoded).compileDirReplacement.empty());
         CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
     }
 }
