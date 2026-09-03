@@ -65,6 +65,8 @@
 #
 # Exit codes: 0 = every test file in scope is selectable. 1 = at least one is not.
 
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()

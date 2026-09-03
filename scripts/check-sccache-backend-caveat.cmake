@@ -39,17 +39,22 @@
 #
 # Exit codes: 0 = every recommendation carries its caveat. 1 = at least one does not.
 
-# A `cmake -P` script has no `cmake_minimum_required`, so every policy is unset
-# and takes its OLD behaviour. Under CMP0007 OLD, `list()` DISCARDS empty
-# elements -- which is every blank line in every file scanned here, so a line
+# Script mode has no project, so every policy starts UNSET: a policy-gated
+# construct then errors out or silently changes meaning, and which of the two
+# depends on the CMake running it. See .agent/rules/build-and-toolchain.md.
+#
+# This file is why that matters here. Under CMP0007 OLD, `list()` DISCARDS empty
+# elements -- which is every blank line in every file scanned below, so a line
 # number is off by however many blank lines precede it. It reproduced exactly
 # that way: identical on CMake 4.3 (where the policy defaults NEW) and wrong from
 # the first blank line on CMake 3.28, which is the version this project supports.
-# Guarded by `if(POLICY ...)` so a CMake that has retired the policy still runs
-# this rather than failing on the line that asks for it.
-if(POLICY CMP0007)
-    cmake_policy(SET CMP0007 NEW)
-endif()
+#
+# It used to be a hand-set `if(POLICY CMP0007) cmake_policy(SET ... NEW)` block,
+# under a comment opening `A cmake -P script has no cmake_minimum_required`. That
+# sentence was true when it was written and this line makes it false, so both are
+# gone: one declaration sets CMP0007 along with every other policy of that
+# vintage, and a per-policy opt-in only covers the trap somebody already met.
+cmake_minimum_required(VERSION 3.28)
 
 # ---------------------------------------------------------------------------
 # What counts as recommending the configuration. These two environment variables

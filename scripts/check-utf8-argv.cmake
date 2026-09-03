@@ -22,6 +22,8 @@
 #   EXE  - the executable to run.
 #   NAME - what to call it in a failure message.
 
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT DEFINED EXE OR NOT DEFINED NAME)
     message(FATAL_ERROR "[utf8-argv] EXE and NAME are required")
 endif()

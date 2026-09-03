@@ -39,6 +39,9 @@
 #
 # No row may contain a ';' -- these are CMake lists, and a semicolon inside a row
 # would split it into two.
+
+cmake_minimum_required(VERSION 3.28)
+
 set(FastCachedNetStandaloneDirs
     "Net|The library itself: sockets, listeners, connectors, framing, TLS."
     "Async|The coroutine and event-loop vocabulary ISocket is expressed IN. ISocket::Read and Write return Task<T>, IoAwaitable is the reactor's completion hook, and EpollSocket / IocpSocket / KqueueSocket are the reactors' own I/O side -- there is no Net without it. Moving that vocabulary into Net/ instead would leave Async/ unusable without Net/, or duplicate Task."

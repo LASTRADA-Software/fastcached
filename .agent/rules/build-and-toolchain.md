@@ -980,6 +980,41 @@ them as the one thing standing behind a rule that has already been a bug:
   could not attribute rather than skipping it: an unattributed registration means
   the scan lost track, and every verdict after that point was drawn from the wrong
   place. It also refuses to conclude when it matched no registrations at all.
+- **Every `cmake -P` script declares `cmake_minimum_required(VERSION 3.28)`, because
+  script mode declares no policies at all.** There is no project, so every policy starts
+  UNSET and a policy-gated construct means whatever the CMake running it decides.
+  Measured on 3.28.3 — the declared minimum and the version CI runs — against the same
+  script with the declaration added:
+
+  | construct | policy | bare `cmake -P` on 3.28.3 | declared, or on 4.x |
+  |---|---|---|---|
+  | `if("b" IN_LIST haystack)` | CMP0057 | `CMake Error: Unknown arguments`, **exit 1** — errors before answering | answers |
+  | `if(TRUE)` | CMP0012 | exit 0, `TRUE` read as a variable name, **branch NOT taken** | branch taken |
+
+  **The half with no other remedy is the REVIEWER's machine.** CMake 4.x removed both
+  policies, so the NEW behaviour is unconditional there and neither finding reproduces at
+  all — a reviewer on 4.x reading one of these scripts is not testing what CI runs, and
+  cannot falsify a claim about it. That is why the declaration is the fix and "reviewers
+  should be more careful" is not: their tooling cannot see the problem. It happened both
+  ways in one night (#497): a lane hit CMP0012 on 3.28 and the manager could not
+  reproduce it on 4.3.1.
+- **Under `ctest` these are LOUD; the silence is one level down.** Nothing in this tree
+  passes `-Wno-dev` and `FASTCACHED_SCRIPT_CHECK_FAILED` is `"CMake Error|CMake Warning"`,
+  so a registered check that trips a policy goes **red** on the 3.28 leg. What is silent
+  is a **selftest's sub-run harness**: all six grep the captured output for `CMake Error`
+  and none for `CMake Warning`, so a construct that merely warns and inverts is invisible
+  there. That is where it actually bit — a #479 mutation warned, inverted, and scored as a
+  successful red-proof of a case that had never been staged.
+- **`script-check-signals` requires the declaration rather than enumerating the
+  constructs.** The set of policy-gated constructs grows with every CMake release, so a
+  guard that lists them is stale by construction. It walks the same registrations it
+  already reads for `FAIL_REGULAR_EXPRESSION`, so the subject is derived and there is no
+  second list. It lives there rather than in a check of its own because of the PARSER —
+  a separate script would duplicate forty lines of NAME/`-P` pairing or restate the list.
+  Not because "a new script would itself need the declaration", which sounds load-bearing
+  and is false: it would be registered like every other check and covered by this pass. It matches `^cmake_minimum_required\(` anchored at line
+  start: a word-match scored a file as compliant on the strength of a **comment saying it
+  had none**, and returned 10 where the answer is 11.
 - Do not "fix" this by raising the minimum to 3.29 and using
   `cmake_language(EXIT)`. The property works on every version, costs nothing, and
   is what makes the canary and the omission check possible; a version bump would

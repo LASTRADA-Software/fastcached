@@ -45,6 +45,9 @@
 # match prose, so a comment or a rule document that mentions `HmacSha256` in
 # backticks is not a violation. A check that failed on the word would make the
 # reasoning unwritable, which is the reliable way to get a guard deleted.
+
+cmake_minimum_required(VERSION 3.28)
+
 set(FastCachedPskPrimitive "HmacSha256")
 set(FastCachedPskCallRegex "HmacSha256[ \t]*\\(")
 

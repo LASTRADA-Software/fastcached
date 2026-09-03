@@ -40,6 +40,9 @@
 #
 # No row may contain a ';' — these are CMake lists, and a semicolon inside a row
 # would split it into two.
+
+cmake_minimum_required(VERSION 3.28)
+
 set(FastCachedForbiddenTrackedPaths
     "version.txt|The git tag is the single source of truth for the version (see cmake/Version.cmake). A committed version.txt outranks every tag, which makes it a second version carrier that each release has to remember to bump in lock-step - and while it existed it pinned every build, every wire banner and every package to whatever it said. Keep it untracked if you want a local override: that is supported and this check will not complain."
 )
