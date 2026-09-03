@@ -169,10 +169,13 @@ struct Record
     /// row per worker in the fleet instead of one per cause. The endpoint rides the
     /// verbose line instead.
     ///
-    /// Empty when there is nothing to explain — and non-empty is not the same as
-    /// failure: a compile a worker ran and the client then discarded carries a
-    /// reason while staying `DispatchOutcome::Dispatched`, exactly as an honest
-    /// MISS can carry a fall-back reason above.
+    /// Empty when there is nothing to explain, which every good outcome is: a state
+    /// that says all there is to say carries no reason. `Refused` and `Discarded`
+    /// are the two that need one, because each covers three different causes an
+    /// operator fixes differently.
+    ///
+    /// Only tallied for a state the report prints, so the reason list and the state
+    /// list always reconcile — see `FoldRecords`.
     std::string dispatchDetail;
 
     // Phase breakdown of elapsedMs. A hit is not "cache latency": it also pays a

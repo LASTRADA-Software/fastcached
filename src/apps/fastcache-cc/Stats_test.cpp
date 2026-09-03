@@ -275,6 +275,36 @@ TEST_CASE("A dispatch token this build does not know decodes as unknown rather t
     CHECK(entries.front().dispatch == DispatchOutcome::Unknown);
 }
 
+TEST_CASE("A reason this build cannot account for is not ranked under a state it does not have")
+{
+    // Two launcher versions appending to one log is what a rolling upgrade looks
+    // like. The newer one writes a state this build does not know, which is counted
+    // nowhere -- so its REASON must not be ranked either, or the report prints a
+    // sentence under "why distribution did not help" with no state line accounting
+    // for it, and the two lists stop reconciling. A claim about a fleet, assembled
+    // from a word this build cannot read.
+    ScopedStateDir const scoped;
+    AppendDispatchRecords(1, DispatchOutcome::Unreachable, "the fleet could not be reached");
+    AppendRawLine("MISS\tmain\t0\t10\tb.cpp\t\t0\t0\t0\t0\t1700000000\tQUARANTINED\tthe fleet was quarantined");
+
+    auto const report = FormatReport("");
+    // The known record still reports normally, so the section IS rendered -- which
+    // is what makes this test able to fail at all.
+    CHECK(report.contains("1x  the fleet could not be reached"));
+    CHECK_FALSE(report.contains("the fleet was quarantined"));
+}
+
+TEST_CASE("Naming the enumerator count does not read past either table")
+{
+    // `Last` is an ordinary enumerator as far as the language is concerned, so the
+    // in-range promise on these two is prose and nothing else. Both answer `Unknown`
+    // -- an unnameable state is the same situation as a token from a later build,
+    // reached from the other side -- and the token round-trips to it.
+    CHECK(ToStringView(DispatchOutcome::Last) == "UNKNOWN");
+    CHECK(RecordingFor(DispatchStatus::Last).outcome == DispatchOutcome::Unknown);
+    CHECK(RecordingFor(DispatchStatus::Last).reason.empty());
+}
+
 TEST_CASE("A dispatch reason is never ranked beside a cache reason")
 {
     // Two axes, two lists. A compile can miss the cache AND fail to dispatch, and an

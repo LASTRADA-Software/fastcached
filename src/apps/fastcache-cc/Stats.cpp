@@ -708,6 +708,14 @@ std::string_view ToStringView(Outcome outcome) noexcept
 
 DispatchRecording RecordingFor(DispatchStatus status) noexcept
 {
+    // `Last` is an ordinary enumerator as far as the language is concerned, so a
+    // caller can name it and every in-range promise here is prose. Answering
+    // `Unknown` rather than reading past the table is the same answer this file
+    // already gives one layer down, where a token from a later build says nothing
+    // this build can report on -- an unnameable status is that situation reached
+    // from the other side.
+    if (static_cast<std::size_t>(status) >= EnumeratorCount<DispatchStatus>)
+        return DispatchRecording { .reason = {}, .outcome = DispatchOutcome::Unknown };
     auto const& row = DispatchRecordingTable[static_cast<std::size_t>(status)];
     return DispatchRecording { .reason = row.reason, .outcome = row.outcome };
 }
@@ -718,6 +726,13 @@ std::string_view ToStringView(DispatchOutcome outcome) noexcept
     // one spelling and read back in another -- which is a whole axis of the report
     // silently reading as `Unknown` while every test that checks one direction
     // passes.
+    //
+    // Out of range answers with the `Unknown` token rather than reading past the
+    // table: `Last` is an ordinary enumerator to the language, and a log line is the
+    // wrong place to discover that. Round-trips honestly, since that token parses
+    // back to `Unknown`.
+    if (static_cast<std::size_t>(outcome) >= EnumeratorCount<DispatchOutcome>)
+        return RowFor(DispatchOutcome::Unknown).token;
     return RowFor(outcome).token;
 }
 
@@ -881,12 +896,21 @@ namespace
                 if (!record.detail.empty())
                     ++tally->reasons[record.detail];
 
-                // The dispatch axis is folded unconditionally and separately. Every
-                // record lands in exactly one state including `Unknown`, so the
-                // section can tell "no fleet" from "nothing recorded" -- and its
-                // reason goes in its own map, never beside a cache reason.
+                // The dispatch axis is folded separately, and its reason goes in its
+                // own map -- never beside a cache reason.
+                //
+                // Every record lands in exactly one STATE, including `Unknown`, so
+                // the section can tell "no fleet" from "nothing recorded". Its
+                // REASON is folded only when the state is one the section will
+                // print, which keeps the two lists reconciled by construction rather
+                // than by coincidence. Without that, a line written by a LATER build
+                // -- two launcher versions appending to one log is what a rolling
+                // upgrade looks like -- contributes a sentence under "why
+                // distribution did not help" with no state line accounting for it,
+                // which is the claim-about-a-fleet-from-a-word-this-build-cannot-
+                // read that `ParseDispatchOutcome` refuses one layer down.
                 ++tally->dispatch[static_cast<std::size_t>(record.dispatch)];
-                if (!record.dispatchDetail.empty())
+                if (!record.dispatchDetail.empty() && RowFor(record.dispatch).reach != FleetReach::NoFleet)
                     ++tally->dispatchReasons[record.dispatchDetail];
             }
 
