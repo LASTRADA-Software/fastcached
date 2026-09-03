@@ -162,13 +162,19 @@ and the pool behaves as one rather than advertising N times the machine.
 `REGISTER`, `HEARTBEAT`, `LEASE` and `RELEASE` go to the scheduler, along with the
 four cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
 `CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
-only to a member. `COMPILE` goes to a worker on its own port and is the only verb
-a worker answers at all — the scheduler's verbs and the cache's are refused with
-`dispatch-not-permitted`, so a client that sent the wrong verb to the wrong port
-learns which rather than seeing a dropped connection it cannot tell from a dead host.
-`AUTH` is the exception on a **node's** three surfaces — scheduler, compile port and
-cache tier — none of which implements it, so each answers `unknown-opcode`, the one
-refusal a client steps over before carrying on unauthenticated. `fastcached` does
+only to a member. `COMPILE` goes to a worker on the **same** `--listen-node` port
+that carries its cache verbs and, with `--serve-scheduler`, the scheduler's:
+[#290](https://github.com/LASTRADA-Software/fastcached/issues/290) merged what were
+three ports into one `0xFC` surface, so the listener is no longer the policy. Which
+caller is admitted to which verb is a property of the **verb**, asked of the
+component that owns it, and never of the port a frame arrived on. A verb this node
+runs no component for is still refused `dispatch-not-permitted`, so a client learns
+that this node does not serve it rather than seeing a dropped connection it cannot
+tell from a dead host.
+`AUTH` is the exception across a node's three verb families — the scheduler's, the
+compile verbs and the cache tier's, all of them now on that one port — none of which
+implements it, so each answers `unknown-opcode`, the one refusal a client steps over
+before carrying on unauthenticated. `fastcached` does
 implement `AUTH`: it is the only server on this wire that checks a credential, and
 `--requirepass` there refuses the gated verbs `unauthenticated` rather than stepping
 over anything.
