@@ -191,8 +191,17 @@ namespace
     /// headers. A surviving one would therefore make the key's dependency set
     /// depend on which spelling the build happened to use — the exact invariant
     /// MsvcDependencyProbe exists to establish.
-    constexpr std::array<std::string_view, 5> MsvcDrop {
-        "/c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user",
+    ///
+    /// `-c` is here beside `/c` for the same reason: clang-cl is an MSVC-family
+    /// driver that also accepts the GNU spelling, and CMake's Ninja generator
+    /// emits exactly that spelling for CMAKE_CXX_COMPILER=clang-cl. A build
+    /// spelling it `-c` left the marker on the /EP probe line, where clang-cl
+    /// reports it as an unused argument (-Wunused-command-line-argument) --
+    /// silent under an ordinary build, and a hard preprocess failure under one
+    /// that also builds with /WX, which takes the cache out of every compile
+    /// with no build failure to notice it by (#688).
+    constexpr std::array<std::string_view, 6> MsvcDrop {
+        "/c", "-c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user",
     };
     constexpr std::array<std::string_view, 4> GnuDrop { "-c", "-MD", "-MMD", "-MP" };
 

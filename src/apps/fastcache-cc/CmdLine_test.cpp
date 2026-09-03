@@ -205,6 +205,26 @@ TEST_CASE("PreprocessCommand uses the MSVC spelling for MSVC drivers")
     CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
 }
 
+TEST_CASE("PreprocessCommand drops the GNU spelling of compile-only on clang-cl")
+{
+    // Regression guard. clang-cl accepts BOTH `/c` and `-c` for compile-only --
+    // it is a GNU-compatible driver front-ending an MSVC-style one, and CMake's
+    // Ninja generator spells it `-c` for CMAKE_CXX_COMPILER=clang-cl. MsvcDrop
+    // only named "/c", so a `-c` build's own compile-only marker survived onto
+    // the /EP probe line, clang-cl reported it as an unused argument under /EP
+    // (-Werror,-Wunused-command-line-argument), and a build with /WX turned that
+    // into a hard preprocess failure -- the cache silently unreachable for every
+    // translation unit, with the build itself unaffected because the launcher
+    // falls back to the real compiler on any cache error.
+    std::vector<std::string> const argv { R"(C:\llvm\bin\clang-cl.exe)", "-c", "/showIncludes", "/Foout.obj", "a.cpp" };
+    auto const pp = PreprocessCommand(Parse(argv), argv);
+
+    CHECK(std::ranges::contains(pp, "/EP"));
+    CHECK_FALSE(std::ranges::contains(pp, "-c"));
+    CHECK_FALSE(std::ranges::contains(pp, "/showIncludes"));
+    CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
+}
+
 TEST_CASE("PreprocessCommand does not drop a flag that merely starts like a dropped one")
 {
     // Regression guard. Matching drop flags by bare prefix made `-c` swallow
