@@ -786,8 +786,14 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     // is one opaque line: nothing here can tell "this is English" from "this is a
     // language that happens to be shaped like the last one", short of a second probe
     // spawn per compile to compare against. So the residual case is silent by
-    // construction -- recorded here because a cost nobody wrote down is a cost the
-    // next reader will assume was never paid.
+    // construction, which is the half most likely to be rediscovered later and
+    // "fixed".
+    //
+    // Argued in full under `## Accepted trade-offs` in `.agent/rules/compile-cache.md`,
+    // and that is where it has to live rather than only here: nobody debugging a
+    // split estate is reading this file. They are reading the rulebook, because that
+    // is where this project keeps its arguments -- and a cost recorded only beside
+    // the code is one only somebody who already knows where to look will find.
     std::array<EnvironmentAssignment, 1> const english { {
         { .name = "VSLANG", .value = "1033" },
     } };
