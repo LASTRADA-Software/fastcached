@@ -166,11 +166,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "cache verb sent to the scheduler's port. Any rise names a client "
               "pointed at the wrong address.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::DispatchFramesRefusedMalformedPayload,
-      .prometheusName = "fastcached_dispatch_frames_refused_malformed_payload_total",
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedTruncated,
+      .prometheusName = "fastcached_dispatch_frames_refused_truncated_total",
       .help = "Frames at the fleet scheduler's port whose declared payload length did "
-              "not match what arrived. Distinct from the scheduler's own uncounted "
-              "malformed-frame refusal, which is about a payload it could not parse.",
+              "not match what arrived: a framing or transport fault, before any verb "
+              "is routed. Never sum with malformed_payload -- they share a wire code "
+              "and nothing else, and the scheduler's own malformed-frame refusal (a "
+              "payload it could not parse) is deliberately uncounted.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",

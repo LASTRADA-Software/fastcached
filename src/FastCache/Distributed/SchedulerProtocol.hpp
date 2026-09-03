@@ -138,8 +138,7 @@ static_assert(EnumeratorCount<FleetMetric> == CompileCacheWire::HistorySlotCount
 class SchedulerProtocol
 {
   public:
-    /// @param service Decides every request; must outlive this.
-    /// @param service What decides every verb this surface routes.
+    /// @param service Decides every verb this surface routes; must outlive this.
     /// @param metrics Where this surface's own refusals are recorded.
     ///
     /// **Two arguments and no longer `explicit`-with-one**, because this class

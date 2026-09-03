@@ -607,10 +607,11 @@ set_tests_properties("target-file-guards-selftest" PROPERTIES
 # now GLOBS `src/`, headers included, so a new file answering a refusal fails it on
 # the first bare call with nobody editing anything.
 #
-# It also tallies `RefuseUntriaged` and prints the total, because "deliberately not
-# counted" and "forgot to count" were the same text until #492 gave each its own
-# spelling -- and the third spelling is only safe while the backlog it creates is
-# visible. See the script's header.
+# It also reads the `RefuseUntriaged` backlog, because "deliberately not counted" and
+# "forgot to count" were the same text until #492 gave each its own spelling. That
+# reading was a printed total while the backlog was non-empty; #494 drove it to zero,
+# so it is now an ASSERTION -- a count can only be watched, and watching is what let
+# five sites accumulate behind a green check. See the script's header.
 #
 # In the default set with the other hygiene checks: it reads files and compares
 # strings.
@@ -631,9 +632,10 @@ set_tests_properties("worker-refusals-counted" PROPERTIES
 # A glob is only worth more than the list it replaced if it actually bites on a file
 # that was never named, and a guard nobody has seen fire is not a guard. This drives
 # the real check against seven synthetic source trees and asserts each verdict
-# separately -- clean, a new `.cpp`, a new `.hpp`, an untriaged site that must PASS
-# while being counted, an untriaged site naming no issue, a FOURTH refusal spelling
-# added to the allowed header, and a tree whose spellings have been renamed away.
+# separately -- clean, a new `.cpp`, a new `.hpp`, an untriaged site that must now FAIL
+# as a backlog rather than as an unknown spelling, an untriaged site naming no issue, a
+# FOURTH refusal spelling added to the allowed header, and a tree whose spellings have
+# been renamed away.
 #
 # It asserts each direction rather than inverting the whole test with `WILL_FAIL`: a
 # check that stopped refusing and a check that started refusing everything are

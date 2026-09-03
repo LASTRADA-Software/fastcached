@@ -165,9 +165,16 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
         // what arrived, before any verb is routed. Two refusals, one wire code -- which
         // is precisely why the ROW is the unit and a table keyed on the code could not
         // express it (#327).
-        return Cc::Refuse(_metrics,
-                          { .code = Wire::ErrorCode::MalformedFrame,
-                            .counter = IMetricsSink::Counter::DispatchFramesRefusedMalformedPayload });
+        //
+        // `Truncated`, not `MalformedPayload`, because this catalog already separates
+        // the two everywhere else: `WorkerFramesRefusedTruncated` is this event and its
+        // help says in as many words never to sum it with malformed_payload. Naming
+        // this one malformed_payload would have made a cross-surface graph of that
+        // suffix add a framing fault to three decode failures -- one of which this same
+        // change introduces on the daemon.
+        return Cc::Refuse(
+            _metrics,
+            { .code = Wire::ErrorCode::MalformedFrame, .counter = IMetricsSink::Counter::DispatchFramesRefusedTruncated });
 
     auto const reply = Route(descriptor->code, payload, caller);
     if (reply.status == Wire::Status::Ok)

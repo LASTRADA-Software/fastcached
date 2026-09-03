@@ -490,6 +490,24 @@ The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and
 hides an unavailable fleet behind one that merely looks undersized.
 
+Those count what the scheduler *decided*. Four more count what it refused before
+any verb reached it — a frame turned away at the wire, which until #494 answered
+a client and moved nothing, so a scheduler being probed and a scheduler nobody
+was talking to drew the same flat line.
+
+| Counter | Rising means |
+|---------|--------------|
+| `fastcached_dispatch_frames_refused_unsupported_version_total` | A peer built against another release of the wire. During a rollout this tracks the rollout; afterwards it names a machine nobody upgraded. |
+| `fastcached_dispatch_frames_refused_unknown_opcode_total` | A frame naming a verb no build has. A scanner, or a client speaking something else entirely at this port. |
+| `fastcached_dispatch_frames_refused_not_permitted_total` | A frame naming a verb that exists and is served on a **different** port — typically a cache or compile request sent to the scheduler's address. Any rise names a client pointed at the wrong one. |
+| `fastcached_dispatch_frames_refused_truncated_total` | A frame whose header disagreed with what arrived: a framing or transport fault, before any verb was routed. Never sum it with a `malformed_payload` series — those are payloads that decoded wrong, and share only the wire code. |
+
+A non-member caller is **not** in this table: that refusal is decided one layer
+down, in `SchedulerService`, which deliberately counts it nowhere so a client
+retrying past a momentarily full surface cannot bury the credential series.
+Whether it should get a series of its own is
+[#592](https://github.com/LASTRADA-Software/fastcached/issues/592).
+
 On each **worker**, start it with `--admin-listen` and the same endpoint reports
 what that machine is doing:
 

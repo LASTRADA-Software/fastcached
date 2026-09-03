@@ -189,7 +189,7 @@ class IMetricsSink
         /// a different event with the same wire code. A table keyed on the CODE could
         /// not hold both, which is exactly why the row rather than the code is the
         /// unit (#327, #494).
-        DispatchFramesRefusedMalformedPayload,
+        DispatchFramesRefusedTruncated,
 
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this

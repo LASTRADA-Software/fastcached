@@ -49,11 +49,17 @@
 #
 # So `RefuseWithoutCounter` states the decision and carries its reason, and
 # `RefuseUntriaged` states the ABSENCE of one and carries the issue that will make it.
-# The third is not a loophole precisely because this check TALLIES it and prints the
-# total on every run: the backlog is visible and monotonic, a new one cannot be added
-# silently, and the issues it points at get a mechanical completion test instead of a
-# judgement call. Marking a site untriaged buys nothing except honesty, which is the
-# property that makes it safe to have.
+# The third was not a loophole precisely because this check TALLIES it and prints the
+# total on every run: the backlog was visible and monotonic, a new one could not be
+# added silently, and the issues it pointed at got a mechanical completion test instead
+# of a judgement call.
+#
+# **That tally is now an assertion, because #494 drove it to zero.** A count could only
+# ever be published and watched, which is how five sites accumulated behind a green
+# check the last time (#447); an empty backlog is the one state in which the same
+# reading becomes a guard. Adding an untriaged refusal is still legitimate and is no
+# longer SILENT: file the issue that will decide it and relax the assertion at the foot
+# of this file in the same change.
 #
 # Comments naming the function are prose, not calls, for the reason
 # `check-target-file-guards` records: this file's own header describes the thing it
@@ -460,8 +466,10 @@ if(violations)
     message("    Cc::RefuseWithoutCounter({ .rationale = \"..\" })   a rise would mean nothing, because")
     message("    Cc::RefuseUntriaged({ .issue = N })               nobody has decided yet; N will")
     message("")
-    message("The third is a legitimate answer and is counted, not hidden: this check")
-    message("reports the outstanding total on every run.")
+    message("The third is no longer a free answer. #494 emptied the backlog, so this")
+    message("check now REFUSES a non-empty one rather than reporting a total -- reach")
+    message("for it only with the issue filed and this assertion relaxed in the same")
+    message("change, which is a sentence in a review rather than a line nobody reads.")
     message("")
     message("The only files allowed to name the encoder directly are:")
     math(EXPR lastAllowed "${allowedFileCount} - 1")

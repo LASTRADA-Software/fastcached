@@ -561,6 +561,18 @@ looks exactly like a port nobody is talking to.
   honesty, which is what makes it safe to have. Spelling an undecided site
   `RefuseWithoutCounter` with a placeholder reason is WORSE than the bare encoder: it
   carries the appearance of a decision and a dead link to prove it.
+- **And a tally at zero becomes an assertion, which is the only state it can.** #494
+  emptied the backlog — the fleet scheduler's seven arms and the daemon's twelve were
+  the last of it — so `worker-refusals-counted` now REFUSES a non-empty one instead of
+  printing a number. A count can only be published and watched, and watching is exactly
+  how five sites accumulated behind a green check (#447). The third spelling stays
+  legitimate and stops being silent: file the issue and relax the assertion in the same
+  change. The selftest's untriaged case had to be restated with it, and asserts three
+  things rather than one — that the spelling is still RECOGNISED (not reported as a
+  bare encoder call), that the site is still tallied and resolved to its issue, and
+  that the refusal is the empty-backlog one by its own words. A case asserting only
+  "it failed" would pass just as happily if the check stopped understanding
+  `RefuseUntriaged` at all.
 - **The reason is a forcing function, not a dead field.** Nothing sends it and nothing
   reads it at run time; what it does is make the author answer "would a rise here mean
   something happened" before the call compiles. `StartupPolicyRejection` carries a
@@ -758,10 +770,12 @@ outright rather than drawing with a gap.
   in staleness on the one page that exists to be current, and the charts already
   avoid the cost with a validator rather than a lifetime.
 
-- **[#494](https://github.com/LASTRADA-Software/fastcached/issues/494)** — the fleet
-  scheduler's and the daemon's own `0xFC` surfaces answer eight refusals that count
-  nothing; `SchedulerProtocol.cpp` references no metrics sink at all, on the surface
-  carrying lease grants and worker registration. Neither #447 nor #491 reaches them —
-  different components, different binaries. They are marked `RefuseUntriaged` since
-  #492, so `worker-refusals-counted` prints them on every run and closing this issue
-  is the printed count for those files dropping to zero.
+- **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
+  fleet scheduler should count a non-member caller in a series of its own. #494 left it
+  `RefuseWithoutCounter`, deferring to `SchedulerService::UncountedRefusals`, and that
+  service's reason argues against *mixing* the series rather than against counting at
+  all — on the surface a credential-guessing client reaches first. Two things have to
+  be settled together: the counter belongs in the service's own table beside the
+  existing decision, and the refusal has **two** paths (the pre-payload gate and
+  `Route` → `Gate`) which are byte-identical on the wire, so counting one alone
+  under-reports by an amount that varies with frame size.

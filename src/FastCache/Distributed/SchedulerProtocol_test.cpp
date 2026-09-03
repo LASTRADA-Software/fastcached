@@ -223,7 +223,7 @@ TEST_CASE("A payload that does not fill its declared length is refused", "[distr
     // a table keyed on the CODE would have to give these two the same answer, and
     // whichever answer it picked, one of these two lines would fail. That is the
     // rulebook's row-not-code rule, which until #494 had no live instance.
-    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedMalformedPayload) == 1);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedTruncated) == 1);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoWorker) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoCapacity) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesDuplicate) == 0);
@@ -266,7 +266,7 @@ TEST_CASE("A refusal the service decided is not counted a second time here", "[d
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted) == 0);
-    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedMalformedPayload) == 0);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedTruncated) == 0);
 }
 
 TEST_CASE("A whole register-heartbeat-lease-release exchange crosses the wire", "[distributed][scheduler][protocol]")
