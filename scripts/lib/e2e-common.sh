@@ -692,11 +692,23 @@ E2eNodeReadyMarker="compile node ready"
 wait_for_node_ready() {
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
     local seconds="${6:-$_e2e_wait_seconds}"
+    # A log is REQUIRED, and `-` is refused rather than passed through. It is the
+    # sentinel `wait_for_port` accepts in this very position, and two fixtures
+    # already pass it there -- so a call site converted from `wait_for_port`
+    # without noticing would reach `grep -q "$marker" -`, which reads the
+    # FIXTURE'S OWN STDIN once per poll, never matches, and ends the run as a
+    # readiness timeout for a node that was perfectly healthy.
+    [ "$logfile" != "-" ]         || fail "wait_for_node_ready needs a log to read the marker out of; ${what} was given '-'"
     local started="$SECONDS"
     wait_for_port "$host" "$port" "$pid" "$what" "$logfile" "$seconds"
     local remaining=$(( seconds - (SECONDS - started) ))
     [ "$remaining" -gt 0 ] || remaining=1
-    wait_for_log "$E2eNodeReadyMarker" "$pid" "$what" "$logfile" "$remaining"
+    # The readiness leg runs on what the bind left, so its verdict SAYS so. The
+    # budget it prints is otherwise a number no caller configured -- a slow start
+    # would be reported as "gave up ... of a 2s budget" against a stated 30, which
+    # misattributes a slow bind to a readiness stall and sends the reader to look
+    # for the wrong thing.
+    wait_for_log "$E2eNodeReadyMarker" "$pid"         "${what} (readiness, on the ${remaining}s left of a stated ${seconds}s)"         "$logfile" "$remaining"
 }
 
 # Stop a process and require it to actually exit, within a bound.

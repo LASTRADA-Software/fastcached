@@ -463,6 +463,31 @@ run_case() {
         echo "BUG: the wait returned for a node that had only bound"
         ;;
 
+    # And the THIRD verdict, because the helper's header claims there are two and
+    # the pair above cannot show it. Both of those stage the bind first, so a
+    # `wait_for_node_ready` reduced to its marker wait alone would pass them both
+    # -- exit 0 with the marker present, exit 1 with `to log:` in the output. The
+    # claim that "a stall before the bind and a stall between the bind and
+    # readiness are different faults, and the two remain two verdicts" had no
+    # reader until this row.
+    #
+    # A process that is ALIVE and binds nothing at all: the wait must expire in
+    # the PORT leg and say `to listen on`, not `to log`. That is the same
+    # both-directions discipline the marker rows use, applied to the predicates
+    # rather than to the text.
+    node-ready-refuses-unbound)
+        log="${scratch}/unbound.log"
+        : > "$log"
+        p="$(free_port)"
+        # No listener, deliberately. `sleep` is the whole stand-in: the wait needs
+        # a live pid so it reports a timeout rather than a death, and nothing is
+        # supposed to answer the port.
+        sleep 30 >/dev/null 2>&1 &
+        staged=$!
+        wait_for_node_ready 127.0.0.1 "$p" "$staged" "a node that never binds" "$log" 1
+        echo "BUG: the wait returned for a node that never bound"
+        ;;
+
     # --- `run_bounded` -------------------------------------------------------
     #
     # The helper that exists because `cluster-e2e.sh` bounded its probe with a
@@ -995,6 +1020,7 @@ socket_cases=(
     "http-refused|0|http_get returned non-zero for a refused connection"
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
+    "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"
 )
 
 echo "== the helpers, in real shells"
