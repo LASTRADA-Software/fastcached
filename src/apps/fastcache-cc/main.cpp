@@ -791,6 +791,30 @@ using Cc::CompileRun;
     return ProcessRunner().RunCaptureSplit(argv);
 }
 
+/// Run `argv` with the streams captured separately, asking the compiler to speak
+/// English.
+///
+/// **Only for a spawn whose output nobody but this process reads.** `VSLANG` selects
+/// `cl`'s diagnostic language, so this is what makes a compiler's `/showIncludes`
+/// notes parseable by a launcher that matches them against an English literal -- and
+/// it would just as happily anglicize the warnings a developer reads. A separate
+/// entry point rather than a flag on the one above, so that distinction is made at
+/// the call site and can be seen there (issue #692).
+///
+/// `1033` is `en-US`. Best effort by nature: `cl` falls back to whichever language
+/// pack IS installed when the requested one is absent, so a caller must still be
+/// able to tell from the OUTPUT that the request did not take --
+/// `Cc::CarriesUnreadableIncludeNotes` is how.
+/// @param argv Full invocation; argv[0] is the compiler.
+/// @return Exit code plus both captured streams.
+[[nodiscard]] CompileRun RunCaptureSplitInEnglish(std::span<std::string const> argv)
+{
+    std::array<Cc::EnvironmentAssignment, 1> const english { {
+        { .name = "VSLANG", .value = "1033" },
+    } };
+    return ProcessRunner().RunCaptureSplit(argv, english);
+}
+
 /// Replay captured child bytes on one of our own streams verbatim.
 ///
 /// Writes through the C `FILE*` in binary mode rather than `std::cout`/`std::cerr`:
@@ -1081,6 +1105,36 @@ struct SourceProbe
 {
     std::string preprocessed;                 ///< Preprocessor output, no line markers.
     std::vector<std::string> dependencyPaths; ///< Dependencies as the compiler spelled them.
+
+    /// Whether the probe's dependency record was READ, as opposed to reporting
+    /// nothing.
+    ///
+    /// `dependencyPaths` being empty answers two opposite questions at once -- this
+    /// build has no dependency mechanism, or this machine's compiler answered in a
+    /// language the launcher does not read (issue #692) -- and the manifest built
+    /// downstream is correct for the first and a claim about files nobody looked at
+    /// for the second. `Cc::ReportedDependencies` is where that distinction is
+    /// carried; the field is here because the probe is the only thing that can see
+    /// which it was.
+    bool dependenciesUnreadable { false };
+};
+
+/// What a probe learned about a compile's dependencies, without the text.
+///
+/// `SourceProbe` carries several megabytes of preprocessed source and is
+/// deliberately destroyed as soon as the key is computed. The two manifest writers
+/// run long after that, so this is the part that outlives it -- the paths, and
+/// whether the record they came from was READ at all.
+struct ProbedDependencies
+{
+    std::vector<std::string> paths; ///< Dependencies as the compiler spelled them.
+
+    /// The compiler reported dependencies and the launcher could not read them --
+    /// a localized `cl` whose notes do not begin with `Cc::IncludeNoteMarker`
+    /// (issue #692). Distinct from `paths` being empty, which is also what a build
+    /// with no dependency flags at all produces, because the two send an operator
+    /// to opposite places.
+    bool unreadable { false };
 };
 
 /// Preprocess the source (compiler-native, no line markers) AND collect the
@@ -1146,7 +1200,15 @@ struct SourceProbe
     // compiler's diagnostic lines into the hashed text, and the interleave point
     // of two independently-buffered streams is not stable run-to-run — which would
     // make the key nondeterministic and defeat all caching.
-    auto run = RunCaptureSplit(pp);
+    // English, because this run's output is read by nobody but this process: the
+    // `/EP` text goes into the key and the notes are parsed and dropped. `cl` prints
+    // `/showIncludes` notes in the language of whatever pack is installed, and the
+    // launcher matches them against a literal English marker -- so on a localized
+    // Visual Studio every note is invisible here, the key loses its dependency set,
+    // and no manifest is ever recorded (issue #692). The REAL compile is deliberately
+    // not run this way; its diagnostics are the developer's and stay in their
+    // language.
+    auto run = RunCaptureSplitInEnglish(pp);
     if (run.exitCode != 0)
         return std::nullopt;
 
@@ -1183,8 +1245,24 @@ struct SourceProbe
     auto errorNotes = Cc::ParseIncludePaths(run.err);
     split.notePaths.insert(
         split.notePaths.end(), std::make_move_iterator(errorNotes.begin()), std::make_move_iterator(errorNotes.end()));
+
+    // Asked only when nothing was extracted, and only to explain THAT. The spawn
+    // above requested English and `cl` honours `VSLANG` unless the pack is missing,
+    // so reaching this with an empty set on a machine whose compiler is still
+    // localized is the residue the request cannot cover -- and the difference
+    // between "this compile has no dependencies" and "its dependencies are in a
+    // language I do not read" is the whole of what an operator needs (issue #692).
+    //
+    // Only stderr is examined. Stdout carries the preprocessed SOURCE on a stream
+    // driver, and this predicate is deliberately loose enough that a source line
+    // ending in a path would trip it -- harmless for a sentence, misleading as a
+    // diagnosis of the compiler.
+    auto const unreadable = split.notePaths.empty() && Cc::CarriesUnreadableIncludeNotes(run.err);
+
     reconciler.All(split.notePaths);
-    return SourceProbe { .preprocessed = std::move(split.preprocessed), .dependencyPaths = std::move(split.notePaths) };
+    return SourceProbe { .preprocessed = std::move(split.preprocessed),
+                         .dependencyPaths = std::move(split.notePaths),
+                         .dependenciesUnreadable = unreadable };
 }
 
 /// This compiler's version banner.
@@ -1453,10 +1531,21 @@ void NoteNoManifest(std::string_view reason)
 /// Record the direct-mode manifest for a compile whose object bytes are already
 /// stored, so the next compile of this TU can skip preprocessing.
 ///
-/// Called from BOTH the hit and the miss path. On a miss the include text comes
-/// from the compiler that just ran; on a hit it comes from the cached value's
-/// replayed streams — either way it names the same headers, and neither requires
-/// an extra compiler invocation. The manifest records the object's ordinary key
+/// Called from BOTH the hit and the miss path, and from the same source on each:
+/// the dependency set the preprocess probe already produced for the cache key. The
+/// probe ran this very translation unit with these very flags moments earlier, so
+/// no extra compiler invocation is needed and no console text has to be re-parsed.
+///
+/// It used to parse the compiler's captured streams instead -- the real compile's on
+/// a miss, the cached value's REPLAYED ones on a hit -- and both readings had a
+/// locale in them. The miss path matched `cl`'s notes against a literal English
+/// marker, so a localized Visual Studio recorded no manifest ever (issue #692); the
+/// hit path parsed text the PRODUCER's compiler wrote, so a value produced on a
+/// German machine was unreadable on an English one and vice versa. Taking the
+/// probe's set closes both, because the probe is asked in English on a spawn whose
+/// output nobody reads.
+///
+/// The manifest records the object's ordinary key
 /// rather than causing a second copy of the object to be stored: see
 /// DirectManifest::objectKey for why duplicating it is not affordable.
 /// @param cfg             Launcher config.
@@ -1466,8 +1555,7 @@ void NoteNoManifest(std::string_view reason)
 ///                            path the driver reported resolves against it.
 /// @param relativizedArgs     The relativized compile arguments.
 /// @param toolchainStamp      The toolchain identity.
-/// @param includeTextOut      Captured stdout (may carry the include notes).
-/// @param includeTextErr      Captured stderr (cl puts include notes here).
+/// @param probed              The preprocess probe's own dependency answer.
 /// @param objectKeyForPointer Key the object is already stored under; recorded in
 ///                            the manifest so the object is never stored twice.
 /// @param reconciler      Translates a driver's spelling into this build's.
@@ -1477,8 +1565,7 @@ void RecordManifest(Config const& cfg,
                     std::filesystem::path const& workingDirectory,
                     std::vector<std::string> const& relativizedArgs,
                     std::string const& toolchainStamp,
-                    std::string_view includeTextOut,
-                    std::string_view includeTextErr,
+                    ProbedDependencies const& probed,
                     std::string_view objectKeyForPointer,
                     Cc::RootReconciler& reconciler)
 {
@@ -1496,24 +1583,11 @@ void RecordManifest(Config const& cfg,
         return;
     }
 
-    // Either stream may carry the notes (clang-cl uses stdout, cl uses stderr);
-    // parse both rather than guessing which compiler produced this value.
-    auto includes = Cc::ParseIncludePaths(includeTextOut);
-    auto const fromErr = Cc::ParseIncludePaths(includeTextErr);
-    includes.insert(includes.end(), fromErr.begin(), fromErr.end());
-
-    // GNU drivers report nothing on either stream — their dependencies go to the
-    // depfile. Without this, direct mode could never populate on POSIX: every
-    // compile would pay for a manifest lookup that always missed.
-    if (includes.empty())
-        if (auto const depText = ReadDepFile(cmd))
-            includes = Cc::ParseDepFilePaths(*depText);
-
-    // Reconciled here rather than trusted from the caller. The captured streams
-    // arrive already reconciled, but the depfile read above comes straight off
-    // disk — and resolution is memoized and idempotent, so guaranteeing this
-    // function's own inputs costs a hash lookup per path.
-    reconciler.All(includes);
+    // The probe's set, taken as it stands. It is already reconciled -- `Preprocess`
+    // does that at its own boundary -- and it already covers both driver families,
+    // the depfile one and the stream one, which is why the two parses and the
+    // depfile fallback that used to be here are gone rather than moved.
+    auto includes = probed.paths;
 
     // Asked here as well as on the key path, because a manifest is the direct-mode
     // half of the same promise: an entry naming a path this host could not read is
@@ -1538,27 +1612,16 @@ void RecordManifest(Config const& cfg,
     // which is what makes that a precondition rather than a comment here.
     //
     // Whether a dependency record reached us AT ALL is stated rather than left to be
-    // inferred from the vector being empty, and this function is the only place that
-    // knows. Nothing came back means we DID NOT OBSERVE the dependencies, not that
-    // there are none: the two are different states and an empty vector renders them
-    // identically (issue #512). This function genuinely cannot tell them apart --
-    // a GNU compile with no `-MD`/`-MF` produces no depfile and no notes, and so
-    // does an MSVC compile whose notes carry a prefix `Cc::IncludeNoteMarker` does
-    // not match, which is every note a localized `cl` prints. Reading the second as
-    // "this TU includes nothing" would record a manifest asserting the TU alone on
-    // every compile on that machine, and such a manifest revalidates forever and
-    // serves its object into any checkout that computes the key (issue #368).
-    //
-    // The depfile branch above looks like the exception and is not, which is worth
-    // saying because it is the obvious objection: `ReadDepFile` returning a value
-    // seems to BE the observation, so an empty parse of it could be read as an
-    // honest empty set. It cannot. A GNU depfile lists the translation unit among
-    // its own prerequisites, so a real compile never parses to nothing -- an empty
-    // parse means the file was truncated, half-written or in a shape
-    // `ParseDepFilePaths` does not recognise, which is "I could not read it" again
-    // rather than "there is nothing to read". Both routes into this line therefore
-    // reach it for the same reason, and neither of them can honestly say
-    // `Observed({})`.
+    // inferred from the vector being empty. Nothing came back means we DID NOT
+    // OBSERVE the dependencies, not that there are none: the two are different states
+    // and an empty vector renders them identically (issue #512). The probe cannot
+    // tell them apart -- a GNU compile with no `-MD`/`-MF` produces no depfile and no
+    // notes, and so does an MSVC compile whose notes carry a prefix
+    // `Cc::IncludeNoteMarker` does not match, which is every note a localized `cl`
+    // prints when `VSLANG` could not be honoured. Reading either as "this TU includes
+    // nothing" would record a manifest asserting the TU alone on every compile on
+    // that machine, and such a manifest revalidates forever and serves its object
+    // into any checkout that computes the key (issue #368).
     //
     // Said with a VALUE rather than by returning early, which is what this used to
     // do. That left `BuildManifest` -- a library entry point -- correct only because
@@ -1583,7 +1646,20 @@ void RecordManifest(Config const& cfg,
         // whole investigation, and the answer is one path. This said
         // "uncanonicalizable source or include" for every refusal alike, which named
         // neither the file nor which of them it was (issue #68).
-        NoteNoManifest(Cc::DescribeManifestFailure(manifest.error()));
+        //
+        // One state gets a sharper sentence than the fault table can carry, and it
+        // is the one an operator is least able to guess: the compiler DID report its
+        // dependencies and this launcher could not read them. `DepsNotObserved`'s own
+        // label -- "the compile produced no dependency record" -- is true of what was
+        // observed and false about the world there, which is the string issue #692
+        // exists to stop printing for this case. The refusal still comes from the
+        // seam; only the wording is the caller's, because the provenance is.
+        NoteNoManifest(probed.unreadable
+                           ? std::format("the compiler reported dependencies in a language this launcher does not read "
+                                         "(its notes do not begin with \"{}\"), so direct mode cannot populate: {}",
+                                         Cc::IncludeNoteMarker,
+                                         resolvedSource)
+                           : Cc::DescribeManifestFailure(manifest.error()));
         return;
     }
 
@@ -2076,6 +2152,15 @@ void RecordManifest(Config const& cfg,
     // no `#include` at all, so the client writes the dependency record.
     std::vector<std::string> dispatchDependencies;
     bool const dispatchConfigured = DispatchConfigured(cfg);
+
+    // What the probe learned about this compile's dependencies, carried past the
+    // block the probe itself dies in.
+    //
+    // Both readers of it are outside that block: the manifest recorded on a MISS
+    // after the compile, and the one backfilled on a HIT. Both used to parse the
+    // compiler's captured console text instead, and both readings had a locale in
+    // them -- see `RecordManifest` (issue #692).
+    ProbedDependencies probed;
     {
         auto probe = Preprocess(cmd, argv, reconciler);
         if (!probe.has_value())
@@ -2179,7 +2264,13 @@ void RecordManifest(Config const& cfg,
         // the probe is the full list, which only a dispatch reads and which would
         // otherwise be dropped with the block.
         if (dispatchConfigured)
-            dispatchDependencies = std::move(probe->dependencyPaths);
+            dispatchDependencies = probe->dependencyPaths;
+
+        // Copied just above rather than moved when a scheduler is configured, and
+        // moved here in every case: two consumers want the same full list, and the
+        // manifest's is the one that runs on every build rather than only on a
+        // distributed one.
+        probed = { .paths = std::move(probe->dependencyPaths), .unreadable = probe->dependenciesUnreadable };
     }
     invocation.preprocessMs = MsSince(preprocessStarted);
 
@@ -2244,16 +2335,8 @@ void RecordManifest(Config const& cfg,
                 // /showIncludes text names exactly the headers this object depends on, so
                 // no compiler run is needed to record them.
                 if (cfg.direct)
-                    RecordManifest(cfg,
-                                   cmd,
-                                   layout,
-                                   workingDirectory,
-                                   relativizedArgs,
-                                   toolchainStamp,
-                                   materialized.replayOut,
-                                   materialized.replayErr,
-                                   key,
-                                   reconciler);
+                    RecordManifest(
+                        cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
 
                 // The preprocessed-key hit, verified exactly as the direct-mode one
                 // is. Both paths, because a wrong object served through either is the
@@ -2422,16 +2505,7 @@ void RecordManifest(Config const& cfg,
     // lands on RAM where compression cannot help. A direct hit therefore costs one
     // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
-        RecordManifest(cfg,
-                       cmd,
-                       layout,
-                       workingDirectory,
-                       relativizedArgs,
-                       toolchainStamp,
-                       includeTextOut,
-                       includeTextErr,
-                       key,
-                       reconciler);
+        RecordManifest(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
     return code;
 }
 

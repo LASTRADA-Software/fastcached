@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -137,4 +138,87 @@ TEST_CASE("RunCaptureSplit on an empty argv fails instead of spawning anything")
 {
     auto const runner = MakeProcessRunner();
     CHECK(runner->RunCaptureSplit({}).exitCode == -1);
+}
+
+namespace
+{
+/// A script that echoes one named environment variable and then `PATH`.
+///
+/// `PATH` is the inherited one because every host this runs on has it and no test
+/// has to arrange it. The two shells spell an expansion differently and neither
+/// spelling works under the other, which is the trap `ShellCommand` records above.
+/// @param named The variable to echo first.
+/// @return The invocation, in the host shell's dialect.
+[[nodiscard]] std::vector<std::string> EchoEnvironment(std::string const& named)
+{
+#if defined(_WIN32)
+    return ShellCommand("echo %" + named + "%& echo %PATH%");
+#else
+    return ShellCommand("echo \"$" + named + "\"; echo \"$PATH\"");
+#endif
+}
+} // namespace
+
+TEST_CASE("A spawn's added environment is layered on the inherited one, not substituted for it")
+{
+    // The property the overload exists for, and the one that is expensive to get
+    // wrong in the quiet direction. A spawn that REPLACED the environment would pass
+    // any test that only looked for the added variable -- and on Windows it would
+    // lose `INCLUDE`, so every compile fails with `C1034` and a compiler that cannot
+    // find `cstddef` reports a confident syntax error rather than a missing
+    // environment. Both halves are therefore asserted: the addition ARRIVED, and the
+    // inherited environment SURVIVED.
+    auto const runner = MakeProcessRunner();
+    std::array<EnvironmentAssignment, 1> const added { {
+        { .name = "FASTCACHE_ENV_PROBE", .value = "layered" },
+    } };
+
+    auto const run = runner->RunCaptureSplit(EchoEnvironment("FASTCACHE_ENV_PROBE"), added);
+
+    REQUIRE(run.exitCode == 0);
+    CHECK(run.out.contains("layered"));
+
+    // The inherited half, and the assertion is stricter than it first needs to be
+    // for a measured reason. Checking that the second line is merely LONG passes
+    // under a replaced environment: `cmd.exe` echoes an unset variable as the
+    // literal `%PATH%`, which is nine bytes with its terminator, and the test went
+    // green against a runner that had dropped the inherited block entirely. What
+    // cannot survive replacement is a directory SEPARATOR -- every real `PATH` names
+    // directories, and neither `%PATH%` nor an empty POSIX expansion contains one.
+    auto const firstLine = run.out.find('\n');
+    REQUIRE(firstLine != std::string::npos);
+    auto const inheritedPath = run.out.substr(firstLine + 1);
+    CHECK(inheritedPath.find_first_of("/\\") != std::string::npos);
+}
+
+TEST_CASE("A spawn's added environment overrides an inherited variable of the same name")
+{
+    // Additive does not mean appended. A duplicate name is resolved by the
+    // implementation on POSIX, so leaving both entries in place would make the
+    // override silently ineffective on some libc; on Windows a block carrying one
+    // name twice is simply malformed. `PATH` is used because it is guaranteed to be
+    // inherited, which makes this a real collision rather than a constructed one.
+    auto const runner = MakeProcessRunner();
+    std::array<EnvironmentAssignment, 1> const overriding { {
+        { .name = "PATH", .value = "fastcache-overrode-this" },
+    } };
+
+    auto const run = runner->RunCaptureSplit(EchoEnvironment("PATH"), overriding);
+
+    REQUIRE(run.exitCode == 0);
+    CHECK(run.out.contains("fastcache-overrode-this"));
+}
+
+TEST_CASE("A spawn with no additions inherits what it would have inherited anyway")
+{
+    // The no-additions path is the one every ordinary compile takes, and it must not
+    // become a reconstruction of the environment that could differ from the real
+    // one. Asserted through the OVERLOAD rather than the original, because that is
+    // where a rebuilt block would be handed over.
+    auto const runner = MakeProcessRunner();
+    auto const run = runner->RunCaptureSplit(EchoEnvironment("PATH"), {});
+
+    REQUIRE(run.exitCode == 0);
+    CHECK_FALSE(run.out.contains("fastcache-overrode-this"));
+    CHECK(run.out.size() > 8);
 }

@@ -30,6 +30,17 @@ struct CompileRun
     std::string err; ///< Captured stderr (empty for combined captures).
 };
 
+/// One environment variable a spawn ADDS to the environment it inherits.
+///
+/// A named pair rather than a `"NAME=VALUE"` string, because the joining differs by
+/// platform -- Windows wants one `\0`-separated block, POSIX an array -- and a
+/// caller that pre-joined would be writing one of those two by hand.
+struct EnvironmentAssignment
+{
+    std::string name;  ///< The variable to set.
+    std::string value; ///< What to set it to.
+};
+
 /// Spawns child processes and captures their output.
 ///
 /// This is the launcher's process seam. Spawning a compiler is ambient I/O
@@ -72,6 +83,44 @@ class IProcessRunner
     /// @param argv Full invocation; argv[0] is the executable.
     /// @return Exit code and the two captured streams.
     [[nodiscard]] virtual CompileRun RunCaptureSplit(std::span<std::string const> argv) = 0;
+
+    /// The same, with variables ADDED to the environment the child inherits.
+    ///
+    /// Additive, never a replacement, and that is the load-bearing word. A spawn
+    /// that replaced the environment would lose `INCLUDE`, which on Windows is the
+    /// difference between a compile and `C1034` -- and a compiler that cannot find
+    /// `cstddef` reports a confident syntax error rather than a missing environment.
+    /// An assignment naming a variable the parent already has overrides that one;
+    /// everything else is inherited untouched.
+    ///
+    /// It exists for `VSLANG`, which makes `cl` speak English on a spawn whose output
+    /// only the launcher reads (issue #692). It must never be used on a spawn whose
+    /// output reaches the developer: forcing English there would trade a silent
+    /// performance loss for silently anglicizing every diagnostic they read.
+    ///
+    /// **Honouring this is best effort by nature, not by omission.** `cl` ignores
+    /// `VSLANG` when the requested language pack is not installed, so no caller may
+    /// conclude from a successful spawn that the child obeyed. Every caller must be
+    /// able to tell from the OUTPUT that it did not -- which is also what makes the
+    /// default implementation below honest rather than a silent no-op.
+    ///
+    /// An overload rather than a parameter on the one above, deliberately: scripted
+    /// fakes and the compile node's own caller share this interface and none of them
+    /// has an environment to add to. Defaulted for the same reason. A runner that
+    /// really spawns MUST override it.
+    ///
+    /// @param argv        Full invocation; argv[0] is the executable.
+    /// @param environment Variables to add to the inherited environment.
+    /// @return Exit code and the two captured streams.
+    [[nodiscard]] virtual CompileRun RunCaptureSplit(std::span<std::string const> argv,
+                                                     std::span<EnvironmentAssignment const> environment)
+    {
+        // Forwarding rather than ignoring: a runner with no process to spawn has no
+        // environment to set. A caller cannot depend on the variable having taken
+        // effect in either case, which is the contract stated above.
+        (void) environment;
+        return RunCaptureSplit(argv);
+    }
 };
 
 /// Create the process runner for the host platform.
