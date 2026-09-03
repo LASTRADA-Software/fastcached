@@ -234,9 +234,7 @@ namespace
     };
 
     constexpr EnumTable<DispatchStatus, DispatchRecordingRow> DispatchRecordingTable { {
-        DispatchRecordingRow { .reason = {},
-                               .status = DispatchStatus::Compiled,
-                               .outcome = DispatchOutcome::Dispatched },
+        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Compiled, .outcome = DispatchOutcome::Dispatched },
         DispatchRecordingRow { .reason = "the fleet declined this compile",
                                .status = DispatchStatus::Declined,
                                .outcome = DispatchOutcome::Declined },
@@ -248,9 +246,7 @@ namespace
         // that rule requires -- a copy here would print the identical sentence under
         // two headings of one report, and two rankings of one event read as two
         // events. The state says it: `crossed reply` is a line no other state emits.
-        DispatchRecordingRow { .reason = {},
-                               .status = DispatchStatus::Mismatched,
-                               .outcome = DispatchOutcome::Mismatched },
+        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Mismatched, .outcome = DispatchOutcome::Mismatched },
     } };
     static_assert(RowsInEnumeratorOrder(DispatchRecordingTable, &DispatchRecordingRow::status),
                   "DispatchRecordingTable must hold exactly one row per DispatchStatus, in enumerator order");
@@ -266,7 +262,7 @@ namespace
         std::size_t widest = 0;
         for (auto const& row: DispatchTable)
             if (row.reach != FleetReach::NoFleet)
-                widest = (std::max)(widest, row.label.size());
+                widest = (std::max) (widest, row.label.size());
         return widest;
     }
     constexpr std::size_t DispatchLabelWidth = WidestDispatchLabel();

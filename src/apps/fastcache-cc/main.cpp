@@ -1801,9 +1801,9 @@ void RecordManifest(Config const& cfg,
         // `Refused` for the reason the comment above gives: sending it would report
         // as `NoWorker`, which reads as "the fleet has nobody on your toolchain".
         // The tally must not repeat that misdirection.
-        return DeclineDispatch(RefusedHere("this toolchain has no usable fingerprint"),
-                               std::format("not dispatched ({}); compiling locally",
-                                           Cc::ExplainDefect(identity.defect).reason));
+        return DeclineDispatch(
+            RefusedHere("this toolchain has no usable fingerprint"),
+            std::format("not dispatched ({}); compiling locally", Cc::ExplainDefect(identity.defect).reason));
 
     auto const exchange = Cc::MakeTcpExchange(Notice());
     auto const outcome = Cc::Dispatch(*exchange,
@@ -2531,8 +2531,7 @@ int main(int argc, char** argv)
     // node's upstream-store figure. Every path that gets as far as asking overwrites
     // this; every path that does not leaves "a fleet was configured and this compile
     // never reached it", which is a different fact again.
-    invocation.dispatch =
-        DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
+    invocation.dispatch = DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
 
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
