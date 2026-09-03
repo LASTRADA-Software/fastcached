@@ -152,6 +152,14 @@ endif()
 # dependency cache BY CONSTRUCTION -- that is what makes the walk sound here and unsound
 # in a working checkout -- so the fallback is a plain recursive glob with the build-tree
 # names still excluded, and it says which mode produced the answer.
+#
+# The fallback is NOT decorative, and it is worth saying where it gets exercised, because
+# a check with two enumeration paths of which only one is ever taken has an untested half
+# that will be reached exactly once, in anger. Two routes reach it: a release tarball, and
+# **inspecting a merge before it lands** -- `git merge-tree --write-tree` plus `git
+# archive` materialises a tree with no index, which is how #685 first ran this half. It
+# agreed with the git path, and the selftest asserts the MODE on both sides so that
+# agreement is not luck.
 if(NOT testFiles)
     set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
     file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
