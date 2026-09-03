@@ -1455,8 +1455,12 @@ TEST_CASE("CompilerWorkingDirectory keeps the symlinked spelling a driver report
 #if !defined(_WIN32)
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, CompilerWorkingDirectory(physical, logical));
     REQUIRE(mapped.has_value());
-    CHECK(mapped->directory == logical);
-    CHECK(mapped->replacement == ".");
+    // `Unwrap`, not `mapped->`: the pinned clang-tidy reports a bare `operator->` as
+    // `bugprone-unchecked-optional-access` whatever the `REQUIRE` one line above
+    // established, and neither MSVC nor GCC says a word about it.
+    auto const& pair = FastCache::Testing::Unwrap(mapped);
+    CHECK(pair.directory == logical);
+    CHECK(pair.replacement == ".");
 #endif
 
     std::filesystem::remove_all(base);
