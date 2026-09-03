@@ -316,7 +316,7 @@ struct FrameServer::State
             entry->inResponder = true;
     }
 
-    /// Leave the responder, and take any explanation a sweep left owing.
+    /// Leave the responder, and report whether a sweep left an explanation owing.
     ///
     /// One call and one lock rather than a clear followed by a query, so nothing can
     /// run between them. Nothing could anyway -- both this and the sweeper live on the
@@ -324,8 +324,25 @@ struct FrameServer::State
     /// and this line -- but a two-step version would make that a property of the
     /// caller's statement order rather than of this function.
     ///
-    /// TAKING the obligation is what keeps `CloseExpiredDeferrals` from closing the
-    /// socket underneath the refusal this return value is about to cause.
+    /// **`explainBy` is REPORTED and deliberately not disengaged, and the first
+    /// version of this took it.** Taking it looked right -- the obligation is about to
+    /// be settled -- and it opened the hole `CloseExpiredDeferrals` exists to close,
+    /// one statement past that function's guard. `swept` is already true and is never
+    /// cleared, so `CloseOverdue` skips the entry; with `explainBy` disengaged too,
+    /// `CloseExpiredDeferrals` skips it as well, and the `co_await WriteAll` that
+    /// follows is then outside EVERY bound this server has. A peer that stops draining
+    /// fills its receive window, that write parks, and the descriptor, the coroutine
+    /// frame, the connection slot and this entry are held for the life of the process
+    /// -- which is exactly the regression the grace was added to prevent, and which
+    /// the old unconditional close had bounded.
+    ///
+    /// So the deadline stays armed across the write. It covers the whole deferred
+    /// tail, waiting for `Answer` and delivering the refusal alike, which is one
+    /// deadline with one meaning rather than two. A sweep that fires mid-write closes
+    /// the socket, the parked write resumes with a failure, nothing is counted, and
+    /// the connection ends -- the peer that was not reading gets cut off, which is the
+    /// bound working. `Untrack` erases the entry a few statements later, so nothing
+    /// has to remember to disengage it.
     /// @param socket The tracked socket.
     /// @return True when this connection was swept and still owes its peer a reason.
     [[nodiscard]] bool LeaveResponder(ISocket* socket)
@@ -335,7 +352,7 @@ struct FrameServer::State
         if (entry == nullptr)
             return false;
         entry->inResponder = false;
-        return std::exchange(entry->explainBy, std::nullopt).has_value();
+        return entry->explainBy.has_value();
     }
 
     /// Deregister a socket. Must happen before its owner destroys it.
@@ -654,12 +671,20 @@ namespace
     /// without a counter, because the deadline is the endpoint's own fact and the
     /// endpoint already counts both halves of it -- see
     /// `Node::AnswerDeadlineIsTheEndpointsRationale`.
+    /// **The window is PASSED, not re-asked**, and the first version re-asked it four
+    /// lines below the comment saying why not to. `RequestTimeout` is a virtual on a
+    /// surface that may be reconfigured, so a second call can answer a different
+    /// number from the one that armed the deadline and sized the grace -- and the
+    /// refusal would then name a window that did not expire, sending an operator to
+    /// tune the wrong one. The serve loop reads it once and carries it here.
     /// @param state The server state, for the surface and its name.
     /// @param opRaw The verb whose window expired.
+    /// @param window That verb's window, as read when the deadline was armed.
     /// @return The encoded refusal. Never empty.
-    [[nodiscard]] std::vector<std::byte> DeadlineRefusalReply(FrameServer::State const& state, std::uint8_t opRaw)
+    [[nodiscard]] std::vector<std::byte> DeadlineRefusalReply(FrameServer::State const& state,
+                                                              std::uint8_t opRaw,
+                                                              std::chrono::milliseconds window)
     {
-        auto const window = state.responder.RequestTimeout(opRaw);
         return state.responder.EndpointRefusalReply(
             EndpointRefusal::AnswerDeadline,
             opRaw,
@@ -970,7 +995,7 @@ namespace
                 // rather than agreed.
                 if (state->LeaveResponder(socket.get()))
                 {
-                    if (co_await WriteAll(socket.get(), DeadlineRefusalReply(*state, decoded->opRaw)))
+                    if (co_await WriteAll(socket.get(), DeadlineRefusalReply(*state, decoded->opRaw, answerWindow)))
                         // Counted only when it went OUT. A peer that had already hung
                         // up was told nothing, and a row saying otherwise would make
                         // the gap between this and the sweep row mean something else.

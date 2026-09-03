@@ -886,15 +886,27 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
-    // Held past the deadline AND past a sweep, then let go.
+    // Held until the sweep has actually HAPPENED, then let go.
     //
-    // Both halves are needed and the second is what a first attempt got wrong: an
+    // **Waited for, not slept through, and the fixed sleep was wrong twice.** An
     // expired deadline does nothing until the sweeper looks, and it looks every
-    // `SweepInterval`. A 400ms hold exceeded the 100ms window by four times over, was
-    // never swept, and the case failed -- reporting the fix as broken when what was
-    // wrong was the fixture's arithmetic. Derived from the cadence rather than guessed
-    // at a number, so it cannot silently stop covering the sweep if that cadence moves.
-    std::this_thread::sleep_for(FrameServer::SweepInterval * 2);
+    // `SweepInterval` -- so a first attempt held 400 ms, exceeded the 100 ms window
+    // four times over, was never swept, and reported the fix as broken when the
+    // fixture's arithmetic was. A sleep of `SweepInterval * 2` fixed that and then
+    // broke the other way once the sweep learned to DEFER: the deferral is bounded by
+    // `ExplanationGraceFor(100ms)`, which floors at one sweep interval, so the entry
+    // was closed on the following tick and the release landed after the connection
+    // was already gone. Two constants either side of a window neither of them names.
+    //
+    // Waiting on the counter removes both. It is the STAGE this case is about -- the
+    // sweep has observed this connection -- and the release then happens promptly
+    // inside the grace rather than at a guessed offset from it. Bounded, and it says
+    // what it waited for.
+    auto const sweptBy = std::chrono::steady_clock::now() + std::chrono::seconds { 30 };
+    while (fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0
+           && std::chrono::steady_clock::now() < sweptBy)
+        std::this_thread::sleep_for(std::chrono::milliseconds { 10 });
+    REQUIRE(fix.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 1);
     worker.runner.Release();
 
     // The window the RESPONDER named is what expired, and the client is told which
