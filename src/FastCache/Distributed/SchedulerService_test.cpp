@@ -292,6 +292,35 @@ TEST_CASE("A member registers, heartbeats and is leased", "[distributed][schedul
     CHECK_FALSE(Unwrap(grant).leaseToken.empty());
 }
 
+TEST_CASE("A heartbeat reply states the term this scheduler is leading under", "[distributed][scheduler][epoch]")
+{
+    // The scheduler half of #421, and the assertion is that the reply carries THE
+    // TERM THIS SERVICE IS IN -- not that the payload decodes, which a round trip
+    // against a literal would also satisfy. So the role is set to a term nothing else
+    // in this file uses and the reply is read back through the production decoder.
+    Leading fleet;
+    fleet.service.SetRole(SchedulerRole::Leader, {}, 23);
+
+    auto const admitted = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100"));
+    REQUIRE(admitted.status == Wire::Status::Ok);
+    auto const workerId = std::string { Wire::AsStringView(admitted.payload) };
+
+    auto const beat = fleet.service.Heartbeat(Insider, workerId, NodeLoad {});
+    REQUIRE(beat.status == Wire::Status::Ok);
+
+    auto const stated = Wire::DecodeSchedulerTerm(beat.payload);
+    CHECK(stated.state == Wire::SchedulerTermState::Stated);
+    CHECK(stated.term == 23);
+
+    // And it FOLLOWS the role rather than being stamped once: an election is the only
+    // event that moves this, and a worker holding the pre-election term is exactly
+    // what the channel exists to correct.
+    fleet.service.SetRole(SchedulerRole::Leader, {}, 24);
+    auto const later = fleet.service.Heartbeat(Insider, workerId, NodeLoad {});
+    REQUIRE(later.status == Wire::Status::Ok);
+    CHECK(Wire::DecodeSchedulerTerm(later.payload).term == 24);
+}
+
 TEST_CASE("A heartbeat's history is routed under the machine, not the worker id", "[distributed][scheduler][fleethistory]")
 {
     // A machine with two `--toolchain` flags registers twice and heartbeats twice

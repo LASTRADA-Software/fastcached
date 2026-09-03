@@ -75,27 +75,58 @@ class StubRunner final: public IProcessRunner
     }
 };
 
+/// Which of the two production lease policies a fixture runs under.
+///
+/// A choice rather than a `LeaseValidator` parameter, because the validator that
+/// checks needs a `KnownSchedulerTerm` to borrow and that object has to outlive it.
+/// Handed in from a case, the lifetime is a rule somebody has to remember at six call
+/// sites; built by the fixture from its own member, it is member ordering and cannot
+/// be got wrong. Both values name production factories -- neither is a lambda written
+/// here.
+enum class LeasePolicy : std::uint8_t
+{
+    /// `UncheckedLeaseValidator()`: a node with no cluster key. The default, because
+    /// most cases in this file are about codecs, framing and fingerprints and a lease
+    /// they would have to mint first is noise.
+    Unchecked,
+    /// `SignedLeaseValidator()`: a node that holds the key and checks what it is
+    /// handed.
+    Verifying,
+};
+
+/// Build one of the two production lease validators.
+///
+/// Declared here and defined below the lease constants it needs, rather than moving
+/// those up: they belong with the other lease fixtures, and this is the file's one
+/// forward reference.
+/// @param lease Which policy.
+/// @param term What the verifying one borrows; the unchecked one ignores it.
+/// @return The validator.
+[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term);
+
 struct Fixture
 {
     StubRunner runner;
     FastCache::Testing::ScratchDirectory scratch { "fc-wp" };
     CompileJobRunner jobs;
     AtomicMetricsSink metrics;
+
+    /// What this worker has been told about the scheduler's term.
+    ///
+    /// Declared BEFORE `worker` on purpose: the validator borrows it, so member order
+    /// is what guarantees it outlives the thing holding the reference. The epoch cases
+    /// teach it and then read what the worker does about it.
+    Distributed::KnownSchedulerTerm term;
+
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
     ///        passes `AvailableCodecs()`, and a case can narrow it to assert what a
     ///        worker without a codec answers.
-    /// @param validator The lease policy. The default is `UncheckedLeaseValidator()`
-    ///        -- the production validator of a node with no cluster key, spelled by
-    ///        calling the production factory rather than by writing an accept-all
-    ///        lambda here. Most cases in this file are about codecs, framing and
-    ///        fingerprints, and a lease they would have to mint first is noise; the
-    ///        cases that ARE about the lease pass `SignedLeaseValidator`, which is
-    ///        the other production shape.
-    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeaseValidator validator = UncheckedLeaseValidator()):
+    /// @param lease Which production lease policy to build; see `LeasePolicy`.
+    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, std::move(validator), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(lease, term), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -142,6 +173,13 @@ inline constexpr std::string_view DefaultSource = "int main(){return 0;}";
 /// depends on the order they ran in.
 ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
 
+/// The term every grant here is minted under unless a case says otherwise.
+///
+/// Not zero, so a case about an OLDER term has somewhere below it to stand: with the
+/// default at zero the "issued by a deposed scheduler" direction would be
+/// unrepresentable and the epoch cases could only ever test the accepting half.
+constexpr std::uint64_t GrantTerm = 4;
+
 /// A grant, signed the way a scheduler signs one.
 ///
 /// Two actors: this mints as the SCHEDULER, and the worker under test verifies. A
@@ -151,11 +189,13 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
 /// @param fingerprint The toolchain it authorizes.
 /// @param validFor How long past `LeaseClock()` it lasts; negative for an expired one.
 /// @param cluster Which fleet mints it; defaults to the one the worker belongs to.
+/// @param epoch The scheduler term it is issued under.
 /// @return The token, as a client would present it.
 [[nodiscard]] std::string GrantFor(std::string_view endpoint,
                                    std::string_view fingerprint = "gcc-13",
                                    std::chrono::seconds validFor = std::chrono::minutes { 10 },
-                                   std::string_view cluster = ThisCluster)
+                                   std::string_view cluster = ThisCluster,
+                                   std::uint64_t epoch = GrantTerm)
 {
     return FastCache::Distributed::MintLeaseToken(
         TestClusterKey(),
@@ -165,14 +205,14 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
                                               .key = "obj-abc",
                                               .expiresAt = LeaseClock.Now() + validFor,
                                               .clusterId = std::string { cluster },
-                                              .epoch = 4 });
+                                              .epoch = epoch });
 }
 
-/// A worker that holds the cluster key and therefore checks what it is handed.
-/// @return The production validator, built the way `main.cpp` builds it.
-[[nodiscard]] LeaseValidator VerifyingValidator()
+LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term)
 {
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock);
+    if (lease == LeasePolicy::Unchecked)
+        return UncheckedLeaseValidator();
+    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, term);
 }
 
 /// A COMPILE frame carrying `source` as its source field, already enveloped.
@@ -1120,7 +1160,7 @@ TEST_CASE("A lease nobody signed buys no compile", "[worker-protocol][lease]")
     //
     // This case was written as a REPRODUCTION asserting `Status::Ok` and passed. It
     // is the same frame; only the expected answer moved.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const answer =
         fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, "not-a-lease-at-all"));
@@ -1150,7 +1190,7 @@ TEST_CASE("A lease signed for ANOTHER worker is refused here", "[worker-protocol
     // The endpoint is the load-bearing field. It is inside the MAC precisely so a
     // token captured on the way to one worker cannot be replayed against every other
     // worker trusting the same key.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const answer = fix.worker.Answer(
         CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor("some-other-worker:6675")));
@@ -1175,7 +1215,7 @@ TEST_CASE("A lease that has expired past the skew slack is refused", "[worker-pr
     // for a fleet whose machines are not all NTP-managed, so a grant that lapsed one
     // second ago is still honoured and a case asserting otherwise would be asserting
     // the wrong contract.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const stale =
         GrantFor(ThisWorker, "gcc-13", -(FastCache::Distributed::LeaseTokenClockSkewSlack + std::chrono::seconds { 1 }));
@@ -1192,7 +1232,7 @@ TEST_CASE("A lease that lapsed within the skew slack still compiles", "[worker-p
     // The other half of the previous case, and the one that keeps the slack honest:
     // without it, a workstation whose clock is minutes out would refuse every job it
     // was legitimately granted, on exactly the machines nobody is watching.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const barely = GrantFor(ThisWorker, "gcc-13", -std::chrono::seconds { 1 });
     auto const answer = fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, barely));
@@ -1208,7 +1248,7 @@ TEST_CASE("A grant for one toolchain does not pay for another's compile", "[work
     // cannot be spent on a `gcc-13` job. The client here claims the toolchain the
     // worker serves -- so the fingerprint check that already existed passes -- and it
     // is the LEASE that disagrees.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const answer =
         fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker, "clang-18")));
@@ -1227,7 +1267,7 @@ TEST_CASE("An authentic grant naming this worker compiles", "[worker-protocol][l
     // The case that keeps the four above from being satisfiable by refusing
     // everything. A validator that never authorizes anything would pass every
     // refusal assertion in this file and break the entire fleet.
-    Fixture fix { { Wire::IdentityCodec }, VerifyingValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const answer =
         fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
@@ -1240,6 +1280,123 @@ TEST_CASE("An authentic grant naming this worker compiles", "[worker-protocol][l
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired) == 0);
 }
 
+TEST_CASE("A grant from a deposed scheduler is refused, and the counter for it finally moves",
+          "[worker-protocol][lease][epoch]")
+{
+    // The whole of #421 in one case. `WorkerJobsRefusedLeaseStaleEpoch` has been
+    // defined, catalogued and exported the whole time, and could never rise: the
+    // validator passed `LeaseEpochCheck::NotKnownHere()` because a worker learned the
+    // current term from nowhere, and the only term it ever saw was the one inside the
+    // token it was checking. An operator scraping the series read a permanent zero.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    // What a heartbeat reply teaches it. Term 9 is current; the grant below names 4.
+    fix.term.Learn(9);
+
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13",
+                                       DefaultSource,
+                                       { Wire::IdentityCodec },
+                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 4)));
+    REQUIRE(answer.has_value());
+
+    // `LeaseUnauthorized` rather than a code of its own, because the client's answer
+    // is the same -- compile it locally -- and a code it does not know would be worse
+    // than one it does.
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+
+    // BOTH halves. The wire code is shared with two other refusals and the counters
+    // deliberately are not, because a rise in `WrongCluster` says two fleets share a
+    // key file -- a provisioning mistake -- while a rise here says grants are
+    // outliving elections, which is not. A test asserting only that the stale-epoch
+    // counter moved would pass just as happily if this refusal had also been billed
+    // to its neighbours.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster) == 0);
+}
+
+TEST_CASE("A grant from a term this worker has not heard of is honoured", "[worker-protocol][lease][epoch]")
+{
+    // The direction that must NOT refuse, and it is the one the ticket expected to
+    // have to trade availability for. A worker whose heartbeat is stale is the one
+    // that is behind; the scheduler is authoritative about its own term and the MAC
+    // has already proved this grant authentic. Refusing here would make a worker that
+    // missed one heartbeat reject the new leader -- the fleet ceasing to distribute
+    // right after an election, which is the failure #421 exists to prevent.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    fix.term.Learn(4);
+
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13",
+                                       DefaultSource,
+                                       { Wire::IdentityCodec },
+                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 9)));
+    REQUIRE(answer.has_value());
+
+    CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 0);
+}
+
+TEST_CASE("A newer term is ADOPTED, so the grant it arrived on is a learning channel", "[worker-protocol][lease][epoch]")
+{
+    // Proved by CONSEQUENCE, which is the only way it can be. The case above accepts a
+    // newer grant, and so would a validator that accepts everything -- the two are
+    // indistinguishable from outside until the newer term is shown to have STUCK. So
+    // this compiles under term 9 and then presents a grant from term 4, which was
+    // acceptable a moment ago and must not be now.
+    //
+    // This is also what keeps the mechanism working when heartbeats are failing: the
+    // grant is the second learning channel, and it is safe to learn from because
+    // adoption happens after `VerifyLeaseToken` returned success. Reading a term off a
+    // REFUSED token would let anybody holding the wire push a worker's expectation up
+    // and make it refuse every honest grant afterwards.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    auto const newer =
+        fix.worker.Answer(CompileFrame("gcc-13",
+                                       DefaultSource,
+                                       { Wire::IdentityCodec },
+                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 9)));
+    REQUIRE(newer.has_value());
+    REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
+
+    auto const older =
+        fix.worker.Answer(CompileFrame("gcc-13",
+                                       DefaultSource,
+                                       { Wire::IdentityCodec },
+                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 4)));
+    REQUIRE(older.has_value());
+
+    CHECK(ErrorOf(Unwrap(older)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
+}
+
+TEST_CASE("A worker that has never learned a term refuses nothing for it", "[worker-protocol][lease][epoch]")
+{
+    // Cold start. A worker that refused before its first heartbeat could not join a
+    // fleet at all, and every restart would be an outage -- so `NotKnownHere` stays a
+    // real answer rather than becoming a sentinel term. `StandaloneSchedulerTerm` is
+    // literally `0`, so a zero standing in for "never learned" would have made a
+    // single-node fleet's real term mean "unknown", which `SchedulerService.hpp:40`
+    // warns about in as many words.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13",
+                                       DefaultSource,
+                                       { Wire::IdentityCodec },
+                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 0)));
+    REQUIRE(answer.has_value());
+
+    CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 0);
+}
+
 TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole policy", "[worker-protocol][lease]")
 {
     // `UncheckedLeaseValidator` is what a single-machine install runs, and it is a
@@ -1250,7 +1407,7 @@ TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole po
     // It is only ever reachable for a node admitting nothing but its own machine:
     // `NodeConfig`'s startup table refuses a keyless node that admits peers
     // elsewhere, which is what makes this safe rather than a hole with a comment.
-    Fixture fix { { Wire::IdentityCodec }, UncheckedLeaseValidator() };
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Unchecked };
 
     auto const answer =
         fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, "not-a-lease-at-all"));
@@ -1363,6 +1520,77 @@ TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no l
     REQUIRE_FALSE(beat.has_value());
     CHECK_FALSE(beat.error().leader.has_value());
     CHECK(registrar.WorkerId().empty());
+}
+
+TEST_CASE("A heartbeat reply states the scheduler's term, and the registrar hands it back", "[cc][registrar][epoch]")
+{
+    // The channel #421 added, asserted end to end through the real encoder and the
+    // real registrar rather than by round-tripping the codec against itself.
+    auto registrar = MakeRegistrar();
+    auto const term = Wire::EncodeSchedulerTerm(11);
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeReply(Wire::Status::Ok, std::span<std::byte const> { term }) }) };
+
+    REQUIRE(registrar.Register(scheduler).has_value());
+    auto const beat = registrar.Heartbeat(scheduler, 0);
+    REQUIRE(beat.has_value());
+    CHECK(beat->state == Wire::SchedulerTermState::Stated);
+    CHECK(beat->term == 11);
+}
+
+TEST_CASE("A heartbeat reply with no payload is an older scheduler, not a decode failure", "[cc][registrar][epoch]")
+{
+    // The rollout case, and the one a round-trip test cannot see: every scheduler
+    // predating #421 answers `SchedulerReply::Success()` with nothing in it. Reported
+    // as `NotStated` rather than folded in with a payload this build cannot read,
+    // because the two are different operator problems -- one is ordinary mid-rollout
+    // and the other is two builds disagreeing -- even though the worker learns nothing
+    // either way. An `optional` would have made them one value and hidden the second
+    // behind the first forever.
+    auto registrar = MakeRegistrar();
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeReply(Wire::Status::Ok, {}) }) };
+
+    REQUIRE(registrar.Register(scheduler).has_value());
+    auto const beat = registrar.Heartbeat(scheduler, 0);
+    REQUIRE(beat.has_value());
+    CHECK(beat->state == Wire::SchedulerTermState::NotStated);
+}
+
+TEST_CASE("A heartbeat reply of the wrong width is refused rather than read as a term", "[cc][registrar][epoch]")
+{
+    // Strict about the width for the reason `DecodeU32Field` is: reading the first
+    // eight bytes of a payload this build does not understand would INVENT a term --
+    // and here that is a number the worker then refuses authentic grants against. A
+    // fabricated high term would refuse everything the fleet issued.
+    auto registrar = MakeRegistrar();
+    std::array<std::byte, 3> const stub {};
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeReply(Wire::Status::Ok, std::span<std::byte const> { stub }) }) };
+
+    REQUIRE(registrar.Register(scheduler).has_value());
+    auto const beat = registrar.Heartbeat(scheduler, 0);
+    REQUIRE(beat.has_value());
+    CHECK(beat->state == Wire::SchedulerTermState::Unreadable);
+}
+
+TEST_CASE("A refused heartbeat teaches no term", "[cc][registrar][epoch]")
+{
+    // A heartbeat that was not accepted says nothing about whose term is current, and
+    // a `NotLeader` naming somewhere else says less than nothing -- the term it would
+    // carry belongs to the scheduler being redirected AWAY from. Expressed by the
+    // return type rather than by a rule: the term rides the success channel, so there
+    // is no way to reach one from a refusal.
+    auto registrar = MakeRegistrar();
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
+          Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
+
+    REQUIRE(registrar.Register(scheduler).has_value());
+    CHECK_FALSE(registrar.Heartbeat(scheduler, 0).has_value());
 }
 
 TEST_CASE("A credentialled client reaches a worker that has no AUTH and still gets its answer", "[worker-protocol]")

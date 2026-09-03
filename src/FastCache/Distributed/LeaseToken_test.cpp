@@ -403,15 +403,75 @@ TEST_CASE("A grant from a superseded scheduler term is refused where the term is
     auto const old = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 6));
 
     auto const refusal = VerifyLeaseToken(
-        key, old, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::MustEqual(7)), Noon());
+        key, old, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon());
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error().reason == LeaseRefusalReason::EpochMismatch);
 
     // And the current term is served.
     auto const current = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
+    CHECK(
+        VerifyLeaseToken(
+            key, current, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon())
+            .has_value());
+
+    // And a LATER term is served too, which is the half #421 added and the half a
+    // `MustEqual` reading would have refused. A worker whose heartbeat is stale is the
+    // one that is behind; refusing here would make it reject the new leader, which is
+    // the fleet ceasing to distribute right after an election. Pinned one term either
+    // side of the boundary, because that is where a comparison mistake lives.
+    auto const later = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 8));
     CHECK(VerifyLeaseToken(
-              key, current, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::MustEqual(7)), Noon())
+              key, later, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon())
               .has_value());
+}
+
+TEST_CASE("What a worker knows about the term is three states, and zero is not one of them",
+          "[distributed][lease][token][epoch]")
+{
+    // `SchedulerService::StandaloneSchedulerTerm` IS `0` -- the term of a node leading
+    // alone -- and its own declaration warns that "a literal at a call site is exactly
+    // how somebody later reads it as unknown and starts treating it as one". So
+    // never-learned is a FLAG on `KnownSchedulerTerm` rather than a term value, and
+    // this pins the difference the warning is about: a worker that has learned term 0
+    // is checking, and one that has learned nothing is not. The two differ in
+    // `Checked()` and in nothing else a caller can see.
+    //
+    // Named rather than included: `SchedulerService.hpp` is a scheduler header and
+    // this is a token test, and reaching for it here collides with an unrelated
+    // `Detail` namespace. The zero below is the constant's value, which is the case's
+    // input -- writing it is not the mistake, reading it as "unknown" would be.
+    KnownSchedulerTerm fresh;
+    CHECK_FALSE(fresh.Check().Checked());
+    CHECK(fresh.Check().Accepts(0));
+    CHECK(fresh.Check().Accepts(9'999));
+
+    KnownSchedulerTerm standalone;
+    standalone.Learn(0);
+    CHECK(standalone.Check().Checked());
+    CHECK(standalone.Check().Expected() == 0);
+    CHECK(standalone.Check().Accepts(0));
+}
+
+TEST_CASE("A worker's knowledge of the term only ever moves forward", "[distributed][lease][token][epoch]")
+{
+    // Monotonic, so the order two channels happen to write in cannot matter: a
+    // heartbeat reply and an authentic grant both teach this, on different threads,
+    // and a stale message overtaking a fresh one must not walk the expectation
+    // backwards. Raft terms only increase within a cluster and the MAC binds the
+    // cluster, so a lower number arriving is late rather than authoritative.
+    KnownSchedulerTerm term;
+    term.Learn(7);
+    CHECK(term.Check().Expected() == 7);
+
+    term.Learn(4);
+    CHECK(term.Check().Expected() == 7);
+    CHECK_FALSE(term.Check().Accepts(6));
+
+    term.Learn(9);
+    CHECK(term.Check().Expected() == 9);
+    CHECK_FALSE(term.Check().Accepts(8));
+    CHECK(term.Check().Accepts(9));
+    CHECK(term.Check().Accepts(10));
 }
 
 TEST_CASE("A verifier that cannot know the term accepts any of them", "[distributed][lease][token]")
@@ -419,9 +479,10 @@ TEST_CASE("A verifier that cannot know the term accepts any of them", "[distribu
     // `NotKnownHere` is an answer rather than a placeholder, and this pins what it
     // means so that changing it is a decision somebody makes rather than a default
     // somebody inherits. A worker learns the current term from nowhere -- the only
-    // term it sees is the one inside the token it is checking -- so until #421 makes
-    // the term travel on REGISTER, the epoch is covered by the MAC and enforced by the
-    // scheduler alone.
+    // term it sees is the one inside the token it is checking. #421 gave it a channel
+    // -- the heartbeat reply, and any authentic grant naming a later term -- but a
+    // worker that has used neither yet is in exactly this state, and a worker that
+    // refused here could not cold-start.
     auto const key = Key();
     for (auto const epoch: { std::uint64_t { 0 }, std::uint64_t { 1 }, std::uint64_t { 9'999 } })
     {
