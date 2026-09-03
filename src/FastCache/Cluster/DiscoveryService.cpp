@@ -179,9 +179,14 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                 return DiscoveryEvent::ProofRejected;
             }
 
-            auto const expected = DiscoveryWire::ExpectedProofTag(
-                _config.presharedKey, pending->second.challenge, proof->nodeId, proof->raftEndpoint);
-            if (!ConstantTimeEquals(expected, proof->tag))
+            // Through `VerifyProofTag` rather than by taking the expected tag and
+            // comparing it here. The comparison has to be constant-time -- anything
+            // on the segment can provoke another challenge and retry, so a compare
+            // that stops at the first difference leaks the tag a byte at a time --
+            // and that is a property of the seam, not something each verifier
+            // should be trusted to remember.
+            if (!DiscoveryWire::VerifyProofTag(
+                    _config.presharedKey, pending->second.challenge, proof->nodeId, proof->raftEndpoint, proof->tag))
             {
                 // Warn rather than debug: on a healthy segment this does not
                 // happen, and when it does it means either a misconfigured key or

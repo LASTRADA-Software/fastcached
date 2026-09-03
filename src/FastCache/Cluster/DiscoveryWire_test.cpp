@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -160,6 +162,46 @@ TEST_CASE("A proof authenticates the endpoint, not just the nonce", "[cluster][d
 
     // Same inputs, same tag -- otherwise nobody could ever join.
     CHECK(ConstantTimeEquals(honest, DiscoveryWire::ExpectedProofTag(key, challenge, "worker-a", "10.0.0.5:7000")));
+}
+
+TEST_CASE("A proof is signed in its own domain, which the unlabelled message was not", "[cluster][discovery][wire]")
+{
+    // The wire change #402 makes, asserted rather than described. Until then a
+    // proof's message was the four fields alone, with no domain label -- so what
+    // kept it from colliding with a lease tag under the SAME pre-shared key was
+    // that the two happened to have different field arities. That is a property of
+    // the pair, not of either construction, and it survives exactly as long as
+    // nobody adds a field to discovery.
+    auto const key = Bytes("shared-secret");
+    DiscoveryWire::Challenge const challenge { .clusterId = "prod", .nonce = SampleNonce() };
+
+    auto const fields =
+        std::array<std::span<std::byte const>, 4> { WireFields::AsBytes(challenge.clusterId),
+                                                    std::span<std::byte const> { challenge.nonce },
+                                                    WireFields::AsBytes(std::string_view { "worker-a" }),
+                                                    WireFields::AsBytes(std::string_view { "10.0.0.5:7000" }) };
+
+    auto const tag = DiscoveryWire::ExpectedProofTag(key, challenge, "worker-a", "10.0.0.5:7000");
+
+    // What it IS now: the label, then those four fields.
+    CHECK(ConstantTimeEquals(
+        tag,
+        HmacSha256(key,
+                   WireFields::Encode({ WireFields::AsBytes(DescribeSigningDomain(SigningDomain::DiscoveryProof).label),
+                                        fields[0],
+                                        fields[1],
+                                        fields[2],
+                                        fields[3] }))));
+
+    // What it WAS: the four fields alone. A node on an older build therefore fails
+    // to prove the key and is logged saying so, rather than being silently ignored
+    // -- the datagram grammar and its version are untouched.
+    CHECK_FALSE(
+        ConstantTimeEquals(tag, HmacSha256(key, WireFields::Encode({ fields[0], fields[1], fields[2], fields[3] }))));
+
+    // And the same four fields signed as a LEASE are a different tag, which is the
+    // separation the label buys and which arity alone was standing in for.
+    CHECK_FALSE(ConstantTimeEquals(tag, SignFields(key, SigningDomain::LeaseToken, fields)));
 }
 
 TEST_CASE("A proof's fields are framed, not concatenated", "[cluster][discovery][wire]")

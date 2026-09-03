@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Core/Base64.hpp>
+#include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -463,7 +466,8 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     auto const key = Key();
     auto const claims = Grant();
     auto const packedV1 = Detail::PackClaims(1, claims);
-    auto const tag = Detail::ExpectedTag(key, packedV1);
+    auto const tag =
+        Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packedV1 } });
     auto const envelope =
         WireFields::Encode({ std::span<std::byte const> { packedV1 }, std::span<std::byte const> { tag } });
 
@@ -504,6 +508,36 @@ TEST_CASE("A discovery proof is not a lease, under the same key", "[distributed]
     // refused -- the first as malformed, the second because the label is not in it.
     auto const bare = Base64Encode(std::span<std::byte const> { proof });
     CHECK_FALSE(VerifyLeaseToken(key, bare, Worker(), Noon()).has_value());
+
+    // The seam-level property -- one field list, two domains, two tags -- is
+    // `ClusterSigning_test.cpp`'s and is deliberately not restated here. This case
+    // asserts the protocol-level consequence with a real proof and a real token,
+    // which is the part `LeaseToken` owns.
+}
+
+TEST_CASE("Moving the lease onto the shared seam changed none of its bytes", "[distributed][lease][token]")
+{
+    // The one thing a consolidation must be able to say for itself. The lease
+    // already carried `fastcache-lease-v1` ahead of its packed claims, so routing
+    // it through `Cluster::SignFields` had to reproduce that message exactly --
+    // and "the tests still pass" cannot show it, because the tests moved with the
+    // code. The pre-seam construction is therefore written out here as a literal:
+    // `HmacSha256` over `Encode({ "fastcache-lease-v1", packedClaims })`, with the
+    // label spelled rather than read from the table it now lives in.
+    auto const key = Key();
+    auto const token = MintLeaseToken(key, Grant());
+
+    auto const decoded = Unwrap(Base64Decode(token));
+    auto const outer = Unwrap(WireFields::SplitExactly(AsBytes(decoded), 2));
+    auto const packed = outer[0];
+    auto const tag = outer[1];
+
+    auto const preSeam = HmacSha256(key, WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v1" }), packed }));
+
+    REQUIRE(tag.size() == Sha256::DigestSize);
+    Sha256::Digest presented {};
+    std::ranges::copy(tag, presented.begin());
+    CHECK(ConstantTimeEquals(preSeam, presented));
 }
 
 TEST_CASE("A malformed token is refused rather than partly believed", "[distributed][lease][token]")
