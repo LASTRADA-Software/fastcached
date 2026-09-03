@@ -1325,7 +1325,9 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
     // free-list walk that `FilePageStore::RecoverExistingFile` does at startup
     // has no `InMemoryPageStore` equivalent. A damaged free-list page IS a
     // startup refusal on a real store -- the operator page says so -- and
-    // nothing here exercises it.
+    // nothing HERE exercises it. It is covered on a file-backed store instead,
+    // by the `[filestore][freelist]` cases in `src/CowTree/FilePageStore_test.cpp`
+    // (#580), which also record why no store this project writes can reach it.
     CowTree::InMemoryPageStore store { DamagePageSize };
     FastCache::CowTreeStorage::Options const opts;
     {
