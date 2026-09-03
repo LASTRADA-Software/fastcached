@@ -332,6 +332,32 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     CHECK(scheduler.Answered().size() == 4);
 }
 
+TEST_CASE("A peer watch is routed to the surface whose work it would abandon", "[node][merged-responder][peerwatch]")
+{
+    // Assert the wiring. The counter a watch raises belongs to the surface whose work
+    // was abandoned, and nothing but this router carries it there -- a fold, or a
+    // constant, would file every surface's abandoned deliveries under whichever one
+    // happened to arm a watch, and the endpoint could not tell.
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    NamedResponder compile { "compile" };
+    compile.SetPeerWatchCounter(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    MergedResponder responder { &cache, &scheduler, &compile };
+
+    CHECK(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Compile))
+          == std::optional { IMetricsSink::Counter::WorkerJobsAbandonedClientGone });
+
+    // And the surfaces that answer from memory are not watched: a watch that is armed
+    // and does not fire ends the connection, which is what the cache surface must not
+    // pay (#176).
+    CHECK_FALSE(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+    CHECK_FALSE(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+
+    // A verb nobody owns is not watched. It is unreachable -- `RefusePeer` has already
+    // refused it -- and not-watching is the answer that changes nothing.
+    CHECK_FALSE(responder.PeerWatchCounter(0xEE).has_value());
+}
+
 TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE admitted",
           "[node][merged-responder][cache-locality]")
 {

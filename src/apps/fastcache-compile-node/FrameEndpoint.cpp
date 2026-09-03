@@ -143,6 +143,22 @@ struct TrackedConnection
     /// expected 1.
     bool swept { false };
 
+    /// Whether this process, rather than the peer, is what closed this socket.
+    ///
+    /// **A peer watch cannot tell the two apart, and they are opposite facts.**
+    /// `WatchPeer` reports `gone` whenever its wait fails, and a wait fails just as
+    /// readily because this node closed the socket underneath it -- a responder swept
+    /// past its explanation grace, or a shutdown closing everything. Counted as
+    /// `WorkerJobsAbandonedClientGone`, every compile in flight during a node restart
+    /// would land in a row whose documentation says a CLIENT went, so an orderly stop
+    /// would read as a fleet losing its users. The rule this breaks is
+    /// `metrics-and-observability.md`'s: an absence must not be counted as an event.
+    ///
+    /// Set under the mutex by the three paths that close a socket this endpoint owns,
+    /// and read the same way, because the reader is the connection coroutine and the
+    /// writer is the sweeper.
+    bool closedLocally { false };
+
     /// Whether `ServeConnection` is parked INSIDE the responder right now.
     ///
     /// **The whole of #523 turns on this one bit**, because it is what separates the
@@ -371,7 +387,7 @@ struct FrameServer::State
     /// **This sweeper never writes to a socket, and that is a rule about ownership
     /// rather than about interleaving.** The obvious repair for the silence -- have
     /// the sweeper send a refusal before closing -- is not merely racy, it is a
-    /// use-after-free: the socket is owned by `ServeConnection`'s coroutine frame
+    /// use-after-free: the socket is held by `ServeConnection`'s coroutine frame
     /// (`std::unique_ptr<ISocket> owned`) and this table holds a bare pointer, so a
     /// `co_await socket->Write(...)` here would hold that pointer across a suspension
     /// the connection can complete and destroy through. No amount of write-interlocking
@@ -418,6 +434,12 @@ struct FrameServer::State
                     // been acted on.
                     entry.swept = true;
 
+                    // A close from here is THIS node's, not the peer's -- see
+                    // `TrackedConnection::closedLocally`. Marked even when the close is
+                    // deferred, because the deferral ends in `CloseExpiredDeferrals`
+                    // closing it just the same.
+                    entry.closedLocally = true;
+
                     // Engaged only for the connections that can act on it, so the
                     // field's engagement IS the obligation and there is no second
                     // flag to keep in step. Sized from the entry's OWN window rather
@@ -446,6 +468,21 @@ struct FrameServer::State
                 entry.socket->Close();
         }
         return tally;
+    }
+
+    /// Whether this endpoint is what closed @p socket.
+    ///
+    /// Asked by the connection before it files an abandoned delivery, so this node's
+    /// own teardowns do not arrive in a counter documented as a client-side story. An
+    /// entry already erased answers false: `Untrack` runs when the coroutine unwinds,
+    /// which is after this is read.
+    /// @param socket The connection's socket.
+    /// @return True when a sweep or a shutdown closed it here.
+    [[nodiscard]] bool ClosedLocally(ISocket const* socket) const
+    {
+        std::scoped_lock const guard { mutex };
+        auto const found = std::ranges::find(open, socket, &TrackedConnection::socket);
+        return found != open.end() && found->closedLocally;
     }
 
     /// Close the connections that were left open to explain themselves and did not.
@@ -477,6 +514,7 @@ struct FrameServer::State
                 if (entry.explainBy.has_value() && *entry.explainBy <= now)
                 {
                     entry.explainBy.reset();
+                    entry.closedLocally = true; // See `TrackedConnection::closedLocally`.
                     expired.push_back(entry.socket);
                 }
         }
@@ -493,8 +531,11 @@ struct FrameServer::State
         std::vector<ISocket*> sockets;
         {
             std::scoped_lock const guard { mutex };
-            for (auto const& entry: open)
+            for (auto& entry: open)
+            {
+                entry.closedLocally = true; // See `TrackedConnection::closedLocally`.
                 sockets.push_back(entry.socket);
+            }
         }
         for (auto* socket: sockets)
             socket->Close();
@@ -774,6 +815,47 @@ namespace
         else
             watch->pulled.assign(probe.begin(), probe.begin() + static_cast<std::ptrdiff_t>(*got));
         watch->finished = true;
+        co_return;
+    }
+
+    /// Wait, bounded, for a peer watch to reach a terminal state.
+    ///
+    /// **Closing straight away loses the reply that was just written**, and that is
+    /// measured rather than feared: the pipelined case received its first answer and
+    /// then ZERO further bytes, because a close over a socket with I/O still pending is
+    /// abortive and takes the buffered reply with it. `RefuseAtCapacity` documents the
+    /// same hazard from the other direction -- a peer that saw a reset instead of the
+    /// refusal it had been sent.
+    ///
+    /// So the peer is given the chance to take the answer and hang up, and the watcher
+    /// is what observes it doing so: the client's FIN is a readable edge, which is
+    /// exactly what that coroutine is parked on. The ordinary client --
+    /// `Cc::RunOneExchange`, which reads its reply and closes -- is gone within one
+    /// step.
+    ///
+    /// Polled rather than woken, for the reason `NextWakeStep` states: `IReactor::Schedule`
+    /// cannot be cancelled, so a wait that must also be woken by something else sleeps
+    /// in steps and re-reads, leaving nothing parked behind it. The loop is inlined
+    /// rather than delegated to `InterruptibleSleepUntil` for the reason that header
+    /// gives for its own three siblings; the arithmetic is the part they share.
+    ///
+    /// Bounded by `RefusalTimeout`, and for its reason: the peer has its answer and has
+    /// only to read it, which is a round trip rather than a request. One that dawdles
+    /// past that is closed on anyway, which is exactly what happened before this
+    /// existed. It costs the CLIENT nothing either way -- the reply has already gone
+    /// out, and this only makes the hang-up orderly.
+    ///
+    /// One function rather than a loop at each of the two sites that need it, because
+    /// the second is the deferred deadline refusal (#523) -- and a rule remembered at
+    /// one write and forgotten at the other is how that explanation goes missing again.
+    /// @param reactor The loop this connection runs on.
+    /// @param watch The watch to wait on; not modified here.
+    Task<void> AwaitWatchQuiet(IReactor& reactor, PeerWatch const& watch)
+    {
+        auto const until = reactor.Clock().Now() + FrameServer::RefusalTimeout;
+        while (!watch.finished && reactor.Clock().Now() < until)
+            co_await SleepUntil { .reactor = &reactor,
+                                  .deadline = NextWakeStep(reactor.Clock().Now(), until, FrameServer::GracefulCloseStep) };
         co_return;
     }
 
@@ -1115,6 +1197,16 @@ namespace
                         // the gap between this and the sweep row mean something else.
                         state->metrics.Increment(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
 
+                    // The same abortive-close hazard the ordinary reply path has, on
+                    // the one surface that arms a watch: this explanation is written
+                    // and then the `break` below closes, and a close over a parked
+                    // wait discards what was just buffered. #523 is specifically about
+                    // this explanation REACHING the peer, so it gets the same wait --
+                    // which is why that wait is a function rather than a loop written
+                    // twice.
+                    if (watch)
+                        co_await AwaitWatchQuiet(state->io.Reactor(), *watch);
+
                     // And then it ends, whether or not the refusal landed. This
                     // connection has been swept; the answer it was holding is not
                     // owed to anybody any more, and continuing the loop would serve
@@ -1122,11 +1214,16 @@ namespace
                     break;
                 }
 
-                // **What the watch learned. Three states, and each is a different
-                // thing to do** -- which is why `PeerWatch` carries two flags and not
-                // one: "the peer went" and "the watcher is still parked" are not
-                // opposites, and a single bool could not tell either from "it woke,
-                // found a request, and finished".
+                // **The one question worth asking BEFORE the reply: is anybody still
+                // there to receive it.** The other two answers a watch can carry --
+                // still parked, and woke with a pipelined request -- are settled after
+                // the write, because both survive it and one of them can only BECOME
+                // true during it.
+                //
+                // Which is why `PeerWatch` carries two flags and not one: "the peer
+                // went" and "the watcher is still parked" are not opposites, and a
+                // single bool could not tell either from "it woke, found a request, and
+                // finished".
                 if (watch)
                 {
                     // **One turn of the loop before reading the flags**, and it is what
@@ -1153,20 +1250,17 @@ namespace
                         // now nothing here observed the disconnect at all, because the
                         // loop is not reading while a compile runs.
                         //
-                        // Counted only when there was something to deliver. An empty
-                        // reply means the surface had already decided to close, and
-                        // filing that as an abandoned delivery would inflate the row
-                        // with events that cost nothing.
-                        if (!reply.empty())
+                        // Counted only when there was something to deliver AND when a
+                        // CLIENT is what went. An empty reply means the surface had
+                        // already decided to close, and a socket this process closed --
+                        // a sweep past the grace, a shutdown -- reaches the watcher
+                        // looking exactly like a peer that hung up. Filing either as an
+                        // abandoned delivery would put this node's own teardowns in a
+                        // row documented as a client-side story.
+                        if (!reply.empty() && !state->ClosedLocally(socket.get()))
                             state->metrics.Increment(*watchCounter);
                         break;
                     }
-
-                    // Bytes the watcher took to tell EOF from data. They belong to a
-                    // pipelined request and go back into the one reader allowed to
-                    // parse this stream; ordering is safe because the watch is armed
-                    // only when that reader holds nothing.
-                    reader.PrimeWith(watch->pulled);
                 }
 
                 if (reply.empty())
@@ -1176,50 +1270,40 @@ namespace
                 if (!co_await WriteAll(socket.get(), reply))
                     break;
 
-                // **A watch still parked ends the connection, and the `break` IS the
-                // cancellation**: it falls through to the `socket->Close()` below, the
-                // only thing on `ISocket` that can retrieve a coroutine parked in
-                // `WaitReadable`. Looping round instead would arm a `Read` over that
-                // parked wait and silently leak its frame;
-                // `IFrameResponder::PeerWatchCounter` carries the derivation and the
-                // measurement.
-                if (watch && !watch->finished)
+                // **The watch is settled AFTER the reply, never before it**, and that
+                // ordering is the whole of it: `WriteAll` suspends -- an object is
+                // megabytes and a receive window is not -- so a peer can pipeline its
+                // next request DURING the write, and the watcher takes those bytes off
+                // the socket. Read before the write, that verdict is "still parked" and
+                // the bytes it goes on to pull are dropped: the next `ReadExactly`
+                // starts mid-frame, decodes a foreign magic, and closes a connection
+                // whose peer did nothing wrong.
+                if (watch)
                 {
-                    // **Closing straight away loses the reply that was just written**,
-                    // and that is measured rather than feared: the pipelined case
-                    // received its first answer and then ZERO further bytes, because a
-                    // close over a socket with I/O still pending is abortive and takes
-                    // the buffered reply with it. `RefuseAtCapacity` documents the same
-                    // hazard from the other direction -- a peer that saw a reset instead
-                    // of the refusal it had been sent.
-                    //
-                    // So the peer is given the chance to take the answer and hang up,
-                    // and the watcher is what observes it doing so: the client's FIN is
-                    // a readable edge, which is exactly what this coroutine is parked
-                    // on. The ordinary client -- `Cc::RunOneExchange`, which reads its
-                    // reply and closes -- is gone within one step.
-                    //
-                    // Polled rather than woken, for the reason `NextWakeStep` states:
-                    // `IReactor::Schedule` cannot be cancelled, so a wait that must also
-                    // be woken by something else sleeps in steps and re-reads, leaving
-                    // nothing parked behind it. The loop is inlined rather than
-                    // delegated to `InterruptibleSleepUntil` for the reason that header
-                    // gives for its three siblings; the arithmetic is the part they
-                    // share, and it is shared here.
-                    //
-                    // Bounded by `RefusalTimeout`, and for its reason: the peer has its
-                    // answer and has only to read it, which is a round trip rather than
-                    // a request. One that dawdles past that is closed on anyway, which
-                    // is exactly what happened before this block existed. It costs the
-                    // CLIENT nothing either way -- the reply went out at the `WriteAll`
-                    // above, and this only makes the hang-up orderly.
-                    auto& reactor = state->io.Reactor();
-                    auto const until = reactor.Clock().Now() + FrameServer::RefusalTimeout;
-                    while (!watch->finished && reactor.Clock().Now() < until)
-                        co_await SleepUntil { .reactor = &reactor,
-                                              .deadline = NextWakeStep(
-                                                  reactor.Clock().Now(), until, FrameServer::GracefulCloseStep) };
-                    break;
+                    co_await AwaitWatchQuiet(state->io.Reactor(), *watch);
+
+                    // **A watch still parked ends the connection, and the `break` IS
+                    // the cancellation**: it falls through to the `socket->Close()`
+                    // below, the only thing on `ISocket` that can retrieve a coroutine
+                    // parked in `WaitReadable`. Looping round instead would arm a
+                    // `Read` over that parked wait and silently leak its frame;
+                    // `IFrameResponder::PeerWatchCounter` carries the derivation and
+                    // the measurement.
+                    if (!watch->finished)
+                        break;
+
+                    // The peer took its answer and hung up, which is the ordinary end
+                    // of a watched exchange and not an abandoned delivery: the reply
+                    // went out at the `WriteAll` above.
+                    if (watch->gone)
+                        break;
+
+                    // Bytes the watcher took to tell EOF from data -- before the write
+                    // or during it. They belong to a pipelined request and go back into
+                    // the one reader allowed to parse this stream; ordering is safe
+                    // because the watch is armed only when that reader holds nothing
+                    // and nothing has read from it since.
+                    reader.PrimeWith(watch->pulled);
                 }
             }
         }
