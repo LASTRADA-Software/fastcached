@@ -865,12 +865,15 @@ e2e_bound_outcome() {
 # then reported "no node ever named a leader" about a cluster whose own dumped
 # logs showed a leader elected in term 1 with both followers naming it.
 #
-# The obvious repair is to look for `timeout` and then `gtimeout`, which is what
-# `scripts/tsan-gate.sh` does and which this file deliberately does NOT do.
+# The obvious repair is to look for `timeout` and then `gtimeout`, which
+# `scripts/tsan-gate.sh` used to do and which this file deliberately does NOT do.
 # Measured rather than assumed: GitHub's `macos-14` image ships **neither** --
 # `gtimeout` comes from Homebrew's `coreutils`, which is not in that image, and
-# `tsan-gate.sh`'s macOS branch has never executed anywhere because the
-# `clang-tsan` job is `runs-on: ubuntu-24.04`. So a resolver that refuses when it
+# `tsan-gate.sh`'s macOS branch had never executed anywhere because the
+# `clang-tsan` job is `runs-on: ubuntu-24.04`. (That resolver is gone as of #488;
+# the gate calls `run_bounded` and the scan below no longer exempts it. The
+# measurement above is this comment's own and stays here -- it is what #488 cites
+# rather than restates.) So a resolver that refuses when it
 # finds nothing would refuse on exactly the platform this was written for, and
 # one that falls back to running unbounded would restore the unbounded probe
 # while looking like it had a bound.
@@ -882,10 +885,16 @@ e2e_bound_outcome() {
 #
 # This function is therefore also the CHECK, in #469's sense: with a bounded run
 # in the shared library there is no reason for a fixture to spell `timeout`
-# again, and `check-e2e-helpers.sh` scans for one that does. A correct paragraph
-# in `tsan-gate.sh` did not travel to the next script that needed it, and a
-# fourth private copy is how the three `ScriptedSocket` copies each carried the
-# same defect.
+# again, and `check-e2e-helpers.sh` scans for one that does. A paragraph in
+# `tsan-gate.sh` did not travel to the next script that needed it, and a fourth
+# private copy is how the three `ScriptedSocket` copies each carried the same
+# defect. That paragraph was originally described here as CORRECT; #488 measured
+# it and it was not -- it claimed the `clang-tsan` preset runs on macOS, which it
+# does not, so the fallback it justified had never executed anywhere. Worth
+# keeping in view, because it makes the case stronger rather than weaker: what
+# failed to travel was not a fact but a plausible sentence, and a scan cannot
+# tell those apart either, which is why the remedy is a shared implementation
+# rather than a better comment.
 #
 # ---------------------------------------------------------------------------
 #
