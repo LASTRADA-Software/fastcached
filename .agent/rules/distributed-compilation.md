@@ -1334,6 +1334,32 @@ Six more about what the tier IS and who gets to see it:
   string to and a port cannot be opened without a row. A guard that fails the build
   beats one that fails a suite.
 
+  **The operator documentation was the one copy the type system could not reach**, and
+  #288 left it that way: the tables and the firewall advice are hand-written prose, and
+  a hand-pasted `--print-surfaces` transcript looks like machine output while being a
+  string in a markdown file. `ctest -R node-surface-docs` holds five documents to the
+  table, in **both** directions — every declared surface present, and nothing
+  surface-shaped that the table does not declare, because on a firewall worksheet an
+  extra row reads as authorisation to open a port.
+- **The row rule cannot see prose, and prose is what survived the hand-edit.** #290
+  stage 3 rewrote every one of those lines by hand and got every port NUMBER right;
+  what it left behind were two sentences — *"carries the full six-surface table"*
+  against four rows, and *"Five TCP rules and one wrong one"* against three TCP
+  surfaces, sitting directly under a correct four-row table an operator counts rules
+  from. So the check carries a COUNT rule as well, and that is the half that found
+  both. A hand-edit correcting a table is not evidence that the paragraph under it
+  was re-read.
+- **`surface` names two different things here, and #290 is why.** There are FOUR ports
+  and THREE policy roles sharing the node port, and prose legitimately counts either —
+  so a count rule anchored on the word alone checks two concepts with one regex and
+  fires on correct writing, and a rule with a known false-positive class gets disabled
+  by the third person it inconveniences. The anchor is therefore narrow (a phrasing
+  that names the port set: a *table*, a *process*, a protocol's *rules*) and the
+  residue is **refused rather than ignored**: any other number-plus-`surface`
+  collocation must be classified in the check's exemption table with a reason. Covering
+  less and being right beats covering everything and crying wolf — and the exemption
+  rows are now the only written record that the word is overloaded.
+
   What that removes is subtler than the duplication. **The default host used to be a
   caller's argument**, so the cache's loopback and the scheduler's wildcard -- which
   exist for a security reason, not a preference -- were mechanically whatever the call
