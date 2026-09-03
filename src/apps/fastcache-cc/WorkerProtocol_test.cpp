@@ -94,48 +94,6 @@ enum class LeasePolicy : std::uint8_t
     Verifying,
 };
 
-/// Build one of the two production lease validators.
-///
-/// Declared here and defined below the lease constants it needs, rather than moving
-/// those up: they belong with the other lease fixtures, and this is the file's one
-/// forward reference.
-/// @param lease Which policy.
-/// @param term What the verifying one borrows; the unchecked one ignores it.
-/// @return The validator.
-[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term);
-
-struct Fixture
-{
-    StubRunner runner;
-    FastCache::Testing::ScratchDirectory scratch { "fc-wp" };
-    CompileJobRunner jobs;
-    AtomicMetricsSink metrics;
-
-    /// What this worker has been told about the scheduler's term.
-    ///
-    /// Declared BEFORE `worker` on purpose: the validator borrows it, so member order
-    /// is what guarantees it outlives the thing holding the reference. The epoch cases
-    /// teach it and then read what the worker does about it.
-    Distributed::KnownSchedulerTerm term;
-
-    WorkerProtocol worker;
-
-    /// @param codecs What this worker can produce and decode; the production node
-    ///        passes `AvailableCodecs()`, and a case can narrow it to assert what a
-    ///        worker without a codec answers.
-    /// @param lease Which production lease policy to build; see `LeasePolicy`.
-    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
-        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(lease, term), std::move(codecs), metrics }
-    {
-    }
-    Fixture(Fixture const&) = delete;
-    Fixture& operator=(Fixture const&) = delete;
-    Fixture(Fixture&&) = delete;
-    Fixture& operator=(Fixture&&) = delete;
-    ~Fixture() = default;
-};
-
 /// The cluster key both actors in a lease case share.
 ///
 /// A constant rather than a random draw: what these cases turn on is which FIELDS a
@@ -208,12 +166,48 @@ constexpr std::uint64_t GrantTerm = 4;
                                               .epoch = epoch });
 }
 
-LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term)
+/// Build one of the two production lease validators.
+/// @param lease Which policy.
+/// @param term What the verifying one borrows; the unchecked one ignores it.
+/// @return The validator.
+[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term)
 {
     if (lease == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
     return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, term);
 }
+
+struct Fixture
+{
+    StubRunner runner;
+    FastCache::Testing::ScratchDirectory scratch { "fc-wp" };
+    CompileJobRunner jobs;
+    AtomicMetricsSink metrics;
+
+    /// What this worker has been told about the scheduler's term.
+    ///
+    /// Declared BEFORE `worker` on purpose: the validator borrows it, so member order
+    /// is what guarantees it outlives the thing holding the reference. The epoch cases
+    /// teach it and then read what the worker does about it.
+    Distributed::KnownSchedulerTerm term;
+
+    WorkerProtocol worker;
+
+    /// @param codecs What this worker can produce and decode; the production node
+    ///        passes `AvailableCodecs()`, and a case can narrow it to assert what a
+    ///        worker without a codec answers.
+    /// @param lease Which production lease policy to build; see `LeasePolicy`.
+    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
+        jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
+        worker { jobs, MakeLeaseValidator(lease, term), std::move(codecs), metrics }
+    {
+    }
+    Fixture(Fixture const&) = delete;
+    Fixture& operator=(Fixture const&) = delete;
+    Fixture(Fixture&&) = delete;
+    Fixture& operator=(Fixture&&) = delete;
+    ~Fixture() = default;
+};
 
 /// A COMPILE frame carrying `source` as its source field, already enveloped.
 ///
@@ -1280,6 +1274,24 @@ TEST_CASE("An authentic grant naming this worker compiles", "[worker-protocol][l
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired) == 0);
 }
 
+/// A well-formed COMPILE frame whose grant was issued under @p epoch.
+///
+/// The sibling of the frame helpers above, and it exists for the reason one of them
+/// already records: every epoch case cares about exactly one argument, and spelling
+/// the four before it positionally made `GrantFor`'s own defaults dead for the whole
+/// block -- fifteen restated defaults across five cases, which also hard-coded
+/// `ThisCluster` and a ten-minute validity into cases about neither. A typo in either
+/// reaches a different refusal with a different counter.
+/// @param epoch The scheduler term the grant names.
+/// @return The frame.
+[[nodiscard]] std::vector<std::byte> FrameGrantedUnder(std::uint64_t epoch)
+{
+    return CompileFrame("gcc-13",
+                        DefaultSource,
+                        { Wire::IdentityCodec },
+                        GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, epoch));
+}
+
 TEST_CASE("A grant from a deposed scheduler is refused, and the counter for it finally moves",
           "[worker-protocol][lease][epoch]")
 {
@@ -1293,11 +1305,7 @@ TEST_CASE("A grant from a deposed scheduler is refused, and the counter for it f
     // What a heartbeat reply teaches it. Term 9 is current; the grant below names 4.
     fix.term.Learn(9);
 
-    auto const answer =
-        fix.worker.Answer(CompileFrame("gcc-13",
-                                       DefaultSource,
-                                       { Wire::IdentityCodec },
-                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 4)));
+    auto const answer = fix.worker.Answer(FrameGrantedUnder(GrantTerm));
     REQUIRE(answer.has_value());
 
     // `LeaseUnauthorized` rather than a code of its own, because the client's answer
@@ -1329,11 +1337,7 @@ TEST_CASE("A grant from a term this worker has not heard of is honoured", "[work
 
     fix.term.Learn(4);
 
-    auto const answer =
-        fix.worker.Answer(CompileFrame("gcc-13",
-                                       DefaultSource,
-                                       { Wire::IdentityCodec },
-                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 9)));
+    auto const answer = fix.worker.Answer(FrameGrantedUnder(9));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
@@ -1356,19 +1360,11 @@ TEST_CASE("A newer term is ADOPTED, so the grant it arrived on is a learning cha
     // and make it refuse every honest grant afterwards.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
-    auto const newer =
-        fix.worker.Answer(CompileFrame("gcc-13",
-                                       DefaultSource,
-                                       { Wire::IdentityCodec },
-                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 9)));
+    auto const newer = fix.worker.Answer(FrameGrantedUnder(9));
     REQUIRE(newer.has_value());
     REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
 
-    auto const older =
-        fix.worker.Answer(CompileFrame("gcc-13",
-                                       DefaultSource,
-                                       { Wire::IdentityCodec },
-                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 4)));
+    auto const older = fix.worker.Answer(FrameGrantedUnder(GrantTerm));
     REQUIRE(older.has_value());
 
     CHECK(ErrorOf(Unwrap(older)) == Wire::ErrorCode::LeaseUnauthorized);
@@ -1386,11 +1382,7 @@ TEST_CASE("A worker that has never learned a term refuses nothing for it", "[wor
     // warns about in as many words.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
-    auto const answer =
-        fix.worker.Answer(CompileFrame("gcc-13",
-                                       DefaultSource,
-                                       { Wire::IdentityCodec },
-                                       GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 0)));
+    auto const answer = fix.worker.Answer(FrameGrantedUnder(0));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
@@ -1527,7 +1519,7 @@ TEST_CASE("A heartbeat reply states the scheduler's term, and the registrar hand
     // The channel #421 added, asserted end to end through the real encoder and the
     // real registrar rather than by round-tripping the codec against itself.
     auto registrar = MakeRegistrar();
-    auto const term = Wire::EncodeSchedulerTerm(11);
+    auto const term = Wire::EncodeU64Field(11);
     Testing::ScriptedSocket scheduler { Testing::Replies(
         { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
           Wire::EncodeReply(Wire::Status::Ok, std::span<std::byte const> { term }) }) };

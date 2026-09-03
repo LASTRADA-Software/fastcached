@@ -584,7 +584,21 @@ class KnownSchedulerTerm
         while (term > seen && !_term.compare_exchange_weak(seen, term, std::memory_order_relaxed))
         {
         }
-        _learned.store(true, std::memory_order_release);
+
+        // Guarded, because this runs on every dispatched compile and publishes a
+        // transition that happens once per process. The two members share a cache
+        // line, so an unconditional release store took it exclusive per compile and
+        // forced every other worker thread's next `Check()` to re-acquire it -- a
+        // coherence round trip to republish a flag that has been true since the first
+        // heartbeat. The relaxed load reads the line without invalidating it.
+        //
+        // What the guard gives up, stated because it is the half that is not obvious:
+        // a LATER `Learn` that raises `_term` no longer carries a release edge. Nothing
+        // races -- `_term` is atomic — and the only reachable effect is a reader seeing
+        // an older term, which accepts more and never refuses. That is the direction
+        // this class is safe in by design.
+        if (!_learned.load(std::memory_order_relaxed))
+            _learned.store(true, std::memory_order_release);
     }
 
     /// @return What a verifier should expect of a grant's term right now.

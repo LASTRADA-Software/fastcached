@@ -144,18 +144,15 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // toolchain's lease from paying for another's compile; neither does it alone,
         // which is why the grant's fingerprint check is not redundant with the
         // worker's.
-        auto verified = Distributed::VerifyLeaseToken(
-            key,
-            token,
-            Distributed::LeaseExpectation { .endpoint = endpoint,
-                                            .fingerprint = fingerprint,
-                                            .clusterId = cluster,
-                                            // Stated, not omitted -- see the header.
-                                            // `NotKnownHere` until a heartbeat reply
-                                            // or an authentic grant has taught this
-                                            // worker a term (#421).
-                                            .epoch = term.Check() },
-            clock.Now());
+        auto verified =
+            Distributed::VerifyLeaseToken(key,
+                                          token,
+                                          Distributed::LeaseExpectation { .endpoint = endpoint,
+                                                                          .fingerprint = fingerprint,
+                                                                          .clusterId = cluster,
+                                                                          // Stated, not omitted -- see the header.
+                                                                          .epoch = term.Check() },
+                                          clock.Now());
         if (verified.has_value())
         {
             // **The second learning channel, and it works when the first does not.**
@@ -458,10 +455,10 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
-std::expected<Wire::SchedulerTermView, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
-                                                                                   std::uint32_t inFlight,
-                                                                                   Wire::LoadFields const& load,
-                                                                                   Credential const& credential)
+std::expected<Wire::SchedulerTermFields, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
+                                                                                     std::uint32_t inFlight,
+                                                                                     Wire::LoadFields const& load,
+                                                                                     Credential const& credential)
 {
     if (_workerId.empty())
         // Never registered; nothing to refresh. Named rather than silent, because

@@ -98,14 +98,12 @@ using LeaseValidator =
 ///        value, because the whole point is that the heartbeat thread writes it while
 ///        the compile threads read it.
 ///
-/// **The term is checked since #421, and the check is one-sided.** A grant naming a
-/// term BELOW what this worker has learned came from a deposed scheduler and is
-/// refused; one naming a term above it is accepted, and adopted. That asymmetry is
-/// what keeps a worker's own staleness from ever causing a refusal -- refusing a
-/// newer term would make a worker that missed a heartbeat reject the new leader,
-/// which is the fleet ceasing to distribute right after an election. Until a term has
-/// been learned at all the check is `NotKnownHere` and accepts everything, because a
-/// worker that refused before its first heartbeat could not cold-start.
+/// **The term is checked since #421, and the check is one-sided**: a grant from a
+/// term below what this worker has learned is refused, one from a term above it is
+/// accepted and adopted, and a worker that has learned nothing refuses none of them.
+/// `Distributed::LeaseEpochCheck`'s class comment owns the argument for that
+/// asymmetry -- it is the type that makes the decision, and one explanation copied to
+/// each site is four places to edit and four chances to drift.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
                                                   std::string clusterId,
@@ -334,7 +332,7 @@ class WorkerRegistrar
     ///         refusal. An empty `WorkerId()` afterwards is the "register again"
     ///         signal; a set `leader` is the "announce somewhere else" one, and the
     ///         two are independent.
-    [[nodiscard]] std::expected<CompileCacheWire::SchedulerTermView, AnnounceRefusal> Heartbeat(
+    [[nodiscard]] std::expected<CompileCacheWire::SchedulerTermFields, AnnounceRefusal> Heartbeat(
         ISocket& scheduler,
         std::uint32_t inFlight,
         CompileCacheWire::LoadFields const& load = {},

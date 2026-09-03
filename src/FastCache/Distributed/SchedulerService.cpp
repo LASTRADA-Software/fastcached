@@ -556,7 +556,7 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
     // read whole by every deployed launcher, so its arity is not merely exact but
     // absent -- there is nothing to extend. This reply was empty and its client read
     // nothing from it, so eight bytes are additive in both directions.
-    auto const term = Wire::EncodeSchedulerTerm(_epoch.load(std::memory_order_relaxed));
+    auto const term = Wire::EncodeU64Field(_epoch.load(std::memory_order_relaxed));
     return SchedulerReply::Success(std::vector<std::byte> { term.begin(), term.end() });
 }
 
