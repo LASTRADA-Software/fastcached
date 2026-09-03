@@ -1700,10 +1700,15 @@ if [[ -z "$dwarf_reader" ]]; then
 elif ! (cd "$mapdir" && "$compiler" -g "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen.cpp" -o probe.o) \
         >/dev/null 2>&1; then
     echo "   SKIPPED: ${compiler} does not accept -fdebug-prefix-map, so neither half can be mapped"
-elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)" ]]; then
-    # The arrangement, asserted. If the worker's inherited directory were this one
-    # the two objects would agree with the mapping removed entirely.
-    fail "case 13 cannot bite: the worker inherited the same directory the launcher runs in"
+elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"* || "$(pwd -P)" == "$(cd "$mapdir" && pwd -P)"* ]]; then
+    # The arrangement, asserted, and CONTAINMENT rather than equality is the test.
+    # Equal directories make the case vacuous -- the two objects would then agree with
+    # the mapping removed entirely. But a worker directory that merely CONTAINS the
+    # launcher's is worse than vacuous: a prefix-map rule appends the unmatched tail, so
+    # the worker's own rule would rewrite the launcher's paths and the case would fail
+    # for where it was invoked rather than for anything about the subject. Reachable by
+    # running this fixture from a parent of $TMPDIR.
+    fail "case 13 cannot bite: the worker's inherited directory and the launcher's are not disjoint"
 else
     reference_comp_dir=""
     remote_comp_dir=""

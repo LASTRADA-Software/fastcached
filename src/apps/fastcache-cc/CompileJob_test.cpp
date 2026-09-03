@@ -996,19 +996,71 @@ TEST_CASE("A worker asked for no mapping adds no rule", "[compile-job][prefix-ma
     CHECK(rules->empty());
 }
 
-TEST_CASE("A worker refuses half a compilation-directory mapping", "[compile-job][prefix-map]")
+TEST_CASE("An empty replacement maps a directory to nothing, and is legal", "[compile-job][prefix-map]")
 {
-    // Half a pair is half a rule and the missing half is not guessable: an empty
-    // replacement maps a real directory to nothing, an empty directory maps everything.
-    // Refused rather than treated as "maps nothing", which would be a silent wrong
-    // answer where this is a named one.
-    auto const noReplacement = WorkerPrefixMapRules("/scratch", "/home/ci/build", "", DriverFamily::Gnu);
-    REQUIRE_FALSE(noReplacement.has_value());
-    CHECK(noReplacement.error() == JobRefusal::RejectedArgument);
+    // `-fdebug-prefix-map=<builddir>=` is a standard reproducible-build spelling, and
+    // `MatchPathValueFlag` reports it as a directory with an empty replacement -- so a
+    // client using it sends exactly that. Refusing it as "half a pair" cost such a build
+    // distribution entirely: every TU paid a scheduler grant and a worker round trip and
+    // then compiled locally anyway.
+    auto const rules = WorkerPrefixMapRules("/scratch", "/home/ci/build", "", DriverFamily::Gnu);
+    REQUIRE(rules.has_value());
+    CHECK(*rules == std::vector<std::string> { "-fdebug-prefix-map=/home/ci/build=", "-fdebug-prefix-map=/scratch=" });
+}
 
-    auto const noDirectory = WorkerPrefixMapRules("/scratch", "", ".", DriverFamily::Gnu);
-    REQUIRE_FALSE(noDirectory.has_value());
-    CHECK(noDirectory.error() == JobRefusal::RejectedArgument);
+TEST_CASE("A worker refuses a replacement with no directory to replace", "[compile-job][prefix-map]")
+{
+    // The one genuinely malformed half: a replacement with no left-hand side would map
+    // everything. The DIRECTORY is what says whether a mapping is in force, so this is
+    // not "maps nothing" and must not be read as it.
+    auto const rules = WorkerPrefixMapRules("/scratch", "", ".", DriverFamily::Gnu);
+    REQUIRE_FALSE(rules.has_value());
+    CHECK(rules.error() == JobRefusal::RejectedArgument);
+}
+
+TEST_CASE("A worker drops its own rule when that rule would swallow the client's paths", "[compile-job][prefix-map]")
+{
+    // THE regression case for the shipped Linux deployment. A prefix-map rule appends
+    // the unmatched tail, so a worker directory of `/` rewrites `/home/ci/build` to
+    // `.home/ci/build` and every system header to `.usr/include/...`. And `/` is the
+    // production value: `fastcache-compile-node.service` sets no `WorkingDirectory=`,
+    // and `PosixDaemonHost` calls `chdir("/")` on the daemonize path.
+    //
+    // Measured on gcc 14.2.0 with both rules present and this one last:
+    // `DW_AT_comp_dir` came back `.tmp/l506d/client`, and every system header read
+    // `.usr/include/...`. That is a WRONG object under a correct key -- strictly worse
+    // than the unmapped directory #506 is about.
+    //
+    // The client's rule still lands, which is what keeps the gcc case fully mapped.
+    auto const atRoot = WorkerPrefixMapRules("/", "/home/ci/build", ".", DriverFamily::Gnu);
+    REQUIRE(atRoot.has_value());
+    CHECK(*atRoot == std::vector<std::string> { "-fdebug-prefix-map=/home/ci/build=." });
+
+    // Not only the root: any worker directory the client's own lies under.
+    auto const above = WorkerPrefixMapRules("/home/ci", "/home/ci/build", ".", DriverFamily::Gnu);
+    REQUIRE(above.has_value());
+    CHECK(*above == std::vector<std::string> { "-fdebug-prefix-map=/home/ci/build=." });
+
+    // And a worker directory that merely RESEMBLES the client's still gets its rule:
+    // the test is containment, because a byte prefix is what the driver applies.
+    auto const beside = WorkerPrefixMapRules("/home/cix", "/home/ci/build", ".", DriverFamily::Gnu);
+    REQUIRE(beside.has_value());
+    CHECK(beside->size() == 2);
+}
+
+TEST_CASE("A worker refuses when its OWN directory cannot be spelled", "[compile-job][prefix-map]")
+{
+    // The value the client did not send, so it is the WORKER's fault -- blaming a client
+    // for a property of the machine it was sent to sends an operator to the wrong end of
+    // the fleet. Checked at all because the header's argument for the alphabet is that
+    // these are spliced onto a command line, and this is the value that used to skip it.
+    for (auto const& bad: { std::string { "/scratch dir" }, std::string { "/scratch\"quoted" }, std::string {} })
+    {
+        INFO("worker directory: " << bad);
+        auto const rules = WorkerPrefixMapRules(bad, "/home/ci/build", ".", DriverFamily::Gnu);
+        REQUIRE_FALSE(rules.has_value());
+        CHECK(rules.error() == JobRefusal::SpawnFailed);
+    }
 }
 
 TEST_CASE("A worker maps BOTH candidate directories to the client's replacement", "[compile-job][prefix-map]")

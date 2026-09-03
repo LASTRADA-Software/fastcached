@@ -206,9 +206,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     fixes clang and leaves gcc recording an unmapped path, which no object comparison
     can see. And it is the node's WORKING directory, not the scratch directory #506
     named. Empty means map nothing (a build that asked for nothing must not get a
-    directory neither machine has), half a pair is refused, it cannot ride in `args`
-    (which refuse a path separator, and `:` is a path character), and a worker that
-    cannot spell the rules REFUSES. Read `comp_dir`, never compare objects.
+    directory neither machine has) and the DIRECTORY is what says so, never the
+    replacement — an empty replacement is a real reproducible-build spelling. It cannot
+    ride in `args` (which refuse a path separator, and `:` is a path character), and a
+    worker that cannot spell the rules REFUSES. **A prefix-map rule appends the
+    unmatched tail**, so the worker's own rule is DROPPED when its directory contains
+    the client's: `/` is the shipped unit's working directory and `/=.` rewrites every
+    absolute path in the object — measured, a `comp_dir` of `.tmp/…/client` and system
+    headers reading `.usr/include/...`, worse than the bug. Read `comp_dir`, never
+    compare objects.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

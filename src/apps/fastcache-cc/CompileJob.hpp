@@ -464,18 +464,34 @@ class CompileJobRunner final: public ICompileJobRunner
 ///
 /// ## What it refuses, and why each refusal is not a silent skip
 ///
-///   - **An empty pair is not a refusal.** It is the client saying it maps nothing, and
+///   - **No directory is not a refusal.** It is the client saying it maps nothing, and
 ///     a worker that mapped anyway would hand a build that asked for nothing an object
-///     naming a directory neither machine has. A HALF-empty pair is refused: it is half
-///     a rule, and guessing the other half is guessing about debug output.
-///   - **Either half carrying anything but the shape below.** They are peer text that
-///     ends up inside an artefact and, before that, on a command line. The set allowed
-///     is deliberately narrower than `SafeSourceName`'s in one direction and wider in
-///     another: no `=` (the drivers disagree about where a second one splits), no
-///     whitespace, quote or control character (this is spliced into a command line and,
-///     on Windows, into a `CreateProcessA` string), and bounded — but bytes at or above
-///     `0x80` ARE allowed, because unlike a source name neither ever becomes a path and
-///     a build directory with a non-ASCII component is an ordinary thing to have.
+///     naming a directory neither machine has. An empty REPLACEMENT is not that case
+///     either: `-fdebug-prefix-map=<builddir>=` maps a root to nothing and is a standard
+///     reproducible-build spelling, so the DIRECTORY alone says whether a mapping is in
+///     force. Only the reverse — a replacement with no directory — is refused, because
+///     it would map everything.
+///   - **Any of the three carrying anything but the shape below.** They are peer text
+///     that ends up inside an artefact and, before that, on a command line. The set
+///     allowed is deliberately narrower than `SafeSourceName`'s in one direction and
+///     wider in another: never the row's own separator, no whitespace, quote or control
+///     character (this is spliced into a command line and, on Windows, into a
+///     `CreateProcessA` string), and bounded — but bytes at or above `0x80` ARE allowed,
+///     because unlike a source name none of them ever becomes a path and a build
+///     directory with a non-ASCII component is an ordinary thing to have. This worker's
+///     OWN directory is checked too; it is the one value the client did not send, so it
+///     is refused as the worker's fault rather than the client's.
+///   - **The worker's own rule is DROPPED, not refused, when it would also match the
+///     client's directory.** A prefix-map rule appends the unmatched tail, so a worker
+///     directory of `/` rewrites `/home/ci/build` to `.home/ci/build` and every system
+///     header to `.usr/include/...`. That is the production value — the shipped
+///     `fastcache-compile-node.service` sets no `WorkingDirectory=` and
+///     `PosixDaemonHost` calls `chdir("/")` — and measured on gcc 14.2.0 it produced a
+///     `DW_AT_comp_dir` of `.tmp/…/client`, a WRONG object under a correct key and
+///     strictly worse than the unmapped directory this closes. The client's rule still
+///     lands, so the gcc case is fully mapped; what remains is clang on such a node,
+///     which is the pre-#506 state rather than a new defect. Refusing instead would
+///     cost every dispatched compile on every node installed from the shipped unit.
 ///   - **A compile directory containing `=`**, this worker's own included. gcc splits
 ///     `<from>=<to>` at the last separator and clang at the first — measured: a working
 ///     directory of `/tmp/l506b/eq=sign` mapped to `.` gives `.` under gcc and

@@ -647,6 +647,13 @@ Two consequences worth knowing:
   directory contains an `=` (gcc and clang split `<from>=<to>` at opposite ends, so no
   unambiguous rule exists) or when the worker's driver has no path-map switch at all.
   It shows up as a refusal on the worker's metrics and costs one local compile.
+- **A worker running in `/` maps only your directory, not its own.** A prefix-map rule
+  appends the unmatched tail, so a rule whose left-hand side is `/` would rewrite every
+  absolute path in the object — `/usr/include/...` becomes `.usr/include/...`. The
+  shipped `fastcache-compile-node.service` sets no `WorkingDirectory=`, so that is the
+  ordinary Linux deployment. Your own rule still lands, which covers gcc completely;
+  under clang such a node's objects keep its working directory, exactly as they did
+  before. Giving the unit a `WorkingDirectory=` of its own closes that too.
 
 The `#line` markers a worker is sent still carry the dispatching machine's paths,
 so a dispatched object's line table names the producing checkout's headers. That

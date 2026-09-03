@@ -1315,9 +1315,24 @@ stops being one — the same confound that cost #493 a re-run.
     body carrying a path separator, deliberately, and both halves are full of them.
     Weakening that rule to carry a debug token would be paying a security-shaped
     price for a debug-info fix.
-  - **A HALF-filled pair is refused**, never read as "maps nothing": an empty
-    replacement maps a real directory to nothing and an empty directory maps
-    everything, and neither missing half is guessable.
+  - **The DIRECTORY says whether a mapping is in force, never the replacement.** An
+    empty replacement is legal — `-fdebug-prefix-map=<builddir>=` maps a root to
+    nothing and is a standard reproducible-build spelling, and refusing it as "half a
+    pair" cost such a build distribution entirely. A replacement with no directory is
+    the one malformed half, and is refused: it would map everything.
+  - **The worker's OWN rule is dropped when it would also match the client's
+    directory**, and this is the sharpest edge in the change. A prefix-map rule appends
+    the unmatched tail, so a worker directory of `/` rewrites `/home/ci/build` to
+    `.home/ci/build` and every system header to `.usr/include/...`. `/` is the
+    PRODUCTION value: `fastcache-compile-node.service` sets no `WorkingDirectory=` and
+    `PosixDaemonHost` calls `chdir("/")`. Measured on gcc 14.2.0 with both rules and the
+    worker's last, `DW_AT_comp_dir` came back `.tmp/…/client` — a WRONG object under a
+    correct key, strictly worse than what this ticket set out to fix, and invisible to
+    an e2e that runs the node from the fixture's own directory. Dropped rather than
+    refused: the client's rule still lands, so gcc is fully mapped and only clang on
+    such a node keeps the pre-#506 state, where refusing would cost every dispatched
+    compile on every node installed from the shipped unit. The real repair is a
+    `WorkingDirectory=` in the unit, which is packaging.
   - **`:` is a path character here.** A Windows absolute path begins `C:\`, and a
     GNU-layout driver on Windows — mingw, or plain clang — is an ordinary client.
     Leaving `:` out of the safe set refused every such client's own directory before

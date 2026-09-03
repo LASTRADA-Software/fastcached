@@ -714,21 +714,22 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
                                                                        std::string_view replacement,
                                                                        DriverFamily family)
 {
-    // Both empty is the client saying it maps nothing, and it is the ONE case that must
-    // not become a refusal or a worker-chosen default: a worker that mapped anyway would
-    // hand a build that asked for nothing an object naming a directory neither machine
-    // has. No rules, and no error.
+    // No directory is the client saying it maps nothing, and it is the ONE case that
+    // must not become a refusal or a worker-chosen default: a worker that mapped anyway
+    // would hand a build that asked for nothing an object naming a directory neither
+    // machine has. No rules, and no error.
+    //
+    // An empty REPLACEMENT is not that case. `-fdebug-prefix-map=<builddir>=` maps a
+    // root to nothing and is a standard reproducible-build spelling, so the directory
+    // alone is what says whether a mapping is in force. The reverse -- a replacement
+    // with no directory -- is genuinely half a rule and is refused: it would map
+    // everything.
     if (clientDirectory.empty() && replacement.empty())
         return std::vector<std::string> {};
-
-    // Half a pair is half a rule, and the missing half is not guessable: an empty
-    // replacement would map a real directory to nothing, and an empty directory would
-    // map everything. This detail is this file's own literal text and carries none of
-    // the client's bytes, so it needs no naming.
-    if (clientDirectory.empty() || replacement.empty())
+    if (clientDirectory.empty())
         return std::unexpected(JobError { .reason = JobRefusal::RejectedArgument,
-                                          .detail = "a compilation-directory mapping needs both a directory and a "
-                                                    "replacement" });
+                                          .detail = "a compilation-directory replacement needs the directory it "
+                                                    "replaces" });
 
     // Bounded, and two different numbers because they are two different things: a
     // replacement is a relative path a build tree produces, a directory is an absolute
@@ -754,74 +755,92 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
                        .detail = "this worker's driver family has no path-mapping switch, so a dispatched object "
                                  "cannot record the compilation directory the client asked for" });
 
-    // **The separator is asked of the ROW, for all three values.** gcc cuts `<from>=<to>`
-    // at the last separator and clang at the first, so any value carrying one is a rule
-    // the two drivers read differently -- measured: a directory of `/tmp/l506b/eq=sign`
-    // mapped to `.` gives `.` under gcc 14 and `sign=.=sign` under clang 20, a WRONG
-    // compilation directory rather than a missing one.
-    //
-    // Asking the row rather than leaning on the alphabet below is what keeps this from
-    // failing OPEN when the table grows. `CmdLine.hpp` already names the row it expects
-    // next -- `-fprofile-prefix-map`, a `<path>:<something>` spelling -- and `:` is in
-    // that alphabet, because a Windows absolute path begins `C:\`. Add such a row and an
-    // alphabet-only guard admits a value containing the new separator and emits a rule
-    // the driver splits in the wrong place, which is this ticket reintroduced by what
-    // looks like a pure table addition.
-    //
-    // The two halves are attributed differently on purpose: a client's value is the
-    // CLIENT's fault, this worker's own directory is the WORKER's.
-    if (clientDirectory.contains(row->valueTailSeparator) || replacement.contains(row->valueTailSeparator))
-        return std::unexpected(JobError::RejectedArgumentNaming(
-            clientDirectory.contains(row->valueTailSeparator) ? clientDirectory : replacement));
-    if (workerDirectory.contains(row->valueTailSeparator))
-        return std::unexpected(
-            JobError { .reason = JobRefusal::SpawnFailed,
-                       .detail = std::format("this worker's compile directory contains '{}', which the GNU drivers "
-                                             "disagree about splitting, so no unambiguous mapping rule exists",
-                                             row->valueTailSeparator) });
-
-    // The rest of the shape rule, spelled the way `IsSafeStem` above spells its own: an
-    // explicit alphabet read from a capturing lambda, and no `<cctype>`. `std::isalnum`
-    // is locale-dependent, which is the exact hazard the note under `IsSafeStem` records
+    // The shape rule, spelled the way `IsSafeStem` above spells its own: an explicit
+    // alphabet read from a capturing lambda, and no `<cctype>`. `std::isalnum` is
+    // locale-dependent, which is the exact hazard the note under `IsSafeStem` records
     // for `std::tolower` -- a rule that answers differently on two workers is how one
     // machine refuses what the next accepts.
     //
     // Two things are why this is not `IsSafeStem` itself. Bytes at or above 0x80 are
-    // ALLOWED, because neither value ever becomes a path here and a build directory with
-    // a non-ASCII component is ordinary; and `/`, `\`, `:` are allowed, which a name that
-    // becomes a file must refuse. `:` because of the Windows drive letter above --
-    // without it, such a client's own directory was refused before the driver family was
-    // even consulted, so the refusal named the wrong end of the fleet.
+    // ALLOWED, because none of these ever becomes a path here and a build directory
+    // with a non-ASCII component is ordinary; and `/`, `\`, `:` are allowed, which a
+    // name that becomes a file must refuse. `:` because a Windows absolute path begins
+    // `C:\` and a GNU-layout driver on Windows is an ordinary client -- without it,
+    // such a client's own directory was refused before the driver family was even
+    // consulted, so the refusal named the wrong end of the fleet.
+    //
+    // The row's own separator is excluded HERE rather than left to the alphabet, so
+    // the guard cannot fail open when the table grows: `CmdLine.hpp` names the row it
+    // expects next -- `-fprofile-prefix-map`, a `<path>:<something>` spelling -- and
+    // `:` is in that alphabet. gcc cuts `<from>=<to>` at the last separator and clang
+    // at the first, so a value carrying one is a rule the two drivers read differently
+    // (measured: `/tmp/l506b/eq=sign` mapped to `.` gives `.` on gcc 14 and
+    // `sign=.=sign` on clang 20 -- a WRONG compilation directory, not a missing one).
     constexpr std::string_view Allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./\\:_-+~";
     auto const unspellable = [&](char c) {
-        return static_cast<unsigned char>(c) < 0x80 && !Allowed.contains(c);
+        return c == row->valueTailSeparator || (static_cast<unsigned char>(c) < 0x80 && !Allowed.contains(c));
     };
+
+    // ALL THREE values, and the two halves are attributed differently on purpose: a
+    // value the client sent is the CLIENT's fault, this worker's own directory is the
+    // WORKER's. Blaming a client for a property of the machine it was sent to sends an
+    // operator to the wrong end of the fleet.
     if (std::ranges::any_of(clientDirectory, unspellable))
         return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
     if (std::ranges::any_of(replacement, unspellable))
         return std::unexpected(JobError::RejectedArgumentNaming(replacement));
+    if (workerDirectory.empty() || workerDirectory.size() > MaxDirectory
+        || std::ranges::any_of(workerDirectory, unspellable))
+        return std::unexpected(
+            JobError { .reason = JobRefusal::SpawnFailed,
+                       .detail = "this worker's own compile directory cannot be spelled inside a mapping rule, so no "
+                                 "unambiguous rule exists" });
 
-    // The separator appears twice in each rule -- once joining the flag to its value,
-    // once inside that value -- and this spells both from the row's own
-    // `valueTailSeparator`. That is one character for every row the table can currently
-    // hold, and it is an assumption rather than a fact, so `CompileJob_test` pins the
-    // join DIRECTLY.
-    //
-    // Re-parsing what this emits does not pin it, and that was the first version of the
-    // guard: `StripJoinSeparator` accepts every character in `JoinSeparators` by design,
-    // so a rule joined with `:` parses back with the same head and the same tail. All
-    // five of its assertions passed with this line broken.
     auto const ruleFor = [&](std::string_view directory) {
+        // The separator appears twice -- once joining the flag to its value, once
+        // inside that value -- and this spells both from the row's own
+        // `valueTailSeparator`. That is one character for every row the table can
+        // currently hold, and it is an assumption rather than a fact, so
+        // `CompileJob_test` pins the join DIRECTLY. Re-parsing what this emits does not
+        // pin it: `StripJoinSeparator` accepts every character in `JoinSeparators` by
+        // design, so a rule joined with `:` parses back with the same head and the same
+        // tail. All five of that guard's assertions passed with this line broken.
         return std::format(
             "{}{}{}{}{}", row->spelling, row->valueTailSeparator, directory, row->valueTailSeparator, replacement);
     };
 
+    // **The worker's own rule is DROPPED when it would also match the client's
+    // directory**, and that is not a nicety -- it is the difference between a mapped
+    // object and a corrupted one.
+    //
+    // A prefix-map rule appends the unmatched tail, so `<from>` = `/` rewrites
+    // `/home/ci/build` to `.home/ci/build` and `/usr/include/...` to `.usr/include/...`
+    // -- every absolute path in the object. And `/` is the production value: the shipped
+    // `fastcache-compile-node.service` sets no `WorkingDirectory=`, so systemd starts
+    // the node in `/`, and `PosixDaemonHost` calls `chdir("/")` on the daemonize path.
+    //
+    // Measured on gcc 14.2.0, node in `/`, both rules present with this one last:
+    // `DW_AT_comp_dir` came back `.tmp/l506d/client` and every system header read
+    // `.usr/include/...`. That is a WRONG object under a correct key -- strictly worse
+    // than the unmapped directory #506 is about.
+    //
+    // Dropping it rather than refusing the job is deliberate. The client's rule still
+    // lands, so the gcc case -- where the compile adopts the CLIENT's directory from the
+    // preprocessed text -- is fully mapped: measured, `comp_dir` is `.`. What is left
+    // is clang on such a node, whose object keeps the worker's directory, which is
+    // exactly the pre-#506 state rather than a new defect. Refusing instead would cost
+    // every dispatched compile on every node installed from the shipped unit, to buy a
+    // case that is no worse than it was.
+    //
+    // The real repair is a `WorkingDirectory=` in the unit, which is packaging.
+    if (clientDirectory.starts_with(workerDirectory))
+        return std::vector<std::string> { ruleFor(clientDirectory) };
+
     // BOTH, to the same replacement. Which directory the object records is the driver's
     // answer rather than the fleet's -- gcc under `-g` puts the CLIENT's into the
     // preprocessed text and the compile adopts it, clang leaves this worker's showing --
-    // so mapping both gives one answer either way. The worker's own goes LAST, so that
-    // where one directory is a prefix of the other this machine's reading wins; both map
-    // to the same replacement, so the order changes nothing else.
+    // so mapping both gives one answer either way. The worker's own goes LAST, and by
+    // the guard above it cannot contain the client's directory, so the order is free.
     return std::vector<std::string> { ruleFor(clientDirectory), ruleFor(workerDirectory) };
 }
 
