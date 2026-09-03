@@ -571,6 +571,32 @@ class IFrameResponder
     /// justified by a fact about the tree has to name the fact, or it stops being
     /// justified the moment the fact changes and nobody notices.
     ///
+    /// ## What EOF is taken to mean, and the case that reading costs
+    ///
+    /// **A peer that has sent FIN is treated as gone, and that is a decision rather
+    /// than a deduction.** EOF says the peer closed its WRITE side; whether its read
+    /// side is still open is not observable from here, and the only way to find out is
+    /// to write -- which is the cost this exists to avoid. So a half-close, where a
+    /// client says "I will send nothing more" and still waits for its reply, is read
+    /// here as a client that left: its object is not written and the counter names it
+    /// as abandoned.
+    ///
+    /// The opposite rule is taken one directory away, and states its reason:
+    /// `RedisResp`'s `ArmDisconnect` counts only a socket ERROR as a disconnect,
+    /// because on a surface whose loop still owns the reader, mere readability may be
+    /// a pipelined command or exactly this half-close. That rule cannot be taken here:
+    /// a killed client surfaces as EOF and not as an error -- which is the whole case
+    /// this watch is for -- so requiring an error would detect essentially nothing.
+    ///
+    /// **The check that would falsify the trade-off**: does any client half-close after
+    /// sending? None in this tree can. `ISocket` has no `ShutdownWrite` at all --
+    /// `InMemorySocket` declares one, and its forty-odd users are tests standing in for
+    /// "the client is done sending" over the in-memory transport, never a production
+    /// socket. A third-party client speaking `0xFC` over a raw socket could, and would
+    /// lose distribution silently while this counter blamed it. If one ever does, the
+    /// answer is not to soften the rule -- it is that EOF-without-close needs a meaning
+    /// this wire agrees on, in one place, for both surfaces.
+    ///
     /// ## Why it answers a COUNTER rather than a bool
     ///
     /// An abandoned delivery is an event on the SURFACE, not on the endpoint: the
