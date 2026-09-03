@@ -1699,6 +1699,14 @@ makes it anyway and says so there.
   `ctest -R tidy-sweep-database` asserts it stays that way: nothing else connects
   the workflow to the two places that document it.
 
+  Verbatim duplication is right *under the constraint it was written under* and
+  wrong permanently — [#615](https://github.com/LASTRADA-Software/fastcached/issues/615)
+  carries the `tidy22` preset that removes it, and must be taken by whoever can
+  change `build.yml` in the same change: a preset CI does not adopt is a fourth
+  copy, not a consolidation. The check moves to comparing against the preset in
+  that same change, or it fails correctly and confusingly against documentation
+  that is still right.
+
 - **A sweep that cannot prove the tool ran is worth nothing, and reads like
   success.** Every way of getting clang-tidy wrong above -- an unset execute bit
   (the wheel does not carry one), a wrapper that cannot exec, a missing resource

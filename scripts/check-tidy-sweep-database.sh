@@ -57,6 +57,21 @@
 # version; the CONFIGURING compiler is whatever `PATH` offers. Unchanged by #454
 # and not made worse by it, but not closed by this check either.
 #
+# ## When #615 lands, this check must change with it
+#
+# Verbatim duplication of the workflow's line is right only under the constraint
+# it was written under: `build.yml` was held by another pull request, so a
+# `tidy22` configure preset could not have been adopted by CI in the same change
+# and would have become a FOURTH copy rather than a consolidation. #615 carries
+# the permanent fix, and says it must be taken by whoever can change `build.yml`
+# in the same change.
+#
+# The moment CI configures a preset instead of a preset-plus-five-`-D`s, this
+# check starts failing -- CORRECTLY, and confusingly, because the documentation
+# it is comparing will still be right. It is not the thing to delete then: point
+# it at the preset both sides name. Written down here because the person doing
+# that will arrive at a red check before they arrive at #615.
+#
 # ## Usage
 #
 #   bash scripts/check-tidy-sweep-database.sh              # check the tree
