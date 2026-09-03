@@ -62,7 +62,12 @@ namespace Detail
     /// @return True when exactly one of the counter and the rationale is present.
     [[nodiscard]] constexpr bool StatesOneClaim(CacheRefusalPolicy const& policy) noexcept
     {
-        return policy.counter.has_value() == policy.rationale.empty();
+        // Delegated rather than restated. The rule belongs to a refusal ROW and not to
+        // this surface, so it lives beside the enumerator with the wire codes and the
+        // shared rationale. Three surfaces spelling one truth table separately is how
+        // it briefly came to exist in two idioms, one of them the double-negated form
+        // -- and a grep for the name reached only one of the three.
+        return StatesOneRefusalClaim(policy.counter.has_value(), policy.rationale);
     }
 
     /// Answer a cache-surface refusal the way its row decided.
@@ -265,7 +270,7 @@ namespace Detail
     // site read the fields in the luckier order.
     static_assert(std::ranges::all_of(SchedulerEndpointRefusals,
                                       [](SchedulerEndpointRefusal const& row) {
-                                          return row.answer.has_value() != !row.rationale.empty();
+                                          return StatesOneRefusalClaim(row.answer.has_value(), row.rationale);
                                       }),
                   "every scheduler endpoint refusal must state either a counted answer or a rationale, not both");
 
@@ -418,9 +423,7 @@ class SchedulerResponder final: public IFrameResponder
                                                               std::string_view detail) const override
     {
         auto const& row = Detail::SchedulerEndpointRefusals[static_cast<std::size_t>(refusal)];
-        if (!row.answer.has_value())
-            return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal), .rationale = row.rationale }, detail);
-        return Cc::Refuse(_metrics, *row.answer, detail);
+        return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
     }
 
     /// @copydoc IFrameResponder::RequestTimeout

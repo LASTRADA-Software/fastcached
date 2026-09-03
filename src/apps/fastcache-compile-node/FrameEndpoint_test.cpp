@@ -177,6 +177,14 @@ struct Fleet
 ///
 /// A free function taking a raw pointer for the reason `ReadAtLeast` is one: a
 /// capturing lambda coroutine outlives the expression that created it.
+///
+/// **It replaces two inline copies rather than adding a sixth.** The predicate "the
+/// write was accepted" is already spelled out at five places in this tree, including
+/// `FrameEndpoint.cpp`'s own `WriteAll` a hundred lines from the code under test --
+/// and this file had written the same coroutine out inline twice. There is no shared
+/// byte-span writer for test code to call; making one is a `src/tests/` change that
+/// would also want the three read helpers above it, and it is not this ticket's.
+/// Recorded here so the next person adding a seventh knows the count.
 /// @param peer Connected socket.
 /// @param bytes What to send; may be a partial frame, which is the point.
 /// @return Whether the write was accepted.
@@ -943,10 +951,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     constexpr std::uint32_t Declared = 32ULL * 1024ULL;
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
-    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
-        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
-        co_return written.has_value();
-    }(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
+    REQUIRE(SyncRun(SendRaw(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
 
     // The refusal arrives first. Asserted so the observation below cannot pass because
     // the connection was closed for some entirely different reason.
@@ -1780,10 +1785,7 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     // ARM TWO: names a verb the responder then never answers. Swept owing an answer.
     auto owed = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(owed.has_value());
-    REQUIRE(SyncRun([](ISocket* sock, std::vector<std::byte> bytes) -> Task<bool> {
-        auto const written = co_await sock->Write(std::span<std::byte const> { bytes });
-        co_return written.has_value();
-    }((*owed).get(), Wire::EncodeFetch("k"))));
+    REQUIRE(SyncRun(SendRaw((*owed).get(), Wire::EncodeFetch("k"))));
 
     // ONE wait for both, bounded and reporting what it waited for. The bound is
     // generous against `HeaderTimeout` plus a sweep interval, because what this case
@@ -1812,6 +1814,50 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     (*silent)->Close();
     (*owed)->Close();
     responder.Hold(false);
+}
+
+TEST_CASE("The explanation grace scales with the verb's own window", "[node][frame][sweep]")
+{
+    // **This shipped wrong once, and the integration case above could not see it.**
+    // The grace was a flat `SweepInterval * 4`, which resolves to five seconds, while
+    // `CompileResponder::RequestTimeout` is `DefaultCompileLeaseTimeout` -- six
+    // hundred. A translation unit that has just outrun a ten-minute grant does not
+    // return inside five seconds, so the deferral expired, the socket was closed, and
+    // the connection found nothing owed when `Answer` finally came back. The fix
+    // delivered its explanation on the cache surface, where the problem is mild, and
+    // silently not at all on the compile surface, which is the one it was written for.
+    //
+    // **A pure function over the window, tested as one.** The alternative is a case
+    // that waits out the difference in wall clock -- and it cannot be cheap, because
+    // the sweep fires at `RequestTimeout` and the grace is derived from that same
+    // number, so discriminating five seconds from a longer grace needs a window above
+    // five seconds and a hold between the two: sixteen seconds or more for one case,
+    // measured through sleeps whose own spread is the thing being measured. The
+    // testing rules here say to split the DECISION out and pin that; this is that
+    // split, and the case above is what asserts the decision is wired in at all.
+    //
+    // Pinned on BOTH sides, because a bound checked in one direction is satisfied by
+    // a function that ignores its argument.
+    CHECK(FrameServer::ExplanationGraceFor(Wire::DefaultCompileLeaseTimeout) == Wire::DefaultCompileLeaseTimeout);
+    CHECK(FrameServer::ExplanationGraceFor(FrameServer::HeaderTimeout) == FrameServer::HeaderTimeout);
+
+    // The floor, and the reason for it: the sweeper's cadence bounds how promptly any
+    // deadline here can be acted on, so a grace under one tick would be a number that
+    // reads like a guarantee and is not one.
+    CHECK(FrameServer::ExplanationGraceFor(std::chrono::milliseconds { 1 }) == FrameServer::SweepInterval);
+    CHECK(FrameServer::ExplanationGraceFor(FrameServer::SweepInterval) == FrameServer::SweepInterval);
+
+    // And the property that makes the whole thing correct rather than merely bigger:
+    // it never answers a number smaller than the window a surface named for itself.
+    for (auto const window: { std::chrono::milliseconds { 0 },
+                              FrameServer::SweepInterval,
+                              FrameServer::HeaderTimeout,
+                              Wire::DefaultCompileLeaseTimeout })
+        CHECK(FrameServer::ExplanationGraceFor(window) >= window);
+
+    // The flat constant this replaced, named as a value rather than as a symbol, so
+    // this case keeps failing if somebody reintroduces it under another name.
+    CHECK(FrameServer::ExplanationGraceFor(Wire::DefaultCompileLeaseTimeout) > std::chrono::milliseconds { 5'000 });
 }
 
 TEST_CASE("A peer swept inside the surface is told why, and one swept on the socket is not", "[node][frame][sweep]")

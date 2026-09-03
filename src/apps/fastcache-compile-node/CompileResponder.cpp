@@ -131,7 +131,7 @@ namespace
     // and unexplained.
     static_assert(std::ranges::all_of(EndpointRefusalTable,
                                       [](EndpointRefusalRow const& row) {
-                                          return row.answer.has_value() != !row.rationale.empty();
+                                          return StatesOneRefusalClaim(row.answer.has_value(), row.rationale);
                                       }),
                   "every endpoint refusal row must state either a counted answer or a rationale, not both");
 
@@ -171,9 +171,7 @@ std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal re
                                                               std::string_view detail) const
 {
     auto const& row = EndpointRefusalTable[static_cast<std::size_t>(refusal)];
-    if (!row.answer.has_value())
-        return Cc::RefuseWithoutCounter({ .code = ErrorCodeFor(refusal), .rationale = row.rationale }, detail);
-    return Cc::Refuse(_metrics, *row.answer, detail);
+    return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
 }
 
 Task<std::vector<std::byte>> CompileResponder::Answer(std::span<std::byte const> frame, std::string peer)

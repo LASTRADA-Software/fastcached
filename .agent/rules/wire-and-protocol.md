@@ -866,13 +866,32 @@ Every rule below has already been a bug.
     at each of seven write sites is a rule to forget at the eighth. Here it is a
     consequence of where the mark can be set at all, so exactly one writer is
     structural rather than agreed.
-  - **A deferral needs its own bound.** `Answer` is an interface and nothing can
-    promise it returns, so leaving the socket open would hold a descriptor for the life
-    of the process where the old close released it. `FrameServer::ExplanationGrace`
-    closes it after all — a constant, not a flag: its only correct value is a property
-    of the mechanism, and a knob invites tuning a number describing nothing an operator
-    can see. The connection SLOT is held by the coroutine frame either way, so the
-    close was only ever buying one descriptor.
+  - **A deferral needs its own bound, and that bound is DERIVED from the responder's
+    own window — never a constant.** `Answer` is an interface and nothing can promise
+    it returns, so leaving the socket open would hold a descriptor for the life of the
+    process where the old close released it; `ExplanationGraceFor` closes it after all.
+    It shipped once as a flat `SweepInterval * 4`, which is five seconds, against a
+    `CompileResponder::RequestTimeout` of six hundred — **a factor of 120**. A TU that
+    has just outrun a ten-minute grant does not return inside five seconds, so the
+    deferral expired, the socket closed, and nothing was owed when `Answer` came back:
+    the fix explained itself reliably on the cache surface, where the problem is mild,
+    and silently not at all on the compile surface it was written for. The constant's
+    own justification — *"a property of this mechanism and not of a site's workload"* —
+    sat three hundred lines below `IFrameResponder::RequestTimeout` arguing that **one
+    number cannot bound both things this endpoint carries**, and pure virtual precisely
+    so no surface can inherit five seconds. The general form: **a duration this endpoint
+    applies to a responder's work belongs to the responder**, and a constant is how it
+    silently stops applying to the surface that needed it most. The connection SLOT is
+    held by the coroutine frame either way, so the close was only ever buying one
+    descriptor.
+  - **And the case that proves the fix could not see it.** The integration test used a
+    50 ms window and released its hold at once, so it never approached the grace. Nor is
+    the magnitude cheap to assert: the sweep fires at `RequestTimeout` and the grace is
+    derived from that same number, so discriminating the old constant needs a window
+    above five seconds and a hold between the two — sixteen-plus seconds, measured
+    through sleeps whose spread is the quantity. So the grace is a **pure function**
+    over the window, pinned on both sides, which is the testing rules' preference
+    applied to exactly the situation they describe.
   - **Two counters, two events.** `FrameAnswerDeadlineSweeps` keeps its exact meaning
     (a sweep happened) so nothing scraping it breaks; `FrameDeadlineRefusalsSent` says
     how many of those peers were told why, moved by the connection when the write
