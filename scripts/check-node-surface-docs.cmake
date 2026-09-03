@@ -139,10 +139,15 @@ set(FastCachedSurfaceCountPatterns
 # Rule A is covered by the same needle.
 set(FastCachedSurfaceResidueNeedle "surface")
 
-# Number words, in ascending order so a word's VALUE is its position. Digits are
-# deliberately absent: a numeric form falls through to the residue rule and is
-# refused as unclassified, which is the safe direction for a wording nobody has
-# judged.
+# Number words, in ascending order so a word's VALUE is its position.
+#
+# Digits are absent from this table because a digit needs no table to be read.
+# They are NOT absent from the residue rule, and this comment used to say they
+# fell through to it -- they fell through the residue rule's own character class
+# instead, so `6-surface table` was accepted in silence while the sentence here
+# described it being refused. A claim in a comment that nothing reads cannot make
+# the code wrong, so the residue matcher now spells `[A-Za-z0-9]+` and this
+# paragraph is checked by `node-surface-docs-selftest`'s digit case.
 set(FastCachedSurfaceNumberWords
     "one" "two" "three" "four" "five" "six" "seven" "eight" "nine" "ten"
 )
@@ -299,26 +304,50 @@ fastcached_split_lines("${surfaceContent}" surfaceLines)
 
 set(surfaceNames "")
 set(surfaceProtocols "")
-set(surfaceFlags "")
+set(surfaceFlagRows "")
 set(pendingName "")
-set(pendingFlag "")
+set(pendingFlags "")
 foreach(line IN LISTS surfaceLines)
     if(line MATCHES "^[ \t]*\\.name[ \t]*=[ \t]*\"([a-z]+)\"")
         set(pendingName "${CMAKE_MATCH_1}")
-        set(pendingFlag "")
-    elseif(line MATCHES "^[ \t]*\\.flags[ \t]*=[ \t]*\\{[ \t]*\"([^\"]+)\"")
-        set(pendingFlag "${CMAKE_MATCH_1}")
+        set(pendingFlags "")
+    elseif(line MATCHES "^[ \t]*\\.flags[ \t]*=[ \t]*\\{(.*)\\}")
+        # EVERY flag in the row. `discovery` declares two and holding only the
+        # first left `--discovery-reply-port` outside this guard entirely: it
+        # could be renamed in the table with every page keeping the old spelling
+        # and this check would stay green, which is the exact failure the flag
+        # rule exists to refuse. The empty `{}` slots the other three rows carry
+        # yield no literal, so they add no row rather than an empty one.
+        set(pendingFlags "")
+        string(REGEX MATCHALL "\"[^\"]+\"" flagLiterals "${CMAKE_MATCH_1}")
+        foreach(flagLiteral IN LISTS flagLiterals)
+            string(REGEX REPLACE "^\"(.*)\"$" "\\1" flagValue "${flagLiteral}")
+            list(APPEND pendingFlags "${flagValue}")
+        endforeach()
     elseif(line MATCHES "^[ \t]*\\.protocol[ \t]*=[ \t]*SurfaceProtocol::([A-Za-z]+)")
         if(pendingName STREQUAL "")
             list(APPEND violations
                  "${FastCachedSurfaceSource}: a `.protocol` row with no `.name` above it; this scan has lost the table's shape, so nothing it says about the documents is worth reading")
+        elseif(pendingFlags STREQUAL "")
+            # The same lost-shape refusal, in the direction the row restructure
+            # opened: a surface whose flags did not extract would contribute no
+            # row and simply vanish from the flag rule, which is a guard going
+            # quiet rather than a guard firing.
+            list(APPEND violations
+                 "${FastCachedSurfaceSource}: the `${pendingName}` surface committed with no `.flags` extracted; this scan has lost the table's shape, so nothing it says about the documents is worth reading")
+            set(pendingName "")
         else()
             list(APPEND surfaceNames "${pendingName}")
             string(TOUPPER "${CMAKE_MATCH_1}" protocolToken)
             list(APPEND surfaceProtocols "${protocolToken}")
-            list(APPEND surfaceFlags "${pendingFlag}")
+            # One row per (surface, flag) pair. Never a list parallel to
+            # `surfaceNames` by position -- that shape is what made holding a
+            # second flag a reporting bug rather than an extra element.
+            foreach(flagValue IN LISTS pendingFlags)
+                list(APPEND surfaceFlagRows "${pendingName}|${flagValue}")
+            endforeach()
             set(pendingName "")
-            set(pendingFlag "")
+            set(pendingFlags "")
         endif()
     endif()
 endforeach()
@@ -420,12 +449,11 @@ foreach(docFile IN LISTS docFiles)
 
     # Flags are looked for across the whole corpus rather than per document: no
     # single page is obliged to name every surface.
-    foreach(flag IN LISTS surfaceFlags)
-        if(NOT flag STREQUAL "")
-            string(FIND "${docContent}" "${flag}" position)
-            if(NOT position EQUAL -1)
-                list(APPEND flagsSeen "${flag}")
-            endif()
+    foreach(flagRow IN LISTS surfaceFlagRows)
+        fastcached_row_fields("${flagRow}" flagSurface flag)
+        string(FIND "${docContent}" "${flag}" position)
+        if(NOT position EQUAL -1)
+            list(APPEND flagsSeen "${flag}")
         endif()
     endforeach()
 
@@ -464,8 +492,21 @@ foreach(docFile IN LISTS docFiles)
     # quadratic in line length and hands back UNSANITISED text.
     set(fenceState "")
     set(seenInFence "")
+    set(rowsInFence 0)
     foreach(line IN LISTS docLines)
         if(line MATCHES "^[ \t]*```")
+            if(fenceState STREQUAL "transcript" AND rowsInFence EQUAL 0)
+                # A fence that INVOKES `--print-surfaces` and pastes none of its
+                # output is documentation of the command, not a transcript of it.
+                # Holding it to the table reported every surface missing from a
+                # block that claimed nothing -- four findings against a page that
+                # was correct, which is the false-positive direction and the one
+                # that gets a check switched off. A block showing SOME rows is
+                # still held to all of them: a partly-pasted port list is exactly
+                # what misleads on a firewall worksheet.
+                set(fenceState "")
+                continue()
+            endif()
             if(fenceState STREQUAL "transcript")
                 math(EXPR transcriptsChecked "${transcriptsChecked} + 1")
                 if(NOT seenInFence STREQUAL "${surfaceNames}")
@@ -498,6 +539,7 @@ foreach(docFile IN LISTS docFiles)
             if(line MATCHES "print-surfaces")
                 set(fenceState "transcript")
                 set(seenInFence "")
+                set(rowsInFence 0)
                 continue()
             endif()
             if(fenceState STREQUAL "transcript")
@@ -505,6 +547,7 @@ foreach(docFile IN LISTS docFiles)
                 # `-`. The `$` line, the `notes:` block and the wrapped
                 # continuation of the command all fail the two-column shape.
                 if(line MATCHES "^([a-z]+)([ \t]+[a-z]*)?[ \t]+([^ \t]+)[ \t]")
+                    math(EXPR rowsInFence "${rowsInFence} + 1")
                     set(label "${CMAKE_MATCH_1}")
                     list(FIND surfaceNames "${label}" position)
                     if(position EQUAL -1)
@@ -520,7 +563,8 @@ foreach(docFile IN LISTS docFiles)
 
         # Rule B. A port-set phrasing is checked; anything else counting
         # something called a surface must have been classified.
-        set(handled FALSE)
+        set(countHandled FALSE)
+        set(residueLine "${line}")
         foreach(patternRow IN LISTS FastCachedSurfaceCountPatterns)
             fastcached_row_fields("${patternRow}" countPattern countNeedle countKind countReason)
             if(line MATCHES "${countPattern}")
@@ -529,25 +573,42 @@ foreach(docFile IN LISTS docFiles)
                 if(NOT wordIndex EQUAL -1)
                     math(EXPR claimed "${wordIndex} + 1")
                     math(EXPR countClaimsChecked "${countClaimsChecked} + 1")
-                    set(handled TRUE)
+                    set(countHandled TRUE)
                     if(NOT claimed EQUAL ${${countKind}Count})
                         list(APPEND violations
                              "${docPath}: `${line}` claims ${claimed} where ${FastCachedSurfaceSource} declares ${${countKind}Count}. This phrasing is a claim about the port set because: ${countReason}")
                     endif()
+                    # Judged, so take it OUT and let the backstop read what is
+                    # left. Short-circuiting the whole line meant one recognised
+                    # phrasing vouched for every other claim in the same sentence.
+                    string(REGEX REPLACE "${countPattern}" "" residueLine "${line}")
                     break()
                 endif()
             endif()
         endforeach()
-        if(handled)
-            continue()
-        endif()
 
-        if(NOT line MATCHES "([A-Za-z]+)[- ]surfaces?")
-            continue()
-        endif()
-        string(TOLOWER "${CMAKE_MATCH_1}" leadingWord)
-        list(FIND FastCachedSurfaceNumberWords "${leadingWord}" wordIndex)
-        if(wordIndex EQUAL -1)
+        # EVERY `<token> surface` collocation, not just the leftmost. `MATCHES`
+        # reports the first match only, so a line opening `the node surface ...`
+        # masked a numeric claim later in the same sentence: `node` is not a
+        # number word, the rule moved on, and what followed was never judged.
+        # Digits are matched here as well -- see FastCachedSurfaceNumberWords.
+        set(handled FALSE)
+        set(residueFound FALSE)
+        string(REGEX MATCHALL "[A-Za-z0-9]+[- ]surfaces?" residueHits "${residueLine}")
+        foreach(residueHit IN LISTS residueHits)
+            string(REGEX MATCH "^[A-Za-z0-9]+" residueToken "${residueHit}")
+            string(TOLOWER "${residueToken}" residueToken)
+            if(residueToken MATCHES "^[0-9]+$")
+                set(residueFound TRUE)
+                break()
+            endif()
+            list(FIND FastCachedSurfaceNumberWords "${residueToken}" wordIndex)
+            if(NOT wordIndex EQUAL -1)
+                set(residueFound TRUE)
+                break()
+            endif()
+        endforeach()
+        if(NOT residueFound)
             continue()
         endif()
 
@@ -577,13 +638,8 @@ endforeach()
 # third mechanical column of the table an operator maps a firewall rule to a flag
 # with, and without it `--listen-raft` could be renamed while every page kept the
 # old spelling and this check stayed green.
-set(surfaceIndex 0)
-foreach(flag IN LISTS surfaceFlags)
-    list(GET surfaceNames ${surfaceIndex} name)
-    math(EXPR surfaceIndex "${surfaceIndex} + 1")
-    if(flag STREQUAL "")
-        continue()
-    endif()
+foreach(flagRow IN LISTS surfaceFlagRows)
+    fastcached_row_fields("${flagRow}" name flag)
     list(FIND flagsSeen "${flag}" seen)
     if(seen EQUAL -1)
         list(APPEND violations
