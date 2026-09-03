@@ -1154,20 +1154,100 @@ endif()
 # Not labelled "smoke", for the reason the three above are not: it reads source
 # files and reports, so it belongs in the default `ctest` set and must survive
 # `ctest -LE smoke`. It has no skip path -- the source tree is present in an
-# exported tarball exactly as it is in a checkout. Slower than its siblings
-# (~0.2-0.5 s against their ~0.1-0.2 s) because it reads every candidate file to
-# find the few that name a variable, which is what makes it a discovery rather
-# than a list of places to look; still far inside the timeout.
+# exported tarball exactly as it is in a checkout.
+#
+# It is the slowest of the script checks, because it READS every candidate file
+# to find the few that name a variable -- which is what makes it a discovery
+# rather than a list of places to look. What that costs is not stated here. This
+# comment used to say "~0.2-0.5 s against their ~0.1-0.2 s ... still far inside
+# the timeout", and that was the most confident of THREE figures the tree held
+# for this one check: a quiet WSL 9p checkout measures ~4.5 s, and two lanes
+# measured 53-57 s against the 60 s ceiling while several gates ran at once
+# (#479). All three were honestly taken and none carried its conditions, so each
+# read as a fact about the check when all three are facts about a filesystem.
+# The check now measures itself and prints the cost, the band it lands in and
+# the headroom on EVERY run, so the margin is an observation anybody can act on
+# rather than a claim written once. `FastCachedSccacheScanCostBands` in the
+# script carries the conditions table; do not copy a number back out of it.
+#
+# The bound below is a BACKSTOP AGAINST PATHOLOGY, not a deadline, and the
+# distinction is the whole reason it can be this large. This check cannot wedge:
+# it opens no socket, spawns no subprocess, waits on nothing and has no
+# unbounded loop -- it reads N files and exits. So there is no hang for a
+# wall-clock bound to detect here, and the only thing it can catch is a
+# filesystem slower than the widest measured band, which is a condition and not
+# a defect. Do not tighten it as though tightening a real deadline: that is how
+# this check arrived at a 60 s ceiling it spends 7% of on a quiet machine and
+# 95% of under the load this repository routinely runs at.
+#
+# It is defensible only while a run that is going long SAYS SO. The script
+# narrates progress with its measured per-file cost once a run passes
+# `FastCachedSccacheScanNarrateAfterSeconds`, and ctest captures the output of a
+# test it kills, so a kill at this bound arrives with the reason attached. It
+# narrates through both phases -- per scan root while walking, per hundred files
+# while reading -- and the one window it cannot narrate inside is a single
+# `file(GLOB_RECURSE)` call, which is uninterruptible and cannot be subdivided
+# without reintroducing the per-pattern traversals #502 removed.
+#
+# The script refuses a budget below twice that threshold, so the two cannot drift
+# apart quietly: a run killed before narration could start is exactly the bare
+# timeout #479 is about, a signal that cannot say which kind of failure it was.
+#
+# ONE variable, passed to the script AND used as the TIMEOUT, because the
+# headroom the script prints has to be headroom against the number ctest
+# actually enforces. Two numbers that agree today is precisely how this file came
+# to hold three figures for one check.
+set(FastCachedSccacheCaveatBudgetSeconds 180)
 add_test(
     NAME "sccache-backend-caveat"
     COMMAND ${CMAKE_COMMAND}
         "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSccacheCaveatBudgetSeconds}"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-sccache-backend-caveat.cmake"
 )
 set_tests_properties("sccache-backend-caveat" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
-    TIMEOUT 60
+    TIMEOUT ${FastCachedSccacheCaveatBudgetSeconds}
+)
+
+# ---------------------------------------------------------------------------
+# `sccache-backend-caveat` must be SEEN to report its own cost, and seen to stay
+# QUIET when there is nothing to report.
+#
+# The narration is the entire answer to a `ctest` timeout on that check, and it
+# only ever runs on a filesystem slow enough to trigger it -- which is to say it
+# would have been merged untested and stayed untested on every machine where it
+# is not needed. A fixture that has never completed has told you nothing.
+#
+# The NEGATIVE cases are the load-bearing ones: a check that narrates
+# unconditionally passes a test that only proves narration fires, and a frozen
+# clock reporting `0 ms/file` is a broken instrument reporting the best possible
+# filesystem. Both rot in silence. The case table owns the count and prints it;
+# it is deliberately not restated here.
+#
+# Synthesised trees rather than the real source root, for the reason
+# `glob-traversals-selftest` uses them: driving the real tree would double this
+# check's cost on exactly the machines #479 is about, and a synthesised corpus
+# lets the checkpoint interval be small enough to exercise in milliseconds.
+add_test(
+    NAME "sccache-backend-caveat-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/sccache-backend-caveat-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-sccache-backend-caveat-selftest.cmake"
+)
+set_tests_properties("sccache-backend-caveat-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    # Not derived from the budget above, and not a bare number by accident: this
+    # drives the check against a 26-file synthesised tree, so it is six `cmake -P`
+    # spawns over a corpus 30x smaller than the real one and finishes in ~1.4 s on
+    # the bridged filesystem the check itself takes ~4.5 s on. 120 s is the same
+    # backstop every other selftest here carries, and it is two orders of
+    # magnitude clear of what this costs -- which is exactly the margin the check
+    # under test now reports rather than asserts.
+    TIMEOUT 120
 )
 
 # ---------------------------------------------------------------------------
