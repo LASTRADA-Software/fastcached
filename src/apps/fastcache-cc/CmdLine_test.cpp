@@ -1231,6 +1231,20 @@ TEST_CASE("MappedCompileDirectory splits a rule where GCC splits it")
     CHECK(Unwrap(mapped).replacement == ".");
 }
 
+TEST_CASE("MappedCompileDirectory reports a rule that maps a root to nothing")
+{
+    // `-fdebug-prefix-map=<builddir>=` is a standard reproducible-build spelling and it
+    // IS a mapping: the local object records an empty compilation directory. So the
+    // directory travels with an empty replacement, and the worker must treat that as a
+    // mapping rather than as half a pair -- refusing it there cost such a build
+    // distribution entirely.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build=" };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped).directory == "/home/ci/build");
+    CHECK(Unwrap(mapped).replacement.empty());
+}
+
 TEST_CASE("MappedCompileDirectory ignores a rule with no replacement")
 {
     // `-fdebug-prefix-map=/abs` is malformed and the driver says so; it maps nothing,
