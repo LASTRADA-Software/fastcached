@@ -381,6 +381,12 @@ all prefetch groups
   unavailable  : 1  (25.0% of all compiles -- CACHE NOT REACHED)
   fall-back reasons
     1x  fetch exchange failed
+  distribution
+    not attempted   : 2
+    unreachable     : 1
+    dispatched      : 1  (50.0% of 2 asked of the fleet)
+    why distribution did not help
+      1x  the fleet could not be reached
 
   hit latency    2 samples  p50 12ms  p95 70ms  max 70ms
     preprocess   1 samples  all 65ms
@@ -400,6 +406,71 @@ latency is routinely multi-modal: a mean of 300 ms tells you nothing about
 whether that is every TU or a fast majority plus a slow tail. Fall-back reasons
 are itemized so `unavailable` is actionable — a refused connection and a
 rejected STORE call for very different responses.
+
+## The distribution section
+
+The cache and the fleet are two failure domains, and this report keeps them on
+two axes. **A compile can be a cache miss and a dispatch failure at once**: the
+daemon answered honestly, the object was compiled and stored, and the fleet was
+still no help. Recording the second as a cache outcome would inflate `unavailable`
+and send you to look at the daemon, so it has a section and a reason list of its
+own — `why distribution did not help` is never merged into `fall-back reasons`
+above it.
+
+**The section appears only when there is a fleet to report on.** With no
+`FASTCACHE_SCHEDULER` set, this launcher does not distribute, and printing
+`dispatched: 0 (0.0%)` for it would render an absence as a total failure. So it
+prints nothing at all — as does a log written before this section existed, which
+is silent about dispatch rather than evidence of no fleet.
+
+| Line | Meaning |
+|------|---------|
+| `not attempted` | A scheduler is configured and this compile never reached the dispatch decision — the cache served it, it was uncacheable, or the key was never derived. Nothing about the fleet follows from it. |
+| `refused here` | **This launcher** would not send the compile. The fleet was never asked, so this is fixed on your machine, not in the fleet — see the reason table below for which of the three it was. |
+| `fleet declined` | The scheduler or the worker said no: no worker on this toolchain, no capacity, the key already in flight, or the worker refusing the job. Ordinary; the question is the fleet's size or shape. |
+| `unreachable` | The scheduler or the worker could not be reached, or an exchange broke. Also ordinary, and fixed somewhere else entirely — a machine that is down or a network that is not carrying, rather than a fleet that is merely busy. That difference is why these are two lines and not one. |
+| `crossed reply` | A worker answered about a compile other than the one it was asked for, and the object was refused unread. **A defect somewhere in the fleet, not a fleet declining to help** — see the entry in the fall-back table above, which is where its reason is ranked. |
+| `result discarded` | A worker ran the compiler and this client did not keep the object: the remote compile exited non-zero and was retried locally, or the object or depfile could not be written here. The exchange worked and the compile was still done twice. |
+| `dispatched` | A worker ran the compiler and the object was used. Distribution worked. |
+
+**The rate is taken over what was actually asked of the fleet** — `fleet declined`,
+`unreachable`, `crossed reply`, `result discarded` and `dispatched` — and *not*
+over every compile. `not attempted` and `refused here` are excluded because the
+fleet never saw them, so a build that mostly hit the cache does not read as a fleet
+that mostly refused. It is the same reasoning as the hit rate being taken over
+cacheable compiles: an absence must not be counted as a failure. When nothing was
+asked at all the rate reads `n/a` rather than `0.0%`.
+
+`result discarded` is a line of its own for the same reason. Folded into
+`dispatched` with an explanatory reason underneath, a fleet whose every object was
+thrown away would headline **100% dispatched** — a green number over work done
+twice. It is also the only place a node that fails compiles which are fine is
+visible at all, because the local retry succeeds and the build stays green; a
+rising count here is the signal, and the reason says which of the three causes it
+was.
+
+The `dispatched` line prints even at zero. A fleet that dispatched nothing is
+exactly what this section exists to make visible, and omitting the line would read
+as "no data" rather than as "none". Every other line is dropped when it is zero.
+
+`--html-stats` renders the same states as a panel, driven by the same table, so a
+state cannot appear in one report and be missing from the other.
+
+### Why distribution did not help
+
+Every reason that appears under `why distribution did not help`. All of them still
+produce a correct object — the translation unit is compiled locally instead — and
+none of them is a caching failure.
+
+| Reason | Meaning |
+|--------|---------|
+| `the command line is not dispatchable` | `RemoteCompileArgs` found something on the line it cannot account for, so nothing was sent. Refusing costs one local compile, where stripping an unrecognised argument would change the generated code and hand back an object nobody asked for. `FASTCACHE_VERBOSE` names the offending flag; it is deliberately not in this tally, or you would get one row per command line instead of one per cause. |
+| `the dispatch preprocess failed` | A worker is fed a *second* preprocess, with `#line` markers that the cache key's copy suppresses, and that run failed. The key's own preprocess had already succeeded, so this is about the marker-emitting form of the command specifically. |
+| `this toolchain has no usable fingerprint` | The toolchain digest does not identify this compiler, so no worker could match it. Deliberately refused here rather than sent: a scheduler asked for an unidentifiable fingerprint answers `NoWorker`, which reads as "the fleet has nobody on your toolchain" and sends you to look at the fleet for a problem on this machine. `fastcache-cc --print-toolchain-fingerprint <compiler>` says what this machine computes and why it is unusable. |
+| `the fleet declined this compile` | The scheduler or the worker refused, and the verbose line carries its own words — `rejected (no-worker)`, `rejected (no-capacity)`, `already-in-flight`, and so on. Those are not split out here yet; that is [#618](https://github.com/LASTRADA-Software/fastcached/issues/618). |
+| `the fleet could not be reached` | The scheduler or the worker did not answer, broke mid-reply, or ran out of budget. If every compile shows this, check the address in `FASTCACHE_SCHEDULER` before suspecting the fleet — a wrong one looks exactly like a fleet that is entirely down. |
+| `a worker compile failed and was retried locally` | The remote compiler exited non-zero, so the result was discarded and the translation unit compiled here to confirm. Broken code produces this on every machine and is not a fleet problem; a *rising* count against a build that keeps succeeding is a worker producing failures that are not real, and the verbose line names the machine. |
+| `the dispatched object could not be written`, `the depfile for a dispatched compile could not be written` | The object came back and this machine could not store it — a full disk or a read-only output path. Local, not a fleet problem, and the compile is redone here. |
 
 ## Exit codes
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "Dispatch.hpp"
+
 #include <FastCache/Cli/UsageDoc.hpp>
 
 #include <cstdint>
@@ -25,10 +27,125 @@ enum class Outcome : std::uint8_t
 /// @return The stable token written to the log (also parsed back when reporting).
 [[nodiscard]] std::string_view ToStringView(Outcome outcome) noexcept;
 
+/// What the launcher did about DISTRIBUTION on one compile — an axis of its own,
+/// beside `Outcome` rather than folded into it.
+///
+/// **Two independent facts.** A compile can be a cache miss *and* a dispatch
+/// failure at the same time, so neither can stand in for the other: recording a
+/// dispatch failure as `Outcome::Unavailable` would inflate a *cache* bucket for a
+/// *fleet* event and send an operator to look at the daemon, which is the
+/// conflation `RecordFallback`'s rule already refuses from the other side.
+///
+/// Before this axis existed there was no third place for it to go, so it went
+/// nowhere: every non-answer from `Dispatch` ended at a `FASTCACHE_VERBOSE`-gated
+/// stderr line that deliberately leaves the recorded outcome alone. A fleet in
+/// which *every* dispatch failed therefore produced a perfectly ordinary miss rate
+/// and total silence about distribution
+/// ([#427](https://github.com/LASTRADA-Software/fastcached/issues/427)) — the shape
+/// [#236](https://github.com/LASTRADA-Software/fastcached/issues/236) already cost
+/// this project once, arriving one layer further in.
+///
+/// **Not attempted, refused here, declined and unreachable are four states, not a
+/// `bool` and not a count.** A launcher with no scheduler configured never
+/// distributes and must report *no fleet*; counted as a failure it would report a
+/// 100 % dispatch failure rate forever, which is precisely what `NoUpstream`'s
+/// honest `false` did to the node's upstream-store figure.
+enum class DispatchOutcome : std::uint8_t
+{
+    /// This column did not exist when the line was written. **Not** "no fleet": a
+    /// pre-upgrade record knows nothing about dispatch in either direction, so it
+    /// is left out of the distribution report entirely rather than counted as
+    /// anything — the treatment `Record::hasPhaseColumns` gives the phase
+    /// histograms, for the same reason.
+    ///
+    /// Enumerator zero deliberately, so a `Record` nobody filled in reports
+    /// *unknown* instead of making a claim about somebody's fleet.
+    Unknown,
+    /// No scheduler is configured: this launcher does not distribute at all. An
+    /// absence, never a failure, and the whole reason it is not a `bool`.
+    NotConfigured,
+    /// A scheduler is configured and this compile never reached the dispatch
+    /// decision — the cache served it, or it was uncacheable, or the key was never
+    /// derived. Nothing about the fleet can be read from it either way.
+    NotAttempted,
+    /// The launcher itself refused to dispatch: a command line it cannot account
+    /// for, a dispatch preprocess that failed, a toolchain whose fingerprint does
+    /// not identify it. The fleet was never asked, so this says nothing about the
+    /// fleet — it is fixed on THIS machine, which is why it is not `Declined`.
+    Refused,
+    /// The fleet declined — no worker on this toolchain, no capacity, the key
+    /// already in flight, or the worker refusing the job. Ordinary; the operator's
+    /// question is about the fleet's size or shape.
+    Declined,
+    /// The scheduler or the worker could not be reached, or an exchange broke. Also
+    /// ordinary, and fixed somewhere else entirely: a machine that is down or a
+    /// network that is not carrying, rather than a fleet that is merely busy. That
+    /// difference is the whole point of splitting it from `Declined`.
+    Unreachable,
+    /// A worker answered about a compile other than the one it was asked for, and
+    /// this client refused the object
+    /// ([#280](https://github.com/LASTRADA-Software/fastcached/issues/280)). Kept
+    /// apart for the reason `DispatchStatus::Mismatched` gives: every other state
+    /// here is a fleet declining to help, and this one is a defect somebody has to
+    /// look at. Folded in with `Unreachable` it would read as a network blip.
+    Mismatched,
+    /// A worker ran the compiler and this client did not keep the object — a
+    /// non-zero remote exit code retried locally, or an artefact that could not be
+    /// written. The exchange worked and the compile was still done twice.
+    ///
+    /// **A state rather than a reason on `Dispatched`.** The reports rate
+    /// `Dispatched` against what was asked of the fleet, so a fleet whose every
+    /// result was thrown away would headline *100% dispatched* with the
+    /// contradiction relegated to a free-text tally underneath — a real failure
+    /// wearing an ordinary-looking number, which is #427's own defect one layer
+    /// further in. A state that is only true when read together with a string is
+    /// not a state. The reason still says WHICH of the three it was.
+    Discarded,
+    /// A worker ran the compiler and this client used the object. Distribution
+    /// worked, with nothing to qualify.
+    Dispatched,
+    /// The enumerator count; see `Core/EnumTable.hpp`. Never a state a `Record`
+    /// carries.
+    Last
+};
+
+/// @param outcome The dispatch outcome to name.
+/// @return The stable token written to the log (also parsed back when reporting).
+[[nodiscard]] std::string_view ToStringView(DispatchOutcome outcome) noexcept;
+
+/// How one `DispatchStatus` is recorded on the dispatch axis.
+struct DispatchRecording
+{
+    /// The FIXED tally reason, under `RecordFallback`'s rule. Empty where the state
+    /// alone says everything — a dispatch that worked, and a crossed reply, whose
+    /// sentence the CACHE axis already carries under #280's rule and which would
+    /// otherwise be printed twice in one report.
+    std::string_view reason;
+    DispatchOutcome outcome {}; ///< How `--show-stats` buckets it.
+};
+
+/// Decide how to record what `Dispatch` returned.
+///
+/// **Here rather than in the launcher's `main.cpp`, and that is the point.** This
+/// bridges two enumerations, neither of them `main`'s, and a decision that lives in
+/// `main.cpp` is a decision nothing can assert — that file is in no test target, as
+/// `CMakeLists.txt` says in as many words about the wire framing it already had to
+/// move out for the same reason. `RowsInEnumeratorOrder` proves such a table is
+/// *total*, never that it is *right*: swap the declined and unreachable rows and
+/// every assertion still passes while an operator is sent to look at the network
+/// for a fleet that was merely busy.
+///
+/// @param status What `Dispatch` returned.
+/// @return The state to record and the reason to tally it under.
+[[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status) noexcept;
+
 /// One recorded invocation.
 struct Record
 {
     Outcome outcome { Outcome::Unavailable };
+    /// What this compile did about distribution. Defaults to `Unknown` rather than
+    /// to any real state, so a caller that never set it makes no claim.
+    DispatchOutcome dispatch { DispatchOutcome::Unknown };
     std::string prefetchGroup;   ///< FASTCACHE_PREFETCH_GROUP at the time of the compile.
     std::string source;          ///< Translation-unit path, for per-TU attribution.
     std::uint64_t valueBytes {}; ///< Cached payload size (0 when nothing moved).
@@ -39,6 +156,27 @@ struct Record
     /// and compiled locally (#280), which leaves the outcome an honest miss with a
     /// reason worth ranking.
     std::string detail;
+
+    /// Why distribution did not help, tallied per cause beside — never inside —
+    /// the cache's `detail` above. One map each, because a compile that missed the
+    /// cache and then failed to dispatch has two causes and an operator fixes them
+    /// in two different places; ranked together, a fleet failure would show up in
+    /// the list somebody reads to decide whether the *daemon* is healthy.
+    ///
+    /// A FIXED string under `RecordFallback`'s rule, which bites harder here than
+    /// on the cache axis: `Dispatch` formats the worker's endpoint into its
+    /// declined message, so forwarding that text verbatim would produce one tally
+    /// row per worker in the fleet instead of one per cause. The endpoint rides the
+    /// verbose line instead.
+    ///
+    /// Empty when there is nothing to explain, which every good outcome is: a state
+    /// that says all there is to say carries no reason. `Refused` and `Discarded`
+    /// are the two that need one, because each covers three different causes an
+    /// operator fixes differently.
+    ///
+    /// Only tallied for a state the report prints, so the reason list and the state
+    /// list always reconcile — see `FoldRecords`.
+    std::string dispatchDetail;
 
     // Phase breakdown of elapsedMs. A hit is not "cache latency": it also pays a
     // full preprocess to derive the key, so a slow hit needs these to attribute.
