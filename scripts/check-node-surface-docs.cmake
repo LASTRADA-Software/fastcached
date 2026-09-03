@@ -638,6 +638,11 @@ endforeach()
 # third mechanical column of the table an operator maps a firewall rule to a flag
 # with, and without it `--listen-raft` could be renamed while every page kept the
 # old spelling and this check stayed green.
+list(LENGTH surfaceFlagRows flagRowCount)
+if(flagRowCount EQUAL 0)
+    list(APPEND violations
+         "no `.flags` were extracted from ${FastCachedSurfaceSource}, so the flag rule compared nothing against nothing and agreed")
+endif()
 foreach(flagRow IN LISTS surfaceFlagRows)
     fastcached_row_fields("${flagRow}" name flag)
     list(FIND flagsSeen "${flag}" seen)
@@ -701,4 +706,4 @@ endif()
 message(STATUS
     "node surface docs: ${surfaceCount} surface(s) (${tcpCount} TCP, ${udpCount} UDP) against "
     "${docsScanned} document(s) -- ${transcriptsChecked} transcript(s), ${countClaimsChecked} "
-    "port-set count claim(s) and ${surfaceCount} flag(s) checked")
+    "port-set count claim(s) and ${flagRowCount} flag(s) checked")
