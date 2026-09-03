@@ -1332,10 +1332,8 @@ stops being one — the same confound that cost #493 a re-run.
     nonexistent path and a relative path each fall back to `/tmp/l506f/build`. So it is a
     `stat` comparison, not a spelling one — `std::filesystem::equivalent`. And the
     discriminating case: a rule written with the RESOLVED spelling matches NOTHING, so
-    this cannot be answered by canonicalizing both sides and comparing identities. That
-    is more permissive than the driver and would send a worker a mapping the local
-    compile never applied, manufacturing the disagreement in the other direction.
-    `current_path()` is `getcwd(3)`, so the first implementation matched nothing on any
+    this cannot be answered by canonicalizing both sides and comparing identities — the
+    first instance of *err narrow* above. `current_path()` is `getcwd(3)`, so the first implementation matched nothing on any
     build reached through a link, sent no pair, and left the dispatched object unmapped —
     this ticket surviving its own fix, with every counter normal. macOS meets it because
     `/var` is a symlink and `$TMPDIR` is under one; Linux `/tmp` is not, which is why it

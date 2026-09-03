@@ -222,8 +222,7 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `getcwd(3)`, so the first fix matched nothing on any build reached through a symlink,
     sent no pair, and left the dispatched object unmapped — the ticket surviving its own
     fix, every counter normal, green on Linux because `/tmp` is not a link while macOS's
-    `$TMPDIR` sits under one. Not canonicalizing both sides: that is MORE permissive than
-    the driver and manufactures the disagreement in the other direction. Case 13 runs at
+    `$TMPDIR` sits under one. Case 13 runs at
     two spellings, each with its own source or the second replays the first's object.
     A dispatched object showing the CLIENT's directory is gcc's `-fworking-directory`
     residue, NOT proof it came from no worker — one fault, two residues, which is the
