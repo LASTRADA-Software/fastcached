@@ -78,11 +78,13 @@ using SameFieldFn = bool (*)(ConfigOf<Result> const&, ConfigOf<Result> const&);
 
 /// Whether a setting can take effect without restarting the process.
 ///
-/// **Opt-in, and that default is the guard.** The daemon's reloader decides this in a
-/// hand-written ladder, which means a flag added today is *silently reloadable* --
-/// [#406](https://github.com/LASTRADA-Software/fastcached/issues/406), measured at 10
-/// of 38 members guarded. Defaulting to `No` inverts that failure: a new flag is
-/// silently IMMUTABLE, so the worst a forgotten column costs is a reload refused with
+/// **Opt-in, and that default is the guard.** The daemon's reloader used to decide
+/// this in a hand-written ladder, which meant a flag added that day was *silently
+/// reloadable* -- measured at 10 of 38 members guarded, which is what
+/// [#406](https://github.com/LASTRADA-Software/fastcached/issues/406) was and what it
+/// closed by giving the daemon this column too. That pre-fix figure is kept because it
+/// is still the argument: defaulting to `No` inverts that failure, so a new flag is
+/// silently IMMUTABLE, and the worst a forgotten column costs is a reload refused with
 /// a name attached, never a live-wired object left disagreeing with the configuration
 /// that claims to describe it.
 enum class Reloadable : std::uint8_t
@@ -102,8 +104,10 @@ enum class Reloadable : std::uint8_t
     ///   table doing another, with nothing anywhere saying so.
     ///
     /// The second is unbounded and invisible; the first is a sentence on a terminal.
-    /// So a forgotten column fails closed. This is the inverse of #406, where the
-    /// daemon's hand-written ladder means a new flag is silently RELOADABLE.
+    /// So a forgotten column fails closed. It is the inverse of what #406 found: a
+    /// hand-written ladder beside a table makes a new flag silently RELOADABLE, which
+    /// is the direction with no bound on what it costs. Both binaries answer this
+    /// column now, so neither has such a ladder left.
     No,
     Yes, ///< Takes effect on reload.
 };
