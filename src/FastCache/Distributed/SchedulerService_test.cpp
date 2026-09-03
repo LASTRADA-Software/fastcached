@@ -30,10 +30,10 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A caller the fleet has admitted.
-constexpr CallerContext Insider { .membership = Membership::Member, .peerId = "peer-1" };
+CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1" };
 
 /// A caller that holds no membership -- the leech this policy exists for.
-constexpr CallerContext Outsider { .membership = Membership::Outsider, .peerId = "stranger" };
+CallerContext const Outsider { .membership = Membership::Outsider, .peerId = "stranger" };
 
 /// A worker offering one slot of the given toolchain.
 [[nodiscard]] WorkerRegistration OneSlot(std::string_view fingerprint, std::string_view endpoint)

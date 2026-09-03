@@ -31,7 +31,7 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A caller the fleet has admitted.
-constexpr CallerContext Insider { .membership = Membership::Member, .peerId = "peer-1" };
+CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1" };
 
 /// A scheduler that already leads, plus the protocol in front of it.
 struct Fixture
@@ -262,7 +262,7 @@ TEST_CASE("The service's refusals reach the wire with their codes intact", "[dis
 
     SECTION("a non-member")
     {
-        constexpr CallerContext outsider { .membership = Membership::Outsider, .peerId = "stranger" };
+        CallerContext const outsider { .membership = Membership::Outsider, .peerId = "stranger" };
         CHECK(ErrorOf(fixture.protocol.Answer(ask, outsider)) == Wire::ErrorCode::NotAMember);
     }
 
