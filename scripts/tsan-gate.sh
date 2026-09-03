@@ -199,23 +199,25 @@ export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressio
 # compilers and claims scratch roots, so on expiry a grandchild can outlive the
 # target this gate killed.
 #
-# Two consequences, and the second is the one an argument about the verdict does
-# not reach:
+# The obvious fear is that a survivor POISONS THE NEXT RUN by holding something,
+# and that was checked rather than assumed, because it is the difference between
+# a note and a defect. It does not, and not by luck: the two things a grandchild
+# could hold are both already closed where they are taken.
 #
-#   * THIS run is unaffected. Expiry is a named refusal either way, the gate
-#     exits immediately after it, and `run_bounded` captures into a file rather
-#     than a pipe, so a surviving writer cannot block the read that follows.
-#   * The NEXT run can be. A survivor holding a scratch-root `flock` is a live
-#     lock owner, and the run after a deadlock then refuses by name in a way that
-#     reads as a scratch-claim defect rather than as debris from the kill. That
-#     is a worse diagnosis than the one this change removes, in the same family.
+#   * a scratch-root claim -- `ScratchClaim.cpp` opens its lock file `O_CLOEXEC`,
+#     and its comment says why in these words: the `flock` lives on the open file
+#     DESCRIPTION, so an inherited copy would keep the root claimed after the node
+#     is gone and the next one would refuse, blaming a node that does not exist;
+#   * this gate's own output -- `run_bounded` captures into a FILE rather than a
+#     pipe, and unlinks it, so a surviving writer can neither block the read that
+#     follows nor corrupt a later one.
 #
-# Accepted rather than solved, because solving it means changing how a SHARED
-# helper signals: `run_bounded`'s header rejects both routes on stated grounds --
-# job control changes the calling fixture's own signal handling, and a watchdog
-# that fires after `wait` reaps can signal a REUSED pid. Neither is a decision to
-# take inside a ticket about a comment. Tracked with the ticket rather than left
-# in this paragraph, so it is somebody's rather than nobody's.
+# What is left is a compiler burning CPU until it finishes on its own, after a
+# run that has already stopped with a named refusal somebody is reading. Real,
+# bounded, and not worth changing how a SHARED helper signals to remove --
+# `run_bounded`'s header rejects both routes on stated grounds: job control
+# changes the calling fixture's own signal handling, and a watchdog firing after
+# `wait` reaps can signal a REUSED pid.
 TargetTimeoutSeconds="${FASTCACHE_TSAN_TIMEOUT:-900}"
 
 # The canary's own bound, which is much tighter because the canary is a few
