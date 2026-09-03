@@ -260,9 +260,11 @@ namespace
                 return std::ranges::any_of(environment, sameName);
             };
 
-            auto const append = [&block](std::string_view text) {
-                block.insert(block.end(), text.begin(), text.end());
-                block.push_back('\0');
+            // Collected first, so the whole set can be ordered once; the block's own
+            // shape is built at the end.
+            std::vector<std::string> entries;
+            auto const append = [&entries](std::string_view text) {
+                entries.emplace_back(text);
             };
 
             // `GetEnvironmentStringsA`, not `environ`: the CRT copy is a snapshot
@@ -285,7 +287,34 @@ namespace
             }
 
             for (auto const& [name, value]: environment)
-                append(name + "=" + value);
+            {
+                // Built by appending rather than by two `operator+` calls, each of
+                // which allocates a temporary this would discard.
+                std::string entry = name;
+                entry += '=';
+                entry += value;
+                append(entry);
+            }
+
+            // Sorted before serializing, because that is `CreateProcess`'s documented
+            // contract for the block it is handed. `GetEnvironmentStringsA` returns
+            // one already in that order, so appending the additions after every
+            // inherited entry would hand a child something no OS-built block looks
+            // like. The fold is ASCII and spelled out for the reason the name
+            // comparison above is: a locale-dependent one is the family of defect
+            // this whole change is about.
+            auto const fold = [](char c) {
+                return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+            };
+            std::ranges::sort(entries, [fold](std::string_view a, std::string_view b) {
+                return std::ranges::lexicographical_compare(a, b, [fold](char x, char y) { return fold(x) < fold(y); });
+            });
+
+            for (auto const& entry: entries)
+            {
+                block.insert(block.end(), entry.begin(), entry.end());
+                block.push_back('\0');
+            }
             block.push_back('\0');
             return block;
         }
@@ -651,7 +680,15 @@ namespace
                             merged.emplace_back(text);
                     }
                     for (auto const& [name, value]: environment)
-                        merged.push_back(name + "=" + value);
+                    {
+                        // Appended rather than concatenated, as on the Windows side and
+                        // for the same reason: two `operator+` calls allocate a
+                        // temporary each.
+                        std::string entry = name;
+                        entry += '=';
+                        entry += value;
+                        merged.push_back(std::move(entry));
+                    }
 
                     // Reserved before any `data()` is taken: a reallocation would
                     // leave every pointer already stored dangling.

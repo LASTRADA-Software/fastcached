@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -460,6 +459,18 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
 
 namespace
 {
+    /// What separates a `/showIncludes` note's prefix from the path it names.
+    ///
+    /// Two spellings, because the separator is part of the TRANSLATION. MSVC's CJK
+    /// catalogues use the full-width colon `U+FF1A`, so a reader searching only for
+    /// the ASCII `": "` answers "no note here" for exactly the locales this file
+    /// exists to report on -- and prints the sentence issue #692 exists to stop
+    /// printing. A synthesised fixture cannot be relied on to find that: whoever
+    /// types a Japanese line by hand is as likely to reach for an ASCII colon as
+    /// not, which is what happened here, so the second spelling is reasoned about
+    /// rather than waited for and pinned by a fixture that uses it deliberately.
+    constexpr std::array<std::string_view, 2> IncludeNoteSeparators { ": ", "\xEF\xBC\x9A" };
+
     /// Whether `text` begins where an absolute path begins.
     ///
     /// Three anchors, because a note names a file on whichever host printed it: a
@@ -476,8 +487,14 @@ namespace
             return true;
         // A drive letter, its colon, and a separator. `size() > 2` rather than a
         // three-character substring compare: the separator may be either.
-        return text.size() > 2 && std::isalpha(static_cast<unsigned char>(text.front())) != 0 && text[1] == ':'
-               && (text[2] == '\\' || text[2] == '/');
+        // An ASCII letter test spelled out rather than `std::isalpha`, whose answer
+        // for a byte >= 0x80 depends on the global locale -- which is the family of
+        // defect this predicate exists to report on.
+        auto const letter = [](char c) {
+            auto const lower = static_cast<char>(c | 0x20);
+            return lower >= 'a' && lower <= 'z';
+        };
+        return text.size() > 2 && letter(text.front()) && text[1] == ':' && (text[2] == '\\' || text[2] == '/');
     }
 } // namespace
 
@@ -505,11 +522,21 @@ bool CarriesUnreadableIncludeNotes(std::string_view showIncludesText) noexcept
         // several languages -- German's `Hinweis: Einlesen der Datei:` has two --
         // and a path on Windows contains a colon of its own, so the first is wrong
         // in one direction and a bare colon search is wrong in the other.
-        auto const separator = line.rfind(": ");
+        //
+        // Both spellings are tried; see `IncludeNoteSeparators` for why there are two.
+        std::size_t separator = std::string_view::npos;
+        std::size_t width = 0;
+        for (auto const candidate: IncludeNoteSeparators)
+            if (auto const at = line.rfind(candidate);
+                at != std::string_view::npos && (separator == std::string_view::npos || at > separator))
+            {
+                separator = at;
+                width = candidate.size();
+            }
         if (separator == std::string_view::npos)
             continue;
 
-        auto tail = line.substr(separator + 2);
+        auto tail = line.substr(separator + width);
         while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t'))
             tail.remove_prefix(1);
         if (StartsAbsolutePath(tail))

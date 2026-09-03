@@ -1383,11 +1383,17 @@ enum class HitDisposition : std::uint8_t
 };
 
 /// A hit after it has been examined and, if it held up, materialized.
+///
+/// The localized streams are deliberately NOT a member. They were, and their only
+/// reader outside this type was the manifest backfill, which parsed them for the
+/// headers this object depends on -- a reading with the PRODUCER's locale in it, so
+/// a value written by a German `cl` was unparseable on an English machine and the
+/// other way round (issue #692). The backfill takes the probe's own dependency set
+/// now, and returning several megabytes of replayed text to nobody is not a
+/// harmless leftover: it is a claim about who reads it.
 struct MaterializedHit
 {
     HitDisposition disposition { HitDisposition::Unusable };
-    std::string replayOut; ///< Localized region 0, kept for the manifest backfill.
-    std::string replayErr; ///< Localized region 1, same.
 };
 
 /// A hit that was not materialized, so carries no streams. A named factory rather
@@ -1397,7 +1403,7 @@ struct MaterializedHit
 /// @return The outcome, with empty replay text.
 [[nodiscard]] MaterializedHit NotMaterialized(HitDisposition disposition)
 {
-    return { .disposition = disposition, .replayOut = {}, .replayErr = {} };
+    return { .disposition = disposition };
 }
 
 /// Localize a hit's regions, check that this machine can honour what they assert,
@@ -1461,12 +1467,15 @@ struct MaterializedHit
 
     // Only the first ReplayRegionCount regions are streams; the rest are files and
     // must never reach stdout or stderr.
-    MaterializedHit result = NotMaterialized(HitDisposition::Served);
-    std::array<std::string*, ReplayRegionCount> const streams { &result.replayOut, &result.replayErr };
-    for (std::size_t idx = 0; idx < localized.size() && idx < streams.size(); ++idx)
-        *streams[idx] = localized[idx].bytes;
-    ReplayStreams(result.replayOut, result.replayErr);
-    return result;
+    //
+    // Local to this function now, because replaying them is the whole of what they
+    // are for -- `MaterializedHit` records what used to read them afterwards and why
+    // it no longer does.
+    std::array<std::string, ReplayRegionCount> replayed;
+    for (std::size_t idx = 0; idx < localized.size() && idx < replayed.size(); ++idx)
+        replayed[idx] = localized[idx].bytes;
+    ReplayStreams(replayed[0], replayed[1]);
+    return NotMaterialized(HitDisposition::Served);
 }
 
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
@@ -1584,10 +1593,33 @@ void RecordManifest(Config const& cfg,
     }
 
     // The probe's set, taken as it stands. It is already reconciled -- `Preprocess`
-    // does that at its own boundary -- and it already covers both driver families,
-    // the depfile one and the stream one, which is why the two parses and the
-    // depfile fallback that used to be here are gone rather than moved.
+    // does that at its own boundary -- and it covers both driver families, which is
+    // why the two stream parses that used to be here are gone rather than moved.
     auto includes = probed.paths;
+
+    // The build's OWN depfile, when the probe came back with nothing and the reason
+    // was not that its notes were unreadable.
+    //
+    // Kept rather than dropped with the parses, and the reason is asymmetric.
+    // `Preprocess` has two documented ways to yield an empty set on a depfile driver
+    // -- its scratch destination was not writable, or the driver wrote the file and
+    // put nothing in it -- and it DEGRADES rather than failing, because an empty
+    // dependency set costs the KEY only its moved-header protection. It costs the
+    // MANIFEST everything: direct mode would be off in that tree permanently and
+    // silently, on every compile. The build's own `-MF` names the same headers.
+    //
+    // Guarded on `unreadable` so it cannot paper over the localized case: an MSVC
+    // build has no depfile to read there, and the operator needs the sentence below
+    // rather than a second empty answer arrived at by a different route.
+    if (includes.empty() && !probed.unreadable)
+        if (auto const depText = ReadDepFile(cmd))
+        {
+            includes = Cc::ParseDepFilePaths(*depText);
+            // Reconciled here because this set came straight off disk, unlike the
+            // probe's. Resolution is memoized and idempotent, so it costs a hash
+            // lookup per path.
+            reconciler.All(includes);
+        }
 
     // Asked here as well as on the key path, because a manifest is the direct-mode
     // half of the same promise: an entry naming a path this host could not read is
@@ -2331,9 +2363,14 @@ void RecordManifest(Config const& cfg,
                 //
                 // Without this, direct mode could never populate on a cache that already
                 // holds preprocessed-key entries: manifests would only ever be written by
-                // the miss path, so a warm cache would preprocess forever. The localized
-                // /showIncludes text names exactly the headers this object depends on, so
-                // no compiler run is needed to record them.
+                // the miss path, so a warm cache would preprocess forever.
+                //
+                // From THIS machine's probe rather than from the value's replayed
+                // /showIncludes text, which is what it used to read. Both name the same
+                // headers, but the replayed text was written by the producer's compiler
+                // in the producer's language, so parsing it made the backfill work only
+                // between machines that happened to share a locale (issue #692). The
+                // probe already ran, so this still costs no compiler invocation.
                 if (cfg.direct)
                     RecordManifest(
                         cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);

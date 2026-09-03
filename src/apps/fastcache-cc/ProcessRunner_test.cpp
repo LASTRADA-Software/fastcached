@@ -219,6 +219,12 @@ TEST_CASE("A spawn with no additions inherits what it would have inherited anywa
     auto const run = runner->RunCaptureSplit(EchoEnvironment("PATH"), {});
 
     REQUIRE(run.exitCode == 0);
-    CHECK_FALSE(run.out.contains("fastcache-overrode-this"));
-    CHECK(run.out.size() > 8);
+
+    // The same separator test the case above had to derive, and for the same reason:
+    // a length check passes here under a runner that dropped the inherited block
+    // entirely, because `cmd.exe` echoes an unset variable as the literal `%PATH%`
+    // and this script echoes it twice. A `CHECK_FALSE` for the overriding value
+    // would be worse than weak -- nothing in this spawn ever sets it, so it is
+    // vacuous.
+    CHECK(run.out.find_first_of("/\\") != std::string::npos);
 }

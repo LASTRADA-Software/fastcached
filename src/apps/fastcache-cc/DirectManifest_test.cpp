@@ -487,10 +487,22 @@ constexpr std::string_view JapaneseNotes = "\xE3\x83\xA1\xE3\x83\xA2: \xE3\x82\x
                                            "\xE3\x83\xBC\xE3\x83\x89 \xE3\x83\x95\xE3\x82\xA1\xE3\x82\xA4\xE3\x83\xAB: "
                                            "C:\\proj\\src\\a.hpp\r\n";
 
-/// The two localized streams, spelled once because both cases below walk them.
-constexpr std::array<LocalizedNotes, 2> Localized { {
+// The same Japanese note with the FULL-WIDTH colon `U+FF1A`, which is what MSVC's
+// CJK catalogues actually use. A separate row rather than a correction of the one
+// above, because both spellings are plausible and only one of them had been
+// reasoned about: the fixture above was typed with ASCII colons, so it could never
+// have caught a reader searching for `": "` alone. A synthesised fixture tests the
+// shape whoever typed it had in mind, which is the limit review found in it.
+constexpr std::string_view JapaneseFullWidthNotes =
+    "\xE3\x83\xA1\xE3\x83\xA2\xEF\xBC\x9A\xE3\x82\xA4\xE3\x83\xB3\xE3\x82\xAF\xE3\x83\xAB"
+    "\xE3\x83\xBC\xE3\x83\x89 \xE3\x83\x95\xE3\x82\xA1\xE3\x82\xA4\xE3\x83\xAB\xEF\xBC\x9A"
+    "C:\\proj\\src\\a.hpp\r\n";
+
+/// The localized streams, spelled once because both cases below walk them.
+constexpr std::array<LocalizedNotes, 3> Localized { {
     { .language = "German", .text = GermanNotes },
-    { .language = "Japanese", .text = JapaneseNotes },
+    { .language = "Japanese (ASCII colon)", .text = JapaneseNotes },
+    { .language = "Japanese (full-width colon)", .text = JapaneseFullWidthNotes },
 } };
 } // namespace
 
