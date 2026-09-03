@@ -886,11 +886,13 @@ namespace
                 auto const reply = co_await state->responder.Answer(frame, peer);
 
                 // **The one place a deferred sweep is observed, and deliberately one.**
-                // A check at each of this loop's write sites would be a rule to
-                // remember at six places and at the seventh somebody adds; here it is a
-                // consequence of where the mark can be set at all. The refusal is
-                // written from the same statement sequence every other reply is, so
-                // "exactly one writer" is structural rather than agreed.
+                // This loop held six `WriteAll` calls before this line and holds seven
+                // with it; a "check whether you were swept first" rule spread over them
+                // would be a rule to remember six times and to forget at the eighth
+                // somebody adds. Here it is instead a consequence of where the mark can
+                // be set at all, and the refusal leaves by the same statement sequence
+                // every other reply does -- so "exactly one writer" is structural
+                // rather than agreed.
                 if (state->LeaveResponder(socket.get()))
                 {
                     // Named, with the number that explains it -- for the reason the
