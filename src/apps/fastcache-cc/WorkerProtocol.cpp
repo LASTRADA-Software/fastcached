@@ -128,10 +128,14 @@ namespace
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     std::string clusterId,
-                                    IWallClock const& clock)
+                                    IWallClock const& clock,
+                                    Distributed::KnownSchedulerTerm& term)
 {
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), cluster = std::move(clusterId), &clock](
-               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+    return [key = std::move(signingKey),
+            endpoint = std::move(advertisedEndpoint),
+            cluster = std::move(clusterId),
+            &clock,
+            &term](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -147,10 +151,28 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                             .fingerprint = fingerprint,
                                             .clusterId = cluster,
                                             // Stated, not omitted -- see the header.
-                                            .epoch = Distributed::LeaseEpochCheck::NotKnownHere() },
+                                            // `NotKnownHere` until a heartbeat reply
+                                            // or an authentic grant has taught this
+                                            // worker a term (#421).
+                                            .epoch = term.Check() },
             clock.Now());
         if (verified.has_value())
+        {
+            // **The second learning channel, and it works when the first does not.**
+            // A grant naming a later term than this worker knows is adopted -- and it
+            // is safe to adopt precisely BECAUSE this line sits after the MAC
+            // verified: `VerifyLeaseToken` authenticates before it reports on any
+            // claim, so nothing an unauthenticated sender writes can move this
+            // number. Reading the term off a refused token would let anybody holding
+            // the wire push a worker's expectation up and make it refuse every honest
+            // grant afterwards.
+            //
+            // It also makes the refusal in test terms observable at all: without
+            // adoption, a validator that accepted everything and one that adopts
+            // forward are indistinguishable from outside.
+            term.Learn(verified->epoch);
             return std::nullopt;
+        }
 
         // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
         // permission, and the object key inside it is the SCHEDULER's bookkeeping, so
@@ -436,10 +458,10 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
-                                                                std::uint32_t inFlight,
-                                                                Wire::LoadFields const& load,
-                                                                Credential const& credential)
+std::expected<Wire::SchedulerTermView, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
+                                                                                   std::uint32_t inFlight,
+                                                                                   Wire::LoadFields const& load,
+                                                                                   Credential const& credential)
 {
     if (_workerId.empty())
         // Never registered; nothing to refresh. Named rather than silent, because
@@ -451,7 +473,11 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& schedul
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
     auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (outcome.IsHit())
-        return {};
+        // An empty payload is a scheduler predating #421 and is ordinary during a
+        // rollout, which is why it is a state of its own rather than a decode
+        // failure: the two are told apart here and would be one value under an
+        // `optional`.
+        return Wire::DecodeSchedulerTerm(outcome.value);
 
     // A scheduler that does not know this worker is telling it to register again --
     // it restarted, or expired this entry. Forgetting the id here is what makes the

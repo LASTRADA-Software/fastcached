@@ -16,8 +16,12 @@
 namespace FastCache::Node
 {
 
-std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
-    NodeConfig const& cfg, std::string_view advertise, SocketActivation activation, IWallClock const& clock, ILogger& logger)
+std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
+                                                                        std::string_view advertise,
+                                                                        SocketActivation activation,
+                                                                        IWallClock const& clock,
+                                                                        Distributed::KnownSchedulerTerm& term,
+                                                                        ILogger& logger)
 {
     if (cfg.clusterKeyFile.empty())
     {
@@ -60,7 +64,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
                 "verifying lease signatures against the cluster key, for grants naming {} issued by cluster '{}'",
                 advertise,
                 cfg.clusterId);
-    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, cfg.clusterId, clock);
+    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, cfg.clusterId, clock, term);
 }
 
 } // namespace FastCache::Node

@@ -269,6 +269,16 @@ struct HeartbeatRound
     Node::FleetSampler& sampler;                  ///< This machine's own series.
     Cc::Credential const& credential;             ///< What the scheduler requires.
     ILogger& logger;                              ///< Where a refusal is named.
+
+    /// What this machine knows about the scheduler's term, written here and read by
+    /// the lease validator on every compile (#421).
+    ///
+    /// ONE per node, not one per registrar: several registrars announce several
+    /// toolchains to the same scheduler, so they all learn the same number, and a
+    /// copy each would be several writers of one fact with the sharing invisible.
+    /// It is `Learn`-only from this side -- monotonic, so the order the round's
+    /// entries happen to answer in cannot matter.
+    Distributed::KnownSchedulerTerm& schedulerTerm;
 };
 
 /// What one announcement learned, beyond how many entries landed.
@@ -353,6 +363,22 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             {
                 ++accepted;
                 handedOver = true;
+                // The only channel a worker has for learning the term (#421). Learned
+                // per ENTRY rather than once per round because that is where the
+                // reply is: a round can have some entries accepted and others
+                // refused, and the accepted ones each carry the same authoritative
+                // number.
+                if (beat->state == Wire::SchedulerTermState::Stated)
+                    round.schedulerTerm.Learn(beat->term);
+                else if (beat->state == Wire::SchedulerTermState::Unreadable)
+                    // Debug, not Warn: a scheduler saying something this build cannot
+                    // read is worth a trace and is not worth a per-heartbeat warning
+                    // on a fleet mid-rollout. `NotStated` is silent -- an older
+                    // scheduler is the ordinary case and says nothing wrong.
+                    round.logger.Logf(LogLevel::Debug,
+                                      "scheduler {} answered the heartbeat with a term this build cannot read; "
+                                      "leaving this worker's expectation where it was",
+                                      endpoint);
                 continue;
             }
             if (!leader.has_value())
@@ -751,11 +777,23 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
     // wants -- a local here was one more object whose outliving had to be reasoned
     // about, for no gain.
+    // Declared HERE, ahead of both the validator that reads it and the heartbeat
+    // thread that writes it, because it is the one object those two share and its
+    // lifetime has to cover the longer of them. A local in `main` is exactly that:
+    // `main` returns after the server loop and the heartbeat thread have both ended.
+    //
+    // Empty at this point, and that is a state rather than a gap -- a worker that
+    // refused grants before its first heartbeat could not cold-start, so
+    // `KnownSchedulerTerm` reports `NotKnownHere` and the check accepts everything
+    // until a scheduler has said something.
+    Distributed::KnownSchedulerTerm schedulerTerm;
+
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
                                        activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
+                                       schedulerTerm,
                                        logger);
     if (!validator.has_value())
     {
@@ -1173,7 +1211,8 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
                                  .metrics = metrics,
                                  .sampler = sampler,
                                  .credential = credential,
-                                 .logger = logger };
+                                 .logger = logger,
+                                 .schedulerTerm = schedulerTerm };
 
     // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of
     // the thread's lambda rather than a member of anything: only this thread reads or

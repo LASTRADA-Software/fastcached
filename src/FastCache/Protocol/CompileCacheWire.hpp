@@ -2509,6 +2509,66 @@ struct HeartbeatView
     return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight, .load = *load };
 }
 
+/// What a HEARTBEAT reply says about the scheduler's term.
+///
+/// Three states rather than an `optional`, because "this scheduler did not state a
+/// term" and "this scheduler stated something this build cannot read" are different
+/// operator problems even though a worker's ACTION is the same for both -- it learns
+/// nothing either way. The first is ordinary during a rollout and worth no attention;
+/// the second is two builds disagreeing about a payload and is worth a line. An
+/// `optional` would have made them one value and the rollout case would have hidden
+/// the other forever.
+enum class SchedulerTermState : std::uint8_t
+{
+    /// The reply carried no payload: a scheduler predating #421.
+    NotStated,
+    /// The term is in hand.
+    Stated,
+    /// A payload that is neither empty nor a term this build knows how to read.
+    Unreadable,
+};
+
+/// A HEARTBEAT reply's term, and whether there is one.
+struct SchedulerTermView
+{
+    SchedulerTermState state { SchedulerTermState::NotStated };
+    /// The term; meaningless unless @ref state is `Stated`.
+    std::uint64_t term { 0 };
+};
+
+/// Encode the scheduler term a HEARTBEAT reply carries.
+///
+/// The whole payload, with no field framing, for the reason REGISTER's reply has none
+/// either: these two replies are bare payloads and always have been. What makes
+/// ADDING one safe here is that the heartbeat reply is empty today and its client
+/// reads nothing from it, so an old worker ignores these bytes and an old scheduler
+/// sends none -- additive in both directions, which the REGISTER reply is not, since
+/// its entire payload already means "the worker id".
+/// @param term The scheduler's current term.
+/// @return Exactly eight big-endian bytes.
+[[nodiscard]] inline std::array<std::byte, sizeof(std::uint64_t)> EncodeSchedulerTerm(std::uint64_t term)
+{
+    return WireFields::ToBigEndian<std::uint64_t>(term);
+}
+
+/// Read the term from a HEARTBEAT reply's payload.
+///
+/// Strict about the width for the reason `DecodeU32Field` is: a payload of another
+/// length is a sender speaking a shape this build does not know, and reading the
+/// first eight bytes of it would invent a term -- which, here, is a number a worker
+/// would then refuse authentic grants against.
+/// @param payload The bytes of the reply.
+/// @return What it states, and whether it states anything.
+[[nodiscard]] inline SchedulerTermView DecodeSchedulerTerm(std::span<std::byte const> payload)
+{
+    if (payload.empty())
+        return SchedulerTermView { .state = SchedulerTermState::NotStated, .term = 0 };
+    auto const term = WireFields::FromBigEndian<std::uint64_t>(payload);
+    if (!term.has_value())
+        return SchedulerTermView { .state = SchedulerTermState::Unreadable, .term = 0 };
+    return SchedulerTermView { .state = SchedulerTermState::Stated, .term = *term };
+}
+
 /// Frame a LEASE request.
 /// @param request What the client wants to compile and with what.
 /// @param version Version to advertise.
