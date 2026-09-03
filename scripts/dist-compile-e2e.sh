@@ -1736,12 +1736,23 @@ case13_at() {
     [[ -n "$remote_comp_dir" && "$remote_comp_dir" == "$reference_comp_dir" ]] \
         || {
             # Everything the next reader needs, because a verdict with no evidence
-            # sends whoever meets it to re-run rather than to diagnose. A wrong
-            # compilation directory has two shapes and they are fixed in different
-            # places: the CLIENT's own means the object never came from a worker
-            # however the dispatch line reads, and the WORKER's means it came from one
-            # that was told nothing -- which is what a spelling mismatch looks like,
-            # since the launcher then sends no mapping at all.
+            # sends whoever meets it to re-run rather than to diagnose.
+            #
+            # An unmapped directory here has two shapes and **both are one fault** --
+            # no mapping reached the worker -- so read the shape as a fact about the
+            # DRIVER rather than about where the object came from. gcc's
+            # `-fworking-directory` is implicit under `-g` and puts the CLIENT's
+            # directory into the preprocessed text, which the worker's compile then
+            # adopts; clang emits no such marker and leaves the WORKER's own showing.
+            # Do not read the client's directory as "this never came from a worker":
+            # measured under a reverted fix, a genuinely dispatched gcc object records
+            # exactly that, with `DISPATCHED to` in the log two lines below.
+            #
+            # What DOES separate them is `--- resolved to:` against `--- launcher
+            # directory:`. Differing, and a dispatched directory equal to either of
+            # them, is the spelling mismatch: `current_path()` is getcwd(3) and the
+            # rule on the line spells the link, so `MappedCompileDirectory` matched
+            # nothing and the launcher sent no mapping at all.
             echo "--- spelling: ${label}" >&2
             echo "--- reader: ${dwarf_reader}" >&2
             echo "--- launcher directory: ${spelling}" >&2
