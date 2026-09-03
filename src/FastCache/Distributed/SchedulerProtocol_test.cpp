@@ -46,7 +46,7 @@ struct Fixture
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
-    SchedulerProtocol protocol { service };
+    SchedulerProtocol protocol { service, metrics };
 };
 
 /// The status byte of a reply, or nullopt when the reply is unreadable.
@@ -158,6 +158,13 @@ TEST_CASE("An unknown opcode is stepped over, not fatal", "[distributed][schedul
     auto const reply = fixture.protocol.Answer(frame, Insider);
     CHECK(StatusOf(reply) == Wire::Status::Error);
     CHECK(ErrorOf(reply) == Wire::ErrorCode::UnknownOpcode);
+
+    // And it is SEEN. Stepping over a verb is the designed forward-compatibility
+    // path, but a rise still means something -- a newer client against this build, or
+    // somebody walking the opcode space at the port that carries lease grants. Before
+    // #494 this surface held no sink at all, so an operator watching it being probed
+    // saw exactly what a port nobody talks to looks like.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode) == 1);
 }
 
 TEST_CASE("A version outside the range is told what would have worked", "[distributed][scheduler][protocol]")
@@ -176,6 +183,8 @@ TEST_CASE("A version outside the range is told what would have worked", "[distri
     auto const payload = PayloadOf(reply).subspan(1);
     auto const text = std::string { reinterpret_cast<char const*>(payload.data()), payload.size() };
     CHECK(text.contains("supported versions"));
+
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 1);
 }
 
 TEST_CASE("A frame that is not this protocol is the one condition that closes", "[distributed][scheduler][protocol]")
@@ -202,14 +211,62 @@ TEST_CASE("A payload that does not fill its declared length is refused", "[distr
 
     CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::MalformedFrame);
 
-    // And it moves no counter, which is the half that used to be asserted a layer
-    // down. A malformed frame is a CLIENT defect: counting it beside the capacity
-    // refusals would put one broken build's noise into the numbers a fleet is sized
-    // from, which is the reason `RefusalTable` lets a row name no counter at all.
+    // **Two refusals, one wire code, and this is where they are told apart.**
+    //
+    // This frame's own header disagrees with what arrived, before any verb is routed
+    // -- an event on the surface that carries lease grants, so it counts. The
+    // service's `MalformedFrame`, a payload it could not parse, is a CLIENT defect and
+    // is deliberately uncounted so one broken build's noise stays out of the numbers a
+    // fleet is sized from.
+    //
+    // Both halves are asserted because either alone is satisfied by the wrong design:
+    // a table keyed on the CODE would have to give these two the same answer, and
+    // whichever answer it picked, one of these two lines would fail. That is the
+    // rulebook's row-not-code rule, which until #494 had no live instance.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedTruncated) == 1);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoWorker) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoCapacity) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesDuplicate) == 0);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchWorkerRegistrations) == 0);
+}
+
+TEST_CASE("A cache verb at the scheduler's port is counted, and named as the wrong port",
+          "[distributed][scheduler][protocol][metrics]")
+{
+    // `DispatchNotPermitted` rather than `UnknownOpcode`, and the distinction is the
+    // rule: the verb EXISTS and is served on another port, so telling a client it is
+    // unknown would say this daemon is too OLD when it is merely the wrong address.
+    // A rise is a misconfigured client -- something an operator fixes.
+    Fixture fixture;
+
+    auto const frame = Wire::EncodeFetch("some-key");
+
+    CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted) == 1);
+}
+
+TEST_CASE("A refusal the service decided is not counted a second time here", "[distributed][scheduler][protocol][metrics]")
+{
+    // **The half that would be invisible if it regressed.** `SchedulerService` triages
+    // every code it can produce into `RefusalTable` or `UncountedRefusals`, proven
+    // complete by `RefusalsAreDisjoint()`. So a counter on this surface's `Route` arm
+    // would sum the counted six a second time -- and nothing about the reply would
+    // change, which is why only a counter assertion can catch it.
+    //
+    // A lease at an empty fleet: the service answers `NoWorker` and increments
+    // `DispatchLeasesNoWorker` exactly once, at the decision.
+    Fixture fixture;
+
+    auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+
+    CHECK(ErrorOf(fixture.protocol.Answer(frame, Insider)) == Wire::ErrorCode::NoWorker);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchLeasesNoWorker) == 1);
+
+    // And this surface's own four stayed still: the refusal never reached them.
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion) == 0);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode) == 0);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedNotPermitted) == 0);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::DispatchFramesRefusedTruncated) == 0);
 }
 
 TEST_CASE("A whole register-heartbeat-lease-release exchange crosses the wire", "[distributed][scheduler][protocol]")

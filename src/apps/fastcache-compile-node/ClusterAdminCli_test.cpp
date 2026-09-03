@@ -65,7 +65,7 @@ struct Fixture
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
     Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
-    Distributed::SchedulerProtocol protocol { service };
+    Distributed::SchedulerProtocol protocol { service, metrics };
 
     /// Frame `request`, answer it, and hand back the reply bytes.
     /// @param request What the operator asked for.

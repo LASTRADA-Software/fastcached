@@ -3,6 +3,7 @@
 
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -137,9 +138,22 @@ static_assert(EnumeratorCount<FleetMetric> == CompileCacheWire::HistorySlotCount
 class SchedulerProtocol
 {
   public:
-    /// @param service Decides every request; must outlive this.
-    explicit SchedulerProtocol(SchedulerService& service) noexcept:
-        _service { service }
+    /// @param service Decides every verb this surface routes; must outlive this.
+    /// @param metrics Where this surface's own refusals are recorded.
+    ///
+    /// **Two arguments and no longer `explicit`-with-one**, because this class
+    /// refuses frames the service never sees: a version it does not serve, an opcode
+    /// with no row, a verb served on another port, a header that disagrees with its
+    /// own payload. Those are decided here and were counted nowhere, on the one
+    /// surface that carries lease grants and worker registration -- so an operator
+    /// watching it being probed saw the same flat line as one nobody was talking to
+    /// ([#494](https://github.com/LASTRADA-Software/fastcached/issues/494)).
+    ///
+    /// The sink is the one `SchedulerTier` already holds, so nothing new is
+    /// constructed and no call site above it changes.
+    SchedulerProtocol(SchedulerService& service, IMetricsSink& metrics) noexcept:
+        _service { service },
+        _metrics { metrics }
     {
     }
 
@@ -182,6 +196,7 @@ class SchedulerProtocol
                                        CallerContext const& caller);
 
     SchedulerService& _service;
+    IMetricsSink& _metrics;
 };
 
 } // namespace FastCache::Distributed

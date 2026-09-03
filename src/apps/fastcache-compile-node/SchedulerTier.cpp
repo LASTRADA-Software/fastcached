@@ -23,7 +23,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              std::string_view clusterId,
                              std::shared_ptr<AuthPolicy const> policy):
     _service { clock, wallClock, metrics, logger, signingKey, clusterId },
-    _protocol { _service },
+    _protocol { _service, metrics },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
     // object, and a node that answered "is this peer one of ours" differently at its
     // two surfaces would admit a peer to the fleet and refuse it the objects that

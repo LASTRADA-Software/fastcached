@@ -180,9 +180,20 @@ if(NOT objected)
          "new-header: a bare EncodeErrorReply in a HEADER did not fail the check -- headers are where refusal rows now legitimately live")
 endif()
 
-# 4. An untriaged refusal passes, and is COUNTED. The third spelling is only safe
-#    because the backlog it creates is visible; a tally that printed a total it never
-#    computed would be the same silence in a different font.
+# 4. An untriaged refusal now FAILS -- and fails as a backlog, not as an unknown
+#    spelling. #494 emptied the backlog, so the tally became an assertion, and this
+#    case had to be restated with it. Three separate verdicts, because collapsing them
+#    would let the case pass for the wrong reason: a future edit that stopped
+#    RECOGNISING `RefuseUntriaged` at all would also make this tree fail, and a case
+#    asserting only "it failed" would call that a pass.
+#
+#    So the spelling must still be recognised (it is not reported as a bare
+#    `EncodeErrorReply`), the site must still be tallied and resolved to its issue --
+#    a failure a person cannot act on is the accumulation in a different font -- and
+#    the refusal must be the empty-backlog assertion by its own words.
+#
+#    Case 1 holds the other direction: a tree with no untriaged site passes and says
+#    "none awaiting triage", so this assertion is not simply always-fatal.
 set(untriagedBody [==[
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -195,9 +206,14 @@ std::vector<std::byte> AnswerSomething()
 ]==])
 fastcached_make_tree("untriaged" "src/apps/some-new-surface/NewSurface.cpp" "${untriagedBody}" tree)
 fastcached_run_check("${tree}" objected output)
-if(objected)
+if(NOT objected)
     list(APPEND failures
-         "untriaged: the check refused a site marked RefuseUntriaged, which is a legitimate answer and must pass while being counted")
+         "untriaged: a site marked RefuseUntriaged did not fail the check -- #494 emptied the backlog, so a new one is a regression rather than a report")
+endif()
+string(FIND "${output}" "calls EncodeErrorReply directly" position)
+if(NOT position EQUAL -1)
+    list(APPEND failures
+         "untriaged: the check reported RefuseUntriaged as a bare encoder call, so it has stopped recognising the spelling and this case would fail for the wrong reason")
 endif()
 string(FIND "${output}" "1 refusal site(s) awaiting triage" position)
 if(position EQUAL -1)
@@ -206,7 +222,12 @@ endif()
 string(FIND "${output}" "awaiting #4242" position)
 if(position EQUAL -1)
     list(APPEND failures
-         "untriaged: the tally did not resolve the site to its issue, so neither issue gets the completion test the count is for")
+         "untriaged: the tally did not resolve the site to its issue, so the failure names a count and not a decision anybody can go and make")
+endif()
+string(FIND "${output}" "expected none" position)
+if(position EQUAL -1)
+    list(APPEND failures
+         "untriaged: the check failed for some reason other than the backlog being non-empty, so this case is no longer testing the assertion it was restated for")
 endif()
 
 # 5. An untriaged call that names no issue. The backlog is read twice -- from the

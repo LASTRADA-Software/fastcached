@@ -150,6 +150,47 @@ class IMetricsSink
         /// has since forgotten. This one was never issued at all.
         DispatchLeasesUnauthorized,
 
+        /// Frames refused at the FLEET SCHEDULER's port for naming a protocol version
+        /// this build does not serve.
+        ///
+        /// The scheduler's own half of `WorkerFramesRefusedUnsupportedVersion`, and a
+        /// separate counter for the reason every split on this surface has one: the
+        /// two ports are reached by different peers for different purposes, and a
+        /// worker built against another release is a different operator problem from a
+        /// client that is. Rising during a staggered upgrade is expected and bounded;
+        /// rising afterwards names a node that never came back.
+        DispatchFramesRefusedUnsupportedVersion,
+
+        /// Frames naming an opcode this build has no row for, at the scheduler's port.
+        ///
+        /// Stepped over rather than fatal by design -- the framing exists so a receiver
+        /// can skip a verb it does not know, which is what lets a newer client talk to
+        /// an older scheduler. So a rise is either that, or somebody walking the opcode
+        /// space; both are worth seeing on the surface that carries lease grants.
+        DispatchFramesRefusedUnknownOpcode,
+
+        /// Frames naming a verb this scheduler does not serve, at the scheduler's port.
+        ///
+        /// A CACHE verb arriving here, answered `DispatchNotPermitted` rather than
+        /// `UnknownOpcode`: the verb exists and is served on another port, and telling
+        /// a client it is unknown would say this daemon is too OLD when it is merely
+        /// the wrong port. A rise is a misconfigured client, which is a thing an
+        /// operator fixes rather than a thing they wait out.
+        DispatchFramesRefusedNotPermitted,
+
+        /// Frames whose declared payload length did not match what arrived, at the
+        /// scheduler's port.
+        ///
+        /// **Not the same refusal as `SchedulerService`'s uncounted `MalformedFrame`,
+        /// and that is the point.** The service refuses a payload it could not make
+        /// sense of, and deliberately counts nothing for it because a broken client's
+        /// noise must stay out of the numbers a fleet is sized from. This one is a
+        /// frame whose own header disagrees with itself, before any verb is routed --
+        /// a different event with the same wire code. A table keyed on the CODE could
+        /// not hold both, which is exactly why the row rather than the code is the
+        /// unit (#327, #494).
+        DispatchFramesRefusedTruncated,
+
         /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
         /// in-flight count — two monotone counters rather than a gauge, which this
         /// interface deliberately does not have, and their difference is what
@@ -639,6 +680,86 @@ class IMetricsSink
         /// whichever verb decodes it first, and SMEMBERS reaches it as readily as
         /// SADD.
         CacheMalformedValues,
+
+        /// Frames refused at the DAEMON's `0xFC` port for naming a protocol version
+        /// this build does not serve.
+        ///
+        /// The daemon's own half of `WorkerFramesRefusedUnsupportedVersion` and
+        /// `DispatchFramesRefusedUnsupportedVersion`. Three surfaces speak this wire
+        /// and each counts its own, because "which port did the mismatched peer
+        /// reach" is the first thing an operator needs and a shared counter cannot
+        /// say it.
+        CacheFramesRefusedUnsupportedVersion,
+
+        /// Frames naming an opcode this build has no row for, at the daemon's
+        /// `0xFC` port.
+        CacheFramesRefusedUnknownOpcode,
+
+        /// Frames refused before their payload was read, for declaring more than the
+        /// session or the verb allows.
+        ///
+        /// Both ceilings, deliberately: the session-wide cap and the per-verb one are
+        /// two spellings of "more than you may send" and an operator acts on them
+        /// identically -- raise a limit, or find the client that is wrong about it.
+        CacheFramesRefusedPayloadTooLarge,
+
+        /// Frames refused for arriving on a connection that has not authenticated.
+        ///
+        /// Distinct from `CacheCredentialsRejected`, which is a credential PRESENTED
+        /// and refused. This one is a verb attempted without presenting anything, and
+        /// the two send an operator to different places: a wrong password against a
+        /// client that never learned it needs one.
+        CacheFramesRefusedUnauthenticated,
+
+        /// Requests whose payload did not decode as the verb they named.
+        ///
+        /// One counter for STORE and FETCH, following the worker surface's own split
+        /// rather than inventing a finer one: "a verb's payload would not decode" is a
+        /// single operator-facing fact about a broken or mismatched client, and the
+        /// verb is in the log line beside it. AUTH is the exception below, because a
+        /// malformed credential is a security signal rather than a client defect.
+        CacheFramesRefusedMalformedPayload,
+
+        /// AUTH requests whose payload did not decode.
+        ///
+        /// Split from `CacheFramesRefusedMalformedPayload` for the reason the worker
+        /// surface splits it: garbage aimed at the credential verb is what a scanner
+        /// produces, and summing it with ordinary client defects would bury exactly
+        /// the series somebody is watching for.
+        CacheFramesRefusedMalformedCredential,
+
+        /// Credentials presented to the daemon's `0xFC` port and refused.
+        ///
+        /// The signal a password-guessing client produces. Counted separately from
+        /// every framing refusal above because it is the one that means somebody is
+        /// trying rather than misconfigured.
+        CacheCredentialsRejected,
+
+        /// STOREs refused because the value is not a compile value at all.
+        ///
+        /// This server speaks the whole protocol and canonicalizes what it stores; a
+        /// value it cannot decode is a client writing something else to a compile
+        /// cache. Distinct from `CacheMalformedValues`, which is the memcached and
+        /// Redis path's own answer for a set or stream whose bytes contradict the
+        /// flags that describe them.
+        CacheStoresRefusedNotACompileValue,
+
+        /// STOREs refused for naming a canonicalization generation this build does
+        /// not implement.
+        ///
+        /// The daemon's half of `NodeCacheRequestsRefusedForeignGeneration`, and the
+        /// only signal that a fleet is MIXED rather than broken: a rise here names a
+        /// rolling upgrade in progress, and it stopping names one that finished.
+        CacheStoresRefusedForeignGeneration,
+
+        /// STOREs that reached the engine and failed to be written.
+        ///
+        /// Not a refusal of the client's making, and the only one of this surface's
+        /// arms that is about THIS machine rather than about whoever is talking to
+        /// it: a full disk, a read-only mount, a backend that has stopped accepting
+        /// writes. Nothing else counted it -- `fastcached_write_errors_total` is
+        /// named in this file's own history and no longer exists.
+        CacheStoresFailed,
 
         /// Connections the frame surface swept before the peer had named a verb.
         ///

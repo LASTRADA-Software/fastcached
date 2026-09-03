@@ -149,6 +149,31 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "Never sum with unknown-lease refusals: those name a lease this "
               "scheduler issued and has forgotten, this one was never issued.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion,
+      .prometheusName = "fastcached_dispatch_frames_refused_unsupported_version_total",
+      .help = "Frames refused at the fleet scheduler's port for naming a protocol "
+              "version this build does not serve: a peer built against another "
+              "release.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode,
+      .prometheusName = "fastcached_dispatch_frames_refused_unknown_opcode_total",
+      .help = "Frames naming an opcode this build has no row for, at the fleet "
+              "scheduler's port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedNotPermitted,
+      .prometheusName = "fastcached_dispatch_frames_refused_not_permitted_total",
+      .help = "Frames naming a verb the fleet scheduler does not serve, typically a "
+              "cache verb sent to the scheduler's port. Any rise names a client "
+              "pointed at the wrong address.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchFramesRefusedTruncated,
+      .prometheusName = "fastcached_dispatch_frames_refused_truncated_total",
+      .help = "Frames at the fleet scheduler's port whose declared payload length did "
+              "not match what arrived: a framing or transport fault, before any verb "
+              "is routed. Never sum with malformed_payload -- they share a wire code "
+              "and nothing else, and the scheduler's own malformed-frame refusal (a "
+              "payload it could not parse) is deliberately uncounted.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
       .help = "Compiles this worker began. Minus jobs_completed_total, the number "
@@ -489,6 +514,60 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "bytes that are not a well-formed set or stream. NOT a disk signal: the store is "
               "intact and every record still verifies. These were reported as Corrupt until #296, "
               "which moved fastcached_write_errors_total and told operators their disk had failed.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedUnsupportedVersion,
+      .prometheusName = "fastcached_cache_frames_refused_unsupported_version_total",
+      .help = "Frames refused at the daemon's compile-cache port for naming a protocol "
+              "version this build does not serve.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode,
+      .prometheusName = "fastcached_cache_frames_refused_unknown_opcode_total",
+      .help = "Frames naming an opcode this build has no row for, at the daemon's "
+              "compile-cache port.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedPayloadTooLarge,
+      .prometheusName = "fastcached_cache_frames_refused_payload_too_large_total",
+      .help = "Frames refused before their payload was read, for declaring more than "
+              "the session cap or the verb's own ceiling allows.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedUnauthenticated,
+      .prometheusName = "fastcached_cache_frames_refused_unauthenticated_total",
+      .help = "Verbs attempted on a connection that has not authenticated. A client "
+              "that never learned it needs a credential, rather than one presenting a "
+              "wrong credential.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedPayload,
+      .prometheusName = "fastcached_cache_frames_refused_malformed_payload_total",
+      .help = "Requests whose payload did not decode as the verb they named.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheFramesRefusedMalformedCredential,
+      .prometheusName = "fastcached_cache_frames_refused_malformed_credential_total",
+      .help = "AUTH requests whose payload did not decode. Counted apart from ordinary "
+              "malformed payloads because garbage aimed at the credential verb is what "
+              "a scanner produces.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheCredentialsRejected,
+      .prometheusName = "fastcached_cache_credentials_rejected_total",
+      .help = "Credentials presented to the daemon's compile-cache port and refused. "
+              "Any sustained rise names somebody guessing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheStoresRefusedNotACompileValue,
+      .prometheusName = "fastcached_cache_stores_refused_not_a_compile_value_total",
+      .help = "STOREs refused because the value is not a compile value. Distinct from "
+              "fastcached_cache_malformed_values_total, which is the memcached and "
+              "Redis path's answer for a set or stream contradicting its own flags.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheStoresRefusedForeignGeneration,
+      .prometheusName = "fastcached_cache_stores_refused_foreign_generation_total",
+      .help = "STOREs naming a canonicalization generation this build does not "
+              "implement. A rise names a rolling upgrade in progress; it stopping "
+              "names one that finished.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::CacheStoresFailed,
+      .prometheusName = "fastcached_cache_stores_failed_total",
+      .help = "STOREs that reached the engine and could not be written: a full disk, a "
+              "read-only mount, or a backend refusing writes. The only arm of this "
+              "surface that is about this machine rather than its clients.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::FrameRequestDeadlineSweeps,
       .prometheusName = "fastcache_frame_request_deadline_sweeps_total",

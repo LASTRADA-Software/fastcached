@@ -18,18 +18,11 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// The issue that will decide which of this surface's refusals are events.
-    ///
-    /// This class holds no metrics sink at all, so every refusal below is answered
-    /// correctly and counted nowhere -- on the one surface that carries lease grants
-    /// and worker registration, which is where a credential-guessing client shows up
-    /// first. None of the arms has been argued either way, so they are
-    /// `RefuseUntriaged` rather than `RefuseWithoutCounter`: the latter would claim a
-    /// decision nobody has made, which is a worse lie than the bare encoder it
-    /// replaces. Deciding them per arm, against "would a rise here mean something
-    /// happened", is
-    /// [#494](https://github.com/LASTRADA-Software/fastcached/issues/494).
-    constexpr std::uint32_t SchedulerRefusalTriage = 494;
+    // **Triaged in #494.** Four of this surface's seven arms count -- the ones the
+    // service never sees, where a frame is refused before any verb reaches it. The
+    // other three defer to `SchedulerService`, which triages its own refusals
+    // completely (`RefusalTable`, `UncountedRefusals`, and `RefusalsAreDisjoint()`
+    // proving every code is in exactly one). Each arm states its own reasoning.
 
     /// The verbs a scheduler answers.
     ///
@@ -85,7 +78,28 @@ std::optional<std::vector<std::byte>> SchedulerProtocol::RefusePeer(CallerContex
     // Encoded exactly as `Answer` encodes a refusal, so an early refusal and a late
     // one are the same bytes on the wire -- a client must not be able to tell which
     // side of the payload read it was refused on.
-    return Cc::RefuseUntriaged({ .code = refusal->error, .issue = SchedulerRefusalTriage }, refusal->message);
+    // **Uncounted, and decided by `SchedulerService` rather than here.** This arm
+    // hands back whatever `RefuseUnlessMember` produced -- today `NotAMember`, which
+    // the service lists in `UncountedRefusals` on the argument that counting a policy
+    // answer beside the capacity refusals would put noise into the numbers a fleet is
+    // sized from.
+    //
+    // A counter here would also count only ONE of the two paths to that refusal: the
+    // same condition is answered again by `Route` -> `Gate` after the payload is read,
+    // and the two are deliberately byte-identical on the wire. Counting the early path
+    // alone would under-report by an amount that varies with frame size, which is a
+    // worse number than none.
+    //
+    // Whether the scheduler should count non-member callers in a series of its OWN --
+    // the service's reason argues against mixing rather than against counting, and
+    // this is the surface a credential-guessing client reaches first -- is
+    // [#592](https://github.com/LASTRADA-Software/fastcached/issues/592), which
+    // belongs in the service's table beside the existing decision.
+    return Cc::RefuseWithoutCounter(
+        { .code = refusal->error,
+          .rationale = "SchedulerService::UncountedRefusals already decided this refusal, and both paths to it must "
+                       "agree; counting only the pre-payload path would under-report. See #592" },
+        refusal->message);
 }
 
 std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> frame, CallerContext const& caller)
@@ -101,37 +115,77 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
     if (!Wire::IsSupported(header->version))
         // Naming the supported range, because a rejection that cannot say what
         // would have worked cannot be acted on.
-        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnsupportedVersion, .issue = SchedulerRefusalTriage },
-                                   std::format("supported versions {}..{}",
-                                               static_cast<unsigned>(Wire::MinSupportedVersion),
-                                               static_cast<unsigned>(Wire::CurrentVersion)));
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::UnsupportedVersion,
+                            .counter = IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion },
+                          std::format("supported versions {}..{}",
+                                      static_cast<unsigned>(Wire::MinSupportedVersion),
+                                      static_cast<unsigned>(Wire::CurrentVersion)));
 
     auto const* descriptor = Wire::FindOp(header->opRaw);
     if (descriptor == nullptr)
         // Stepped over rather than fatal: the framing exists so a receiver can skip
         // a verb it does not know, which is what lets a newer client talk to an
         // older scheduler at all.
-        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::UnknownOpcode, .issue = SchedulerRefusalTriage });
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::UnknownOpcode,
+                            .counter = IMetricsSink::Counter::DispatchFramesRefusedUnknownOpcode });
 
     if (!IsSchedulerVerb(descriptor->code))
     {
+        // **Uncounted, for two independent reasons, and both are recorded because only
+        // one of them survives a row being added.**
+        //
+        // The code comes from the MATCHED ROW, so a counter beside it would have to be
+        // built from a table that has no counter column -- the same argument
+        // `CacheProxy`'s equivalent arm carries. And `RefusedVerbs` is empty here, so
+        // this branch cannot fire at all today. The first reason still holds the day
+        // somebody adds a row; the second stops holding at that moment.
         if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-            return Cc::RefuseUntriaged({ .code = row->code, .issue = SchedulerRefusalTriage }, row->why);
+            return Cc::RefuseWithoutCounter({ .code = row->code,
+                                              .rationale = "the code comes from the matched RefusedVerb row, which "
+                                                           "carries no counter column; and RefusedVerbs is empty, so "
+                                                           "this arm is unreachable today" },
+                                            row->why);
 
         // A cache verb at the scheduler's port. Answered rather than dropped, so a
         // misconfigured client learns which port it got wrong instead of seeing
         // something indistinguishable from a dead host.
-        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::DispatchNotPermitted, .issue = SchedulerRefusalTriage });
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .counter = IMetricsSink::Counter::DispatchFramesRefusedNotPermitted });
     }
 
     auto const payload = frame.subspan(Wire::RequestHeaderSize);
     if (payload.size() != header->payloadLength)
-        return Cc::RefuseUntriaged({ .code = Wire::ErrorCode::MalformedFrame, .issue = SchedulerRefusalTriage });
+        // **Counted, and NOT the same refusal as the service's uncounted
+        // `MalformedFrame`.** That one is a payload the service could not parse, and it
+        // is deliberately uncounted so a broken client's noise stays out of the numbers
+        // a fleet is sized from. This one is a frame whose own header disagrees with
+        // what arrived, before any verb is routed. Two refusals, one wire code -- which
+        // is precisely why the ROW is the unit and a table keyed on the code could not
+        // express it (#327).
+        //
+        // `Truncated`, not `MalformedPayload`, because this catalog already separates
+        // the two everywhere else: `WorkerFramesRefusedTruncated` is this event and its
+        // help says in as many words never to sum it with malformed_payload. Naming
+        // this one malformed_payload would have made a cross-surface graph of that
+        // suffix add a framing fault to three decode failures -- one of which this same
+        // change introduces on the daemon.
+        return Cc::Refuse(
+            _metrics,
+            { .code = Wire::ErrorCode::MalformedFrame, .counter = IMetricsSink::Counter::DispatchFramesRefusedTruncated });
 
     auto const reply = Route(descriptor->code, payload, caller);
     if (reply.status == Wire::Status::Ok)
         return Wire::EncodeReply(Wire::Status::Ok, reply.payload);
-    return Cc::RefuseUntriaged({ .code = reply.error, .issue = SchedulerRefusalTriage }, reply.message);
+    // A counter here would double the six the service counts and pull the seven it
+    // does not into series their own reasoning kept them out of.
+    return Cc::RefuseWithoutCounter(
+        { .code = reply.error,
+          .rationale = "counted at the decision, in SchedulerService::Refuse, which triages every code it can produce "
+                       "into RefusalTable or UncountedRefusals -- proven complete by RefusalsAreDisjoint()" },
+        reply.message);
 }
 
 namespace
