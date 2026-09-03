@@ -203,6 +203,13 @@ e2e_begin "dist-compile E2E" "$workdir"
 # cold include-tree walk before its node binds; here the walk is already warm by
 # the time any node starts, because `--print-toolchain-fingerprint` below walks
 # the same tree first.
+#
+# It is the default for the LIBRARY's waits, and this fixture has a second budget
+# it does not reach: `wait_for_counter` below is still a hand-written poll loop
+# with its own `seconds=10`, because its three-way triage -- nothing ever
+# answered, the series is absent, the reading never rose -- is not something
+# `wait_until` can say. Naming that here so the number above is not read as the
+# only one.
 e2e_wait_seconds 30
 
 # Statistics are per-user state; keep this run out of the developer's real log.
@@ -261,6 +268,11 @@ started_pid=""
 # failure need not respell the tag.
 started_log=""
 
+# And the port it bound, for the caller that drew the port itself and has to name
+# it again later. The membership mode's leg 3 dials the listener leg 1 compiled
+# on, which is the only reader today.
+started_port=""
+
 # Start one compile node, and wait for it to be listening.
 #
 # THE recipe this fixture inlined at ten sites (#451). What was actually repeated
@@ -285,6 +297,33 @@ started_log=""
 # is what turns a tier OFF, so a node that silently kept one would race for
 # `fastcache-cc`'s default port with every other node in the run.
 #
+# BOUND IS NOT READY, and that is why there are two waits here rather than one.
+#
+# Since #365 a node binds FIRST and logs `compile node ready` afterwards, so a
+# caller that only waited for the port got a listener that answers and a process
+# still finishing its startup. Case 8 was measured falling into that window: five
+# runs of the pre-#451 fixture reported `READY` at the moment it signalled the
+# worker, and the converted one reported `NOTREADY` on every run whose port
+# answered on the FIRST probe -- the old per-fixture `wait_for_port` opened with
+# `for _ in $(seq 1 100)` and probed before the node had bound, so it always
+# failed once and slept 200 ms, and that accidental 200 ms was what the graceful
+# stop rested on. `wait_until` does its setup before probing and does not
+# oversleep; it exposed a hole it did not create.
+#
+# HERE and not at the case that was caught, because a first failure masks its
+# identical siblings: case 9's `tier-node` and case 11's `blackhole-node` are
+# compiled against immediately after their bind and had exactly the same hole, and
+# fixing only the observed site relocates a flake rather than removing it.
+# `compile node ready` is one unconditional line every node logs, the scheduler
+# tier included, so there is no node this can hang on.
+#
+# It stays a SECOND wait rather than being folded into the first, because a stall
+# before the bind and a stall between the bind and readiness are different faults;
+# `wait_until` names the predicate that expired, so the two remain two verdicts.
+# Registration is deliberately NOT here -- some nodes are started to hold a port
+# and a cache tier and never join a fleet -- and stays at the call sites that want
+# it.
+#
 # @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message about
 #          this node, so a reader handed a failure can find the log without a
 #          mapping from one to the other
@@ -301,8 +340,10 @@ start_node() {
     pid=$!
     started_pid="$pid"
     started_log="$log"
+    started_port="$port"
     pids+=("$pid")
     wait_for_port "$host" "$port" "$pid" "$tag" "$log"
+    wait_for_log "compile node ready" "$pid" "$tag" "$log"
 }
 
 # Write a translation unit whose content is unique to the caller.
@@ -641,24 +682,17 @@ if [[ "$mode" == "membership" ]]; then
     # reached from a non-loopback address too. The client dials it at $lan_address,
     # and so does the worker when it registers.
     #
-    # The port the last `start_membership_worker` bound. `start_node` hands back
-    # `started_pid` and `started_log` for the reason its own header gives; the port
-    # is this mode's addition, because leg 3 dials the listener leg 1 compiled on
-    # and so has to be able to name it.
-    started_port=""
-
     # @param 1 tag, for the log file and the messages
     # @param 2 dispatch (`--listen-node`) port
     start_membership_scheduler() {
-        local tag="$1" dispatch="$2" pid=""
+        local tag="$1" dispatch="$2"
         start_node "$tag" "$lan_address" "$dispatch" \
             "$no_local_cache" \
             --serve-scheduler \
             --fleet-member="$lan_address" \
             --scheduler="${lan_address}:${dispatch}" \
             --toolchain="scheduler-only=${compiler}" --slots=1 --log-level=debug
-        pid="$started_pid"
-        wait_for_log "scheduling for the fleet" "$pid" "$tag" "$started_log"
+        wait_for_log "scheduling for the fleet" "$started_pid" "$tag" "$started_log"
     }
 
     # Start a worker bound on this host's non-loopback address.
@@ -688,27 +722,23 @@ if [[ "$mode" == "membership" ]]; then
     # @param 4 the cache-tier flag: `--cache-memory=<n>`, or `$no_local_cache` for none
     # @param 5.. the membership flags under test, if any
     start_membership_worker() {
-        local tag="$1" dispatch="$2" admin="$3" tier="$4" port="" pid="" log=""
+        local tag="$1" dispatch="$2" admin="$3" tier="$4"
         shift 4
-        # As above: the compile port is the worker's own business, since the client
-        # is told where to dial by the lease rather than by this fixture.
-        port="$(free_port)"
-        start_node "$tag" "$lan_address" "$port" \
+        # The compile port is the worker's own business, since the client is told
+        # where to dial by the lease rather than by this fixture. `start_node`
+        # hands it back as `started_port`, which leg 3 reads.
+        start_node "$tag" "$lan_address" "$(free_port)" \
             "$tier" \
             --scheduler="${lan_address}:${dispatch}" \
             --admin-listen="$admin" \
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
             ${@+"$@"}
-        pid="$started_pid"
-        log="$started_log"
-        started_port="$port"
-        # Bind, readiness, registration and the admin surface are waited for
-        # separately, because a stall in one is a different fault from a stall in
-        # another and a fixture that folds them cannot say which happened. The bind
-        # is `start_node`'s; the three below are this worker's own.
-        wait_for_log "compile node ready" "$pid" "$tag" "$log"
-        wait_for_registration "$pid" "$tag" "$log"
-        wait_for_port 127.0.0.1 "$admin" "$pid" "${tag} admin endpoint" "$log"
+        # Registration and the admin surface are waited for separately from the
+        # bind and the readiness `start_node` covers, because a stall in one is a
+        # different fault from a stall in another and a fixture that folds them
+        # cannot say which happened.
+        wait_for_registration "$started_pid" "$tag" "$started_log"
+        wait_for_port 127.0.0.1 "$admin" "$started_pid" "${tag} admin endpoint" "$started_log"
     }
 
     # --- leg 1: the address is a member, and the compile is served ---------------
@@ -1163,7 +1193,6 @@ start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
     --scheduler="127.0.0.1:${iso_dispatch_port}" \
     --toolchain="also-not-the-compiler-this-client-uses=${compiler}" \
     --slots=1 --log-level=debug
-iso_scheduler_pid="$started_pid"
 
 iso_worker_port="$(free_port)"
 start_node "iso-worker" 127.0.0.1 "$iso_worker_port" \
@@ -1266,7 +1295,6 @@ start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
     --scheduler="127.0.0.1:${cap_dispatch_port}" \
     --toolchain="not-the-compiler-under-test=${compiler}" \
     --slots=1 --log-level=debug
-cap_scheduler_pid="$started_pid"
 
 cap_worker_port="$(free_port)"
 start_node "cap-worker" 127.0.0.1 "$cap_worker_port" \
@@ -1378,31 +1406,12 @@ start_node "stop-worker" 127.0.0.1 "$stop_port" \
     --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info
 stop_worker_pid="$started_pid"
 
-# READY, not merely BOUND, and this line is the whole of it.
-#
-# A bound port is not a worker that can be gracefully stopped: since #365 the node
-# binds FIRST and logs `compile node ready` afterwards, so `wait_for_port`
-# returning leaves a window in which the listener answers and the shutdown path is
-# not yet in place. A TERM inside that window kills the process outright, and the
-# case then reports "the worker did not report a graceful stop" about a worker
-# that was never asked to.
-#
-# This case has always had that hole and has been passing on its own polling
-# latency. Measured here, with a fork-free probe of the worker's log taken
-# immediately before the signal: three runs of the pre-#451 fixture read
-# `DBG-AT-KILL=READY` three times, and the converted one read `NOTREADY` on every
-# run whose port answered on the FIRST probe and `READY` on every run that needed
-# a second. The old per-fixture `wait_for_port` opened its loop with
-# `for _ in $(seq 1 100)` and probed before the node had bound, so it always slept
-# once -- and that accidental 200 ms was what the assertion below was resting on.
-# `wait_until` does its setup before probing and does not oversleep, which is a
-# better wait that removes the luck; it did not create the hole, it exposed it.
-#
-# So the fix is the stage rather than the delay, which is `.agent/rules/testing.md`
-# on #365: wait for what the line MEANS. A `sleep` here would restore the same luck
-# with a number attached to it.
-wait_for_log "compile node ready" "$stop_worker_pid" "stop-worker" "$started_log"
-
+# A TERM is sent only once `start_node` has seen `compile node ready`, and that is
+# not incidental: this is the case whose failure measured the bind-to-ready window,
+# and signalling inside it kills the process before its handler exists, so the
+# assertions below report "did not report a graceful stop" about a worker that was
+# never asked to. The wait is in `start_node` because the hole is not this case's;
+# the argument is there in full.
 stop_and_require_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds"
 
 # Exiting is necessary but not sufficient: a worker that died of the signal also
@@ -1436,7 +1445,6 @@ start_node "tier-node" 127.0.0.1 "$cache_node_port" \
     --upstream="127.0.0.1:${cache_upstream_port}" \
     --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="cache-node-only=${compiler}" --slots=1 --log-level=debug
-tier_node_pid="$started_pid"
 
 write_source "${proj}/nine.cpp" "casenine"
 "$compiler" -std=c++17 -O1 -c "${proj}/nine.cpp" -o "${proj}/build/nine-ref.o"     || fail "the case 9 reference compile failed"
@@ -1490,14 +1498,13 @@ start_node "sizing" 127.0.0.1 "$sizing_port" \
     --node-class=dedicated --reserve-cores=0 --log-level=debug
 sizing_pid="$started_pid"
 
-# Waited for, then read. A one-shot `sed` straight after `wait_for_port` is the
-# race `wait_for_log`'s own header describes -- a bound port does not mean a
-# process has finished announcing itself -- and it is the same hole case 8 above
-# was measured falling into. It differs only in what it costs: there the fixture
-# signalled a worker that was not ready, here it would report "the worker did not
-# report a derived slot count" about a worker that logs it a millisecond later.
-wait_for_log "slot(s) as a dedicated node" "$sizing_pid" "sizing" "$started_log"
-
+# Read from the line `start_node` has already waited for: the slot count is a field
+# of `compile node ready` itself, not a later message, so the readiness wait is
+# what makes this one-shot `sed` safe. Read straight after a bare `wait_for_port`
+# it would be the same race case 8 was measured falling into, costing a wrong
+# "the worker did not report a derived slot count" about a worker that logs it a
+# millisecond later.
+#
 # The count itself depends on the runner, so what is asserted is that it is a
 # positive number and that the class reached the worker -- not a fixed value, which
 # would make this case a report about the CI machine rather than about the code.
@@ -1546,7 +1553,6 @@ start_node "blackhole-node" 127.0.0.1 "$blackhole_node_port" \
     --upstream="192.0.2.1:6674" \
     --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="blackhole-node=${compiler}" --slots=1 --log-level=info
-blackhole_node_pid="$started_pid"
 
 write_source "${proj}/eleven_a.cpp" "caseelevena"
 write_source "${proj}/eleven_b.cpp" "caseelevenb"

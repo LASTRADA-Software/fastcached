@@ -315,10 +315,12 @@ run_case() {
     # `accepted`; a wait loosened back to the bare word would pass `accepted` and
     # fail `refuses-zero`. Only the pair pins the marker.
     #
-    # The marker is not spelled out in the assertions either -- the row below
-    # matches the text `wait_for_registration` puts in its own message, which is
-    # `E2eRegisteredMarker`. A case that restated the string would agree with
-    # itself whatever the function waited for.
+    # The `refuses-zero` row asserts the marker text, and it can: what it matches
+    # is the message `wait_for_registration` BUILDS from `E2eRegisteredMarker`
+    # (`... to log: 1 of 1 toolchain(s) registered`), so a constant changed to
+    # anything else fails that row rather than agreeing with it. Staging a log
+    # line and then asserting the same string back is what would agree with
+    # itself, and neither case does that.
     registration-accepted)
         log="${scratch}/register.log"
         echo "0 of 1 toolchain(s) registered" > "$log"
@@ -1018,22 +1020,34 @@ if [ -n "$spurious" ]; then
 fi
 rm -rf "$canary_dir"
 
-# One row per exemption, `basename:reason`, matched per row. A single scalar could
+# Is this script exempt from a scan, per that scan's allowlist?
+#
+# One row per exemption, `basename:reason`, matched PER ROW. A single scalar could
 # hold only ONE row however many were appended to it -- a second exemption would
 # silently fail to exempt and the check would go red for a file its author believed
-# was allowlisted.
+# was allowlisted. Written once because both scans in this file need it, and a
+# subtlety that has to be re-explained beside each copy is a subtlety one copy will
+# eventually be missing.
+#
+# @param 1 the script's basename
+# @param 2 the allowlist text, one `basename:reason` per line
+# @return 0 when exempt
+_scan_exempt() {
+    local base="$1" row=""
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        case "$row" in "${base}:"*) return 0 ;; esac
+    done <<EOF
+$2
+EOF
+    return 1
+}
+
 timeout_allowed="tsan-gate.sh:not an e2e fixture, and it resolves timeout/gtimeout itself rather than assuming one. Its clang-tsan job is runs-on: ubuntu-24.04, so its macOS branch has never executed anywhere.
 check-e2e-helpers.sh:this file, which stages the scan's own canary invocations above. They are heredoc text and run nothing; the canary asserting all seven are caught is what covers them."
 for script in "${source_dir}"/scripts/*.sh; do
     base="$(basename "$script")"
-    exempt=0
-    while IFS= read -r row; do
-        [ -n "$row" ] || continue
-        case "$row" in "${base}:"*) exempt=1 ;; esac
-    done <<EOF
-${timeout_allowed}
-EOF
-    [ "$exempt" -eq 0 ] || continue
+    _scan_exempt "$base" "$timeout_allowed" && continue
     ran=$(( ran + 1 ))
     hits="$(_timeout_invocations "$script")"
     if [ -n "$hits" ]; then
@@ -1081,7 +1095,24 @@ _library_helper_names() {
 # helpers are not all at column zero -- `dist-compile-e2e.sh` defines two inside
 # its `--case membership` block -- so anchoring at column zero would read a
 # nested copy as absent, which is the direction that fails silently.
+#
+# WHOLE-FILE FIRST, because this test is in the DEFAULT set and runs on every
+# platform CI builds. The per-name loop is one `grep` plus one `sed` per name per
+# script -- 20 names over 21 scripts is 840 processes -- and measured on Linux
+# that is 0.90 s against 0.06 s with the line below, about 45% of the CPU this
+# whole test burns. `check-worker-refusals-counted.cmake` made the same trade for
+# the same reason and records the same argument.
+#
+# Unlike the usual cheap prefilter this one is EXACT in both directions, and that
+# is worth stating because the next reader will assume it is lossy: the filter is
+# the literal disjunction of the twenty per-name regexes, every name is
+# `[A-Za-z0-9_]` only with no metacharacter to widen it, and the trailing `\(\)`
+# is in both. So it can produce neither a false negative nor a false positive.
+# Today nothing matches, so the loop never runs at all; it costs something only on
+# the run that is about to fail, which is exactly when the per-name prefix earns
+# its keep.
 _helper_redefinitions() {
+    grep -qE "^[[:space:]]*(${helper_alternation})\(\)" "$1" || return 0
     local script="$1" name=""
     for name in $helper_names; do
         grep -nE "^[[:space:]]*${name}\(\)" "$script" | sed "s/^/${name}: /" || true
@@ -1089,6 +1120,7 @@ _helper_redefinitions() {
 }
 
 helper_names="$(_library_helper_names)"
+helper_alternation="$(printf '%s\n' "$helper_names" | tr '\n' '|' | sed 's/|$//')"
 
 # Both scans, asserted non-empty before either verdict is read. Two empty lists
 # agree perfectly: a `_library_helper_names` that matched nothing would report
@@ -1143,24 +1175,16 @@ if [ -n "$spurious" ]; then
 fi
 rm -rf "$canary_dir"
 
-# One row per exemption, `basename:reason`, matched per row -- a single scalar
-# could hold only ONE row however many were appended to it. Each row names why,
-# and the two that are defects name the ISSUE, so an exclusion cannot rot into
-# folklore and closing the ticket has an obvious row to delete.
+# The same `_scan_exempt` the timeout scan above uses. Each row names why, and the
+# two that are defects name the ISSUE, so an exclusion cannot rot into folklore and
+# closing the ticket has an obvious row to delete.
 helper_copy_allowed="local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it.
 launcher-replay-e2e.sh:#627. Its 'fail' carries the '[ \"\${BASHPID:-\$\$}\" = \"\$top_pid\" ]' guard the bash-3.2 table below bans by name -- correct on bash 4, silently inert on macOS 3.2, where a 'fail' inside ( ... ) then ends only the subshell.
 migrate-storage-e2e.sh:#628. Its 'fail' is the ordinary private copy; the sharper defect is its 'port', which this NAME scan cannot see -- see the header above."
 scanned=0
 for script in "${source_dir}"/scripts/*.sh; do
     base="$(basename "$script")"
-    exempt=0
-    while IFS= read -r row; do
-        [ -n "$row" ] || continue
-        case "$row" in "${base}:"*) exempt=1 ;; esac
-    done <<EOF
-${helper_copy_allowed}
-EOF
-    [ "$exempt" -eq 0 ] || continue
+    _scan_exempt "$base" "$helper_copy_allowed" && continue
     scanned=$(( scanned + 1 ))
     ran=$(( ran + 1 ))
     hits="$(_helper_redefinitions "$script")"
