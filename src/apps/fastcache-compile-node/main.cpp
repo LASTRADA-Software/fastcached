@@ -534,6 +534,13 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 /// in force.
 /// @param reloader The pipeline, or null when this worker has no configuration file.
 /// @param logger Where the outcome is reported.
+///
+/// Returns nothing: the heartbeat thread notices a reload by comparing snapshots, so
+/// there is no signal to hand it. A `ConfigReloaderOf::Subscribe` callback would be the
+/// house idiom for one, and is declined here for a lifetime reason rather than a
+/// stylistic one -- the reloader is declared in `main` and outlives `WorkerBody`, and
+/// `Subscribe` has no unsubscribe, so a subscriber capturing this frame's locals would
+/// outlive them.
 void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
 {
     if (reloader == nullptr)
@@ -543,6 +550,12 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
         return;
     }
+
+    // Taken BEFORE the swap, because "did the advertised set change" cannot be asked
+    // afterwards: `Reload()` replaces the snapshot, and the previous one is then only
+    // reachable through a reference somebody kept. Each snapshot is immutable, so
+    // holding this one costs nothing and stays valid however the swap goes.
+    auto const before = reloader->Current();
 
     auto const outcome = reloader->Reload();
     if (!outcome.has_value())
@@ -556,7 +569,19 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
 
     auto const current = reloader->Current();
     logger.SetMinLevel(current->logLevel);
-    logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
+
+    // Asked here only to say the right thing to the operator, at the moment they
+    // acted: the re-survey is the expensive part (`AdvertisedClaimsDiffer` carries
+    // what it costs and why it is not run unconditionally), and somebody who saved a
+    // file should know it was accepted before it finishes. The heartbeat thread asks
+    // the same question again for itself, from the same function.
+    if (Node::AdvertisedClaimsDiffer(*before, *current))
+        logger.Logf(LogLevel::Info,
+                    "configuration reloaded; log level is now {}. What this worker serves has changed, so it will "
+                    "re-derive its toolchains and re-register on the next heartbeat",
+                    ToStringView(current->logLevel));
+    else
+        logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
 }
 
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
@@ -579,7 +604,20 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     auto const runner = Cc::MakeProcessRunner();
 
     auto const toolchainHost = Cc::MakeToolchainHost();
-    auto const discovery = cfg.toolchainDiscovery ? Cc::MakeToolchainDiscovery(*toolchainHost, *runner) : nullptr;
+    // Built UNCONDITIONALLY, and gated per call instead, since #403 made
+    // `--no-toolchain-discovery` reloadable. A discovery object constructed only when
+    // the flag was off at startup is one the flag can never be turned back on for --
+    // the running worker would hold a null it could not refill, so a reload that
+    // enabled discovery would silently keep serving nothing.
+    //
+    // It costs nothing to hold: `MakeToolchainDiscovery` stores two references and
+    // searches only when `Discover()` is called. `discoveryFor` is what decides,
+    // and it reads the configuration it is HANDED rather than the startup one, so
+    // the reloaded snapshot governs on the heartbeat thread.
+    auto const discovery = Cc::MakeToolchainDiscovery(*toolchainHost, *runner);
+    auto const discoveryFor = [&discovery](NodeConfig const& against) -> Cc::IToolchainDiscovery* {
+        return against.toolchainDiscovery ? discovery.get() : nullptr;
+    };
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to `MakeWorkerLeaseValidator` below and to the heartbeat's REGISTER, and a
@@ -629,7 +667,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // Its own clock rather than one of the tiers': it is what the hash phase's
     // progress rate reads elapsed time from.
     SteadyClock const toolchainClock;
-    auto discoveredOrNone = Node::DiscoverToolchainEntries(cfg, discovery.get(), *runner, logger);
+    auto discoveredOrNone = Node::DiscoverToolchainEntries(cfg, discoveryFor(cfg), *runner, logger);
     if (!discoveredOrNone.has_value())
         return ExitUsage;
     auto const discoveredToolchains = *std::move(discoveredOrNone);
@@ -1180,6 +1218,16 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // writes it.
     std::uint64_t beat = 0;
 
+    // The configuration snapshot this thread last surveyed against, so a reload is
+    // noticed by COMPARISON rather than by a flag somebody else sets.
+    //
+    // Seeded BEFORE the initial survey rather than left null, which is what makes the
+    // first beat comparable to every other one: the survey is expensive and a reload
+    // can land while it runs, so a baseline taken afterwards would either miss that
+    // reload or -- taken as "null means new" -- treat every ordinary start as one.
+    // Null only when this worker has no configuration file at all.
+    ConfigReloaderOf<NodeConfig>::Snapshot actedOn = reloader != nullptr ? reloader->Current() : nullptr;
+
     // Where this node believes the scheduler's leader is. Declared out here so it
     // survives across rounds -- remembering the leader is the whole reason a
     // steady-state fleet does not spend a redirect on every heartbeat -- and, like
@@ -1276,11 +1324,45 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
             // never be looked at again, and a node left serving nothing could not
             // recover at all without a restart.
             ++beat;
-            auto const depth =
-                beat % SweepEveryBeats == 0 ? Node::RecheckDepth::Unconditional : Node::RecheckDepth::WhenEvidenceMoved;
+
+            // The configuration this beat acts on, which is the RELOADED one when a
+            // file exists. Read once and held for the whole beat: `Current()` can be
+            // swapped underneath by a reload arriving mid-beat, and deciding the depth
+            // against one configuration and then surveying against another is how a
+            // re-derivation gets skipped for the very change that asked for it.
+            auto const snapshot = reloader != nullptr ? reloader->Current() : nullptr;
+            auto const& liveCfg = snapshot ? *snapshot : cfg;
+
+            // Three ways to take the expensive path, and the third is #403's. A
+            // witness moved (the cheap check inside `RefreshToolchains`); the periodic
+            // sweep came round, which is the only way back from serving LESS than this
+            // machine has; or an operator edited the file, which moves no witness at
+            // all and would otherwise wait for that sweep.
+            //
+            // **Asked here rather than signalled from the reload.** This thread now
+            // holds both operands -- the snapshot it last acted on and the one it is
+            // acting on now -- so a flag set on the main loop would be a second
+            // author of a fact this thread can just compute. It would also be lossy in
+            // both directions: a beat racing the store misses it until the next one,
+            // and two reloads that cancel each other still buy a survey that had
+            // nothing to find. Comparing the snapshots has neither problem, because
+            // identity is what changed rather than an edge that can be missed.
+            // `actedOn` is non-null from the moment this thread starts, so a null here
+            // means only "this worker has no configuration file" -- never "first beat".
+            // Written the other way round it read as a reload on beat 1 of every node
+            // that HAS a file, buying a second full survey immediately after the
+            // initial one: minutes of include-tree walking on a cold machine, and a
+            // window in which one transient probe failure drops toolchains the node
+            // had just successfully identified.
+            auto const reloaded = actedOn != nullptr && snapshot != nullptr && snapshot != actedOn
+                                          && Node::AdvertisedClaimsDiffer(*actedOn, *snapshot)
+                                      ? Node::ClaimsReloaded::Yes
+                                      : Node::ClaimsReloaded::No;
+            actedOn = snapshot;
+            auto const depth = Node::RecheckDepthFor(reloaded, beat, SweepEveryBeats);
 
             if (auto refreshed = Node::RefreshToolchains(
-                    toolchains, cfg, discovery.get(), *runner, *toolchainHost, toolchainClock, logger, depth);
+                    toolchains, liveCfg, discoveryFor(liveCfg), *runner, *toolchainHost, toolchainClock, logger, depth);
                 refreshed.changed)
             {
                 toolchains = std::move(refreshed.served);
@@ -1376,6 +1458,10 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         // Taken here rather than in the handler, for the reason the handler's own note
         // gives. `TakeReloadRequest` clears the flag atomically, so a burst of SIGHUPs
         // costs one re-read rather than one per signal.
+        //
+        // Nothing is handed to the heartbeat thread: it compares snapshots itself, so
+        // this call publishes a new configuration and says so, and the next beat picks
+        // it up on its own.
         if (DaemonControls::Instance().TakeReloadRequest())
             ApplyReloadRequest(reloader, logger);
         std::this_thread::sleep_for(StopPollInterval);
@@ -1683,16 +1769,11 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
         return ExitUsage;
     }
-    // Only when the machine will not be asked. With discovery on, "no toolchain" is
-    // not yet a fact -- it is a question the node answers a few lines later, and
-    // refusing here would refuse every worker installed by a package.
-    if (cfg.toolchains.empty() && !cfg.toolchainDiscovery)
-    {
-        logger.Logf(LogLevel::Error,
-                    "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
-                    "and then refuse every job the scheduler sent it");
-        return ExitUsage;
-    }
+    // "no --toolchain and no discovery" used to be refused HERE, and is now a
+    // `StartupPolicyRejection` row. It depends on nothing but the parsed
+    // configuration, which is what that table is for -- and leaving it in the tier
+    // meant a reload could reach the state a start refuses, since #403 made both of
+    // its flags reloadable and `ValidateNodeReloadable` composes the startup rules.
 
     // Checked here rather than inside WorkerBody, for the reason the two above are:
     // the POSIX host has already redirected stdout to /dev/null by the time the body

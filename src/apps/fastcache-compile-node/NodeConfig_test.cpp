@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
+#include "NodeToolchains.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
@@ -2966,4 +2967,195 @@ TEST_CASE("Every reloadable row is one the option table can actually compare", "
         CHECK(spec->same != nullptr);
         CHECK_FALSE(spec->yamlKey.empty());
     }
+}
+
+TEST_CASE("A toolchain change is reloadable, and says the fleet must be told", "[node][config][reload]")
+{
+    // #403. The band that is not local wiring but a CLAIM this worker made to the
+    // scheduler at REGISTER. `--toolchain` is the one an operator actually edits: a
+    // compiler was installed, or one is being retired from the fleet a machine at a
+    // time.
+    //
+    // Two assertions, and the second is the one that matters. That the reload is
+    // ACCEPTED is necessary and proves nothing on its own -- a row marked
+    // `Reloadable::Yes` whose change never reaches the fleet is precisely the silent
+    // failure the column exists to prevent, and it would satisfy the first assertion
+    // perfectly. So the acceptance is paired with `AdvertisedClaimsDiffer`, which is
+    // what the heartbeat thread reads to decide whether to re-derive and re-register.
+    Testing::ScratchDirectory const scratch { "node-reload-toolchain" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "toolchain:\n  - /usr/bin/g++\n");
+
+    NodeConfig initial;
+    initial.toolchains = { "/usr/bin/clang++" };
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const before = reloader.Current();
+    auto const outcome = reloader.Reload();
+
+    REQUIRE(outcome.has_value());
+    CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
+
+    // The half that fails open: accepted, adopted, and the scheduler never told.
+    CHECK(Node::AdvertisedClaimsDiffer(*before, *reloader.Current()));
+}
+
+TEST_CASE("Turning discovery off is reloadable, and also a claim", "[node][config][reload]")
+{
+    // The band's other member, and it has to be turned off ALONGSIDE naming a
+    // toolchain: on its own it is a worker with nothing to serve, which the startup
+    // rules refuse and a reload may therefore not reach either. That case is asserted
+    // separately below; this one is the legitimate edit -- an operator pinning the set
+    // and telling the node to stop searching the machine.
+    Testing::ScratchDirectory const scratch { "node-reload-discovery" };
+    auto const& dir = scratch.Path();
+    auto const path = WriteNodeConfigFile(dir, "no_toolchain_discovery: true\ntoolchain:\n  - /usr/bin/g++\n");
+
+    NodeConfig initial;
+    REQUIRE(initial.toolchainDiscovery);
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const before = reloader.Current();
+    REQUIRE(reloader.Reload().has_value());
+
+    CHECK_FALSE(reloader.Current()->toolchainDiscovery);
+    CHECK(Node::AdvertisedClaimsDiffer(*before, *reloader.Current()));
+}
+
+TEST_CASE("A log-level reload does not re-derive what this worker serves", "[node][config][reload]")
+{
+    // **The direction that costs minutes if it is wrong.** Re-deriving the served set
+    // spawns a driver per compiler and walks every include tree -- over 300 s on a
+    // cold machine (#354) -- and the moment an operator raises the log level is
+    // mid-incident, which is the worst possible time to spend that.
+    //
+    // So `AdvertisedClaimsDiffer` is asked rather than assumed, and this is the
+    // assertion that fails if it is ever replaced by "a reload happened".
+    Testing::ScratchDirectory const scratch { "node-reload-loglevel-only" };
+    auto const& dir = scratch.Path();
+    // The file carries BOTH, and only the level moves. A file naming no toolchain at
+    // all would not test this: a reload builds a FRESH configuration and applies the
+    // file to it, so a `toolchain:` key that disappears from the file legitimately
+    // returns this worker to discovery -- a real change, correctly reported as one.
+    // Written the other way round, this case asserted that reverting to discovery is
+    // NOT a change, which is the opposite of true and would have hidden it.
+    auto const path = WriteNodeConfigFile(dir, "log_level: error\ntoolchain:\n  - /usr/bin/g++\n");
+
+    NodeConfig initial;
+    initial.logLevel = LogLevel::Info;
+    initial.toolchains = { "/usr/bin/g++" };
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const before = reloader.Current();
+    REQUIRE(reloader.Reload().has_value());
+
+    REQUIRE(reloader.Current()->logLevel == LogLevel::Error);
+    CHECK_FALSE(Node::AdvertisedClaimsDiffer(*before, *reloader.Current()));
+}
+
+TEST_CASE("The capacity trio and --advertise stay unreloadable, each for its own reason", "[node][config][reload]")
+{
+    // #403 moved the toolchain pair and deliberately left the rest of the band where
+    // it was. Asserted rather than left to the table, because "we decided not to" and
+    // "we forgot" are the same diff.
+    //
+    // `--advertise` is the one that could not move even if the capacity trio did: it
+    // is baked into every outstanding lease's MAC as `expected.endpoint`, so changing
+    // it mid-life does not merely mislead the scheduler -- it invalidates every grant
+    // already in a client's hands, which then fail `EndpointMismatch`.
+    for (auto const* flag: { "--advertise", "--slots", "--node-class", "--reserve-cores" })
+    {
+        INFO("flag: " << flag);
+        auto const rows = NodeOptions();
+        auto const spec =
+            std::ranges::find_if(rows, [flag](OptionSpec<NodeConfig> const& row) { return row.primary == flag; });
+        REQUIRE(spec != rows.end());
+        CHECK(spec->reloadable == Reloadable::No);
+    }
+}
+
+TEST_CASE("A reload forces the survey a witness would never trigger", "[node][config][reload]")
+{
+    // **The gap between "the reload was accepted" and "anything happened".**
+    // `RefreshToolchains` is driven by WITNESSES -- a compiler's stamp moving on disk
+    // -- and editing a configuration file moves none of them. Without the forced
+    // depth, a reload that changed `--toolchain` would be accepted, logged, and then
+    // do nothing at all until the periodic sweep came round, which is up to
+    // `SweepEveryBeats` heartbeats away. An operator would have saved a file, seen it
+    // accepted, and watched the fleet keep dispatching the old set.
+    //
+    // This is a pure function precisely so it can be asserted: it lived as an
+    // expression inside the heartbeat loop, in `main.cpp`, which is in no test target.
+    using Node::ClaimsReloaded;
+    using Node::RecheckDepth;
+    using Node::RecheckDepthFor;
+
+    // A reload forces it on ANY beat, including the ones the sweep would skip.
+    CHECK(RecheckDepthFor(ClaimsReloaded::Yes, 1, 45) == RecheckDepth::Unconditional);
+    CHECK(RecheckDepthFor(ClaimsReloaded::Yes, 44, 45) == RecheckDepth::Unconditional);
+
+    // And without one, the ordinary cadence is unchanged -- the half that keeps a
+    // heartbeat cheap. A beat that is not a sweep asks the witnesses and spawns
+    // nothing.
+    CHECK(RecheckDepthFor(ClaimsReloaded::No, 1, 45) == RecheckDepth::WhenEvidenceMoved);
+    CHECK(RecheckDepthFor(ClaimsReloaded::No, 44, 45) == RecheckDepth::WhenEvidenceMoved);
+    CHECK(RecheckDepthFor(ClaimsReloaded::No, 45, 45) == RecheckDepth::Unconditional);
+    CHECK(RecheckDepthFor(ClaimsReloaded::No, 90, 45) == RecheckDepth::Unconditional);
+
+    // Zero would be a division by zero on the heartbeat thread. It means "never
+    // sweep", which leaves the witnesses and a reload as the two triggers -- not a
+    // crash, and not a survey on every single beat either.
+    CHECK(RecheckDepthFor(ClaimsReloaded::No, 7, 0) == RecheckDepth::WhenEvidenceMoved);
+    CHECK(RecheckDepthFor(ClaimsReloaded::Yes, 7, 0) == RecheckDepth::Unconditional);
+}
+
+TEST_CASE("A malformed toolchain is declined by the reload, not applied", "[node][config][reload]")
+{
+    // The grammar used to be enforced at SURVEY time, which was harmless while this
+    // flag could only arrive at startup: a bad value exited with a message and nothing
+    // had been applied. Reloadable, it stopped being harmless -- the value passed the
+    // applier, was published, and the heartbeat thread then discovered it was malformed
+    // with nothing left to do but serve NOTHING, unrecoverably, because an empty served
+    // set has no witnesses to notice a correction with.
+    //
+    // Both halves of a pinned toolchain have to be non-empty, which is exactly what
+    // `SplitToolchain` says; this asserts the reload asks it.
+    for (auto const* bad: { "toolchain:\n  - =/usr/bin/g++\n", "toolchain:\n  - abc=\n" })
+    {
+        INFO(bad);
+        Testing::ScratchDirectory const scratch { "node-reload-bad-toolchain" };
+        auto const path = WriteNodeConfigFile(scratch.Path(), bad);
+
+        NodeConfig initial;
+        initial.toolchains = { "/usr/bin/g++" };
+
+        auto reloader = MakeNodeReloader(initial, path);
+        CHECK_FALSE(reloader.Reload().has_value());
+
+        // The live configuration is untouched, which is the half that matters: the
+        // worker goes on serving what it was serving.
+        CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
+    }
+}
+
+TEST_CASE("A reload cannot reach a state startup would have refused", "[node][config][reload]")
+{
+    // `--no-toolchain-discovery` with no `--toolchain` is a worker with nothing to
+    // serve. Startup refuses it by name; until #403 no reload could produce it, because
+    // neither flag was reloadable. Both are now, so the reload path composes the
+    // startup rules exactly as `NodeInstallRejection` does -- the same reasoning, since
+    // whatever is accepted here becomes the configuration in force.
+    Testing::ScratchDirectory const scratch { "node-reload-nothing-to-serve" };
+    auto const path = WriteNodeConfigFile(scratch.Path(), "no_toolchain_discovery: true\n");
+
+    NodeConfig initial;
+    initial.toolchains = { "/usr/bin/g++" };
+
+    auto reloader = MakeNodeReloader(initial, path);
+    auto const outcome = reloader.Reload();
+
+    REQUIRE_FALSE(outcome.has_value());
+    // Named, so an operator is told which setting and not merely that something failed.
+    CHECK(outcome.error().context.contains("--toolchain"));
+    CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
 }

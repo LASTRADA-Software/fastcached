@@ -848,9 +848,70 @@ Consequences that are each load-bearing:
   and *names* what it erased; the registry does not touch the lease table itself,
   because that is its sibling rather than its dependency, so `SchedulerService` pairs
   them — from `Lease` and nowhere else, that being the one decision the leftovers
-  corrupt. Reaping cannot see the second route to the same pin: a node that restarts
-  inside the heartbeat window keeps its entry, so `Register` releases its leases too,
-  on the same reasoning that already resets `inFlight` there.
+  corrupt.
+  - **`Register` does NOT release leases, and this rule used to say it did.** The
+    sentence read "a node that restarts inside the heartbeat window keeps its entry, so
+    `Register` releases its leases too, on the same reasoning that already resets
+    `inFlight` there" — and the code declines that reasoning explicitly, in a comment
+    beside the call. The two are not the same bet: a node re-registers after **any**
+    refused heartbeat — `EndpointBusy`, or `NotLeader` during an election — and not only
+    after a restart, so releasing there would wipe leases for compiles that are **still
+    running** and hand a second client the same work. `inFlight` recovers from that
+    guess at the next heartbeat; a lease does not. A worker that genuinely restarted
+    needs nothing: its client's compile exchange fails and the client resolves its own
+    lease on that path, like every other (#212). So `Register` closes the **`inFlight`
+    capacity** pin, and `ReleaseWorker` is reached from `ReapExpiredWorkers` alone.
+  - Found by reasoning **from this file** while designing #403's reload-driven
+    re-registration, which is the third route into the same machinery — the rule said
+    the leases were already released, the code said the opposite, and only one of them
+    runs. A rule that misdescribes the code is worse than a missing one, because it is
+    trusted at exactly the moment somebody is deciding whether a new caller is safe.
+- **A reloadable flag that feeds REGISTER is a claim, not a setting, and adopting one
+  without telling the fleet is the silent failure the whole column exists to prevent**
+  ([#403](https://github.com/LASTRADA-Software/fastcached/issues/403)). `--toolchain`
+  and `--no-toolchain-discovery` decide which fingerprints this node registers, so a
+  reload of either has to re-derive the served set **and** re-register. Three things
+  make that safe, and none of them was built for it:
+  - The heartbeat thread already replaces the served set mid-life when a compiler is
+    patched underneath it (#238), in the order that matters — the compile port first,
+    the registration second — so a job naming a dropped fingerprint is refused
+    `UnknownFingerprint` rather than served by a compiler nobody keyed against.
+  - `RefreshToolchains` already reads the set from the configuration, and
+    `ConfigReloaderOf` already publishes an immutable snapshot any thread may read. The
+    reload therefore *feeds* the existing path; it does not open a second one.
+  - Re-registration leaves outstanding leases alone (the bullet above), which is what
+    makes a reload safe while compiles are running.
+
+  **But a configuration change moves no WITNESS, and that is the trap.** The re-survey
+  is triggered by a compiler's stamp moving on disk; editing a file moves nothing, so a
+  reload that only published a snapshot would be accepted, logged, and then do nothing
+  until the periodic sweep came round — an operator saving a file, seeing it accepted,
+  and watching the fleet keep dispatching the old set. The reload therefore forces
+  `RecheckDepth::Unconditional` on the next beat, and that decision is a pure function
+  (`RecheckDepthFor`) rather than an expression in the heartbeat loop, because
+  `main.cpp` is in no test target and this is precisely the rule that fails silently in
+  one direction.
+
+  **What stays `Reloadable::No` is a decision with a reason, not an omission.**
+  `--advertise` is inside every outstanding lease's MAC as `expected.endpoint`, so
+  changing it mid-life does not merely mislead the scheduler — it invalidates grants
+  already in clients' hands, which then fail `EndpointMismatch`. `--slots`,
+  `--node-class` and `--reserve-cores` feed `NodeCapacityOf`, which is derived **below**
+  the cache tier (#167) and would have to re-establish that ordering without restarting
+  it. And because "we decided not to" and "we forgot" are the same diff, the reloadable
+  set is pinned by a `static_assert` beside the option table: a fourth `Reloadable::Yes`
+  row fails the build until its author classifies it in `AdvertisedClaimsDiffer`.
+
+  **The removal direction fails CLOSED, and #403's own text says otherwise.** Admission
+  is a single funnel — `WorkerProtocol` is the only caller of `CompileJobRunner::Run`,
+  which looks the fingerprint up under its lock and refuses `UnknownFingerprint`
+  (or `ToolchainSurveyInFlight` before the survey lands) — and the lease's own
+  fingerprint check composes with it rather than replacing it. So a stale
+  `(fingerprint, endpoint)` entry costs a failed dispatch and a local compile for at
+  most one `DefaultHeartbeatTimeout`, never a wrong object. There is no wire verb that
+  retires a registry entry, and adding one
+  ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)) is therefore a
+  latency optimisation over a bounded, self-healing window — not a correctness fix.
 - **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
   code with the counter it moves, and `std::nullopt` is a legitimate row: a
   malformed frame is a *client* defect, and counting it beside the capacity
@@ -1855,6 +1916,18 @@ something more threads reach past (#354). Run before the bind, that walk was tim
 during which the node served *nothing*: not its cache tier, not `/healthz`, not
 `/metrics`. So `DiscoverToolchainEntries` stays on the startup path and
 `FingerprintToolchains` moves to the heartbeat thread's first round (#365).
+
+- **Anything that decides "has this changed since the survey" is seeded BEFORE the
+  survey, never after it.** The heartbeat notices a configuration reload by comparing
+  the snapshot it last acted on against the current one, and a baseline left null
+  until the first beat reads that beat as a reload — so every node with a
+  configuration file ran a second full survey immediately after its first: minutes of
+  include-tree walking on a cold machine, and a window in which one transient probe
+  failure drops toolchains the node had just successfully identified. Seeded before,
+  the first beat is comparable to every other one AND a reload that lands *during* the
+  survey is still seen, which a baseline taken afterwards would have swallowed. The
+  bullet above is about when the survey runs; this is about what the survey is measured
+  against, and getting the second wrong costs the whole benefit of the first (#403).
 
 - **Registration is not moved with it, and cannot be.** A `ServedToolchain` cannot
   exist without a real fingerprint, so `toolchains` is simply empty until the walk

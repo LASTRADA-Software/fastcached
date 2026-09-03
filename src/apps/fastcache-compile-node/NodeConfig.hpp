@@ -753,6 +753,45 @@ struct NodeConfig
 /// @return An explanatory message when the install must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg);
 
+/// The reloadable flags that are CLAIMS this worker made to the fleet.
+///
+/// Changing one means re-deriving what this node serves and re-registering, so the
+/// scheduler stops dispatching against a set this worker no longer has.
+inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--toolchain", "--no-toolchain-discovery" };
+
+/// The reloadable flags that are local wiring and reach no other machine.
+///
+/// A list rather than "whatever is not advertised", so that adding a reloadable row
+/// forces a choice instead of defaulting into the cheap answer.
+inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-level" };
+
+/// Whether a reload changed something this worker had TOLD the fleet.
+///
+/// The band #403 made reloadable is not local wiring: `--toolchain` and
+/// `--no-toolchain-discovery` decide the fingerprints this node registers, so adopting
+/// one without telling the scheduler leaves it dispatching against a set this worker no
+/// longer serves. This is what separates "re-derive and re-register" from "apply and
+/// carry on", and `--log-level` -- the third reloadable row -- is squarely the latter.
+///
+/// **Asked rather than assumed**, because the re-survey is the expensive thing this
+/// process does: a driver spawned per compiler and a walk of every include tree, over
+/// 300 s cold (#354). Re-running it because somebody raised the log level mid-incident
+/// would be the worst possible moment to spend that.
+///
+/// **Driven off the table rather than comparing fields by hand.** The rows it consults
+/// are named once, in `AdvertisedReloadableFlags`, and the comparison is each row's own
+/// `same` -- so a flag's idea of "changed" is written in exactly one place, beside the
+/// flag. Spelled out here instead, the two `!=` expressions would be a second copy of
+/// two `FieldEq` comparators sitting in the very rows this is about.
+///
+/// A `static_assert` beside the table requires every `Reloadable::Yes` row to appear on
+/// that list or on the local-only one, so a fourth reloadable row cannot be added
+/// without its author saying which kind it is.
+/// @param previous The configuration that was in force.
+/// @param candidate The configuration just adopted.
+/// @return Whether what this worker advertises has changed.
+[[nodiscard]] bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate);
+
 /// What a bare `--listen-raft` binds.
 ///
 /// The wildcard, like a scheduling node's `--listen-node` and unlike a worker's:

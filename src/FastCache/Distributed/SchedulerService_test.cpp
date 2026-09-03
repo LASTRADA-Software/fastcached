@@ -583,6 +583,52 @@ TEST_CASE("A resolved lease stops suppressing its key at once", "[distributed][s
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
 }
 
+TEST_CASE("A re-registration leaves outstanding leases alone", "[distributed][scheduler]")
+{
+    // **Newly load-bearing, rather than newly true** (#403). `Register` has always
+    // left leases where they were, with its reason written out beside the call: a
+    // node re-registers after any refused heartbeat -- `EndpointBusy`, or `NotLeader`
+    // during an election -- so releasing here would wipe leases for compiles that are
+    // still running and hand a second client the same work.
+    //
+    // What changed is how a re-registration is REACHED. It used to take a restart or
+    // a refused round; a configuration reload now causes one whenever an operator
+    // edits the toolchain set, which is a thing they do deliberately and often. So
+    // the property moves from "true and rarely exercised" to "true and depended on",
+    // and #403's acceptance names it: a lease granted before the reload must RESOLVE
+    // rather than be silently dropped.
+    //
+    // The clock does not move, which is the point -- this is about the
+    // re-registration, not about expiry.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+
+    // The worker re-registers mid-flight, exactly as a reload makes it do. Same
+    // fingerprint and same endpoint, so this refreshes the entry rather than adding
+    // one -- the registry keys on that pair.
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+    // The lease is still the scheduler's to settle: the client resolves it over a
+    // fresh connection on every path out of the compile, and that has to keep
+    // working across the re-registration it never saw.
+    CHECK(fleet.service.Release(Insider, TokenOf(granted), "key-1").status == Wire::Status::Ok);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
+
+    // And it was a real lease throughout, not one quietly dropped and forgiven: the
+    // key stayed suppressed across the re-registration, so a second client could not
+    // have been handed the same work. Asserting only the release above would pass
+    // just as well if `Register` had voided the lease and `Release` were merely
+    // tolerant of an unknown token.
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const second = fleet.service.Lease(Insider, Ask("gcc-14", "key-2"));
+    REQUIRE(second.status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::AlreadyInFlight);
+}
+
 TEST_CASE("A resolved lease gives the worker back its slot", "[distributed][scheduler]")
 {
     // The other half of the same missing transition. `JobStarted` at `Lease` is what

@@ -1405,6 +1405,68 @@ Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install
 time and re-probing would boot out one that was never there).
 
+## Reloading it
+
+`SIGHUP` — or `systemctl reload` — makes the worker re-read its `--config` file
+without restarting. It needs a file: a worker started with flags alone says so and
+changes nothing.
+
+**A reload is all-or-nothing.** The file is applied to a fresh configuration and then
+your command line is applied over it, exactly as at startup, so "the command line
+wins" stays a question of which pass ran second. If the file will not parse, or
+changes a setting that cannot change at runtime, **nothing is applied** and the
+refusal names every offending setting. You saved once; you get one answer.
+
+| Reloadable | Requires a restart |
+|---|---|
+| `log_level`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+
+### Changing what this worker serves
+
+`toolchain` and `no_toolchain_discovery` are not local settings — they are **claims
+this worker made to the scheduler**. So changing either does more than update a
+snapshot: on the next heartbeat the worker re-derives what it can serve, updates its
+compile port, and re-registers with the fleet under the new set. That takes one
+heartbeat, plus however long identifying the toolchains takes on the machine — which
+on a cold host with large include trees is minutes, not seconds. The startup log says
+when it begins and when it finishes.
+
+The order is deliberate and worth knowing, because it is what makes this safe to do on
+a busy worker: the **compile port is updated first, the registration second**. Between
+the two, a job arriving for a toolchain you just removed is refused rather than served
+by a compiler nobody keyed against.
+
+Three consequences, in decreasing order of how likely they are to surprise you:
+
+- **A toolchain you remove keeps being dispatched to this worker for a short while.**
+  The scheduler's entry for it expires on its own after the heartbeat timeout (90
+  seconds by default); until then, clients are leased this worker, it refuses them,
+  and they compile locally. You lose some round trips, never correctness — a removed
+  toolchain is never served by the wrong compiler.
+- **Compiles already running are not disturbed**, and leases already granted stay
+  valid. A client holding a lease resolves it as it always does, over a fresh
+  connection when its job ends.
+- **Removing the `toolchain:` key entirely returns the worker to discovery.** A reload
+  builds a fresh configuration from the file, so a key that is gone from the file is a
+  setting that is gone — not one that persists from the previous run.
+
+### Why `advertise` and the capacity flags need a restart
+
+Not an oversight in either case.
+
+`advertise` is inside the signature of every lease the scheduler has handed out
+naming this worker. Changing it while those are outstanding would not merely leave
+the fleet with a stale address — it would invalidate grants already in clients'
+hands, which would then be refused by this worker as naming the wrong endpoint.
+
+`slots`, `node_class` and `reserve_cores` are resolved against what the cache tier
+actually holds, which is decided when that tier starts. Re-deriving them safely means
+re-establishing that ordering on a running node, which is a larger change than it
+looks.
+
+Raising `log_level` is always safe and takes effect immediately, which is the one you
+want mid-incident.
+
 ## Capacity
 
 Say nothing and the worker sizes itself. It takes its hardware threads, clamps

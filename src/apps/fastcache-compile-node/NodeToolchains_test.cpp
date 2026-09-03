@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <map>
 #include <ranges>
@@ -1157,6 +1158,56 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
             RefreshToolchains(first.served, cfg, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
         CHECK_FALSE(again.changed);
         CHECK(again.served.empty());
+    }
+
+    SECTION("repointing a pinned fingerprint at another compiler is a change")
+    {
+        // **A wrong object under a correct key, which is the worst failure this
+        // repository has a name for -- silent, stored and shared.**
+        //
+        // An operator's `<fingerprint>=<compiler>` is never probed, so it carries no
+        // witness and can never be `stale`; and repointing one leaves the KEY set
+        // identical. The short-circuit compared keys alone, so this survey ran, got
+        // the right answer, and threw it away: the worker went on spawning the old
+        // compiler under a fingerprint its operator had deliberately redefined, and
+        // every client keying on that fingerprint got objects from a compiler it had
+        // not keyed against.
+        //
+        // Pre-existing rather than introduced by #403 -- but unreachable until it,
+        // because nothing could repoint a pin on a running worker. Making
+        // `--toolchain` reloadable is what turned it into something an operator does
+        // on purpose, in the middle of a working day.
+        //
+        // Discovery is deliberately empty: a pinned set is `OperatorNamed`, so the
+        // machine is never searched and the two configurations differ in exactly one
+        // thing -- which compiler the pin names.
+        FixedDiscovery discovery { {} };
+
+        auto pinnedTo = [&](std::string_view path) {
+            auto pinned = cfg;
+            pinned.toolchains = { std::format("pinned={}", path) };
+            return pinned;
+        };
+
+        auto const before = pinnedTo("/usr/bin/g++");
+        auto const first =
+            RefreshToolchains(nothing, before, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
+        REQUIRE(first.changed);
+        REQUIRE(first.served.contains("pinned"));
+        REQUIRE(first.served.at("pinned").compiler == "/usr/bin/g++");
+
+        // The same key, a different program behind it.
+        auto const after = pinnedTo("/usr/bin/clang++");
+
+        auto const repointed = RefreshToolchains(
+            first.served, after, &discovery, runner, host, TestClock(), logger, RecheckDepth::Unconditional);
+
+        // Both halves. `changed` alone would pass a fix that reported the change and
+        // handed back the old mapping, which is the same wrong object with a louder
+        // log line.
+        CHECK(repointed.changed);
+        REQUIRE(repointed.served.contains("pinned"));
+        CHECK(repointed.served.at("pinned").compiler == "/usr/bin/clang++");
     }
 
     SECTION("a machine that still has nothing stays serving nothing")

@@ -363,6 +363,52 @@ enum class RecheckDepth : std::uint8_t
     Unconditional,
 };
 
+/// Whether a configuration reload moved what this worker advertises.
+///
+/// An enum rather than a `bool` at this seam: the call site reads
+/// `RecheckDepthFor(reloaded, beat, sweepEveryBeats)`, where a bare `true` would say
+/// nothing about which of three arguments it is.
+enum class ClaimsReloaded : std::uint8_t
+{
+    No,
+    Yes,
+};
+
+/// How hard the next heartbeat should look at this machine's toolchains.
+///
+/// **A pure function over the two facts, because `main.cpp` is in no test target.**
+/// This rule was an expression inside the heartbeat loop, where the only way to check
+/// it was to read it -- and it is exactly the kind of rule that is wrong in one
+/// direction silently: a reload that failed to force the survey is a configuration an
+/// operator saved, saw accepted, and which then did nothing for up to `sweepEveryBeats`
+/// heartbeats. Split out, both directions are one assertion each (#403, and the same
+/// lesson as #354's readings record).
+///
+/// @param claims Whether a reload changed what this worker would advertise.
+/// @param beat Which heartbeat this is. The caller increments before asking, so the
+///        first is 1 and 0 never arrives -- the sweep therefore lands on
+///        `sweepEveryBeats` and its multiples, not on the first beat.
+/// @param sweepEveryBeats How often the unconditional sweep comes round. Zero means
+///        never, which leaves the witnesses and a reload as the two triggers.
+/// @return The depth to pass `RefreshToolchains`.
+[[nodiscard]] constexpr RecheckDepth RecheckDepthFor(ClaimsReloaded claims,
+                                                     std::uint64_t beat,
+                                                     std::uint64_t sweepEveryBeats) noexcept
+{
+    // A reload outranks the cadence: it is the one trigger that knows something the
+    // witnesses cannot see.
+    if (claims == ClaimsReloaded::Yes)
+        return RecheckDepth::Unconditional;
+
+    // Guarded rather than trusted. The caller's `sweepEveryBeats` is a constant today,
+    // which is exactly the kind of thing a later edit makes configurable -- and the
+    // failure would be a modulo by zero on the heartbeat thread rather than a wrong
+    // answer.
+    if (sweepEveryBeats == 0)
+        return RecheckDepth::WhenEvidenceMoved;
+    return beat % sweepEveryBeats == 0 ? RecheckDepth::Unconditional : RecheckDepth::WhenEvidenceMoved;
+}
+
 /// Re-derive what this node serves, if the machine changed underneath it.
 ///
 /// The whole of #238's decision, in one place a test can drive. A node fingerprints
