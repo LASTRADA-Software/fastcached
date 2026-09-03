@@ -67,6 +67,24 @@
 # reporting a green suite is the failure mode this ordering exists to prevent, and
 # it has happened here.
 #
+# Because it stops at the first red leg, EVERY run -- red or green -- ends with a
+# per-leg verdict naming what passed, what failed, and what never started. Stopping
+# early is right; saying nothing about the legs it skipped was not, and
+#
+#     GATE FAILED: clang-debug tests
+#
+# read as "the rest passed" when the rest had not been asked. What that cost, and
+# why the renderer below is a pure function, is in
+# `.agent/rules/build-and-toolchain.md` (#501) -- one place, so a citation cannot
+# drop the conditions the measurement came with.
+#
+# Reading a red run of THIS script: the leg block is the answer to "how much of the
+# gate actually ran". For the failure itself, read the raw log the message names --
+# ninja's diagnostic begins with a `FAILED:` line and puts the error text several
+# lines BELOW it, so a wrapper filtering on `error|warning:` alone can surface an
+# unrelated warning and none of the actual failure. Filter on `FAILED:` as well, or
+# not at all.
+#
 # **bash 3.2**, because `--self-test` is in the default ctest set and macOS ships a
 # 2007 `/bin/bash`. No `mapfile`, no `declare -A`, no `local -n` -- and no bare
 # `"${arr[@]}"` on an array that can be EMPTY, which is an unbound-variable error
@@ -99,7 +117,39 @@ done
 # prints which binary it used.
 tools_version="${CLANG_TOOLS_VERSION:-22}"
 
-fail() { echo "GATE FAILED: $*" >&2; exit 1; }
+# Render one line per configuration: what it did, including having done nothing.
+#
+# PURE -- everything it reports arrives as arguments. That split is the point rather
+# than tidiness: the bug this fixes is a REPORTING bug, and a reporting bug whose
+# report cannot be exercised without building two whole configurations is the same
+# bug one level up. `--self-test` drives every verdict here in milliseconds.
+#
+# The three states are spelled so that no two can be mistaken for each other, which
+# is the entire acceptance criterion: "failed" and "never ran" must not read alike,
+# because a developer who confuses them pushes. An unrecognised state renders as
+# unrecognised rather than as the nearest plausible neighbour -- a fourth state
+# arriving here silently as `passed` would recreate the defect exactly.
+#
+# @param ... One `preset=state` pair per leg, in table order.
+leg_summary() {
+    local pair preset state label
+    echo "== gate legs:"
+    # `${1+"$@"}` rather than `"$@"`: before bash 4.4 an empty `$@` is an unbound
+    # expansion under `set -u`, which is the hazard this file's header names. No
+    # caller passes none today, but this function is documented as argument-driven,
+    # so the next one would meet the reporter dying while reporting.
+    for pair in ${1+"$@"}; do
+        preset="${pair%%=*}"
+        state="${pair#*=}"
+        case "$state" in
+            passed)  label="passed" ;;
+            failed)  label="FAILED" ;;
+            not-run) label="NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" ;;
+            *)       label="UNKNOWN STATE '$state' -- this is a bug in the gate, not a verdict" ;;
+        esac
+        printf '==   %-14s %s\n' "$preset" "$label"
+    done
+}
 
 # What each preset is here for, and whether the analyser pin has to reach it.
 #
@@ -115,6 +165,80 @@ gate_presets=(
     "clang-debug|tidy"
     "gcc-release|no-tidy"
 )
+
+# What each leg has done so far, by index into the table above. Declared empty and
+# never pre-filled: `leg_pairs` reads an absent entry as `not-run`, which is the
+# truth for every leg until the loop reaches it and is what a failure BEFORE the loop
+# -- a missing analyser, a formatter that refuses -- has to report. Filling it in
+# advance would only have created a second list to keep in step with the first.
+leg_states=()
+
+# Every leg's state, as `preset=state` pairs in table order, for `leg_summary`.
+#
+# Split from the renderer so the renderer stays pure. `:-not-run` is what makes the
+# absence of an entry mean something rather than being an unbound-variable death
+# under `set -u`. Unquoted at the call site on purpose: these are CMake preset
+# names, which cannot contain whitespace.
+leg_pairs() {
+    local i=0 row
+    for row in "${gate_presets[@]}"; do
+        echo "${row%%|*}=${leg_states[$i]:-not-run}"
+        i=$((i + 1))
+    done
+}
+
+# Run every leg in table order, marking each one as it goes.
+#
+# `failed` BEFORE the leg runs and `passed` after it, so that any `fail` reached from
+# inside the runner -- configure, launcher refusal, build, ctest -- renders this leg
+# as failed and every later one as never started, without each of those call sites
+# having to know it is being reported on.
+#
+# Takes the runner by NAME so `--self-test` can drive this loop with a stub. That is
+# not indirection for its own sake: the bookkeeping here is the half of #501 that
+# could plausibly be wrong, and until it took an argument the only way to exercise it
+# was to build two whole configurations.
+#
+# @param 1 Name of the function to invoke per leg, as `runner <preset> <analyser>`.
+run_all_legs() {
+    local runner="$1" i=0 row status
+    for row in "${gate_presets[@]}"; do
+        leg_states[$i]="failed"
+        # The status is CHECKED, not assumed. There is no `set -e` here, so an
+        # unchecked call would mark the leg `passed` on any return at all -- and the
+        # whole scheme would then rest on every failure path in the runner calling
+        # `fail` and exiting, which is true today and is exactly the kind of thing a
+        # later edit breaks by doing the idiomatic thing instead. A runner that
+        # `return 1`s would otherwise be reported as a passed leg, the next leg would
+        # run, and the gate would end `LOCAL GATE PASSED`: #501 reproduced one level
+        # down, inside the fix for it.
+        status=0
+        "$runner" "${row%%|*}" "${row#*|}" || status=$?
+        if [[ "$status" -ne 0 ]]; then
+            fail "${row%%|*} returned $status rather than refusing"
+        fi
+        leg_states[$i]="passed"
+        i=$((i + 1))
+    done
+}
+
+# A refusal reports the legs as well as the reason. Before this, the reason WAS the
+# whole report, and the reader supplied the rest from optimism.
+#
+# Below both tables rather than above them, because it READS them: `leg_pairs`
+# expands `gate_presets`, which is unset until line ~190.
+#
+# Note what that does NOT buy, since the obvious reading is wrong: it is not a guard
+# on the argument loop further up. A `fail` added there -- the natural home for
+# "unknown flag" -- would run before this definition exists, so bash would report
+# `fail: command not found`, return 127, and with no `set -e` the script would CARRY
+# ON and exit 0. That fails open. Anything up there refuses with `echo >&2; exit`,
+# as the usage arm already does.
+fail() {
+    echo "GATE FAILED: $*" >&2
+    leg_summary $(leg_pairs) >&2
+    exit 1
+}
 
 # The value CMake actually cached for one entry of a build directory, or empty
 # when there is no such entry.
@@ -485,8 +609,107 @@ if [[ "$self_test" -eq 1 ]]; then
     fi
     chmod 644 "$scratch/denied/build.ninja" 2>/dev/null
 
-    # The table drives both of the above, so a row that stopped parsing would make
-    # every check here vacuous while every one of them passed.
+    # The per-leg verdict (#501). The renderer is pure, so every state is reachable
+    # here without a compiler -- which is the whole reason it takes its input as
+    # arguments instead of reading the globals.
+    #
+    # The defect being guarded is a READING failure, not a crash: the old gate
+    # printed one true sentence and let the reader infer a false one. So what these
+    # pin is that the states are DISTINGUISHABLE, not merely that each prints
+    # something.
+    expect "a leg that ran and passed says so" \
+        "== gate legs:
+==   clang-debug    passed" \
+        "$(leg_summary clang-debug=passed)"
+    expect "a leg that ran and failed says FAILED" \
+        "== gate legs:
+==   clang-debug    FAILED" \
+        "$(leg_summary clang-debug=failed)"
+
+    # The acceptance criterion, asserted as the inequality it actually is rather than
+    # by eyeballing two literals: these two renderings must never coincide.
+    expect "FAILED and NOT RUN do not render the same for the same preset" \
+        "differ" \
+        "$([[ "$(leg_summary gcc-release=failed)" != "$(leg_summary gcc-release=not-run)" ]] && echo differ || echo SAME)"
+
+    # The scenario from #493, end to end: first leg red, second never asked. The
+    # second line is the one that was missing for five consecutive gate runs.
+    expect "a first-leg failure names the leg that never started" \
+        "== gate legs:
+==   clang-debug    FAILED
+==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+        "$(leg_summary clang-debug=failed gcc-release=not-run)"
+
+    # The fourth state, and the reason the renderer has a default arm at all: a state
+    # it does not know must not be shown as the nearest plausible verdict. `passed`
+    # there would recreate #501 exactly, one level down.
+    expect "an unrecognised state is reported as unrecognised, never as a verdict" \
+        "== gate legs:
+==   clang-debug    UNKNOWN STATE 'wat' -- this is a bug in the gate, not a verdict" \
+        "$(leg_summary clang-debug=wat)"
+
+    # An entry nothing has written yet reads as never run, which is what makes an
+    # empty `leg_states` honest rather than a hole -- and the second check is the
+    # index arithmetic itself, which pairs row N with state N.
+    expect "leg_pairs reads an unwritten entry as never run" \
+        "clang-debug=not-run
+gcc-release=not-run" \
+        "$(leg_pairs)"
+    expect "leg_pairs pairs each table row with the state written for it" \
+        "clang-debug=passed
+gcc-release=failed" \
+        "$(leg_states=(passed failed); leg_pairs)"
+
+    # THE WIRING, which none of the above can see. Deleting the summary from `fail`,
+    # or dropping the index advance in `run_all_legs`, leaves every check above green
+    # while reverting the whole of #501 -- a report nothing calls is the bug it was
+    # written to fix. Both mutations were confirmed to survive the checks above
+    # before these were written, which is the only reason to trust that they add
+    # anything.
+    #
+    # Driven through the real `run_all_legs` against stub runners. `fail` exits, and
+    # inside `$( ... )` that ends the substitution's subshell rather than this script,
+    # so the refusal can be captured and read rather than killing the self-test.
+    #
+    # `; echo CONTINUED` is the sentinel for a THIRD mutation the other two miss:
+    # because the summary is printed INSIDE `fail`, a `fail` that stopped exiting
+    # would produce byte-identical output while letting the gate run the next leg and
+    # finish `LOCAL GATE PASSED` after having printed `GATE FAILED`. The expected text
+    # ends at the leg block, so the sentinel appearing is a mismatch.
+    stub_ok() { :; }
+    stub_fail_first() {
+        if [[ "$1" == "${gate_presets[0]%%|*}" ]]; then fail "$1 tests"; fi
+    }
+    stub_returns_one() { return 1; }
+
+    expect "a run where every leg passes marks every leg passed" \
+        "clang-debug=passed
+gcc-release=passed" \
+        "$(run_all_legs stub_ok; leg_pairs)"
+
+    expect "a first-leg failure refuses through fail(), naming the leg never reached" \
+        "GATE FAILED: clang-debug tests
+== gate legs:
+==   clang-debug    FAILED
+==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+        "$( (run_all_legs stub_fail_first; echo CONTINUED) 2>&1 )"
+
+    # A runner that RETURNS non-zero rather than calling `fail`. There is no `set -e`,
+    # so an unchecked call would mark this leg `passed`, run the next one, and end the
+    # gate green -- #501 one level down. The natural future edit (a non-fatal leg that
+    # returns instead of exiting) is exactly what would do it.
+    expect "a runner that returns non-zero is a failed leg, never a passed one" \
+        "GATE FAILED: clang-debug returned 1 rather than refusing
+== gate legs:
+==   clang-debug    FAILED
+==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+        "$( (run_all_legs stub_returns_one; echo CONTINUED) 2>&1 )"
+
+    # The table drives the launcher and analyser decisions above, the `leg_pairs`
+    # checks, and the whole gate below, so a row that stopped parsing would make
+    # those vacuous while every one of them passed. The `leg_summary` checks are
+    # deliberately NOT among them -- they pass their pairs explicitly, which is what
+    # lets them state what the renderer does independently of what the gate runs.
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -676,9 +899,13 @@ run_preset() {
     rm -f "$log"
 }
 
-for row in "${gate_presets[@]}"; do
-    run_preset "${row%%|*}" "${row#*|}"
-done
+run_all_legs run_preset
 
+# The same block on the way out green. A summary that appears only on failure is one
+# nobody has read when it matters, and the presets are read from the table rather
+# than named in the sentence -- the old line said "(clang-debug + gcc-release)" as a
+# literal, so a third row would have been silently absent from the gate's own
+# statement of what it had just done.
 echo
-echo "LOCAL GATE PASSED (clang-debug + gcc-release)"
+leg_summary $(leg_pairs)
+echo "LOCAL GATE PASSED"

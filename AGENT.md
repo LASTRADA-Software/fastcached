@@ -790,10 +790,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
-- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate — and a
-  RED run is silent about every leg after the failure, so "GATE FAILED: clang-debug tests"
-  does not mean the rest passed (#501). Two `-Werror` defects in one change hid behind
-  five red runs that never reached `gcc-release`. A GREEN run is silent in the OTHER
+- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate. A RED run
+  stops at the first failing leg — correct, and it now NAMES the legs it skipped, because
+  "GATE FAILED: clang-debug tests" alone read as "the rest passed" and two `-Werror`
+  defects hid behind five red runs that never reached `gcc-release` (#501). Read the
+  per-leg block, not just the reason. A GREEN run is silent in the OTHER
   direction: four defects in four tickets were reachable only by the analyser or a
   sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
   them. A platform's leg answers a different question, not a weaker version of the same one.
