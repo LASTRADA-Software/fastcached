@@ -3390,46 +3390,59 @@ TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "
     // bytes pending, and only the first is a departure: the second is a command
     // queued for after this one, which the handler's own reader owns.
     //
-    // Staged through the re-arm, because that is the only place the distinction is
-    // reachable -- the handler has consumed everything by the time it first parks,
-    // so a spurious wake is what makes it arm a SECOND disconnect watch, and the
-    // pipelined PING written meanwhile is what that watch sees. Abandon on
-    // readability and the block dies here with its stream never appended to.
+    // Staged through the RE-ARM, because that is the only place the distinction is
+    // reachable: the handler has consumed everything by the time it first parks, so
+    // bytes can only be pending at a SECOND watch -- and `RunBlockingRead` arms one
+    // per loop iteration. The wake that makes it loop is a real, asserted append
+    // that does not satisfy the cursor (`5-0` requested, `1-0` written), rather than
+    // a notification with nothing behind it: this case must not rest on how the
+    // registry treats a notify that wakes nobody's cursor.
+    //
+    // If the re-arm ever stops happening, the guard is the SECOND assertion below
+    // going vacuous, not a failure -- so it is paired with the reply comparison at
+    // the end, which fails outright if the block was abandoned at any point.
     BlockingHarness h;
     auto session = h.Session();
 
     REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n")));
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
     auto launcher = h.RunHandler(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned);
 
-    // Pipeline a second command behind the parked one, then wake the reader with a
-    // notification carrying no new entry: it re-polls, finds nothing, and re-arms
-    // the disconnect watch -- now with those bytes waiting.
+    // Pipeline a second command behind the parked one, then append an entry the
+    // blocked read does not want: it wakes, re-polls, finds nothing after 5-0, and
+    // re-arms the disconnect watch -- now with the PING's bytes waiting.
     REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(), "*1\r\n$4\r\nPING\r\n")));
+    auto const unwanted = h.engine.StreamAdd("s",
+                                             FastCache::StreamCodec::StreamId { .ms = 1, .seq = 0 },
+                                             false,
+                                             std::vector<std::pair<std::string, std::string>> { { "a", "b" } },
+                                             std::nullopt,
+                                             false);
+    REQUIRE(unwanted.has_value());
     h.waiters.NotifyAppended("s");
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned); // data pending is not a departure.
 
-    // Still blocked, so a real append still wakes it, and the pipelined PING is
-    // then served in order behind the reply it was queued after.
-    auto const added = h.engine.StreamAdd("s",
-                                          FastCache::StreamCodec::StreamId { .ms = 1, .seq = 0 },
-                                          false,
-                                          std::vector<std::pair<std::string, std::string>> { { "f", "v" } },
-                                          std::nullopt,
-                                          false);
-    REQUIRE(added.has_value());
+    // Still blocked, so the entry it IS waiting for wakes it, and the pipelined
+    // PING is then served in order behind the reply it was queued after.
+    auto const wanted = h.engine.StreamAdd("s",
+                                           FastCache::StreamCodec::StreamId { .ms = 6, .seq = 0 },
+                                           false,
+                                           std::vector<std::pair<std::string, std::string>> { { "f", "v" } },
+                                           std::nullopt,
+                                           false);
+    REQUIRE(wanted.has_value());
     h.waiters.NotifyAppended("s");
     h.reactor.Run();
 
     h.EndConnection();
     REQUIRE(h.handlerReturned);
-    REQUIRE(h.reply == "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n+PONG\r\n");
+    REQUIRE(h.reply == "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n6-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n+PONG\r\n");
 }
 
 TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immediately", "[protocol][resp][stream][multi]")

@@ -643,13 +643,24 @@ namespace
     ///
     /// **A non-zero count is NOT a disconnect.** `>0` is data pending — a pipelined
     /// command for after this one — and consuming it here to disambiguate would eat
-    /// bytes the next command owns. So the trampoline simply ends, leaving the wait
-    /// to the data and timeout arms. It is not re-armed in a loop either:
-    /// `WaitReadable` would keep returning the same pending byte immediately, and
-    /// that is a spin, not a watch. The residue is that a peer which pipelines and
-    /// *then* closes is not detected until something reads — narrower than what this
-    /// fixes, unchanged by it, and left as its own question rather than softened away
-    /// here.
+    /// bytes the next command owns. So the trampoline ends, leaving the wait to the
+    /// data and timeout arms. It does not loop: `WaitReadable` would keep answering
+    /// with the same pending byte immediately, which is a spin, not a watch.
+    /// `RunBlockingRead` arms a fresh one per iteration, so a wait that resumes and
+    /// re-registers is watched again; a wait that stays parked with bytes pending is
+    /// not.
+    ///
+    /// **Two cases it therefore does not cover**, both stated rather than left to be
+    /// discovered:
+    ///
+    ///  - A peer that pipelines and *then* closes, until the next re-arm or read.
+    ///  - **TLS, where that is the ORDINARY close**, not a corner: a well-behaved
+    ///    peer sends a `close_notify` RECORD and then FIN, and
+    ///    `TlsSocket::WaitReadable` defers to the raw socket, which sees that record
+    ///    as bytes and answers `>0`. So the arm declines and a TLS `BLOCK 0` client
+    ///    closing cleanly still parks. Code-read, not measured. Reporting EOF through
+    ///    a TLS socket needs the record decrypted, which is a decision for that
+    ///    layer, not something to soften here.
     /// @param waiter The waiter to resolve on disconnect (kept alive here).
     /// @param socket The connection socket to watch for closure.
     DetachedTask ArmDisconnect(std::shared_ptr<StreamWaiter> waiter, ISocket* socket)
