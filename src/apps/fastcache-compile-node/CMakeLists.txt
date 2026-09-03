@@ -124,6 +124,7 @@ if(FASTCACHED_BUILD_TESTS)
         CompileCapacity.cpp
         CompileResponder.cpp
         CompileResponder_test.cpp
+        DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
     )
     target_include_directories(fastcache-compile-node-tests PRIVATE
@@ -137,7 +138,16 @@ if(FASTCACHED_BUILD_TESTS)
     # deletes the executable that would otherwise answer for itself, so a label
     # that drifted leaves a job registered with nothing left able to remove it.
     target_compile_definitions(fastcache-compile-node-tests PRIVATE
-        FASTCACHED_MACOS_NODE_LABEL="${FASTCACHED_MACOS_NODE_LABEL}")
+        FASTCACHED_MACOS_NODE_LABEL="${FASTCACHED_MACOS_NODE_LABEL}"
+        # The repository root, so DocumentedCommandLines_test.cpp can read the
+        # documentation pages it checks. The docs are not build inputs, so there is
+        # no generated copy to point at and no reason to make one.
+        #
+        # PROJECT_SOURCE_DIR rather than CMAKE_SOURCE_DIR: the two differ the moment
+        # this tree is consumed with add_subdirectory(), and the check would then
+        # iterate a `docs/` belonging to somebody else -- or, far more likely, throw
+        # a filesystem_error for a directory that is not there.
+        FASTCACHED_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     if(WIN32)
         target_link_libraries(fastcache-compile-node-tests PRIVATE ws2_32)
     endif()

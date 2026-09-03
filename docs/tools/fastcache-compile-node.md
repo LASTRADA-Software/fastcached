@@ -133,7 +133,7 @@ fastcache-compile-node \
     --serve-scheduler --listen-node=0.0.0.0:6675 \
     --fleet-open --cluster-key-file=/etc/fastcached/cluster.key \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6674 \
+    --advertise=scheduler.internal:6675 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -503,7 +503,7 @@ fastcache-compile-node \
     --listen-node=6677 --cache-memory=8g \
     --upstream=build-cache.internal:6674 \
     --scheduler=scheduler.internal:6675 \
-    --advertise=worker-01.internal:6674 \
+    --advertise=worker-01.internal:6677 \
     --toolchain=/usr/bin/g++
 ```
 
@@ -876,7 +876,9 @@ fastcache-compile-node \
     --raft-peer=n2=10.0.0.2:6680 \
     --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
-    --advertise=10.0.0.1:6674 \
+    --scheduler=10.0.0.1:6675 \
+    --advertise=10.0.0.1:6675 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -986,7 +988,9 @@ fastcache-compile-node \
     --raft-peer=n4=10.0.0.4:6680 \
     --raft-peer=n1=10.0.0.1:6680 --raft-peer=n2=10.0.0.2:6680 --raft-peer=n3=10.0.0.3:6680 \
     --serve-scheduler --listen-node=6675 --fleet-open \
-    --advertise=10.0.0.4:6674 \
+    --scheduler=10.0.0.4:6675 \
+    --advertise=10.0.0.4:6675 \
+    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1101,6 +1105,7 @@ fastcache-compile-node \
     --discovery=255.255.255.255:6681 \
     --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
+    --scheduler=10.0.0.1:6675 --advertise=10.0.0.1:6675 \
     --serve-scheduler --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
 ```
 
@@ -1804,9 +1809,10 @@ numbers those images are drawn from.
 
 ```sh
 fastcache-compile-node --scheduler 127.0.0.1:6675 \
-                       --advertise 10.0.0.1:6674 \
+                       --advertise 10.0.0.1:6675 \
                        --serve-scheduler --listen-node 6675 --fleet-member 10.0.0.2 \
                        --admin-listen 6677 \
+                       --cluster-key-file /etc/fastcached/cluster.key \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
 curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
 ```
