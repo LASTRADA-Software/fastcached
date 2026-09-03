@@ -152,6 +152,22 @@ class NamedResponder final: public IFrameResponder
         return _ownBudget;
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// Settable per fake, because what `MergedResponder` must do with this is ROUTE
+    /// it -- the same reason `HoldsOwnByteBudget` above is settable.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _watchPeer;
+    }
+
+    /// Name the counter this fake's abandoned deliveries belong to, or none.
+    /// @param counter What `PeerWatchCounter` should answer.
+    void SetPeerWatchCounter(std::optional<IMetricsSink::Counter> counter) noexcept
+    {
+        _watchPeer = counter;
+    }
+
     /// Claim, or stop claiming, that this fake accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -202,6 +218,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxOpen { 8 };
     std::size_t _maxInFlight { 4096 };
     bool _ownBudget { false };
+    std::optional<IMetricsSink::Counter> _watchPeer {};
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like

@@ -612,6 +612,14 @@ class ShortWindowResponder final: public IFrameResponder
         return _inner.HoldsOwnByteBudget(opRaw);
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// Forwarded, like every other question this decorator does not itself answer.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t opRaw) const noexcept override
+    {
+        return _inner.PeerWatchCounter(opRaw);
+    }
+
   private:
     IFrameResponder& _inner;
     std::chrono::milliseconds _window;

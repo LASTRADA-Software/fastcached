@@ -260,6 +260,28 @@ class CompileResponder final: public IFrameResponder
         return true;
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// **Yes, and this is the one surface for which the question is worth asking.** A
+    /// compile runs for seconds to minutes while nothing here reads the socket, so a
+    /// client that is killed mid-build -- `Ctrl-C`, a cancelled CI job, a reclaimed
+    /// runner -- goes unnoticed until the object is written into a socket nobody is
+    /// reading. #223 measured that at 84 MB for a single translation unit.
+    ///
+    /// The compile itself is unaffected and still counts in `WorkerJobsCompleted`: it
+    /// ran and this machine paid for it, and only the handover found nobody there.
+    /// Stopping the compile as well needs a cancellable process seam, which
+    /// `IProcessRunner` does not have and
+    /// [#661](https://github.com/LASTRADA-Software/fastcached/issues/661) is about.
+    ///
+    /// Verb-blind, exactly as `HoldsOwnByteBudget` above: `MergedResponder` routes by
+    /// verb FAMILY, so every verb arriving here is a compile verb, and answering
+    /// per-verb would restate the family table somewhere it can disagree with itself.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return IMetricsSink::Counter::WorkerJobsAbandonedClientGone;
+    }
+
   private:
     Cc::WorkerProtocol& _protocol;
     CompileCapacity& _capacity;

@@ -481,6 +481,17 @@ class SchedulerResponder final: public IFrameResponder
         return false;
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// None. A scheduler verb is answered from memory in microseconds, so a client
+    /// cannot realistically vanish inside one -- and the write that would discover it
+    /// is the very next statement anyway. Watching would buy a park and a wake per
+    /// request to learn something the write already reports.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
   private:
     /// Who is asking, as both the gate and the early refusal need it.
     ///
@@ -739,6 +750,22 @@ class CacheResponder final: public IFrameResponder
         return false;
     }
 
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// None, and the reason is the same one that sizes this surface's window: a cache
+    /// answer is a lookup or one bounded upstream round trip, so the interval in which
+    /// a client could disappear unnoticed is the interval before the next statement.
+    ///
+    /// It also keeps the connection-lifetime concession off this surface entirely. A
+    /// watch that does not fire ends the connection, and this is the surface where a
+    /// peer genuinely does stay attached across requests (#176) -- so answering
+    /// anything else here would trade a long-lived cache connection for a disconnect
+    /// notice nobody needs.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
   private:
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
@@ -991,6 +1018,21 @@ class MergedResponder final: public IFrameResponder
     {
         auto const* const owner = OwnerOf(opRaw);
         return owner != nullptr && owner->HoldsOwnByteBudget(opRaw);
+    }
+
+    /// @copydoc IFrameResponder::PeerWatchCounter
+    ///
+    /// **Routed to the owner**, for the reason the line above is: this is a property
+    /// of the VERB, not of the merged listener, and the counter a watch raises belongs
+    /// to the surface whose work was abandoned. Folding would be worse than useless
+    /// here -- there is no counter to fold two answers into.
+    ///
+    /// A verb nobody owns is not watched. It is unreachable, `RefusePeer` having
+    /// already refused it, and not-watching is the answer that changes nothing.
+    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner != nullptr ? owner->PeerWatchCounter(opRaw) : std::nullopt;
     }
 
   private:

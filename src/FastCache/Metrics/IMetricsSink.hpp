@@ -211,6 +211,22 @@ class IMetricsSink
         /// question: the duration of whichever compile happened to finish last.
         WorkerCompileMillisTotal,
 
+        /// Compiles whose client had gone before the reply could be written.
+        ///
+        /// **The delivery failed, not the compile**, which is why this does not
+        /// displace `WorkerJobsCompleted`: the compiler ran, produced an object and
+        /// charged this machine for it, and only the handover found nobody there.
+        /// Folding the two would make an abandoned delivery look like a compile that
+        /// never happened, and an operator watching a completion rate would read a
+        /// fleet losing clients as a machine getting slower.
+        ///
+        /// A rise here is a client-side story -- builds cancelled, `Ctrl-C`, a CI
+        /// runner reclaimed mid-job -- and what it saves is the object write, which
+        /// #223 measured at 84 MB for one translation unit. It is emphatically NOT a
+        /// refusal: nothing was declined and no reply was sent, so it carries no wire
+        /// code and belongs to no `SurfaceRefusal` row.
+        WorkerJobsAbandonedClientGone,
+
         /// Jobs refused because no compiler here matches the client's fingerprint.
         /// The worker's own half of `DispatchLeasesNoWorker`: rising here means
         /// the fleet is misconfigured, and it is the commonest setup failure.
