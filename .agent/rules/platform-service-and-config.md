@@ -392,8 +392,8 @@ readable and silently ignored. Every rule below has already been one of them.
   command-line-only parse" forbids. Taking the parse is also the guard, since a
   function handed only the merge's output cannot obey a rule about the command line.
 
-  And the daemon's audit moved the whole table rather than the two rows that could
-  lose a pin today. Twenty-two of its rows were safe only because their default is a
+  And the daemon's audit moved the whole table rather than the five settings that
+  could lose a pin. **Eighteen** of its rows were safe only because their default is a
   **compile-time constant** — which is exactly what `logTimestamps` was until #496
   made it platform-dependent, at which point `--no-log-timestamps` began registering
   nothing on a host that defaults it off. "Safe because the default happens to be a
@@ -404,13 +404,33 @@ readable and silently ignored. Every rule below has already been one of them.
   switch: the two were separate because a value comparison needs a platform default
   for the two-sided one, and provenance consults no default at all.
 
-  What keeps a value comparison on the daemon is a path flag whose default is
-  **empty** — the same shape as the node's `--cache-dir` above, and here the reason is
-  sharper than "no address to arrive at without asking": emitting `--storage=` would
-  absolutize the *installing shell's working directory* into the registration, which
-  is worse than the drop. Those rows are excluded from the mechanical guard by name,
-  each with its reason, and the guard asserts every excluded spelling is still a real
-  row so an excuse cannot outlive the flag it excuses.
+  **An explicitly EMPTIED value is a pin, and an empty default is not a licence to
+  drop it.** The first pass excused `--storage`, `--tls-cert` and `--tls-key` on the
+  grounds that empty is the flag's own way of saying "off" and there is therefore
+  nothing to lose. There is: `ParseText` never fails, so `--storage=` parses, and
+  under CLI-over-file precedence it means *no persistence whatever `--config`'s file
+  says*. Deciding by presence dropped it, let the file win at every start, and left
+  the daemon persisting to disk — #349's shape inside #349's own fix. What the empty
+  default really constrains is the **absolutizer**, not the decision:
+  `std::filesystem::absolute("")` is the installing shell's working directory, so an
+  explicitly empty value is emitted verbatim. `WithScopeDefaults` then leaves it
+  alone for the same reason it leaves a named `--config` alone.
+
+  Only `--config` and `--pidfile` keep a presence test, and now for an exact reason
+  rather than an approximate one: they carry **no explicit bit**, so they cannot be
+  asked. That is the one shape the node's `--cache-dir` bullet above describes.
+
+  **And a coverage sweep that asks only whether a flag APPEARED cannot see a line
+  naming the wrong field.** `emitIfExplicit("metrics-port", cfg.port,
+  cli.metricsPortExplicit)` emits a token under the right spelling forever, while
+  every registration pins the cache port as the metrics port. So the daemon's sweep
+  drives each value row a second time, with a value distinct from that row's default,
+  and requires the emitted token to **move**. Movement is a value row's question
+  only: a valueless flag's own `apply` may produce the platform default —
+  `--no-log-timestamps` on a host that already defaults off emits the same token
+  either way — so demanding it there would demand a contradiction on one platform,
+  and a wrong field on a switch is caught by the presence half instead, since the
+  emission follows the other field and no token under this spelling appears at all.
 
   A flag needs no bit when its default is **empty**. There is then no address to
   arrive at without asking, so every failure on it is unconditionally fatal —
