@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "Dispatch.hpp"
+
 #include <FastCache/Cli/UsageDoc.hpp>
 
 #include <cstdint>
@@ -87,17 +89,55 @@ enum class DispatchOutcome : std::uint8_t
     /// here is a fleet declining to help, and this one is a defect somebody has to
     /// look at. Folded in with `Unreachable` it would read as a network blip.
     Mismatched,
-    /// A worker ran the compiler. Whether the client went on to USE the object is a
-    /// separate question, answered by the reason a discarded one carries — a
-    /// non-zero remote exit code is a *successful dispatch* of a failing compile,
-    /// exactly as `DispatchStatus::Compiled` says.
+    /// A worker ran the compiler and this client did not keep the object — a
+    /// non-zero remote exit code retried locally, or an artefact that could not be
+    /// written. The exchange worked and the compile was still done twice.
+    ///
+    /// **A state rather than a reason on `Dispatched`.** The reports rate
+    /// `Dispatched` against what was asked of the fleet, so a fleet whose every
+    /// result was thrown away would headline *100% dispatched* with the
+    /// contradiction relegated to a free-text tally underneath — a real failure
+    /// wearing an ordinary-looking number, which is #427's own defect one layer
+    /// further in. A state that is only true when read together with a string is
+    /// not a state. The reason still says WHICH of the three it was.
+    Discarded,
+    /// A worker ran the compiler and this client used the object. Distribution
+    /// worked, with nothing to qualify.
     Dispatched,
+    /// The enumerator count; see `Core/EnumTable.hpp`. Never a state a `Record`
+    /// carries.
     Last
 };
 
 /// @param outcome The dispatch outcome to name.
 /// @return The stable token written to the log (also parsed back when reporting).
 [[nodiscard]] std::string_view ToStringView(DispatchOutcome outcome) noexcept;
+
+/// How one `DispatchStatus` is recorded on the dispatch axis.
+struct DispatchRecording
+{
+    /// The FIXED tally reason, under `RecordFallback`'s rule. Empty where the state
+    /// alone says everything — a dispatch that worked, and a crossed reply, whose
+    /// sentence the CACHE axis already carries under #280's rule and which would
+    /// otherwise be printed twice in one report.
+    std::string_view reason;
+    DispatchOutcome outcome {}; ///< How `--show-stats` buckets it.
+};
+
+/// Decide how to record what `Dispatch` returned.
+///
+/// **Here rather than in the launcher's `main.cpp`, and that is the point.** This
+/// bridges two enumerations, neither of them `main`'s, and a decision that lives in
+/// `main.cpp` is a decision nothing can assert — that file is in no test target, as
+/// `CMakeLists.txt` says in as many words about the wire framing it already had to
+/// move out for the same reason. `RowsInEnumeratorOrder` proves such a table is
+/// *total*, never that it is *right*: swap the declined and unreachable rows and
+/// every assertion still passes while an operator is sent to look at the network
+/// for a fleet that was merely busy.
+///
+/// @param status What `Dispatch` returned.
+/// @return The state to record and the reason to tally it under.
+[[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status) noexcept;
 
 /// One recorded invocation.
 struct Record

@@ -111,6 +111,37 @@ class ScopedStateDir
     return record;
 }
 
+/// Build a miss carrying one dispatch state and reason.
+[[nodiscard]] Record MakeDispatchRecord(DispatchOutcome dispatch, std::string_view detail, std::string_view source)
+{
+    auto record = MakeRecord(Outcome::Miss, "main", std::string { source }, 900);
+    record.dispatch = dispatch;
+    record.dispatchDetail = detail;
+    return record;
+}
+
+/// Append `count` identical such records.
+///
+/// Every distribution case sets up this way and they differed only in the count, the
+/// state and the reason — the copy-paste-differing-by-a-constant the guidelines name
+/// outright. Folded here, the assertion is the visible part of each case again.
+void AppendDispatchRecords(int count,
+                           DispatchOutcome dispatch,
+                           std::string_view detail = {},
+                           std::string_view source = "a.cpp")
+{
+    for (int i = 0; i < count; ++i)
+        AppendRecord(MakeDispatchRecord(dispatch, detail, source));
+}
+
+/// Write one raw log line, for the shapes `AppendRecord` cannot produce: a
+/// pre-upgrade line, and a line written by a build newer than this one.
+void AppendRawLine(std::string_view line)
+{
+    std::ofstream out { LogPath(), std::ios::binary | std::ios::app };
+    out << line << '\n';
+}
+
 } // namespace
 
 TEST_CASE("ToStringView round-trips every outcome token")
@@ -121,12 +152,35 @@ TEST_CASE("ToStringView round-trips every outcome token")
     CHECK(ToStringView(Outcome::Unavailable) == "UNAVAILABLE");
 }
 
-TEST_CASE("ToStringView round-trips every dispatch token")
+TEST_CASE("RecordingFor names what an operator reads for each dispatch status")
 {
-    // Both directions off one table, because a token written in one spelling and
-    // read back in another loses the whole axis silently -- every record would
-    // decode as `Unknown` and the report would say nothing, which is
-    // indistinguishable from a build that never dispatched.
+    // The bridge between the two enumerations, asserted rather than assumed.
+    // `RowsInEnumeratorOrder` proves that table is TOTAL, never that it is RIGHT:
+    // swap the declined and unreachable rows and every static assertion still passes
+    // while an operator is sent to look at the network for a fleet that was merely
+    // busy. Only a test tells those apart -- which is why the table had to leave
+    // `main.cpp`, a file in no test target.
+    CHECK(RecordingFor(DispatchStatus::Compiled).outcome == DispatchOutcome::Dispatched);
+    CHECK(RecordingFor(DispatchStatus::Compiled).reason.empty());
+
+    CHECK(RecordingFor(DispatchStatus::Declined).outcome == DispatchOutcome::Declined);
+    CHECK(RecordingFor(DispatchStatus::Declined).reason == "the fleet declined this compile");
+
+    CHECK(RecordingFor(DispatchStatus::Unavailable).outcome == DispatchOutcome::Unreachable);
+    CHECK(RecordingFor(DispatchStatus::Unavailable).reason == "the fleet could not be reached");
+
+    // A state and no reason: the cache axis already carries #280's sentence, and one
+    // report must not print it under two headings.
+    CHECK(RecordingFor(DispatchStatus::Mismatched).outcome == DispatchOutcome::Mismatched);
+    CHECK(RecordingFor(DispatchStatus::Mismatched).reason.empty());
+}
+
+TEST_CASE("ToStringView names every dispatch token")
+{
+    // The write half; the read half is `ParseLog`, below. One table serves both,
+    // because a token written in one spelling and read back in another loses the
+    // whole axis silently -- every record decodes as `Unknown` and the report says
+    // nothing, which is indistinguishable from a build that never dispatched.
     CHECK(ToStringView(DispatchOutcome::Unknown) == "UNKNOWN");
     CHECK(ToStringView(DispatchOutcome::NotConfigured) == "NOT_CONFIGURED");
     CHECK(ToStringView(DispatchOutcome::NotAttempted) == "NOT_ATTEMPTED");
@@ -134,6 +188,7 @@ TEST_CASE("ToStringView round-trips every dispatch token")
     CHECK(ToStringView(DispatchOutcome::Declined) == "DECLINED");
     CHECK(ToStringView(DispatchOutcome::Unreachable) == "UNREACHABLE");
     CHECK(ToStringView(DispatchOutcome::Mismatched) == "MISMATCHED");
+    CHECK(ToStringView(DispatchOutcome::Discarded) == "DISCARDED");
     CHECK(ToStringView(DispatchOutcome::Dispatched) == "DISPATCHED");
 }
 
@@ -162,13 +217,7 @@ TEST_CASE("A build whose every dispatch failed says so rather than reading as an
     // ENTIRE record: the report showed a normal miss rate and said nothing at all
     // about distribution unless somebody happened to have FASTCACHE_VERBOSE set.
     ScopedStateDir const scoped;
-    for (int i = 0; i < 5; ++i)
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
-        record.dispatch = DispatchOutcome::Unreachable;
-        record.dispatchDetail = "the fleet could not be reached";
-        AppendRecord(record);
-    }
+    AppendDispatchRecords(5, DispatchOutcome::Unreachable, "the fleet could not be reached");
 
     auto const report = FormatReport("");
     CHECK(report.contains("misses       : 5")); // the cache axis still reads honestly
@@ -176,8 +225,8 @@ TEST_CASE("A build whose every dispatch failed says so rather than reading as an
     CHECK(report.contains("unreachable"));
     // Zero dispatched is PRINTED rather than dropped: a fleet that dispatched
     // nothing is exactly what this section exists to make visible, and an omitted
-    // line would read as "no data" instead of as "none".
-    CHECK(report.contains("dispatched"));
+    // line would read as "no data" instead of as "none". Asserted through the rate,
+    // which only the dispatched line can emit.
     CHECK(report.contains("0.0% of 5 asked of the fleet"));
     CHECK(report.contains("5x  the fleet could not be reached"));
 }
@@ -189,12 +238,7 @@ TEST_CASE("A launcher with no scheduler reports no fleet rather than a failed on
     // no FASTCACHE_SCHEDULER must not report a 100% dispatch failure rate. It has no
     // fleet, so the section does not exist for it.
     ScopedStateDir const scoped;
-    for (int i = 0; i < 4; ++i)
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 100);
-        record.dispatch = DispatchOutcome::NotConfigured;
-        AppendRecord(record);
-    }
+    AppendDispatchRecords(4, DispatchOutcome::NotConfigured);
 
     auto const report = FormatReport("");
     CHECK(report.contains("misses       : 4"));
@@ -210,11 +254,7 @@ TEST_CASE("A pre-upgrade log line makes no claim about the operator's fleet")
     // other state would invent a dispatch that was never recorded. `Unknown` is
     // neither, so the section stays absent.
     ScopedStateDir const scoped;
-    auto const path = LogPath();
-    {
-        std::ofstream out { path, std::ios::binary | std::ios::app };
-        out << "MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\n";
-    }
+    AppendRawLine("MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000");
 
     auto const entries = ParseLog("");
     REQUIRE(entries.size() == 1);
@@ -228,11 +268,7 @@ TEST_CASE("A dispatch token this build does not know decodes as unknown rather t
     // A line written by a LATER build. Guessing at it would be a claim about a fleet
     // made from a word this build cannot interpret.
     ScopedStateDir const scoped;
-    auto const path = LogPath();
-    {
-        std::ofstream out { path, std::ios::binary | std::ios::app };
-        out << "MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tQUARANTINED\tsomething new\n";
-    }
+    AppendRawLine("MISS\tmain\t0\t10\ta.cpp\t\t0\t0\t0\t0\t1700000000\tQUARANTINED\tsomething new");
 
     auto const entries = ParseLog("");
     REQUIRE(entries.size() == 1);
@@ -288,16 +324,8 @@ TEST_CASE("A refusal on this machine is not reported as the fleet declining")
     // dispatch rate is taken over. Counted as an attempt it would blame a fleet for
     // a command line this launcher would not send in the first place.
     ScopedStateDir const scoped;
-    for (int i = 0; i < 3; ++i)
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 50);
-        record.dispatch = DispatchOutcome::Refused;
-        record.dispatchDetail = "the command line is not dispatchable";
-        AppendRecord(record);
-    }
-    auto dispatched = MakeRecord(Outcome::Miss, "main", "b.cpp", 900);
-    dispatched.dispatch = DispatchOutcome::Dispatched;
-    AppendRecord(dispatched);
+    AppendDispatchRecords(3, DispatchOutcome::Refused, "the command line is not dispatchable");
+    AppendDispatchRecords(1, DispatchOutcome::Dispatched, {}, "b.cpp");
 
     auto const report = FormatReport("");
     CHECK(report.contains("refused here"));
@@ -305,46 +333,48 @@ TEST_CASE("A refusal on this machine is not reported as the fleet declining")
     CHECK(report.contains("100.0% of 1 asked of the fleet"));
 }
 
-TEST_CASE("A dispatched compile the client threw away is still a dispatch, with a reason")
+TEST_CASE("A fleet whose every result was thrown away does not headline as fully dispatched")
 {
-    // A worker DID run the compiler, which is what `Dispatched` means. The reason is
-    // what says the result was discarded -- and the two together are the only place
-    // a node failing compiles that are fine can be seen at all, because the local
-    // retry succeeds and the build stays green.
+    // A worker ran the compiler and the client kept nothing. That is `Discarded` and
+    // NOT `Dispatched` with an explanatory string, because the reports rate
+    // `Dispatched` against what was asked: as a reason on `Dispatched` this reads
+    // "100.0% of 2 asked of the fleet" -- a green headline over two compiles done
+    // twice, with the contradiction demoted to a free-text tally underneath. That is
+    // #427's own defect one layer in, so the state carries it.
     ScopedStateDir const scoped;
-    for (int i = 0; i < 2; ++i)
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
-        record.dispatch = DispatchOutcome::Dispatched;
-        record.dispatchDetail = "a worker compile failed and was retried locally";
-        AppendRecord(record);
-    }
+    AppendDispatchRecords(2, DispatchOutcome::Discarded, "a worker compile failed and was retried locally");
 
     auto const report = FormatReport("");
-    CHECK(report.contains("100.0% of 2 asked of the fleet"));
+    CHECK(report.contains("result discarded"));
+    CHECK(report.contains("0.0% of 2 asked of the fleet"));
+    CHECK_FALSE(report.contains("100.0% of 2 asked of the fleet"));
+    // The reason still says WHICH of the three discard causes it was.
     CHECK(report.contains("2x  a worker compile failed and was retried locally"));
+}
+
+TEST_CASE("A discarded result is still counted as having asked the fleet")
+{
+    // The exchange worked, so it belongs in the denominator: half the fleet's
+    // answers being thrown away must read as 50%, never as 100% over the half that
+    // survived.
+    ScopedStateDir const scoped;
+    AppendDispatchRecords(1, DispatchOutcome::Dispatched);
+    AppendDispatchRecords(1, DispatchOutcome::Discarded, "the dispatched object could not be written", "b.cpp");
+
+    CHECK(FormatReport("").contains("50.0% of 2 asked of the fleet"));
 }
 
 TEST_CASE("FormatHtmlReport carries the distribution panel only when there is a fleet")
 {
     ScopedStateDir const scoped;
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 900);
-        record.dispatch = DispatchOutcome::Declined;
-        record.dispatchDetail = "the fleet declined this compile";
-        AppendRecord(record);
-    }
+    AppendDispatchRecords(1, DispatchOutcome::Declined, "the fleet declined this compile");
     auto const withFleet = FormatHtmlReport("");
     CHECK(withFleet.contains(">distribution<"));
     CHECK(withFleet.contains("asked of the fleet"));
     CHECK(withFleet.contains("the fleet declined this compile"));
 
     REQUIRE(ResetLog());
-    {
-        auto record = MakeRecord(Outcome::Miss, "main", "a.cpp", 100);
-        record.dispatch = DispatchOutcome::NotConfigured;
-        AppendRecord(record);
-    }
+    AppendDispatchRecords(1, DispatchOutcome::NotConfigured);
     auto const withoutFleet = FormatHtmlReport("");
     CHECK_FALSE(withoutFleet.contains(">distribution<"));
     CHECK_FALSE(withoutFleet.contains("asked of the fleet"));
