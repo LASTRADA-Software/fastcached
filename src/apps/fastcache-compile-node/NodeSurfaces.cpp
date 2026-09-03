@@ -301,14 +301,26 @@ namespace
     // them would pass back a null inside a satisfied `expected`, and their callers
     // dereference it unconditionally.
     //
-    // So this is the notice, delivered at the moment somebody flips a column: a
-    // tolerated surface is a change HERE and in that surface's opener, and each opener
-    // states what its half would cost. Deliberately a build failure rather than a
-    // runtime check -- the point is that it cannot be started and observed.
+    // So this is the notice, delivered at the moment somebody flips a column, and it
+    // is deliberately a build failure rather than a runtime check -- the point is that
+    // it cannot be started and observed.
+    //
+    // **The message names the WORK, not a prohibition.** Somebody flipping a row to
+    // `Tolerate` is not making a mistake; they are asking for a feature that is not
+    // built, and a message that only forbids invites them to delete the assert --
+    // which is the one outcome worse than having written nothing. So it says which
+    // openers are unsound and why, because both were measured once and the next person
+    // should not have to measure them again.
     static_assert(std::ranges::all_of(Surfaces,
                                       [](SurfaceRow const& row) { return row.bindFailure != BindFailurePolicy::Tolerate; }),
-                  "no opener implements a tolerated bind failure yet: flipping a row means writing that surface's "
-                  "opener too, and its caller's null case with it");
+                  "you are asking for a tolerated bind failure, and the opener half is not built yet -- this assert is "
+                  "where that work starts, not a rule against it. JudgeBindFailure already handles Tolerate and is tested "
+                  "on it; what is missing is an opener that can hand its caller a surface which is not there. Two are "
+                  "unsound today and were measured: AdminEndpoint returns a null unique_ptr inside a SUCCESSFUL expected "
+                  "and its caller dereferences it unconditionally to log the bound endpoint, and ConsensusTier::Launch "
+                  "would return success before _transport, _driver, _sink and _peerServer exist, so Start logs consensus "
+                  "as running and the first Propose dereferences a null _driver. Write that surface's opener and its "
+                  "caller's absent case, then remove this row from the assert");
 
     // A spec and its grammar travel together: text nothing validates is text an
     // operator can typo into a registration that replays forever, and a grammar with

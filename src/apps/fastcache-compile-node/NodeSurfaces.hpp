@@ -101,6 +101,20 @@ enum class BindFailurePolicy : std::uint8_t
     /// never the flip: it is that the four reasons had to be WRITTEN, and one of them
     /// existed nowhere in the tree.
     ///
+    /// ### Why this enumerator stays, given an assert makes it unreachable
+    ///
+    /// **Because deleting it makes the failure worse.** The obvious next thought is
+    /// that an enumerator no row may hold is dead weight, and it is worth answering
+    /// where somebody has it: this name is what the person who NEEDS tolerance reaches
+    /// for. With it here they write `Tolerate`, the build stops, and the message tells
+    /// them which openers are unsound, why, and what to write. Without it they invent
+    /// an enumerator, meet an unhandled-`switch` error in `JudgeBindFailure`, and are
+    /// told nothing at all about the two callers that would dereference a null.
+    ///
+    /// So the enumerator is not a placeholder for a feature. It is the vocabulary the
+    /// column needs in order to refuse well -- an absent concept cannot carry a
+    /// diagnostic, and the diagnostic is the entire value of the guard.
+    ///
     /// The concept is not speculative even so: the compile port held this policy until
     /// #290, on the provenance bit #286 added, and it remains `fastcached`'s answer for
     /// the admin surface -- which is why the node's Admin row explains itself against
