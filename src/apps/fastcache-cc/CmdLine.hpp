@@ -766,20 +766,31 @@ struct ParsedCommand
                                                                                      std::span<std::string const> argv,
                                                                                      std::string_view targetTriple);
 
-/// How this client's own compile would spell its **compilation directory**, once its
-/// `-fdebug-prefix-map` rules have been applied to it.
+/// A client's own compilation directory and what its mapping spells that as.
+///
+/// The two travel together or not at all: a replacement with no directory is half a
+/// rule, and both halves come out of one computation.
+struct MappedCompileDir
+{
+    std::string directory;   ///< The directory the client's own compile runs in.
+    std::string replacement; ///< What the client's own `-fdebug-prefix-map` rules spell it as.
+};
+
+/// How this client's own compile spells its **compilation directory**, and the
+/// directory it spells.
 ///
 /// A compiler with debug info on records the directory it ran in — DWARF's
 /// `DW_AT_comp_dir` — and that appears on no command line, so no cache key can
 /// relativize it. `RemoteCompileArgs` drops every path-valued flag, the prefix-map row
-/// included, so a worker received no mapping and a dispatched object recorded the
-/// WORKER's directory under the same key a locally mapped one uses
+/// included, so a worker received no mapping and a dispatched object recorded a
+/// directory a locally mapped one does not, under the same key
 /// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
 ///
-/// The flag itself cannot be forwarded: its left-hand side is a path on the CLIENT and
-/// the worker compiles somewhere else entirely, so the rule would match nothing there.
-/// What can travel is the **replacement**, and the worker then supplies its own
-/// left-hand side. This computes that replacement.
+/// The flag itself cannot be forwarded: a worker needs a rule whose left-hand side is a
+/// path on the WORKER, which this machine has never seen. So this pair travels and the
+/// worker builds the rules — **both** of them, because which directory a dispatched
+/// object records is a fact about the driver rather than about the fleet. The
+/// measurements are on `CompileRequest::compileDir`.
 ///
 /// ## The rule this models is the driver's, and it was measured
 ///
@@ -799,12 +810,12 @@ struct ParsedCommand
 /// @param argv The original full invocation, as the build system wrote it.
 /// @param family The client driver's family, so `/I` is not read as a flag on POSIX.
 /// @param workingDirectory The directory the client's own compile runs in.
-/// @return The replacement, or nullopt when no rule on the line governs that directory
-///         — which is the honest answer for a build that maps nothing, and the answer
-///         the worker must be given so it maps nothing either.
-[[nodiscard]] std::optional<std::string> MappedCompileDirectory(std::span<std::string const> argv,
-                                                                DriverFamily family,
-                                                                std::string_view workingDirectory);
+/// @return The directory and its replacement, or nullopt when no rule on the line
+///         governs that directory — which is the honest answer for a build that maps
+///         nothing, and the answer the worker must be given so it maps nothing either.
+[[nodiscard]] std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
+                                                                     DriverFamily family,
+                                                                     std::string_view workingDirectory);
 
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,

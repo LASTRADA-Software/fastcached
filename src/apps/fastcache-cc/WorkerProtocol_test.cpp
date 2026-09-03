@@ -1656,7 +1656,7 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
     // `FrameWithSource` sends no arguments, names the file `a.cpp` and asks for no
     // compilation-directory mapping.
     CHECK(Wire::AsStringView(Unwrap(result).correlation)
-          == CompileCorrelation(Source, std::span<std::string const> {}, "gcc-13", "a.cpp", ""));
+          == CompileCorrelation(Source, std::span<std::string const> {}, "gcc-13", "a.cpp", "", ""));
 }
 
 namespace

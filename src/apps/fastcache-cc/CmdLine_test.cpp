@@ -1175,7 +1175,9 @@ TEST_CASE("MappedCompileDirectory reads the build-tree rule this project emits")
     };
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/out/build/x");
     REQUIRE(mapped.has_value());
-    CHECK(Unwrap(mapped) == ".");
+    CHECK(Unwrap(mapped).replacement == ".");
+    // The directory travels beside it, because a worker needs both halves of a rule.
+    CHECK(Unwrap(mapped).directory == "/home/ci/out/build/x");
 }
 
 TEST_CASE("MappedCompileDirectory follows the LAST matching rule, not the first")
@@ -1185,14 +1187,12 @@ TEST_CASE("MappedCompileDirectory follows the LAST matching rule, not the first"
     // the source rule first and the build-tree rule last SO THAT the build tree wins,
     // so a first-match model would predict the source rule's replacement for every
     // build this project does.
-    std::vector<std::string> const argv { "g++",
-                                          "-c",
-                                          "a.cpp",
-                                          "-fdebug-prefix-map=/home/ci=A",
-                                          "-fdebug-prefix-map=/home/ci=B" };
+    std::vector<std::string> const argv {
+        "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci=A", "-fdebug-prefix-map=/home/ci=B"
+    };
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci");
     REQUIRE(mapped.has_value());
-    CHECK(Unwrap(mapped) == "B");
+    CHECK(Unwrap(mapped).replacement == "B");
 }
 
 TEST_CASE("MappedCompileDirectory keeps the tail below a mapped root")
@@ -1203,7 +1203,8 @@ TEST_CASE("MappedCompileDirectory keeps the tail below a mapped root")
     std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build=." };
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build/sub/deeper");
     REQUIRE(mapped.has_value());
-    CHECK(Unwrap(mapped) == "./sub/deeper");
+    CHECK(Unwrap(mapped).replacement == "./sub/deeper");
+    CHECK(Unwrap(mapped).directory == "/home/ci/build/sub/deeper");
 }
 
 TEST_CASE("MappedCompileDirectory matches a BYTE prefix, as the drivers do")
@@ -1216,7 +1217,7 @@ TEST_CASE("MappedCompileDirectory matches a BYTE prefix, as the drivers do")
     std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/tmp/work=X" };
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/tmp/worker");
     REQUIRE(mapped.has_value());
-    CHECK(Unwrap(mapped) == "Xer");
+    CHECK(Unwrap(mapped).replacement == "Xer");
 }
 
 TEST_CASE("MappedCompileDirectory splits a rule where GCC splits it")
@@ -1227,7 +1228,7 @@ TEST_CASE("MappedCompileDirectory splits a rule where GCC splits it")
     std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/a=b/build=." };
     auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/a=b/build");
     REQUIRE(mapped.has_value());
-    CHECK(Unwrap(mapped) == ".");
+    CHECK(Unwrap(mapped).replacement == ".");
 }
 
 TEST_CASE("MappedCompileDirectory ignores a rule with no replacement")

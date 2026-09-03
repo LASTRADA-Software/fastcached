@@ -614,14 +614,34 @@ A root containing a **space** is not mapped at all: these rules are spliced into
 `CMAKE_<LANG>_FLAGS`, which is space-separated, so one rule would arrive at the
 driver as two arguments and every compile would fail. The configure says so.
 
-**A dispatched compile is not covered.** The flag is a path-valued argument, and
-`RemoteCompileArgs` drops every one of those before a job is sent, so a worker
-never receives it — an object built on the fleet carries the worker's scratch
-directory as its compilation directory and the dispatching machine's paths in its
-`#line` markers, under the same key a locally built and correctly mapped object
-would use. Forwarding it needs the client's root to travel with the job, which is
-its own change:
-[#506](https://github.com/LASTRADA-Software/fastcached/issues/506).
+**A dispatched compile records the same compilation directory a local one does.**
+The flag itself is never forwarded — it is a path-valued argument, and
+`RemoteCompileArgs` drops every one of those, correctly: its left-hand side names a
+directory on *your* machine and would match nothing on a worker. What travels
+instead is the **replacement**, and the worker pairs it with the directory its own
+compiler will run in. So a fleet-built object and a locally built one both record
+`.`, and a debugger resolves sources the same way whichever produced the object in
+your cache.
+
+Two consequences worth knowing:
+
+- **If your build passes no mapping, a worker adds none.** An object built on the
+  fleet then records the *worker's* directory, exactly as it did before — which is
+  the honest answer, because there is no directory your build would rather see.
+- **A worker that cannot honour the mapping refuses the job** rather than returning
+  an object that disagrees, and your compile runs locally. That happens when the
+  worker's own directory contains an `=` (gcc and clang split `<from>=<to>` at
+  opposite ends, so no unambiguous rule exists) or when its driver has no path-map
+  switch at all. It shows up as a `rejected argument` refusal on the worker's
+  metrics and costs one local compile.
+
+The `#line` markers a worker is sent still carry the dispatching machine's paths,
+so a dispatched object's line table names the producing checkout's headers. That
+half is [#506](https://github.com/LASTRADA-Software/fastcached/issues/506)'s
+remainder rather than its subject: on gcc the file names come from those markers
+and already match a local compile's, and on clang the compilation unit's own name
+is the worker's scratch file
+([#660](https://github.com/LASTRADA-Software/fastcached/issues/660)).
 
 **On Windows there is no equivalent and the paths stay.** `cl` has no path-map
 switch, and `-ffile-prefix-map` does not reach the records that matter for

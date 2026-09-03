@@ -1282,9 +1282,9 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
     return out;
 }
 
-std::optional<std::string> MappedCompileDirectory(std::span<std::string const> argv,
-                                                  DriverFamily family,
-                                                  std::string_view workingDirectory)
+std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
+                                                       DriverFamily family,
+                                                       std::string_view workingDirectory)
 {
     auto const introducers = IntroducersOf(family);
 
@@ -1294,7 +1294,7 @@ std::optional<std::string> MappedCompileDirectory(std::span<std::string const> a
     // -- it emits the source rule first and the build-tree rule last precisely so the
     // build tree wins -- so a first-match model here would predict the source rule's
     // replacement and disagree with every object this project builds.
-    std::optional<std::string> mapped;
+    std::optional<MappedCompileDir> mapped;
     for (auto const& arg: argv)
     {
         auto const match = MatchPathValueFlag(arg, introducers, family);
@@ -1312,8 +1312,13 @@ std::optional<std::string> MappedCompileDirectory(std::span<std::string const> a
         if (!workingDirectory.starts_with(match->value))
             continue;
 
-        // `valueTail` carries the separator, so the replacement is what follows it.
-        mapped = std::string { match->valueTail.substr(1) } + std::string { workingDirectory.substr(match->value.size()) };
+        // `valueTail` carries the separator, so the replacement is what follows it. The
+        // directory travels beside it because a worker needs BOTH left-hand sides: gcc
+        // under `-g` puts this directory into the preprocessed text and the worker's
+        // object then adopts it, while clang leaves the worker's own showing.
+        mapped = MappedCompileDir { .directory = std::string { workingDirectory },
+                                    .replacement = std::string { match->valueTail.substr(1) }
+                                                   + std::string { workingDirectory.substr(match->value.size()) } };
     }
     return mapped;
 }

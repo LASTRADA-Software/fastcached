@@ -29,13 +29,15 @@ struct CompileJob
     /// before it becomes a path -- see `SafeSourceName` -- and never trusted: this
     /// is a string that arrived over a socket.
     std::string sourceName;
-    /// What the CLIENT's own compile records as its compilation directory, already
-    /// rewritten by the client's own `-fdebug-prefix-map` rules. Empty when the client
-    /// maps nothing, and the worker must then map nothing either.
+    /// The directory the CLIENT's compile ran in, and what its own
+    /// `-fdebug-prefix-map` rules spell that as. Both empty when the client maps
+    /// nothing, and the worker must then map nothing either; a half-filled pair is
+    /// refused.
     ///
-    /// A replacement, never a path: the worker pairs it with a left-hand side of its
-    /// own and never opens it. See `WorkerPrefixMapRule`.
+    /// Neither is a path this worker opens — they become the two halves of the rules
+    /// `WorkerPrefixMapRule` builds, and reach only the debug records of the object.
     std::string compileDir;
+    std::string compileDirReplacement;
 };
 
 /// Why a job was refused before any compiler ran.
@@ -442,12 +444,13 @@ enum class PrefixMapOutcome : std::uint8_t
     /// then records this worker's own directory, exactly as it did before #506 -- which
     /// is the honest answer, because there is no directory the client would rather see.
     NotRequested,
-    /// `PrefixMapRule::rule` is the argument to append.
+    /// `PrefixMapRule::rules` are the arguments to append.
     Emit,
-    /// The replacement the client sent is not one this worker will put on a command
-    /// line. A client fault, refused as `JobRefusal::RejectedArgument`.
+    /// Something the client sent is not one this worker will put on a command line, or
+    /// the pair arrived half filled. A client fault, refused as
+    /// `JobRefusal::RejectedArgument`.
     RefusedReplacement,
-    /// This worker cannot express the rule at all -- its driver has no such flag, or
+    /// This worker cannot express the rules at all -- its driver has no such flag, or
     /// its own working directory cannot be spelled unambiguously inside one. A WORKER
     /// fault, and refused rather than silently skipped: skipping it would hand back an
     /// object whose compilation directory disagrees with a locally built one under the
@@ -455,62 +458,87 @@ enum class PrefixMapOutcome : std::uint8_t
     RefusedWorker,
 };
 
-/// A worker's decision about the compilation-directory mapping, and the rule it made.
+/// A worker's decision about the compilation-directory mapping, and the rules it made.
 struct PrefixMapRule
 {
     PrefixMapOutcome outcome { PrefixMapOutcome::NotRequested }; ///< What was decided.
-    std::string rule; ///< The whole argument to append; empty unless `outcome` is `Emit`.
+    /// The arguments to append, in order; empty unless `outcome` is `Emit`.
+    ///
+    /// TWO of them, and both are needed: which directory a dispatched object records is
+    /// a fact about the driver rather than about the fleet. See `WorkerPrefixMapRule`.
+    std::vector<std::string> rules;
     /// Why, for a refusal's `JobError::detail`; empty otherwise. Never carries the
     /// client's bytes -- `JobError::RejectedArgumentNaming` is the one producer allowed
     /// to do that, and it is what the caller reaches for.
     std::string why;
 };
 
-/// The `-fdebug-prefix-map` rule a worker must add so its object records the
+/// The `-fdebug-prefix-map` rules a worker must add so its object records the
 /// compilation directory the CLIENT's own mapping records.
 ///
-/// ## Why the worker builds the rule rather than receiving it
+/// ## Why the worker builds the rules rather than receiving them
 ///
 /// `DW_AT_comp_dir` is the directory the compiler ran in. It is on no command line, so
-/// no cache key can distinguish two producers by it, and a worker runs somewhere the
-/// client has never seen -- so a dispatched object recorded the worker's directory
-/// under the same key a locally mapped one uses
-/// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)). The client
-/// cannot send a whole rule, because a rule's left-hand side would have to be a path on
-/// THIS machine. So the client sends the replacement and this pairs it with the only
-/// left-hand side that can be right: this worker's own compile directory.
+/// no cache key can distinguish two producers by it, and a dispatched object recorded a
+/// directory a locally mapped one does not, under the same key
+/// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)). One half of
+/// the rule the worker needs is a path on THIS machine, which the client has never
+/// seen, so the client sends its own directory and its own replacement and this builds
+/// the rules.
+///
+/// ## TWO rules, because WHICH directory the object records is the driver's answer
+///
+/// Measured on gcc 14.2.0 and clang 20.1.2, one translation unit each way, reading
+/// `DW_AT_comp_dir` off the worker's object:
+///
+/// | preprocess line | the worker's object records |
+/// | --- | --- |
+/// | `g++ -E` | the WORKER's directory |
+/// | `g++ -E -g` | the CLIENT's directory |
+/// | `clang++ -E`, `clang++ -E -g` | the WORKER's directory |
+///
+/// gcc's `-fworking-directory` is implicit under `-g` and emits a line marker naming
+/// the preprocessing directory, which the worker's compile adopts; clang emits none. So
+/// both candidates are mapped, to the same replacement, and the answer is the same
+/// whichever the driver used. **Mapping only this worker's own directory fixes clang
+/// and leaves gcc recording the client's UNMAPPED path** — the object comparison every
+/// other case in the fleet's end-to-end fixture makes cannot see that, and reading
+/// `comp_dir` can, which is why #506's acceptance clause insists on reading it.
 ///
 /// ## What it refuses, and why each refusal is not a silent skip
 ///
-///   - **An empty @p replacement is not a refusal.** It is the client saying it maps
-///     nothing, and a worker that mapped anyway would hand a build that asked for
-///     nothing an object naming a directory neither machine has.
-///   - **A replacement carrying anything but the shape below.** It is peer text that
+///   - **An empty pair is not a refusal.** It is the client saying it maps nothing, and
+///     a worker that mapped anyway would hand a build that asked for nothing an object
+///     naming a directory neither machine has. A HALF-empty pair is refused: it is half
+///     a rule, and guessing the other half is guessing about debug output.
+///   - **Either half carrying anything but the shape below.** They are peer text that
 ///     ends up inside an artefact and, before that, on a command line. The set allowed
 ///     is deliberately narrower than `SafeSourceName`'s in one direction and wider in
 ///     another: no `=` (the drivers disagree about where a second one splits), no
 ///     whitespace, quote or control character (this is spliced into a command line and,
-///     on Windows, into a `CreateProcessA` string), and bounded -- but bytes at or above
-///     `0x80` ARE allowed, because unlike a source name this never becomes a path and a
-///     build directory with a non-ASCII component is an ordinary thing to have.
-///   - **A compile directory containing `=`.** gcc splits `<from>=<to>` at the last
-///     separator and clang at the first, so `-fdebug-prefix-map=/a=b/x=.` is the same
-///     rule to gcc and a different one to clang -- measured: a working directory of
-///     `/tmp/l506b/eq=sign` mapped to `.` gives `.` under gcc and `sign=.=sign` under
-///     clang. A wrong compilation directory is the defect this closes, so the job is
-///     refused instead.
+///     on Windows, into a `CreateProcessA` string), and bounded — but bytes at or above
+///     `0x80` ARE allowed, because unlike a source name neither ever becomes a path and
+///     a build directory with a non-ASCII component is an ordinary thing to have.
+///   - **A compile directory containing `=`**, this worker's own included. gcc splits
+///     `<from>=<to>` at the last separator and clang at the first — measured: a working
+///     directory of `/tmp/l506b/eq=sign` mapped to `.` gives `.` under gcc and
+///     `sign=.=sign` under clang. A wrong compilation directory is the defect this
+///     closes, so the job is refused instead.
 ///   - **A driver with no such flag.** Read off `PathValueFlags()`'s prefix-map row
 ///     rather than tested by name, so the spelling, the separator and which families
 ///     accept it stay in the one table. `cl` has no path-map switch and clang-cl's
 ///     CodeView records are not remapped by one, which is why the row is GNU-only and
 ///     why an MSVC worker refuses rather than pretending.
 ///
-/// @param compileDirectory The directory this worker's compiler will run in.
-/// @param replacement What the client asked its compilation directory to read as;
-///        empty when the client maps nothing.
+/// @param workerDirectory The directory this worker's compiler will run in.
+/// @param clientDirectory The directory the CLIENT's compile ran in; empty when the
+///        client maps nothing.
+/// @param replacement What the client asked that directory to read as; empty when the
+///        client maps nothing.
 /// @param family This worker's OWN driver family, never anything the client sent.
-/// @return The decision, and the argument to append when there is one.
-[[nodiscard]] PrefixMapRule WorkerPrefixMapRule(std::string_view compileDirectory,
+/// @return The decision, and the arguments to append when there are any.
+[[nodiscard]] PrefixMapRule WorkerPrefixMapRule(std::string_view workerDirectory,
+                                                std::string_view clientDirectory,
                                                 std::string_view replacement,
                                                 DriverFamily family);
 

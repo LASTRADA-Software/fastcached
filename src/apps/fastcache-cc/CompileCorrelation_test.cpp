@@ -14,18 +14,19 @@ using namespace FastCache::Cc;
 namespace
 {
 
-/// The five covered inputs, so a case can vary exactly one of them.
+/// The six covered inputs, so a case can vary exactly one of them.
 struct Job
 {
     std::string preprocessed { "int main(){return 0;}" };
     std::vector<std::string> args { "-O2", "-DNDEBUG" };
     std::string fingerprint { "gcc-14-x86_64-linux-gnu" };
     std::string sourceName { "tu.cpp" };
-    std::string compileDir { "." };
+    std::string compileDir { "/home/ci/build" };
+    std::string compileDirReplacement { "." };
 
     [[nodiscard]] std::string Digest() const
     {
-        return CompileCorrelation(preprocessed, args, fingerprint, sourceName, compileDir);
+        return CompileCorrelation(preprocessed, args, fingerprint, sourceName, compileDir, compileDirReplacement);
     }
 };
 
@@ -83,14 +84,21 @@ TEST_CASE("Each covered input changes the correlation", "[correlation]")
         CHECK(other.Digest() != base);
     }
 
-    SECTION("the compilation-directory replacement")
+    SECTION("the compilation directory")
     {
-        // It becomes a `-fdebug-prefix-map` argument on the line the worker spawns, so
-        // two jobs differing only here produce objects whose `DW_AT_comp_dir` differs
-        // -- which is #506's own defect, and crossing the replies would reintroduce it
-        // underneath the fix.
+        // It becomes the left-hand side of a `-fdebug-prefix-map` argument on the line
+        // the worker spawns, so two jobs differing only here produce objects whose
+        // `DW_AT_comp_dir` differs -- #506's own defect, and crossing the replies would
+        // reintroduce it underneath the fix.
         Job other;
-        other.compileDir = "./sub";
+        other.compileDir = "/home/ci/other";
+        CHECK(other.Digest() != base);
+    }
+
+    SECTION("its replacement")
+    {
+        Job other;
+        other.compileDirReplacement = "./sub";
         CHECK(other.Digest() != base);
     }
 
@@ -98,9 +106,10 @@ TEST_CASE("Each covered input changes the correlation", "[correlation]")
     {
         // The pair that matters most: a client that asked for no mapping and one that
         // asked for `.` get objects recording different directories, and the empty
-        // spelling must not digest as though the field were absent.
+        // spelling must not digest as though the fields were absent.
         Job other;
         other.compileDir = "";
+        other.compileDirReplacement = "";
         CHECK(other.Digest() != base);
     }
 }

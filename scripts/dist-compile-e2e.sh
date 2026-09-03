@@ -1636,5 +1636,117 @@ cmp -s "${proj}/build/twelve-ref.o" "${proj}/build/twelve.o" \
     || fail "the object dispatched around an unreachable cache is wrong"
 echo "   the fleet compiled it with the cache unreachable, and said so"
 
+# --- case 13: a dispatched object records the directory a local one records ----
+#
+# Issue #506. `DW_AT_comp_dir` is the directory the compiler ran in; it appears on
+# no command line, so nothing in the cache key can distinguish two producers by it.
+# #203 made a local object relocatable by appending `-fdebug-prefix-map` rules, and
+# `RemoteCompileArgs` drops every path-valued flag -- so a worker received no
+# mapping and a fleet-built object recorded the WORKER's directory under the same
+# key a locally mapped one uses.
+#
+# **Read, never compared.** The ticket says so and it is the load-bearing half: two
+# different-but-checkout-independent mappings compare EQUAL across checkouts, which
+# is exactly how #203's own rule-order defect first read green. Case 1 above is the
+# byte comparison; this one is the only assertion in the fixture that opens the
+# debug records and looks.
+#
+# **The launcher is run from a directory the worker is not in**, and that is the
+# whole arrangement. The node was started with no directory of its own, so it
+# inherits this fixture's -- and a case that compiled here too would produce
+# agreeing objects with the fix reverted, which is a case that passes under the bug.
+# The two directories are asserted to differ rather than assumed to.
+echo "== case 13: a dispatched object records the compilation directory a local one records"
+
+# The reader is a prerequisite rather than a property, so its absence is SKIPPED
+# and said out loud -- absent, skipped and failed being three different things and
+# a silent pass being the worst of the three.
+dwarf_reader=""
+for candidate in readelf llvm-dwarfdump dwarfdump; do
+    command -v "$candidate" >/dev/null 2>&1 && { dwarf_reader="$candidate"; break; }
+done
+
+# The compilation directory a DWARF object records.
+#
+# Three readers, three renderings: `readelf` prints `... offset: 0x25): .`,
+# `llvm-dwarfdump` prints `DW_AT_comp_dir (".")`, macOS `dwarfdump` prints
+# `AT_comp_dir( "." )`. One awk: a quoted value if there is one, otherwise
+# everything after the LAST `: ` -- `sub` with a greedy `.*` takes the last.
+#
+# The dump is captured into a variable BEFORE it is filtered. `producer | awk`
+# with an exiting awk is a false negative under `set -o pipefail`, and it fails on
+# the success path.
+comp_dir_of() {
+    local obj="$1" dump=""
+    case "$dwarf_reader" in
+        readelf) dump="$(readelf --debug-dump=info "$obj" 2>/dev/null || true)" ;;
+        llvm-dwarfdump) dump="$(llvm-dwarfdump --debug-info "$obj" 2>/dev/null || true)" ;;
+        dwarfdump) dump="$(dwarfdump --debug-info "$obj" 2>/dev/null || true)" ;;
+        *) return 0 ;;
+    esac
+    awk '/_comp_dir/ {
+             if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+             line = $0; sub(/.*: */, "", line)
+             gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
+         }' <<< "$dump"
+}
+
+mapdir="${proj}/build/mapcase"
+mkdir -p "$mapdir"
+write_source "${proj}/thirteen.cpp" "casethirteen"
+
+if [[ -z "$dwarf_reader" ]]; then
+    echo "   SKIPPED: no readelf, llvm-dwarfdump or dwarfdump on this machine"
+elif ! (cd "$mapdir" && "$compiler" -g "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen.cpp" -o probe.o) \
+        >/dev/null 2>&1; then
+    echo "   SKIPPED: ${compiler} does not accept -fdebug-prefix-map, so neither half can be mapped"
+elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)" ]]; then
+    # The arrangement, asserted. If the worker's inherited directory were this one
+    # the two objects would agree with the mapping removed entirely.
+    fail "case 13 cannot bite: the worker inherited the same directory the launcher runs in"
+else
+    reference_comp_dir=""
+    remote_comp_dir=""
+
+    (cd "$mapdir" && "$compiler" -std=c++17 -O1 -g "-fdebug-prefix-map=${mapdir}=." \
+        -c "${proj}/thirteen.cpp" -o "${mapdir}/thirteen-ref.o") \
+        || fail "the case 13 reference compile failed"
+
+    (
+        export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
+        cd "$mapdir" && run_launcher "${workdir}/case13.log" -std=c++17 -O1 -g \
+            "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen.cpp" -o "${mapdir}/thirteen.o"
+    ) || { cat "${workdir}/case13.log" >&2; fail "the case 13 dispatched compile failed"; }
+
+    grep -q "DISPATCHED to " "${workdir}/case13.log" \
+        || {
+            cat "${workdir}/case13.log" >&2
+            echo "--- worker log ---" >&2
+            cat "${workdir}/worker.log" >&2
+            fail "case 13 was not dispatched, so it says nothing about a dispatched object"
+        }
+
+    reference_comp_dir="$(comp_dir_of "${mapdir}/thirteen-ref.o")"
+    remote_comp_dir="$(comp_dir_of "${mapdir}/thirteen.o")"
+
+    # Asserted against the EXPECTED value and not only against each other. Two
+    # readers that both return nothing agree perfectly, and that agreement is what a
+    # comparison alone would report as a pass.
+    [[ "$reference_comp_dir" == "." ]] \
+        || fail "the locally mapped object records '${reference_comp_dir}', not '.', so this case is measuring the wrong thing"
+    [[ "$remote_comp_dir" == "." ]] \
+        || {
+            # Both logs. A wrong compilation directory has two shapes and they are
+            # fixed in different places: the CLIENT's own directory means the object
+            # never came from a worker however the dispatch line reads, and the
+            # WORKER's means it came from one that was told nothing.
+            cat "${workdir}/case13.log" >&2
+            echo "--- worker log ---" >&2
+            cat "${workdir}/worker.log" >&2
+            fail "the dispatched object records '${remote_comp_dir}' as its compilation directory, not '.'"
+        }
+    echo "   both objects record '.' as their compilation directory (${dwarf_reader})"
+fi
+
 echo
 echo "dist-compile E2E PASSED"

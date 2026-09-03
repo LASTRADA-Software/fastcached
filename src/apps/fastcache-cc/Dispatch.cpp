@@ -140,13 +140,15 @@ namespace
 
         // Not `const`: the frame carries a whole preprocessed translation unit, so it
         // is MOVED into the exchange rather than copied on the hot path of a build.
-        auto compileFrame = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = job.leaseToken,
-                                                                       .fingerprint = job.request.fingerprint,
-                                                                       .args = argsField,
-                                                                       .source = sourceField,
-                                                                       .acceptedCodecs = job.accepted,
-                                                                       .sourceName = sourceName,
-                                                                       .compileDir = job.request.compileDir });
+        auto compileFrame =
+            Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = job.leaseToken,
+                                                       .fingerprint = job.request.fingerprint,
+                                                       .args = argsField,
+                                                       .source = sourceField,
+                                                       .acceptedCodecs = job.accepted,
+                                                       .sourceName = sourceName,
+                                                       .compileDir = job.request.compileDir,
+                                                       .compileDirReplacement = job.request.compileDirReplacement });
         auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
             // Unreachable, broken mid-reply, or out of budget. The three are one
@@ -189,7 +191,8 @@ namespace
                                                  job.request.args,
                                                  job.request.fingerprint,
                                                  sourceName,
-                                                 job.request.compileDir);
+                                                 job.request.compileDir,
+                                                 job.request.compileDirReplacement);
         if (Wire::AsStringView(result->correlation) != expected)
             return Refused(DispatchStatus::Mismatched,
                            std::format("{} answered about a different compile (expected {}, got {})",

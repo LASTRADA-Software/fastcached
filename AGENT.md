@@ -197,8 +197,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
     with a SPACE is not mapped at all, the rules being spliced into a space-separated
     flags string. `ctest -R debug-prefix-map-rules`.
-  - A DISPATCHED compile is not covered ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)):
-    `RemoteCompileArgs` drops every path-valued flag.
+  - A DISPATCHED compile carries the REPLACEMENT, never the rule: the flag's left-hand
+    side is a path on the CLIENT, so `RemoteCompileArgs` goes on dropping it and
+    `CompileRequest::compileDir` travels instead, the worker pairing it with its own
+    working directory — which is what `DW_AT_comp_dir` is there, NOT the scratch
+    directory #506 named. Empty means map nothing, or a build that asked for nothing
+    gets a directory neither machine has; it cannot ride in `args`, which refuse a path
+    separator; and a worker that cannot spell the rule REFUSES, since an object whose
+    comp_dir disagrees under one key is the ticket itself. Read `comp_dir`, never
+    compare objects.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

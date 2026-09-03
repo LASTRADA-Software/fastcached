@@ -247,7 +247,8 @@ struct ReplyFields
                               request.args,
                               request.fingerprint,
                               SentSourceName(request.sourceName),
-                              request.compileDir);
+                              request.compileDir,
+                              request.compileDirReplacement);
 }
 
 /// The reply an HONEST worker sends back for `request`.
@@ -723,7 +724,8 @@ TEST_CASE("The worker is told what this compile records as its compilation direc
     fleet.Serve(std::string { Scheduler }, GrantReply());
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
-    request.compileDir = "./sub";
+    request.compileDir = "/home/ci/build";
+    request.compileDirReplacement = "./sub";
     fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
 
     REQUIRE(Dispatch(fleet, request).Ran());
@@ -732,7 +734,8 @@ TEST_CASE("The worker is told what this compile records as its compilation direc
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
-    CHECK(Wire::AsStringView(Unwrap(compile).compileDir) == "./sub");
+    CHECK(Wire::AsStringView(Unwrap(compile).compileDir) == "/home/ci/build");
+    CHECK(Wire::AsStringView(Unwrap(compile).compileDirReplacement) == "./sub");
 }
 
 TEST_CASE("A reply about a compile mapped somewhere else is refused", "[dispatch][correlation]")
@@ -747,10 +750,11 @@ TEST_CASE("A reply about a compile mapped somewhere else is refused", "[dispatch
     fleet.Serve(std::string { Scheduler }, GrantReply());
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
-    request.compileDir = ".";
+    request.compileDir = "/home/ci/build";
+    request.compileDirReplacement = ".";
 
     auto elsewhere = request;
-    elsewhere.compileDir = "./other";
+    elsewhere.compileDirReplacement = "./other";
     fleet.Serve(std::string { Worker }, CompileReply(elsewhere, "OBJ"));
 
     auto const outcome = Dispatch(fleet, request);
