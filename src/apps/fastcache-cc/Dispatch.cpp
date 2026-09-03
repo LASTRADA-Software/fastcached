@@ -145,7 +145,8 @@ namespace
                                                                        .args = argsField,
                                                                        .source = sourceField,
                                                                        .acceptedCodecs = job.accepted,
-                                                                       .sourceName = sourceName });
+                                                                       .sourceName = sourceName,
+                                                                       .compileDir = job.request.compileDir });
         auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
             // Unreachable, broken mid-reply, or out of budget. The three are one
@@ -184,8 +185,11 @@ namespace
         // the whole ticket. A crossed reply accepted here is a wrong object under a
         // correct key, which is silent, cached, and shared with every other machine
         // that later fetches that key (#280).
-        auto const expected =
-            CompileCorrelation(job.request.preprocessed, job.request.args, job.request.fingerprint, sourceName);
+        auto const expected = CompileCorrelation(job.request.preprocessed,
+                                                 job.request.args,
+                                                 job.request.fingerprint,
+                                                 sourceName,
+                                                 job.request.compileDir);
         if (Wire::AsStringView(result->correlation) != expected)
             return Refused(DispatchStatus::Mismatched,
                            std::format("{} answered about a different compile (expected {}, got {})",

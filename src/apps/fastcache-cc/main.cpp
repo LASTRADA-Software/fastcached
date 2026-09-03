@@ -1805,6 +1805,26 @@ void RecordManifest(Config const& cfg,
             RefusedHere("this toolchain has no usable fingerprint"),
             std::format("not dispatched ({}); compiling locally", Cc::ExplainDefect(identity.defect).reason));
 
+    // What THIS compile records as its compilation directory, so the worker can make
+    // its object record the same thing. It is the launcher's own working directory --
+    // the local compile below runs with no directory of its own -- put through whatever
+    // `-fdebug-prefix-map` rules the build put on the line. Empty when the build maps
+    // nothing, which is what tells the worker to map nothing either (#506).
+    //
+    // `current_path()` rather than a seam: this is the one fact about the environment
+    // that decides the answer, the function that uses it is pure and tested, and an
+    // unreadable working directory is simply no mapping.
+    std::error_code cwdError;
+    auto const workingDirectory = std::filesystem::current_path(cwdError);
+    //
+    // A named `std::string` and not a `value_or` temporary: `DispatchRequest` holds
+    // views, and this repository has been bitten three times by a value that borrows
+    // from something it outlives.
+    std::string const compileDir =
+        cwdError ? std::string {}
+                 : Cc::MappedCompileDirectory(argv, Cc::DriverOf(cmd.flavor).family, workingDirectory.string())
+                       .value_or(std::string {});
+
     auto const exchange = Cc::MakeTcpExchange(Notice());
     auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
@@ -1812,7 +1832,8 @@ void RecordManifest(Config const& cfg,
                                                             .objectKey = key,
                                                             .args = *args,
                                                             .preprocessed = preprocessRun.out,
-                                                            .sourceName = cmd.source },
+                                                            .sourceName = cmd.source,
+                                                            .compileDir = compileDir },
                                       DispatchBudgetsOf(cfg),
                                       cfg.credential);
     // What the fleet's own answer means on the statistics axis, decided once and in

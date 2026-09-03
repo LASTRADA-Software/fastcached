@@ -364,7 +364,13 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                 // runner is what creates the file, so the check
                                                 // belongs beside the creation rather than at each
                                                 // caller that might forget it.
-                                                .sourceName = std::string { Wire::AsStringView(fields->sourceName) } });
+                                                .sourceName = std::string { Wire::AsStringView(fields->sourceName) },
+                                                // Validated where it becomes a command-line argument, for the
+                                                // same reason `sourceName` is sanitized where it becomes a path:
+                                                // the runner is what spells it, so the check belongs beside the
+                                                // spelling rather than at each caller that might forget it.
+                                                .compileDir =
+                                                    std::string { Wire::AsStringView(fields->compileDir) } });
     if (!outcome.has_value())
     {
         // The refusal's detail rides the reply message, so a client's local fallback

@@ -1282,6 +1282,42 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
     return out;
 }
 
+std::optional<std::string> MappedCompileDirectory(std::span<std::string const> argv,
+                                                  DriverFamily family,
+                                                  std::string_view workingDirectory)
+{
+    auto const introducers = IntroducersOf(family);
+
+    // The LAST match wins, so the loop records rather than returns. Measured on gcc
+    // 14 and clang 20, two rules over one directory: the second replacement is what
+    // `DW_AT_comp_dir` holds. It is also what `_fc_debug_prefix_map_rules` relies on
+    // -- it emits the source rule first and the build-tree rule last precisely so the
+    // build tree wins -- so a first-match model here would predict the source rule's
+    // replacement and disagree with every object this project builds.
+    std::optional<std::string> mapped;
+    for (auto const& arg: argv)
+    {
+        auto const match = MatchPathValueFlag(arg, introducers, family);
+        // A rule whose value carries no tail is `-fdebug-prefix-map=/abs` with no
+        // replacement, which the driver rejects; it maps nothing, so it is skipped
+        // here rather than treated as a mapping to the empty string.
+        if (!match.has_value() || match->flag.role != PathValueRole::PrefixMap || match->valueTail.empty())
+            continue;
+
+        // A BYTE prefix, deliberately, because that is what both drivers implement:
+        // `-fdebug-prefix-map=/tmp/work=X` rewrites a working directory of
+        // `/tmp/worker` to `Xer` on gcc and on clang alike. Requiring a separator
+        // boundary would read better and would make this client predict a replacement
+        // its own compiler does not write.
+        if (!workingDirectory.starts_with(match->value))
+            continue;
+
+        // `valueTail` carries the separator, so the replacement is what follows it.
+        mapped = std::string { match->valueTail.substr(1) } + std::string { workingDirectory.substr(match->value.size()) };
+    }
+    return mapped;
+}
+
 std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv)
 {
     auto const& driver = DriverOf(cmd.flavor);

@@ -766,6 +766,46 @@ struct ParsedCommand
                                                                                      std::span<std::string const> argv,
                                                                                      std::string_view targetTriple);
 
+/// How this client's own compile would spell its **compilation directory**, once its
+/// `-fdebug-prefix-map` rules have been applied to it.
+///
+/// A compiler with debug info on records the directory it ran in — DWARF's
+/// `DW_AT_comp_dir` — and that appears on no command line, so no cache key can
+/// relativize it. `RemoteCompileArgs` drops every path-valued flag, the prefix-map row
+/// included, so a worker received no mapping and a dispatched object recorded the
+/// WORKER's directory under the same key a locally mapped one uses
+/// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
+///
+/// The flag itself cannot be forwarded: its left-hand side is a path on the CLIENT and
+/// the worker compiles somewhere else entirely, so the rule would match nothing there.
+/// What can travel is the **replacement**, and the worker then supplies its own
+/// left-hand side. This computes that replacement.
+///
+/// ## The rule this models is the driver's, and it was measured
+///
+/// gcc 14 and clang 20 agree on all three points that matter here, and the third is
+/// where an intuition would have gone wrong:
+///
+///   - the **last** matching rule wins, not the first (two rules mapping one directory
+///     to `A` then `B` give `B`);
+///   - a longer directory keeps its tail (`/root=.` with a working directory of
+///     `/root/sub/deeper` gives `./sub/deeper`);
+///   - the match is a **byte prefix and not a path prefix** — `/tmp/work=X` against a
+///     working directory of `/tmp/worker` gives `Xer`, on both drivers. So no
+///     separator boundary is imposed here either: modelling the flag more sensibly
+///     than the compiler implements it would make the client predict a replacement the
+///     compiler never writes, which is exactly the disagreement this exists to end.
+///
+/// @param argv The original full invocation, as the build system wrote it.
+/// @param family The client driver's family, so `/I` is not read as a flag on POSIX.
+/// @param workingDirectory The directory the client's own compile runs in.
+/// @return The replacement, or nullopt when no rule on the line governs that directory
+///         — which is the honest answer for a build that maps nothing, and the answer
+///         the worker must be given so it maps nothing either.
+[[nodiscard]] std::optional<std::string> MappedCompileDirectory(std::span<std::string const> argv,
+                                                                DriverFamily family,
+                                                                std::string_view workingDirectory);
+
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
                                                          std::string_view dependencyProbePath = {});

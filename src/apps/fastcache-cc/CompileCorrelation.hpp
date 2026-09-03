@@ -69,11 +69,14 @@ namespace FastCache::Cc
 ///        appends around it.
 /// @param fingerprint The toolchain the client named.
 /// @param sourceName The base name as the client sent it, before sanitizing.
+/// @param compileDir The compilation-directory replacement as the client sent it,
+///        before validating; empty when the client maps nothing.
 /// @return The correlation, as 32 lowercase hex characters.
 [[nodiscard]] inline std::string CompileCorrelation(std::string_view preprocessed,
                                                     std::span<std::string const> args,
                                                     std::string_view fingerprint,
-                                                    std::string_view sourceName)
+                                                    std::string_view sourceName,
+                                                    std::string_view compileDir)
 {
     // `fingerprint` is covered because two jobs identical in source, args and name
     // but built for different toolchains have different correct objects, and crossing
@@ -86,9 +89,19 @@ namespace FastCache::Cc
     // different correct objects. Raw, so the client is not made a second author of the
     // sanitization rule; that makes this FINER than strictly required, which is safe,
     // where coarser would be a hole.
-    KeyDigest digest { "compile-corr-v1" };
+    //
+    // `compileDir` is covered for the same reason and it satisfies the rule at the top
+    // of this header exactly: the client knows it before sending, and the runner
+    // observes it -- it becomes a `-fdebug-prefix-map` argument on the line that is
+    // spawned. Two jobs differing only in it have different correct objects, and the
+    // difference is `DW_AT_comp_dir`, which is what #506 is about; crossing them would
+    // otherwise be the very thing that ticket closes, reappearing one layer down. Raw,
+    // like `sourceName`, so the client is not made a second author of the worker's
+    // validation rule.
+    KeyDigest digest { "compile-corr-v2" };
     digest.Field(fingerprint);
     digest.Field(sourceName);
+    digest.Field(compileDir);
     for (auto const& arg: args)
         digest.Item(arg);
     digest.Field(preprocessed);

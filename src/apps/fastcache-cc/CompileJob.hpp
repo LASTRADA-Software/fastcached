@@ -29,6 +29,13 @@ struct CompileJob
     /// before it becomes a path -- see `SafeSourceName` -- and never trusted: this
     /// is a string that arrived over a socket.
     std::string sourceName;
+    /// What the CLIENT's own compile records as its compilation directory, already
+    /// rewritten by the client's own `-fdebug-prefix-map` rules. Empty when the client
+    /// maps nothing, and the worker must then map nothing either.
+    ///
+    /// A replacement, never a path: the worker pairs it with a left-hand side of its
+    /// own and never opens it. See `WorkerPrefixMapRule`.
+    std::string compileDir;
 };
 
 /// Why a job was refused before any compiler ran.
@@ -420,5 +427,91 @@ class CompileJobRunner final: public ICompileJobRunner
 /// @param sourceName The base name the client asked for.
 /// @return A file name safe to create inside the scratch directory.
 [[nodiscard]] std::string SafeSourceName(std::string_view sourceName);
+
+/// What a worker decided about the compilation-directory mapping a client asked for.
+///
+/// FOUR outcomes and not an optional, because "the client asked for nothing", "here is
+/// the rule", "this client asked for something this worker will not spell" and "this
+/// worker cannot express a rule for its own directory" are four different answers that
+/// end in three different places -- proceed, proceed with the flag, refuse the client,
+/// refuse as a worker fault. Collapsing the last two would blame a client for a
+/// property of the machine it was sent to.
+enum class PrefixMapOutcome : std::uint8_t
+{
+    /// The client mapped nothing, so the worker maps nothing. The dispatched object
+    /// then records this worker's own directory, exactly as it did before #506 -- which
+    /// is the honest answer, because there is no directory the client would rather see.
+    NotRequested,
+    /// `PrefixMapRule::rule` is the argument to append.
+    Emit,
+    /// The replacement the client sent is not one this worker will put on a command
+    /// line. A client fault, refused as `JobRefusal::RejectedArgument`.
+    RefusedReplacement,
+    /// This worker cannot express the rule at all -- its driver has no such flag, or
+    /// its own working directory cannot be spelled unambiguously inside one. A WORKER
+    /// fault, and refused rather than silently skipped: skipping it would hand back an
+    /// object whose compilation directory disagrees with a locally built one under the
+    /// same key, which is #506 itself.
+    RefusedWorker,
+};
+
+/// A worker's decision about the compilation-directory mapping, and the rule it made.
+struct PrefixMapRule
+{
+    PrefixMapOutcome outcome { PrefixMapOutcome::NotRequested }; ///< What was decided.
+    std::string rule; ///< The whole argument to append; empty unless `outcome` is `Emit`.
+    /// Why, for a refusal's `JobError::detail`; empty otherwise. Never carries the
+    /// client's bytes -- `JobError::RejectedArgumentNaming` is the one producer allowed
+    /// to do that, and it is what the caller reaches for.
+    std::string why;
+};
+
+/// The `-fdebug-prefix-map` rule a worker must add so its object records the
+/// compilation directory the CLIENT's own mapping records.
+///
+/// ## Why the worker builds the rule rather than receiving it
+///
+/// `DW_AT_comp_dir` is the directory the compiler ran in. It is on no command line, so
+/// no cache key can distinguish two producers by it, and a worker runs somewhere the
+/// client has never seen -- so a dispatched object recorded the worker's directory
+/// under the same key a locally mapped one uses
+/// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)). The client
+/// cannot send a whole rule, because a rule's left-hand side would have to be a path on
+/// THIS machine. So the client sends the replacement and this pairs it with the only
+/// left-hand side that can be right: this worker's own compile directory.
+///
+/// ## What it refuses, and why each refusal is not a silent skip
+///
+///   - **An empty @p replacement is not a refusal.** It is the client saying it maps
+///     nothing, and a worker that mapped anyway would hand a build that asked for
+///     nothing an object naming a directory neither machine has.
+///   - **A replacement carrying anything but the shape below.** It is peer text that
+///     ends up inside an artefact and, before that, on a command line. The set allowed
+///     is deliberately narrower than `SafeSourceName`'s in one direction and wider in
+///     another: no `=` (the drivers disagree about where a second one splits), no
+///     whitespace, quote or control character (this is spliced into a command line and,
+///     on Windows, into a `CreateProcessA` string), and bounded -- but bytes at or above
+///     `0x80` ARE allowed, because unlike a source name this never becomes a path and a
+///     build directory with a non-ASCII component is an ordinary thing to have.
+///   - **A compile directory containing `=`.** gcc splits `<from>=<to>` at the last
+///     separator and clang at the first, so `-fdebug-prefix-map=/a=b/x=.` is the same
+///     rule to gcc and a different one to clang -- measured: a working directory of
+///     `/tmp/l506b/eq=sign` mapped to `.` gives `.` under gcc and `sign=.=sign` under
+///     clang. A wrong compilation directory is the defect this closes, so the job is
+///     refused instead.
+///   - **A driver with no such flag.** Read off `PathValueFlags()`'s prefix-map row
+///     rather than tested by name, so the spelling, the separator and which families
+///     accept it stay in the one table. `cl` has no path-map switch and clang-cl's
+///     CodeView records are not remapped by one, which is why the row is GNU-only and
+///     why an MSVC worker refuses rather than pretending.
+///
+/// @param compileDirectory The directory this worker's compiler will run in.
+/// @param replacement What the client asked its compilation directory to read as;
+///        empty when the client maps nothing.
+/// @param family This worker's OWN driver family, never anything the client sent.
+/// @return The decision, and the argument to append when there is one.
+[[nodiscard]] PrefixMapRule WorkerPrefixMapRule(std::string_view compileDirectory,
+                                                std::string_view replacement,
+                                                DriverFamily family);
 
 } // namespace FastCache::Cc

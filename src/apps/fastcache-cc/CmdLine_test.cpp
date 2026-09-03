@@ -1143,3 +1143,109 @@ TEST_CASE("A module interface unit is never dispatched, whatever the driver")
         CHECK(parsed.error().contains("BMI"));
     }
 }
+
+// --- MappedCompileDirectory --------------------------------------------------
+
+TEST_CASE("MappedCompileDirectory answers nothing when the build maps nothing")
+{
+    // The load-bearing case, and the whole argument against the worker choosing a
+    // token of its own: a build that asked for no mapping must get back an object
+    // recording no invented directory. Nothing here is what carries that to the
+    // worker (#506).
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-o", "a.o", "-O2", "-g" };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory answers nothing when no rule reaches this directory")
+{
+    // A rule mapping the SOURCE tree says nothing about a working directory outside
+    // it. Reporting its replacement anyway would have the worker record a directory
+    // this compile never records.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/src=../.." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory reads the build-tree rule this project emits")
+{
+    // The shape `_fc_debug_prefix_map_rules` produces: source rule first, build-tree
+    // rule last, the working directory being the build tree. Measured on gcc 14 and
+    // clang 20, such a compile records `.` as its `DW_AT_comp_dir`.
+    std::vector<std::string> const argv {
+        "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/src=../../..", "-fdebug-prefix-map=/home/ci/out/build/x=."
+    };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/out/build/x");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == ".");
+}
+
+TEST_CASE("MappedCompileDirectory follows the LAST matching rule, not the first")
+{
+    // Both drivers honour the last match -- measured, two rules over one directory
+    // giving the second replacement. Not a detail: `_fc_debug_prefix_map_rules` emits
+    // the source rule first and the build-tree rule last SO THAT the build tree wins,
+    // so a first-match model would predict the source rule's replacement for every
+    // build this project does.
+    std::vector<std::string> const argv { "g++",
+                                          "-c",
+                                          "a.cpp",
+                                          "-fdebug-prefix-map=/home/ci=A",
+                                          "-fdebug-prefix-map=/home/ci=B" };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == "B");
+}
+
+TEST_CASE("MappedCompileDirectory keeps the tail below a mapped root")
+{
+    // A recursive make runs the compiler in a subdirectory of the build tree, so the
+    // rule matches a PREFIX and the remainder survives. Measured: `/root=.` with a
+    // working directory of `/root/sub/deeper` gives `./sub/deeper` on both drivers.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build=." };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build/sub/deeper");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == "./sub/deeper");
+}
+
+TEST_CASE("MappedCompileDirectory matches a BYTE prefix, as the drivers do")
+{
+    // Not a path prefix. Measured on gcc 14 and clang 20:
+    // `-fdebug-prefix-map=/tmp/work=X` against a working directory of `/tmp/worker`
+    // yields `Xer`. Modelling it as a component-boundary match would read better and
+    // would make this client predict a replacement neither compiler writes, which is
+    // exactly the disagreement the field exists to end.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/tmp/work=X" };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/tmp/worker");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == "Xer");
+}
+
+TEST_CASE("MappedCompileDirectory splits a rule where GCC splits it")
+{
+    // The launcher follows gcc, which cuts `<from>=<to>` at the LAST separator, so a
+    // mapped root containing one still isolates the whole root. `MatchPathValueFlag`
+    // owns that rule; this asserts it is the rule reaching the replacement too.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/a=b/build=." };
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/a=b/build");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == ".");
+}
+
+TEST_CASE("MappedCompileDirectory ignores a rule with no replacement")
+{
+    // `-fdebug-prefix-map=/abs` is malformed and the driver says so; it maps nothing,
+    // so it must not read as a mapping to the empty string -- which would travel as
+    // "this client maps nothing" and be indistinguishable from a build with no rule at
+    // all, while meaning something different.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-fdebug-prefix-map=/home/ci/build" };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/build").has_value());
+}
+
+TEST_CASE("MappedCompileDirectory reads no rule on an MSVC line")
+{
+    // `/` introduces an option under a Windows layout, and the prefix-map row is
+    // GNU-only because neither COFF driver honours such a flag. A line carrying the
+    // spelling anyway must not make this client promise a mapping its own compiler
+    // will not perform.
+    std::vector<std::string> const argv { "cl.exe", "/c", "a.cpp", "-fdebug-prefix-map=C:/ci/build=." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Msvc, "C:/ci/build").has_value());
+}

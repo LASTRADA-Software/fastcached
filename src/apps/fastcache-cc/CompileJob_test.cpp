@@ -15,6 +15,7 @@
 #include <fstream>
 #include <latch>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -975,4 +976,158 @@ TEST_CASE("A job already inside a compile keeps the compiler it looked up", "[co
     REQUIRE(replaced.Run(Job()).has_value());
     REQUIRE_FALSE(after.Argv().empty());
     CHECK(after.Argv().front() == "/opt/after/g++");
+}
+
+// --- the compilation-directory mapping (#506) --------------------------------
+
+TEST_CASE("A worker asked for no mapping adds no rule", "[compile-job][prefix-map]")
+{
+    // The case the whole design turns on. A build that maps nothing must get an
+    // object recording no directory it did not ask for, so an absent replacement is
+    // not a refusal and not an invitation for the worker to pick a token.
+    auto const decided = WorkerPrefixMapRule("/var/lib/fastcache-node", "", DriverFamily::Gnu);
+    CHECK(decided.outcome == PrefixMapOutcome::NotRequested);
+    CHECK(decided.rule.empty());
+}
+
+TEST_CASE("A worker pairs the client's replacement with its OWN directory", "[compile-job][prefix-map]")
+{
+    // The fix itself. The client cannot send a rule -- the left-hand side would have
+    // to be a path on this machine -- so it sends the replacement and this supplies
+    // the directory the compiler will actually run in. Measured on gcc 14 and clang
+    // 20: with this rule in force a dispatched object's `DW_AT_comp_dir` reads `.`,
+    // the same as a locally mapped one's, where without it it read the worker's own
+    // directory (#506).
+    auto const decided = WorkerPrefixMapRule("/var/lib/fastcache-node", ".", DriverFamily::Gnu);
+    REQUIRE(decided.outcome == PrefixMapOutcome::Emit);
+    CHECK(decided.rule == "-fdebug-prefix-map=/var/lib/fastcache-node=.");
+}
+
+TEST_CASE("Every prefix-map row round-trips through the launcher's own parser", "[compile-job][prefix-map]")
+{
+    // The rule is assembled from the table row's spelling and its `valueTailSeparator`
+    // -- one character standing for both the flag/value join and the split inside the
+    // value, which is true of every row the table can hold today and is an assumption
+    // rather than a fact. Asserted by parsing what was emitted back, per row, so a
+    // future row that joins and splits on different characters fails here instead of
+    // producing an argument no driver understands.
+    for (PathValueFlag const& row: PathValueFlags())
+    {
+        if (row.role != PathValueRole::PrefixMap)
+            continue;
+        INFO("row: " << row.spelling);
+        auto const decided = WorkerPrefixMapRule("/scratch/dir", "TOKEN", row.families);
+        REQUIRE(decided.outcome == PrefixMapOutcome::Emit);
+
+        auto const parsed = MatchPathValueFlag(decided.rule, IntroducersOf(row.families), row.families);
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->flag.role == PathValueRole::PrefixMap);
+        CHECK(parsed->value == "/scratch/dir");
+        CHECK(parsed->valueTail == std::string { row.valueTailSeparator } + "TOKEN");
+    }
+}
+
+TEST_CASE("A worker refuses a replacement it will not put on a command line", "[compile-job][prefix-map]")
+{
+    // Peer text that ends up inside an artefact, so it is bounded and restricted
+    // before it is spelled. Refused rather than dropped: dropping it silently returns
+    // an object whose compilation directory disagrees with a locally built one under
+    // the same key, which is the defect this closes.
+    for (auto const& replacement: { std::string { "a=b" },
+                                    std::string { "a b" },
+                                    std::string { "a\"b" },
+                                    std::string { "a\nb" },
+                                    std::string(300, '.') })
+    {
+        INFO("replacement: " << replacement);
+        CHECK(WorkerPrefixMapRule("/scratch", replacement, DriverFamily::Gnu).outcome
+              == PrefixMapOutcome::RefusedReplacement);
+    }
+}
+
+TEST_CASE("A worker accepts a non-ASCII replacement", "[compile-job][prefix-map]")
+{
+    // Deliberately wider than `SafeSourceName`, and the difference is what each string
+    // becomes: a source name becomes a FILE on this worker, a replacement never does.
+    // A build directory with a non-ASCII component is ordinary, and refusing one would
+    // cost that build distribution entirely.
+    auto const decided = WorkerPrefixMapRule("/scratch", "./b\xc3\xa4u", DriverFamily::Gnu);
+    CHECK(decided.outcome == PrefixMapOutcome::Emit);
+}
+
+TEST_CASE("A worker refuses when its own directory cannot be spelled in a rule", "[compile-job][prefix-map]")
+{
+    // gcc cuts `<from>=<to>` at the last separator and clang at the first, so a
+    // compile directory carrying one is a rule the two drivers read differently.
+    // Measured: a working directory of `/tmp/l506b/eq=sign` mapped to `.` gives `.`
+    // under gcc 14 and `sign=.=sign` under clang 20 -- a WRONG compilation directory,
+    // not a missing one, which is why this refuses rather than emits.
+    auto const decided = WorkerPrefixMapRule("/tmp/eq=sign", ".", DriverFamily::Gnu);
+    CHECK(decided.outcome == PrefixMapOutcome::RefusedWorker);
+}
+
+TEST_CASE("A worker whose driver has no such flag refuses rather than pretending", "[compile-job][prefix-map]")
+{
+    // `cl` has no path-map switch and clang-cl's CodeView records are not remapped by
+    // one, which is why the table's row is GNU-only. Emitting nothing and compiling
+    // anyway would return an object recording this worker's directory under the key a
+    // mapped one uses.
+    CHECK(WorkerPrefixMapRule("C:/scratch", ".", DriverFamily::Msvc).outcome == PrefixMapOutcome::RefusedWorker);
+}
+
+TEST_CASE("A run appends the mapping after the client's own arguments", "[compile-job][prefix-map]")
+{
+    // AFTER the client's arguments, because both GNU drivers honour the LAST matching
+    // rule. That ordering is defensive rather than reachable today, and saying so is
+    // the point: a client's own `-fdebug-prefix-map` is dropped twice over -- by
+    // `RemoteCompileArgs` as a path-valued flag, and again by this worker's allowlist,
+    // which refuses any argument body carrying a path separator. So no client argument
+    // can currently contend with this rule, and a case staging one would be asserting
+    // against a command line no worker can receive.
+    //
+    // The directory in the rule is THIS process's, which is what the compiler
+    // inherits: `IProcessRunner` spawns with no directory of its own and every path
+    // the runner passes is absolute.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job({ "-O2", "-DNDEBUG" });
+    job.compileDir = ".";
+    REQUIRE(jobs.Run(job).has_value());
+
+    auto const expected = std::format("-fdebug-prefix-map={}=.", std::filesystem::current_path().string());
+    auto const& argv = runner.Argv();
+    auto const at = std::ranges::find(argv, expected);
+    REQUIRE(at != argv.end());
+    CHECK(at > std::ranges::find(argv, "-DNDEBUG"));
+    CHECK(at < std::ranges::find(argv, "-c"));
+}
+
+TEST_CASE("A run asked for no mapping puts no such flag on the line", "[compile-job][prefix-map]")
+{
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    REQUIRE(jobs.Run(Job()).has_value());
+    CHECK(std::ranges::none_of(runner.Argv(),
+                               [](std::string const& arg) { return arg.starts_with("-fdebug-prefix-map"); }));
+}
+
+TEST_CASE("A run refuses a replacement the worker will not spell, and spawns nothing", "[compile-job][prefix-map]")
+{
+    // Counted as a rejected argument, which is what it is -- a value this worker will
+    // not put on a command line -- so the existing refusal counter moves and the
+    // client compiles locally rather than caching an object with a wrong directory.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.compileDir = "a=b";
+    auto const result = jobs.Run(job);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == JobRefusal::RejectedArgument);
+    CHECK(runner.Argv().empty());
 }

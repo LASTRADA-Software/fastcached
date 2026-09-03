@@ -199,6 +199,10 @@ struct DispatchRequest
     /// name travels -- see `Dispatch`, which takes it -- because that is what a
     /// compiler records in the object and the worker has no use for the rest.
     std::string_view sourceName;
+    /// What this client's own compile records as its compilation directory, from
+    /// `MappedCompileDirectory`. Empty when the build maps nothing, which is what tells
+    /// the worker to map nothing either.
+    std::string_view compileDir;
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.

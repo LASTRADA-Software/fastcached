@@ -899,7 +899,8 @@ inline constexpr std::array OpTable {
                    .family = VerbFamily::Scheduler },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
-                   .fieldCount = 6, // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName
+                   // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName, compileDir
+                   .fieldCount = 7,
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
@@ -2236,6 +2237,34 @@ struct CompileRequest
     /// is a string from the network that becomes a path, so the two checks are the
     /// same pair as the argument filter's.
     std::string_view sourceName;
+    /// What the client's own compile would record as its **compilation directory**,
+    /// as the client's `-fdebug-prefix-map` rules already spell it. Empty when the
+    /// client maps nothing.
+    ///
+    /// A compiler with debug info on records the directory it ran in -- DWARF's
+    /// `DW_AT_comp_dir` -- and that appears on no command line, so nothing in the
+    /// cache key can distinguish two producers by it. A worker runs in a directory of
+    /// its own, so a dispatched object recorded the WORKER's, under the same key a
+    /// locally built one uses
+    /// ([#506](https://github.com/LASTRADA-Software/fastcached/issues/506)).
+    ///
+    /// The client cannot send a rule, because the rule's left-hand side is a path on
+    /// the WORKER that the client has never seen. So the **replacement** travels and
+    /// the worker supplies its own left-hand side. That is the whole reason this is a
+    /// field rather than an argument: `IsAcceptableJobArgument` refuses any argument
+    /// whose body carries a path separator, deliberately, and a replacement is
+    /// routinely `./sub` or a `..` chain.
+    ///
+    /// **Empty means the client asked for no mapping, and the worker must then add
+    /// none.** A worker that mapped to a token of its own would hand a client that
+    /// requested nothing an object recording a directory neither machine has, which
+    /// is the same asymmetry #506 is about, pointing the other way.
+    ///
+    /// It is a replacement, not a path: the worker never opens it, and it reaches
+    /// only the debug records of the object. It is still peer text that ends up
+    /// inside an artefact, so the worker bounds it and restricts its characters
+    /// before spelling it into a command line.
+    std::string_view compileDir;
 };
 
 /// The same, as views into a received payload.
@@ -2247,6 +2276,9 @@ struct CompileView
     std::span<std::byte const> source;     ///< Still enveloped; decode with DecodeCodecEnvelope.
     CodecList acceptedCodecs;              ///< What the client can decode.
     std::span<std::byte const> sourceName; ///< Base name to give the scratch file; sanitize before use.
+    /// The compilation-directory replacement, empty when the client maps nothing.
+    /// Bound and restrict it before it reaches a command line.
+    std::span<std::byte const> compileDir;
 };
 
 /// Frame a REGISTER request.
@@ -2791,7 +2823,8 @@ struct ClusterAdmitView
                                    request.args,
                                    request.source,
                                    std::span<std::byte const> { codecs },
-                                   AsBytes(request.sourceName) });
+                                   AsBytes(request.sourceName),
+                                   AsBytes(request.compileDir) });
 }
 
 /// Split a COMPILE payload.
@@ -2807,7 +2840,8 @@ struct ClusterAdmitView
                          .args = (*fields)[2],
                          .source = (*fields)[3],
                          .acceptedCodecs = DecodeCodecList((*fields)[4]),
-                         .sourceName = (*fields)[5] };
+                         .sourceName = (*fields)[5],
+                         .compileDir = (*fields)[6] };
 }
 
 /// What a scheduler answers a LEASE with, on success.

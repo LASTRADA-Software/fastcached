@@ -14,17 +14,18 @@ using namespace FastCache::Cc;
 namespace
 {
 
-/// The four covered inputs, so a case can vary exactly one of them.
+/// The five covered inputs, so a case can vary exactly one of them.
 struct Job
 {
     std::string preprocessed { "int main(){return 0;}" };
     std::vector<std::string> args { "-O2", "-DNDEBUG" };
     std::string fingerprint { "gcc-14-x86_64-linux-gnu" };
     std::string sourceName { "tu.cpp" };
+    std::string compileDir { "." };
 
     [[nodiscard]] std::string Digest() const
     {
-        return CompileCorrelation(preprocessed, args, fingerprint, sourceName);
+        return CompileCorrelation(preprocessed, args, fingerprint, sourceName, compileDir);
     }
 };
 
@@ -79,6 +80,27 @@ TEST_CASE("Each covered input changes the correlation", "[correlation]")
         // produce different objects. Seven bytes, per `CompileRequest`'s own note.
         Job other;
         other.sourceName = "other.cpp";
+        CHECK(other.Digest() != base);
+    }
+
+    SECTION("the compilation-directory replacement")
+    {
+        // It becomes a `-fdebug-prefix-map` argument on the line the worker spawns, so
+        // two jobs differing only here produce objects whose `DW_AT_comp_dir` differs
+        // -- which is #506's own defect, and crossing the replies would reintroduce it
+        // underneath the fix.
+        Job other;
+        other.compileDir = "./sub";
+        CHECK(other.Digest() != base);
+    }
+
+    SECTION("mapping nothing, against mapping to the current directory")
+    {
+        // The pair that matters most: a client that asked for no mapping and one that
+        // asked for `.` get objects recording different directories, and the empty
+        // spelling must not digest as though the field were absent.
+        Job other;
+        other.compileDir = "";
         CHECK(other.Digest() != base);
     }
 }
