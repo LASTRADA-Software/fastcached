@@ -772,6 +772,96 @@ set_tests_properties("node-config-reference" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The operator port docs against `NodeSurfaceTable()`. Fails when a document
+# claims a surface the table does not declare, omits one it does, or states a
+# count of the port set that the table contradicts.
+# scripts/check-node-surface-docs.cmake carries the tables and the reasoning.
+#
+# A port table is what an operator writes firewall rules from, so a wrong one
+# closes a port that was needed or opens one that was not. One of the documents
+# is a hand-pasted `--print-surfaces` transcript, which looks like machine output
+# and is a string in a markdown file -- a reader has no way to tell it from the
+# real thing, which is why the transcript is checked harder than the prose around
+# it rather than being de-transcripted (#462).
+#
+# It checks BOTH directions. A scan that only walks the table passes a document
+# that has grown a port the binary never opens, and on a firewall worksheet an
+# extra row reads as authorisation to open something.
+#
+# Every markdown page under docs/ is GLOBBED rather than listed, for the reason
+# `DocumentedCommandLines_test.cpp` records over these same documents: a hand
+# list is exact about the pages it knows and silent about the ones it does not,
+# and silence reads identically to complete coverage. Measured, globbing costs
+# zero exemption rows and buys the pages a list would have missed.
+#
+# It also holds each surface's own flag -- the third mechanical column of that
+# table -- so `--listen-raft` cannot be renamed while every page keeps the old
+# spelling and this check stays green.
+#
+# It also carries a COUNT rule, which is the half that found the live defects:
+# #290 stage 3 corrected every port NUMBER by hand and left "the full six-surface
+# table" and "Five TCP rules" behind it, neither of which a row-to-row comparison
+# can see. See the script's header for why that rule is anchored narrowly -- the
+# word `surface` names both the four ports and the policy roles sharing one of
+# them, so an unclassified collocation is refused rather than guessed at.
+#
+# Not labelled "smoke", for the reason node-config-reference is not: it reads
+# source and markdown and compares strings, so it belongs in the default `ctest`
+# set and must survive `ctest -LE smoke`. Every file it reads ships in an exported
+# tarball, so it has no skip path.
+add_test(
+    NAME "node-surface-docs"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-surface-docs.cmake"
+)
+set_tests_properties("node-surface-docs" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# The check above must be SEEN to refuse each thing it claims, and seen to stay
+# quiet on the shape that merely looks like a violation.
+#
+# It is registered because four of that check's rules did not implement what
+# their own comments said -- a digit count claim accepted in silence, a residue
+# rule reading only the leftmost collocation on a line, an invocation-only fence
+# held to the whole table, and only the first of a surface's flags extracted.
+# All four produced a green run, and three were written WITH a comment asserting
+# the opposite. A rule nobody has watched refuse is not a rule.
+#
+# Synthesised trees, never the real source root: mutations go to a copy, so there
+# is no revert step and nothing can be left in the worktree. The pages a count
+# exemption names are staged by READING that table out of the check rather than
+# restating it here -- a second copy would redden this fixture every time an
+# unrelated exemption row is added, which is the maintenance cost that gets a
+# fixture deleted rather than fixed.
+#
+# The baseline case is the load-bearing one. Every refusal is evidence only if
+# the unmutated tree passes; otherwise each case merely re-observes one failure
+# and would go on passing with the rule it names deleted.
+add_test(
+    NAME "node-surface-docs-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/node-surface-docs-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-surface-docs-selftest.cmake"
+)
+set_tests_properties("node-surface-docs-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    # Ten `cmake -P` spawns, each over a synthesised tree of about ten small
+    # files. Measured across three runs on the bridged filesystem this repository
+    # is checked out on: 1.59 s, 2.57 s, 2.42 s, against 1.48-1.60 s for the check
+    # itself over the real 87-page corpus. The spread is the measurement -- a
+    # single figure here would be one draw from it presented as the cost. 120 s is
+    # the backstop the other selftests carry and is well clear of the top of it.
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # ThreadSanitizer scope hygiene. Fails when a test file in a concurrency-bearing
 # directory carries no tag `scripts/tsan-gate.sh` selects on, so the gate's scope
 # is enforced rather than merely asserted.

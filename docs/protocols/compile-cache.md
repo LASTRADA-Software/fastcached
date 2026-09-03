@@ -100,7 +100,7 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x19` | lease-unauthorized | The lease token is not one this cluster issued: its MAC does not verify under the shared key, or it is not a lease token at all. Deliberately one code for both — a receiver cannot tell a forgery from a random string. Distinct from `unknown-lease`, which names a lease the scheduler *did* issue and has since forgotten. Nothing the token claimed is echoed back. |
 | `0x1a` | lease-endpoint-mismatch | An authentic lease, presented to a worker it was not issued for. Only ever reported once the MAC has verified, so it is a diagnostic rather than a hint: the message names both endpoints, because the common cause is a worker registered under an address clients do not dial, not a replay. |
 | `0x1b` | lease-expired | An authentic lease, presented past its expiry and the clock-skew slack. Not a capacity statement — a worker's slots bound what it runs, the expiry bounds how long a *captured* token is worth replaying. |
-| `0x1c` | worker-toolchain-survey-in-flight | The worker is still identifying its toolchains and serves nothing yet. Distinct from `fingerprint-mismatch`: that one says this worker serves a different toolchain, this one says the same request will succeed shortly. Reachable only by dialling a compile port directly — a node registers nothing until its survey finishes, so the scheduler does not offer it. |
+| `0x1c` | worker-toolchain-survey-in-flight | The worker is still identifying its toolchains and serves nothing yet. Distinct from `fingerprint-mismatch`: that one says this worker serves a different toolchain, this one says the same request will succeed shortly. Reachable only by dialling the node directly — a node registers nothing until its survey finishes, so the scheduler never offers it to anyone who asked the fleet. |
 | `0x1d` | request-deadline-exceeded | The request was admitted and outran the window this surface allows for answering it. Not `endpoint-busy`, which says the node is momentarily full and to come back: this one says the work was abandoned on time, and for a compile it is a question about the lease timeout rather than about the worker. Sent only when the server can still reach the client — a peer swept while the connection is parked on the socket gets the close alone. |
 | `0x1e` | foreign-value-generation | A STORE whose value *is* a compile value, well formed, written under a canonicalization generation this build does not implement. Emphatically not `malformed-value`, which says the bytes are not a compile value at all: this one is the normal, expected answer to a peer of a *different* generation during a rolling upgrade, and reporting it as malformed tells an operator their cache is damaged when the fleet is merely mixed. Either direction — a producer behind this server answers it exactly as one ahead of it — so the message names both generations rather than a direction, and that is the whole diagnostic. |
 
@@ -143,8 +143,8 @@ arity does not depend on which credential style a client uses.
 
 Five more verbs turn the same wire into a scheduler and a worker protocol. None
 of them is served by `fastcached`: the scheduler is `fastcache-compile-node
---serve-scheduler` (answered on its `--listen-node`) and the worker is the same
-binary's own compile port.
+--serve-scheduler` and the worker is the same binary serving compiles, both
+answering on its one `--listen-node`.
 
 A scheduling verb arriving at a cache listener is answered `dispatch-not-permitted`
 with a message naming where the scheduler went. It is a **reply**, not a dropped
@@ -162,13 +162,26 @@ and the pool behaves as one rather than advertising N times the machine.
 `REGISTER`, `HEARTBEAT`, `LEASE` and `RELEASE` go to the scheduler, along with the
 four cluster-administration verbs (`CLUSTER-STATUS` `0x08`, `CLUSTER-SET` `0x09`,
 `CLUSTER-FORGET` `0x0a`, `CLUSTER-ADMIT` `0x0b`), which the **leader** answers and
-only to a member. `COMPILE` goes to a worker on its own port and is the only verb
-a worker answers at all — the scheduler's verbs and the cache's are refused with
-`dispatch-not-permitted`, so a client that sent the wrong verb to the wrong port
-learns which rather than seeing a dropped connection it cannot tell from a dead host.
-`AUTH` is the exception on a **node's** three surfaces — scheduler, compile port and
-cache tier — none of which implements it, so each answers `unknown-opcode`, the one
-refusal a client steps over before carrying on unauthenticated. `fastcached` does
+only to a member. `COMPILE` goes to a worker on the **same** `--listen-node` port
+that carries its cache verbs and, with `--serve-scheduler`, the scheduler's:
+[#290](https://github.com/LASTRADA-Software/fastcached/issues/290) merged what were
+three ports into one `0xFC` surface, so the listener is no longer the policy. Which
+caller is admitted to which verb is a property of the **verb**, asked of the
+component that owns it, and never of the port a frame arrived on. A verb this node
+runs no component for is refused `unknown-opcode`: that is the honest code, because
+this endpoint really does not implement it, and a client learns so rather than
+seeing a dropped connection it cannot tell from a dead host. It is emphatically not
+`dispatch-not-permitted`, which says the verb is served **somewhere else** — that is
+what `fastcached` answers a scheduling verb, two paragraphs up. The distinction is
+the client's: `unknown-opcode` is the one refusal a launcher steps over before
+carrying on, and `dispatch-not-permitted` is one it treats as fatal, so the wrong
+code here is a worker that never joins and a cache that never hits, behind a green
+build. A node with no cache tier and no scheduler is the ordinary shape, not a
+misconfiguration, so this is what a **healthy** build answers.
+`AUTH` is the exception across a node's three verb families — the scheduler's, the
+compile verbs and the cache tier's, all of them now on that one port — none of which
+implements it, so each answers `unknown-opcode`, the one refusal a client steps over
+before carrying on unauthenticated. `fastcached` does
 implement `AUTH`: it is the only server on this wire that checks a credential, and
 `--requirepass` there refuses the gated verbs `unauthenticated` rather than stepping
 over anything.
