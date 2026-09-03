@@ -545,19 +545,19 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
     if (_history != nullptr && !history.empty())
         _history->AcceptHistory(*endpoint, history);
 
-    // **The term travels here, and #421 is why.** A worker learned the current term
-    // from nowhere: the only one it ever saw was inside the token it was checking,
-    // and comparing a claim against itself establishes nothing -- so `EpochMismatch`
-    // was catalogued, exported and unreachable, and an operator scraping
-    // `..._lease_stale_epoch_total` read a permanent zero.
+    // **This reply deliberately carries no term.** #421 first put the scheduler's term
+    // here, and review found it: this channel is unauthenticated -- `Credential` is
+    // client-to-server, the frame surface is plaintext, and a reply has no integrity
+    // protection at all. Anything that can answer a worker's `--scheduler` dial could
+    // hand it a term of `UINT64_MAX` once and that worker would refuse every authentic
+    // grant until its process restarted, which is the fleet ceasing to distribute --
+    // the exact failure #421 exists to prevent, caused by #421, from one packet.
     //
-    // On the heartbeat rather than on REGISTER, which the ticket offered as the
-    // alternative and the code refuses: REGISTER's reply payload IS the worker id,
-    // read whole by every deployed launcher, so its arity is not merely exact but
-    // absent -- there is nothing to extend. This reply was empty and its client read
-    // nothing from it, so eight bytes are additive in both directions.
-    auto const term = Wire::EncodeU64Field(_epoch.load(std::memory_order_relaxed));
-    return SchedulerReply::Success(std::vector<std::byte> { term.begin(), term.end() });
+    // A worker learns the term from the grant instead, where the MAC has already run.
+    // Deleting the surface rather than defending it is what this repository does when
+    // both are available: `CacheResponder` takes no membership oracle, and its absence
+    // IS the fix.
+    return SchedulerReply::Success();
 }
 
 void SchedulerService::ReapExpiredWorkers()

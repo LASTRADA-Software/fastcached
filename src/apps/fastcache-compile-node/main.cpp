@@ -282,22 +282,6 @@ struct AnnounceOutcome
     /// included, so a node that merely logged this would keep announcing itself to
     /// a demoted scheduler and expire out of the real one's registry.
     std::optional<std::string> leader;
-
-    /// The scheduler term this round was told, when it was told one (#421).
-    ///
-    /// Reported the same way `leader` is, and for the same reason: this struct is
-    /// what a round LEARNED, while `HeartbeatRound` beside it is documented as what a
-    /// round READS and is passed as a `const&`. A `KnownSchedulerTerm&` member there
-    /// would have been a write reached through that reference, and a second mechanism
-    /// for the same category of fact inside one function -- some of what a round
-    /// learns coming back in the return value and some going out sideways.
-    ///
-    /// One per round rather than one per entry, because every accepted entry carries
-    /// the same authoritative number: several registrars announce several toolchains
-    /// to the SAME scheduler. Disengaged when no entry was accepted, or when the
-    /// scheduler predates #421 and stated nothing -- which is not the same as a term
-    /// of zero, that being what a node leading alone is legitimately in.
-    std::optional<std::uint64_t> learnedTerm;
 };
 
 /// Announce this machine to every scheduler entry it serves, once.
@@ -360,9 +344,6 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // first is what lets the whole round move together.
     std::optional<std::string> leader;
 
-    // What the scheduler said its term is, if any entry was accepted and it said.
-    std::optional<std::uint64_t> learnedTerm;
-
     for (auto& registrar: round.registrars)
     {
         if (!registrar.WorkerId().empty())
@@ -372,32 +353,6 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             {
                 ++accepted;
                 handedOver = true;
-
-                // The only channel a worker has for learning the term (#421).
-                //
-                // A switch rather than an `if`/`else if`, so a fourth state is a build
-                // failure here instead of a silent fall-through. It costs nothing --
-                // the enum arrives in this same change -- and it never becomes free
-                // again.
-                switch (beat->state)
-                {
-                    case Wire::SchedulerTermState::Stated:
-                        learnedTerm = beat->term;
-                        break;
-                    case Wire::SchedulerTermState::Unreadable:
-                        // Debug, not Warn: a scheduler saying something this build
-                        // cannot read is worth a trace and is not worth a per-heartbeat
-                        // warning on a fleet mid-rollout.
-                        round.logger.Logf(LogLevel::Debug,
-                                          "scheduler {} answered the heartbeat with a term this build cannot read; "
-                                          "leaving this worker's expectation where it was",
-                                          endpoint);
-                        break;
-                    case Wire::SchedulerTermState::NotStated:
-                        // Silent: an older scheduler is the ordinary case mid-rollout
-                        // and says nothing wrong.
-                        break;
-                }
                 continue;
             }
             if (!leader.has_value())
@@ -435,7 +390,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
                       endpoint,
                       accepted,
                       round.registrars.size());
-    return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader), .learnedTerm = learnedTerm };
+    return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
 }
 
 /// Announce this machine once, following `NotLeader` to wherever it points.
@@ -454,14 +409,8 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
 ///
 /// @param round What to announce and where to read it from.
 /// @param link Where this node believes the leader is; advanced across the round.
-/// @param schedulerTerm What this node knows about the scheduler's term, taught by
-///        whatever the round learned (#421). One per node, not one per registrar:
-///        several registrars announce several toolchains to the same scheduler.
 /// @param connector Dials each endpoint the link names.
-void AnnounceRound(HeartbeatRound const& round,
-                   Node::SchedulerLink& link,
-                   Distributed::KnownSchedulerTerm& schedulerTerm,
-                   BlockingConnector& connector)
+void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, BlockingConnector& connector)
 {
     for (link.BeginRound();;)
     {
@@ -484,17 +433,6 @@ void AnnounceRound(HeartbeatRound const& round,
         }
 
         auto const outcome = AnnounceOnce(round, *client, link.Target());
-
-        // Applied HERE, beside `link.Accepted()` and `link.Redirect()`, because this
-        // is the layer that acts on what a round learned -- `AnnounceOnce` reports and
-        // this decides, which is the split `SchedulerLink`'s own header states. It runs
-        // before the redirect branch on purpose: an endpoint that stated a term
-        // answered a heartbeat under it, and that is true whether or not it also
-        // pointed somewhere else. `Learn` is monotonic, so a redirect chain that hears
-        // from two schedulers keeps the later term rather than the last one spoken to.
-        if (outcome.learnedTerm.has_value())
-            schedulerTerm.Learn(*outcome.learnedTerm);
-
         if (!outcome.leader.has_value())
         {
             // Committed only when this endpoint actually took an entry. It answered
@@ -813,15 +751,21 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
     // wants -- a local here was one more object whose outliving had to be reasoned
     // about, for no gain.
-    // Declared HERE, ahead of both the validator that reads it and the heartbeat
-    // thread that writes it, because it is the one object those two share and its
-    // lifetime has to cover the longer of them. A local in `main` is exactly that:
-    // `main` returns after the server loop and the heartbeat thread have both ended.
+    // What this worker has learned about the scheduler's term (#421). Declared here
+    // because the validator below borrows it for the rest of this node's life.
     //
-    // Empty at this point, and that is a state rather than a gap -- a worker that
-    // refused grants before its first heartbeat could not cold-start, so
-    // `KnownSchedulerTerm` reports `NotKnownHere` and the check accepts everything
-    // until a scheduler has said something.
+    // Written by nothing but the validator itself: a grant that has passed its MAC
+    // teaches the term inside it. The first shape of #421 also had the heartbeat reply
+    // state it, and review found that channel is unauthenticated -- anything able to
+    // answer this node's `--scheduler` dial could push the expectation to `UINT64_MAX`
+    // and make this worker refuse every honest grant until it restarted. So the
+    // channel was deleted rather than defended, which is what `CacheResponder` taking
+    // no membership oracle already records as this repository's preference.
+    //
+    // Empty at this point, and that is a state rather than a gap: a worker that
+    // refused before it had ever seen a grant could not cold-start, so
+    // `KnownSchedulerTerm` reports `NotKnownHere` and accepts everything until an
+    // authentic grant has taught it something.
     Distributed::KnownSchedulerTerm schedulerTerm;
 
     auto validator =
@@ -1377,7 +1321,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
                                 "this machine now has no usable toolchain; serving nothing until one returns");
             }
 
-            AnnounceRound(round, link, schedulerTerm, heartbeatConnector);
+            AnnounceRound(round, link, heartbeatConnector);
 
             // Slept in slices so a stop request is observed promptly: a worker that
             // took a full heartbeat interval to exit would hold its port that long

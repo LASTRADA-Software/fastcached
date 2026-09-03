@@ -526,21 +526,50 @@ at startup rather than leaving these at zero and looking healthy — a node that
 another machine could dial is refused outright without the key
 ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)).
 
-Four of them share the wire code `lease-unauthorized`, because a client's answer to
-all four is the same — compile it locally — and a code it does not recognise would be
-worse than one it does. **Your** answer is different for each, which is why they are
-four series rather than one: a bad signature is a security question, a good signature
-from another fleet is a provisioning one, a superseded term is an election, and an
-expired lease is usually a clock.
+**Three** of them — `..._unauthorized_total`, `..._wrong_cluster_total` and
+`..._stale_epoch_total` — share the wire code `lease-unauthorized`, because a client's
+answer to all three is the same, compile it locally, and a code it does not recognise
+would be worse than one it does. **Your** answer is different for each, which is why
+they are three series rather than one: a bad signature is a security question, a good
+signature from another fleet is a provisioning one, and a superseded term is an
+election.
+
+The other two carry codes of their own — `..._endpoint_mismatch_total` answers
+`lease-endpoint-mismatch` and `..._expired_total` answers `lease-expired` — so an alert
+written against `lease-unauthorized` will not see them. That is deliberate and it is
+`LeaseRefusalTable` in `LeaseToken.hpp` that decides it: a client can act differently
+on those two, and a code it can act on is worth minting.
 
 `..._lease_stale_epoch_total` could not rise at all before
 [#421](https://github.com/LASTRADA-Software/fastcached/issues/421). A worker had no
-way to learn which term was current — the only term it ever saw was the one inside
-the token it was checking — so the series was exported and permanently zero. It now
-learns the term from the heartbeat reply, and from any authentic grant naming a later
-one. A worker whose heartbeat is stale still refuses nothing: only a grant naming an
-**older** term than the worker has seen is turned away, so a machine that is merely
-behind accepts the new leader's grants and catches up from them.
+way to learn which term was current — the only term it ever saw was the one inside the
+token it was checking — so the series was exported and permanently zero.
+
+A worker now learns the term from **authentic grants only**: a grant that has passed
+its signature check teaches the term inside it, and a later grant naming an older term
+is refused. Nothing else teaches it, and in particular the scheduler does not announce
+it — that channel would be unauthenticated, and anything able to answer a worker's
+`--scheduler` dial could then push it to a term no scheduler is in and make it refuse
+every honest grant until restarted.
+
+The bound that buys is weaker than announcing the term would be, and it is worth
+knowing which way: **a token captured before an election stays spendable at a given
+worker until that worker sees its first grant from the new leader.** An idle worker is
+not compiling anything worth protecting, and a busy one learns almost immediately, so
+the exposure tracks how little the machine is being used. A worker that is merely
+behind refuses nothing at all — only an *older* term is turned away, so a machine
+catching up accepts the new leader's grants and learns from them.
+
+Two known cases where a rise here is **not** a replay and the fleet is the thing that
+is wrong: a scheduler restarting can serve grants under term `0` before its consensus
+layer has published the real one
+([#613](https://github.com/LASTRADA-Software/fastcached/issues/613)), and a cluster
+that has been re-bootstrapped — or had consensus turned off — genuinely drops to a
+lower term, which a worker will not accept until it is restarted
+([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Both predate the
+term check in their causes and are made visible by it. If this counter rises across
+the whole fleet at once rather than on one machine, look there before looking for an
+attacker.
 
 The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,

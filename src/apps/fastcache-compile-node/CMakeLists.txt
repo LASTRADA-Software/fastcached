@@ -113,6 +113,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
         NodeMembership_test.cpp
+        WorkerLease_test.cpp
         NodeToolchains.cpp
         NodeToolchains_test.cpp
         ToolchainHashProgress_test.cpp

@@ -548,10 +548,15 @@ class LeaseEpochCheck
 /// compile `WorkerProtocol.cpp` and only one of them links `FastCache` -- a seam with
 /// a `.cpp` would need a new `_fc_cc_core` row, and this needs none.
 ///
-/// **Two channels write it, and they are not redundant.** The heartbeat reply states
-/// the term outright, which is the fast path; an authentic grant naming a later term
-/// states it too, which is the one that still works when heartbeats are failing.
-/// Neither is a round trip added for this.
+/// **One channel writes it: an authentic grant.** #421's first shape also had the
+/// HEARTBEAT reply state the term, which was faster and scheduler-driven, and it was
+/// deleted before it shipped. That reply is unauthenticated -- `Credential` is
+/// client-to-server and the frame surface is plaintext -- so anything able to answer a
+/// worker's `--scheduler` dial could write `UINT64_MAX` here once and the worker would
+/// refuse every authentic grant until it restarted. A value that only ever rises is a
+/// ratchet, and a ratchet an unauthenticated peer can turn is a permanent denial of
+/// service rather than a transient one. The grant channel has no such problem: the MAC
+/// is verified first, so only the scheduler can move this number.
 ///
 /// **Monotonic, so a late writer cannot walk it backwards.** Raft terms only ever
 /// increase within a cluster, and the MAC binds the cluster -- so a lower number
@@ -568,11 +573,14 @@ class LeaseEpochCheck
 /// sees a `_term` at least as new. A reader that sees `false` accepts everything,
 /// which is the safe direction.
 ///
-/// The failure directions, both named because that asymmetry is what makes this
-/// tolerable: a term learned too LATE costs nothing at all -- the check accepts
-/// anything not older, so a worker that is behind refuses nothing. A term learned too
-/// EARLY cannot happen; there is no channel that reports a term before a scheduler
-/// has entered it.
+/// A term learned too LATE costs nothing at all: the check accepts anything not older,
+/// so a worker that is behind refuses nothing and catches up from the next grant.
+///
+/// The sentence that used to sit here claimed a term could never be learned too EARLY,
+/// "because there is no channel that reports a term before a scheduler has entered
+/// it". It was written beside a channel for which it was false, and is recorded as
+/// deleted rather than quietly dropped: what makes the remaining channel safe is the
+/// MAC, not the absence of a way to lie.
 class KnownSchedulerTerm
 {
   public:

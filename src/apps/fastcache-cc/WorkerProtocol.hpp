@@ -309,34 +309,23 @@ class WorkerRegistrar
     /// its way of saying "register again" — a worker that ignored that would
     /// heartbeat into a void forever while the fleet ran without it. So this
     /// reports the need to re-register rather than merely failing.
-    /// **It also returns what the scheduler said its term is** (#421), which is the
-    /// only channel a worker has for learning one: REGISTER's reply payload IS the
-    /// worker id, read whole, so it has no room, while this reply was empty and its
-    /// client read nothing from it.
-    ///
-    /// RETURNED rather than written into a `KnownSchedulerTerm` this object holds.
-    /// A node runs one registrar per toolchain and they all talk to one scheduler, so
-    /// the term is a fact about the SCHEDULER and there is exactly one of it per node
-    /// -- a pointer on each registrar would be several writers of one value, with the
-    /// sharing invisible from here. The caller owns the shared one and this stays a
-    /// protocol object with no collaborators to keep alive.
-    ///
-    /// A refusal carries no term, deliberately: a heartbeat that was not accepted
-    /// says nothing about whose term is current, and a `NotLeader` naming somewhere
-    /// else says less than nothing.
+    /// **It deliberately learns nothing about the scheduler's term here** (#421).
+    /// The first shape of that change had this reply state the term, and review found
+    /// that this channel is unauthenticated -- so anything able to answer a worker's
+    /// `--scheduler` dial could push its expectation to `UINT64_MAX` and make it
+    /// refuse every authentic grant until restarted. The term is learned from the
+    /// grant, below the MAC, and this stays a liveness report.
     /// @param scheduler Connected transport; not owned.
     /// @param inFlight Jobs running right now.
     /// @param load What else this machine has to say about itself right now.
     /// @param credential Credential to present.
-    /// @return What the scheduler said about its term when accepted; otherwise the
-    ///         refusal. An empty `WorkerId()` afterwards is the "register again"
-    ///         signal; a set `leader` is the "announce somewhere else" one, and the
-    ///         two are independent.
-    [[nodiscard]] std::expected<CompileCacheWire::SchedulerTermFields, AnnounceRefusal> Heartbeat(
-        ISocket& scheduler,
-        std::uint32_t inFlight,
-        CompileCacheWire::LoadFields const& load = {},
-        Credential const& credential = {});
+    /// @return Nothing when accepted; otherwise the refusal. An empty `WorkerId()`
+    ///         afterwards is the "register again" signal; a set `leader` is the
+    ///         "announce somewhere else" one, and the two are independent.
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(ISocket& scheduler,
+                                                                 std::uint32_t inFlight,
+                                                                 CompileCacheWire::LoadFields const& load = {},
+                                                                 Credential const& credential = {});
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept

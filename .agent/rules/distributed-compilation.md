@@ -718,25 +718,42 @@ Consequences that are each load-bearing:
   nothing is not. A worker that refused before its first heartbeat could not
   cold-start and every restart would be an outage, so *accept everything* is the right
   answer in that state and `LeaseEpochCheck::NotKnownHere` stays a real answer.
-- **The term rides the HEARTBEAT reply because REGISTER's has no room, and "no room"
-  is stronger than "exact arity".** A node's version rides REGISTER's nested capacity
-  record for the usual reason — that record is extensible and the top level is not.
-  The REGISTER *reply* is a different thing again: its entire payload **is** the
-  worker id, read whole by every deployed launcher (`WorkerProtocol.cpp`,
-  `Wire::AsStringView(outcome.value)`), so there is no field structure to extend at
-  all. The heartbeat reply was empty and its client read nothing from it, which makes
-  adding bytes additive in both directions — an old scheduler sends none, a new one
-  sends eight an old worker ignores. Check what a reply's client actually READS before
-  concluding a field will fit.
-- **A reply that states nothing and a reply this build cannot read are different
-  answers.** `SchedulerTermState` is `NotStated` / `Stated` / `Unreadable`, not an
-  `optional`, even though the worker learns nothing in two of the three: an empty
-  payload is every scheduler predating #421 and is ordinary mid-rollout, while a
-  payload of the wrong width is two builds disagreeing and is worth a line. Folded
-  into one value, the rollout case hides the other permanently. And the width is
-  **strict** for the reason `DecodeU32Field` is: reading the first eight bytes of
-  something this build does not understand would invent a term, and here that is a
-  number the worker then refuses authentic grants against.
+- **The grant is the ONLY channel that teaches a term, and the heartbeat reply was
+  deleted rather than defended.** #421's first shape had the scheduler state its term
+  in the HEARTBEAT reply — fast, scheduler-driven, on a reply that was empty and whose
+  client read nothing from it, so the bytes were additive in both directions. Every
+  one of those facts was true and the design was still wrong, because that reply is
+  **unauthenticated**: `Credential` is client-to-server, the `0xFC` surface is
+  plaintext, and a reply carries no integrity protection at all. So anything able to
+  answer a worker's `--scheduler` dial — on-path, a spoofed name, or an operator who
+  typos the flag at another fleet's scheduler — hands it `UINT64_MAX` once, and that
+  worker refuses **every authentic grant** until its process restarts while
+  `..._lease_stale_epoch_total` climbs like an election storm. One packet, and the
+  fleet stops distributing: the exact failure the check exists to prevent, caused by
+  the check.
+  **Deleting the surface beats defending it**, which is the choice `CacheResponder`
+  already records by taking no membership oracle — its absence IS the fix. Signing the
+  term with the cluster key would have worked too, and would have been more code
+  guarding more attack surface. What deletion costs is a weaker bound, taken
+  knowingly: a token captured before an election stays spendable at a given worker
+  until that worker sees its first grant from the new leader. An idle worker is not
+  compiling anything to protect, and a busy one learns almost at once.
+  The reusable half: **a value that can only be raised, never lowered, must not be
+  writable by an unauthenticated peer.** Monotonic state is a ratchet, and a ratchet an
+  attacker can turn is a permanent denial of service rather than a transient one.
+- **Learning only from grants does not fix what the scheduler MINTS, and two known
+  residuals say so.** Authenticity is not the property in question in either.
+  [#613](https://github.com/LASTRADA-Software/fastcached/issues/613): the scheduler
+  binds its lease surface before `ConsensusTier` exists, so a restarting leader serves
+  `Lease` while `SchedulerTier`'s constructor value of `StandaloneSchedulerTerm` (`0`)
+  is still current, and every worker that has learned a real term refuses those
+  perfectly authentic grants — compiles that worked before the term was enforced.
+  [#614](https://github.com/LASTRADA-Software/fastcached/issues/614): the learned term
+  has no downward path, so a wiped Raft directory, a re-bootstrap, or consensus turned
+  off legitimately drops the scheduler to a lower term and every long-running worker
+  refuses everything until restarted. The minimum acceptable outcome for both is a
+  **named, visible refusal** — a fleet that stops distributing and cannot say why is
+  what this file keeps being written about.
 - **A scheduler with no `--cluster-key-file` signs nothing, and says so.** Refusing
   to schedule without a key would break every single-machine install, which is what
   most people run; doing it quietly is the failure class this repository keeps

@@ -455,10 +455,10 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
-std::expected<Wire::SchedulerTermFields, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
-                                                                                     std::uint32_t inFlight,
-                                                                                     Wire::LoadFields const& load,
-                                                                                     Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
+                                                                std::uint32_t inFlight,
+                                                                Wire::LoadFields const& load,
+                                                                Credential const& credential)
 {
     if (_workerId.empty())
         // Never registered; nothing to refresh. Named rather than silent, because
@@ -470,11 +470,7 @@ std::expected<Wire::SchedulerTermFields, AnnounceRefusal> WorkerRegistrar::Heart
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
     auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (outcome.IsHit())
-        // An empty payload is a scheduler predating #421 and is ordinary during a
-        // rollout, which is why it is a state of its own rather than a decode
-        // failure: the two are told apart here and would be one value under an
-        // `optional`.
-        return Wire::DecodeSchedulerTerm(outcome.value);
+        return {};
 
     // A scheduler that does not know this worker is telling it to register again --
     // it restarted, or expired this entry. Forgetting the id here is what makes the

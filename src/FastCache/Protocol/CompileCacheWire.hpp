@@ -1580,30 +1580,6 @@ struct CodecEnvelopeView
     return WireFields::FromBigEndian<std::uint32_t>(field);
 }
 
-/// Encode a `u64` as its own length-prefixed field's contents.
-///
-/// The 64-bit half of the pair above, which the file wanted before this: roughly
-/// twenty sites reach for `WireFields::ToBigEndian<std::uint64_t>` directly, and a
-/// helper named after one payload would have left the next one to copy it or reopen
-/// the gap. Those sites are deliberately not converted here -- this adds the sibling,
-/// it does not sweep.
-/// @param value The value.
-/// @return Exactly eight big-endian bytes.
-[[nodiscard]] inline std::array<std::byte, sizeof(std::uint64_t)> EncodeU64Field(std::uint64_t value)
-{
-    return WireFields::ToBigEndian<std::uint64_t>(value);
-}
-
-/// Read a `u64` from a field that must hold exactly eight bytes.
-///
-/// Strict about the width for the reason `DecodeU32Field` is.
-/// @param field The field.
-/// @return The value, or nullopt when the field is not exactly eight bytes.
-[[nodiscard]] inline std::optional<std::uint64_t> DecodeU64Field(std::span<std::byte const> field)
-{
-    return WireFields::FromBigEndian<std::uint64_t>(field);
-}
-
 /// A codec preference list, most-preferred first.
 ///
 /// Travels as one byte per codec id in a single field. A list rather than a single
@@ -2531,65 +2507,6 @@ struct HeartbeatView
     if (!load.has_value())
         return std::nullopt;
     return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight, .load = *load };
-}
-
-/// What a HEARTBEAT reply says about the scheduler's term.
-///
-/// Three states rather than an `optional`, because "this scheduler did not state a
-/// term" and "this scheduler stated something this build cannot read" are different
-/// operator problems even though a worker's ACTION is the same for both -- it learns
-/// nothing either way. The first is ordinary during a rollout and worth no attention;
-/// the second is two builds disagreeing about a payload and is worth a line. An
-/// `optional` would have made them one value and the rollout case would have hidden
-/// the other forever.
-enum class SchedulerTermState : std::uint8_t
-{
-    /// The reply carried no payload: a scheduler predating #421.
-    NotStated,
-    /// The term is in hand.
-    Stated,
-    /// A payload that is neither empty nor a term this build knows how to read.
-    Unreadable,
-};
-
-/// A HEARTBEAT reply's term, and whether there is one.
-///
-/// `*Fields` and not `*View`: it owns two scalars and borrows nothing, and in this
-/// file that suffix is a contract rather than a naming habit -- a `*View` borrows the
-/// bytes it was decoded from, which has twice been a use-after-free here. This one is
-/// returned out of `WorkerRegistrar::Heartbeat` and read after the reply buffer is
-/// gone, which is exactly what the name has to be honest about.
-struct SchedulerTermFields
-{
-    SchedulerTermState state { SchedulerTermState::NotStated };
-    /// The term; meaningless unless @ref state is `Stated`.
-    std::uint64_t term { 0 };
-};
-
-/// Read the term from a HEARTBEAT reply's payload.
-///
-/// The term travels as the WHOLE payload with no field framing, for the reason
-/// REGISTER's reply has none either: these two replies are bare payloads and always
-/// have been, so `EncodeU64Field` is the encoder and there is no `EncodeSchedulerTerm`
-/// to pair with this. What makes ADDING a payload safe here is that the heartbeat
-/// reply was empty and its client read nothing from it, so an old worker ignores
-/// these bytes and an old scheduler sends none -- additive in both directions, which
-/// the REGISTER reply is not, since its entire payload already means "the worker id".
-///
-/// Strict about the width, via `DecodeU64Field` and for its reason: a payload of
-/// another length is a sender speaking a shape this build does not know, and reading
-/// the first eight bytes of it would invent a term -- which, here, is a number a
-/// worker would then refuse authentic grants against.
-/// @param payload The bytes of the reply.
-/// @return What it states, and whether it states anything.
-[[nodiscard]] inline SchedulerTermFields DecodeSchedulerTerm(std::span<std::byte const> payload)
-{
-    if (payload.empty())
-        return SchedulerTermFields { .state = SchedulerTermState::NotStated, .term = 0 };
-    auto const term = DecodeU64Field(payload);
-    if (!term.has_value())
-        return SchedulerTermFields { .state = SchedulerTermState::Unreadable, .term = 0 };
-    return SchedulerTermFields { .state = SchedulerTermState::Stated, .term = *term };
 }
 
 /// Frame a LEASE request.
