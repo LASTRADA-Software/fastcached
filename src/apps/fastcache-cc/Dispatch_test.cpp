@@ -451,7 +451,8 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     constexpr std::chrono::milliseconds CompileTotal { 600'000 };
     static_assert(ControlTotal != CompileTotal, "the totals must differ, or a swap passes on symmetry");
 
-    auto const budgets = DispatchBudgetsFor(Connect, ControlTotal, CompileTotal);
+    auto const budgets = DispatchBudgetsFor(
+        DispatchBudgetKnobs { .connect = Connect, .controlTotal = ControlTotal, .compileTotal = CompileTotal });
 
     CHECK(budgets.compile.keepAlive == KeepAlive::Yes);
     CHECK(budgets.control.keepAlive == KeepAlive::No);

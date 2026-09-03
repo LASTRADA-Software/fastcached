@@ -135,6 +135,30 @@ struct DispatchBudgets
     /// decompressed length is the one figure in a reply that decides an allocation
     /// before any of it is validated.
     std::size_t maxDecompressedBytes { DefaultMaxDecompressedBytes };
+
+    /// Field-by-field equality, for the reason `ExchangeBudget`'s own says.
+    [[nodiscard]] friend constexpr bool operator==(DispatchBudgets const&, DispatchBudgets const&) = default;
+};
+
+/// The launcher's three timeout knobs, named.
+///
+/// A struct rather than three `std::chrono::milliseconds` parameters, for the reason
+/// `ExchangeBudget` gives about two of them: same type, adjacent, and a reader at the
+/// call site cannot tell a transposition from the intended order. Three is worse than
+/// two, and the only PRODUCTION call site is in `main.cpp`, which is in **no test
+/// target** -- so a swap of `controlTotal` and `compileTotal` there would compile, hand
+/// the compile leg the cache's ten seconds, restore #223 in full, and nothing in this
+/// tree could observe it. Designated initializers put the names back at the call site.
+struct DispatchBudgetKnobs
+{
+    /// Ceiling on opening either connection, name resolution included.
+    std::chrono::milliseconds connect { ExchangeBudget {}.connect };
+
+    /// Ceiling on a LEASE or RELEASE round trip.
+    std::chrono::milliseconds controlTotal { ExchangeBudget {}.total };
+
+    /// Ceiling on the whole COMPILE exchange.
+    std::chrono::milliseconds compileTotal { DefaultDispatchTotal };
 };
 
 /// The budgets a dispatch runs under, built from the launcher's three knobs.
@@ -153,21 +177,27 @@ struct DispatchBudgets
 ///
 /// So the derivation lives here, where a test reads it, and it *names* each field on
 /// which the two legs differ instead of inheriting the rest by copy. A fourth field
-/// that must differ is a line in this function, and the compiler does not have to be
-/// the thing that notices.
-/// @param connect Ceiling on opening either connection, name resolution included.
-/// @param controlTotal Ceiling on a LEASE or RELEASE round trip.
-/// @param compileTotal Ceiling on the whole COMPILE exchange.
+/// that must differ is a line in this function -- and, because naming them leaves the
+/// intent written twice, the `static_assert` below is what stops the two copies from
+/// drifting the way #247's did.
+/// @param knobs The launcher's three timeouts, named.
 /// @return Both budgets.
-[[nodiscard]] constexpr DispatchBudgets DispatchBudgetsFor(std::chrono::milliseconds connect,
-                                                           std::chrono::milliseconds controlTotal,
-                                                           std::chrono::milliseconds compileTotal) noexcept
+[[nodiscard]] constexpr DispatchBudgets DispatchBudgetsFor(DispatchBudgetKnobs const& knobs) noexcept
 {
     return DispatchBudgets {
-        .control = ExchangeBudget { .connect = connect, .total = controlTotal, .keepAlive = KeepAlive::No },
-        .compile = ExchangeBudget { .connect = connect, .total = compileTotal, .keepAlive = KeepAlive::Yes },
+        .control = ExchangeBudget { .connect = knobs.connect, .total = knobs.controlTotal, .keepAlive = KeepAlive::No },
+        .compile = ExchangeBudget { .connect = knobs.connect, .total = knobs.compileTotal, .keepAlive = KeepAlive::Yes },
     };
 }
+
+/// The compile leg's intent is now written twice -- here, which production uses, and
+/// `DispatchBudgets`'s own default member initializers, which every test that takes
+/// the default argument uses. Two independent statements of one rule is what #247 was,
+/// so they are held against each other rather than left to agree by inspection: a
+/// field added to the type's initializers and forgotten here fails the build instead
+/// of shipping a launcher that dials with it unset.
+static_assert(DispatchBudgetsFor(DispatchBudgetKnobs {}) == DispatchBudgets {},
+              "DispatchBudgetsFor must reproduce DispatchBudgets' own defaults, field for field");
 
 /// How a dispatch attempt ended.
 ///

@@ -570,6 +570,17 @@ Consequences that are each load-bearing:
       of inheriting the rest, and the test reads the production derivation rather than
       the default. A `<field> = <value>` written in a struct definition is a claim; it
       is only a rule once something reads it.
+
+      Naming the fields leaves the intent written **twice** -- in `DispatchBudgetsFor`,
+      which production uses, and in `DispatchBudgets`'s own default member
+      initializers, which every caller taking the default argument uses -- which is
+      the defect's own shape one level up. So they are `static_assert`ed equal through
+      a **defaulted** `operator==`, never a hand-written one: a field added to
+      `ExchangeBudget` joins that comparison by itself, where a spelled-out comparison
+      would go on agreeing about the fields it still mentions. And the knobs travel as
+      a named struct, because three adjacent `std::chrono::milliseconds` parameters
+      transposed at a call site in `main.cpp` -- which is in no test target -- hands
+      the compile leg the cache's ten seconds and restores #223 in full, silently.
   - **Zero means UNBOUNDED, and the arithmetic alone says the opposite.** A zero total
     puts the deadline at `Now()`, so every exchange dies on the reactor's next turn —
     a knob documented as "turn the ceiling off" that turns the *cache* off instead,

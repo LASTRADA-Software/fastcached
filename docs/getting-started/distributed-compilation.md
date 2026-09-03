@@ -435,8 +435,9 @@ the reason in the next box.
 
     The worker notices the client has gone and skips writing the object back, so
     the transfer is not paid for. The compile itself still runs to completion, so
-    that CPU is spent twice and `worker_jobs_completed_total` still counts the job;
-    `worker_jobs_abandoned_client_gone_total` counts the delivery that was skipped.
+    that CPU is spent twice and `fastcache_worker_jobs_completed_total` still counts
+    the job; `fastcache_worker_jobs_abandoned_client_gone_total` counts the delivery
+    that was skipped.
 
 !!! note "`FASTCACHE_TOKEN` against a node is accepted and ignored"
 

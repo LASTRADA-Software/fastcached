@@ -313,6 +313,15 @@ struct ExchangeBudget
     /// It detects a dead connection or host, never a peer that is alive and merely
     /// silent -- that is #245's progress frames. See `Net/KeepAlive.hpp`.
     KeepAlive keepAlive { KeepAlive::No };
+
+    /// Field-by-field equality, so a `static_assert` can hold two independently
+    /// written budgets against each other.
+    ///
+    /// Defaulted rather than spelled out, and that is the whole point: a field added
+    /// to this struct joins the comparison by itself. A hand-written one would keep
+    /// agreeing after the field that made two budgets differ stopped being covered,
+    /// which is exactly the shape of #247's defect.
+    [[nodiscard]] friend constexpr bool operator==(ExchangeBudget const&, ExchangeBudget const&) = default;
 };
 
 /// Send one framed request and read its reply, presenting `credential` if

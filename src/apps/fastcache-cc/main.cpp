@@ -930,14 +930,6 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
     return out.good();
 }
 
-/// The deadlines this invocation runs every cache exchange under.
-/// @param cfg The launcher's configuration.
-/// @return The budget.
-[[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
-{
-    return Cc::ExchangeBudget { .connect = cfg.connectTimeout, .total = cfg.ioTimeout };
-}
-
 /// The deadlines this invocation runs a dispatch under.
 ///
 /// The scheduler's control verbs take the cache's budget, because they are the same
@@ -955,7 +947,24 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    return Cc::DispatchBudgetsFor(cfg.connectTimeout, cfg.ioTimeout, cfg.dispatchTimeout);
+    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs {
+        .connect = cfg.connectTimeout, .controlTotal = cfg.ioTimeout, .compileTotal = cfg.dispatchTimeout });
+}
+
+/// The deadlines this invocation runs every cache exchange under.
+///
+/// The dispatch's CONTROL budget, taken rather than built a second time. The two are
+/// the same conversation -- a short reply out of a daemon's or a scheduler's own
+/// tables -- and saying so once is what the comment this replaced was reaching for
+/// when it derived the control leg from this call instead. Either direction is one
+/// producer; this one is the direction that leaves `Cc::DispatchBudgetsFor` the only
+/// place a budget is assembled, so a field added to `ExchangeBudget` cannot reach the
+/// cache legs and miss the dispatch legs or the reverse.
+/// @param cfg The launcher's configuration.
+/// @return The budget.
+[[nodiscard]] Cc::ExchangeBudget BudgetOf(Config const& cfg)
+{
+    return DispatchBudgetsOf(cfg).control;
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
