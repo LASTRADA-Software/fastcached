@@ -175,14 +175,65 @@ endforeach()
 # the script: scripts/coverage.sh reads the percentage out of llvm-cov's JSON
 # summary with it, at the very end, so a missing interpreter would otherwise
 # surface only after the entire suite, the merge and both exports had run.
-find_program(PYTHON3_PATH
-    NAMES python3
-    DOC "python3, used by scripts/coverage.sh to read llvm-cov's JSON summary")
+#
+# THE RULE (#568): a tool this build will EXECUTE is located by something that
+# executes it. The two `find_program` calls above obey it the long way -- each
+# runs `--version` and refuses on a mismatch -- because there is no
+# `find_package` for llvm-profdata. For Python there is one, so this is the whole
+# obedience:
+#
+#   `find_package(Python3 COMPONENTS Interpreter)` VALIDATES by running the
+#   interpreter. `find_program(NAMES python3)` returns the first name match on
+#   PATH and never runs it.
+#
+# That is not a style preference, and this gate is the reason. Windows carries an
+# App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`: a ZERO-BYTE
+# reparse point named `python3.exe` which, when its backing Store package is
+# absent, is found on PATH and then refuses to execute. Measured on a developer
+# host in this project, against one tree, in one configure:
+#
+#   find_program(NAMES python3)  -> ...\WindowsApps\python3.exe        0 bytes
+#   find_package(Python3 ...)    -> ...\python3.13.exe            171744 bytes
+#
+# So a presence check over a `find_program` result passes, bakes an unrunnable
+# path into the `coverage` target's command line, and fails at the end of the run
+# -- which is precisely the outcome the paragraph above says this gate exists to
+# prevent. The gate was testing for the wrong property: not "is there a python3"
+# but "is there one that RUNS".
+#
+# QUIET plus an explicit check rather than REQUIRED, so the diagnostic below
+# survives; `src/tests/CMakeLists.txt` spells its own Python lookup the same way
+# for the same reason, and those two sites are the whole of it.
+find_package(Python3 COMPONENTS Interpreter QUIET)
 
-if(NOT PYTHON3_PATH)
+if(NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR
-        "[Coverage] python3 not found. scripts/coverage.sh needs it to extract the coverage "
-        "percentage from llvm-cov's JSON summary.")
+        "[Coverage] no Python 3 interpreter found. scripts/coverage.sh needs one to extract "
+        "the coverage percentage from llvm-cov's JSON summary. Note that this asks for an "
+        "interpreter that RUNS: a `python3` on PATH which cannot execute -- a Windows App "
+        "Execution Alias with no Store package behind it is the one that happens -- is "
+        "correctly not found here.")
+endif()
+
+# `PYTHON3_PATH` was this file's own spelling for the lookup above until #568, and
+# is now read by nothing. Two ways that still bites: a build tree configured
+# before the change carries the cache entry as residue, and a script or a habit
+# can still pass `-DPYTHON3_PATH=...`, which would now be accepted in silence and
+# have no effect. A setting somebody believes is in force is worse than one that
+# was refused.
+#
+# Dropping the entry is what makes this proportionate rather than noisy, and it
+# separates the two cases without having to tell them apart: residue warns once
+# and is gone, while a `-D` passed again warns again, because the person is still
+# passing it. A WARNING and not a FATAL_ERROR -- inert residue must not break a
+# re-configure of a tree that was fine.
+if(DEFINED PYTHON3_PATH)
+    unset(PYTHON3_PATH CACHE)
+    message(WARNING
+        "[Coverage] PYTHON3_PATH is set and is no longer read by anything (#568). The "
+        "interpreter is located with find_package(Python3), which validates it by running "
+        "it; point -DPython3_EXECUTABLE=... at a specific interpreter instead. The stale "
+        "entry has been dropped from the cache.")
 endif()
 
 message(STATUS "[Coverage] Clang ${COVERAGE_CLANG_MAJOR} source-based instrumentation enabled")
@@ -228,7 +279,7 @@ function(fastcached_add_coverage_targets)
             --source-dir "${CMAKE_SOURCE_DIR}"
             --llvm-profdata "${LLVM_PROFDATA_PATH}"
             --llvm-cov "${LLVM_COV_PATH}"
-            --python3 "${PYTHON3_PATH}"
+            --python3 "${Python3_EXECUTABLE}"
             -- ${objects}
         COMMENT "Running the test suite under instrumentation and rendering the coverage report"
         VERBATIM
