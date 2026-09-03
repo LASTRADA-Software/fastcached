@@ -108,11 +108,14 @@ class InMemorySocket: public ISocket
         return _peerAddress;
     }
 
-    /// Half-close: signal EOF to the peer on the outbound pipe but leave
-    /// the inbound (this socket's read side) open. Used by tests that need
-    /// to send a complete request, let the server consume it, and still
-    /// read the response back.
-    void ShutdownWrite() noexcept;
+    /// @copydoc ISocket::ShutdownWrite
+    ///
+    /// Signals EOF to the peer on the outbound pipe and leaves the inbound -- this
+    /// socket's read side -- open. It predates the interface method by a long way and
+    /// is now an override of it: its ~45 callers are the tests that need to send a
+    /// complete request, let the server consume it, and still read the response back,
+    /// which is the wire's rule (*finished sending*, not *gone*) stated as a fixture.
+    void ShutdownWrite() noexcept override;
 
     /// @copydoc ISocket::WaitReadable
     ///

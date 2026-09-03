@@ -268,6 +268,12 @@ IocpSocket::~IocpSocket()
     IocpSocket::Close();
 }
 
+void IocpSocket::ShutdownWrite() noexcept
+{
+    if (!_closed && _impl)
+        Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_impl->native));
+}
+
 void IocpSocket::Close() noexcept
 {
     if (_closed)

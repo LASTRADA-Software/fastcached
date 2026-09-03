@@ -602,6 +602,18 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
 - A synchronous dial spends a thread the caller does not own — a reactor thread
   dials through `PlatformConnector`, never `BlockingConnector`.
+- EOF means "this peer has finished SENDING", not "this peer is gone": a server
+  answers what is already determined and abandons what is still pending. Three
+  surfaces here answered that oppositely, so it was settled against a running
+  reference rather than by argument, and the measurement travels with the rule
+  (`scripts/probes/redis-eof-semantics.py`) — a citation people can re-run is one
+  they stop re-litigating. `ISocket::ShutdownWrite` exists so the question is
+  askable in PRODUCTION at all: `InMemorySocket` had one, public and widely called,
+  but on the CONCRETE type — so nothing holding an `ISocket&` could reach it, every
+  consumer was a test by construction, and a rule nothing can express is a rule
+  nothing can be held to. The answer does not transfer between wires — the compile surface reads
+  a mid-compile EOF as *gone* under the SAME rule, because a compile's reply is not
+  yet determined — so state which surface any measurement covers.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through

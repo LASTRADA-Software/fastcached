@@ -59,6 +59,20 @@ namespace Detail
     /// @return The category it belongs to.
     [[nodiscard]] NetErrorCode TranslateSocketError(int code) noexcept;
 
+    /// Close the WRITE half of @p socket, leaving its read half open.
+    ///
+    /// Declared here for the reason `TranslateSocketError` and `ArmNoSigPipe` are:
+    /// there must be exactly one answer and every socket implementation needs it, so
+    /// the platform split (`SD_SEND` against `SHUT_WR`) lives in one place rather
+    /// than in each of the four transports that call it.
+    ///
+    /// Errors are deliberately dropped. A half-close is best-effort by nature -- the
+    /// peer may already be gone, which is precisely one of the cases a caller is
+    /// trying to find out about -- and there is nothing a caller could do with the
+    /// failure that it will not learn from the next read.
+    /// @param socket A connected native socket; `InvalidSocket` is a no-op.
+    void HalfCloseWrite(NativeSocket socket) noexcept;
+
     /// Keep a write to this socket's broken pipe from raising a fatal signal.
     ///
     /// Declared here rather than kept private to `BlockingSocket.cpp` for the same
@@ -313,6 +327,10 @@ class BlockingSocket final: public ISocket
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::ShutdownWrite
+    void ShutdownWrite() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;

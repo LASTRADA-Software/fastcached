@@ -362,6 +362,12 @@ KqueueSocket::~KqueueSocket()
     KqueueSocket::Close();
 }
 
+void KqueueSocket::ShutdownWrite() noexcept
+{
+    if (!_closed)
+        Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_fd));
+}
+
 void KqueueSocket::Close() noexcept
 {
     if (_closed)

@@ -63,6 +63,30 @@ class TlsSocket final: public ISocket
     [[nodiscard]] IoAwaitable WaitReadable() override;
     [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::ShutdownWrite
+    ///
+    /// Delegated to the raw transport, and **no `close_notify` is sent** -- for the
+    /// same reason `Close()` sends none: flushing a TLS alert needs an *awaited*
+    /// write and this signature cannot do one. So the peer sees a transport-level
+    /// half-close on a stream that is still cryptographically open, which is what a
+    /// caller wants here and is not a graceful TLS shutdown.
+    ///
+    /// **This is the one transport where the interface's "reads keep working" is
+    /// qualified.** A plaintext half-close cannot affect the read direction; here it
+    /// can, because TLS reads are not read-only at the transport layer. `PumpRead`'s
+    /// `SSL_ERROR_WANT_READ` path calls `FlushOutgoing()` and propagates its failure,
+    /// so if OpenSSL has anything queued outbound after the half-close -- an alert, a
+    /// TLS 1.3 KeyUpdate response, any post-handshake message -- the underlying
+    /// `Write` fails and `Read` answers `NetError` where a plaintext socket would have
+    /// answered data or a clean `0`.
+    ///
+    /// Left as a documented consequence rather than papered over: swallowing that
+    /// flush error to make the shapes match would hide genuine write failures on
+    /// every other read, which is a worse trade than a caller on the one encrypted
+    /// transport having to expect an error it can already get.
+    void ShutdownWrite() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override;
     /// Forward the peer address of the wrapped transport so `--log-source`
     /// works identically for TLS and plaintext connections.

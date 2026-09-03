@@ -674,6 +674,89 @@ Every rule below has already been a bug.
   `std::expected<void, ConsensusError>` and translates both at the point of
   failure. A missing file stays *success with nothing read*: a store starting for
   the first time is the ordinary case, not a fault.
+- **EOF means "this peer has finished sending", not "this peer is gone" — and a
+  server answers what is already determined while abandoning what is still
+  pending.** Three places in this tree answered that question and disagreed, so it
+  was settled against a running reference rather than by argument
+  ([#671](https://github.com/LASTRADA-Software/fastcached/issues/671)).
+
+  **How it was determined, because a citation without its conditions outlives its
+  own truth.** `redis-server 7.0.15` on `Linux 5.15.167.4-microsoft-standard-WSL2`,
+  stock configuration (`--save "" --appendonly no`), driven over raw sockets. Every
+  scenario has a control, so a null result cannot be read as an answer:
+
+  | | observed |
+  |---|---|
+  | `BLPOP` + half-close, then a push arrives | server closed, **no reply** |
+  | `BLPOP`, no half-close, then a push arrives *(control)* | reply delivered |
+  | `PING` + immediate half-close | `+PONG` delivered |
+  | `BLPOP` + half-close, nothing ever pushed | server closed promptly |
+  | `SET`, `GET`, `BLPOP` pipelined, then half-close | `+OK`, `written`, then EOF |
+  | blocked clients in the server's own `CLIENT LIST` | **1 before the half-close, 0 after** |
+  | same, without the half-close *(control)* | 1, stays |
+
+  The `CLIENT LIST` row is the one to rest on: the drop is visible in the *server's
+  own view of its clients*, so it depends on no inference from a client socket —
+  which is the failure mode of every probe that reads a close as an absence. The
+  pipelined row rules out a race, since two determined replies came back in order
+  and only the block was abandoned.
+
+  - **It is neither of the two doctrines this tree held, and both.** *Finished
+    sending* for replies already determined — which is `RedisResp`'s reading and
+    every `ShutdownWrite` test's — and *gone* for futures still pending, which is
+    the compile surface's. That the contradiction resolves without either side
+    being simply wrong is the sign the framing was off rather than one of the
+    verdicts.
+
+  - **`ArmDisconnect`'s comment asserts the opposite of the reference.** It says of
+    a half-closed blocked client that *"abandoning the read there would be wrong"*.
+    The measurement is that the reference unblocks exactly such a client and frees
+    the connection — deliberately, as its own `CLIENT LIST` shows. A comment
+    asserting what nothing checks cannot make the code fail, and this one had been
+    contradicting the reference for as long as it had been there.
+
+  - **The compile surface is vindicated by the RULE, not by transfer.** #662 reads
+    EOF during a compile as *gone* and skips writing the object. That is not Redis's
+    answer carried onto the `0xFC` wire — answers do not transfer between wires, and
+    a half-close mid-compile means something different from one mid-`BLPOP`. It is
+    the same rule evaluated on a different surface: a compile's reply is not
+    determined when the watcher fires, so it is a pending future, and abandoning it
+    is what the rule prescribes. State which surface any future measurement covers.
+
+  - **The memcached, RESP-command and admin surfaces are unaffected.** They have no
+    blocking verbs, so every reply is determined and *answer what you owe* is what
+    their `ShutdownWrite` tests already assert.
+
+  - **A judgement that a real client "would not do that" is not this rule.** The
+    reading that got there first was *a real `XREAD BLOCK 0` client keeps its
+    connection open, so the two blocking tests are an artifact* — a guess about
+    clients, and right by accident. The measurement is sharper and about servers: if
+    a client does half-close, **the reference drops it**, so those tests assert a
+    reply the reference would never send. Same conclusion, and only one of the two
+    can be checked.
+
+  - **`ISocket::ShutdownWrite` exists so the question is askable in production.** It
+    did not, and that absence is why the disagreement was unreachable from inside
+    the repository. Not for want of VISIBILITY — `InMemorySocket::ShutdownWrite` has
+    been public since the MVP commit (`57076ec6`) and some forty tests call it — but
+    because it sat on the CONCRETE type. Nothing holding an `ISocket&` could reach
+    it, so every consumer was a test by construction, and "make it public" was never
+    the missing step: production code never names `InMemorySocket`. A rule nothing can
+    express is a rule nothing can be held to. The default is a no-op for fakes; every
+    transport this library hands out overrides it.
+
+  - **The error-only reading detects neither way a client leaves.**
+    `RedisResp.cpp`'s *"a full peer close surfaces as the error case"* is false on
+    IOCP — a full close arrives as readable, measured while landing #662 — and the
+    table above adds that a **half**-close is acted on too, which an error-only rule
+    cannot see at all. Fixing that is
+    [#673](https://github.com/LASTRADA-Software/fastcached/issues/673); this rule is
+    what it is fixed *against*.
+
+  The probes are `scripts/probes/redis-eof-semantics.py`, runnable in about two
+  minutes against any `redis-server`. A rule people can re-run is one they stop
+  re-litigating.
+
 ## Dialing, and the reactor underneath it
 
 - **A synchronous dial spends a thread the caller does not own, and the argument

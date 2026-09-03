@@ -59,6 +59,14 @@ struct Observation
     /// Bytes a follow-up `Read` returned, for the case that asserts the peek consumed
     /// nothing.
     std::atomic<std::size_t> readBack { 0 };
+
+    /// Whether the observer should write a reply once it has seen the peer's EOF.
+    ///
+    /// Plain, not atomic: set before the task is started and never touched again.
+    bool replyAfterEof { false };
+
+    /// Whether that reply was accepted by the socket.
+    std::atomic<bool> replySent { false };
 };
 
 /// Accept one connection, wait for readability, and publish what came back.
@@ -100,6 +108,16 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
             out->readBack.store(*got, std::memory_order_relaxed);
     }
 
+    // Answering AFTER the peer's EOF, which is the wire's rule made executable: a
+    // half-close says the peer has finished sending, not that it has gone, so a reply
+    // it is already owed must still reach it.
+    if (out->replyAfterEof)
+    {
+        std::array<std::byte, 3> const owed { std::byte { 'o' }, std::byte { 'w' }, std::byte { 'e' } };
+        if ((co_await socket->Write(std::span<std::byte const> { owed })).has_value())
+            out->replySent.store(true, std::memory_order_relaxed);
+    }
+
     out->resolved.store(true, std::memory_order_release);
     socket->Close();
     reactor->Stop();
@@ -139,18 +157,22 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     Observation observed;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
 
-    std::jthread client { [port, &observed] {
+    // Recorded here, asserted on the main thread: a `REQUIRE` that fires inside a
+    // `jthread` body is `std::terminate`, not a failed case.
+    std::atomic<bool> unresolvedBeforeClose { false };
+
+    std::jthread client { [port, &observed, &unresolvedBeforeClose] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
-        // Waited for: the server to reach its await. **Then asserted still unresolved**
+        // Waited for: the server to reach its await. **Then recorded still unresolved**
         // -- without that, a `WaitReadable` that answered synchronously would test the
         // other path entirely and this case would pass having never parked anything.
         (void) WaitForFlag(observed.arming);
-        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+        unresolvedBeforeClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // A full, graceful close: FIN, not RST.
         (*socket)->Close();
@@ -159,6 +181,7 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     reactor.Run();
     client.join();
 
+    CHECK(unresolvedBeforeClose.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed)); // EOF is not an error.
     CHECK(observed.count.load(std::memory_order_relaxed) == 0);
@@ -180,7 +203,10 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
     Observation observed;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ true);
 
-    std::jthread client { [port, &observed] {
+    // As above: recorded on the client thread, asserted on the main one.
+    std::atomic<bool> unresolvedBeforeWrite { false };
+
+    std::jthread client { [port, &observed, &unresolvedBeforeWrite] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -188,7 +214,7 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
             return;
 
         (void) WaitForFlag(observed.arming);
-        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+        unresolvedBeforeWrite.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         std::array<std::byte, 1> const payload { std::byte { 0x7A } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 1> p) -> FastCache::Task<bool> {
@@ -204,6 +230,7 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
     reactor.Run();
     client.join();
 
+    CHECK(unresolvedBeforeWrite.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
     CHECK(observed.count.load(std::memory_order_relaxed) > 0);
@@ -249,4 +276,101 @@ TEST_CASE("WaitReadable reports zero when EOF is already pending before it is ca
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
     CHECK(observed.count.load(std::memory_order_relaxed) == 0);
+}
+
+TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][waitreadable][halfclose]")
+{
+    // **The wire's rule, executable.** `ISocket::ShutdownWrite` exists so a peer can
+    // say "I have finished sending" without saying "I have gone", and the rule
+    // (`.agent/rules/wire-and-protocol.md`) is that a server answers what it already
+    // owes such a peer. This is that sentence as a test: the server sees EOF -- count
+    // `0`, the #677 contract -- and its reply still arrives.
+    //
+    // It is also the first production use of `ShutdownWrite` in this tree. Until now
+    // only `InMemorySocket` had one and every caller was a test, which is exactly why
+    // the question could not be settled from inside the repository.
+    FastCache::SteadyClock clock;
+    FastCache::PlatformReactor reactor { clock };
+    auto listener = FastCache::PlatformListener::Bind(reactor, "127.0.0.1", 0);
+    REQUIRE(listener);
+    auto const port = listener->BoundPort();
+    REQUIRE(port != 0);
+
+    Observation observed;
+    observed.replyAfterEof = true;
+    ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
+
+    // Recorded in the client thread, asserted on the main one. A failing Catch2
+    // assertion throws, and thrown out of a `jthread` body that is `std::terminate`
+    // -- measured: staging the half-close as a full `Close()` ended the process with
+    // exit 3 instead of reporting a failed case. The reading still has to happen in
+    // the thread that owns the socket, so what crosses back is the observation.
+    std::atomic<bool> openAfterHalfClose { false };
+
+    // The same marshalling, for the same reason. This one reads "the observer had
+    // not resolved before we half-closed", which is what makes the reply below an
+    // answer to the EOF rather than something already in flight -- and asserting it
+    // HERE, on the client thread, is the exact hazard the paragraph above records:
+    // a `REQUIRE` that fires inside a `jthread` body terminates the process instead
+    // of failing the case. The remedy had been applied three lines below it and not
+    // to it.
+    std::atomic<bool> unresolvedBeforeHalfClose { false };
+
+    std::vector<std::byte> received;
+    std::jthread client { [port, &observed, &received, &openAfterHalfClose, &unresolvedBeforeHalfClose] {
+        FastCache::BlockingConnector connector;
+        auto socket = FastCache::SyncRun(
+            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        if (!socket.has_value())
+            return;
+
+        (void) WaitForFlag(observed.arming);
+        unresolvedBeforeHalfClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
+
+        // **Half-close, not close.** The read half stays open, which is the whole
+        // point: a `Close()` here would make the assertion below unreachable.
+        (*socket)->ShutdownWrite();
+        openAfterHalfClose.store(!(*socket)->IsClosed(), std::memory_order_relaxed);
+
+        // **Bounded, and it is what keeps a missing fix a FAILURE rather than a
+        // hang.** With no `ShutdownWrite` on the transport the interface default is a
+        // no-op, so the server never sees EOF, never resolves, and never stops its
+        // reactor -- and a test that hangs reports nothing at all. Waiting here and
+        // closing anyway lets the server unpark, the reactor return, and the
+        // assertions below say what was actually wrong.
+        if (!WaitForFlag(observed.resolved))
+        {
+            (*socket)->Close();
+            return;
+        }
+
+        received = FastCache::SyncRun([](FastCache::ISocket* s) -> FastCache::Task<std::vector<std::byte>> {
+            std::array<std::byte, 8> buf {};
+            auto const got = co_await s->Read(std::span<std::byte> { buf });
+            if (!got.has_value() || *got == 0)
+                co_return std::vector<std::byte> {};
+            co_return std::vector<std::byte> { buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(*got) };
+        }((*socket).get()));
+        (*socket)->Close();
+    } };
+
+    reactor.Run();
+    client.join();
+
+    REQUIRE(observed.resolved.load(std::memory_order_acquire));
+    REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
+
+    // The observer was still parked when the half-close happened, so the reply below
+    // answers the EOF and is not something that was already on its way.
+    CHECK(unresolvedBeforeHalfClose.load(std::memory_order_relaxed));
+
+    // A half-close is not a close: the client's socket stayed open to read with.
+    CHECK(openAfterHalfClose.load(std::memory_order_relaxed));
+
+    // The server saw "finished sending", spelled as the #677 count.
+    CHECK(observed.count.load(std::memory_order_relaxed) == 0);
+
+    // And the peer, which had closed only its write half, still got its answer.
+    CHECK(observed.replySent.load(std::memory_order_relaxed));
+    CHECK(received.size() == 3);
 }

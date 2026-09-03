@@ -368,6 +368,23 @@ BlockingSocket::~BlockingSocket()
     BlockingSocket::Close();
 }
 
+void Detail::HalfCloseWrite(Detail::NativeSocket socket) noexcept
+{
+    if (socket == Detail::InvalidSocket)
+        return;
+#if defined(_WIN32)
+    ::shutdown(static_cast<SOCKET>(socket), SD_SEND);
+#else
+    ::shutdown(socket, SHUT_WR);
+#endif
+}
+
+void BlockingSocket::ShutdownWrite() noexcept
+{
+    if (!_closed)
+        Detail::HalfCloseWrite(_native);
+}
+
 void BlockingSocket::Close() noexcept
 {
     if (_closed)
