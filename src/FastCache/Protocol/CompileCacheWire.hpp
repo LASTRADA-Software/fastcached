@@ -428,6 +428,41 @@ enum class ErrorCode : std::uint8_t
     /// that ends a parked read and it is the write side gone. See
     /// `FrameServer::CloseOverdue`.
     RequestDeadlineExceeded = 0x1D,
+
+    /// The value a STORE carried is a compile value of a **generation this build
+    /// does not implement**.
+    ///
+    /// **Emphatically NOT `MalformedValue`**, and the split is the one
+    /// `.agent/rules/storage.md` already draws on disk between
+    /// `UnsupportedFormatVersion` and `Corrupt`. `MalformedValue` says the bytes are
+    /// not a compile value at all, which is a statement about a broken or mismatched
+    /// CLIENT. This one says the bytes *are* a compile value, well formed, written
+    /// under a canonicalization spec newer than this server's -- which during a
+    /// rolling upgrade is a **normal and expected** condition and says nothing is
+    /// wrong with anybody.
+    ///
+    /// The code is what monitoring sees, and the remedies diverge: a rise in
+    /// malformed values sends an operator looking for a broken client, or -- worse,
+    /// and the reason the disk rule exists -- to wipe a cache that is perfectly
+    /// healthy. The remedy here is to finish the rollout or roll it back. A fleet is
+    /// permanently mid-upgrade ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)),
+    /// so this is not an exotic state.
+    ///
+    /// Refused rather than stored, and neither server on this wire has a choice about
+    /// that: storing it would mean storing text this build cannot rewrite -- the
+    /// producing checkout's absolute paths, under a key every machine computes, which
+    /// is exactly what `CanonicalStoredValue` exists to prevent
+    /// ([#483](https://github.com/LASTRADA-Software/fastcached/issues/483)).
+    ///
+    /// The two surfaces answering it keep **separate counters**, because a shared code
+    /// is not a shared event: `SurfaceRefusal`'s row is the refusal, not the code.
+    ///
+    /// A refusal a client answers by compiling locally, like the rest of this range.
+    /// Deployed launchers need no new arm: they special-case `NotLeader` and
+    /// `UnknownLease` and treat every other code as a generic rejection, so this is
+    /// additive for clients built before it existed -- which is the whole point, since
+    /// the clients that meet it are by definition of another generation.
+    ForeignValueGeneration = 0x1E,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -963,6 +998,14 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::RequestDeadlineExceeded,
                       .name = "request-deadline-exceeded",
                       .defaultMessage = "this request outran the window this surface allows" },
+    // The default names no generation, because the generations are what an operator
+    // acts on and neither of them is known here. Both surfaces send
+    // `ForeignGenerationMessage`, which states them; this sentence is what a caller
+    // that supplies none falls back to.
+    ErrorDescriptor { .code = ErrorCode::ForeignValueGeneration,
+                      .name = "foreign-value-generation",
+                      .defaultMessage = "stored value names a canonicalization generation this build does not "
+                                        "implement" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
