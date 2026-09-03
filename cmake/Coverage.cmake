@@ -201,11 +201,25 @@ endforeach()
 # prevent. The gate was testing for the wrong property: not "is there a python3"
 # but "is there one that RUNS".
 #
+# The two platforms reject it differently, and both are fine here. Measured:
+# on Windows FindPython knows the alias and steps OVER it to a real interpreter;
+# on Linux (CMake 3.28) it stops at the first candidate, fails to run it, and
+# reports not-found. Either way the unrunnable path does not reach the target --
+# on Linux the outcome is this gate firing at CONFIGURE time, which is the whole
+# point of the paragraph above.
+#
 # QUIET plus an explicit check rather than REQUIRED, so the diagnostic below
 # survives; `src/tests/CMakeLists.txt` spells its own Python lookup the same way
 # for the same reason, and those two sites are the whole of it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
+# `Python3_Interpreter_FOUND` and never `Python3_EXECUTABLE`, which is the one
+# way to write this that looks tidier and restores the bug. When FindPython
+# rejects a candidate it leaves `Python3_EXECUTABLE` SET to the path it rejected:
+# measured here, against a `python3` first on PATH that cannot execute,
+# `Python3_Interpreter_FOUND` was FALSE while `Python3_EXECUTABLE` still named
+# the broken file. Testing the path would pass, and the target below would be
+# handed exactly the interpreter this whole change exists to keep out of it.
 if(NOT Python3_Interpreter_FOUND)
     message(FATAL_ERROR
         "[Coverage] no Python 3 interpreter found. scripts/coverage.sh needs one to extract "
