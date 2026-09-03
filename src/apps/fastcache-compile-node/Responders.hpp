@@ -451,17 +451,25 @@ class SchedulerResponder final: public IFrameResponder
     /// One place the peer becomes a `CallerContext`, so the classification behind an
     /// early refusal is by construction the classification the verb would have got.
     ///
-    /// By value and moved, which is the shape #395 was filed about -- it used to be
-    /// a use-after-free and is now the correct one. `CallerContext::peerId` owns, so
-    /// there is no longer a parameter for the returned context to point into, and
-    /// the caller that already holds a `std::string` hands it over rather than
-    /// having it copied.
+    /// By value and moved, which is the shape #395 was filed about. It was never a
+    /// use-after-free on either production path -- the old view pointed into the
+    /// coroutine frame's own `std::string` here, and into `FrameEndpoint`'s
+    /// connection-lifetime peer at the refusal site, both of which outlived the
+    /// context. It was a hazard the TYPE invited and the next author would have
+    /// taken, which is what that ticket is about and why nothing shipped broken.
     ///
-    /// The classification is taken BEFORE the move: `Classify` reads the host, and
-    /// sequencing it after would pass it a moved-from string. That is a real hazard
-    /// of this shape rather than a stylistic note -- argument evaluation order
-    /// inside one aggregate initialiser would not save it, since the move and the
-    /// read would be two unsequenced reads of the same object.
+    /// `CallerContext::peerId` owns now, so there is no parameter for the returned
+    /// context to point into, and a caller already holding a `std::string` hands it
+    /// over rather than having it copied.
+    ///
+    /// `Classify` is called before the move for READABILITY, not for correctness:
+    /// `[dcl.init.list]/4` sequences a braced-init-list's clauses in written order,
+    /// so `{ .membership = Classify(peer), .peerId = std::move(peer) }` would have
+    /// been well-defined too. Verified on gcc and clang rather than reasoned about,
+    /// because an earlier draft of this comment asserted the opposite. Do not carry
+    /// "aggregate initialisers are unsequenced" anywhere else -- it is false, and
+    /// function ARGUMENTS, which are indeterminately sequenced, are the rule that
+    /// gets misremembered into it.
     ///
     /// @param peer The caller's peer host, taken over by the returned context.
     [[nodiscard]] Distributed::CallerContext Context(std::string peer) const
