@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -117,7 +118,7 @@ TEST_CASE("The production factory wires the term through, grant to refusal", "[n
 
     auto const stale = (*validator)(GrantUnder(DeposedTerm), "gcc-13");
     REQUIRE(stale.has_value());
-    CHECK(stale->reason == Distributed::LeaseRefusalReason::EpochMismatch);
+    CHECK(Testing::Unwrap(stale).reason == Distributed::LeaseRefusalReason::EpochMismatch);
 }
 
 TEST_CASE("A node with no cluster key builds a validator that learns nothing", "[node][lease][epoch]")
