@@ -102,8 +102,8 @@ TEST_CASE("ServiceControl: a command line that named nothing registers nothing",
 
 TEST_CASE("ServiceControl: the executable path is always quoted", "[platform][service]")
 {
-    FastCache::CliResult const cfg {};
-    auto const cmd = CommandLineFor(std::filesystem::path { "C:/Program Files/fastcached.exe" }, cfg);
+    FastCache::CliResult const cli {};
+    auto const cmd = CommandLineFor(std::filesystem::path { "C:/Program Files/fastcached.exe" }, cli);
     REQUIRE(cmd.starts_with("\"C:/Program Files/fastcached.exe\" --daemon"));
 }
 
@@ -129,8 +129,8 @@ TEST_CASE("ServiceControl: a flag the operator never named is omitted", "[platfo
     // the wrong question: `--max-memory` at its default may be a value the operator
     // typed, and #349 is what dropping it costs. What is omitted is what was never
     // named.
-    FastCache::CliResult const cfg {};
-    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cfg);
+    FastCache::CliResult const cli {};
+    auto const cmd = CommandLineFor(std::filesystem::path { "fastcached" }, cli);
     REQUIRE(!cmd.contains("--port="));
     REQUIRE(!cmd.contains("--bind="));
     REQUIRE(!cmd.contains("--max-memory="));
@@ -705,113 +705,6 @@ TEST_CASE("ServiceControl: a service name that escapes its directory is refused"
     REQUIRE(!rejects("fastcached-2"));
 }
 
-TEST_CASE("ServiceControl: every Config-backed flag reaches the service argv", "[platform][service]")
-{
-    // BuildServiceArgv re-spells every flag name by hand, so it is a second
-    // place a CLI flag is written down. Until it is driven off CliOptions()
-    // directly, this walks that table and asserts the coverage the comment
-    // above emitIfSet only claims in prose: a new flag that forgets an
-    // emitIfSet line fails here rather than being silently dropped between the
-    // install command line and the supervisor.
-    //
-    // The exclusions are the flags that are not Config state, quoted from that
-    // same comment.
-    constexpr auto NotConfigState = std::to_array<std::string_view>({
-        "--install-service",   // a service must never re-install itself
-        "--uninstall-service", //
-        "--service-scope",     // install-time only
-        "--seed-config",
-        // Converting the store is a one-shot act, not state a daemon runs with.
-        // A registration carrying it would re-run the conversion at every boot,
-        // on a store that after the first run has nothing left to convert.
-        "--migrate-storage", // an installer step, not daemon state
-        "--daemon",          // emitted unconditionally, not from Config
-        "--healthcheck",     //
-        "--help",            //
-        "--version",         //
-        "--config",          // the operator's own assertion; see main.cpp
-        "--service-name",    // emitted unconditionally, above the table
-        // BOTH spellings of the timestamp switch, and the pair is excluded rather
-        // than one of it. A registration carries whichever spelling PRODUCES the
-        // configured value and never both, so this sweep -- one configuration, every
-        // flag must appear in it -- cannot express the pair at all: demanding both is
-        // a contradiction, and demanding one is a guess about which platform the
-        // sweep is running on. The default is platform-dependent since #496, so that
-        // guess is wrong half the time and silently: excluding only the negative
-        // spelling passed here and dropped `--log-timestamps` from the sweep on
-        // macOS.
-        //
-        // The coverage moved rather than vanished. "the timestamp switch registers
-        // whichever spelling produces the value" drives all four combinations --
-        // both values against both platform defaults -- which is more than this
-        // sweep could assert for it even on one platform.
-        "--log-timestamps",
-        "--no-log-timestamps",
-        "--pidfile", // POSIX daemon-mode only, never registered
-        // The one Config field with no safe representation in launch arguments:
-        // a supervisor records them where every local account can read them, so
-        // emitting the secret would publish it to exactly the accounts it exists
-        // to keep out. ServiceRegistrationRejection reports the omission instead,
-        // and the case below asserts that.
-        "--requirepass",
-        // Repeatable listeners are emitted as a group and asserted separately, by
-        // "a listener's role survives the registration" below.
-        "--listen",
-        "--listen-tls",
-    });
-
-    // A configuration in which no field holds its default, so every emitIfSet
-    // fires.
-    FastCache::Config cfg {};
-    cfg.bindAddress = "0.0.0.0";
-    cfg.port = 12345;
-    cfg.maxMemoryBytes = 123456789;
-    cfg.logLevel = FastCache::LogLevel::Debug;
-    // Away from the default WHATEVER the default is, so the fixture's own rule --
-    // no field holds its default -- keeps holding on a platform where that default
-    // is true (#496).
-    cfg.logTimestamps = !FastCache::DefaultLogTimestamps;
-    cfg.logSource = true;
-    cfg.logEverything = true;
-    cfg.storagePath = "cache.db";
-    cfg.storageDurability = FastCache::StorageDurability::Fsync;
-    cfg.storageMaxValueBytes = 4096;
-    cfg.storageMaxDiskBytes = 8192;
-    cfg.storageShards = 7;
-    cfg.activeExpiryIntervalMs = 250;
-    cfg.activeExpiryScanBudget = 64;
-    cfg.workerThreads = 5;
-    cfg.listenBacklog = 64;
-    cfg.lruRecency = FastCache::LruRecency::Strict;
-    cfg.cpuAffinity = FastCache::CpuAffinity::None;
-    cfg.compression = FastCache::CompressionCodec::Identity;
-    cfg.compressionLevel = 9;
-    cfg.compressionMinBytes = 1024;
-    cfg.notifyKeyspaceEvents = "KEA";
-    cfg.authUsername = "operator";
-    cfg.metricsEnabled = true;
-    cfg.metricsBindAddress = "0.0.0.0";
-    cfg.metricsPort = 9999;
-    cfg.tlsEnabled = true;
-    cfg.tlsCertPath = "cert.pem";
-    cfg.tlsKeyPath = "key.pem";
-
-    auto const argv =
-        FastCache::BuildServiceArgv(std::filesystem::path { "fastcached" }, AsTyped(cfg), FastCache::EmitDaemonFlag::Yes);
-
-    for (auto const& spec: FastCache::CliOptions())
-    {
-        if (std::ranges::contains(NotConfigState, spec.primary))
-            continue;
-        INFO("flag: " << spec.primary);
-        // FlagMatches is the parser's own rule for "this token names that flag",
-        // so the guard cannot drift from what the daemon will accept back.
-        auto const emitted =
-            std::ranges::any_of(argv, [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); });
-        CHECK(emitted);
-    }
-}
-
 TEST_CASE("ServiceControl: every registration rule gates an install", "[platform][service]")
 {
     // One gate for both platforms' InstallService, so a rule cannot be enforced
@@ -926,49 +819,97 @@ TEST_CASE("ServiceControl: a pinned --max-memory equal to the host default is re
     CHECK(std::ranges::contains(argv, pin));
 }
 
-TEST_CASE("ServiceControl: every flag the operator can name survives at its default value", "[platform][service]")
+TEST_CASE("ServiceControl: every flag that can reach a registration does, one row at a time", "[platform][service]")
 {
-    // **The mechanical half of #349, and it is mechanical on purpose.** The daemon's
-    // table carries thirty-one explicit bits and `BuildServiceArgv` emits every one of
-    // them; fixing the row that was caught would leave the other thirty with the same
-    // shape, which is how this defect reached a second binary in the first place. So
-    // the guard walks the table: for each row that records provenance, the one shape a
-    // value comparison cannot distinguish from silence -- named, at its default -- must
-    // still reach the supervisor. A new row cannot regress by omission.
+    // **The mechanical guard, and it is mechanical on purpose (#349).**
+    // `BuildServiceArgv` re-spells every flag by hand, so it is a second place a CLI
+    // flag is written down, and #349 was one of those spellings deciding by VALUE
+    // what the parse had already recorded as PROVENANCE. Fixing the row that was
+    // caught would have left thirty with the same shape, which is how the defect
+    // reached a second binary in the first place -- so the guard walks
+    // `CliOptions()` instead, and a new row cannot regress by omission.
     //
-    // A switch is driven through its own `apply`, which is what typing it does. Its
-    // default is the value it cannot express, so "named, at its default" is not a
-    // reachable shape for one, and asserting it would be asserting a contradiction.
-    // That also covers both timestamp spellings on both platform defaults, which the
-    // coverage sweep below cannot express at all.
-    constexpr auto NotRegistrable = std::to_array<std::pair<std::string_view, std::string_view>>({
-        // Never emitted at all: launch arguments are world-readable, so the secret is
-        // refused rather than baked in. InlineCredentialRejection reports it.
-        { "--requirepass", "refused rather than registered; see InlineCredentialRejection" },
-        // The empty string is the DEFAULT of all three and is the flag's own way of
-        // saying "off", so there is no pin to lose -- and emitting `--storage=` would
-        // absolutize the installing shell's working directory into the registration,
-        // which is worse than the drop. "an unset path flag is omitted rather than
-        // absolutized" asserts that directly.
-        { "--storage", "an explicitly empty path names nothing; emitting it would register the installer's cwd" },
-        { "--tls-cert", "an explicitly empty path names nothing" },
-        { "--tls-key", "an explicitly empty path names nothing" },
+    // **One row at a time**, which is what makes it stronger than the whole-config
+    // sweep it replaces. That one drove every field away from its default at once,
+    // so it could not see a line naming the wrong field or the wrong bit -- a
+    // neighbour's emission covered it -- and it could not express the timestamp pair
+    // at all, since a registration carries whichever spelling produces the value and
+    // never both. Per row, both spellings are ordinary cases.
+    //
+    // Each row is stimulated the way TYPING it would:
+    //
+    //  - a valueless flag runs its own `apply`, which is exactly what typing it does.
+    //    Its default is the value it cannot express, so "named, at its default" is
+    //    not a reachable shape for one;
+    //  - a row named in `DrivenWithAValue` gets one, because its default is EMPTY and
+    //    empty is that flag's own way of saying "off" -- there is nothing to register
+    //    and nothing to lose. Driven rather than excused, so the row is still
+    //    asserted to reach the supervisor;
+    //  - every other row keeps its DEFAULT and is merely named. That is the #349
+    //    shape: the one input no value comparison can tell from silence.
+    struct Stimulus
+    {
+        std::string_view flag;   ///< The row this applies to.
+        std::string_view value;  ///< What typing it would supply.
+        std::string_view reason; ///< Why a default cannot serve.
+    };
+
+    constexpr auto DrivenWithAValue = std::to_array<Stimulus>({
+        { .flag = "--config", .value = "fastcached.yaml", .reason = "no explicit bit; emitted on presence" },
+        { .flag = "--pidfile", .value = "fastcached.pid", .reason = "no explicit bit; emitted on presence" },
+        { .flag = "--storage", .value = "cache.cow", .reason = "empty is the flag's own `off`" },
+        { .flag = "--tls-cert", .value = "cert.pem", .reason = "empty is the flag's own `off`" },
+        { .flag = "--tls-key", .value = "key.pem", .reason = "empty is the flag's own `off`" },
+        // Repeatable, and each appends one listener. The role each is spelled back
+        // with is asserted by "a TLS listener's kind survives the registration".
+        { .flag = "--listen", .value = "127.0.0.1:11211", .reason = "repeatable; an empty listener set registers nothing" },
+        { .flag = "--listen-tls",
+          .value = "127.0.0.1:11212",
+          .reason = "repeatable; an empty listener set registers nothing" },
     });
+
+    // The rows a registration must NOT carry. Every one is either not daemon state
+    // at all, or is refused outright -- there is no row here excused for being
+    // inconvenient to assert.
+    constexpr auto NeverRegistered = std::to_array<Stimulus>({
+        { .flag = "--install-service", .value = {}, .reason = "a service must never re-install itself" },
+        { .flag = "--uninstall-service", .value = {}, .reason = "nor deregister itself" },
+        { .flag = "--service-scope", .value = {}, .reason = "install-time only, and not Config state" },
+        { .flag = "--seed-config", .value = {}, .reason = "an installer step, not daemon state" },
+        // Converting the store is a one-shot act. A registration carrying it would
+        // re-run the conversion at every boot, on a store that after the first run
+        // has nothing left to convert.
+        { .flag = "--migrate-storage", .value = {}, .reason = "a one-shot verb, not daemon state" },
+        { .flag = "--daemon", .value = {}, .reason = "carried by EmitDaemonFlag, not from Config" },
+        { .flag = "--healthcheck", .value = {}, .reason = "probe and exit, instead of serving" },
+        { .flag = "--help", .value = {}, .reason = "not daemon state" },
+        { .flag = "--version", .value = {}, .reason = "not daemon state" },
+        // The one Config field with no safe representation in launch arguments: a
+        // supervisor records them where every local account can read them, so
+        // emitting the secret would publish it to exactly the accounts it exists to
+        // keep out. ServiceRegistrationRejection reports the omission instead, and
+        // "dropping a password is reported, not silent" asserts that.
+        { .flag = "--requirepass", .value = {}, .reason = "world-readable launch arguments; refused instead" },
+    });
+
+    auto const named = [](auto const& table, std::string_view flag) {
+        return std::ranges::find_if(table, [flag](Stimulus const& row) { return row.flag == flag; });
+    };
 
     for (auto const& spec: FastCache::CliOptions())
     {
-        if (spec.explicitBit == nullptr)
-            continue;
-        if (std::ranges::any_of(NotRegistrable, [&spec](auto const& row) { return row.first == spec.primary; }))
+        if (named(NeverRegistered, spec.primary) != NeverRegistered.end())
             continue;
 
         INFO("flag: " << spec.primary);
         FastCache::CliResult cli {};
-        // A valueless flag's effect IS typing it; a value flag keeps its default,
-        // which is the coincidence #349 is about.
-        if (spec.arity == FastCache::Arity::None && spec.apply != nullptr)
+        REQUIRE(spec.apply != nullptr);
+        if (auto const driven = named(DrivenWithAValue, spec.primary); driven != DrivenWithAValue.end())
+            REQUIRE(spec.apply(cli, driven->value).has_value());
+        else if (spec.arity == FastCache::Arity::None)
             REQUIRE(spec.apply(cli, {}).has_value());
-        cli.*spec.explicitBit = true;
+        if (spec.explicitBit != nullptr)
+            cli.*spec.explicitBit = true;
 
         auto const argv = BuildServiceArgv(std::filesystem::path { "fastcached" }, cli, EmitDaemonFlag::No);
         // FlagMatches is the parser's own rule for "this token names that flag", so
@@ -977,14 +918,16 @@ TEST_CASE("ServiceControl: every flag the operator can name survives at its defa
                                   [&spec](std::string const& arg) { return FastCache::FlagMatches(arg, spec.primary); }));
     }
 
-    // The exclusion list is not allowed to grow silently into the whole table: every
-    // row on it must still BE a row, so a flag that is renamed or retired takes its
-    // excuse with it rather than leaving a line nothing reads.
-    for (auto const& row: NotRegistrable)
-    {
-        INFO("excluded flag: " << row.first);
-        CHECK(std::ranges::any_of(FastCache::CliOptions(), [&row](auto const& spec) {
-            return spec.primary == row.first && spec.explicitBit != nullptr;
-        }));
-    }
+    // Neither table is allowed to grow silently into the whole option table: every
+    // row on both must still BE a row, so a flag that is renamed or retired takes
+    // its excuse with it rather than leaving a line nothing reads.
+    for (auto const& table:
+         { std::span<Stimulus const> { DrivenWithAValue }, std::span<Stimulus const> { NeverRegistered } })
+        for (auto const& row: table)
+        {
+            INFO("listed flag: " << row.flag);
+            CHECK(
+                std::ranges::any_of(FastCache::CliOptions(), [&row](auto const& spec) { return spec.primary == row.flag; }));
+            CHECK(!row.reason.empty());
+        }
 }

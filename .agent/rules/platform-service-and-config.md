@@ -737,22 +737,33 @@ boot, silently, because a registration replays its command line forever. So:
 
 - **A flag whose default is platform-dependent needs a negative spelling** and
   `SwitchSpellingFor`, which emits whichever of the pair PRODUCES the value.
-  `--log-source` and `--log-everything` default false everywhere, so *differs* still
-  means *on* for them and `emitSwitchIfSet` stays right — do not unify the two.
+  *This bullet used to end "`--log-source` and `--log-everything` default false
+  everywhere, so `emitSwitchIfSet` stays right — do not unify the two", and that
+  was correct exactly while the rule was a value comparison*: the two-sided switch
+  needed a platform default the one-sided ones did not. Provenance consults no
+  default at all (#349), so on the daemon the only thing left separating them is
+  **whether a negative spelling exists** — an argument, not a second emitter — and
+  one `emitSwitch` serves both. The node still has both helpers, and the sentence
+  stays true there.
 - **The negative spelling gets no `yamlKey`.** A file already says both things with
   `log_timestamps: true|false`; a second key for the same field would be two ways to
   spell one setting, with a precedence question nobody asked for. It is on
   `notFromFile` with that reason.
 - **The defect lives in a COMBINATION, so the test must drive one.** On a false
   default the old emitter is correct, and with one value driven the wrong spelling is
-  still A spelling. Both values against both platform defaults — which needs the
-  decision extracted as a pure function, since a host runs one default and cannot be
-  asked for the other.
-- **A coverage sweep cannot hold a mutually-exclusive pair.** "one configuration,
-  every flag appears in it" is a shape that demands a contradiction for two spellings
-  of one field; excluding just the negative one passed on Windows and silently dropped
-  `--log-timestamps` from the sweep on macOS. Exclude the pair, and name the case that
-  took the coverage over.
+  still A spelling. Both values against both axes — which needs the decision extracted
+  as a pure function, since a host runs one default and cannot be asked for the other.
+  The daemon's second axis is now provenance rather than the platform default, which
+  strictly widens it: a typed `--log-timestamps` on a true-defaulting host used to
+  register nothing, correct for that build and a pin the next one could move.
+- **A coverage sweep cannot hold a mutually-exclusive pair — unless it drives ONE ROW
+  at a time.** "one configuration, every flag appears in it" is a shape that demands a
+  contradiction for two spellings of one field; excluding just the negative one passed
+  on Windows and silently dropped `--log-timestamps` from the sweep on macOS. The
+  daemon's sweep no longer has that shape: per row, both spellings are ordinary cases
+  and neither needs excluding. Per row is stronger for a second reason — a whole-config
+  sweep cannot see a line naming the wrong field or the wrong bit, because a
+  neighbour's emission covers it.
 
 ## Open work
 

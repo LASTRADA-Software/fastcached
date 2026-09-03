@@ -260,10 +260,15 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
     //
     // Presence rather than provenance, and that is not the defect above: an empty
     // path is the flag's own way of saying "off", and it is the DEFAULT of every
-    // one of these. So there is no pin to lose -- `--storage=` names nothing, and
-    // emitting it would absolutize the installing shell's working directory into
-    // the registration, which is worse than the drop. The audit that closed #349
-    // records this as the reason these four rows keep a value test.
+    // row reached through here. So there is no pin to lose -- `--storage=` names
+    // nothing, and emitting it would absolutize the installing shell's working
+    // directory into the registration, which is worse than the drop. The audit
+    // that closed #349 records this as why these rows keep a value test.
+    //
+    // Two of them (`--config`, `--pidfile`) carry no explicit bit at all and could
+    // not ask provenance if they wanted to; "named, at its default" is therefore
+    // not a reachable shape for any of them, and the guard drives them with a
+    // VALUE rather than excusing them.
     auto const emitPathIfSet = [&argv](std::string_view flag, std::string const& value) {
         if (!value.empty())
             argv.push_back(std::format("--{}={}", flag, AbsolutePathArg(value)));

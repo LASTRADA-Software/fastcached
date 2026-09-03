@@ -73,11 +73,22 @@ enum class WindowsLogonAccount : std::uint8_t
 ///
 /// What is deliberately **not** here is how `arguments` was derived. An
 /// `OptionSpec` describes how to *parse* a flag and carries no way to read a
-/// value back out, so "emit every field that differs from a default" cannot be
-/// written once generically -- each binary walks its own table and hands the
-/// result over. That is why `BuildServiceArgv` stays hand-written per binary and
-/// is guarded by a test that walks the option table and requires every
-/// non-excluded flag to be emitted.
+/// value back out, so the emission cannot be written once generically -- each
+/// binary walks its own table and hands the result over. That is why
+/// `BuildServiceArgv` stays hand-written per binary and is guarded by a test that
+/// walks the option table and requires every non-excluded flag to be emitted.
+///
+/// **That obstacle is a missing column, not an impossibility**, and the honest
+/// version of this paragraph says so: `OptionSpec::same` already carries a
+/// member-pointer column that reads a field back out (`FieldEq<&Config::x>()`),
+/// so a symmetric renderer would make the emission table pure data and delete
+/// thirty hand-copied lines per binary. It is not written yet, and the reason is
+/// scope rather than principle --
+/// [#349](https://github.com/LASTRADA-Software/fastcached/issues/349) moved the
+/// emission rule and left the shape alone. What keeps the hand-written table
+/// honest meanwhile is the guard, which drives ONE row at a time, so a line
+/// naming the wrong field or the wrong bit fails rather than being covered by a
+/// neighbour.
 struct ServiceSpec
 {
     /// The supervisor's key: the SCM service name, and the stem of the launchd
