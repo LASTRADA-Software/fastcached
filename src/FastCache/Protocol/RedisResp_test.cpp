@@ -3232,16 +3232,32 @@ struct BlockingHarness
     FastCache::RedisRespHandler handler;
     std::string reply;
 
+    /// Whether `handler.Run` has RETURNED, which `reply` cannot answer: a handler
+    /// that is still parked and one that unwound having written nothing both leave
+    /// `reply` empty, and telling those apart is the whole of #673. Set before the
+    /// drain so it is true even when the connection produced no bytes at all.
+    bool handlerReturned { false };
+
     /// Launcher coroutine: runs the handler to completion and captures the reply.
     FastCache::Task<void> RunHandler(FastCache::SessionContext session)
     {
         co_await handler.Run(pair.server.get(), &engine, /*primer*/ {}, session);
+        handlerReturned = true;
         pair.server->Close();
         reply = co_await DrainResponse(pair.client.get());
     }
 };
 
 } // namespace
+
+// The two parking cases below deliberately keep the client's WRITE side open
+// while the read is parked, and half-close only once the reply they assert has
+// been produced. Half-closing before parking is what a client that has GONE looks
+// like on this wire ("EOF means: finished sending", `.agent/rules/wire-and-protocol.md`,
+// #671), so the reference server abandons such a read and sends nothing — these
+// used to close first and therefore asserted a reply `redis-server` would never
+// send. Keeping the write side open is also the CONTROL for #673: it is the
+// observation `ArmDisconnect` must NOT treat as a disconnect.
 
 TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp][stream]")
 {
@@ -3255,14 +3271,15 @@ TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp
                                            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
-    h.pair.client->ShutdownWrite();
 
     // Launch the handler on the reactor; it processes the XADD, then parks on
     // the blocking XREAD (no entry after 1-0 yet).
     auto launcher = h.RunHandler(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
-    REQUIRE(h.reply.empty()); // still parked — nothing returned yet.
+    // Parked and NOT abandoned: the peer is still able to send, so the disconnect
+    // arm must have declined to fire.
+    REQUIRE_FALSE(h.handlerReturned);
 
     // A second "connection" appends 2-0 and notifies the registry, which wakes
     // the parked reader; ticking the reactor resumes it to read + reply.
@@ -3276,6 +3293,11 @@ TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp
     h.waiters.NotifyAppended("s");
     h.reactor.Run();
 
+    // The reply is written but the handler is now parked on the NEXT command, so
+    // half-close to end the connection and let the drain run.
+    h.pair.client->ShutdownWrite();
+    h.reactor.Run();
+    REQUIRE(h.handlerReturned);
     REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
 }
 
@@ -3290,18 +3312,101 @@ TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[prot
                                            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
-    h.pair.client->ShutdownWrite();
 
     auto launcher = h.RunHandler(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
-    REQUIRE(h.reply.empty()); // parked, waiting on the 50ms deadline.
+    REQUIRE_FALSE(h.handlerReturned); // parked, waiting on the 50ms deadline.
 
     // Advance past the deadline; the scheduled timeout fires, waking the reader
     // which finds no data and replies nil.
     h.clock.SetNow(h.clock.Now() + std::chrono::milliseconds { 51 });
     h.reactor.Run();
+
+    h.pair.client->ShutdownWrite();
+    h.reactor.Run();
+    REQUIRE(h.handlerReturned);
     REQUIRE(h.reply.ends_with("$-1\r\n"));
+}
+
+TEST_CASE("RESP: XREAD BLOCK 0 is abandoned when the peer closes gracefully", "[protocol][resp][stream]")
+{
+    // #673. A `BLOCK 0` reader whose peer goes away the ORDINARY way — a clean
+    // shutdown rather than a crash — must be woken as disconnected, so the
+    // connection coroutine unwinds and releases its socket and admission slot.
+    //
+    // A graceful close is NOT an error on any transport here: the FIN makes the
+    // socket readable and `WaitReadable` reports a count of 0 (#677). Watching only
+    // for an error therefore leaves this reader parked forever, which is verbatim
+    // the leak the disconnect arm exists to prevent.
+    //
+    // `handlerReturned` rather than `reply` is what this rests on, and that is not
+    // incidental: a handler still parked and one that unwound having written
+    // nothing both leave `reply` empty, so an assertion about the reply cannot
+    // separate the leak from the fix. `TestReactor::Run` drains and returns rather
+    // than blocking, so under the pre-fix code this FAILS at that assertion instead
+    // of hanging.
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    h.pair.client->ShutdownWrite(); // the peer has finished sending, and is gone.
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+
+    // The handler unwound instead of parking: no XADD ever arrives, and nothing
+    // else in this test would ever wake it.
+    REQUIRE(h.handlerReturned);
+
+    // What the peer was already OWED still went out -- the XADD's id -- and the
+    // block, which was not determined, produced nothing: no entries, and no nil
+    // either, since there is no live peer to answer.
+    REQUIRE(h.reply == "$3\r\n1-0\r\n");
+}
+
+TEST_CASE("RESP: XREAD BLOCK 0 survives a graceful close on a LATER connection", "[protocol][resp][stream]")
+{
+    // The negative half of the case above, and the one a fix that simply treats
+    // readability as a disconnect would fail: this peer's write side is open the
+    // whole time, so `WaitReadable` reports data-pending rather than EOF and the
+    // reader must stay parked until the append wakes it. Without this, "detect a
+    // graceful close" and "abandon every blocking read the moment it parks" are
+    // the same passing test.
+    BlockingHarness h;
+    FastCache::SessionContext session;
+    session.streamWaiters = &h.waiters;
+    session.reactor = &h.reactor;
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n")));
+
+    auto launcher = h.RunHandler(session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE_FALSE(h.handlerReturned);
+
+    auto const added = h.engine.StreamAdd("s",
+                                          FastCache::StreamCodec::StreamId { .ms = 1, .seq = 0 },
+                                          false,
+                                          std::vector<std::pair<std::string, std::string>> { { "f", "v" } },
+                                          std::nullopt,
+                                          false);
+    REQUIRE(added.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+
+    h.pair.client->ShutdownWrite();
+    h.reactor.Run();
+    REQUIRE(h.handlerReturned);
+    REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
 }
 
 TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immediately", "[protocol][resp][stream][multi]")

@@ -745,13 +745,31 @@ Every rule below has already been a bug.
     express is a rule nothing can be held to. The default is a no-op for fakes; every
     transport this library hands out overrides it.
 
-  - **The error-only reading detects neither way a client leaves.**
+  - **The error-only reading detected neither way a client leaves**, and
+    `ArmDisconnect` now reads the COUNT
+    ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)).
     `RedisResp.cpp`'s *"a full peer close surfaces as the error case"* is false on
     IOCP — a full close arrives as readable, measured while landing #662 — and the
     table above adds that a **half**-close is acted on too, which an error-only rule
-    cannot see at all. Fixing that is
-    [#673](https://github.com/LASTRADA-Software/fastcached/issues/673); this rule is
-    what it is fixed *against*.
+    cannot see at all. Two arms, and they answer different questions: an ERROR is an
+    abortive close (RST), a count of **`0`** is EOF, and EOF is the ordinary way a
+    client goes away. A count `>0` is still not a disconnect — it is a pipelined
+    command — so this is not "readable means gone", which would abandon every
+    blocking read the instant it parked.
+
+    **A watch is proved by DELETING an arm, never by a passing suite**, because both
+    arms set one flag and either alone makes every test green. That is how #673 was
+    found (delete the error arm on IOCP: 7 cases, 61 assertions, all still pass — so
+    it had never fired) and it is how its fix is checked: delete the EOF arm and
+    exactly one case fails, `RESP: XREAD BLOCK 0 is abandoned when the peer closes
+    gracefully`, while its control stays green. The control is not optional — without
+    a case that must survive an open write side, "detect a graceful close" and
+    "abandon everything" are the same passing test.
+
+    And the signal is that the HANDLER RETURNED, not that a reply was empty: a reader
+    still parked and one that unwound having written nothing produce identical bytes,
+    which is why the in-memory suite could not see this even after
+    `InMemorySocket::WaitReadable` made the condition expressible (#677).
 
   The probes are `scripts/probes/redis-eof-semantics.py`, runnable in about two
   minutes against any `redis-server`. A rule people can re-run is one they stop
