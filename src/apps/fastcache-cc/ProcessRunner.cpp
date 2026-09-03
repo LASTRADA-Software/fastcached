@@ -7,6 +7,7 @@
 
 #include "IProcessRunner.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -196,12 +197,18 @@ namespace
         {
             // Both child streams share one pipe write-end, so the merge happens in
             // the kernel and the ordering matches what a console would show.
-            return Spawn(argv, Merge::Yes);
+            return Spawn(argv, Merge::Yes, {});
         }
 
         [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv) override
         {
-            return Spawn(argv, Merge::No);
+            return Spawn(argv, Merge::No, {});
+        }
+
+        [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv,
+                                                 std::span<EnvironmentAssignment const> environment) override
+        {
+            return Spawn(argv, Merge::No, environment);
         }
 
       private:
@@ -211,11 +218,115 @@ namespace
             Yes
         };
 
+        /// The environment block `CreateProcess` wants, built from this process's own
+        /// plus the caller's additions.
+        ///
+        /// Additive: the inherited block is copied wholesale and only a variable the
+        /// caller NAMES is replaced. Dropping the rest would lose `INCLUDE` and turn
+        /// every spawn into `C1034`.
+        ///
+        /// Empty when there is nothing to add, and the caller then passes `nullptr`
+        /// -- inherit-everything, which is byte for byte the behaviour before this
+        /// existed rather than a reconstruction of it that could differ.
+        ///
+        /// The block's shape is `NAME=VALUE\0NAME=VALUE\0\0`, and names compare
+        /// case-insensitively because Windows environment variables do.
+        /// @param environment Variables to add or override.
+        /// @return The block, or empty when there is nothing to add.
+        [[nodiscard]] static std::vector<char> EnvironmentBlock(std::span<EnvironmentAssignment const> environment)
+        {
+            std::vector<char> block;
+            if (environment.empty())
+                return block;
+
+            auto const overridden = [&environment](std::string_view entry) {
+                auto const eq = entry.find('=');
+                if (eq == std::string_view::npos)
+                    return false;
+                auto const name = entry.substr(0, eq);
+                // ASCII-only fold, spelled here rather than borrowed: this file is the
+                // process seam and depends on nothing above it, and every environment
+                // variable name a caller of this may pass is ASCII. `std::tolower`
+                // would make the comparison locale-dependent, which is the family of
+                // defect this whole change is about.
+                auto const sameName = [name](EnvironmentAssignment const& assignment) {
+                    auto const lower = [](char c) {
+                        return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+                    };
+                    return assignment.name.size() == name.size()
+                           && std::ranges::equal(
+                               assignment.name, name, [lower](char a, char b) { return lower(a) == lower(b); });
+                };
+                return std::ranges::any_of(environment, sameName);
+            };
+
+            // Collected first, so the whole set can be ordered once; the block's own
+            // shape is built at the end.
+            std::vector<std::string> entries;
+            auto const append = [&entries](std::string_view text) {
+                entries.emplace_back(text);
+            };
+
+            // `GetEnvironmentStringsA`, not `environ`: the CRT copy is a snapshot
+            // taken at startup, while this is what the OS would hand a child anyway.
+            char* const inherited = GetEnvironmentStringsA();
+            if (inherited != nullptr)
+            {
+                for (char const* cursor = inherited; *cursor != '\0';)
+                {
+                    std::string_view const entry { cursor };
+                    cursor += entry.size() + 1;
+                    // A leading `=` marks Windows' hidden per-drive current
+                    // directories (`=C:=C:\path`). Kept, because dropping them changes
+                    // where a child resolves a drive-relative path, and never read as
+                    // a name the caller might be overriding.
+                    if (entry.starts_with('=') || !overridden(entry))
+                        append(entry);
+                }
+                FreeEnvironmentStringsA(inherited);
+            }
+
+            for (auto const& [name, value]: environment)
+            {
+                // Built by appending rather than by two `operator+` calls, each of
+                // which allocates a temporary this would discard.
+                std::string entry = name;
+                entry += '=';
+                entry += value;
+                append(entry);
+            }
+
+            // Sorted before serializing, because that is `CreateProcess`'s documented
+            // contract for the block it is handed. `GetEnvironmentStringsA` returns
+            // one already in that order, so appending the additions after every
+            // inherited entry would hand a child something no OS-built block looks
+            // like. The fold is ASCII and spelled out for the reason the name
+            // comparison above is: a locale-dependent one is the family of defect
+            // this whole change is about.
+            auto const fold = [](char c) {
+                return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+            };
+            std::ranges::sort(entries, [fold](std::string_view a, std::string_view b) {
+                return std::ranges::lexicographical_compare(a, b, [fold](char x, char y) { return fold(x) < fold(y); });
+            });
+
+            for (auto const& entry: entries)
+            {
+                block.insert(block.end(), entry.begin(), entry.end());
+                block.push_back('\0');
+            }
+            block.push_back('\0');
+            return block;
+        }
+
         /// Spawn `argv`, capturing output either merged or split.
         /// @param argv Full invocation; argv[0] is the executable.
         /// @param merge Whether stderr shares stdout's pipe.
+        /// @param environment Variables added to the inherited environment.
         /// @return Exit code plus captured streams.
-        [[nodiscard]] static CompileRun Spawn(std::span<std::string const> argv, Merge merge)
+        [[nodiscard]] static CompileRun Spawn(std::span<std::string const> argv,
+                                              Merge merge,
+                                              std::span<EnvironmentAssignment const> environment)
         {
             CompileRun result;
             if (argv.empty())
@@ -284,6 +395,13 @@ namespace
             std::vector<char> mutableCmd { cmd.begin(), cmd.end() };
             mutableCmd.push_back('\0');
 
+            // Empty means "add nothing", and `nullptr` is what says that to
+            // CreateProcess -- inherit everything, exactly as before this parameter
+            // existed. Passing a rebuilt block for the no-additions case would put a
+            // reconstruction on the path every ordinary spawn takes.
+            std::vector<char> block = EnvironmentBlock(environment);
+            void* const childEnvironment = block.empty() ? nullptr : block.data();
+
             PROCESS_INFORMATION pi {};
             BOOL const ok = CreateProcessA(nullptr,
                                            mutableCmd.data(),
@@ -291,7 +409,7 @@ namespace
                                            nullptr,
                                            TRUE,
                                            EXTENDED_STARTUPINFO_PRESENT,
-                                           nullptr,
+                                           childEnvironment,
                                            nullptr,
                                            &si.StartupInfo,
                                            &pi);
@@ -344,12 +462,18 @@ namespace
       public:
         [[nodiscard]] CompileRun RunCaptureCombined(std::span<std::string const> argv) override
         {
-            return Spawn(argv, Merge::Yes);
+            return Spawn(argv, Merge::Yes, {});
         }
 
         [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv) override
         {
-            return Spawn(argv, Merge::No);
+            return Spawn(argv, Merge::No, {});
+        }
+
+        [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv,
+                                                 std::span<EnvironmentAssignment const> environment) override
+        {
+            return Spawn(argv, Merge::No, environment);
         }
 
       private:
@@ -459,8 +583,11 @@ namespace
         ///
         /// @param argv Full invocation; argv[0] is the executable.
         /// @param merge Whether stderr shares stdout's pipe.
+        /// @param environment Variables added to the inherited environment.
         /// @return Exit code plus captured streams.
-        [[nodiscard]] static CompileRun Spawn(std::span<std::string const> argv, Merge merge)
+        [[nodiscard]] static CompileRun Spawn(std::span<std::string const> argv,
+                                              Merge merge,
+                                              std::span<EnvironmentAssignment const> environment)
         {
             CompileRun result;
             if (argv.empty())
@@ -530,7 +657,49 @@ namespace
                 char** const inherited = environ;
     #endif
 
-                int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), inherited);
+                // Additions are layered ON that, never substituted for it. With none
+                // to make, `inherited` is handed over untouched, so the ordinary
+                // spawn is byte for byte what it was before this parameter existed.
+                //
+                // A name the parent already carries is dropped from the copy rather
+                // than appended after it: POSIX leaves a duplicate's resolution to
+                // the implementation, and `getenv` returning the first match would
+                // make the addition silently ineffective on some libc.
+                std::vector<std::string> merged;
+                std::vector<char*> mergedPointers;
+                char** childEnvironment = inherited;
+                if (!environment.empty())
+                {
+                    for (char** entry = inherited; entry != nullptr && *entry != nullptr; ++entry)
+                    {
+                        std::string_view const text { *entry };
+                        auto const eq = text.find('=');
+                        auto const name = eq == std::string_view::npos ? text : text.substr(0, eq);
+                        if (std::ranges::none_of(environment,
+                                                 [name](EnvironmentAssignment const& a) { return a.name == name; }))
+                            merged.emplace_back(text);
+                    }
+                    for (auto const& [name, value]: environment)
+                    {
+                        // Appended rather than concatenated, as on the Windows side and
+                        // for the same reason: two `operator+` calls allocate a
+                        // temporary each.
+                        std::string entry = name;
+                        entry += '=';
+                        entry += value;
+                        merged.push_back(std::move(entry));
+                    }
+
+                    // Reserved before any `data()` is taken: a reallocation would
+                    // leave every pointer already stored dangling.
+                    mergedPointers.reserve(merged.size() + 1);
+                    for (auto& entry: merged)
+                        mergedPointers.push_back(entry.data());
+                    mergedPointers.push_back(nullptr);
+                    childEnvironment = mergedPointers.data();
+                }
+
+                int const spawned = ::posix_spawnp(&pid, cargv[0], &actions, nullptr, cargv.data(), childEnvironment);
                 ::posix_spawn_file_actions_destroy(&actions);
                 if (spawned != 0)
                     return result;

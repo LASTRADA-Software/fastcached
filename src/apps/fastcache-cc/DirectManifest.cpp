@@ -459,6 +459,94 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
 
 namespace
 {
+    /// What separates a `/showIncludes` note's prefix from the path it names.
+    ///
+    /// Two spellings, because the separator is part of the TRANSLATION. MSVC's CJK
+    /// catalogues use the full-width colon `U+FF1A`, so a reader searching only for
+    /// the ASCII `": "` answers "no note here" for exactly the locales this file
+    /// exists to report on -- and prints the sentence issue #692 exists to stop
+    /// printing. A synthesised fixture cannot be relied on to find that: whoever
+    /// types a Japanese line by hand is as likely to reach for an ASCII colon as
+    /// not, which is what happened here, so the second spelling is reasoned about
+    /// rather than waited for and pinned by a fixture that uses it deliberately.
+    constexpr std::array<std::string_view, 2> IncludeNoteSeparators { ": ", "\xEF\xBC\x9A" };
+
+    /// Whether `text` begins where an absolute path begins.
+    ///
+    /// Three anchors, because a note names a file on whichever host printed it: a
+    /// Windows drive (`C:\`, and `C:/` since a driver may print either separator),
+    /// a UNC share (`\\`), and a POSIX root (`/`). Deliberately NOT a general path
+    /// test -- what this has to separate is "the line ends by naming a file" from
+    /// "the line ends by saying something", and every locale's ordinary diagnostic
+    /// ends with prose.
+    /// @param text The tail of a line, already trimmed of leading blanks.
+    /// @return True when it starts with an absolute-path anchor.
+    [[nodiscard]] bool StartsAbsolutePath(std::string_view text) noexcept
+    {
+        if (text.starts_with('/') || text.starts_with(R"(\\)"))
+            return true;
+        // A drive letter, its colon, and a separator. `size() > 2` rather than a
+        // three-character substring compare: the separator may be either.
+        // An ASCII letter test spelled out rather than `std::isalpha`, whose answer
+        // for a byte >= 0x80 depends on the global locale -- which is the family of
+        // defect this predicate exists to report on.
+        auto const letter = [](char c) {
+            auto const lower = static_cast<char>(c | 0x20);
+            return lower >= 'a' && lower <= 'z';
+        };
+        return text.size() > 2 && letter(text.front()) && text[1] == ':' && (text[2] == '\\' || text[2] == '/');
+    }
+} // namespace
+
+bool CarriesUnreadableIncludeNotes(std::string_view showIncludesText) noexcept
+{
+    std::size_t offset = 0;
+    while (offset < showIncludesText.size())
+    {
+        auto lineEnd = showIncludesText.find('\n', offset);
+        if (lineEnd == std::string_view::npos)
+            lineEnd = showIncludesText.size();
+        auto line = showIncludesText.substr(offset, lineEnd - offset);
+        offset = lineEnd + 1;
+
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+
+        // A line the marker DID match is not evidence of anything wrong, and asking
+        // `IncludeNotePath` rather than re-testing the marker keeps this from
+        // becoming a second spelling of the recognition rule.
+        if (IncludeNotePath(line).has_value())
+            continue;
+
+        // The LAST separator, not the first. A note's own prefix contains one in
+        // several languages -- German's `Hinweis: Einlesen der Datei:` has two --
+        // and a path on Windows contains a colon of its own, so the first is wrong
+        // in one direction and a bare colon search is wrong in the other.
+        //
+        // Both spellings are tried; see `IncludeNoteSeparators` for why there are two.
+        std::size_t separator = std::string_view::npos;
+        std::size_t width = 0;
+        for (auto const candidate: IncludeNoteSeparators)
+            if (auto const at = line.rfind(candidate);
+                at != std::string_view::npos && (separator == std::string_view::npos || at > separator))
+            {
+                separator = at;
+                width = candidate.size();
+            }
+        if (separator == std::string_view::npos)
+            continue;
+
+        auto tail = line.substr(separator + width);
+        while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t'))
+            tail.remove_prefix(1);
+        if (StartsAbsolutePath(tail))
+            return true;
+    }
+    return false;
+}
+
+namespace
+{
     /// Which half of a depfile rule a walk collects.
     enum class RuleSide : std::uint8_t
     {
