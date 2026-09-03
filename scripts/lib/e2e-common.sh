@@ -607,9 +607,23 @@ wait_for_registration() {
 # The line a compile node logs once it is SERVING, and the marker
 # `wait_for_node_ready` below waits on.
 #
-# A named constant for the reason `E2eRegisteredMarker` above is one: the
-# self-test stages both halves of this text, and a test that spelled the marker
-# out a second time would agree with itself whatever the function does.
+# A named constant, but NOT for the reason `E2eRegisteredMarker` above gives, and
+# the difference is worth stating because the shapes are otherwise identical.
+# That constant's self-test stages TWO texts -- `1 of 1` against `0 of 1` -- so
+# naming it catches a wait that matched the wrong line. This one's self-test
+# stages ONE text, present against absent, which catches a wait that does not
+# wait; a second spelling of the text would not weaken that pair.
+#
+# What the constant buys HERE is that a rename has more than one reader. The
+# self-test asserts through it (`node-ready-waits-for-marker`) and against the
+# expiry message `wait_for_log` BUILDS from it (`node-ready-refuses-bound-only`'s
+# required `to log: ...` text), so changing this line's wording fails the suite
+# instead of quietly leaving three fixtures waiting for a string nothing logs.
+#
+# `_selftest_node` spells the text literally on purpose and is not a third
+# reader: it is STAGING what a real node writes, the way `registration-accepted`
+# stages its line. Staging the product's output and asserting the helper's
+# behaviour are different jobs.
 E2eNodeReadyMarker="compile node ready"
 
 # Wait until a compile node is SERVING, not merely bound.
@@ -645,17 +659,44 @@ E2eNodeReadyMarker="compile node ready"
 # a cache tier and never join a fleet, so that stays `wait_for_registration` at the
 # call sites that want it.
 #
+# THE BOUND IS THE TOTAL, and it is split rather than handed to each wait.
+#
+# Passing it to both is the obvious spelling and it means a stated N enforces up
+# to 2N -- the declared number not being the quantity enforced, which is a defect
+# this repository has already had and already fixed once: `cluster-e2e.sh`'s
+# `enclosing_deadline` exists because a 30 s replication loop could call a 60 s
+# `find_leader` twice, "reintroduced by composition rather than by arithmetic".
+# Composing two bounded waits reintroduces it the same way.
+#
+# It is not academic here. `fleet-dashboard-e2e` runs with a 240 s ambient budget
+# under a 600 s ctest timeout: at 2x, a node that binds and never becomes ready
+# burns 480 s, and if ctest fires first the fixture is KILLED -- losing the
+# verdict and the log dump, which is the entire point of the bounded wait. A test
+# that hangs reports less than a test that fails.
+#
+# The remainder is floored at one second rather than allowed to reach zero. If the
+# bind consumed the whole budget the port wait has already failed and ended the
+# run, so reaching this line means it did not -- but it may have left nothing, and
+# a zero-second wait would expire without ever testing the predicate, reporting a
+# readiness failure for a node nobody asked about readiness. One second overruns
+# the stated total by at most that, and says something true instead.
+#
 # @param 1 host
 # @param 2 port
 # @param 3 pid to watch, or "-"
 # @param 4 what it is, for the messages
 # @param 5 the log to watch -- required, unlike `wait_for_port`'s, because the
 #          marker is read out of it and there is nothing to wait on without it
-# @param 6 optional bound in seconds; defaults to `e2e_wait_seconds`
+# @param 6 optional bound in seconds for BOTH waits together; defaults to
+#          `e2e_wait_seconds`
 wait_for_node_ready() {
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
-    wait_for_port "$host" "$port" "$pid" "$what" "$logfile" ${6+"$6"}
-    wait_for_log "$E2eNodeReadyMarker" "$pid" "$what" "$logfile" ${6+"$6"}
+    local seconds="${6:-$_e2e_wait_seconds}"
+    local started="$SECONDS"
+    wait_for_port "$host" "$port" "$pid" "$what" "$logfile" "$seconds"
+    local remaining=$(( seconds - (SECONDS - started) ))
+    [ "$remaining" -gt 0 ] || remaining=1
+    wait_for_log "$E2eNodeReadyMarker" "$pid" "$what" "$logfile" "$remaining"
 }
 
 # Stop a process and require it to actually exit, within a bound.

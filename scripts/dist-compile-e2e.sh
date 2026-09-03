@@ -273,7 +273,7 @@ started_log=""
 # on, which is the only reader today.
 started_port=""
 
-# Start one compile node, and wait for it to be listening.
+# Start one compile node, and wait for it to be SERVING.
 #
 # THE recipe this fixture inlined at ten sites (#451). What was actually repeated
 # is not the flags -- those are what each case is ABOUT and they stay at the call
@@ -297,24 +297,23 @@ started_port=""
 # is what turns a tier OFF, so a node that silently kept one would race for
 # `fastcache-cc`'s default port with every other node in the run.
 #
-# BOUND IS NOT READY, which is `wait_for_node_ready`'s whole subject and is why
-# this waits through that rather than through `wait_for_port` (#451, #634). Case 8
-# was measured falling into the window: five runs of the pre-#451 fixture reported
-# `READY` at the moment it signalled the worker, and the converted one reported
-# `NOTREADY` on every run whose port answered on the FIRST probe.
+# BOUND IS NOT READY, which is why this waits through `wait_for_node_ready`
+# rather than `wait_for_port` (#451, #634). The full account -- what the window
+# is, why the old loop hid it, and what the second wait establishes -- is in the
+# library beside the helper, and is deliberately not restated here: three copies
+# of one story had already drifted apart on who removed the accidental delay
+# before anyone noticed they were the same story.
 #
-# HERE and not at the case that was caught, because a first failure masks its
-# identical siblings: case 9's `tier-node` and case 11's `blackhole-node` are
-# compiled against immediately after their bind and had exactly the same hole, and
+# What is local to this file: case 8 was measured falling into the window, and
+# the fix is HERE rather than at that case because a first failure masks its
+# identical siblings -- case 9's `tier-node` and case 11's `blackhole-node` are
+# compiled against immediately after their bind and had exactly the same hole, so
 # fixing only the observed site relocates a flake rather than removing it. The
 # marker is one unconditional line every node logs, the scheduler tier included,
 # so there is no node this can hang on.
 #
-# The reasoning for the pairing -- why it is two waits and not one, and what the
-# second establishes -- is in the library beside the helper, and is deliberately
-# not restated here. Registration is NOT part of it: some nodes are started to
-# hold a port and a cache tier and never join a fleet, so it stays at the call
-# sites that want it.
+# Registration is NOT part of it: some nodes are started to hold a port and a
+# cache tier and never join a fleet, so it stays at the call sites that want it.
 #
 # @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message about
 #          this node, so a reader handed a failure can find the log without a

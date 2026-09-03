@@ -377,15 +377,30 @@ run_case() {
     #
     # Each alone passes the broken helper. The pair does not.
     #
-    # The marker is `E2eNodeReadyMarker`'s, reached through the helper rather than
-    # spelled again here, for the reason `E2eRegisteredMarker` records: a test that
-    # wrote the text a second time would agree with itself whatever the function
-    # does.
+    # WHAT PINS THE MARKER, precisely, because the obvious sentence here would be
+    # wrong. These two cases stage ONE text, present against absent -- unlike
+    # `registration-accepted` above, which stages `1 of 1` against `0 of 1` and so
+    # catches a wait that matched the wrong line. A second spelling of the text
+    # would not weaken this pair.
+    #
+    # So the constant is pinned by having READERS, not by being unspoken: the
+    # assertion below matches `$E2eNodeReadyMarker` itself, and
+    # `refuses-bound-only`'s table row requires the expiry message `wait_for_log`
+    # builds FROM it. Reword the line in the library and both fail.
+    #
+    # `_selftest_node` spells the text literally and is not a third reader -- it is
+    # staging what a real node writes, which is the same thing
+    # `registration-accepted` does with its log line. Staging the product's output
+    # and asserting the helper's behaviour are different jobs.
     node-ready-waits-for-marker)
         log="${scratch}/ready.log"
         : > "$log"
         p="$(free_port)"
-        _selftest_node "$p" 1 "$log" >/dev/null 2>&1 &
+        # stderr into the file the wait is told to dump, as the three socket cases
+        # above do and for their reason: a stand-in that cannot bind otherwise
+        # arrives as an unexplained death beside an EMPTY log, on a runner nobody
+        # can reach. stdout is closed off, being the staged listener's own chatter.
+        _selftest_node "$p" 1 "$log" >/dev/null 2>>"$log" &
         staged=$!
         # THE BIND IS STAGED FIRST, and that is the point rather than setup.
         #
@@ -408,8 +423,13 @@ run_case() {
         # THE assertion, and it is on the marker rather than on having returned:
         # a helper loosened back to the bind also RETURNS here, and exits 0, so the
         # status cannot tell the two apart and only this can.
+        #
+        # Through `$E2eNodeReadyMarker` and not the text, which is the whole reason
+        # that constant exists: an assertion that spelled the marker a second time
+        # would agree with itself whatever the helper does, and a marker changed in
+        # the library would leave this case passing against a string nothing logs.
         case "$(<"$log")" in
-            *"compile node ready"*) echo "wait_for_node_ready returned with the node serving" ;;
+            *"$E2eNodeReadyMarker"*) echo "wait_for_node_ready returned with the node serving" ;;
             *) echo "BUG: it returned while the node had only bound" ;;
         esac
         kill "$staged" 2>/dev/null || true
@@ -423,7 +443,7 @@ run_case() {
         log="${scratch}/never.log"
         : > "$log"
         p="$(free_port)"
-        _selftest_node "$p" never "$log" >/dev/null 2>&1 &
+        _selftest_node "$p" never "$log" >/dev/null 2>>"$log" &
         staged=$!
         # Staged for the reason the case above gives, and here it is also what
         # makes the budget mean what it says: the 2s below must be spent waiting
@@ -432,7 +452,14 @@ run_case() {
         # expiry in the port wait says `to listen on` and fails the row, so this
         # cannot quietly go back to timing the wrong thing.
         wait_for_port 127.0.0.1 "$p" "$staged" "a node that never finishes starting" "$log" 15
-        wait_for_node_ready 127.0.0.1 "$p" "$staged" "a node that never finishes starting" "$log" 2
+        # ONE second, not two. This case runs in the DEFAULT ctest set on every
+        # platform CI builds, and the budget below is the one number here that is
+        # spent in full by design rather than being a ceiling nothing reaches --
+        # so a second of it is a second on every run everywhere. What makes the
+        # case discriminate is the staged bind above, not the size of this: with
+        # the port already bound and held, the only expiry reachable is the log
+        # one, and its verdict text is identical at either value.
+        wait_for_node_ready 127.0.0.1 "$p" "$staged" "a node that never finishes starting" "$log" 1
         echo "BUG: the wait returned for a node that had only bound"
         ;;
 
