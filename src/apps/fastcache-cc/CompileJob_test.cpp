@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CmdLine.hpp"
 #include "CompileJob.hpp"
 #include "StubObjectTestSupport.hpp"
 
@@ -1166,16 +1167,55 @@ TEST_CASE("A worker refuses a value it will not put on a command line", "[compil
         CHECK(WorkerPrefixMapRules("/scratch", bad, ".", DriverFamily::Gnu).error() == JobRefusal::RejectedArgument);
     }
 
-    // The two lengths are different numbers because the two values are different
-    // things: a replacement is a relative path a build tree produces, a directory is an
-    // absolute path. A 300-byte DIRECTORY is ordinary and must be accepted, which is
-    // what a shared bound would have refused -- this case asserted exactly that and was
-    // wrong rather than the code.
-    CHECK(WorkerPrefixMapRules("/scratch", "/client/dir", std::string(300, '.'), DriverFamily::Gnu).error()
-          == JobRefusal::RejectedArgument);
+    // ONE ceiling, and this case used to assert two. It said a replacement is a
+    // relative path and a directory an absolute one, so 300 bytes must be refused as
+    // one and accepted as the other -- correct about a rule's `<to>`, and about a value
+    // that never reaches this function. What arrives is `<to>` plus the client's
+    // directory tail (see the note on the bound), so its length tracks the DIRECTORY,
+    // and a 300-byte one is exactly as ordinary on this side as on the other. The case
+    // above builds such a value through the real producer and requires it accepted;
+    // this one keeps the ceiling itself honest.
+    //
+    // Both halves at 300 -- accepted, because neither is remarkable.
+    CHECK(WorkerPrefixMapRules("/scratch", "/client/dir", std::string(300, '.'), DriverFamily::Gnu).has_value());
     CHECK(WorkerPrefixMapRules("/scratch", std::string(300, '.'), ".", DriverFamily::Gnu).has_value());
+
+    // And both halves past it -- refused, so removing the ceiling is still caught.
     CHECK(WorkerPrefixMapRules("/scratch", std::string(5000, '.'), ".", DriverFamily::Gnu).error()
           == JobRefusal::RejectedArgument);
+    CHECK(WorkerPrefixMapRules("/scratch", "/client/dir", std::string(5000, '.'), DriverFamily::Gnu).error()
+          == JobRefusal::RejectedArgument);
+}
+
+TEST_CASE("A shallow rule over a deep build directory still distributes", "[compile-job][prefix-map]")
+{
+    // The producer and the consumer, in one case, because the defect lived exactly
+    // between them and neither half shows it alone.
+    //
+    // `MappedCompileDirectory` does not send the rule's `<to>`. It sends `<to>` PLUS the
+    // working directory's tail past the matched prefix, so the value's length tracks the
+    // DIRECTORY, not the rule. Bounding it as though it were a rule's `<to>` refused an
+    // ordinary build: mapping at a shallow prefix is standard reproducible-build
+    // practice, and a deep-enough build directory under it then produced a replacement
+    // over the old 256-byte ceiling. Every COMPILE for that build was refused, the
+    // client fell back locally, and the build stopped distributing entirely -- while the
+    // refusal blamed a client ARGUMENT for a value the launcher had derived.
+    //
+    // A hand-made string cannot catch that. This one is built the way the wire builds it.
+    auto const deep = std::string { "/home/ci/" } + std::string(270, 'd') + "/build";
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-g", "-fdebug-prefix-map=/home/ci=." };
+
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, deep);
+    REQUIRE(mapped.has_value());
+    auto const& pair = FastCache::Testing::Unwrap(mapped);
+
+    // The value that actually travels is longer than the old ceiling, which is the
+    // whole point -- if this ever stops holding the case has stopped testing anything.
+    REQUIRE(pair.replacement.size() > 256);
+    CHECK(pair.directory == deep);
+
+    // And the worker must accept it. The directory is ordinary and so is the rule.
+    CHECK(WorkerPrefixMapRules("/scratch", pair.directory, pair.replacement, DriverFamily::Gnu).has_value());
 }
 
 TEST_CASE("A worker accepts a non-ASCII replacement", "[compile-job][prefix-map]")

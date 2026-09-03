@@ -731,14 +731,33 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
                                           .detail = "a compilation-directory replacement needs the directory it "
                                                     "replaces" });
 
-    // Bounded, and two different numbers because they are two different things: a
-    // replacement is a relative path a build tree produces, a directory is an absolute
-    // one. A single bound refuses a 300-byte directory, which is ordinary.
-    constexpr std::size_t MaxReplacement = 256;
-    constexpr std::size_t MaxDirectory = 4096;
-    if (replacement.size() > MaxReplacement)
+    // ONE ceiling, and the two-number version it replaces was wrong about which value
+    // it was bounding.
+    //
+    // The reasoning was "a replacement is a relative path a build tree produces, a
+    // directory is an absolute one", so 256 against 4096. That is true of a RULE's
+    // `<to>` and false of what actually arrives here. `MappedCompileDirectory` sends
+    // `<to>` plus the working directory's tail past the matched prefix:
+    //
+    //     .replacement = <to> + workingDirectory.substr(match->value.size())
+    //
+    // so its length tracks the DIRECTORY, not the rule. Mapping at a shallow prefix is
+    // standard reproducible-build practice -- `-fdebug-prefix-map=/home/ci=.` -- and a
+    // deep enough build directory under one then derives a replacement past 256 bytes
+    // while the directory itself is unremarkable. Every COMPILE for that build was then
+    // refused, the client fell back to compiling locally, and the build stopped
+    // distributing entirely. The refusal also blamed a client ARGUMENT for a value this
+    // side derived from one.
+    //
+    // 4096 for both, because the question these guard is command-line length rather
+    // than filesystem length: neither value is ever opened, and the replacement cannot
+    // exceed its directory by more than the rule's own `<to>`. A value at the ceiling
+    // is still spelled into `-fdebug-prefix-map=<from>=<to>` well inside every
+    // platform's argument limit.
+    constexpr std::size_t MaxRuleValue = 4096;
+    if (replacement.size() > MaxRuleValue)
         return std::unexpected(JobError::RejectedArgumentNaming(replacement));
-    if (clientDirectory.size() > MaxDirectory)
+    if (clientDirectory.size() > MaxRuleValue)
         return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
 
     // Read off the table BEFORE anything is validated against it, so which families
@@ -789,7 +808,7 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
         return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
     if (std::ranges::any_of(replacement, unspellable))
         return std::unexpected(JobError::RejectedArgumentNaming(replacement));
-    if (workerDirectory.empty() || workerDirectory.size() > MaxDirectory
+    if (workerDirectory.empty() || workerDirectory.size() > MaxRuleValue
         || std::ranges::any_of(workerDirectory, unspellable))
         return std::unexpected(
             JobError { .reason = JobRefusal::SpawnFailed,
